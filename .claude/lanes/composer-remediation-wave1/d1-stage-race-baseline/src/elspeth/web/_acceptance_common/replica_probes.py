@@ -1,0 +1,760 @@
+"""The replicas > 1 probes: one driver, one decision table, a closed ``mechanism`` vocabulary.
+
+The legacy probes (plan §7) define this acceptance receipt's evidence scope,
+not the complete current multi-replica runtime. They are written once here and
+driven against a :class:`ReplicaController` port (address a replica, partition
+or stop the owner, restore it) and an :class:`EvidenceObserver` port (read the
+database facts a probe scores). Each provider supplies its two ports; the
+decisions never change per provider.
+
+**Overclaiming is a schema violation, not a convention.** Every result names
+the ``mechanism`` that produced its evidence from a closed set, each probe may
+only claim the mechanisms the tree actually has for it, and P4b cannot be
+constructed with any outcome but ``cannot_pass``:
+
+- **P1** concurrent freeform message ingress on one session from two replicas
+  ends in a fence conflict and one durable ingress receipt, never a double
+  dispatch — ``session_operation_fence``.
+- **P2** concurrent run starts end in one run and one 409 —
+  ``session_operation_fence_execute``. The result has no field for a
+  ``run_start_permits`` row: the legacy receipt measures fence contention,
+  not a durable permit saga or cross-database dispatch recovery.
+- **P3** a survivor takes a dead owner's lease over only after it expires —
+  ``role_revocation_lease_expiry`` (the primary primitive: the owner's
+  database role is revoked with ``ALTER ROLE … NOLOGIN`` and its backends
+  self-terminated, so it can neither heartbeat nor release) or
+  ``revision_deactivate_lease_expiry`` (the secondary, a grace-0 platform
+  stop). If the owner's membership row reads ``stopped`` or ``draining`` the
+  owner *did* reach its lifecycle release path, so the result **downgrades**
+  to ``graceful_stop``: a takeover happened, but not from a dead owner. Missing
+  owner membership is reported ``unreachable`` rather than inferred.
+- **P4a** database-backed state and blob bytes written on one replica are
+  visible from the other within one poll interval — ``postgresql_and_nfs``.
+- **P4b** the legacy contract does not measure durable progress or peer ticket
+  consumption. It retains ``owner_affine`` and the production mitigation and
+  **cannot** pass, independently of newer runtime capabilities.
+
+**Timezones.** Every datetime a decision compares must be timezone-aware; the
+driver converts to UTC before comparing and refuses a naive value with
+``AcceptanceCheckError('probe_timestamp')``. The decisions are therefore
+indifferent to the database session timezone by construction.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import threading
+import time
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from types import MappingProxyType
+from typing import Final, Literal, TypedDict
+from uuid import UUID, uuid4
+
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
+from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.web.sessions.schemas import ComposerOperationStatusResponse, SendMessageRequest
+
+from .errors import AcceptanceCheckError, AcceptanceInputError
+from .http_client import AcceptanceHttpClient
+
+Probe = Literal["P1", "P2", "P3", "P4a", "P4b"]
+FenceConflictTrialKind = Literal["same_operation", "distinct_operations"]
+P1_OPERATION_POLL_GRACE_SECONDS: Final = 30.0
+ProbeOutcome = Literal["pass", "fail", "cannot_pass", "unreachable"]
+Mechanism = Literal[
+    "session_operation_fence",
+    "session_operation_fence_execute",
+    "role_revocation_lease_expiry",
+    "revision_deactivate_lease_expiry",
+    "graceful_stop",
+    "postgresql_and_nfs",
+    "owner_affine",
+]
+
+PROBES: Final[frozenset[str]] = frozenset({"P1", "P2", "P3", "P4a", "P4b"})
+PROBE_OUTCOMES: Final[frozenset[str]] = frozenset({"pass", "fail", "cannot_pass", "unreachable"})
+MECHANISMS: Final[frozenset[str]] = frozenset(
+    {
+        "session_operation_fence",
+        "session_operation_fence_execute",
+        "role_revocation_lease_expiry",
+        "revision_deactivate_lease_expiry",
+        "graceful_stop",
+        "postgresql_and_nfs",
+        "owner_affine",
+    }
+)
+PROBE_MECHANISMS: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
+    {
+        "P1": frozenset({"session_operation_fence"}),
+        "P2": frozenset({"session_operation_fence_execute"}),
+        "P3": frozenset({"role_revocation_lease_expiry", "revision_deactivate_lease_expiry", "graceful_stop"}),
+        "P4a": frozenset({"postgresql_and_nfs"}),
+        "P4b": frozenset({"owner_affine"}),
+    }
+)
+"""The mechanisms each probe may claim; anything else is a schema violation."""
+
+SESSION_OPERATION_CONFLICT_DETAIL: Final = "Session operation is already active"
+"""The 409 body ``web/app.py`` returns for a fence conflict (``_session_operation_conflict_handler``)."""
+
+ORPHAN_CANCELLATION_REASON_PREFIX: Final = "Orphaned by periodic cleanup"
+"""How the survivor's periodic sweep words the run's cancellation reason.
+
+``web/app.py`` ``_periodic_orphan_cleanup`` writes ``"Orphaned by periodic
+cleanup — no active executor thread"`` (optionally followed by the Landscape
+reconciliation-pending suffix) into the run's error column; the startup sweep
+writes ``"Orphaned by server restart …"`` instead, which P3 must not accept —
+a restart is not a surviving replica taking over.
+"""
+
+TERMINAL_RUN_STATUSES: Final[frozenset[str]] = frozenset({"completed", "completed_with_failures", "failed", "empty", "cancelled"})
+
+DEFAULT_TRIALS: Final = 20
+DEFAULT_MAX_DISPATCH_SPREAD_MS: Final = 5.0
+
+
+def require_contention_trials(value: int) -> int:
+    """The acceptance plan requires at least twenty independent contention pairs."""
+
+    if type(value) is not int or value < DEFAULT_TRIALS:
+        raise AcceptanceInputError(f"contention trials must be an integer at least {DEFAULT_TRIALS}")
+    return value
+
+
+class ProbeReceiptDetails(TypedDict):
+    """The closed detail set a probe result contributes to a receipt."""
+
+    probe: str
+    outcome: str
+    mechanism: str
+    reasons: list[str]
+    evidence: dict[str, object]
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    """One probe's verdict. Construction enforces the closed vocabularies and the P4b cannot-pass rule."""
+
+    probe: Probe
+    outcome: ProbeOutcome
+    mechanism: Mechanism
+    reasons: tuple[str, ...] = ()
+    evidence: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.probe not in PROBES:
+            raise ValueError("probe must be one of P1, P2, P3, P4a, P4b")
+        if self.outcome not in PROBE_OUTCOMES:
+            raise ValueError("outcome must be pass, fail, cannot_pass or unreachable")
+        if self.mechanism not in PROBE_MECHANISMS[self.probe]:
+            raise ValueError(f"{self.probe} cannot claim mechanism {self.mechanism!r}; allowed: {sorted(PROBE_MECHANISMS[self.probe])}")
+        if self.probe == "P4b" and self.outcome != "cannot_pass":
+            raise ValueError("P4b records an owner-affine surface and cannot pass")
+        if (self.outcome == "pass") != (not self.reasons):
+            raise ValueError("a passing result carries no reasons; every other outcome names at least one")
+        if any(type(reason) is not str or not reason or len(reason) > 128 for reason in self.reasons):
+            raise ValueError("reasons must be non-empty bounded strings")
+        if any(type(key) is not str or not key for key in self.evidence):
+            raise ValueError("evidence keys must be non-empty strings")
+        if self.outcome == "pass" and self.probe in {"P1", "P2"}:
+            if "trials" not in self.evidence:
+                raise ValueError("passing contention evidence requires a trial count")
+            trials = self.evidence["trials"]
+            if type(trials) is not int or trials < DEFAULT_TRIALS:
+                raise ValueError("passing contention evidence requires at least twenty trials")
+            if self.probe == "P1":
+                if "distinct_winners" not in self.evidence:
+                    raise ValueError("passing P1 evidence requires a winner count")
+                winners = self.evidence["distinct_winners"]
+                if type(winners) is not int or not 2 <= winners <= trials:
+                    raise ValueError("passing P1 evidence requires distinct winners")
+        freeze_fields(self, "evidence")
+
+    def to_receipt_details(self) -> ProbeReceiptDetails:
+        return {
+            "probe": self.probe,
+            "outcome": self.outcome,
+            "mechanism": self.mechanism,
+            "reasons": list(self.reasons),
+            "evidence": {key: deep_thaw(value) for key, value in self.evidence.items()},
+        }
+
+
+# --------------------------------------------------------------------------- observations
+
+
+@dataclass(frozen=True)
+class ReplicaResponse:
+    """One response as a probe saw it: which replica it was addressed to, and which answered."""
+
+    addressed_to: str
+    status: int
+    instance_id: str | None
+    detail: str | None = None
+    run_id: str | None = None
+    operation_id: str | None = None
+    error_type: str | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return 200 <= self.status < 300
+
+    @property
+    def refused_by_fence(self) -> bool:
+        return self.status == 409 and self.detail == SESSION_OPERATION_CONFLICT_DETAIL
+
+    @property
+    def refused_as_active(self) -> bool:
+        return self.status == 409 and self.error_type == "composer_operation_active"
+
+
+@dataclass(frozen=True)
+class FenceConflictTrial:
+    """P1: one concurrent freeform message pair and its durable fence facts."""
+
+    responses: tuple[ReplicaResponse, ReplicaResponse]
+    fence_epoch_before: int
+    fence_epoch_after: int
+    fence_owner_after: str | None
+    message_ingress_receipt_rows: int
+    dispatch_spread_ms: float
+    kind: FenceConflictTrialKind = "same_operation"
+    operation_ids: tuple[str, str] = ("", "")
+    composer_operation_rows: int = 0
+    terminal_status: Literal["completed", "failed"] | None = None
+
+
+@dataclass(frozen=True)
+class RunStartTrial:
+    """P2: one concurrent pair of run starts and the run rows they produced.
+
+    There is deliberately no ``run_start_permit`` field: the legacy receipt
+    measures run-start contention, not permit durability or dispatch recovery.
+    """
+
+    responses: tuple[ReplicaResponse, ReplicaResponse]
+    runs_row_ids: tuple[str, ...]
+    landscape_run_ids: tuple[str, ...]
+    dispatch_spread_ms: float
+
+
+@dataclass(frozen=True)
+class MembershipRow:
+    """The owner's ``web_instances`` row as the observer read it."""
+
+    instance_id: str
+    state: str
+    lease_expires_at: datetime
+
+
+@dataclass(frozen=True)
+class LeaseTakeoverObservation:
+    """P3: everything the driver saw around one partitioned owner."""
+
+    primitive: Literal["role_revocation", "revision_deactivate"]
+    owner_instance_id: str
+    survivor_instance_id: str
+    owner_row: MembershipRow | None
+    before_expiry: ReplicaResponse
+    after_expiry: ReplicaResponse
+    takeover_observed_at: datetime
+    cancelled_run_reason: str | None
+    fence_owner_after: str | None
+    duplicate_sink_effects: int
+
+
+@dataclass(frozen=True)
+class CrossReplicaProgressObservation:
+    """P4a: state written through the owner, read through the other replica."""
+
+    owner_instance_id: str
+    reader_instance_id: str
+    poll_interval_seconds: float
+    status_visible_after_seconds: float
+    outputs_visible_after_seconds: float
+    messages_visible_after_seconds: float
+    blob_sha256_via_owner: str
+    blob_sha256_via_reader: str
+    terminal_status_on_reader: str | None
+
+
+# --------------------------------------------------------------------------- decisions
+
+
+def _aware_utc(value: datetime, *, label: str) -> datetime:
+    """Refuse a naive datetime; normalise an aware one to UTC before any comparison."""
+
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise AcceptanceCheckError("probe_timestamp", missing=(label,))
+    return value.astimezone(UTC)
+
+
+def _distinct_instances(responses: tuple[ReplicaResponse, ReplicaResponse]) -> bool:
+    first, second = responses
+    return first.instance_id is not None and second.instance_id is not None and first.instance_id != second.instance_id
+
+
+def decide_fence_conflict(
+    trials: Sequence[FenceConflictTrial],
+    *,
+    required_trials: int = DEFAULT_TRIALS,
+    max_dispatch_spread_ms: float = DEFAULT_MAX_DISPATCH_SPREAD_MS,
+) -> ProbeResult:
+    """P1: both admission trial kinds produce one terminal job and one fenced ingress."""
+
+    require_contention_trials(required_trials)
+    reasons: list[str] = []
+    if len(trials) != required_trials:
+        reasons.append(f"trial_count:{len(trials)}!={required_trials}")
+    winners: set[str] = set()
+    for index, trial in enumerate(trials):
+        successes = [response for response in trial.responses if response.status == 202]
+        refusals = [response for response in trial.responses if response.refused_as_active]
+        valid_pair = (
+            len(successes) == 2 and trial.operation_ids[0] == trial.operation_ids[1]
+            if trial.kind == "same_operation"
+            else len(successes) == 1 and len(refusals) == 1 and trial.operation_ids[0] != trial.operation_ids[1]
+        )
+        if not valid_pair:
+            reasons.append(f"trial[{index}]:invalid_operation_admission_pair")
+        if not _distinct_instances(trial.responses):
+            reasons.append(f"trial[{index}]:instances_not_distinct")
+        winner = trial.fence_owner_after
+        if winner is not None:
+            winners.add(winner)
+        if trial.fence_epoch_after != trial.fence_epoch_before + 1:
+            reasons.append(f"trial[{index}]:fence_epoch_not_advanced_by_one")
+        if winner is None or winner not in {response.instance_id for response in trial.responses}:
+            reasons.append(f"trial[{index}]:claim_owner_not_observed_replica")
+        if trial.composer_operation_rows != 1:
+            reasons.append(f"trial[{index}]:composer_operation_rows_not_one")
+        if trial.terminal_status not in ("completed", "failed"):
+            reasons.append(f"trial[{index}]:operation_not_terminal")
+        if any(response.operation_id not in trial.operation_ids for response in successes):
+            reasons.append(f"trial[{index}]:accepted_operation_identity_mismatch")
+        if trial.message_ingress_receipt_rows != 1:
+            reasons.append(f"trial[{index}]:message_ingress_receipt_rows:{trial.message_ingress_receipt_rows}!=1")
+        if trial.dispatch_spread_ms > max_dispatch_spread_ms:
+            reasons.append(f"trial[{index}]:dispatch_spread_ms:{trial.dispatch_spread_ms:.3f}>{max_dispatch_spread_ms}")
+    if trials and len(winners) < 2:
+        reasons.append("winners_not_distinct_across_run")
+    if {trial.kind for trial in trials} != {"same_operation", "distinct_operations"}:
+        reasons.append("both_operation_trial_kinds_required")
+    return ProbeResult(
+        probe="P1",
+        outcome="pass" if not reasons else "fail",
+        mechanism="session_operation_fence",
+        reasons=tuple(reasons),
+        evidence={"trials": len(trials), "distinct_winners": len(winners)},
+    )
+
+
+def decide_run_start(
+    trials: Sequence[RunStartTrial],
+    *,
+    required_trials: int = DEFAULT_TRIALS,
+    max_dispatch_spread_ms: float = DEFAULT_MAX_DISPATCH_SPREAD_MS,
+) -> ProbeResult:
+    """P2: every trial is one accepted run and one fence refusal, and exactly one run row exists."""
+
+    require_contention_trials(required_trials)
+    reasons: list[str] = []
+    if len(trials) != required_trials:
+        reasons.append(f"trial_count:{len(trials)}!={required_trials}")
+    for index, trial in enumerate(trials):
+        accepted = [response for response in trial.responses if response.status == 202 and response.run_id is not None]
+        refusals = [response for response in trial.responses if response.refused_by_fence]
+        if len(accepted) != 1 or len(refusals) != 1:
+            reasons.append(f"trial[{index}]:not_one_accepted_run_and_one_fence_refusal")
+            continue
+        if not _distinct_instances(trial.responses):
+            reasons.append(f"trial[{index}]:instances_not_distinct")
+        run_id = accepted[0].run_id
+        if trial.runs_row_ids != (run_id,):
+            reasons.append(f"trial[{index}]:runs_rows:{len(trial.runs_row_ids)}!=1_or_not_the_accepted_run")
+        if len(trial.landscape_run_ids) != 1:
+            reasons.append(f"trial[{index}]:landscape_runs:{len(trial.landscape_run_ids)}!=1")
+        if trial.dispatch_spread_ms > max_dispatch_spread_ms:
+            reasons.append(f"trial[{index}]:dispatch_spread_ms:{trial.dispatch_spread_ms:.3f}>{max_dispatch_spread_ms}")
+    return ProbeResult(
+        probe="P2",
+        outcome="pass" if not reasons else "fail",
+        mechanism="session_operation_fence_execute",
+        reasons=tuple(reasons),
+        evidence={"trials": len(trials)},
+    )
+
+
+def decide_lease_takeover(observation: LeaseTakeoverObservation) -> ProbeResult:
+    """P3: the survivor takes over only after the dead owner's lease expired, and only once.
+
+    A ``stopped`` or ``draining`` owner row means the owner reached its own
+    release path: the mechanism is downgraded to ``graceful_stop`` and the
+    result says so. No row at all means the membership authority has not
+    shipped: ``unreachable``, never ``fail``.
+    """
+
+    primary: Mechanism = (
+        "role_revocation_lease_expiry" if observation.primitive == "role_revocation" else "revision_deactivate_lease_expiry"
+    )
+    if observation.owner_row is None:
+        return ProbeResult(
+            probe="P3",
+            outcome="unreachable",
+            mechanism=primary,
+            reasons=("web_instances_has_no_row_for_the_owner:membership_authority_not_landed",),
+            evidence={"owner_instance_id": observation.owner_instance_id, "primitive": observation.primitive},
+        )
+    row = observation.owner_row
+    lease_expires_at = _aware_utc(row.lease_expires_at, label="owner_row.lease_expires_at")
+    takeover_observed_at = _aware_utc(observation.takeover_observed_at, label="takeover_observed_at")
+    mechanism: Mechanism = primary
+    reasons: list[str] = []
+    if row.instance_id != observation.owner_instance_id:
+        reasons.append("owner_row_is_not_the_owner")
+    if row.state in {"stopped", "draining"}:
+        mechanism = "graceful_stop"
+    elif row.state != "active":
+        reasons.append(f"owner_row_state_unknown:{row.state}")
+    if not observation.before_expiry.refused_by_fence:
+        reasons.append("survivor_not_refused_before_lease_expiry")
+    if observation.before_expiry.instance_id != observation.survivor_instance_id:
+        reasons.append("before_expiry_response_not_from_survivor")
+    if takeover_observed_at <= lease_expires_at:
+        reasons.append("takeover_observed_before_lease_expiry")
+    if not observation.after_expiry.succeeded:
+        reasons.append("survivor_not_admitted_after_lease_expiry")
+    if observation.after_expiry.instance_id != observation.survivor_instance_id:
+        reasons.append("after_expiry_response_not_from_survivor")
+    if observation.owner_instance_id == observation.survivor_instance_id:
+        reasons.append("owner_and_survivor_are_the_same_instance")
+    if observation.cancelled_run_reason is None or not observation.cancelled_run_reason.startswith(ORPHAN_CANCELLATION_REASON_PREFIX):
+        reasons.append("owner_run_not_cancelled_with_the_orphan_reason")
+    if observation.fence_owner_after != observation.survivor_instance_id:
+        reasons.append("fence_owner_did_not_move_to_the_survivor")
+    if observation.duplicate_sink_effects != 0:
+        reasons.append(f"duplicate_sink_effects:{observation.duplicate_sink_effects}")
+    return ProbeResult(
+        probe="P3",
+        outcome="pass" if not reasons else "fail",
+        mechanism=mechanism,
+        reasons=tuple(reasons),
+        evidence={
+            "primitive": observation.primitive,
+            "owner_row_state": row.state,
+            "lease_expires_at": lease_expires_at.isoformat().replace("+00:00", "Z"),
+            "takeover_observed_at": takeover_observed_at.isoformat().replace("+00:00", "Z"),
+            "observation": {
+                "primitive": observation.primitive,
+                "owner_instance_id": observation.owner_instance_id,
+                "survivor_instance_id": observation.survivor_instance_id,
+                "owner_row": {
+                    "instance_id": row.instance_id,
+                    "state": row.state,
+                    "lease_expires_at": lease_expires_at.isoformat().replace("+00:00", "Z"),
+                },
+                "before_expiry": asdict(observation.before_expiry),
+                "after_expiry": asdict(observation.after_expiry),
+                "takeover_observed_at": takeover_observed_at.isoformat().replace("+00:00", "Z"),
+                "cancelled_run_reason": observation.cancelled_run_reason,
+                "fence_owner_after": observation.fence_owner_after,
+                "duplicate_sink_effects": observation.duplicate_sink_effects,
+            },
+        },
+    )
+
+
+def decide_cross_replica_progress(observation: CrossReplicaProgressObservation) -> ProbeResult:
+    """P4a: database-backed state and blob bytes are visible from the non-owner within one poll interval."""
+
+    reasons: list[str] = []
+    if observation.owner_instance_id == observation.reader_instance_id:
+        reasons.append("owner_and_reader_are_the_same_instance")
+    if observation.poll_interval_seconds <= 0:
+        reasons.append("poll_interval_not_positive")
+    for label, seconds in (
+        ("status", observation.status_visible_after_seconds),
+        ("outputs", observation.outputs_visible_after_seconds),
+        ("messages", observation.messages_visible_after_seconds),
+    ):
+        if seconds < 0 or seconds > observation.poll_interval_seconds:
+            reasons.append(f"{label}_not_visible_within_one_poll_interval")
+    if observation.blob_sha256_via_owner != observation.blob_sha256_via_reader:
+        reasons.append("blob_bytes_differ_across_replicas")
+    if observation.terminal_status_on_reader not in TERMINAL_RUN_STATUSES:
+        reasons.append("terminal_status_not_observed_on_reader")
+    return ProbeResult(
+        probe="P4a",
+        outcome="pass" if not reasons else "fail",
+        mechanism="postgresql_and_nfs",
+        reasons=tuple(reasons),
+        evidence={"poll_interval_seconds": observation.poll_interval_seconds, "observation": asdict(observation)},
+    )
+
+
+def record_owner_affine_progress(*, mitigation: Literal["single_revision_sticky_sessions"]) -> ProbeResult:
+    """P4b retains its legacy mechanism; durable progress is not measured and cannot pass here."""
+
+    return ProbeResult(
+        probe="P4b",
+        outcome="cannot_pass",
+        mechanism="owner_affine",
+        reasons=("legacy_p4b_contract_does_not_measure_durable_progress",),
+        evidence={"mitigation": mitigation},
+    )
+
+
+# --------------------------------------------------------------------------- ports
+
+
+@dataclass(frozen=True)
+class ReplicaAddress:
+    name: str
+    origin: str
+
+
+class ReplicaController(ABC):
+    """What a platform must offer the driver: name its replicas, and kill or restore an owner."""
+
+    @abstractmethod
+    def replicas(self) -> tuple[ReplicaAddress, ReplicaAddress]:
+        """The two addressable replicas (label URLs on Container Apps, pinned targets on ECS)."""
+
+    @abstractmethod
+    def partition_owner(self, replica: str) -> None:
+        """Sever the owner from every database authority without letting it release (role revocation)."""
+
+    @abstractmethod
+    def stop_owner(self, replica: str) -> None:
+        """Platform stop with no grace period (the secondary primitive)."""
+
+    @abstractmethod
+    def restore_owner(self, replica: str) -> None:
+        """Undo the partition or stop."""
+
+
+class EvidenceObserver(ABC):
+    """The database facts a probe scores, read through the provider's own channel."""
+
+    @abstractmethod
+    def fence_epoch(self, session_id: str) -> int: ...
+
+    @abstractmethod
+    def fence_owner(self, session_id: str) -> str | None: ...
+
+    @abstractmethod
+    def message_ingress_receipt_rows(self, session_id: str, *, operation_id: str) -> int: ...
+
+    @abstractmethod
+    def composer_operation_rows(self, session_id: str, *, operation_id: str) -> int: ...
+
+    @abstractmethod
+    def composer_operation_claim_owner(self, session_id: str, *, operation_id: str) -> str | None: ...
+
+    @abstractmethod
+    def runs_row_ids(self, session_id: str) -> tuple[str, ...]: ...
+
+    @abstractmethod
+    def landscape_run_ids(self, session_id: str) -> tuple[str, ...]: ...
+
+    @abstractmethod
+    def membership_row(self, instance_id: str) -> MembershipRow | None: ...
+
+
+@dataclass(frozen=True)
+class ProbeRequest:
+    method: str
+    path: str
+    json_body: object
+
+
+@trust_boundary(
+    tier=3,
+    source="the JSON body and X-Elspeth-Instance header of one response from a deployed replica under probe",
+    source_param="body",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns an owned ReplicaResponse with bounded detail, run_id and error_type, plus a canonical operation_id, "
+        "taken only from a dict body's named members or its FastAPI detail object and None otherwise; "
+        "never raises on the body's shape and never coerces "
+        "external values"
+    ),
+    non_raising=True,
+)
+def replica_response_from_envelope(*, addressed_to: str, status: int, instance_id: str | None, body: object) -> ReplicaResponse:
+    detail: str | None = None
+    run_id: str | None = None
+    operation_id: str | None = None
+    error_type: str | None = None
+    if isinstance(body, dict):
+        candidate_detail = body.get("detail")
+        operation_envelope = candidate_detail if isinstance(candidate_detail, dict) else body
+        if isinstance(candidate_detail, dict):
+            candidate_detail = candidate_detail.get("detail")
+        if type(candidate_detail) is str and 0 < len(candidate_detail) <= 256:
+            detail = candidate_detail
+        candidate_run_id = body.get("run_id")
+        if type(candidate_run_id) is str and 0 < len(candidate_run_id) <= 128:
+            run_id = candidate_run_id
+        candidate_operation = operation_envelope.get("operation_id")
+        if type(candidate_operation) is str:
+            try:
+                if str(UUID(candidate_operation)) == candidate_operation:
+                    operation_id = candidate_operation
+            except ValueError:
+                pass
+        candidate_error = operation_envelope.get("error_type")
+        if type(candidate_error) is str and 0 < len(candidate_error) <= 128:
+            error_type = candidate_error
+    return ReplicaResponse(
+        addressed_to=addressed_to,
+        status=status,
+        instance_id=instance_id,
+        detail=detail,
+        run_id=run_id,
+        operation_id=operation_id,
+        error_type=error_type,
+    )
+
+
+class ReplicaProbeDriver:
+    """Fire one request at two replicas inside the dispatch window and collect what each answered."""
+
+    def __init__(
+        self,
+        *,
+        controller: ReplicaController,
+        observer: EvidenceObserver,
+        client_factory: Callable[[str], AcceptanceHttpClient],
+        clock: Callable[[], float] = time.monotonic,
+        pinned_clients: tuple[AcceptanceHttpClient, AcceptanceHttpClient] | None = None,
+    ) -> None:
+        self._controller = controller
+        self._observer = observer
+        self._client_factory = client_factory
+        self._clock = clock
+        self._pinned_clients = pinned_clients
+        if pinned_clients is not None:
+            addresses = controller.replicas()
+            if pinned_clients[0] is pinned_clients[1] or any(
+                client.origin != address.origin for client, address in zip(pinned_clients, addresses, strict=True)
+            ):
+                raise AcceptanceInputError("pinned clients must be distinct and match ordered replica origins")
+
+    def fire_pair(
+        self, request: ProbeRequest, *, expected_statuses: set[int], second_request: ProbeRequest | None = None
+    ) -> tuple[tuple[ReplicaResponse, ReplicaResponse], float]:
+        """Send ``request`` to both replicas, released together; return the responses and the dispatch spread in ms."""
+
+        first, second = self._controller.replicas()
+        if first.name == second.name or (first.origin == second.origin and self._pinned_clients is None):
+            raise AcceptanceInputError("replica probes need two distinct replicas")
+        barrier = threading.Barrier(2, timeout=30.0)
+        sent_at: dict[str, float] = {}
+
+        def send(address: ReplicaAddress, client: AcceptanceHttpClient, selected: ProbeRequest) -> ReplicaResponse:
+            barrier.wait()
+            sent_at[address.name] = self._clock()
+            status, instance_id, body = client.request_json_with_instance(
+                selected.method,
+                selected.path,
+                expected_statuses=expected_statuses,
+                json_body=selected.json_body,
+            )
+            return replica_response_from_envelope(addressed_to=address.name, status=status, instance_id=instance_id, body=body)
+
+        def fire(address: ReplicaAddress, index: int) -> ReplicaResponse:
+            selected = second_request if index == 1 and second_request is not None else request
+            if self._pinned_clients is not None:
+                return send(address, self._pinned_clients[index], selected)
+            with self._client_factory(address.origin) as client:
+                client.authenticate(register=False)
+                return send(address, client, selected)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = (pool.submit(fire, first, 0), pool.submit(fire, second, 1))
+            responses = (futures[0].result(), futures[1].result())
+        spread_ms = abs(sent_at[first.name] - sent_at[second.name]) * 1000.0
+        return responses, spread_ms
+
+    def fence_conflict_trial(
+        self, session_id: str, request: ProbeRequest, *, kind: FenceConflictTrialKind = "same_operation"
+    ) -> FenceConflictTrial:
+        """One P1 trial: fire one freeform request on both replicas and read its receipt."""
+
+        if kind not in ("same_operation", "distinct_operations"):
+            raise AcceptanceInputError("P1 requires an owned trial kind")
+        body = SendMessageRequest.model_validate(request.json_body)
+        second_body = body if kind == "same_operation" else body.model_copy(update={"operation_id": str(uuid4())})
+        second_request = ProbeRequest(request.method, request.path, second_body.model_dump(mode="json"))
+        epoch_before = self._observer.fence_epoch(session_id)
+        responses, spread_ms = self.fire_pair(request, expected_statuses={202, 409}, second_request=second_request)
+        accepted = [response for response in responses if response.status == 202 and response.operation_id is not None]
+        if not accepted:
+            raise AcceptanceCheckError("probe_operation_not_admitted")
+        if any(response.operation_id not in (body.operation_id, second_body.operation_id) for response in accepted):
+            raise AcceptanceCheckError("probe_operation_identity")
+        operation_id = accepted[0].operation_id
+        assert operation_id is not None
+        terminal = self._poll_composer_operation(session_id, operation_id)
+        ids = (body.operation_id, second_body.operation_id)
+        return FenceConflictTrial(
+            responses=responses,
+            fence_epoch_before=epoch_before,
+            fence_epoch_after=self._observer.fence_epoch(session_id),
+            fence_owner_after=self._observer.composer_operation_claim_owner(session_id, operation_id=operation_id),
+            message_ingress_receipt_rows=self._observer.message_ingress_receipt_rows(session_id, operation_id=operation_id),
+            dispatch_spread_ms=spread_ms,
+            kind=kind,
+            operation_ids=ids,
+            composer_operation_rows=sum(self._observer.composer_operation_rows(session_id, operation_id=item) for item in set(ids)),
+            terminal_status="completed" if terminal.status == "completed" else "failed",
+        )
+
+    def _poll_composer_operation(self, session_id: str, operation_id: str) -> ComposerOperationStatusResponse:
+        def poll(client: AcceptanceHttpClient) -> ComposerOperationStatusResponse:
+            deadline: float | None = None
+            while True:
+                body = client.request_json("GET", f"/api/sessions/{session_id}/operations/{operation_id}", expected_statuses={200})
+                status = ComposerOperationStatusResponse.model_validate_json(json.dumps(body))
+                if status.operation_id != operation_id:
+                    raise AcceptanceCheckError("probe_operation_identity")
+                remaining = self._clock() + status.deadline_remaining_ms / 1000 + P1_OPERATION_POLL_GRACE_SECONDS
+                deadline = remaining if deadline is None else min(deadline, remaining)
+                if status.status in ("completed", "failed"):
+                    return status
+                if self._clock() >= deadline:
+                    raise AcceptanceCheckError("probe_operation_terminal_timeout")
+                time.sleep(min(status.poll_after_ms / 1000, max(0, deadline - self._clock())))
+
+        if self._pinned_clients is not None:
+            return poll(self._pinned_clients[0])
+        first, _second = self._controller.replicas()
+        with self._client_factory(first.origin) as client:
+            client.authenticate(register=False)
+            return poll(client)
+
+    def run_start_trial(self, session_id: str, request: ProbeRequest, *, observation_timeout_seconds: float = 30.0) -> RunStartTrial:
+        """One P2 trial against a fresh prepared session; historical runs invalidate isolation."""
+
+        if self._observer.runs_row_ids(session_id) or self._observer.landscape_run_ids(session_id):
+            raise AcceptanceCheckError("probe_session_not_fresh")
+        responses, spread_ms = self.fire_pair(request, expected_statuses={202, 409})
+        # HTTP 202 follows worker submission; the worker creates its Landscape
+        # row asynchronously. Observe its durable publication before scoring.
+        deadline = time.monotonic() + observation_timeout_seconds
+        landscape_ids = self._observer.landscape_run_ids(session_id)
+        while not landscape_ids and time.monotonic() < deadline:
+            time.sleep(0.05)
+            landscape_ids = self._observer.landscape_run_ids(session_id)
+        return RunStartTrial(
+            responses=responses,
+            runs_row_ids=self._observer.runs_row_ids(session_id),
+            landscape_run_ids=landscape_ids,
+            dispatch_spread_ms=spread_ms,
+        )

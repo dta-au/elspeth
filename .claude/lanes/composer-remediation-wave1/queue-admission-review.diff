@@ -1,0 +1,515 @@
+diff --git a/src/elspeth/web/composer/tools/transforms.py b/src/elspeth/web/composer/tools/transforms.py
+index 6e86d6218..b563f2305 100644
+--- a/src/elspeth/web/composer/tools/transforms.py
++++ b/src/elspeth/web/composer/tools/transforms.py
+@@ -629,6 +629,9 @@ def _execute_upsert_queue_node(
+         expected_output_count=validated.expected_output_count,
+         timeout_seconds=validated.timeout_seconds,
+         description=validated.description,
++        scope_name=validated.scope_name,
++        scope_opener=validated.scope_opener,
++        scope_policy=validated.scope_policy,
+     )
+     contract_error = queue_node_contract_error(node)
+     if contract_error is not None:
+diff --git a/tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py b/tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py
+index 039b29e83..3c6f7eff0 100644
+--- a/tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py
++++ b/tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py
+@@ -13,6 +13,7 @@ from httpx import ASGITransport, AsyncClient
+ from sqlalchemy import func, select
+ from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+ from tests.unit.web.composer.test_planner_authoring_aids import _empty_state, _guardrail_profile_view
++from tests.unit.web.composer.test_queue_scope_admission import QUEUE, SCOPE, complete_queue, private_snapshot, scope_message
+ from tests.unit.web.composer.test_required_control_autowire import _bare_llm_candidate
+ from tests.unit.web.sessions.routes.composer.test_proposal_accept_preflight_failure import _set_pipeline_arguments
+ from tests.unit.web.sessions.test_blob_proposal_accept import _save_composition_state
+@@ -64,6 +65,76 @@ def _proposal(
+     )
+ 
+ 
++@pytest.mark.parametrize("override", [*({key: value} for key, value in SCOPE.items()), SCOPE, {"scope_policy": []}])
++def test_legacy_queue_scope_replay_terminalizes_without_changing_private_composition(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    override: dict[str, Any],
++) -> None:
++    app, service = _make_app(tmp_path)
++    client = TestClient(app)
++    session_id = UUID(client.post("/api/sessions", json={"title": "Queue replay"}).json()["id"])
++    _, built, _ = complete_queue(tmp_path, session_id=str(session_id))
++    data = built.to_dict()
++    saved = asyncio.run(
++        _save_composition_state(
++            service,
++            session_id,
++            CompositionStateData(
++                sources=data["sources"], nodes=data["nodes"], edges=data["edges"], outputs=data["outputs"], metadata_=data["metadata"]
++            ),
++            provenance="session_seed",
++        )
++    )
++    before = private_snapshot(state_from_record(saved))
++    proposal = _proposal(service, session_id, "upsert_node", {**QUEUE, "description": "Do not apply", **override}, saved.id)
++    real_dispatch = routes.execute_tool
++    results = []
++    attempts = []
++
++    def observe(*args: Any, **kwargs: Any) -> Any:
++        attempts.append(True)
++        result = real_dispatch(*args, **kwargs)
++        results.append(result)
++        return result
++
++    monkeypatch.setattr(routes, "execute_tool", observe)
++    endpoint = f"/api/sessions/{session_id}/proposals/{proposal.id}/accept"
++    response = client.post(endpoint)
++    assert response.status_code == 422, response.text
++    malformed = override == {"scope_policy": []}
++    assert response.json()["detail"]["error_type"] == "proposal_validation_failed"
++    assert len(attempts) == 1
++    if not malformed:
++        (result,) = results
++        assert not result.success and result.affected_nodes == () and result.applied_component is None
++        error = result.validation.errors[0]
++        assert (error.component, error.error_code, error.rejected_component) == (
++            "rejected_mutation",
++            "queue_config_invalid",
++            "node:inbound",
++        )
++        assert error.message == scope_message(override)
++        assert private_snapshot(result.updated_state) == before
++    else:
++        assert len(results) == 1 and not results[0].success
++        assert results[0].validation.errors[0].error_code != "queue_config_invalid"
++        assert private_snapshot(results[0].updated_state) == before
++    current = asyncio.run(service.get_current_state(session_id))
++    assert current is not None and current.id == saved.id
++    assert private_snapshot(state_from_record(current)) == before
++    with service._engine.connect() as conn:
++        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 1
++    assert (
++        asyncio.run(service.get_authoritative_composition_proposal(session_id=session_id, proposal_id=proposal.id)).row.status == "rejected"
++    )
++    events = [event for event in asyncio.run(service.list_proposal_events(session_id)) if event.proposal_id == proposal.id]
++    assert [event.event_type for event in events] == ["proposal.created", "proposal.rejected"]
++    assert client.post(endpoint).status_code == 409
++    assert len(attempts) == 1
++    assert [event for event in asyncio.run(service.list_proposal_events(session_id)) if event.proposal_id == proposal.id] == events
++
++
+ @pytest.mark.parametrize(
+     ("tool_name", "arguments", "changed"),
+     [
+diff --git a/tests/unit/web/composer/test_queue_scope_admission.py b/tests/unit/web/composer/test_queue_scope_admission.py
+new file mode 100644
+index 000000000..d01e95021
+--- /dev/null
++++ b/tests/unit/web/composer/test_queue_scope_admission.py
+@@ -0,0 +1,176 @@
++"""Queue scope values reach the intrinsic guard without changing saved graphs."""
++
++from __future__ import annotations
++
++from copy import deepcopy
++from itertools import combinations
++from pathlib import Path
++from typing import Any, Literal
++
++import pytest
++
++from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
++from elspeth.contracts.hashing import stable_hash
++from elspeth.web.composer.pipeline_proposal import composition_content_hash
++from elspeth.web.composer.protocol import ToolArgumentError
++from elspeth.web.composer.state import CompositionState
++from elspeth.web.composer.tools import execute_tool, transforms
++from elspeth.web.composer.tools._common import ToolContext, ToolResult
++from tests.unit.web.composer.test_set_pipeline_candidate import _empty_state, _named_multi_source_queue_args, _trained_context
++from tests.unit.web.composer.test_transform_rejection_contracts import _assert_refusal, _saved_state
++
++QUEUE = {"id": "inbound", "node_type": "queue", "input": "inbound"}
++SCOPE = {"scope_name": "document_pages", "scope_opener": "expand_rows", "scope_policy": "require_all"}
++SCOPE_CASES = (
++    [
++        {key: (policy if key == "scope_policy" else SCOPE[key]) for key in keys}
++        for size in range(1, 4)
++        for keys in combinations(SCOPE, size)
++        for policy in (["require_all", "best_effort"] if "scope_policy" in keys else ["require_all"])
++    ]
++    + [{**dict.fromkeys(SCOPE), key: value} for key, value in SCOPE.items()]
++    + [{"scope_name": ""}, {"scope_opener": ""}]
++)
++MALFORMED_SCOPE_CASES = [{key: value} for key in SCOPE for value in (42, [], {})] + [
++    {"scope_policy": "all"},
++    {"unknown_scope": "document_pages"},
++]
++
++
++def scope_message(override: dict[str, Any]) -> str:
++    present = sorted(key for key, value in override.items() if value is not None)
++    return f"Queue 'inbound' does not accept field(s): {present}."
++
++
++def private_snapshot(state: CompositionState) -> tuple[dict[str, Any], str, str, int]:
++    content_hash = composition_content_hash(state)
++    data = state.to_dict()
++    return deepcopy(data), stable_hash(data), content_hash, state.version
++
++
++def dispatch(tool: str, args: dict[str, Any], state: CompositionState, context: ToolContext, **kwargs: Any) -> ToolResult:
++    return execute_tool(
++        tool,
++        args,
++        state,
++        context.catalog,
++        plugin_snapshot=context.plugin_snapshot,
++        data_dir=context.data_dir,
++        session_id=context.session_id,
++        validate_arguments=True,
++        **kwargs,
++    )
++
++
++def complete_queue(tmp_path: Path, *, session_id: str = "test-session") -> tuple[dict[str, Any], CompositionState, ToolContext]:
++    """Real catalog and complete graph with source paths in the current session."""
++    args = _named_multi_source_queue_args(tmp_path)
++    for name, source in args["sources"].items():
++        path = tmp_path / "blobs" / session_id / f"{name}.csv"
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text("value\n1\n", encoding="utf-8")
++        source["options"]["path"] = str(path)
++    context = _trained_context(data_dir=tmp_path, session_id=session_id)
++    built = dispatch("set_pipeline", args, _empty_state(), context)
++    assert built.success and built.validation.is_valid, built.to_dict()
++    canonical = dispatch("upsert_node", args["nodes"][0], built.updated_state, context)
++    assert canonical.success and canonical.validation.is_valid, canonical.to_dict()
++    return args, canonical.updated_state, context
++
++
++@pytest.mark.parametrize("surface", ["handler", "dispatch"])
++@pytest.mark.parametrize("existing_queue", [False, True])
++@pytest.mark.parametrize("override", SCOPE_CASES)
++def test_scope_refusal_preserves_full_private_saved_state(
++    surface: Literal["handler", "dispatch"],
++    existing_queue: bool,
++    override: dict[str, Any],
++) -> None:
++    state = _saved_state()
++    context = _trained_context()
++    if existing_queue:
++        canonical = dispatch("upsert_node", {**QUEUE, "options": {"description": "Keep this queue"}}, state, context)
++        assert canonical.success
++        state = canonical.updated_state
++    before = private_snapshot(state)
++    standing = state.validate()
++    args = {**QUEUE, "description": "Must not replace", **override}
++    result = transforms._handle_upsert_node(args, state, context) if surface == "handler" else dispatch("upsert_node", args, state, context)
++    _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
++    assert result.validation.errors[0].message == scope_message(override)
++    assert result.applied_component is None
++    assert private_snapshot(state) == before
++    assert private_snapshot(result.updated_state) == before
++
++
++@pytest.mark.parametrize("override", SCOPE_CASES)
++def test_complete_real_routes_agree_on_intrinsic_refusal(tmp_path: Path, override: dict[str, Any]) -> None:
++    args, state, context = complete_queue(tmp_path)
++    before = private_snapshot(state)
++    args["nodes"][0].update(override)
++    incremental = dispatch("upsert_node", args["nodes"][0], state, context)
++    bulk = dispatch("set_pipeline", args, state, context)
++    for result in (incremental, bulk):
++        assert not result.success and result.updated_state is state
++        assert result.affected_nodes == () and result.applied_component is None
++        entry = result.validation.errors[0]
++        assert entry.error_code == "queue_config_invalid" and entry.rejected_component == "node:inbound"
++        assert entry.message.endswith(scope_message(override))
++        assert private_snapshot(result.updated_state) == before
++    assert len(bulk.validation.errors) == 1
++
++
++@pytest.mark.parametrize("surface", ["handler", "dispatch"])
++@pytest.mark.parametrize("override", [{}, dict.fromkeys(SCOPE), {"options": {"description": "interleave"}}, {"description": "Queue notes"}])
++def test_canonical_orphan_and_changed_description_remain_admitted(surface: str, override: dict[str, Any]) -> None:
++    context = _trained_context()
++    state = _empty_state()
++    args = {**QUEUE, **override}
++    invoke = (
++        (lambda payload, prior: transforms._handle_upsert_node(payload, prior, context))
++        if surface == "handler"
++        else (lambda payload, prior: dispatch("upsert_node", payload, prior, context))
++    )
++    result = invoke(args, state)
++    assert result.success and not result.validation.is_valid
++    assert result.updated_state.version == state.version + 1 and "inbound" in result.affected_nodes
++    (queue,) = result.updated_state.nodes
++    assert queue.id == queue.input == "inbound"
++    assert queue.plugin is queue.on_success is queue.on_error is None
++    assert queue.condition is queue.routes is queue.fork_to is queue.branches is None
++    assert queue.policy is queue.merge is queue.trigger is queue.output_mode is None
++    assert queue.expected_output_count is queue.timeout_seconds is None
++    assert queue.scope_name is queue.scope_opener is queue.scope_policy is None
++    assert dict(queue.options) == override.get("options", {})
++    assert queue.description == override.get("description")
++    changed = invoke({**args, "description": "Changed description"}, result.updated_state)
++    assert changed.success and changed.updated_state.version == result.updated_state.version + 1
++    assert changed.updated_state.nodes[0].description == "Changed description"
++
++
++@pytest.mark.parametrize("override", MALFORMED_SCOPE_CASES)
++def test_malformed_scope_retains_existing_argument_channels(override: dict[str, Any]) -> None:
++    state, context = _saved_state(), _trained_context()
++    before = private_snapshot(state)
++    args = {**QUEUE, **override}
++    with pytest.raises(ToolArgumentError) as caught:
++        transforms._handle_upsert_node(args, state, context)
++    assert caught.value.category == ToolArgumentErrorCategory.MODEL_VALIDATION
++    with pytest.raises(ToolArgumentError) as caught:
++        execute_tool("upsert_node", args, state, context.catalog, plugin_snapshot=context.plugin_snapshot)
++    assert caught.value.category == ToolArgumentErrorCategory.MODEL_VALIDATION
++    ordinary = dispatch("upsert_node", args, state, context)
++    assert not ordinary.success and ordinary.updated_state is state
++    with pytest.raises(ToolArgumentError) as caught:
++        dispatch("upsert_node", args, state, context, raise_schema_argument_errors=True)
++    assert caught.value.category == ToolArgumentErrorCategory.SCHEMA_SHAPE
++    assert private_snapshot(state) == before
++
++
++def test_bulk_arbitrary_policy_still_reaches_intrinsic_guard(tmp_path: Path) -> None:
++    args, state, context = complete_queue(tmp_path)
++    args["nodes"][0]["scope_policy"] = "all"
++    result = dispatch("set_pipeline", args, state, context)
++    assert not result.success and result.updated_state is state
++    assert result.validation.errors[0].error_code == "queue_config_invalid"
++    assert result.validation.errors[0].message.endswith(scope_message({"scope_policy": "all"}))
+diff --git a/tests/unit/web/composer/test_queue_scope_approval.py b/tests/unit/web/composer/test_queue_scope_approval.py
+new file mode 100644
+index 000000000..a72d747e3
+--- /dev/null
++++ b/tests/unit/web/composer/test_queue_scope_approval.py
+@@ -0,0 +1,88 @@
++"""Approval previews refuse scope-bearing queues before staging proposals."""
++
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Any
++from uuid import UUID
++
++import pytest
++from sqlalchemy import func, select
++
++from elspeth.web.composer.service import ComposerServiceImpl
++from elspeth.web.composer.tools._common import ToolResult
++from elspeth.web.dependencies import create_catalog_service
++from elspeth.web.sessions.converters import state_from_record
++from elspeth.web.sessions.models import composition_states_table
++from elspeth.web.sessions.protocol import CompositionStateData
++from tests.unit.web.composer._helpers import _make_settings
++from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean as _stub_advisor_end_gate_clean
++from tests.unit.web.composer.conftest import _fake_llm_response, _FakeComposeLLM
++from tests.unit.web.composer.test_queue_scope_admission import QUEUE, SCOPE, complete_queue, private_snapshot
++from tests.unit.web.sessions.test_blob_proposal_accept import _save_composition_state
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("override", [{}, *({key: value} for key, value in SCOPE.items()), SCOPE])
++async def test_real_explicit_approval_previews_changed_queue_without_committing_composition(
++    tmp_path: Path,
++    override: dict[str, Any],
++    composer_service_with_real_sessions: ComposerServiceImpl,
++    result_session_id: str,
++) -> None:
++    sessions = composer_service_with_real_sessions._require_sessions_service()
++    composer = ComposerServiceImpl.for_trained_operator(
++        catalog=create_catalog_service(),
++        settings=_make_settings(data_dir=tmp_path),
++        sessions_service=sessions,
++    )
++    session_id = result_session_id
++    session_uuid = UUID(session_id)
++    _, built, _ = complete_queue(tmp_path, session_id=session_id)
++    data = built.to_dict()
++    saved = await _save_composition_state(
++        sessions,
++        session_uuid,
++        CompositionStateData(
++            sources=data["sources"], nodes=data["nodes"], edges=data["edges"], outputs=data["outputs"], metadata_=data["metadata"]
++        ),
++        provenance="session_seed",
++    )
++    state = state_from_record(saved)
++    before = private_snapshot(state)
++    await sessions.update_composer_preferences(
++        session_uuid, trust_mode="explicit_approve", density_default="high", actor="user:phase3-test-user"
++    )
++    arguments = {**QUEUE, "description": "Changed queue description", **override}
++    llm = _FakeComposeLLM(
++        (
++            _fake_llm_response(tool_calls=({"id": "queue_edit", "name": "upsert_node", "arguments": arguments},)),
++            _fake_llm_response(content="The queue edit has been considered."),
++        )
++    )
++    result = await composer._run_one_turn_for_test(
++        llm=llm,
++        session_id=session_id,
++        current_state_id=str(saved.id),
++        initial_state=state,
++    )
++    proposals = await sessions.list_composition_proposals(session_uuid)
++    assert len(result.tool_outcomes) == 1
++    feedback = result.tool_outcomes[0].response
++    assert isinstance(feedback, ToolResult)
++    if override:
++        assert proposals == []
++        assert not feedback.success
++        assert feedback.validation.errors[0].error_code == "queue_config_invalid"
++        assert feedback.validation.errors[0].rejected_component == "node:inbound"
++    else:
++        assert len(proposals) == 1 and proposals[0].status == "pending"
++        assert proposals[0].tool_name == "upsert_node"
++        assert proposals[0].arguments_json["description"] == "Changed queue description"
++    current = await sessions.get_current_state(session_uuid)
++    assert current is not None and current.id == saved.id
++    assert private_snapshot(state_from_record(current)) == before
++    assert private_snapshot(state) == before
++    assert result.tool_outcomes[0].post_version == state.version
++    with sessions._engine.connect() as conn:
++        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 1
+diff --git a/tests/unit/composer_mcp/test_queue_scope_admission.py b/tests/unit/composer_mcp/test_queue_scope_admission.py
+new file mode 100644
+index 000000000..45d30ae90
+--- /dev/null
++++ b/tests/unit/composer_mcp/test_queue_scope_admission.py
+@@ -0,0 +1,130 @@
++"""SDK queue refusals preserve private working state and durable checkout."""
++
++from __future__ import annotations
++
++import json
++from copy import deepcopy
++from pathlib import Path
++from typing import Any
++
++import pytest
++
++from elspeth.composer_mcp import server as server_module
++from elspeth.composer_mcp.session import SessionManager
++from elspeth.contracts.composer_audit import ComposerToolStatus
++from elspeth.web.dependencies import create_catalog_service
++from tests.unit.composer_mcp.test_call_tool_audit import _call_handler, _ProbeRecorder
++from tests.unit.web.composer.test_queue_scope_admission import (
++    MALFORMED_SCOPE_CASES,
++    QUEUE,
++    SCOPE_CASES,
++    private_snapshot,
++    scope_message,
++)
++
++
++@pytest.mark.asyncio
++async def test_sdk_scope_refusals_preserve_private_state_checkout_and_saved_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    probe = _ProbeRecorder()
++    server = server_module.create_server(
++        create_catalog_service(),
++        tmp_path,
++        recorder=probe,
++        runtime_preflight=None,
++        runtime_preflight_settings_hash=None,
++    )
++    observed = []
++    real_dispatch = server_module._dispatch_tool
++
++    def observe(name: str, arguments: dict[str, Any], state: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
++        before = private_snapshot(state)
++        checkout = kwargs["session_checkout_ref"][0]
++        result = real_dispatch(name, arguments, state, *args, **kwargs)
++        observed.append((name, before, checkout, deepcopy(result)))
++        return result
++
++    monkeypatch.setattr(server_module, "_dispatch_tool", observe)
++
++    async def call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
++        count = len(probe.invocations)
++        response = await _call_handler(server.request_handlers, name, arguments)
++        assert len(probe.invocations) == count + 1
++        assert not response.root.isError
++        return json.loads(response.root.content[0].text)
++
++    created = await call("new_session", {"name": "Private queue"})
++    session_id = created["data"]["session_id"]
++    canonical = await call("upsert_node", {**QUEUE, "description": "Saved queue"})
++    assert canonical["success"]
++    assert (await call("save_session", {"session_id": session_id}))["success"]
++    manager = SessionManager(tmp_path)
++    saved = manager.checkout(session_id)
++    before = private_snapshot(saved.state)
++    path = tmp_path / f"{session_id}.json"
++    saved_bytes = path.read_bytes()
++    saved_stat = path.stat()
++    for override in SCOPE_CASES:
++        result = await call("upsert_node", {**QUEUE, "description": "Must not replace", **override})
++        assert not result["success"]
++        error = result["validation"]["errors"][0]
++        assert (error["component"], error["error_code"], error["rejected_component"]) == (
++            "rejected_mutation",
++            "queue_config_invalid",
++            "node:inbound",
++        )
++        assert error["message"] == scope_message(override)
++        assert result["affected_nodes"] == [] and "validation_delta" not in result
++        assert "applied_component" not in result
++        assert probe.invocations[-1].status == ComposerToolStatus.SUCCESS
++        _, dispatch_before, checkout, private_result = observed[-1]
++        assert dispatch_before == before and checkout == saved
++        assert private_result["state"] == before[0]
++        # The next real call sees the SDK's reconstructed private working state.
++        readback = await call("get_pipeline_state", {})
++        assert readback["success"] and any(node["id"] == "inbound" for node in readback["state"]["nodes"])
++        assert observed[-1][1] == before and observed[-1][2] == saved
++        assert path.read_bytes() == saved_bytes and manager.checkout(session_id) == saved
++        assert (path.stat().st_ino, path.stat().st_mtime_ns) == (saved_stat.st_ino, saved_stat.st_mtime_ns)
++
++    # A distinct canonical edit, explicit save and reload prove checkout authority survives.
++    assert (await call("upsert_node", {**QUEUE, "description": "Explicitly persisted"}))["success"]
++    assert path.read_bytes() == saved_bytes
++    assert (await call("save_session", {"session_id": session_id}))["success"]
++    assert path.read_bytes() != saved_bytes
++    assert (await call("load_session", {"session_id": session_id}))["success"]
++    await call("get_pipeline_state", {})
++    assert observed[-1][1] == private_snapshot(manager.load(session_id))
++    assert manager.load(session_id).nodes[0].description == "Explicitly persisted"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("override", MALFORMED_SCOPE_CASES)
++async def test_sdk_malformed_scope_is_audited_argument_error_before_dispatch(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    override: dict[str, Any],
++) -> None:
++    probe = _ProbeRecorder()
++    server = server_module.create_server(
++        create_catalog_service(),
++        tmp_path,
++        recorder=probe,
++        runtime_preflight=None,
++        runtime_preflight_settings_hash=None,
++    )
++    await _call_handler(server.request_handlers, "new_session", {"name": "Malformed queue"})
++    real_dispatch = server_module._dispatch_tool
++    dispatches = []
++
++    def observe(*args: Any, **kwargs: Any) -> dict[str, Any]:
++        dispatches.append(args[0])
++        return real_dispatch(*args, **kwargs)
++
++    monkeypatch.setattr(server_module, "_dispatch_tool", observe)
++    response = await _call_handler(server.request_handlers, "upsert_node", {**QUEUE, **override})
++    assert response.root.isError is True
++    assert response.root.content[0].text.startswith("Tool error: ")
++    assert len(probe.invocations) == 2 and probe.invocations[-1].status == ComposerToolStatus.ARG_ERROR
++    assert dispatches == []
++    readback = await _call_handler(server.request_handlers, "get_pipeline_state", {})
++    assert json.loads(readback.root.content[0].text)["state"]["nodes"] == []

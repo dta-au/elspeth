@@ -1,0 +1,3 @@
+checking file src/elspeth/composer_mcp/portable_supervisor.py
+checking file tests/helpers/composer_stdio_ownership_probe.py
+checking file tests/unit/composer_mcp/test_standalone_lifecycle.py

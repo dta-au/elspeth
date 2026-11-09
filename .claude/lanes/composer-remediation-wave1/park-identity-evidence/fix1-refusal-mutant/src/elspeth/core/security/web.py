@@ -1,0 +1,657 @@
+"""Web security infrastructure for SSRF prevention and URL validation.
+
+This module provides defense-in-depth against Server-Side Request Forgery (SSRF):
+
+1. **Scheme validation**: Only HTTP/HTTPS allowed (blocks file://, ftp://, etc.)
+2. **IP blocking**: Comprehensive blocklist covering private, loopback, metadata endpoints
+3. **DNS rebinding prevention**: IP pinning via SSRFSafeRequest (resolve once, use that IP)
+
+The key innovation is SSRFSafeRequest + validate_url_for_ssrf() which eliminates
+the TOCTOU (Time-of-Check to Time-of-Use) vulnerability in traditional SSRF defenses:
+
+    # VULNERABLE (old pattern - resolved twice, attacker can return different IPs):
+    # validate then httpx.get(url) → second DNS lookup → 169.254.169.254
+
+    # SECURE (resolved once, IP pinned for connection):
+    safe_request = validate_url_for_ssrf(url)  # Resolves and validates
+    httpx.get(safe_request.connection_url, headers={"Host": safe_request.host_header})
+"""
+
+from __future__ import annotations
+
+import hashlib
+import ipaddress
+import socket
+import threading
+import urllib.parse
+from collections.abc import Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from dataclasses import dataclass
+from ipaddress import IPv4Network, IPv6Network
+from typing import Literal
+
+import httpx
+
+from elspeth.contracts.call_mode import ReplaySSRFRequest
+
+SSRFRefusalKind = Literal[
+    "origin_not_allowed",
+    "malformed_url",
+    "invalid_port",
+    "missing_scheme",
+    "credentials_in_url",
+    "forbidden_scheme",
+    "missing_hostname",
+    "port_zero",
+    "unparseable_ip",
+    "always_blocked_range",
+    "blocked_range",
+    "archived_request_mismatch",
+]
+
+DNSFailureKind = Literal[
+    "dns_failed",
+    "dns_capacity_exhausted",
+    "dns_timeout",
+    "dns_no_addresses",
+]
+
+
+class SSRFBlockedError(Exception):
+    """URL validation failed due to security policy (SSRF prevention).
+
+    ``kind`` names WHICH policy check refused the URL. It is the value-free
+    half of the refusal: the message may name the URL's scheme, host, hash or
+    resolved address (fine where the URL is operator config), but a caller
+    recording a refusal of a ROW's URL records ``kind`` and never the message,
+    because every part of that URL is row data.
+    """
+
+    def __init__(self, message: str, *, kind: SSRFRefusalKind) -> None:
+        super().__init__(message)
+        self.kind: SSRFRefusalKind = kind
+
+
+class NetworkError(Exception):
+    """Network operation failed (DNS, connection, etc.).
+
+    ``kind`` is the value-free classification (see ``SSRFBlockedError``): the
+    message names the host, ``kind`` does not.
+    """
+
+    def __init__(self, message: str, *, kind: DNSFailureKind) -> None:
+        super().__init__(message)
+        self.kind: DNSFailureKind = kind
+
+
+ALLOWED_SCHEMES = {"http", "https"}
+
+# Comprehensive blocklist for SSRF prevention
+# Each range blocks a specific attack vector - do not remove without security review
+BLOCKED_IP_RANGES = [
+    # IPv4 ranges
+    ipaddress.ip_network("0.0.0.0/8"),  # Current network (RFC 1122) - can route to localhost
+    ipaddress.ip_network("127.0.0.0/8"),  # Loopback
+    ipaddress.ip_network("10.0.0.0/8"),  # Private Class A (RFC 1918)
+    ipaddress.ip_network("172.16.0.0/12"),  # Private Class B (RFC 1918)
+    ipaddress.ip_network("192.168.0.0/16"),  # Private Class C (RFC 1918)
+    ipaddress.ip_network("169.254.0.0/16"),  # Link-local (AWS/Azure/GCP metadata endpoints)
+    ipaddress.ip_network("100.64.0.0/10"),  # CGNAT (RFC 6598) - shared ISP space, often internal
+    ipaddress.ip_network("192.0.0.0/24"),  # IETF protocol assignments (RFC 6890) - not public hosts
+    ipaddress.ip_network("198.18.0.0/15"),  # Benchmarking (RFC 2544) - often internal test networks
+    ipaddress.ip_network("240.0.0.0/4"),  # Reserved (RFC 1112) - never a public host
+    # IPv6 ranges
+    ipaddress.ip_network("::1/128"),  # IPv6 loopback
+    ipaddress.ip_network("::/128"),  # IPv6 unspecified - like 0.0.0.0, connects to local listeners
+    ipaddress.ip_network("fc00::/7"),  # IPv6 unique local (RFC 4193) - private
+    ipaddress.ip_network("fe80::/10"),  # IPv6 link-local (RFC 4291) - can reach metadata
+    ipaddress.ip_network("::ffff:0:0/96"),  # IPv4-mapped IPv6 - CRITICAL: bypass vector!
+    # IPv6 prefixes that embed an IPv4 address. Where the network translates
+    # them, they reach whatever IPv4 host they embed, private ranges included.
+    ipaddress.ip_network("::/96"),  # IPv4-compatible IPv6 (RFC 4291, deprecated)
+    ipaddress.ip_network("64:ff9b::/96"),  # NAT64 well-known prefix (RFC 6052)
+    ipaddress.ip_network("64:ff9b:1::/48"),  # NAT64 local-use prefix (RFC 8215)
+    ipaddress.ip_network("2002::/16"),  # 6to4 (RFC 3056)
+]
+
+# Unconditionally blocked — no allowlist can bypass these.
+# Cloud metadata endpoints are the #1 SSRF target (IAM credential exfiltration).
+# Broadcast/multicast are never valid HTTP targets.
+# Recognized IPv4 embeddings are checked against these IPv4 policies before
+# any IPv6 allowlist admission. Explicit private access still permits mapped
+# private addresses. The local-use NAT64 prefix has deployment-specific subnet
+# lengths, so its translated destination cannot be determined from the address
+# alone; the entire prefix is refused even under an explicit allowlist.
+ALWAYS_BLOCKED_RANGES = (
+    ipaddress.ip_network("169.254.0.0/16"),  # IPv4 link-local (AWS/Azure/GCP metadata)
+    ipaddress.ip_network("::ffff:169.254.0.0/112"),  # IPv4-mapped metadata endpoint
+    ipaddress.ip_network("::169.254.0.0/112"),  # IPv4-compatible metadata endpoint
+    ipaddress.ip_network("64:ff9b::169.254.0.0/112"),  # NAT64 metadata endpoint
+    ipaddress.ip_network("2002:a9fe::/32"),  # 6to4 metadata endpoint
+    ipaddress.ip_network("fd00:ec2::254/128"),  # AWS EC2 IPv6 metadata endpoint
+    ipaddress.ip_network("168.63.129.16/32"),  # Azure WireServer / platform endpoint
+    ipaddress.ip_network("64:ff9b:1::/48"),  # Local-use NAT64 translation is deployment-specific
+    ipaddress.ip_network("fe80::/10"),  # IPv6 link-local (same attack surface)
+    ipaddress.ip_network("255.255.255.255/32"),  # IPv4 broadcast
+    ipaddress.ip_network("224.0.0.0/4"),  # IPv4 multicast
+    ipaddress.ip_network("ff00::/8"),  # IPv6 multicast
+)
+
+_LOW32_IPV4_EMBEDDING_PREFIXES = (
+    ipaddress.IPv6Network("::/96"),
+    ipaddress.IPv6Network("64:ff9b::/96"),
+)
+
+# Bounded thread pool for DNS resolution. Caps concurrent getaddrinfo threads
+# and outstanding resolver work so repeated timeouts (e.g. blackholed resolver)
+# cannot exhaust OS threads or accumulate an unbounded executor queue.
+_DNS_POOL_SIZE = 8
+_dns_pool = ThreadPoolExecutor(max_workers=_DNS_POOL_SIZE, thread_name_prefix="dns_resolve")
+_dns_capacity = threading.BoundedSemaphore(_DNS_POOL_SIZE)
+
+
+def _url_sha256(url: str) -> str:
+    """Return a stable diagnostic hash for a user-supplied URL."""
+    return hashlib.sha256(url.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def _safe_url_diagnostic_from_parts(url: str, *, scheme: str, host: str) -> str:
+    return f"scheme={scheme!r}, host={host!r}, url_sha256={_url_sha256(url)}"
+
+
+def _safe_unparsed_scheme_hint(url: str) -> str:
+    if url[:6].lower().startswith("https:"):
+        return "https"
+    if url[:5].lower().startswith("http:"):
+        return "http"
+    return "invalid"
+
+
+def _safe_unparsed_url_diagnostic(url: str) -> str:
+    return _safe_url_diagnostic_from_parts(url, scheme=_safe_unparsed_scheme_hint(url), host="invalid")
+
+
+def _safe_url_diagnostic(url: str, parsed: urllib.parse.ParseResult) -> str:
+    """Return URL diagnostics without userinfo, path, query, fragment, or raw input."""
+    scheme = parsed.scheme.lower() if parsed.scheme else "missing"
+    try:
+        host = parsed.hostname or "unknown"
+    except ValueError:
+        host = "invalid"
+    return _safe_url_diagnostic_from_parts(url, scheme=scheme, host=host)
+
+
+def _parse_url_for_validation(url: str) -> urllib.parse.ParseResult:
+    try:
+        return urllib.parse.urlparse(url)
+    except ValueError:
+        pass
+    raise SSRFBlockedError(f"Malformed URL; {_safe_unparsed_url_diagnostic(url)}.", kind="malformed_url")
+
+
+def _validated_url_hostname(url: str, parsed: urllib.parse.ParseResult) -> str | None:
+    try:
+        hostname = parsed.hostname
+        if hostname is not None and not hostname.isascii():
+            # Resolve the same IDNA hostname HTTPX uses on the wire. Keeping
+            # Unicode here makes Host unencodable and can make the resolver's
+            # IDNA codec select a different name from HTTPX's URL codec.
+            hostname = httpx.URL(scheme=parsed.scheme, host=hostname).raw_host.decode("ascii")
+        return hostname
+    except (ValueError, httpx.InvalidURL):
+        raise SSRFBlockedError(f"Malformed URL; {_safe_url_diagnostic(url, parsed)}.", kind="malformed_url") from None
+
+
+def _validated_url_port(url: str, parsed: urllib.parse.ParseResult) -> int | None:
+    try:
+        return parsed.port
+    except ValueError:
+        pass
+    raise SSRFBlockedError(f"Invalid port in URL; {_safe_url_diagnostic(url, parsed)}.", kind="invalid_port")
+
+
+def validate_url_scheme(url: str) -> None:
+    """Validate URL scheme is in allowlist (http/https only).
+
+    Args:
+        url: URL to validate
+
+    Raises:
+        TypeError: If url is not a string
+        SSRFBlockedError: If scheme is not in allowlist
+    """
+    if type(url) is not str:
+        raise TypeError(f"url must be str, got {type(url).__name__}")
+
+    parsed = _parse_url_for_validation(url)
+    scheme = parsed.scheme.lower()
+    if not scheme:
+        raise SSRFBlockedError(
+            f"URL is missing a scheme (expected 'https://' or 'http://' prefix); "
+            f"{_safe_url_diagnostic(url, parsed)}. Add an explicit 'https://' or 'http://' prefix.",
+            kind="missing_scheme",
+        )
+    if scheme in ALLOWED_SCHEMES:
+        if parsed.username is not None or parsed.password is not None:
+            raise SSRFBlockedError(f"URL credentials are not allowed; {_safe_url_diagnostic(url, parsed)}.", kind="credentials_in_url")
+        return
+    raise SSRFBlockedError(
+        f"Forbidden URL scheme {parsed.scheme!r} — only http and https are allowed; {_safe_url_diagnostic(url, parsed)}.",
+        kind="forbidden_scheme",
+    )
+
+
+def _resolve_hostname(hostname: str) -> list[str]:
+    """Resolve hostname to all IP addresses (IPv4 + IPv6).
+
+    Uses getaddrinfo() instead of gethostbyname() to support IPv6.
+
+    Args:
+        hostname: Hostname to resolve
+
+    Returns:
+        List of unique IP addresses (IPv4 and/or IPv6)
+
+    Raises:
+        NetworkError: If DNS resolution fails or the hostname is not
+            IDNA-encodable (Tier 3: hostname is user-supplied)
+    """
+    try:
+        # AF_UNSPEC = return both IPv4 and IPv6
+        # SOCK_STREAM = TCP (filters out UDP-only results)
+        results = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        # results[i] = (family, type, proto, canonname, sockaddr)
+        # sockaddr = (ip, port) for IPv4 or (ip, port, flow, scope) for IPv6
+        # sockaddr[0] is always the IP address string for both AF_INET and AF_INET6
+        seen: set[str] = set()
+        ips: list[str] = []
+        for r in results:
+            ip = str(r[4][0])
+            if ip not in seen:
+                seen.add(ip)
+                ips.append(ip)
+        return ips
+    except (socket.gaierror, UnicodeError) as e:
+        # socket.gaierror: resolver-level failure (NXDOMAIN, no resolver, etc.).
+        # UnicodeError: getaddrinfo raises this when the user-supplied hostname is
+        # not IDNA-encodable (Tier 3 external input). Both are recoverable external
+        # boundary failures, surfaced as the documented NetworkError — never crashed.
+        raise NetworkError(f"DNS resolution failed: {hostname}: {e}", kind="dns_failed") from e
+
+
+def _submit_dns_resolution(hostname: str) -> Future[list[str]]:
+    """Submit a DNS resolution task only when resolver capacity is available."""
+    capacity = _dns_capacity
+    if not capacity.acquire(blocking=False):
+        raise NetworkError(f"DNS resolution capacity exhausted: {hostname}", kind="dns_capacity_exhausted")
+
+    try:
+        future = _dns_pool.submit(_resolve_hostname, hostname)
+    except BaseException:
+        capacity.release()
+        raise
+
+    future.add_done_callback(lambda _future: capacity.release())
+    return future
+
+
+def _validate_ip_address(
+    ip_str: str,
+    *,
+    allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
+) -> None:
+    """Validate that an IP address is not in any blocked range.
+
+    Three-tier check order:
+    1. ALWAYS_BLOCKED_RANGES — unconditional, no allowlist bypass
+    2. allowed_ranges — if IP matches, skip blocklist (early return)
+    3. BLOCKED_IP_RANGES — standard blocklist
+
+    Args:
+        ip_str: IP address string (IPv4 or IPv6)
+        allowed_ranges: IP networks that bypass the standard blocklist.
+            Does NOT bypass ALWAYS_BLOCKED_RANGES.
+
+    Raises:
+        SSRFBlockedError: If IP is blocked or unparseable (fail-closed)
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError as e:
+        # Fail CLOSED: if we can't parse the IP (e.g. zone-scoped IPv6 like
+        # "fe80::1%eth0"), block the request rather than allowing it through.
+        raise SSRFBlockedError(f"Unparseable IP address: {ip_str!r}: {e}", kind="unparseable_ip") from e
+
+    # 1. Always-blocked — unconditional, including the actual IPv4 destination
+    # behind a recognized IPv6 translation or mapping.
+    candidates: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, ...] = (ip,)
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded = ip.ipv4_mapped
+        if embedded is None:
+            embedded = ip.sixtofour
+        if embedded is None and any(ip in prefix for prefix in _LOW32_IPV4_EMBEDDING_PREFIXES):
+            embedded = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        if embedded is not None:
+            candidates = (ip, embedded)
+    for never_allow in ALWAYS_BLOCKED_RANGES:
+        if any(candidate in never_allow for candidate in candidates):
+            raise SSRFBlockedError(f"Always-blocked IP range: {ip_str} in {never_allow}", kind="always_blocked_range")
+
+    # 2. Allowlist — if IP matches an allowed range, skip blocklist
+    # Note: cross-family checks (e.g. IPv6 in IPv4 network) return False
+    # in CPython 3.7+ — no TypeError to catch.
+    for allowed in allowed_ranges:
+        if ip in allowed:
+            return
+
+    # 3. Standard blocklist
+    for blocked in BLOCKED_IP_RANGES:
+        if ip in blocked:
+            raise SSRFBlockedError(f"Blocked IP range: {ip_str} in {blocked}", kind="blocked_range")
+
+
+def validate_literal_ip_for_ssrf(
+    host: str,
+    *,
+    allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
+) -> None:
+    """Validate a literal IP hostname against the SSRF blocklist.
+
+    Hostnames that are not literal IP addresses are ignored. This is for
+    config-time validation where DNS must not be resolved as a side effect;
+    request-time validation still goes through ``validate_url_for_ssrf()``.
+    """
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return
+    _validate_ip_address(host, allowed_ranges=allowed_ranges)
+
+
+def validate_configured_url_for_ssrf(
+    url: str,
+    *,
+    allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
+) -> None:
+    """Validate a fixed HTTP(S) URL without causing DNS traffic at config time.
+
+    Runtime dispatch still calls ``validate_url_for_ssrf`` to resolve and pin
+    the destination IP immediately before connecting.
+    """
+    validate_url_scheme(url)
+    parsed = _parse_url_for_validation(url)
+    hostname = _validated_url_hostname(url, parsed)
+    if not hostname:
+        raise SSRFBlockedError("URL has no hostname", kind="missing_hostname")
+    port = _validated_url_port(url, parsed)
+    if port == 0:
+        raise SSRFBlockedError("Port 0 is not allowed", kind="port_zero")
+    validate_literal_ip_for_ssrf(hostname, allowed_ranges=allowed_ranges)
+
+
+HTTPOrigin = tuple[str, str, int]
+
+
+def parse_http_origin(origin: str) -> HTTPOrigin:
+    """Parse a configured exact HTTP origin without resolving its hostname."""
+    if any(ord(char) < 33 or char == "\\" for char in origin):
+        raise ValueError("allowed_origins entries must not contain whitespace or backslashes")
+    try:
+        validate_url_scheme(origin)
+        parsed = _parse_url_for_validation(origin)
+        hostname = _validated_url_hostname(origin, parsed)
+        port = _validated_url_port(origin, parsed)
+    except (SSRFBlockedError, TypeError) as exc:
+        raise ValueError("allowed_origins entries must be HTTP(S) origins") from exc
+    if (
+        hostname is None
+        or port == 0
+        or "%" in parsed.netloc
+        or "?" in origin
+        or "#" in origin
+        or parsed.path not in ("", "/")
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("allowed_origins entries must contain only scheme, hostname, and optional port")
+    return parsed.scheme.lower(), hostname.lower(), port or (443 if parsed.scheme.lower() == "https" else 80)
+
+
+def validate_allowed_http_origin(url: str, allowed_origins: Sequence[HTTPOrigin]) -> None:
+    """Refuse an unapproved destination before DNS or replay evidence is read."""
+    if not allowed_origins:
+        return
+    if any(ord(char) < 32 or char == "\\" for char in url):
+        raise SSRFBlockedError("URL contains an ambiguous HTTP origin", kind="origin_not_allowed")
+    validate_url_scheme(url)
+    parsed = _parse_url_for_validation(url)
+    hostname = _validated_url_hostname(url, parsed)
+    port = _validated_url_port(url, parsed)
+    if hostname is None or port == 0 or "%" in parsed.netloc:
+        raise SSRFBlockedError("URL has no valid HTTP origin", kind="origin_not_allowed")
+    origin = parsed.scheme.lower(), hostname.lower(), port or (443 if parsed.scheme.lower() == "https" else 80)
+    if origin not in allowed_origins:
+        raise SSRFBlockedError("HTTP origin is not allowed", kind="origin_not_allowed")
+
+
+@dataclass(frozen=True, slots=True)
+class SSRFSafeRequest:
+    """Request with pre-validated IP to prevent DNS rebinding attacks.
+
+    This dataclass captures everything needed to make a request to a specific
+    IP address while preserving the original hostname for Host header and TLS SNI.
+
+    The key insight is that we resolve DNS once, validate the IP, then force the
+    HTTP client to connect to that exact IP by rewriting the URL. The Host header
+    ensures virtual hosting works, and SNI ensures TLS certificate verification.
+
+    Attributes:
+        original_url: The URL as provided by the user
+        resolved_ip: The validated IP address we will connect to
+        host_header: HTTP Host header value — includes port for non-default ports
+            (e.g. "example.com:8443" for https on port 8443)
+        port: Port number (explicit or default based on scheme)
+        path: URL path including query string
+        scheme: "http" or "https"
+        bare_hostname: Bare hostname without port, for TLS SNI
+
+    Example:
+        safe_request = validate_url_for_ssrf("https://example.com:8443/path?q=1")
+        # safe_request.connection_url = "https://93.184.216.34:8443/path?q=1"
+        # safe_request.host_header = "example.com:8443"
+        # safe_request.sni_hostname = "example.com"
+    """
+
+    original_url: str
+    resolved_ip: str
+    host_header: str
+    port: int
+    path: str
+    scheme: str
+    bare_hostname: str
+
+    @property
+    def connection_url(self) -> str:
+        """URL with hostname replaced by resolved IP for direct connection.
+
+        For IPv6 addresses, brackets are added per RFC 2732.
+        """
+        # IPv6 addresses need brackets in URLs
+        ip_for_url = f"[{self.resolved_ip}]" if ":" in self.resolved_ip else self.resolved_ip
+        return f"{self.scheme}://{ip_for_url}:{self.port}{self.path}"
+
+    @property
+    def sni_hostname(self) -> str:
+        """Hostname for TLS SNI (Server Name Indication).
+
+        Always the bare hostname without port — TLS SNI must not include port.
+        """
+        return self.bare_hostname
+
+
+def validate_url_for_ssrf(
+    url: str,
+    timeout: float = 5.0,
+    *,
+    allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
+) -> SSRFSafeRequest:
+    """Validate URL and return request with pinned IP for SSRF-safe connection.
+
+    This is the primary entry point for SSRF-safe HTTP requests. It:
+    1. Validates the URL scheme (http/https only)
+    2. Resolves DNS with timeout
+    3. Validates ALL resolved IPs against blocklist
+    4. Returns SSRFSafeRequest with pinned IP
+
+    The returned SSRFSafeRequest should be used with get_ssrf_safe() or similar
+    methods that connect directly to the resolved IP.
+
+    Args:
+        url: URL to validate and prepare for fetching
+        timeout: DNS resolution timeout in seconds
+        allowed_ranges: Additional IP ranges to permit (e.g. RFC1918 for
+            internal services). These bypass the default blocklist check.
+
+    Returns:
+        SSRFSafeRequest ready for secure fetching
+
+    Raises:
+        SSRFBlockedError: If scheme is forbidden or IP is blocked
+        NetworkError: If DNS resolution fails or times out
+    """
+    # Step 1: Validate scheme
+    validate_url_scheme(url)
+
+    # Step 2: Parse URL components
+    parsed = _parse_url_for_validation(url)
+    hostname = _validated_url_hostname(url, parsed)
+    if not hostname:
+        raise SSRFBlockedError("URL has no hostname", kind="missing_hostname")
+
+    # Determine port (explicit or default)
+    # parsed.port can raise ValueError for out-of-range ports (e.g. 99999).
+    # Port 0 is falsy but must be explicitly rejected (not a valid HTTP port).
+    explicit_port = _validated_url_port(url, parsed)
+
+    if explicit_port is not None:
+        if explicit_port == 0:
+            raise SSRFBlockedError("Port 0 is not allowed", kind="port_zero")
+        port = explicit_port
+    else:
+        port = 443 if parsed.scheme.lower() == "https" else 80
+
+    # Build path (including query string and fragment)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    if parsed.fragment:
+        path = f"{path}#{parsed.fragment}"
+
+    # Step 3: Resolve DNS with timeout via bounded thread pool and a bounded
+    # outstanding-task semaphore.
+    # Using a shared ThreadPoolExecutor (max _DNS_POOL_SIZE workers) instead
+    # of spawning one daemon thread per call.  Under repeated timeouts (e.g.
+    # blackholed DNS resolver), at most _DNS_POOL_SIZE threads are blocked in
+    # getaddrinfo, and additional requests fail fast instead of accumulating in
+    # the executor's unbounded internal queue.
+    #
+    # Future.result(timeout=) re-raises the worker's exception with its original
+    # type, so SSRFBlockedError / NetworkError propagate unchanged and any other
+    # exception (a bug in our own resolver code) crashes rather than being
+    # laundered into NetworkError. On timeout we try to cancel the future; if it
+    # is already running, the capacity slot is released by the completion
+    # callback when the resolver eventually returns.
+    future = _submit_dns_resolution(hostname)
+    try:
+        ip_list = future.result(timeout=timeout)
+    except FutureTimeoutError as exc:
+        future.cancel()
+        raise NetworkError(f"DNS resolution timeout ({timeout}s): {hostname}", kind="dns_timeout") from exc
+
+    if not ip_list:
+        raise NetworkError(f"DNS resolution returned no addresses: {hostname}", kind="dns_no_addresses")
+
+    # Step 4: Validate ALL resolved IPs
+    # Attacker could return a mix of safe and unsafe IPs - block if ANY is unsafe
+    for ip_str in ip_list:
+        _validate_ip_address(ip_str, allowed_ranges=allowed_ranges)
+
+    # Select IP to use (prefer IPv4 for compatibility)
+    ipv4_addrs = [ip for ip in ip_list if ":" not in ip]
+    selected_ip = ipv4_addrs[0] if ipv4_addrs else ip_list[0]
+
+    # Host header must include port for non-default ports (RFC 7230 §5.4).
+    # SNI hostname is always bare (no port) — TLS SNI is hostname-only.
+    scheme_lower = parsed.scheme.lower()
+    default_port = 443 if scheme_lower == "https" else 80
+    # IPv6 literals must be bracketed in the authority / Host header (RFC 3986
+    # §3.2.2, RFC 7230 §5.4); parsed.hostname strips the brackets, so re-add them
+    # for IPv6 (detected by ':') or a non-default port would yield an ambiguous
+    # Host like 2606:...:8080. (elspeth-7144494104)
+    host_for_header = f"[{hostname}]" if ":" in hostname else hostname
+    host_header = f"{host_for_header}:{port}" if port != default_port else host_for_header
+
+    return SSRFSafeRequest(
+        original_url=url,
+        resolved_ip=selected_ip,
+        host_header=host_header,
+        port=port,
+        path=path,
+        scheme=scheme_lower,
+        bare_hostname=hostname,
+    )
+
+
+def validate_archived_ssrf_request(
+    url: str,
+    archived: ReplaySSRFRequest,
+    *,
+    allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
+) -> SSRFSafeRequest:
+    """Revalidate an archived DNS pin without resolving the hostname again.
+
+    Replay may use only the address recorded for the exact original URL. This
+    checks every URL component and applies the *current* IP policy to the
+    archived address, so a forged or newly forbidden pin cannot bypass SSRF
+    admission. No resolver or network client is invoked here.
+    """
+    validate_url_scheme(url)
+    parsed = _parse_url_for_validation(url)
+    hostname = _validated_url_hostname(url, parsed)
+    if not hostname:
+        raise SSRFBlockedError("URL has no hostname", kind="missing_hostname")
+    explicit_port = _validated_url_port(url, parsed)
+    if explicit_port == 0:
+        raise SSRFBlockedError("Port 0 is not allowed", kind="port_zero")
+    port = explicit_port if explicit_port is not None else (443 if parsed.scheme.lower() == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    if parsed.fragment:
+        path = f"{path}#{parsed.fragment}"
+    scheme = parsed.scheme.lower()
+    default_port = 443 if scheme == "https" else 80
+    host_for_header = f"[{hostname}]" if ":" in hostname else hostname
+    host_header = f"{host_for_header}:{port}" if port != default_port else host_for_header
+
+    if (
+        archived.original_url != url
+        or archived.host_header != host_header
+        or archived.port != port
+        or archived.path != path
+        or archived.scheme != scheme
+        or archived.bare_hostname != hostname
+    ):
+        raise SSRFBlockedError("Archived SSRF request does not match the current URL", kind="archived_request_mismatch")
+    _validate_ip_address(archived.resolved_ip, allowed_ranges=allowed_ranges)
+    return SSRFSafeRequest(
+        original_url=url,
+        resolved_ip=archived.resolved_ip,
+        host_header=host_header,
+        port=port,
+        path=path,
+        scheme=scheme,
+        bare_hostname=hostname,
+    )

@@ -1,0 +1,1822 @@
+{
+  "source": "d1-backend-issues.json",
+  "original_stage_exit": 1,
+  "counts": {
+    "runtime-cache-or-cli": 140,
+    "runtime-chroma-cache": 52,
+    "composer-fixtures": 6,
+    "reviewed-bindings": 81,
+    "local-gateway-fixtures": 3,
+    "runtime-browser-dependencies": 18
+  },
+  "dispositions": {
+    "runtime-cache-or-cli": "Focused static dependency run exit 0: 118 passed, 23 existing Terraform-dependent skips; no Terraform binary qualification.",
+    "runtime-chroma-cache": "Complete five-module real ONNX retry exit 0: 171 passed; full tracked freeze healthy.",
+    "runtime-browser-dependencies": "Complete two-module real Caddy/Chromium run exit 0: 18 passed; full tracked freeze healthy.",
+    "reviewed-bindings": "Sol repair in progress; Astra review pending.",
+    "composer-fixtures": "Sol repair in progress; Astra review pending.",
+    "local-gateway-fixtures": "Base and candidate reproduce old failures; focused fixture repair in progress; Astra review pending."
+  },
+  "issues": [
+    {
+      "kind": "failure",
+      "classname": "tests.e2e.examples.test_shipped_examples.TestShippedExamples",
+      "name": "test_multi_worker_showcase_stats_use_completed_terminal_outcomes",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_all_ecr_repository_inputs_enforce_the_same_aws_contract",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_ecr_repository_validation_matches_aws_name_contract[maximum-length]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_ecr_repository_validation_matches_aws_name_contract[over-maximum-length]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_ecr_repository_validation_matches_aws_name_contract[valid-segments]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_ecr_repository_validation_matches_aws_name_contract[trailing-slash]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_ecr_repository_validation_matches_aws_name_contract[empty-path-segment]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_ecr_repository_validation_matches_aws_name_contract[consecutive-dot]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_ecr_repository_validation_matches_aws_name_contract[mixed-separators]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_ecr_repository_validation_matches_aws_name_contract[uppercase]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_backend_state_bucket_validation_enforces_s3_length_limit[maximum-length]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_backend_state_bucket_validation_enforces_s3_length_limit[over-maximum-length]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_backend_state_bucket_validation_enforces_s3_length_limit[adjacent-periods]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_backend_state_bucket_validation_enforces_s3_length_limit[access-point-alias-suffix]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_backend_state_bucket_validation_enforces_s3_length_limit[object-lambda-alias-suffix]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_backend_state_bucket_validation_enforces_s3_length_limit[multi-region-access-point-suffix]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_backend_state_bucket_validation_enforces_s3_length_limit[directory-bucket-suffix]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_backend_state_bucket_validation_enforces_s3_length_limit[table-bucket-suffix]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_scenario_a_https_ingress_is_explicit_and_never_world_open",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_alb_ingress_guard_rejects_every_spelling_of_a_world_open_cidr",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_service_enable_command_pins_the_validated_task_revision",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_database_names_are_safe_and_distinct_before_resource_creation",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_database_bootstrap_waits_for_network_and_execution_role_policies",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_database_bootstrap_admits_full_run_task_json_before_using_the_task_arn",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_ecs_identity_wrapper_delegates_to_the_strict_metadata_boundary",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_container_insights_performance_log_group_is_terraform_owned",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_container_insights_adoption_guidance_requires_a_replacement_plan",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_installer_secret_reads_are_bound_to_the_three_exact_run_namespaces",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_live_composer_generation_is_not_a_cold_install_gate",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_package_contains_only_the_supported_source_and_operator_inputs",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_scenario_web_plugin_allowlist_exposes_textract_to_composer",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_scenario_allowlist_keeps_the_s3_source_authorization_the_web_surface_declines",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_web_plugin_policy_is_operator_configurable",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_default_plugin_preferences_select_the_acceptance_llm_transform",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_bedrock_invoke_grant_is_backend_gated_and_follows_the_configured_llm_profiles",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_guardrail_content_policies_are_rendered_from_variables",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_inconsistent_web_policy_fails_at_plan_not_at_startup",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_terraform_web_policy_validation_matches_the_closed_runtime_contract",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_terraform_and_provider_versions_are_current_and_locked",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_scenario_backends_are_partial_locked_encrypted_and_isolated",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_ownership_tags_are_mandatory_and_propagated_by_every_scenario",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_database_topology_is_aurora_with_separate_databases_and_roles",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_read_only_root_filesystem_matches_the_container_contract",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_gateway_sidecar_supplies_every_required_runtime_environment_name",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_database_bootstrap_uses_the_image_trust_verifier",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_bedrock_composer_uses_the_task_role_without_static_credentials",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_cross_region_bedrock_profile_gets_wildcard_region_foundation_model_grant",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_every_effective_llm_profile_derives_region_aware_exact_bedrock_resources",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_task_role_can_list_the_acceptance_bucket_so_head_object_can_report_missing",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_versioned_textract_inputs_are_allowed_by_task_role_boundary_and_operator_guidance",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_composer_boot_probe_exercises_primary_and_advisor_models",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_cloudwatch_agent_health_probe_checks_the_bounded_loopback_otlp_listener",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_every_image_is_proven_before_any_credentialed_task_definition",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_application_image_contract_is_baked_verified_and_admitted",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_candidate_image_admission_rejects_missing_or_wrong_config_contract[]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_candidate_image_admission_rejects_missing_or_wrong_config_contract[elspeth.aws-ecs.runtime.v0]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_candidate_image_admission_rejects_each_divergence[overrides0-candidate_image_architecture_mismatch]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_candidate_image_admission_rejects_each_divergence[overrides1-candidate_image_scan_unavailable]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_candidate_image_admission_rejects_each_divergence[overrides2-candidate_image_scan_unavailable]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_candidate_image_admission_rejects_each_divergence[overrides3-candidate_image_scan_unavailable]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_candidate_image_admission_rejects_each_divergence[overrides4-candidate_image_revision_mismatch]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_candidate_image_admission_happy_path_passes",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_rollback_image_admission_rejects_each_divergence[overrides0-rollback_image_config_contract_mismatch]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_rollback_image_admission_rejects_each_divergence[overrides1-rollback_image_revision_mismatch]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_rollback_image_admission_happy_path_passes",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_cloudwatch_agent_image_admission_rejects_wrong_revision",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_cloudwatch_agent_image_admission_happy_path_passes",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_gateway_image_admission_rejects_each_identity_divergence[overrides0-gateway_image_revision_mismatch]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_gateway_image_admission_rejects_each_identity_divergence[overrides1-gateway_image_runtime_identity_mismatch]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_gateway_image_admission_rejects_each_identity_divergence[overrides2-gateway_image_contract_major_mismatch]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_gateway_image_admission_rejects_each_identity_divergence[overrides3-gateway_image_adapter_name_mismatch]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_gateway_image_admission_rejects_each_identity_divergence[overrides4-gateway_image_adapter_version_mismatch]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_gateway_image_admission_rejects_each_identity_divergence[overrides5-gateway_image_adapter_api_major_mismatch]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_gateway_image_admission_rejects_each_identity_divergence[overrides6-gateway_image_adapter_fingerprint_mismatch]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_gateway_image_admission_rejects_each_identity_divergence[overrides7-gateway_image_architecture_mismatch]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_gateway_image_admission_rejects_each_identity_divergence[overrides8-gateway_image_scan_unavailable]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_gateway_image_admission_rejects_each_identity_divergence[overrides9-gateway_image_scan_unavailable]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_gateway_image_admission_rejects_each_identity_divergence[overrides10-gateway_image_scan_unavailable]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_gateway_image_admission_happy_path_passes",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_selector_bearing_task_definitions_depend_on_gateway_provenance",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_repository_regexes_escape_dots_before_interpolation",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_image_provenance_isolates_docker_credentials_from_the_operator_default",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_image_provenance_binds_every_check_to_the_selected_target_platform",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_scenario_c_gateway_image_is_proven_and_bedrock_runtime_authority_is_absent",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_database_password_rotation_reexecutes_the_database_bootstrap",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_upgrade_command_selects_the_newly_registered_task_definition",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_source_free_cold_install_runs_the_full_post_enable_acceptance",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_candidate_image_handoff_copies_the_authenticated_ghcr_index_into_bootstrap_ecr",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_candidate_image_handoff_subshell_fails_before_emitting_an_unverified_reference",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_candidate_image_handoff_proves_exact_selected_platform_child_digest",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_service_rollout_proof_binds_primary_task_and_platform_digest",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_teardown_drains_each_applied_service_before_destroy",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_fresh_machine_pulls_the_candidate_before_local_inspection",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_private_candidate_pulls_use_isolated_ecr_credentials_for_registry_commands",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_inventory_v9_exactly_matches_the_runtime_validator_contract",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_inventory_schema_consumers_pin_the_producer_version",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_scenario_a_codeblind_inputs_have_no_acceptance_coordinator_dependencies",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_installer_customer_managed_policy_documents_stay_within_iam_size_limit",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_installer_named_bucket_permissions_use_exact_s3_iam_actions",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_installer_policy_grants_only_run_tagged_guardrail_and_event_rule_updates",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_installer_policy_splits_ecs_tag_drift_by_available_condition_context",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_installer_policy_lists_tasks_through_run_cluster_container_instances",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_installer_policy_executes_only_in_run_scenario_web_containers",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_installer_policy_grants_exact_run_tagged_cognito_child_update_path",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_installer_policy_covers_pinned_provider_update_calls_without_lifecycle_widening",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_installer_policy_is_renderable_scoped_and_boundary_enforced",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_installer_discovery_and_named_mutations_use_exact_scenario_resources",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_iam_lifecycle_policy_and_provider_cannot_mutate_or_activate_role_permissions",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_scenario_a_native_mock_plans_use_only_documented_minimal_inputs",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_iam_role_contract_drift_replaces_roles_and_dependent_policies",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_iam_role_replacement_trigger_binds_the_complete_role_contract",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_scenario_c_native_mock_plans_enforce_the_gateway_contract",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_networking_has_long_request_support_and_correct_listener_target",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_scenario_a_and_c_are_cold_installs_while_b_owns_the_oidc_upgrade_surface",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_monitoring_resources_use_a_retained_digest_pinned_collector",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_cloudwatch_agent_sidecar_exactly_matches_runtime_admission_constants",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_cold_install_pauses_service_until_two_stage_doctor_and_explicit_enable",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_schema_init_and_runtime_doctors_have_separate_credentials_and_commands",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_acceptance_verifier_containers_use_the_live_published_identity",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_upgrade_cognito_subject_binds_after_pool_creation_not_before",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_scenario_b_reuses_the_single_bootstrap_run_identity",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_explicit_aws_profile_is_bound_across_provider_backend_and_local_cli",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_cold_install_runbook_does_not_re_derive_the_namespace",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_certificate_limit_and_code_blind_outputs_are_explicit",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_examples_and_policy_are_parseable_and_contain_no_local_or_account_data",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_source_enumeration_sees_uncommitted_files_but_not_operator_inputs",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_dashboard_metrics_preserve_one_row_per_metric",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_composer_job_defaults_and_real_transport_mirror_are_retained",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_durable_composer_job_budget_executes_independently_of_socket_ceiling[1200-True]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_durable_composer_job_budget_executes_independently_of_socket_ceiling[0-False]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_durable_composer_job_budget_executes_independently_of_socket_ceiling[-1-False]",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_readme_states_the_gateway_per_call_bound_the_module_ships",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_composer_candidate_reasoning_effort_is_pinned_to_the_measured_value",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_every_shipped_web_environment_name_is_a_real_websettings_field",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_documented_minimum_image_revision_is_the_true_settings_floor",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_scenario_allowlist_authorizes_the_llm_source_like_every_other_llm_plugin",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_scenario_allowlist_authorizes_the_document_sink_alongside_the_text_sink",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_scenario_allowlist_authorizes_the_remedies_the_sinks_name",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_always_authorized_web_core_mirror_matches_the_locals_set",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "error",
+      "classname": "tests.unit.deployment.test_aws_ecs_terraform_package",
+      "name": "test_terraform_web_core_matches_the_python_required_set",
+      "group": "runtime-cache-or-cli"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestChromaSearchProvider",
+      "name": "test_search_returns_retrieval_chunks",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestChromaSearchProvider",
+      "name": "test_results_sorted_by_descending_score",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestChromaSearchProvider",
+      "name": "test_min_score_filtering",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestChromaSearchProvider",
+      "name": "test_top_k_limits_results",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestChromaSearchProvider",
+      "name": "test_source_id_matches_document_id",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestChromaSearchProvider",
+      "name": "test_metadata_preserved",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestChromaSearchProvider",
+      "name": "test_distance_function_mismatch_raises",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestChromaSearchProvider",
+      "name": "test_fewer_docs_than_top_k",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestChromaSearchProvider",
+      "name": "test_search_records_call",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestChromaScoreNormalization",
+      "name": "test_cosine_scores_in_unit_range",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestChromaScoreNormalization",
+      "name": "test_l2_scores_in_unit_range",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestChromaScoreNormalization",
+      "name": "test_ip_scores_in_unit_range",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestCallTypeCorrectness",
+      "name": "test_audit_call_uses_vector_call_type",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestTier3ResultBoundary",
+      "name": "test_malformed_results_raises_retrieval_error",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestTier3ResultBoundary",
+      "name": "test_non_mapping_metadata_raises_retrieval_error",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestTier3ResultBoundary",
+      "name": "test_none_inner_list_raises_retrieval_error",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestTier3ResultBoundary",
+      "name": "test_none_distances_raises_retrieval_error",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestTier3ResultBoundary",
+      "name": "test_query_parallel_arrays_ids_and_metadata_require_exact_shapes[results0]",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestTier3ResultBoundary",
+      "name": "test_query_parallel_arrays_ids_and_metadata_require_exact_shapes[results1]",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestTier3ResultBoundary",
+      "name": "test_query_parallel_arrays_ids_and_metadata_require_exact_shapes[results2]",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestTier3ResultBoundary",
+      "name": "test_query_parallel_arrays_ids_and_metadata_require_exact_shapes[results3]",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestTier3ResultBoundary",
+      "name": "test_query_parallel_arrays_ids_and_metadata_require_exact_shapes[results4]",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestDistanceTypeValidation",
+      "name": "test_non_numeric_distance_crashes_on_corrupt_index[0.5-string]",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestDistanceTypeValidation",
+      "name": "test_non_numeric_distance_crashes_on_corrupt_index[True-bool_true]",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestDistanceTypeValidation",
+      "name": "test_non_numeric_distance_crashes_on_corrupt_index[False-bool_false]",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestDistanceTypeValidation",
+      "name": "test_non_numeric_distance_crashes_on_corrupt_index[bad_distance3-list]",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestDistanceTypeValidation",
+      "name": "test_non_numeric_distance_crashes_on_corrupt_index[bad_distance4-dict]",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestPostQueryFailureAudit",
+      "name": "test_malformed_response_records_error_call",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestPostQueryFailureAudit",
+      "name": "test_non_numeric_distance_records_error_call",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestPostQueryFailureAudit",
+      "name": "test_nan_distance_records_error_call",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestPostQueryFailureAudit",
+      "name": "test_none_documents_records_error_call",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestPostQueryFailureAudit",
+      "name": "test_length_mismatch_records_error_call",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestPostQueryFailureAudit",
+      "name": "test_non_serializable_metadata_records_error_call",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestPostQueryFailureAudit",
+      "name": "test_falsy_non_mapping_metadata_records_error_call[0]",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestPostQueryFailureAudit",
+      "name": "test_falsy_non_mapping_metadata_records_error_call[metadata1]",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestDocTypeValidation",
+      "name": "test_non_string_doc_skipped",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestDocTypeValidation",
+      "name": "test_successful_search_clears_previous_skip_reasons",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestChromaSearchProviderReadiness",
+      "name": "test_collection_with_documents_is_ready",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestNegativeL2DistanceBoundary",
+      "name": "test_negative_l2_distance_is_audited_retrieval_error[-1]",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestNegativeL2DistanceBoundary",
+      "name": "test_negative_l2_distance_is_audited_retrieval_error[-0.5]",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestChromaCallMode",
+      "name": "test_verify_readiness_records_and_compares_collection_count",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.plugins.infrastructure.clients.retrieval.test_chroma.TestChromaCallMode",
+      "name": "test_verify_compares_retained_ordered_chunks",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.web.composer.test_compose_loop_persistence",
+      "name": "test_explicit_approval_batch_preflights_proposal_cap_before_creation[11]",
+      "group": "composer-fixtures"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.web.composer.test_compose_loop_persistence",
+      "name": "test_proposal_attempt_cap_rejects_mixed_schema_and_semantic_invalid_calls_before_dispatch",
+      "group": "composer-fixtures"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.web.composer.test_compose_loop_persistence",
+      "name": "test_proposal_attempt_cap_includes_approval_required_blob_only_mutation",
+      "group": "composer-fixtures"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.web.composer.test_endpoint_affordance",
+      "name": "test_call_llm_omits_endpoint_kwargs_when_unset",
+      "group": "composer-fixtures"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.web.composer.test_endpoint_affordance",
+      "name": "test_text_llm_omits_endpoint_kwargs_when_unset",
+      "group": "composer-fixtures"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.web.composer.test_service.TestComposerSingleToolCall",
+      "name": "test_explicit_approve_intercepts_update_blob_without_mutating_blob",
+      "group": "composer-fixtures"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_landscape_mutation_fencing",
+      "name": "test_required_work_reserve_admission_on_actual_sources",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_landscape_mutation_fencing",
+      "name": "test_required_work_reserve_rejects_protected_instance_formal_recovery",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_landscape_mutation_fencing",
+      "name": "test_no_mutation_alias_wrapper_dynamic_or_raw_write_escape_exists",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.pipeline.test_rag_indexed_smoke.TestRAGIndexedSmoke",
+      "name": "test_full_pipeline_sequence",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.pipeline.test_rag_indexed_smoke.TestRAGIndexedSmoke",
+      "name": "test_landscape_records_preflight_results",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.pipeline.test_row_type_violation_routing",
+      "name": "test_a_non_str_rag_query_routes_to_the_named_error_sink_without_its_value[field_only]",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.pipeline.test_row_type_violation_routing",
+      "name": "test_a_non_str_rag_query_routes_to_the_named_error_sink_without_its_value[regex]",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.pipeline.test_row_type_violation_routing",
+      "name": "test_a_template_lookup_keyed_by_a_row_value_is_routed_without_that_value",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_landscape_mutation_fencing",
+      "name": "test_required_work_reserve_proposal_namespace_ignores_unrelated_parent_metadata",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_transfer_receipts_identify_exact_actual_four_calls",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_supplier_refuses_deferred_replacement[def corrupt():\\n global private_operation_failure_draft\\n private_operation_failure_draft = foreign\\n]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_supplier_refuses_deferred_replacement[def corrupt():\\n private_operation_failure_draft.__code__ = foreign.__code__\\n]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_supplier_refuses_deferred_replacement[def corrupt():\\n ComposerOperationFailureFacts.__getattribute__ = foreign\\n]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_transfers_refuse_changed_source[authority]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_transfers_refuse_changed_source[binding]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_transfers_refuse_changed_source[callee]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_transfers_refuse_changed_source[task_supplier]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_transfers_refuse_changed_source[join]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_transfers_refuse_changed_source[cancellation]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_transfers_refuse_changed_source[reader_forwarding]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_transfers_refuse_changed_source[capture_failure]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_transfers_refuse_changed_source[outcome_guard]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_transfers_refuse_changed_source[import]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_transfers_refuse_changed_source[dependency_rebound]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_transfers_refuse_changed_source[private_callee]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_transfers_refuse_changed_source[private_argument]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_transfers_refuse_changed_source[private_forwarding]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_failure_transfers_refuse_changed_source[private_nominal_guard]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.web.sessions.test_operation_fence_wiring",
+      "name": "test_fenced_unit_of_work_exposes_only_exact_composed_capabilities",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_reviewed_writer_recipes_match_live_source_and_refuse_recovery_drift[recovery_guard]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_reviewed_writer_recipes_match_live_source_and_refuse_recovery_drift[review_identity_guard]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_reviewed_writer_recipes_match_live_source_and_refuse_recovery_drift[recovery_default]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_reviewed_writer_recipes_match_live_source_and_refuse_recovery_drift[recovery_import]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_reviewed_source_guard_matches_live_source_and_refuses_changed_bytes[src/elspeth/web/sessions/service.py]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_reviewed_source_guard_matches_live_source_and_refuses_changed_bytes[src/elspeth/web/sessions/protocol.py]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_reviewed_source_guard_matches_live_source_and_refuses_changed_bytes[src/elspeth/web/required_work.py]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_reviewed_source_guard_matches_live_source_and_refuses_changed_bytes[src/elspeth/web/coordination/composer_operation_authority.py]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_reviewed_source_guard_matches_live_source_and_refuses_changed_bytes[src/elspeth/web/sessions/composer_operation_errors.py]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_reviewed_source_guard_matches_live_source_and_refuses_changed_bytes[src/elspeth/web/sessions/composer_operations.py]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_previous_source_guard_refuses_current_source[src/elspeth/web/required_work.py-7d04c0cecccc6587da79b83ac8d290769f93fd46b19f06e021912d643592b5d1]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_previous_source_guard_refuses_current_source[src/elspeth/web/sessions/service.py-45f15a607b271ed709248984e4da55d6aaf6dd52f03a2293159d816fa830eca7]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_previous_source_guard_refuses_current_source[src/elspeth/web/sessions/protocol.py-175f6ad59656431748d5472fb7892915a9c247641da6944915b2a5d41d046083]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_previous_source_guard_refuses_current_source[src/elspeth/web/coordination/composer_operation_authority.py-21ce974db2b688f578141feb109a49abb96721deb9b7b1ba27111bbb4f09b66b]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_previous_source_guard_refuses_current_source[src/elspeth/web/sessions/composer_operation_errors.py-990f34740742ced097f6199cf174cfe9e3e79a9071ea3d8102d492bcc89ddc19]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_previous_source_guard_refuses_current_source[src/elspeth/web/sessions/composer_operations.py-895edd79e2c73867f8a22d5d5ed44dc325dcb0a3fba3c484b6a1666492474f01]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_retained_operation_context_cannot_be_replaced_at_dispatch",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_composer_admission_structure_refuses_drift_even_with_rebound_grammar[alter-1-composer retained operation context admission changed]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_composer_admission_structure_refuses_drift_even_with_rebound_grammar[alter-2-composer pair admission guard changed]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_composer_admission_structure_refuses_drift_even_with_rebound_grammar[alter-3-composer owner, service, binding or context admission changed]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_composer_admission_structure_refuses_drift_even_with_rebound_grammar[move-1-composer retained operation context admission changed]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_composer_admission_structure_refuses_drift_even_with_rebound_grammar[move-2-composer pair admission guard changed]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_composer_admission_structure_refuses_drift_even_with_rebound_grammar[move-3-composer owner, service, binding or context admission changed]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_reviewed_turn_grammar_matches_live_source_and_refuses_reserve_drift[foreign_receiver-compose]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_reviewed_turn_grammar_matches_live_source_and_refuses_reserve_drift[changed_ordinal-compose]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_both_composer_dispatch_branches_require_the_retained_authority[receiver-compose]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_both_composer_dispatch_branches_require_the_retained_authority[receiver-compose_recovery]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_both_composer_dispatch_branches_require_the_retained_authority[owner-compose]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_both_composer_dispatch_branches_require_the_retained_authority[owner-compose_recovery]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_both_composer_dispatch_branches_require_the_retained_authority[work-compose]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_both_composer_dispatch_branches_require_the_retained_authority[work-compose_recovery]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_both_composer_dispatch_branches_require_the_retained_authority[context-compose]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_both_composer_dispatch_branches_require_the_retained_authority[context-compose_recovery]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_both_composer_dispatch_branches_require_the_retained_authority[await-compose]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_both_composer_dispatch_branches_require_the_retained_authority[await-compose_recovery]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_both_composer_dispatch_branches_require_the_retained_authority[escape-compose]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_both_composer_dispatch_branches_require_the_retained_authority[escape-compose_recovery]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_recovery_callee_cannot_replace_its_nominal_owner_guard",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[mount]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[mode]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[user]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[custody]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[producer]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[supplier]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[default]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[receiver_escape]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[services_write]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[join]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[join_wait]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[join_await]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[late_join]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[budget]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[deadline]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[refusal_handler]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[refusal_audit]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.architecture.test_web_reserve_reviewed_contracts",
+      "name": "test_guarded_title_interval_refuses_drift_even_with_rebound_grammar[refusal_status]",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.plugins.transforms.test_rag_pipeline.TestRAGPipelineWithChromaProvider",
+      "name": "test_full_retrieval_with_real_chroma",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.plugins.transforms.test_rag_pipeline.TestRAGPipelineWithChromaProvider",
+      "name": "test_zero_results_with_high_min_score",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.plugins.transforms.test_rag_pipeline.TestRAGPipelineWithChromaProvider",
+      "name": "test_metadata_flows_through_to_sources_json",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.plugins.transforms.test_template_worker_loss",
+      "name": "test_a_run_retries_a_row_whose_render_worker_was_lost_and_never_routes_it",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.plugins.transforms.test_template_worker_loss",
+      "name": "test_a_row_goes_to_on_error_only_when_its_retries_are_spent",
+      "group": "runtime-chroma-cache"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.composer.test_composer_against_gateway",
+      "name": "test_composer_text_round_trip_against_gateway",
+      "group": "local-gateway-fixtures"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.composer.test_composer_against_gateway",
+      "name": "test_composer_tool_round_trip_against_gateway",
+      "group": "local-gateway-fixtures"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.composer.test_composer_against_gateway",
+      "name": "test_gateway_internals_never_leak_on_a_real_failure",
+      "group": "local-gateway-fixtures"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.unit.web.sessions.test_static_direct_writers",
+      "name": "test_static_direct_writers_match_reviewed_allowlist",
+      "group": "reviewed-bindings"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_https_acceptance",
+      "name": "test_tls_instrument_requires_body_before_completion[early-frame-positive]",
+      "group": "runtime-browser-dependencies"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_https_acceptance",
+      "name": "test_tls_instrument_requires_body_before_completion[buffered-frame-negative]",
+      "group": "runtime-browser-dependencies"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_https_acceptance",
+      "name": "test_production_operation_survives_tls_disconnect_without_provider_replay[client-detach]",
+      "group": "runtime-browser-dependencies"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_https_acceptance",
+      "name": "test_production_operation_survives_tls_disconnect_without_provider_replay[proxy-idle-cutoff]",
+      "group": "runtime-browser-dependencies"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_https_acceptance",
+      "name": "test_browser_observes_real_tls_progress_before_durable_completion",
+      "group": "runtime-browser-dependencies"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_https_acceptance",
+      "name": "test_deliberate_caddy_buffering_falls_back_to_same_job_get",
+      "group": "runtime-browser-dependencies"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_https_acceptance",
+      "name": "test_production_browser_observer_completes_same_job_over_tls[healthy]",
+      "group": "runtime-browser-dependencies"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_https_acceptance",
+      "name": "test_production_browser_observer_completes_same_job_over_tls[buffered]",
+      "group": "runtime-browser-dependencies"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_https_acceptance",
+      "name": "test_production_browser_observer_completes_same_job_over_tls[idle-cutoff]",
+      "group": "runtime-browser-dependencies"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_https_acceptance",
+      "name": "test_four_live_tls_readers_leave_auth_and_worker_terminal_usable",
+      "group": "runtime-browser-dependencies"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_https_acceptance",
+      "name": "test_eight_tls_readers_bound_real_pool_submissions_and_settle_jobs",
+      "group": "runtime-browser-dependencies"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_https_acceptance",
+      "name": "test_tls_global_cap_control_detects_removed_global_bound",
+      "group": "runtime-browser-dependencies"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_https_acceptance",
+      "name": "test_browser_custody_races_with_real_tls_authority[late-sql-stop]",
+      "group": "runtime-browser-dependencies"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_https_acceptance",
+      "name": "test_browser_custody_races_with_real_tls_authority[two-tabs-reload-stop]",
+      "group": "runtime-browser-dependencies"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_https_acceptance",
+      "name": "test_browser_custody_races_with_real_tls_authority[auth-refresh-stale-terminal]",
+      "group": "runtime-browser-dependencies"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_https_acceptance",
+      "name": "test_browser_custody_races_with_real_tls_authority[malformed-quarantine]",
+      "group": "runtime-browser-dependencies"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_react_generation_acceptance",
+      "name": "test_actual_react_chat_rejects_prior_actor_publication[session-late-terminal]",
+      "group": "runtime-browser-dependencies"
+    },
+    {
+      "kind": "failure",
+      "classname": "tests.integration.web.test_composer_react_generation_acceptance",
+      "name": "test_actual_react_chat_rejects_prior_actor_publication[principal-late-admission]",
+      "group": "runtime-browser-dependencies"
+    }
+  ]
+}

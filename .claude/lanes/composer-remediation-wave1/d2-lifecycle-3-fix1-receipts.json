@@ -1,0 +1,132 @@
+[
+  {
+    "name": "imports",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/bin/python",
+      "-c",
+      "import elspeth,elspeth_lints,sys; print(elspeth.__file__); print(elspeth_lints.__file__); print(sys.version); print(sys.platform)"
+    ],
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src:/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/elspeth-lints/src",
+    "returncode": 0,
+    "elapsed_seconds": 0.11474946099770023
+  },
+  {
+    "name": "before",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/bin/python",
+      "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/freeze_tree.py",
+      "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-fix1-before.json"
+    ],
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src:/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/elspeth-lints/src",
+    "returncode": 0,
+    "elapsed_seconds": 0.7675170739967143
+  },
+  {
+    "name": "pytest",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/bin/python",
+      "-m",
+      "pytest",
+      "tests/unit/composer_mcp/test_standalone_lifecycle.py",
+      "tests/unit/composer_mcp/test_portable_supervisor.py",
+      "-n",
+      "0",
+      "-o",
+      "pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src /workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/elspeth-lints/src",
+      "-k",
+      "not production_grace and not blocked_actual_preflight",
+      "--basetemp=/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-fix1-pytest",
+      "--junitxml=/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-fix1.xml"
+    ],
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src:/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/elspeth-lints/src",
+    "returncode": 0,
+    "elapsed_seconds": 94.12177779100602
+  },
+  {
+    "name": "ruff",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/bin/python",
+      "-m",
+      "ruff",
+      "check",
+      "src/elspeth/composer_mcp/portable_supervisor.py",
+      "tests/helpers/composer_stdio_ownership_probe.py",
+      "tests/unit/composer_mcp/test_standalone_lifecycle.py"
+    ],
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src:/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/elspeth-lints/src",
+    "returncode": 1,
+    "elapsed_seconds": 0.06425076000596164
+  },
+  {
+    "name": "format",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/bin/python",
+      "-m",
+      "ruff",
+      "format",
+      "--check",
+      "src/elspeth/composer_mcp/portable_supervisor.py",
+      "tests/helpers/composer_stdio_ownership_probe.py",
+      "tests/unit/composer_mcp/test_standalone_lifecycle.py"
+    ],
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src:/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/elspeth-lints/src",
+    "returncode": 0,
+    "elapsed_seconds": 0.06428302800486563
+  },
+  {
+    "name": "mypy",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/bin/python",
+      "-m",
+      "mypy",
+      "--cache-dir",
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.claude/lifecycle-mypy",
+      "src/elspeth/composer_mcp/portable_supervisor.py"
+    ],
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src:/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/elspeth-lints/src",
+    "returncode": 0,
+    "elapsed_seconds": 1.1691513070036308
+  },
+  {
+    "name": "contracts",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/bin/python",
+      "-m",
+      "scripts.check_contracts"
+    ],
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src:/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/elspeth-lints/src",
+    "returncode": 0,
+    "elapsed_seconds": 36.16825899400283
+  },
+  {
+    "name": "whitespace",
+    "command": [
+      "git",
+      "diff",
+      "--check"
+    ],
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src:/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/elspeth-lints/src",
+    "returncode": 0,
+    "elapsed_seconds": 0.01631556000211276
+  },
+  {
+    "name": "after",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/bin/python",
+      "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/freeze_tree.py",
+      "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-fix1-after.json"
+    ],
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src:/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/elspeth-lints/src",
+    "returncode": 0,
+    "elapsed_seconds": 0.6663337589998264
+  }
+]

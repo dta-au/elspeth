@@ -1,0 +1,294 @@
+import { expect, type Page, test } from "@playwright/test";
+import type { CompositionState } from "../../src/types";
+import { ComposerPage } from "./page-objects/composer-page";
+
+const sessionId = "11111111-1111-4111-8111-111111111111";
+
+const baseState = {
+  id: "22222222-2222-4222-8222-222222222222",
+  session_id: sessionId,
+  version: 1,
+  is_valid: true,
+  validation_errors: null,
+  validation_warnings: null,
+  validation_suggestions: null,
+  derived_from_state_id: null,
+  created_at: "2026-05-14T00:00:00Z",
+  composer_meta: null,
+  plugin_policy_findings: [],
+  sources: {
+    source: {
+      plugin: "csv",
+      options: { path: "input.csv" },
+      on_success: "classify_in",
+      on_validation_failure: "discard",
+    },
+  },
+  nodes: [
+    {
+      id: "classify",
+      node_type: "transform",
+      plugin: "llm_transform",
+      input: "classify_in",
+      on_success: "json_out",
+      on_error: null,
+      options: {},
+    },
+  ],
+  edges: [],
+  outputs: [
+    {
+      name: "json_out",
+      plugin: "json",
+      options: { path: "output.jsonl" },
+      on_write_failure: "discard",
+    },
+  ],
+  metadata: { name: "Proposal workflow", description: null },
+} satisfies CompositionState;
+
+const committedState = {
+  ...baseState,
+  id: "33333333-3333-4333-8333-333333333333",
+  version: 2,
+  nodes: [
+    {
+      ...baseState.nodes[0],
+      id: "normalize",
+      plugin: "passthrough",
+    },
+  ],
+};
+
+const pendingProposal = {
+  id: "44444444-4444-4444-8444-444444444444",
+  session_id: sessionId,
+  tool_call_id: "call-1",
+  tool_name: "set_pipeline",
+  status: "pending",
+  summary: "Replace the pipeline with csv input, 1 transform, and 1 output.",
+  rationale: "Requested by the current composer turn.",
+  affects: ["graph", "validation", "yaml"],
+  arguments_redacted_json: { source: { plugin: "csv" } },
+  base_state_id: "22222222-2222-4222-8222-222222222222",
+  committed_state_id: null,
+  audit_event_id: "55555555-5555-4555-8555-555555555555",
+  pipeline_metadata: null,
+  created_at: "2026-05-14T00:00:00Z",
+  updated_at: "2026-05-14T00:00:00Z",
+};
+
+const committedProposal = {
+  ...pendingProposal,
+  status: "committed",
+  committed_state_id: "33333333-3333-4333-8333-333333333333",
+  audit_event_id: "66666666-6666-4666-8666-666666666666",
+  updated_at: "2026-05-14T00:00:02Z",
+};
+
+async function installDeterministicComposerRoutes(page: Page): Promise<void> {
+  let accepted = false;
+  let operationId: string | null = null;
+  let terminalResult: unknown = null;
+  const sessions: unknown[] = [];
+
+  await page.route("**/api/system/status", async (route) => {
+    await route.fulfill({
+      json: {
+        composer_available: true,
+        composer_model: "deterministic-e2e",
+        composer_advisor_model: "deterministic-e2e-advisor",
+        composer_provider: "playwright-route",
+        composer_reason: null,
+        composer_missing_keys: [],
+        composer_timeout_seconds: 180,
+      },
+    });
+  });
+
+  // Full wire shape: decoded structurally since 69c910a56
+  // (preferencesDecoder.ts KEYS); a partial payload surfaces a preferences
+  // error banner instead of the composer defaults. The account must read as
+  // a RETURNING user (tutorial completed): with tutorial_completed_at null the
+  // decoded payload makes this a first run and App.tsx shows the tutorial
+  // welcome instead of the freeform Chat panel this spec drives.
+  await page.route("**/api/composer-preferences", async (route) => {
+    await route.fulfill({
+      json: {
+        freeform_intro_dismissed_at: null,
+        tutorial_completed_at: "2026-05-14T00:00:00Z",
+        tutorial_stage: null,
+        tutorial_session_id: null,
+        tutorial_run_id: null,
+        tutorial_source_data_hash: null,
+        show_advanced: false,
+        updated_at: null,
+      },
+    });
+  });
+
+  await page.route("**/api/sessions**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const path = url.pathname;
+    const method = request.method();
+
+    if (path === "/api/sessions" && method === "GET") {
+      await route.fulfill({ json: sessions });
+      return;
+    }
+
+    if (path === "/api/sessions" && method === "POST") {
+      const session = {
+        id: sessionId,
+        title: "Proposal workflow",
+        created_at: "2026-05-14T00:00:00Z",
+        updated_at: "2026-05-14T00:00:00Z",
+      };
+      sessions.unshift(session);
+      await route.fulfill({ status: 201, json: session });
+      return;
+    }
+
+
+    if (path === `/api/sessions/${sessionId}/composer-progress` && method === "GET") {
+      await route.fulfill({
+        json: {
+          session_id: sessionId,
+          request_id: null,
+          phase: "idle",
+          headline: "Idle.",
+          evidence: [],
+          likely_next: null,
+          reason: "composer_idle",
+          updated_at: "2026-05-14T00:00:00Z",
+        },
+      });
+      return;
+    }
+
+    if (path === `/api/sessions/${sessionId}/messages` && method === "GET") {
+      await route.fulfill({ json: [] });
+      return;
+    }
+
+    if (path === `/api/sessions/${sessionId}/messages` && method === "POST") {
+      operationId = (request.postDataJSON() as { operation_id: string }).operation_id;
+      terminalResult = {
+          message: {
+            id: "77777777-7777-4777-8777-777777777777",
+            session_id: sessionId,
+            role: "assistant",
+            raw_content: null,
+            operation_id: null,
+            segments: [{ kind: "text", content: "I found one pipeline change that needs approval." }],
+            rejection: null,
+            content: "I found one pipeline change that needs approval.",
+            tool_calls: [
+              {
+                id: "call-1",
+                type: "function",
+                function: {
+                  name: "set_pipeline",
+                  arguments: "{\"source\":{\"plugin\":\"csv\"}}",
+                },
+              },
+            ],
+            created_at: "2026-05-14T00:00:01Z",
+            composition_state_id: null,
+            tool_call_id: null,
+            parent_assistant_id: null,
+            sequence_no: 1,
+          },
+          state: baseState,
+          proposals: [pendingProposal],
+        };
+      await route.fulfill({ status: 202, json: { operation_id: operationId, kind: "compose_message", status: "queued", poll_after_ms: 1000 } }); return;
+    }
+    if (operationId !== null && path === `/api/sessions/${sessionId}/operations/${operationId}/stream`) {
+      await route.fulfill({ status: 503, json: { detail: "stream unavailable" } }); return;
+    }
+    if (operationId !== null && path === `/api/sessions/${sessionId}/operations/${operationId}`) {
+      await route.fulfill({ json: { operation_id: operationId, kind: "compose_message", status: "completed", poll_after_ms: 1000, cancel_requested: false, deadline_at: "2026-05-14T00:00:00Z", deadline_remaining_ms: 0, result: terminalResult, error: null } }); return;
+    }
+
+    if (path === `/api/sessions/${sessionId}/state` && method === "GET") {
+      await route.fulfill({ json: accepted ? committedState : baseState });
+      return;
+    }
+
+    if (path === `/api/sessions/${sessionId}/state/versions` && method === "GET") {
+      await route.fulfill({
+        json: [accepted ? committedState : baseState],
+      });
+      return;
+    }
+
+    if (path === `/api/sessions/${sessionId}/runs` && method === "GET") {
+      await route.fulfill({ json: [] });
+      return;
+    }
+
+    if (path === `/api/sessions/${sessionId}/proposals` && method === "GET") {
+      await route.fulfill({ json: accepted ? [] : [pendingProposal] });
+      return;
+    }
+
+    if (path === `/api/sessions/${sessionId}/proposals/44444444-4444-4444-8444-444444444444/accept` && method === "POST") {
+      accepted = true;
+      await route.fulfill({ json: committedProposal });
+      return;
+    }
+
+    if (path === `/api/sessions/${sessionId}/blobs` && method === "GET") {
+      await route.fulfill({ json: [] });
+      return;
+    }
+
+    await route.continue();
+  });
+}
+
+/** Since 5dbbb1439 the tool card's primary label is the humanised sentence
+ *  ("Proposed: Replaces the entire pipeline …") and the raw tool name is a
+ *  separate mono <code> element, so "<status>: <tool>" is no longer one text
+ *  node. Assert the card by its status prefix and its tool-name ribbon. */
+async function expectToolCard(
+  page: Page,
+  status: "Proposed" | "Applied" | "Rejected",
+  toolName: string,
+): Promise<void> {
+  const card = page
+    .getByRole("article")
+    .filter({ hasText: new RegExp(`^${status}:`) })
+    .filter({ has: page.locator("code", { hasText: new RegExp(`^${toolName}$`) }) });
+  await expect(card).toBeVisible();
+}
+
+test("explicit approve tool call is visible before commit", async ({ page }) => {
+  await installDeterministicComposerRoutes(page);
+
+  const composer = new ComposerPage(page);
+  await composer.goto();
+  await composer.createSession("Proposal workflow");
+  await composer.sendMessage("Build a simple csv to json pipeline");
+
+  await expectToolCard(page, "Proposed", "set_pipeline");
+  const decisionPanel = page.getByRole("region", { name: /Awaiting your decision/ });
+  await expect(page.getByRole("region", { name: /Pending changes/ })).toHaveCount(0);
+  await expect(
+    decisionPanel.getByRole("button", { name: /Accept proposal:/ }),
+  ).toBeVisible();
+  await expect(
+    decisionPanel.getByRole("button", { name: /Reject proposal:/ }),
+  ).toBeVisible();
+
+  await decisionPanel.getByRole("button", { name: /Accept proposal:/ }).click();
+
+  await expectToolCard(page, "Applied", "set_pipeline");
+  await expect(
+    // Accessible name updated with the keyboard-focusable conversation region
+    // (elspeth-5e43a0c8b2).
+    page.getByRole("log", { name: "Conversation" }).getByText("audit 66666666"),
+  ).toBeVisible();
+});

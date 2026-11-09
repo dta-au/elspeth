@@ -1,0 +1,4110 @@
+"""Session API routes -- /api/sessions/* with IDOR protection.
+
+Owner-workspace endpoints require a live deployment-wide ``user`` role through
+``require_pipeline_user``. Session-scoped endpoints then verify ownership
+before any business logic.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import sys
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import suppress
+from dataclasses import dataclass
+from dataclasses import replace as _replace
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Any, Final, Literal, cast, overload
+from uuid import UUID, uuid4
+from weakref import WeakValueDictionary
+
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from opentelemetry import metrics
+from pydantic import ValidationError as PydanticValidationError
+from sqlalchemy import insert
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyPoolTimeoutError
+from starlette.applications import Starlette
+
+import elspeth.contracts.errors as contract_errors
+from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, ChargeableAdmissionRefused
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
+from elspeth.contracts.composer_interpretation import (
+    InterpretationChoice,
+    InterpretationEventRecord,
+    InterpretationSource,
+)
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall
+from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressReason, ComposerProgressSink
+from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.secret_scrub import scrub_text_for_audit
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.core.canonical import stable_hash
+from elspeth.core.dag.models import GraphValidationError
+from elspeth.core.landscape.database import LandscapeDB
+from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.infrastructure.manager import PluginNotFoundError
+from elspeth.web.async_workers import run_sync_in_worker
+from elspeth.web.auth.middleware import require_pipeline_user
+from elspeth.web.auth.models import UserIdentity
+from elspeth.web.blobs.protocol import BlobQuotaExceededError
+from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.catalog.protocol import CatalogService as CatalogServiceProtocol
+from elspeth.web.compartments import ChatIngressInput, CompositionIngressRecord, chat_ingress_input
+from elspeth.web.composer import yaml_generator
+from elspeth.web.composer.advisor_decision import AdvisorGateDecision
+from elspeth.web.composer.audit import (
+    BufferingRecorder,
+    audit_envelope,
+    llm_call_audit_envelope,
+    llm_call_audit_summary,
+)
+from elspeth.web.composer.audit_storage import (
+    private_diagnostic_drafts,
+    private_tool_invocation_draft,
+    redacted_tool_invocation_content_and_envelope,
+)
+from elspeth.web.composer.control_messages import replay_composer_control_message
+from elspeth.web.composer.error_codes import REGISTERED_ERROR_CODES
+from elspeth.web.composer.implicit_decisions import merge_implicit_decisions_meta
+from elspeth.web.composer.invariants import InvariantError
+from elspeth.web.composer.no_tool_policy import visible_message_segments
+from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
+from elspeth.web.composer.pipeline_planner import PipelinePlannerError
+from elspeth.web.composer.progress import (
+    ComposerProgressRegistry,
+    ComposerProgressSnapshot,
+    ComposerRequestLease,
+    client_cancelled_progress_event,
+    convergence_progress_event,
+)
+from elspeth.web.composer.protocol import (
+    ComposerConvergenceError,
+    ComposerHistoryMessage,
+    ComposerPluginCrashError,
+    ComposerResult,
+    ComposerRuntimePreflightError,
+    ComposerService,
+    ComposerServiceError,
+)
+from elspeth.web.composer.provider_errors import classify_provider_failure
+from elspeth.web.composer.provider_gateway import _BadRequestLLMError
+from elspeth.web.composer.provider_telemetry import (
+    begin_composer_request_metrics,
+    finish_composer_request_metrics,
+    mark_composer_request_terminal,
+)
+from elspeth.web.composer.redaction import redact_source_storage_path
+from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationEntry, ValidationSummary
+from elspeth.web.composer.telemetry_phase8 import (
+    SessionsTelemetry,
+    record_session_completed,
+    record_session_switched,
+)
+from elspeth.web.composer.tools import execute_tool
+from elspeth.web.composer.tools.generation import explain_validation_code
+from elspeth.web.composer.yaml_generator import generate_public_yaml
+from elspeth.web.coordination.composer_progress_authority import ComposerRequestLeaseLost, DatabaseComposerProgressRegistry
+from elspeth.web.execution.accounting import load_run_accounting_for_settings
+from elspeth.web.execution.completion_gates import (
+    COMPLETION_GATES_META_KEY,
+    CompletionGatesDict,
+    completion_gates_meta_from_facts,
+    parse_completion_gates,
+    resolve_completion_gate_facts,
+)
+from elspeth.web.execution.schemas import RunAccounting, RunStatusResponse, ValidationResult
+from elspeth.web.execution.validation import validate_pipeline
+from elspeth.web.middleware.rate_limit import WebRateLimiter, get_rate_limiter
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
+from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+from elspeth.web.plugin_policy.validation import validate_authored_composition_state
+from elspeth.web.required_work import RequiredWorkCoordinator, RequiredWorkSource
+from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
+from elspeth.web.sessions._auto_title import maybe_auto_title_session
+from elspeth.web.sessions._persist_payload import AuditMessageDraft
+from elspeth.web.sessions.audit_story_models import RunAuditStoryResponse
+from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryService
+from elspeth.web.sessions.composer_operations import ComposerRequiredRecoveryFailure
+from elspeth.web.sessions.converters import state_from_record as _state_from_record
+from elspeth.web.sessions.models import composer_completion_events_table
+from elspeth.web.sessions.proposal_projection import project_composition_proposal
+from elspeth.web.sessions.protocol import (
+    AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST,
+    SESSION_TERMINAL_RUN_STATUS_VALUES,
+    ChatMessageRecord,
+    ChatMessageRole,
+    ComposerSessionPreferencesRecord,
+    CompositionProposalRecord,
+    CompositionRejectionEventRecord,
+    CompositionStateData,
+    CompositionStateRecord,
+    CompositionValidationError,
+    InterpretationEventAlreadyResolvedError,
+    InterpretationEventNotFoundError,
+    InterpretationNodeMissingError,
+    InterpretationNodePluginMutatedError,
+    InterpretationPlaceholderConsumedError,
+    InterpretationSourceDataContractDriftError,
+    InterpretationUnsupportedChoiceError,
+    InvalidForkTargetError,
+    ProposalEventRecord,
+    ProposalLifecycleStatus,
+    RunDiagnosticsAuditAuthority,
+    RunDiagnosticsAuditDraft,
+    RunDiagnosticsAuthorityLostError,
+    RunRecord,
+    SessionRecord,
+    SessionServiceProtocol,
+    TransitionAssistantDraft,
+    serialize_composition_validation_errors,
+)
+from elspeth.web.sessions.schemas import (
+    AcceptProposalRequest,
+    ChatMessageResponse,
+    ChatMessageSegmentResponse,
+    ComposerPreferencesResponse,
+    CompositionObject,
+    CompositionProposalResponse,
+    CompositionStateResponse,
+    CompositionValidationErrorResponse,
+    CreateSessionRequest,
+    ForkSessionRequest,
+    ForkSessionResponse,
+    InterpretationEventResponse,
+    InterpretationOptOutResponse,
+    InterpretationResolveRequest,
+    InterpretationResolveResponse,
+    ListInterpretationEventsResponse,
+    MessageWithStateResponse,
+    OptOutSummaryResponse,
+    PluginPolicyFindingResponse,
+    ProposalEventResponse,
+    RejectProposalRequest,
+    RevertStateRequest,
+    RunResponse,
+    SendMessageRequest,
+    SessionResponse,
+    ToolRejectionResponse,
+    UpdateComposerPreferencesRequest,
+    UpdateSessionRequest,
+    ValidationEntryResponse,
+)
+
+slog = structlog.get_logger()
+
+
+def _log_last_resort_diagnostic(log_call: Callable[..., object], event: str, /, **fields: object) -> None:
+    """Emit a structured diagnostic on the last-resort logging channel.
+
+    Callers evaluate every field eagerly (they are ordinary call arguments),
+    so a first-party bug in diagnostic assembly crashes in the caller frame
+    instead of being swallowed alongside the emission. Only the emission
+    itself is guarded: logging is the channel of last resort — a
+    ordinary logging-stack failure must not displace the primary outcome.
+    Registered framework and audit integrity failures still escape.
+    """
+    try:
+        log_call(event, **fields)
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except Exception:
+        return
+
+
+_REDACTED_SECRET_DETAIL = "<redacted-secret>"
+_PROVIDER_DETAIL_REDACTED = "Provider detail redacted because it may contain secrets."
+_MAX_PROVIDER_DETAIL_CHARS = 1_000
+
+
+class _SessionComposeLockRegistry:
+    """Per-session compose/recompose locks.
+
+    Lazily creates asyncio.Lock instances under a running event loop so the
+    registry can live on app.state without needing sync-time initialization in
+    create_app().
+    """
+
+    def __init__(self) -> None:
+        # Weak custody is deliberate: every borrower holds the lock strongly
+        # from lookup through acquisition/release, so concurrent borrowers
+        # share one identity. Once no holder, waiter, or pre-acquire borrower
+        # remains, the entry is reclaimed without deletion ever evicting a
+        # still-live lock and splitting a session across two lock objects.
+        self._session_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+        self._locks_lock: asyncio.Lock | None = None
+
+    def _ensure_locks_lock(self) -> asyncio.Lock:
+        if self._locks_lock is None:
+            self._locks_lock = asyncio.Lock()
+        return self._locks_lock
+
+    async def get_lock(self, session_id: str) -> asyncio.Lock:
+        async with self._ensure_locks_lock():
+            # Tier note: lazy per-session lock cache — a miss means this
+            # session has not needed a lock yet, not corrupted state; the
+            # WeakValueDictionary drops entries when their sessions go away.
+            lock = self._session_locks.get(session_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._session_locks[session_id] = lock
+            return lock
+
+    async def cleanup_session_lock(self, session_id: str) -> None:
+        """Allow weak reclamation without evicting a lock borrowed by a request."""
+        async with self._ensure_locks_lock():
+            # Iteration commits pending WeakValueDictionary removals while the
+            # registry mutex excludes a simultaneous creator.
+            tuple(self._session_locks)
+
+
+def _get_session_compose_lock_registry(request: Request) -> _SessionComposeLockRegistry:
+    """Return the app-scoped compose lock registry, creating it on first use.
+
+    The registry is lazily attached to ``app.state`` on first use (see the
+    class docstring for why it is not created in ``create_app()``). We probe
+    presence with an explicit membership test on our own state container
+    rather than a ``getattr`` default: absence is a designed first-use
+    condition, and once the key is present a direct attribute read crashes if
+    it is somehow the wrong type — no default papers over a contract bug.
+    """
+    return composer_session_lock_registry(request.app)
+
+
+def composer_session_lock_registry(app: Starlette) -> _SessionComposeLockRegistry:
+    """Return app-owned lock custody without an HTTP request."""
+    if "session_compose_lock_registry" not in app.state:
+        app.state.session_compose_lock_registry = _SessionComposeLockRegistry()
+    return cast(_SessionComposeLockRegistry, app.state.session_compose_lock_registry)
+
+
+def _get_composer_progress_registry(request: Request) -> ComposerProgressRegistry | DatabaseComposerProgressRegistry:
+    """Return the app-scoped composer progress registry."""
+    return cast(ComposerProgressRegistry | DatabaseComposerProgressRegistry, request.app.state.composer_progress_registry)
+
+
+def _request_plugin_policy_context(
+    request: Request,
+    user: UserIdentity,
+) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+    """Build the one immutable plugin-policy context for this HTTP request."""
+    catalog: CatalogServiceProtocol = request.app.state.catalog_service
+    snapshot: PluginAvailabilitySnapshot = request.app.state.plugin_snapshot_factory(user)
+    return PolicyCatalogView(catalog, snapshot, request.app.state.operator_profile_registry), snapshot
+
+
+async def _composer_progress_sink(
+    registry: ComposerProgressRegistry | DatabaseComposerProgressRegistry,
+    request: Request,
+    *,
+    session_id: str,
+    request_id: str | None,
+    user_id: str,
+) -> ComposerProgressSink:
+    """Bind a registry sink to one session/request/user.
+
+    ``user_id`` flows into the registry's internal user index so the
+    /_active in-flight enumeration endpoint can scope cross-session
+    visibility to the authenticated principal that initiated the
+    composer request.
+    """
+
+    return await registry.claim_request(
+        lease=cast(ComposerRequestLease, request.state.composer_request_lease),
+        session_id=session_id,
+        request_id=request_id,
+        user_id=user_id,
+    )
+
+
+async def _publish_progress(
+    progress: ComposerProgressSink,
+    *,
+    event: ComposerProgressEvent,
+) -> None:
+    await progress(event)
+
+
+def _session_response(session: SessionRecord) -> SessionResponse:
+    """Convert a SessionRecord to a SessionResponse."""
+    return SessionResponse(
+        id=str(session.id),
+        user_id=session.user_id,
+        title=session.title,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+        archived=session.archived_at is not None,
+        forked_from_session_id=str(session.forked_from_session_id) if session.forked_from_session_id else None,
+        forked_from_message_id=str(session.forked_from_message_id) if session.forked_from_message_id else None,
+    )
+
+
+def _composer_preferences_response(record: ComposerSessionPreferencesRecord) -> ComposerPreferencesResponse:
+    return ComposerPreferencesResponse(
+        session_id=str(record.session_id),
+        trust_mode=record.trust_mode,
+        density_default=record.density_default,
+        interpretation_review_disabled=record.interpretation_review_disabled,
+        updated_at=record.updated_at,
+    )
+
+
+def _composition_proposal_response(record: CompositionProposalRecord) -> CompositionProposalResponse:
+    return project_composition_proposal(record)
+
+
+def _proposal_event_response(record: ProposalEventRecord) -> ProposalEventResponse:
+    return ProposalEventResponse(
+        id=str(record.id),
+        session_id=str(record.session_id),
+        proposal_id=str(record.proposal_id) if record.proposal_id else None,
+        event_type=record.event_type,
+        actor=record.actor,
+        payload=deep_thaw(record.payload),
+        created_at=record.created_at,
+    )
+
+
+async def _pending_proposal_responses(
+    service: SessionServiceProtocol,
+    session_id: UUID,
+) -> list[CompositionProposalResponse]:
+    proposals = await service.list_composition_proposals(session_id, status="pending")
+    return [_composition_proposal_response(proposal) for proposal in proposals]
+
+
+class _ToolCallOutcomeKind(StrEnum):
+    """Closed vocabulary of server-derived per-call outcomes for the SPA.
+
+    Mirrors the frontend union in ``frontend/src/types/index.ts``
+    (``ToolCallEnvelope.outcome``); the two must be extended together. A
+    ``StrEnum`` member serialises as its bare value, so the wire shape is
+    exactly the string the SPA already decodes.
+    """
+
+    APPLIED = "applied"
+    """The call durably created a composition-state version."""
+
+    REJECTED = "rejected"
+    """Dispatch completed but the tool reported ``success=False`` — validation
+    refused the mutation and nothing persisted."""
+
+    FAILED = "failed"
+    """Arg-error or plugin crash."""
+
+    CANCELLED = "cancelled"
+    """The coordinator cancelled the dispatch (Stop)."""
+
+    COMPLETED = "completed"
+    """Everything else (lookups, advisor hints)."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolCallRejection:
+    """Public closed-code guidance, with no session-derived diagnostic text."""
+
+    error_code: str
+    guidance: tuple[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolCallOutcome:
+    """Server-derived outcome of one tool call, projected for the SPA.
+
+    ``applied_state_version`` accompanies ``applied`` when the version
+    number is derivable (state-id map for primary-writer rows, envelope
+    ``version_after`` for fallback-writer rows), else ``None``.
+    """
+
+    outcome: _ToolCallOutcomeKind
+    applied_state_version: int | None
+    rejection: _ToolCallRejection | None = None
+
+
+def _tool_call_outcomes_by_call_id(
+    messages: Sequence[ChatMessageRecord],
+    *,
+    state_versions_by_id: Mapping[str, int],
+) -> dict[str, _ToolCallOutcome]:
+    """Project role="tool" rows into per-call outcomes (elspeth-f5e6723133).
+
+    Two writers produce tool rows with different per-call semantics:
+
+    * ``persist_compose_turn`` (primary): ``tool_calls`` is NULL or carries
+      its ordinary visible-evidence companion, and
+      ``composition_state_id`` is set exactly when THAT call inserted a
+      composition state — per-call ground truth on the row itself.
+    * ``_persist_tool_invocations`` (fallback drains): every row of the turn
+      shares the post-compose state id, and the per-call truth lives in the
+      row's single ``_kind="audit"`` envelope
+      (``version_before``/``version_after``/``status``).
+
+    Classification never trusts tool NAMES — a mutation tool that validated
+    and was refused must not render as applied, which is exactly the
+    dishonesty class this projection exists to remove.
+    """
+    from elspeth.web.composer.visible_tool_event import VISIBLE_TOOL_EVENT_KIND, VisibleToolEvent
+
+    outcomes: dict[str, _ToolCallOutcome] = {}
+    for row in messages:
+        if row.role != "tool" or row.tool_call_id is None:
+            continue
+        envelope = row.tool_calls[0] if row.tool_calls else None
+        primary_row = envelope is None
+        if envelope is not None and "_kind" in envelope and envelope["_kind"] == VISIBLE_TOOL_EVENT_KIND:
+            assert row.tool_calls is not None
+            if len(row.tool_calls) != 1:
+                raise AuditIntegrityError("Primary tool row must carry exactly one visible companion")
+            # Validate the closed stored shape, then classify from the real
+            # row's state/content. Companion payloads and copied operation IDs
+            # are historical evidence, never outcome or execution authority.
+            VisibleToolEvent.from_envelope(envelope)
+            primary_row = True
+        if primary_row and row.composition_state_id is not None:
+            state_key = str(row.composition_state_id)
+            outcomes[row.tool_call_id] = _ToolCallOutcome(
+                outcome=_ToolCallOutcomeKind.APPLIED,
+                # ``state_versions_by_id`` covers the fetched window only; a row
+                # whose state version was not fetched still renders as applied,
+                # just without a version number.
+                applied_state_version=state_versions_by_id[state_key] if state_key in state_versions_by_id else None,
+            )
+            continue
+        if envelope is not None and not primary_row:
+            # The per-call delta lives one level DOWN, under ``invocation``:
+            # the fallback writer stores exactly
+            # ``redacted_tool_invocation_content_and_envelope(...)[1]``, which
+            # is ``{"_kind": "audit", "invocation": {...}}`` — the fixed
+            # legacy contract. Primary companions were handled above.
+            # Reading these keys off the top level found nothing
+            # on every real row, so an applied mutation fell through to
+            # COMPLETED and rendered as a lookup (elspeth-f5e6723133's own
+            # failure mode). The DB round-trip does not demote authorship
+            # (rows come back as ``mappingproxy`` after the freeze in
+            # ``ChatMessageRecord.__post_init__``), so this is a Tier-1
+            # direct read: a missing or non-mapping ``invocation`` is
+            # corruption and crashes here instead of defaulting to an empty
+            # delta that would silently reclassify the call.
+            delta: Mapping[str, Any] = envelope["invocation"]
+            # Absence is a legitimate envelope shape, not a damaged row, so the
+            # membership read is the honest form.
+            version_before = delta["version_before"] if "version_before" in delta else None
+            version_after = delta["version_after"] if "version_after" in delta else None
+            # Exact ``int`` rather than ``isinstance``: the envelope round-trips
+            # through the session DB's JSON column, so a real version is an exact
+            # ``int`` and a JSON ``true`` must not be admitted as version 1.
+            if type(version_before) is int and type(version_after) is int and version_after > version_before:
+                outcomes[row.tool_call_id] = _ToolCallOutcome(
+                    outcome=_ToolCallOutcomeKind.APPLIED,
+                    applied_state_version=version_after,
+                )
+                continue
+            status = delta["status"] if "status" in delta else None
+            if status == ComposerToolStatus.CANCELLED.value:
+                outcomes[row.tool_call_id] = _ToolCallOutcome(outcome=_ToolCallOutcomeKind.CANCELLED, applied_state_version=None)
+                continue
+            if status in (ComposerToolStatus.ARG_ERROR.value, ComposerToolStatus.PLUGIN_CRASH.value):
+                outcomes[row.tool_call_id] = _ToolCallOutcome(outcome=_ToolCallOutcomeKind.FAILED, applied_state_version=None)
+                continue
+        # Tool-row ``content`` is first-party JSON on BOTH writer paths: the
+        # compose loop ``json.dumps``'s every tool message it persists and the
+        # fallback drain writes canonical JSON (``ChatMessageRecord.content``
+        # is a non-nullable ``str``, so a ``TypeError`` cannot fire honestly
+        # either). An undecodable tool row is Tier-1 corruption and crashes
+        # rather than defaulting to a fabricated COMPLETED classification.
+        try:
+            content = json.loads(row.content)
+        except json.JSONDecodeError as exc:
+            raise AuditIntegrityError("tool-row content is not the first-party JSON both tool-row writers guarantee") from exc
+        # ``content`` is freshly decoded by ``json.loads`` above — never a value
+        # read off a ``deep_freeze``d owner — so a JSON object is an exact
+        # ``dict`` here and the exact-type form is the accurate check.
+        if type(content) is dict:
+            if "error_class" in content and content["error_class"]:
+                cancelled = "_redaction_status" in content and content["_redaction_status"] == ComposerToolStatus.CANCELLED.value
+                outcomes[row.tool_call_id] = _ToolCallOutcome(
+                    outcome=_ToolCallOutcomeKind.CANCELLED if cancelled else _ToolCallOutcomeKind.FAILED,
+                    applied_state_version=None,
+                )
+                continue
+            if "success" in content and content["success"] is False:
+                # The failure producer puts the rejected mutation first; later
+                # errors can describe the unchanged baseline, so never search
+                # them for a replacement diagnosis. Only registered codes with
+                # public catalogue guidance cross into the conversation. Raw
+                # messages remain confined to the audit opt-in below.
+                validation = content["validation"] if "validation" in content else None
+                errors = validation["errors"] if type(validation) is dict and "errors" in validation else None
+                leading_error = errors[0] if type(errors) is list and errors else None
+                code = leading_error["error_code"] if type(leading_error) is dict and "error_code" in leading_error else None
+                rejection: _ToolCallRejection | None = None
+                if type(code) is str and code in REGISTERED_ERROR_CODES:
+                    guidance = explain_validation_code(code)
+                    if guidance is not None:
+                        rejection = _ToolCallRejection(code, guidance)
+                outcomes[row.tool_call_id] = _ToolCallOutcome(
+                    outcome=_ToolCallOutcomeKind.REJECTED, applied_state_version=None, rejection=rejection
+                )
+                continue
+        outcomes[row.tool_call_id] = _ToolCallOutcome(outcome=_ToolCallOutcomeKind.COMPLETED, applied_state_version=None)
+    return outcomes
+
+
+def _rejections_by_tool_call_id(
+    records: Sequence[CompositionRejectionEventRecord],
+) -> dict[str, CompositionRejectionEventRecord]:
+    """Index one session's rejection rows by provider tool_call_id.
+
+    ``uq_chat_messages_tool_call_id`` makes a tool_call_id unique per session
+    and the compose loop writes at most one rejection per tool row, so a
+    duplicate is Tier-1 corruption: crash rather than silently pick one.
+    """
+    indexed: dict[str, CompositionRejectionEventRecord] = {}
+    for record in records:
+        if record.tool_call_id in indexed:
+            raise AuditIntegrityError("composition_rejection_events holds two rows for one tool_call_id in a session")
+        indexed[record.tool_call_id] = record
+    return indexed
+
+
+def _message_response(
+    msg: ChatMessageRecord,
+    *,
+    include_raw_content: bool = False,
+    tool_outcomes: Mapping[str, _ToolCallOutcome] | None = None,
+    rejections: Mapping[str, CompositionRejectionEventRecord] | None = None,
+) -> ChatMessageResponse:
+    """Convert a ChatMessageRecord to a ChatMessageResponse.
+
+    ``include_raw_content`` opt-in surfaces the model's pre-synthesis prose
+    for assistant turns intercepted by the empty-state synthesizer. Default
+    False keeps the conversation channel free of audit-only data; eval
+    tooling sets True via the ``?include_raw_content=true`` query param.
+
+    ``tool_outcomes`` (elspeth-f5e6723133) stamps each assistant-row
+    ``tool_calls`` envelope whose id has a projected outcome with
+    ``outcome`` / ``applied_state_version`` so the SPA can label executed
+    mutations honestly instead of describing every call as a lookup. The
+    stamp is derived from Tier-1 tool rows server-side — never from tool
+    names. Envelopes without a projection are passed through untouched and
+    render under the client's conservative default.
+
+    Rejected envelopes can additionally carry ``rejection`` with only the
+    leading closed error code and static public catalogue guidance. This
+    supports recovery in the conversation without publishing raw diagnostic
+    messages, source facts, or the separate audit-only rejection record.
+
+    ``rejections`` (elspeth-3e28029d2f read side) is supplied only by the
+    audit-grade view under ``include_rejection_reasons``; a ``role="tool"``
+    row whose call id has a rejection row carries it as ``rejection``. Every
+    other caller omits it and the field stays ``None``.
+    """
+    from elspeth.web.composer.diagnostic_evidence import is_diagnostic_evidence_envelope
+
+    if msg.tool_calls is not None and any(is_diagnostic_evidence_envelope(envelope) for envelope in msg.tool_calls):
+        raise AuditIntegrityError("Private Composer evidence cannot be projected into a public message")
+    from elspeth.web.composer.visible_tool_event import VISIBLE_TOOL_EVENT_KIND, VisibleToolEvent
+
+    for envelope in msg.tool_calls or ():
+        if "_kind" in envelope and envelope["_kind"] == VISIBLE_TOOL_EVENT_KIND:
+            VisibleToolEvent.from_envelope(envelope)
+    tool_calls = deep_thaw(msg.tool_calls) if msg.tool_calls is not None else None
+    if tool_calls is not None and tool_outcomes:
+        stamped: list[Any] = []
+        for entry in tool_calls:
+            # The ``deep_thaw`` above is WHAT MAKES the exact-type form correct:
+            # ``ChatMessageRecord.__post_init__`` runs ``freeze_fields(self,
+            # "tool_calls")``, so reading ``msg.tool_calls`` directly would hand
+            # this loop ``mappingproxy`` entries for which ``type(...) is dict``
+            # is permanently False — silently disabling every stamp with no test
+            # failure. Do not move, inline, or drop that thaw without converting
+            # this guard back to ``isinstance(entry, Mapping)``.
+            call_id = entry["id"] if type(entry) is dict and "id" in entry else None
+            projected = tool_outcomes[call_id] if type(call_id) is str and call_id in tool_outcomes else None
+            if projected is not None:
+                entry = {
+                    **entry,
+                    # Emit the bare value: the wire shape is the string the SPA
+                    # union decodes, never an enum repr from a serializer.
+                    "outcome": projected.outcome.value,
+                    "applied_state_version": projected.applied_state_version,
+                }
+                if projected.rejection is not None:
+                    entry["rejection"] = {
+                        "error_code": projected.rejection.error_code,
+                        "guidance": list(projected.rejection.guidance),
+                    }
+            stamped.append(entry)
+        tool_calls = stamped
+    rejection_record = (
+        rejections[msg.tool_call_id]
+        if rejections is not None and msg.role == "tool" and msg.tool_call_id is not None and msg.tool_call_id in rejections
+        else None
+    )
+    rejection = (
+        ToolRejectionResponse(
+            tool_name=rejection_record.tool_name,
+            error_code=rejection_record.error_code,
+            message=rejection_record.message,
+            composition_state_id=rejection_record.composition_state_id,
+            created_at=rejection_record.created_at,
+        )
+        if rejection_record is not None
+        else None
+    )
+    return ChatMessageResponse(
+        id=str(msg.id),
+        session_id=str(msg.session_id),
+        operation_id=str(msg.operation_id) if msg.operation_id is not None else None,
+        role=msg.role,
+        content=msg.content,
+        raw_content=msg.raw_content if include_raw_content else None,
+        segments=[
+            ChatMessageSegmentResponse(kind=segment.kind, content=segment.content)
+            for segment in visible_message_segments(
+                content=msg.content,
+                raw_content=msg.raw_content if msg.role == "assistant" else None,
+            )
+        ],
+        tool_calls=tool_calls,
+        created_at=msg.created_at,
+        composition_state_id=str(msg.composition_state_id) if msg.composition_state_id else None,
+        tool_call_id=msg.tool_call_id,
+        parent_assistant_id=str(msg.parent_assistant_id) if msg.parent_assistant_id else None,
+        sequence_no=msg.sequence_no,
+        rejection=rejection,
+    )
+
+
+def _run_accounting_integrity_http(
+    message: str,
+    *,
+    run_id: UUID | None = None,
+    landscape_run_id: str | None = None,
+    landscape_run_ids: Sequence[str] | None = None,
+    validation_errors: Sequence[Any] | None = None,
+    error: str | None = None,
+) -> HTTPException:
+    """Return the structured 500 used for public run-accounting contract failures."""
+    detail: dict[str, object] = {
+        "code": "run_integrity_error",
+        # "detail" (not "message"): parseResponse (frontend/src/api/client.ts)
+        # reads nestedDetail.detail as the human-readable string, with no
+        # "message" fallback, for ANY non-2xx response (not just 400s).
+        "detail": message,
+    }
+    if run_id is not None:
+        detail["run_id"] = str(run_id)
+    if landscape_run_id is not None:
+        detail["landscape_run_id"] = landscape_run_id
+    if landscape_run_ids is not None:
+        detail["landscape_run_ids"] = list(landscape_run_ids)
+    if validation_errors is not None:
+        detail["validation_errors"] = list(validation_errors)
+    if error is not None:
+        detail["error"] = error
+    return HTTPException(status_code=500, detail=detail)
+
+
+def _validate_run_status_accounting_for_list(run: RunRecord, accounting: RunAccounting | None) -> None:
+    """Apply the canonical run status/accounting contract before list serialization."""
+    try:
+        RunStatusResponse(
+            run_id=str(run.id),
+            status=run.status,
+            started_at=run.started_at,
+            finished_at=run.finished_at,
+            accounting=accounting,
+            error=run.error,
+            landscape_run_id=run.landscape_run_id,
+        )
+    except PydanticValidationError as exc:
+        raise _run_accounting_integrity_http(
+            "Session run failed internal accounting validation.",
+            run_id=run.id,
+            landscape_run_id=run.landscape_run_id,
+            validation_errors=exc.errors(include_url=False, include_context=False, include_input=False),
+        ) from exc
+
+
+def _litellm_error_detail(
+    error_type: str,
+    exc: Exception,
+    *,
+    expose_provider_error: bool,
+) -> dict[str, object]:
+    """Build the HTTP error payload for LiteLLM failures.
+
+    ``detail`` remains class-name-only for the stable redaction contract. When
+    staging/debug mode is explicitly enabled, ``provider_detail`` carries a
+    bounded, scrubbed provider message for operator triage.
+
+    For composer's ``_BadRequestLLMError`` carrier, the raw provider text and
+    HTTP status code are read from the dedicated ``provider_detail`` /
+    ``provider_status_code`` attributes — ``str(exc)`` on that class returns
+    only the redacted wrap message. For LiteLLM-native exceptions the raw
+    message and ``.status_code`` attribute are the right surface.
+    """
+    detail: dict[str, object] = {
+        "error_type": error_type,
+        "detail": type(exc).__name__,
+    }
+    if not expose_provider_error:
+        return detail
+
+    # Exact-type dispatch on our own ``_BadRequestLLMError`` carrier (raised
+    # directly, never subclassed): it exposes scrubbed ``provider_detail`` /
+    # ``provider_status_code`` attributes, whereas a LiteLLM-native exception
+    # in the ``else`` branch is a Tier-3 SDK object we probe defensively.
+    if type(exc) is _BadRequestLLMError:
+        raw_provider_detail: str | None = exc.provider_detail
+        raw_status_code: int | None = exc.provider_status_code
+    else:
+        raw_provider_detail = str(exc).strip() or None
+        try:
+            exc_attrs = vars(exc)
+        except TypeError:
+            exc_attrs = {}
+        natural_status_code = exc_attrs.get("status_code")
+        raw_status_code = natural_status_code if type(natural_status_code) is int else None
+
+    if raw_provider_detail:
+        scrubbed = scrub_text_for_audit(raw_provider_detail).strip()
+        detail["provider_detail"] = (
+            _PROVIDER_DETAIL_REDACTED if scrubbed == _REDACTED_SECRET_DETAIL else scrubbed[:_MAX_PROVIDER_DETAIL_CHARS]
+        )
+
+    if raw_status_code is not None:
+        detail["provider_status_code"] = raw_status_code
+    return detail
+
+
+async def _handle_composer_provider_failure(
+    exc: Exception,
+    *,
+    route: Literal["messages", "recompose"],
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    composition_state_id: UUID | None,
+    progress_sink: ComposerProgressSink | None,
+    session_operation_context: SessionOperationContext,
+    expose_provider_error: bool,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
+) -> HTTPException:
+    """Publish one safe provider disposition for either Composer HTTP route."""
+    from litellm.exceptions import BadGatewayError, ServiceUnavailableError
+
+    failure = classify_provider_failure(exc)
+    if failure is None:
+        raise TypeError("Composer provider failure requires a classified SDK exception")
+    slog.error(
+        "compose_llm_provider_error",
+        route=route,
+        session_id=str(session_id),
+        exc_class=type(exc).__name__,
+    )
+    if failure.kind == "auth":
+        headline = "The composer model is not available."
+        evidence = "The model provider rejected the composer request."
+        likely_next = "Check the composer provider configuration before retrying."
+        reason: ComposerProgressReason = "provider_auth_failed"
+        error_type = "llm_auth_error"
+    elif failure.kind == "bad_request":
+        headline = "The composer model rejected this request."
+        evidence = "The model provider rejected the composer request as invalid."
+        likely_next = "Check the composer provider configuration and request options before retrying."
+        reason = "provider_unavailable"
+        error_type = "llm_unavailable"
+    elif failure.kind == "timeout":
+        headline = "The composer model did not respond in time."
+        evidence = "The model call timed out."
+        likely_next = "Retry later; if this continues, ask an administrator to investigate the model gateway."
+        reason = "provider_unavailable"
+        error_type = "llm_unavailable"
+    else:
+        headline = "The composer model is temporarily unavailable."
+        evidence = "The model provider did not complete the request."
+        likely_next = (
+            "Retry later; if this continues, ask an administrator to investigate the model gateway."
+            if isinstance(exc, (BadGatewayError, ServiceUnavailableError))
+            else "Retry when the provider is available."
+        )
+        reason = "provider_unavailable"
+        error_type = "llm_unavailable"
+    if progress_sink is not None:
+        await _publish_progress(
+            progress_sink,
+            event=ComposerProgressEvent(
+                phase="failed",
+                headline=headline,
+                evidence=(evidence,),
+                likely_next=likely_next,
+                reason=reason,
+            ),
+        )
+    llm_calls = _llm_calls_from_exception(exc)
+    if llm_calls:
+        await _persist_llm_calls(
+            service,
+            session_id,
+            llm_calls,
+            composition_state_id,
+            plugin_crash_pending=True,
+            required_audit=required_audit,
+            required_work=required_work,
+            session_operation_context=session_operation_context,
+        )
+    # Gateway 502/503 text may contain an upstream response body. The staging
+    # debug option cannot make that material safe for a user-facing surface.
+    gateway_failure = isinstance(exc, (BadGatewayError, ServiceUnavailableError)) or failure.kind == "timeout"
+    detail = _litellm_error_detail(
+        error_type,
+        exc,
+        expose_provider_error=expose_provider_error and not gateway_failure,
+    )
+    if gateway_failure:
+        detail["guidance"] = likely_next
+    return HTTPException(status_code=504 if failure.kind == "timeout" else 502, detail=detail)
+
+
+async def _handle_composer_chargeable_refusal(
+    exc: ChargeableAdmissionRefused,
+    *,
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    composition_state_id: UUID | None,
+    progress_sink: ComposerProgressSink | None,
+    session_operation_context: SessionOperationContext,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
+) -> HTTPException:
+    """Keep unknown token usage distinct from a failed provider dispatch."""
+    llm_calls = _llm_calls_from_exception(exc)
+    if llm_calls:
+        await _persist_llm_calls(
+            service,
+            session_id,
+            llm_calls,
+            composition_state_id,
+            plugin_crash_pending=True,
+            required_audit=required_audit,
+            required_work=required_work,
+            session_operation_context=session_operation_context,
+        )
+    if exc.decision.refusal_reason is AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE:
+        guidance = "Ask an administrator to reconcile token accounting before retrying."
+        if progress_sink is not None:
+            await _publish_progress(
+                progress_sink,
+                event=ComposerProgressEvent(
+                    phase="failed",
+                    headline="Token accounting is unavailable for this request.",
+                    evidence=("A new provider attempt could not be admitted.",),
+                    likely_next=guidance,
+                    reason="accounting_unavailable",
+                ),
+            )
+        return HTTPException(
+            status_code=503,
+            detail={
+                "error_type": "composer_admission_refused",
+                "failure_code": "token_accounting_unavailable",
+                "detail": "Token accounting is unavailable, so a new model call cannot start. Ask an administrator to reconcile usage before retrying.",
+                "guidance": guidance,
+            },
+        )
+    if progress_sink is not None:
+        await _publish_progress(
+            progress_sink,
+            event=ComposerProgressEvent(
+                phase="failed",
+                headline="This request was refused by the admission policy.",
+                evidence=(str(exc),),
+                likely_next="Ask an administrator to review your access and quota configuration.",
+                reason="admission_refused",
+            ),
+        )
+    return HTTPException(
+        status_code=403,
+        detail={"error_type": "composer_admission_refused", "failure_code": "admission_refused", "detail": str(exc)},
+    )
+
+
+def composition_validation_error_responses(
+    values: Sequence[CompositionValidationError] | None,
+) -> list[CompositionValidationErrorResponse] | None:
+    """Serialize checked owned errors into the strict nested HTTP shape."""
+    records = serialize_composition_validation_errors(values)
+    if records is None:
+        return None
+    return [CompositionValidationErrorResponse(**record) for record in records]
+
+
+def _validation_entry_responses(entries: Sequence[ValidationEntry]) -> list[ValidationEntryResponse]:
+    """Project owned Stage-1 warnings and suggestions into their HTTP shape."""
+    return [
+        ValidationEntryResponse(component=e.component, message=e.message, severity=e.severity, error_code=e.error_code) for e in entries
+    ]
+
+
+def _state_response(
+    state: CompositionStateRecord,
+    live_validation: ValidationSummary | None = None,
+    *,
+    policy_catalog: PolicyCatalogView | None = None,
+    degrade_unbindable_custody: bool = False,
+) -> CompositionStateResponse:
+    """Convert a CompositionStateRecord to a CompositionStateResponse.
+
+    Unfreezes container fields (MappingProxyType, tuple) into plain
+    dicts/lists so redact_source_storage_path can return redacted copies.
+
+    When live_validation is provided (from a just-computed validate() call),
+    transient warnings and suggestions are included in the response.
+    Historical loads pass None, producing null for these fields.
+    """
+    # B4: Redact internal storage paths from blob-backed sources.
+    # ``redact_source_storage_path`` guarantees the ``"sources"`` key is
+    # preserved in the returned mapping. Index directly so any
+    # future contract violation surfaces as ``KeyError`` rather than being
+    # masked by a silent fallback — silent-failure-hunter I6 review finding,
+    # 2026-05-24.
+    raw_sources = deep_thaw(state.sources)
+    sources_data = raw_sources
+    if sources_data is not None:
+        redacted = redact_source_storage_path({"sources": sources_data})
+        sources_data = redacted["sources"]
+
+    composer_meta_data = deep_thaw(state.composer_meta) if state.composer_meta is not None else None
+
+    return CompositionStateResponse(
+        id=str(state.id),
+        session_id=str(state.session_id),
+        version=state.version,
+        sources=sources_data,
+        nodes=deep_thaw(state.nodes),
+        edges=deep_thaw(state.edges),
+        outputs=deep_thaw(state.outputs),
+        metadata=deep_thaw(state.metadata_),
+        is_valid=state.is_valid,
+        validation_errors=composition_validation_error_responses(state.validation_errors),
+        validation_warnings=_validation_entry_responses(live_validation.warnings) if live_validation is not None else None,
+        validation_suggestions=_validation_entry_responses(live_validation.suggestions) if live_validation is not None else None,
+        derived_from_state_id=str(state.derived_from_state_id) if state.derived_from_state_id is not None else None,
+        created_at=state.created_at,
+        composer_meta=composer_meta_data,
+        plugin_policy_findings=_plugin_policy_findings(state, policy_catalog),
+    )
+
+
+def _plugin_policy_findings(
+    state: CompositionStateRecord,
+    policy_catalog: PolicyCatalogView | None,
+) -> list[PluginPolicyFindingResponse]:
+    """Describe persisted components unavailable in the current snapshot."""
+    if policy_catalog is None:
+        return []
+
+    components: list[tuple[str, PluginId]] = []
+
+    # ``source`` is the documented bridge for rows written before the
+    # multi-source ``sources`` column. New writers always persist ``sources``;
+    # accepting both at once would make the source of truth ambiguous.
+    sources = state.sources
+    if sources is None:
+        sources = {}
+        if state.source is not None:
+            sources = {"source": state.source}
+    elif state.source is not None:
+        raise AuditIntegrityError("persisted plugin policy source projection has both source and sources")
+    for source_name, source in sources.items():
+        if type(source_name) is not str or source_name == "":
+            raise AuditIntegrityError("persisted plugin policy source name must be a non-empty string")
+        if "plugin" not in source:
+            raise AuditIntegrityError(f"persisted plugin policy source {source_name!r} has no plugin")
+        plugin_name = source["plugin"]
+        if type(plugin_name) is not str or plugin_name == "":
+            raise AuditIntegrityError(f"persisted plugin policy source {source_name!r} plugin must be a non-empty string")
+        components.append((source_name, PluginId("source", plugin_name)))
+
+    nodes = state.nodes
+    if nodes is None:
+        nodes = ()
+    for node in nodes:
+        if "id" not in node:
+            raise AuditIntegrityError("persisted plugin policy node has no id")
+        component_id = node["id"]
+        if type(component_id) is not str or component_id == "":
+            raise AuditIntegrityError("persisted plugin policy node id must be a non-empty string")
+        if "node_type" not in node:
+            raise AuditIntegrityError(f"persisted plugin policy node {component_id!r} has no node_type")
+        node_type = node["node_type"]
+        if "plugin" not in node:
+            raise AuditIntegrityError(f"persisted plugin policy {node_type} node {component_id!r} has no plugin")
+        plugin_name = node["plugin"]
+        if node_type in ("transform", "aggregation", "collector"):
+            # Collectors are plugin-bearing: the EXPAND-group closer reuses
+            # the batch-transform plugin contract (ADR-042), so its policy
+            # lookup kind is "transform" like an aggregation's.
+            if type(plugin_name) is not str or plugin_name == "":
+                raise AuditIntegrityError(f"persisted plugin policy {node_type} node {component_id!r} plugin must be a non-empty string")
+            components.append((component_id, PluginId("transform", plugin_name)))
+        elif node_type in ("gate", "coalesce", "queue", "row_union"):
+            if plugin_name is not None:
+                raise AuditIntegrityError(f"persisted plugin policy structural node {component_id!r} plugin must be explicitly null")
+        else:
+            raise AuditIntegrityError(f"persisted plugin policy node {component_id!r} has unknown node_type {node_type!r}")
+
+    outputs = state.outputs
+    if outputs is None:
+        outputs = ()
+    for output in outputs:
+        if "name" not in output:
+            raise AuditIntegrityError("persisted plugin policy output has no canonical name")
+        component_id = output["name"]
+        if type(component_id) is not str or component_id == "":
+            raise AuditIntegrityError("persisted plugin policy output name must be a non-empty string")
+        if "plugin" not in output:
+            raise AuditIntegrityError(f"persisted plugin policy output {component_id!r} has no plugin")
+        plugin_name = output["plugin"]
+        if type(plugin_name) is not str or plugin_name == "":
+            raise AuditIntegrityError(f"persisted plugin policy output {component_id!r} plugin must be a non-empty string")
+        components.append((component_id, PluginId("sink", plugin_name)))
+
+    findings: list[PluginPolicyFindingResponse] = []
+    for component_id, plugin_id in components:
+        reason = policy_catalog.unavailable_reason(plugin_id)
+        if reason is not None:
+            findings.append(
+                PluginPolicyFindingResponse(
+                    component_id=component_id,
+                    plugin_id=str(plugin_id),
+                    reason_code=reason.value,
+                    snapshot_fingerprint=policy_catalog.snapshot.snapshot_hash,
+                )
+            )
+    return findings
+
+
+async def _durable_completion_gates(
+    service: SessionServiceProtocol,
+    session_id: UUID,
+) -> CompletionGatesDict:
+    """Fetch the prior row's completion-gate envelope for carry-forward.
+
+    Recovery persists (convergence / plugin-crash / runtime-preflight
+    failure) re-save a graph without any advisor adjudication of their own;
+    handing this envelope to :func:`_state_data_from_composer_state` keeps a
+    durable blocked advisor fact from being erased by those saves. Parsing
+    validates (Tier 1: corruption raises); re-serialization is verbatim, and
+    the fact's ``for_graph`` fingerprint downgrades it to pending wording on
+    read if the persisted graph moved.
+    """
+    graph = await service.read_current_composition_graph(session_id)
+    if graph.hydration_error is not None:
+        raise AuditIntegrityError("Cannot carry completion gates from an unreadable composition head")
+    return completion_gates_meta_from_facts(graph.effective_completion_gates)
+
+
+def merge_composer_meta_updates(
+    existing_meta: Mapping[str, Any] | None,
+    updates: Mapping[str, Any],
+) -> CompositionObject:
+    """Merge route-owned updates without dropping opaque lifecycle metadata.
+
+    ``composer_meta`` is a shared persistence envelope. Version-changing
+    writes retain keys owned by other subsystems.
+    """
+    merged = cast(CompositionObject, dict(deep_thaw(existing_meta))) if existing_meta is not None else {}
+    merged.update(updates)
+    return merged
+
+
+def _recovery_partial_state_response(state: CompositionStateRecord) -> dict[str, Any]:
+    """Serialize the persisted recovery state, including its server identity."""
+
+    return _state_response(state).model_dump(mode="json")
+
+
+def _interpretation_event_response(event: InterpretationEventRecord) -> InterpretationEventResponse:
+    """Project an :class:`InterpretationEventRecord` to its wire shape.
+
+    Field set is 1:1 with :class:`InterpretationEventResponse`. The
+    response model declares ``id``/``session_id``/``composition_state_id``
+    as ``UUID``, matching the record; Pydantic passes UUID values through
+    untouched (no str↔UUID coercion).
+    """
+    return InterpretationEventResponse(
+        id=event.id,
+        session_id=event.session_id,
+        composition_state_id=event.composition_state_id,
+        affected_node_id=event.affected_node_id,
+        tool_call_id=event.tool_call_id,
+        user_term=event.user_term,
+        kind=event.kind,
+        llm_draft=event.llm_draft,
+        accepted_value=event.accepted_value,
+        choice=event.choice,
+        created_at=event.created_at,
+        resolved_at=event.resolved_at,
+        actor=event.actor,
+        interpretation_source=event.interpretation_source,
+        model_identifier=event.model_identifier,
+        model_version=event.model_version,
+        provider=event.provider,
+        composer_skill_hash=event.composer_skill_hash,
+        surface_origin=event.surface_origin,
+        arguments_hash=event.arguments_hash,
+        hash_domain_version=event.hash_domain_version,
+        runtime_model_identifier_at_resolve=event.runtime_model_identifier_at_resolve,
+        runtime_model_version_at_resolve=event.runtime_model_version_at_resolve,
+        approved_prompt_artifact_hash=event.approved_prompt_artifact_hash,
+    )
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "composer-authored node options persisted inside composition_states — "
+        "CompositionStateRecord freezes its containers but does not promote the nested, "
+        "LLM-authored option shapes it couriers"
+    ),
+    source_param="state",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AuditIntegrityError when a node's options is not a mapping or a present "
+        "model/model_version value is not an exact str; absent model/model_version keys are "
+        "the documented no-runtime-pin case and project as None, never a fabricated default"
+    ),
+    test_ref=(
+        "tests/unit/web/sessions/routes/test_trust_boundary_helpers.py::test_extract_runtime_model_snapshot_rejects_non_string_model"
+    ),
+    test_fingerprint="4cad4f243c81c71785c876e0ef12a5cce8aa306981361fbf7b23fbcf3405c16f",
+)
+def _extract_runtime_model_snapshot(
+    state: CompositionStateRecord,
+    node_id: str | None,
+) -> tuple[str | None, str | None]:
+    """Extract (model_identifier, model_version) for the affected LLM node (F-19).
+
+    ``state.nodes`` is typed ``Sequence[Mapping[str, Any]] | None`` so the
+    Mapping shape is guaranteed; ``id`` and ``options`` are structurally
+    required keys (KeyError on absence is correct behaviour). The nested
+    option values are composer-authored Tier-3 content couriered by the
+    record — this function is their declared parse boundary (see the
+    ``@trust_boundary`` metadata above). ``options.model`` and
+    ``options.model_version`` are *optional* keys by design — an LLM
+    transform without an explicit pin uses an LLM-pack default at runtime.
+    The audit row's columns are nullable; recording ``None`` accurately
+    reflects "no runtime model pinned in composition state" without
+    fabricating a default.
+
+    A non-string value at one of the optional keys is malformed content.
+    It is raised as :class:`AuditIntegrityError` rather than coerced or
+    returned as NULL — a coerce would put garbage into the audit row, a
+    NULL would hide the writer-side bug. ``type(value) is str`` is used
+    rather than ``isinstance`` so callers (and the tier-model gate) can
+    see the offensive check is exact-type, not duck-typed.
+    """
+    if node_id is None or state.nodes is None:
+        return None, None
+    for node in state.nodes:
+        if node["id"] != node_id:
+            continue
+        options = node["options"]
+        if not isinstance(options, Mapping):
+            raise AuditIntegrityError(
+                f"Tier 1 audit anomaly: node {node_id!r}.options is "
+                f"{type(options).__name__!r}, expected mapping. The composition_state "
+                f"writer guarantees an options mapping for LLM nodes."
+            )
+        identifier = options.get("model")
+        version = options.get("model_version")
+        if identifier is not None and type(identifier) is not str:
+            raise AuditIntegrityError(
+                f"Tier 1 audit anomaly: node {node_id!r}.options.model is "
+                f"{type(identifier).__name__!r}, expected str. The composition_state "
+                f"writer guarantees a str-or-absent shape for this key."
+            )
+        if version is not None and type(version) is not str:
+            raise AuditIntegrityError(
+                f"Tier 1 audit anomaly: node {node_id!r}.options.model_version is "
+                f"{type(version).__name__!r}, expected str. The composition_state "
+                f"writer guarantees a str-or-absent shape for this key."
+            )
+        return identifier, version
+    return None, None
+
+
+_PreflightExceptionPolicy = Literal["raise", "persist_invalid"]
+_ComposerPreflightTelemetryResult = Literal["passed", "failed", "exception"]
+_ComposerPreflightTelemetrySource = Literal[
+    "compose",
+    "recompose",
+    "convergence",
+    "plugin_crash",
+    "runtime_preflight",
+    "yaml_export",
+    "state_seed",
+    # Path-1 cached re-raise — composer.compose() re-raised a previously-
+    # cached runtime-preflight failure via web/composer/service.py:
+    # _raise_cached_runtime_preflight_failure. Distinct from "compose" to
+    # let operators separate first-time preflight failures (source=compose,
+    # emitted by _state_data_from_composer_state's raise arm) from
+    # cache-hit re-raises (source=cached_preflight, emitted at the route
+    # outer catch). See elspeth-0891e8da73.
+    "cached_preflight",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimePreflightFailed:
+    """Sentinel for internal preflight failure during composer state persistence.
+
+    Carries structured diagnostic fields so the persisted state's
+    ``validation_errors`` row attributes the failure (exception class,
+    first line of the message, ``file:line:function`` frames) instead of
+    the legacy opaque ``["runtime_preflight_failed"]`` sentinel — which
+    forced operators to ``/state/revert`` because the audit row had
+    nowhere to record triage data (slog deliberately omits ``exc_info``
+    to avoid leaking secret-bearing ``__cause__`` chains; the OTel
+    counter only carries the bounded exception_class bucket).
+
+    Frame strings are ``file:line:function`` only — never source-line
+    text or local-variable repr — so secret-bearing values that may
+    live in plugin config dicts, DB connection strings, or bound SQL
+    parameters do not enter the audit row. See
+    :func:`_safe_frame_strings` for the capture rule.
+
+    The fields are optional (with empty defaults) so the ``with no
+    diagnostics captured`` legacy path — preserved for the
+    ``_RUNTIME_PREFLIGHT_FAILED`` module-level constant referenced by
+    older tests — continues to produce the bare sentinel through
+    :func:`_composer_persisted_validation`.
+    """
+
+    exception_class: str | None = None
+    exception_message_first_line: str = ""
+    frames: tuple[str, ...] = ()
+
+
+_RUNTIME_PREFLIGHT_FAILED = _RuntimePreflightFailed()
+_RuntimePreflightOutcome = ValidationResult | _RuntimePreflightFailed | None
+
+# Bound on diagnostic detail captured for runtime-preflight failures. Keeps
+# the audit row, structured response body, and slog event size predictable
+# regardless of how deep the failing call stack is.
+_RUNTIME_PREFLIGHT_FRAME_LIMIT = 6
+_RUNTIME_PREFLIGHT_MESSAGE_LIMIT = 240
+
+
+def _first_message_line(text: str) -> str:
+    """Return the first non-empty line of an exception's str(), trimmed.
+
+    ``str(exc)`` may contain newlines, embedded SQL fragments, or
+    Pydantic-style multi-line dumps. The audit row only retains the
+    leading message line so a bounded, scannable signal lands in
+    ``validation_errors`` even when the underlying exception's repr is
+    sprawling.
+    """
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def _safe_frame_strings(
+    exc: BaseException,
+    *,
+    max_frames: int = _RUNTIME_PREFLIGHT_FRAME_LIMIT,
+) -> tuple[str, ...]:
+    """Format ``exc.__traceback__`` (and ``__cause__`` chain) frames.
+
+    Returns a bounded tuple of ``frame=<file>:<line>:<function>`` strings
+    drawn from the live traceback, walking the ``__cause__`` chain so a
+    ``raise ... from ...`` boundary inside the failing helper does not
+    cut diagnostics short.
+
+    Includes only file path, line number, and function name. **Never**
+    captures source-line text, local-variable repr, or exception values
+    that ``traceback.format_exception`` would render — secret-bearing
+    plugin config values, DB connection strings, and bound SQL
+    parameters can flow through those surfaces and the audit row /
+    structured server log must not retain them. File paths reference
+    the on-disk source tree, which the operator already has access to
+    under ELSPETH's single-operator deployment model (see the
+    ``_compose_preflight_failure_message`` comment in
+    ``web/composer/service.py`` for the deployment-shape caveat).
+
+    Frames are emitted in walked order — outermost frame of the original
+    exception first, then deeper frames, then the next ``__cause__``.
+    The ``max_frames`` cap is shared across the entire chain so the
+    audit row size stays predictable regardless of stack depth.
+    """
+    frames: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and len(frames) < max_frames:
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+        tb = current.__traceback__
+        while tb is not None and len(frames) < max_frames:
+            f = tb.tb_frame
+            frames.append(f"frame={f.f_code.co_filename}:{tb.tb_lineno}:{f.f_code.co_name}")
+            tb = tb.tb_next
+        current = current.__cause__
+    return tuple(frames)
+
+
+def _runtime_preflight_failure_errors(
+    exception_class: str,
+    exception_message_first_line: str,
+    frames: Sequence[str],
+) -> list[CompositionValidationError]:
+    """Preserve bounded diagnostics with a directly owned failure code.
+
+    The sentinel has a known code. Other permitted diagnostic strings remain
+    message-only records; no identity is inferred from their prose.
+    """
+    truncated_msg = exception_message_first_line[:_RUNTIME_PREFLIGHT_MESSAGE_LIMIT]
+    return [
+        CompositionValidationError(message="runtime_preflight_failed", error_code="runtime_preflight_failed", component=None),
+        CompositionValidationError(message=f"exception_class={exception_class}", error_code=None, component=None),
+        CompositionValidationError(message=f"exception_message={truncated_msg}", error_code=None, component=None),
+        *(CompositionValidationError(message=frame, error_code=None, component=None) for frame in frames),
+    ]
+
+
+def _capture_runtime_preflight_failure(exc: BaseException) -> _RuntimePreflightFailed:
+    """Build a :class:`_RuntimePreflightFailed` with structured diagnostics.
+
+    Single source of truth for the capture: any new raise site that
+    converts an unexpected runtime-preflight exception to a
+    persist-invalid sentinel must use this helper so the audit-row
+    attribution is uniform.
+    """
+    return _RuntimePreflightFailed(
+        exception_class=type(exc).__name__,
+        exception_message_first_line=_first_message_line(str(exc)),
+        frames=_safe_frame_strings(exc),
+    )
+
+
+_COMPOSER_RUNTIME_PREFLIGHT_COUNTER = metrics.get_meter(__name__).create_counter(
+    "composer.runtime_preflight.total",
+    unit="1",
+    description="Count of composer runtime preflight outcomes by route and result",
+)
+_COMPOSER_AUTHORING_VALIDATION_COUNTER = metrics.get_meter(__name__).create_counter(
+    "composer.authoring_validation.total",
+    unit="1",
+    description="Count of composer authoring-state validation outcomes by route and result",
+)
+
+# Composer-request lifecycle telemetry — answers the operator question
+# "what's running on this server right now?" without requiring a per-session
+# /composer-progress poll. UpDownCounter is a gauge: incremented when a
+# request enters the compose-engaged window (after rate limit + ownership
+# check + initial user-message persistence) and decremented in a finally
+# clause regardless of outcome. The terminal counter records the outcome
+# distribution, with one terminal event per request matching the in-flight
+# decrement. session_id is intentionally NOT a metric attribute (cardinality
+# explosion) — per-session attribution lives on the progress snapshot.
+_ComposerRequestEndpoint = Literal["send_message", "recompose"]
+_ComposerRequestTerminalStatus = Literal["completed", "failed", "timed_out", "cancelled"]
+
+
+@dataclass(frozen=True)
+class _FreeformContinuationReceipt:
+    """A fully projected freeform turn whose terminal progress was published."""
+
+    response: MessageWithStateResponse
+    terminal_status: Literal["completed"] = "completed"
+
+
+@dataclass(frozen=True)
+class _FreeformChildFailure:
+    """An observed child error retained for one route-level propagation."""
+
+    error: Exception | asyncio.CancelledError
+
+
+async def _capture_freeform_child[T](awaitable: Awaitable[T]) -> T | _FreeformChildFailure:
+    """Keep lease-owned children successful while the route inspects faults.
+
+    Lease close otherwise rethrows a child error already translated by the
+    route and groups it with that HTTP response. The route joins immediately,
+    inspects this envelope, and propagates the original error exactly once.
+    """
+    try:
+        return await awaitable
+    except (Exception, asyncio.CancelledError) as exc:
+        return _FreeformChildFailure(exc)
+
+
+def _freeform_child_result[T](outcome: T | _FreeformChildFailure) -> T:
+    """Propagate one inspected child fault without replaying it at lease close."""
+    if isinstance(outcome, _FreeformChildFailure):
+        if isinstance(outcome.error, asyncio.CancelledError):
+            raise AuditIntegrityError("Freeform continuation cancelled before settlement") from outcome.error
+        raise outcome.error
+    return outcome
+
+
+@overload
+async def _join_shielded_task_after_cancellation[T](task: asyncio.Task[T]) -> T: ...
+
+
+@overload
+async def _join_shielded_task_after_cancellation[T](task: asyncio.Task[T], *, primary_cancellation: asyncio.CancelledError) -> T | None: ...
+
+
+async def _join_shielded_task_after_cancellation[T](
+    task: asyncio.Task[T], *, primary_cancellation: asyncio.CancelledError | None = None
+) -> T | None:
+    """Join an owned cleanup task despite repeated caller cancellation."""
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+        except BaseException:
+            if not task.done():
+                raise
+    try:
+        return task.result()
+    except BaseException as child_error:
+        if primary_cancellation is None:
+            raise
+        fatal = (
+            child_error.subgroup(contract_errors.TIER_1_ERRORS) is not None
+            if isinstance(child_error, BaseExceptionGroup)
+            else isinstance(child_error, contract_errors.TIER_1_ERRORS)
+        )
+        if fatal:
+            raise child_error from primary_cancellation
+        if isinstance(child_error, asyncio.CancelledError):
+            raise AuditIntegrityError("Shielded cleanup task was cancelled before completion") from primary_cancellation
+        if not isinstance(child_error, Exception):
+            raise
+        primary_cancellation.add_note(f"Shielded cleanup also failed with {type(child_error).__name__}.")
+        previous_cause = primary_cancellation.__cause__
+        primary_cancellation.__cause__ = (
+            child_error if previous_cause is None else BaseExceptionGroup("Shielded cleanup failures", [previous_cause, child_error])
+        )
+        return None
+
+
+async def _join_freeform_owned_task[T](
+    task: asyncio.Task[T], *, cancellation_observations: list[asyncio.CancelledError] | None = None
+) -> tuple[T, asyncio.CancelledError | None]:
+    """Join one required continuation through repeated caller cancellation.
+
+    The caller retains its operation lease and compose lock while joining.
+    A child that cancels itself has not proved settlement, even if the HTTP
+    caller happened to cancel in the same event-loop turn.
+    """
+    first_cancellation: asyncio.CancelledError | None = None
+    owner = asyncio.current_task()
+    if owner is None:
+        raise RuntimeError("Freeform settlement requires an owning request task")
+    while True:
+        try:
+            return await asyncio.shield(task), first_cancellation
+        except asyncio.CancelledError as exc:
+            if owner.cancelling():
+                owner.uncancel()
+                if cancellation_observations is not None and all(exc is not original for original in cancellation_observations):
+                    cancellation_observations.append(exc)
+                if first_cancellation is None:
+                    first_cancellation = exc
+            if task.done():
+                if task.cancelled():
+                    raise AuditIntegrityError("Freeform continuation cancelled before settlement") from exc
+                return task.result(), first_cancellation
+
+
+_COMPOSER_REQUESTS_INFLIGHT = metrics.get_meter(__name__).create_up_down_counter(
+    "composer.requests.inflight",
+    unit="1",
+    description="Current count of in-flight composer message requests by endpoint",
+)
+_COMPOSER_REQUEST_TERMINAL_COUNTER = metrics.get_meter(__name__).create_counter(
+    "composer.request.terminal.total",
+    unit="1",
+    description="Count of completed composer message requests by endpoint and terminal status",
+)
+
+# Audit-primacy counters for the route-side persistence helpers
+# (``_persist_tool_invocations``, ``_persist_llm_calls``). These mirror the
+# SessionServiceImpl-side counters in ``web/sessions/telemetry.py`` by
+# OTel metric name so dashboards aggregate; the route helpers use module-
+# level access (consistent with the other route counters above) rather
+# than threading the SessionsTelemetry container through every helper.
+# The ``helper`` attribute discriminates which row family failed
+# (``tool_invocations`` vs ``llm_calls``).
+_COMPOSER_TIER1_VIOLATION_COUNTER = metrics.get_meter(__name__).create_counter(
+    "composer.audit.tool_row_tier1_violation_total",
+    unit="1",
+    description=(
+        "Count of Tier-1 audit-row persist failures on the success path "
+        "(assistant row already written; tool/LLM-call audit row failed). "
+        "Each increment is paired with an AuditIntegrityError raise."
+    ),
+)
+_COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER = metrics.get_meter(__name__).create_counter(
+    "composer.audit.tool_row_persist_failed_during_unwind_total",
+    unit="1",
+    description=(
+        "Count of prepared audit rows in failed persistence attempts on the unwind "
+        "path (a primary failure was already in flight; the failure is "
+        "recorded but does not raise so it cannot mask the primary "
+        "exception). Includes private diagnostic drafts; replay deduplication "
+        "means this is not a count of newly lost durable rows."
+    ),
+)
+
+
+def _record_composer_request_terminal(
+    status: _ComposerRequestTerminalStatus,
+    *,
+    endpoint: _ComposerRequestEndpoint,
+) -> None:
+    mark_composer_request_terminal(status)
+    _COMPOSER_REQUEST_TERMINAL_COUNTER.add(1, {"endpoint": endpoint, "status": status})
+
+
+_COMPOSER_EXCEPTION_CLASS_BUCKETS = frozenset(
+    {
+        "AttributeError",
+        "ComposerRuntimePreflightError",
+        "FileNotFoundError",
+        "GraphValidationError",
+        "ImportError",
+        "OSError",
+        "PermissionError",
+        "PluginConfigError",
+        "PluginNotFoundError",
+        "RuntimeError",
+        "TimeoutError",
+        "TypeError",
+        "ValueError",
+    }
+)
+_OTHER_COMPOSER_EXCEPTION_CLASS = "other"
+
+
+def _bounded_composer_exception_class(exception_class: str | None) -> str | None:
+    if exception_class is None:
+        return None
+    if exception_class in _COMPOSER_EXCEPTION_CLASS_BUCKETS:
+        return exception_class
+    return _OTHER_COMPOSER_EXCEPTION_CLASS
+
+
+def _record_composer_runtime_preflight_telemetry(
+    result: _ComposerPreflightTelemetryResult,
+    *,
+    source: _ComposerPreflightTelemetrySource,
+    exception_class: str | None = None,
+) -> None:
+    attrs: dict[str, str] = {"result": result, "source": source}
+    bounded_exception_class = _bounded_composer_exception_class(exception_class)
+    if bounded_exception_class is not None:
+        attrs["exception_class"] = bounded_exception_class
+    _COMPOSER_RUNTIME_PREFLIGHT_COUNTER.add(1, attrs)
+
+
+def _record_composer_authoring_validation_telemetry(
+    result: _ComposerPreflightTelemetryResult,
+    *,
+    source: _ComposerPreflightTelemetrySource,
+    exception_class: str | None = None,
+) -> None:
+    attrs: dict[str, str] = {"result": result, "source": source}
+    bounded_exception_class = _bounded_composer_exception_class(exception_class)
+    if bounded_exception_class is not None:
+        attrs["exception_class"] = bounded_exception_class
+    _COMPOSER_AUTHORING_VALIDATION_COUNTER.add(1, attrs)
+
+
+def _composer_history_content(message: ChatMessageRecord) -> str:
+    """Return the content sent back to the composer LLM for a stored message.
+
+    All composer synthesis shapes are augmentations (see
+    service._finalize_no_tool_response). The model's prose is preserved
+    verbatim with an operator-facing suffix appended; ``content`` starts
+    with ``raw_content``. The LLM should see its own prose unmodified
+    on subsequent turns; the operator-facing suffix stays out of the
+    prompt history.
+
+    Equality (``content == raw_content``) is augmentation with an empty
+    suffix and returns ``raw_content`` unchanged. Empty ``raw_content``
+    (the no-mutation, preflight-invalid empty-state, and
+    preflight-invalid non-empty-state augmentation branches in
+    ``service._finalize_no_tool_response`` when the model emitted no
+    prose) is augmentation by the structural rule: the model produced
+    no prose and the operator-facing suffix replaces nothing — so the
+    LLM sees an empty prior turn and the operator-facing suffix stays
+    out of the prompt history.
+
+    The structural rule's correctness depends on the producer never
+    emitting a non-augmentation shape (``content`` not starting with
+    ``raw_content``). This is mechanically enforced at construction by
+    ``service._enforce_augmentation_prefix_invariant``. A row reaching
+    this discriminator that violates the contract is an audit-integrity
+    violation and crashes here rather than silently misroute. The
+    field-level overloading that makes the structural discriminator
+    necessary at all is tracked as architectural debt at
+    ``elspeth-7ae1732ab2`` (introduce a producer-side discriminator
+    field on the record).
+    """
+    if message.role == "assistant" and message.raw_content is not None:
+        if not message.content.startswith(message.raw_content):
+            raise AuditIntegrityError(
+                "Tier 1: composer chat row violates augmentation prefix "
+                "invariant on the read path. content does not start with "
+                "raw_content. All synthesis shapes are augmentations "
+                "post-elspeth-9cfbad6901; a row reaching this discriminator "
+                "that breaks the contract is an audit-integrity violation. "
+                "Fix the producer (service._finalize_no_tool_response) "
+                "or the row (drop the audit DB if the row predates the "
+                "augmentation-only migration; per project_db_migration_policy, "
+                "operator deletes the old DB on schema-shape changes)."
+            )
+        # Augmentation (incl. equality and empty raw_content): emit
+        # unmodified model prose. The operator-facing suffix stays
+        # out of LLM history.
+        return message.raw_content
+    return message.content
+
+
+def composer_turn_end_assistant_row(result: ComposerResult) -> TransitionAssistantDraft:
+    """Return the content/raw_content pair for the turn-end assistant row.
+
+    Both turn-end writers (``routes/messages.py`` send_message and
+    ``routes/composer/compose.py`` recompose) used to persist ``result.message``
+    verbatim. When the compose loop terminates AT a tool-dispatch turn — the
+    staged interpretation-review handoff is the reachable case — the model's
+    last prose IS that turn's prose, which ``turn_audit.persist_compose_turn_async``
+    has already committed as an assistant row with its ``tool_calls`` envelope.
+    The turn-end write then put the same prose in the transcript a second time,
+    with only the backend suffix to tell the copies apart, and
+    ``_composer_conversation_messages`` shows both (elspeth-d581b3da7f; live
+    session 891b7b1e persisted them 99ms apart).
+
+    The row this returns carries ONLY the backend-authored suffix, with
+    ``raw_content=""``. That is the shape ``_composer_history_content``
+    documents for backend chrome: the LLM sees an empty prior turn, so the
+    suffix stays out of prompt history, and the augmentation-prefix read-path
+    invariant still holds. ``visible_message_segments`` recognises the bare
+    suffix through its ``raw_content == ""`` arm and mints it as one
+    ``TrustedSystemNoticeSegment``, so the disclosure keeps its backend
+    provenance instead of being published as model prose.
+
+    Recognising the re-emission starts with the producer-minted
+    ``persisted_assistant_matches_terminal_model_turn`` identity proof. When
+    true, two byte-level invariants make the subtraction exact:
+
+    * ``raw_assistant_content == persisted_assistant_content`` — the terminal
+      turn's pre-synthesis prose is exactly what the committed row holds.
+    * ``message.startswith(...)`` — the augmentation-prefix contract, so the
+      split is exact.
+
+    Bytes alone cannot establish turn identity: a tool-call turn commonly
+    carries no prose, making the prefix test vacuous, while the B-4D-3
+    last-chance finalize can produce later-turn prose byte-identical to an
+    earlier persisted row. The explicit flag declines both later-turn shapes,
+    and it declines the advisor-repair branch too, whose row deliberately holds
+    a fixed public message rather than the turn's prose.
+
+    A false identity flag fails toward persisting the full message — the
+    pre-fix behaviour — never toward dropping model prose. A true flag with
+    inconsistent bytes is an owned audit-invariant violation and fails closed.
+
+    Returns ``TransitionAssistantDraft`` because it already IS this pair with
+    the audit-boundary type assertions, and because returning a value rather
+    than two locals keeps callers honest: both routes rebind ``result`` on the
+    auto-commit-revoked branch, so a pair computed once at the top of the
+    handler goes stale. Call this next to the writer that consumes it.
+    """
+    if not result.persisted_assistant_matches_terminal_model_turn:
+        return TransitionAssistantDraft(content=result.message, raw_content=result.raw_assistant_content)
+    persisted = result.persisted_assistant_content
+    if persisted is None or result.raw_assistant_content != persisted or not result.message.startswith(persisted):
+        raise AuditIntegrityError(
+            "Tier 1: ComposerResult claims the persisted assistant row matches "
+            "the terminal model turn, but its content/prefix invariants disagree."
+        )
+    suffix = result.message[len(persisted) :]
+    if not suffix:
+        # Unreachable by construction: the only producer that satisfies the
+        # predicate is the staged-handoff branch, and it always appends a
+        # non-empty canonical suffix. Reaching here means a producer built a
+        # turn-end message byte-identical to a row already in the transcript,
+        # so the alternatives are committing an exact duplicate or committing
+        # an empty bubble. Fail closed instead — the route's failed-turn
+        # machinery reports it with the audit trail intact.
+        raise AuditIntegrityError(
+            "Tier 1: composer turn-end message is byte-identical to the "
+            "assistant row the compose loop already committed "
+            f"(id={result.persisted_assistant_message_id!r}), leaving no "
+            "backend-authored suffix to persist. Writing it would duplicate "
+            "the row verbatim in the operator's transcript."
+        )
+    return TransitionAssistantDraft(content=suffix, raw_content="")
+
+
+def _is_composer_audit_tool_message(message: ChatMessageRecord) -> bool:
+    """Return true when a persisted chat row is an audit-only composer row.
+
+    Rev-4: ``role="audit"`` rows are unconditionally audit-only — they exist
+    precisely because there is no parent assistant to carry a real
+    ``role="tool"`` row. The legacy ``role="tool"`` audit-envelope path is
+    preserved for the dispatch trail of in-loop tool calls produced by the
+    compose loop; those rows are excluded from prompt history because
+    replaying them without the assistant's tool-call request would create
+    orphan OpenAI tool messages.
+    """
+    if message.role == "audit":
+        return True
+    if message.role != "tool":
+        return False
+    if message.tool_calls is None:
+        return True
+    for tool_call in message.tool_calls:
+        if "_kind" not in tool_call:
+            continue
+        kind = tool_call["_kind"]
+        if kind in {"audit", "llm_call_audit"}:
+            return True
+        if kind is not None:
+            return True
+    return True
+
+
+def _is_composer_llm_audit_tool_message(message: ChatMessageRecord) -> bool:
+    """Return true for the paired planner evidence exposed by the LLM audit view.
+
+    Rev-4: LLM-call audit rows are persisted with ``role="audit"`` (they
+    have no real OpenAI tool-call identity, so they cannot be ``role="tool"``
+    after the parent-CHECK biconditional landed). Planner-attempt rows are
+    the value-free semantic half of that physical-call evidence, so the same
+    explicit audit-grade opt-in returns both halves while the default chat
+    view excludes both.
+    """
+    if message.role != "audit" or message.tool_calls is None:
+        return False
+    return any(
+        "_kind" in tool_call and tool_call["_kind"] in {"llm_call_audit", "planner_attempt_audit"} for tool_call in message.tool_calls
+    )
+
+
+def _composer_conversation_messages(messages: Sequence[ChatMessageRecord]) -> list[ChatMessageRecord]:
+    """Return persisted messages that are part of the LLM conversation."""
+    return [message for message in messages if not _is_composer_audit_tool_message(message)]
+
+
+def _composer_conversation_or_llm_audit_messages(messages: Sequence[ChatMessageRecord]) -> list[ChatMessageRecord]:
+    """Return conversation plus paired physical-call and semantic-attempt audit sidecars."""
+    return [message for message in messages if not _is_composer_audit_tool_message(message) or _is_composer_llm_audit_tool_message(message)]
+
+
+def _composer_conversation_or_tool_messages(messages: Sequence[ChatMessageRecord]) -> list[ChatMessageRecord]:
+    """Return user-visible conversation plus real assistant-linked tool rows."""
+
+    return [message for message in messages if message.role == "tool" or not _is_composer_audit_tool_message(message)]
+
+
+def _composer_conversation_tool_or_llm_audit_messages(messages: Sequence[ChatMessageRecord]) -> list[ChatMessageRecord]:
+    """Return conversation, tool rows, and paired planner audit sidecars."""
+
+    return [
+        message
+        for message in messages
+        if message.role == "tool" or not _is_composer_audit_tool_message(message) or _is_composer_llm_audit_tool_message(message)
+    ]
+
+
+def _composer_chat_history(messages: Sequence[ChatMessageRecord]) -> list[ComposerHistoryMessage]:
+    """Convert persisted session messages to LLM chat history.
+
+    ``raw_content`` is attribution/audit data and feeds the LLM-context
+    decision in ``_composer_history_content``. All assistant-synthesis
+    shapes are augmentations (see ``service._finalize_no_tool_response``
+    and ``_composer_history_content`` for the policy): the model's
+    prose is preserved verbatim and an operator-facing suffix is
+    appended. The LLM sees its own prose unmodified on subsequent
+    turns; the suffix stays out of the prompt.
+
+    Provider-visible composer control rows are persisted as ``role="audit"``
+    with a closed envelope; they are decoded back to their exact provider role
+    here. Exact human-user rows receive a route-owned internal authorship
+    marker; ``prompts.build_messages`` strips it before provider dispatch.
+    Composer tool-call audit rows are persisted as ``role="tool"`` messages so
+    the session record retains the dispatch trail. They are not prior LLM
+    dialogue turns: replaying them without the in-loop assistant tool-call
+    request that produced them creates orphan OpenAI tool messages. Keep them
+    in storage, but exclude them from prompt history and normal chat responses.
+    """
+    from elspeth.web.composer.diagnostic_evidence import is_diagnostic_evidence_envelope
+
+    history: list[ComposerHistoryMessage] = []
+    for message in messages:
+        if message.tool_calls is not None and any(is_diagnostic_evidence_envelope(envelope) for envelope in message.tool_calls):
+            if message.role != "audit" or len(message.tool_calls) != 1 or message.writer_principal != "compose_loop":
+                raise AuditIntegrityError("Private Composer evidence requires a dedicated Composer audit row")
+            continue
+        control = replay_composer_control_message(
+            stored_role=message.role,
+            writer_principal=message.writer_principal,
+            content=message.content,
+            tool_calls=message.tool_calls,
+        )
+        if control is not None:
+            history.append(ComposerHistoryMessage(role=control["role"], content=control["content"]))
+        elif not _is_composer_audit_tool_message(message):
+            history_message = ComposerHistoryMessage(role=message.role, content=_composer_history_content(message))
+            if message.role == "user" and message.writer_principal in {"route_user_message", "session_fork"}:
+                history_message["_elspeth_user_authored"] = True
+                history_message["_elspeth_user_message_id"] = str(message.id)
+            history.append(history_message)
+    return history
+
+
+def _chat_ingress_inputs(messages: Sequence[ChatMessageRecord], *, own_compartment_id: str | None) -> list[ChatIngressInput]:
+    """Collect exact persisted human inputs in transcript order, without their text."""
+    return [
+        chat_ingress_input(str(message.id), message.content, own_compartment_id=own_compartment_id)
+        for message in messages
+        if message.role == "user" and message.writer_principal in {"route_user_message", "session_fork"}
+    ]
+
+
+def _composer_persisted_validation(
+    authoring: ValidationSummary,
+    runtime_preflight: _RuntimePreflightOutcome,
+) -> tuple[bool, list[CompositionValidationError] | None]:
+    """Return persisted validity/errors for a composer-produced state.
+
+    Runtime crashes retain a directly coded failure record followed by the
+    existing bounded diagnostic messages. Validator outcomes carry their
+    owned code and component directly. No diagnostic prose is parsed to
+    manufacture identity, and opaque runtime failure remains invalid.
+    """
+    # Exact-type dispatch on our own ``_RuntimePreflightOutcome`` union
+    # (``ValidationResult | _RuntimePreflightFailed | None``). ``type() is``
+    # rather than ``isinstance`` because these are first-party, non-subclassed
+    # types and exact dispatch is the intended contract. Each member is matched
+    # by a positive ``type() is`` test (which narrows for the type checker)
+    # rather than relying on negative narrowing of a single branch.
+    if type(runtime_preflight) is _RuntimePreflightFailed:
+        if runtime_preflight.exception_class is None:
+            return False, [
+                CompositionValidationError(message="runtime_preflight_failed", error_code="runtime_preflight_failed", component=None)
+            ]
+        return False, _runtime_preflight_failure_errors(
+            runtime_preflight.exception_class,
+            runtime_preflight.exception_message_first_line,
+            runtime_preflight.frames,
+        )
+    if type(runtime_preflight) is ValidationResult:
+        messages = [
+            CompositionValidationError(message=error.message, error_code=error.error_code, component=error.component_id)
+            for error in runtime_preflight.errors
+        ]
+        return runtime_preflight.is_valid, messages or None
+    if authoring.is_valid:
+        raise ValueError("Composer persistence for authoring-valid state requires runtime preflight outcome")
+    messages = [
+        CompositionValidationError(message=error.message, error_code=error.error_code, component=error.component)
+        for error in authoring.errors
+    ]
+    return authoring.is_valid, messages or None
+
+
+async def _runtime_preflight_for_state(
+    state: CompositionState,
+    *,
+    settings: Any,
+    secret_service: Any | None,
+    user_id: str | None,
+    session_id: str | UUID,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    profile_registry: OperatorProfileRegistry,
+    catalog: CatalogServiceProtocol,
+) -> ValidationResult:
+    return await asyncio.wait_for(
+        run_sync_in_worker(
+            validate_pipeline,
+            state,
+            settings,
+            yaml_generator,
+            secret_service=secret_service,
+            secret_wiring_policy=runtime_secret_wiring_policy(settings.secret_wiring_allowlist),
+            user_id=user_id,
+            session_id=str(session_id),
+            plugin_snapshot=plugin_snapshot,
+            profile_registry=profile_registry,
+            catalog=catalog,
+        ),
+        timeout=settings.composer_runtime_preflight_timeout_seconds,
+    )
+
+
+async def _persist_tool_invocations(
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    tool_invocations: tuple[ComposerToolInvocation, ...],
+    composition_state_id: UUID | None,
+    *,
+    parent_assistant_id: UUID | None = None,
+    plugin_crash_pending: bool,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
+    session_operation_context: SessionOperationContext,
+    session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
+) -> tuple[PipelineDispatchAuditBinding, ...]:
+    """Persist per-tool-call audit records, splitting role by parent presence.
+
+    Rev-4: when ``parent_assistant_id`` is supplied (success-path callers
+    after the assistant row was persisted), the row uses ``role="tool"``
+    with the OpenAI-shaped tool-call linkage. When the caller has no
+    assistant row (failure / convergence / preflight paths), the row uses
+    ``role="audit"`` — an internal-only role for audit breadcrumbs that
+    cannot satisfy the ``ck_chat_messages_parent_role`` /
+    ``ck_chat_messages_tool_call_id_role`` biconditional CHECKs.
+
+    Each :class:`ComposerToolInvocation` still lands as one chat row whose
+    ``tool_calls`` JSON column carries an ``_kind="audit"`` envelope. Legacy
+    drains pass through the redaction manifest before writing this row so
+    ``chat_messages`` does not double-mirror sensitive tool arguments/results.
+
+    ``content`` shape per status:
+
+    - SUCCESS or ARG_ERROR with payload: the redacted projection of
+      ``invocation.result_canonical`` for manifest-declared tools, or the
+      original canonical payload for tools with no redaction surface.
+    - PLUGIN_CRASH (no payload): synthetic JSON with ``error_class`` only.
+      The LLM never saw a result on this path; the tool row records that
+      a crash occurred at this position in the dispatch sequence.
+
+    ``composition_state_id`` is the post-compose state id when this turn
+    advanced state, else ``None``. All tool rows from one turn share this
+    id; the per-call audit envelope's ``version_before``/``version_after``
+    captures the per-call state delta.
+
+    Audit primacy disposition (caller-driven via ``plugin_crash_pending``).
+    Mirrors :meth:`SessionServiceImpl.persist_compose_turn` exactly —
+    same name, same semantics:
+
+    - ``plugin_crash_pending=False`` (success path): the assistant row
+      was already written and we are about to return success. A
+      SQLAlchemyError here means the assistant message exists in the
+      audit trail but the tool rows that prove what the LLM saw are
+      missing. That is a Tier-1 audit corruption ("I don't know what
+      happened" is never an acceptable answer — ARCHITECTURE.md §Design
+      Principles). Increment the
+      Tier-1 counter and raise :class:`AuditIntegrityError` chained
+      through the SQLAlchemyError. The request will 500 with the chained
+      cause visible to the operator.
+
+    - ``plugin_crash_pending=True`` (unwind / recovery path): the
+      caller already has a primary failure in hand
+      (ConvergenceError / PluginCrashError / RuntimePreflightError /
+      LLM provider error / CancelledError) and is calling this helper to
+      record audit detail of what happened. Raising
+      AuditIntegrityError here would mask the original failure, which is
+      what the operator needs to see. Increment the
+      "persist failed during unwind" counter, slog the audit-system
+      failure (the slog is permitted under the logging-telemetry-policy skill
+      §Logging Policy because the
+      audit system itself failed — telemetry has nowhere to write the
+      structured event), and continue. The unwind disposition is
+      observable via the counter increment + slog event; the partial
+      tool-trail is observable on read-back via per-message ``tool_calls``
+      count vs. ``ComposerResult.tool_invocations`` length.
+    """
+    if not tool_invocations:
+        return ()
+    producer = sql = projection = None
+    if required_work is not None:
+        if required_work.authority.context != session_operation_context:
+            raise AuditIntegrityError("Required audit work belongs to another exact fence")
+        producer, sql, projection = required_work.reserve_audit_work(
+            RequiredWorkSource.DISPATCH_AUDIT_SQL,
+            RequiredWorkSource.DISPATCH_AUDIT_PROJECTION,
+            transition_ordinal=0,
+            semantic_ordinal=0,
+        )
+    try:
+        role: ChatMessageRole = "tool" if parent_assistant_id is not None else "audit"
+        drafts: list[AuditMessageDraft] = []
+        pipeline_bindings: list[PipelineDispatchAuditBinding] = []
+        for invocation in tool_invocations:
+            content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+            drafts.extend(private_diagnostic_drafts(invocation, context=session_operation_context))
+            drafts.append(
+                private_tool_invocation_draft(invocation, session_id=str(session_id), session_operation_context=session_operation_context)
+            )
+            drafts.append(
+                AuditMessageDraft(
+                    role=role,
+                    content=content,
+                    tool_calls=(envelope,),
+                    tool_call_id=invocation.tool_call_id if role == "tool" else None,
+                    parent_assistant_id=str(parent_assistant_id) if role == "tool" and parent_assistant_id is not None else None,
+                )
+            )
+            if invocation.tool_name == "set_pipeline" and invocation.status is ComposerToolStatus.SUCCESS:
+                pipeline_bindings.append(PipelineDispatchAuditBinding.from_persisted_envelope(envelope))
+    except BaseException as error:
+        if producer is not None and sql is not None and projection is not None:
+            producer.complete_owned(error)
+            sql.complete_without_submission()
+            projection.complete_without_submission()
+        raise
+    if producer is not None:
+        producer.complete_owned()
+    try:
+        # One transaction for the whole invocation cohort
+        # (elspeth-90231248dc): a mid-cohort failure durably persists
+        # nothing, so a later drain of the same buffer can never
+        # duplicate an already-committed prefix.
+        if sql is None:
+            await service.add_messages_atomic(
+                session_id,
+                tuple(drafts),
+                composition_state_id=composition_state_id,
+                writer_principal="compose_loop",
+                session_operation_context=session_operation_context,
+                session_operation_kind=session_operation_kind,
+                audit_only=plugin_crash_pending,
+            )
+        else:
+            await service.add_messages_atomic(
+                session_id,
+                tuple(drafts),
+                composition_state_id=composition_state_id,
+                writer_principal="compose_loop",
+                session_operation_context=session_operation_context,
+                session_operation_kind=session_operation_kind,
+                audit_only=plugin_crash_pending,
+                required_work=sql,
+            )
+    except SQLAlchemyError as save_err:
+        if sql is not None and projection is not None and sql.complete:
+            projection.complete_without_submission()
+        if plugin_crash_pending and not required_audit:
+            # Unwind path: a primary failure is already in flight.
+            # Counting + slog preserves audibility without masking
+            # the original exception. Count every prepared row in the
+            # failed attempt, including variable diagnostic siblings.
+            # Replay deduplication may find some rows already durable.
+            _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
+                len(drafts),
+                {"helper": "tool_invocations"},
+            )
+            slog.error(
+                "composer_tool_invocation_persist_failed_during_unwind",
+                session_id=str(session_id),
+                invocations=len(tool_invocations),
+                tool_names=[invocation.tool_name for invocation in tool_invocations],
+                exc_class=type(save_err).__name__,
+            )
+            # Nothing became durable, so no binding may claim otherwise.
+            return ()
+        # Success-path Tier-1 violation: the assistant row succeeded
+        # but the audit-companion tool rows failed. The audit trail
+        # would assert "these tools were called" without the rows that
+        # prove what they returned. Crash with the chained cause so
+        # the operator sees the full diagnostic.
+        _COMPOSER_TIER1_VIOLATION_COUNTER.add(
+            1,
+            {"helper": "tool_invocations"},
+        )
+        raise AuditIntegrityError(
+            f"composer_tool_invocation_persist_failed: audit insert "
+            f"failed for session_id={session_id!r} after assistant row "
+            f"was persisted — Tier-1 audit corruption (no recovery)"
+        ) from save_err
+    except BaseException:
+        if sql is not None and projection is not None and sql.complete:
+            projection.complete_without_submission()
+        raise
+    if projection is not None:
+        projection.begin_projection()
+        projection.complete_owned()
+    return tuple(pipeline_bindings)
+
+
+def _llm_calls_from_exception(exc: BaseException) -> tuple[ComposerLLMCall, ...]:
+    exc_dict = exc.__dict__
+    if "llm_calls_durable" in exc_dict and exc_dict["llm_calls_durable"] is True:
+        return ()
+    if "llm_calls" not in exc_dict:
+        return ()
+    calls = exc_dict["llm_calls"]
+    if type(calls) is not tuple:
+        return ()
+    return cast(tuple[ComposerLLMCall, ...], calls)
+
+
+async def _persist_llm_calls(
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    llm_calls: tuple[ComposerLLMCall, ...],
+    composition_state_id: UUID | None,
+    *,
+    plugin_crash_pending: bool,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
+    session_operation_context: SessionOperationContext,
+) -> None:
+    """Persist per-LLM-call audit records as audit-only ``role=audit`` rows.
+
+    Audit-primacy disposition mirrors :func:`_persist_tool_invocations`
+    via the ``plugin_crash_pending`` flag — see that helper's docstring
+    for the full rationale. The shape is the same: success-path failure
+    is a Tier-1 audit corruption that must crash; unwind-path failure
+    is recorded via counter + slog so it cannot mask the primary error.
+
+    Every caller is a compose-turn drain site, so rows are attributed to
+    the compose loop; the run-diagnostics route uses
+    :func:`_persist_run_diagnostics_llm_calls` instead, which writes
+    under a durably re-proven run authority (elspeth-0fcf68d50f).
+
+    The cohort settles atomically via ``add_messages_atomic``
+    (elspeth-90231248dc): one transaction for every buffered call, so a
+    mid-cohort failure leaves zero sidecars rather than a partial prefix
+    that reads as a complete record.
+    """
+    if not llm_calls:
+        return
+    producer = sql = projection = None
+    if required_work is not None:
+        if required_work.authority.context != session_operation_context:
+            raise AuditIntegrityError("Required audit work belongs to another exact fence")
+        producer, sql, projection = required_work.reserve_audit_work(
+            RequiredWorkSource.REQUIRED_UNWIND_AUDIT_SQL,
+            RequiredWorkSource.REQUIRED_UNWIND_AUDIT_PROJECTION,
+            transition_ordinal=0,
+            semantic_ordinal=0,
+        )
+    try:
+        drafts = tuple(
+            AuditMessageDraft(
+                role="audit",
+                content=llm_call_audit_summary(call),
+                tool_calls=(llm_call_audit_envelope(call),),
+            )
+            for call in llm_calls
+        )
+        drafts += tuple(draft for call in llm_calls for draft in private_diagnostic_drafts(call, context=session_operation_context))
+    except BaseException as error:
+        if producer is not None and sql is not None and projection is not None:
+            producer.complete_owned(error)
+            sql.complete_without_submission()
+            projection.complete_without_submission()
+        raise
+    if producer is not None:
+        producer.complete_owned()
+    try:
+        if sql is None:
+            await service.add_messages_atomic(
+                session_id,
+                drafts,
+                composition_state_id=composition_state_id,
+                writer_principal="compose_loop",
+                session_operation_context=session_operation_context,
+                audit_only=True,
+            )
+        else:
+            await service.add_messages_atomic(
+                session_id,
+                drafts,
+                composition_state_id=composition_state_id,
+                writer_principal="compose_loop",
+                session_operation_context=session_operation_context,
+                audit_only=True,
+                required_work=sql,
+            )
+    except SQLAlchemyError as save_err:
+        if sql is not None and projection is not None and sql.complete:
+            projection.complete_without_submission()
+        if plugin_crash_pending and not required_audit:
+            # Count prepared rows in the failed attempt (see
+            # _persist_tool_invocations); the log lists every model.
+            _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
+                len(drafts),
+                {"helper": "llm_calls"},
+            )
+            slog.error(
+                "composer_llm_call_persist_failed_during_unwind",
+                session_id=str(session_id),
+                calls=len(llm_calls),
+                models_requested=[call.model_requested for call in llm_calls],
+                statuses=[call.status.value for call in llm_calls],
+                exc_class=type(save_err).__name__,
+            )
+            return
+        _COMPOSER_TIER1_VIOLATION_COUNTER.add(
+            1,
+            {"helper": "llm_calls"},
+        )
+        raise AuditIntegrityError(
+            f"composer_llm_call_persist_failed: audit insert failed for "
+            f"session_id={session_id!r} on success path — Tier-1 audit "
+            f"corruption (no recovery)"
+        ) from save_err
+    except BaseException:
+        if sql is not None and projection is not None and sql.complete:
+            projection.complete_without_submission()
+        raise
+    if projection is not None:
+        projection.begin_projection()
+        projection.complete_owned()
+
+
+async def _persist_turn_audit_cohort(
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    tool_invocations: tuple[ComposerToolInvocation, ...],
+    llm_calls: tuple[ComposerLLMCall, ...],
+    *,
+    tool_composition_state_id: UUID | None,
+    llm_composition_state_id: UUID | None,
+    parent_assistant_id: UUID | None = None,
+    plugin_crash_pending: bool,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
+    session_operation_context: SessionOperationContext,
+    additional_drafts: tuple[AuditMessageDraft, ...] = (),
+) -> tuple[PipelineDispatchAuditBinding, ...]:
+    """Settle one turn's tool AND LLM audit rows as a single atomic cohort.
+
+    :func:`_persist_tool_invocations` and :func:`_persist_llm_calls`
+    each settle atomically, but calling them back-to-back still commits
+    the turn as TWO independent transactions: a failure between them
+    leaves the tool cohort durable without the LLM sidecars that prove
+    what the model saw — the partial-cohort defect elspeth-90231248dc
+    removed, recreated one level up. This helper builds both draft
+    groups and hands them to ``add_messages_atomic`` in ONE call, so the
+    whole turn becomes durable together or not at all.
+
+    The two groups legitimately carry different state ids — tool rows
+    bind to the post-compose state their calls produced,
+    LLM-call sidecars to the pre-send state the request was composed
+    against — expressed via the per-draft ``composition_state_id``
+    override rather than per-group transactions.
+
+    Draft shapes, role selection (``tool`` vs ``audit`` by
+    ``parent_assistant_id``), redaction, and pipeline-binding capture
+    mirror :func:`_persist_tool_invocations`; LLM drafts mirror
+    :func:`_persist_llm_calls`. Audit-primacy disposition is likewise
+    identical (``plugin_crash_pending``): unwind-path failure is counted
+    and slogged without masking the primary error and nothing becomes
+    durable; success-path failure is a Tier-1 audit corruption and
+    raises :class:`AuditIntegrityError`.
+
+    Either group may be empty (e.g. compose-loop turns whose tool rows
+    were already committed by ``persist_compose_turn`` drain only LLM
+    calls here); both empty is a no-op.
+    """
+    if not tool_invocations and not llm_calls and not additional_drafts:
+        return ()
+    producer = sql = projection = None
+    if required_work is not None:
+        if required_work.authority.context != session_operation_context:
+            raise AuditIntegrityError("Required audit work belongs to another exact fence")
+        producer, sql, projection = required_work.reserve_audit_work(
+            RequiredWorkSource.REQUIRED_UNWIND_AUDIT_SQL,
+            RequiredWorkSource.REQUIRED_UNWIND_AUDIT_PROJECTION,
+            transition_ordinal=0,
+            semantic_ordinal=0,
+        )
+    try:
+        role: ChatMessageRole = "tool" if parent_assistant_id is not None else "audit"
+        tool_csid = str(tool_composition_state_id) if tool_composition_state_id else None
+        llm_csid = str(llm_composition_state_id) if llm_composition_state_id else None
+        drafts: list[AuditMessageDraft] = list(additional_drafts)
+        pipeline_bindings: list[PipelineDispatchAuditBinding] = []
+        for invocation in tool_invocations:
+            content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+            drafts.extend(private_diagnostic_drafts(invocation, context=session_operation_context, composition_state_id=tool_csid))
+            drafts.append(
+                private_tool_invocation_draft(
+                    invocation,
+                    session_id=str(session_id),
+                    session_operation_context=session_operation_context,
+                    composition_state_id=tool_csid,
+                )
+            )
+            drafts.append(
+                AuditMessageDraft(
+                    role=role,
+                    content=content,
+                    tool_calls=(envelope,),
+                    tool_call_id=invocation.tool_call_id if role == "tool" else None,
+                    parent_assistant_id=str(parent_assistant_id) if role == "tool" and parent_assistant_id is not None else None,
+                    composition_state_id=tool_csid,
+                )
+            )
+            if invocation.tool_name == "set_pipeline" and invocation.status is ComposerToolStatus.SUCCESS:
+                pipeline_bindings.append(PipelineDispatchAuditBinding.from_persisted_envelope(envelope))
+        for call in llm_calls:
+            drafts.extend(private_diagnostic_drafts(call, context=session_operation_context, composition_state_id=llm_csid))
+            drafts.append(
+                AuditMessageDraft(
+                    role="audit",
+                    content=llm_call_audit_summary(call),
+                    tool_calls=(llm_call_audit_envelope(call),),
+                    composition_state_id=llm_csid,
+                )
+            )
+    except BaseException as error:
+        if producer is not None and sql is not None and projection is not None:
+            producer.complete_owned(error)
+            sql.complete_without_submission()
+            projection.complete_without_submission()
+        raise
+    if producer is not None:
+        producer.complete_owned()
+    try:
+        if sql is None:
+            await service.add_messages_atomic(
+                session_id,
+                tuple(drafts),
+                composition_state_id=None,
+                writer_principal="compose_loop",
+                session_operation_context=session_operation_context,
+                audit_only=True,
+            )
+        else:
+            await service.add_messages_atomic(
+                session_id,
+                tuple(drafts),
+                composition_state_id=None,
+                writer_principal="compose_loop",
+                session_operation_context=session_operation_context,
+                audit_only=True,
+                required_work=sql,
+            )
+    except SQLAlchemyError as save_err:
+        if sql is not None and projection is not None and sql.complete:
+            projection.complete_without_submission()
+        if plugin_crash_pending and not required_audit:
+            # Count prepared rows in the failed attempt, including tool,
+            # LLM and private diagnostic siblings (see _persist_tool_invocations).
+            _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
+                len(drafts),
+                {"helper": "turn_audit_cohort"},
+            )
+            slog.error(
+                "composer_turn_audit_cohort_persist_failed_during_unwind",
+                session_id=str(session_id),
+                invocations=len(tool_invocations),
+                tool_names=[invocation.tool_name for invocation in tool_invocations],
+                calls=len(llm_calls),
+                models_requested=[call.model_requested for call in llm_calls],
+                exc_class=type(save_err).__name__,
+            )
+            # Nothing became durable, so no binding may claim otherwise.
+            return ()
+        _COMPOSER_TIER1_VIOLATION_COUNTER.add(
+            1,
+            {"helper": "turn_audit_cohort"},
+        )
+        raise AuditIntegrityError(
+            f"composer_turn_audit_cohort_persist_failed: audit insert "
+            f"failed for session_id={session_id!r} after assistant row "
+            f"was persisted — Tier-1 audit corruption (no recovery)"
+        ) from save_err
+    except BaseException:
+        if sql is not None and projection is not None and sql.complete:
+            projection.complete_without_submission()
+        raise
+    if projection is not None:
+        projection.begin_projection()
+        projection.complete_owned()
+    return tuple(pipeline_bindings)
+
+
+async def _persist_run_diagnostics_llm_calls(
+    service: SessionServiceProtocol,
+    authority: RunDiagnosticsAuditAuthority,
+    llm_calls: tuple[ComposerLLMCall, ...],
+    *,
+    plugin_crash_pending: bool,
+) -> None:
+    """Persist run-diagnostics LLM audit rows under run-scoped authority.
+
+    Sibling of :func:`_persist_llm_calls` with the same audit-primacy
+    disposition, but the cohort goes through
+    ``add_run_diagnostics_audit_messages_atomic`` so the
+    run/session/state binding is re-proven durably inside the write
+    transaction, and each audit envelope carries ``run_id`` so an
+    auditor can answer "which operation wrote this" from the row alone
+    (elspeth-0fcf68d50f).
+
+    The cohort settles atomically (elspeth-90231248dc): one custody
+    proof and one transaction for every buffered call, so a mid-cohort
+    failure leaves zero sidecars rather than a partial prefix that
+    reads as a complete diagnostics record.
+
+    Authority loss is custody movement, not audit corruption: on the
+    success path it propagates so the route refuses to return an
+    unaudited explanation; on the unwind path it is recorded and
+    swallowed so it cannot mask the primary error.
+    """
+    if not llm_calls:
+        return
+    drafts = tuple(
+        RunDiagnosticsAuditDraft(
+            content=llm_call_audit_summary(call),
+            tool_calls=({**llm_call_audit_envelope(call), "run_id": str(authority.run_id)},),
+        )
+        for call in llm_calls
+    )
+    try:
+        await service.add_run_diagnostics_audit_messages_atomic(authority, drafts)
+    except RunDiagnosticsAuthorityLostError as lost:
+        if plugin_crash_pending:
+            # Counter unit is ROWS lost (see _persist_tool_invocations).
+            _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
+                len(llm_calls),
+                {"helper": "run_diagnostics_llm_calls"},
+            )
+            slog.error(
+                "run_diagnostics_audit_authority_lost_during_unwind",
+                session_id=str(authority.session_id),
+                run_id=str(authority.run_id),
+                calls=len(llm_calls),
+                reason=lost.reason,
+            )
+            return
+        raise
+    except SQLAlchemyError as save_err:
+        if plugin_crash_pending:
+            # Counter unit is ROWS lost (see _persist_tool_invocations);
+            # the log lists the full cohort, mirroring _persist_llm_calls.
+            _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
+                len(llm_calls),
+                {"helper": "run_diagnostics_llm_calls"},
+            )
+            slog.error(
+                "run_diagnostics_llm_call_persist_failed_during_unwind",
+                session_id=str(authority.session_id),
+                run_id=str(authority.run_id),
+                calls=len(llm_calls),
+                models_requested=[call.model_requested for call in llm_calls],
+                statuses=[call.status.value for call in llm_calls],
+                exc_class=type(save_err).__name__,
+            )
+            return
+        _COMPOSER_TIER1_VIOLATION_COUNTER.add(
+            1,
+            {"helper": "run_diagnostics_llm_calls"},
+        )
+        raise AuditIntegrityError(
+            f"run_diagnostics_llm_call_persist_failed: audit insert failed "
+            f"for session_id={authority.session_id!r} "
+            f"run_id={authority.run_id!r} on success path — Tier-1 audit "
+            f"corruption (no recovery)"
+        ) from save_err
+
+
+_COMPOSER_HEARTBEAT_SECONDS = 15.0
+
+_COMPOSER_REQUEST_LEASE_SECONDS = 60
+"""Lifetime a composer request lease gains on each renewal.
+
+Copy of ``SessionComposerProgressAuthority``'s ``lease_seconds`` default,
+which ``web/app.py`` does not override. The progress-registry protocol does
+not expose the lease length, so the heartbeat derives its retry headroom
+from this copy.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class _ComposerHeartbeatTimer:
+    """Clock and wait the compose heartbeat measures its lease headroom with.
+
+    ``now`` is a monotonic reading in seconds and ``wait`` suspends for the
+    given seconds. Kept together so a test that fakes the clock also fakes the
+    interval wait it measures.
+    """
+
+    now: Callable[[], float]
+    wait: Callable[[float], Awaitable[None]]
+
+
+_COMPOSER_HEARTBEAT_TIMER = _ComposerHeartbeatTimer(now=time.monotonic, wait=asyncio.sleep)
+
+
+@dataclass(frozen=True, slots=True)
+class _ComposerHeartbeatCancel:
+    """Why the compose heartbeat cancelled its owning request.
+
+    Only the three module singletons below exist. One is passed through
+    ``Task.cancel(message)``, so it arrives as the sole ``CancelledError.args``
+    entry and is recognised by identity. It names the renewal fault so
+    the owning turn records a server fault.
+    """
+
+    kind: Literal["transient_exhausted", "lease_lost", "renewal_defect"]
+
+
+_COMPOSER_HEARTBEAT_TRANSIENT_EXHAUSTED = _ComposerHeartbeatCancel(kind="transient_exhausted")
+_COMPOSER_HEARTBEAT_LEASE_LOST = _ComposerHeartbeatCancel(kind="lease_lost")
+_COMPOSER_HEARTBEAT_RENEWAL_DEFECT = _ComposerHeartbeatCancel(kind="renewal_defect")
+# Keyed by identity: the singletons live for the whole process, so no other
+# live object (such as a CancelledError's argument) can share one of these ids.
+_COMPOSER_HEARTBEAT_CANCELS_BY_ID: Final[dict[int, _ComposerHeartbeatCancel]] = {
+    id(marker): marker
+    for marker in (
+        _COMPOSER_HEARTBEAT_TRANSIENT_EXHAUSTED,
+        _COMPOSER_HEARTBEAT_LEASE_LOST,
+        _COMPOSER_HEARTBEAT_RENEWAL_DEFECT,
+    )
+}
+
+
+def _composer_heartbeat_cancel_of(exc: asyncio.CancelledError) -> _ComposerHeartbeatCancel | None:
+    """Return the heartbeat's cancel marker when ``exc`` was delivered by it."""
+    if len(exc.args) != 1:
+        return None
+    delivered_id = id(exc.args[0])
+    if delivered_id not in _COMPOSER_HEARTBEAT_CANCELS_BY_ID:
+        return None
+    return _COMPOSER_HEARTBEAT_CANCELS_BY_ID[delivered_id]
+
+
+def _composer_heartbeat_failed_progress_event() -> ComposerProgressEvent:
+    """Terminal progress for a request the server cancelled after losing its lease.
+
+    A server fault, never ``client_cancelled``: the user did not press Stop.
+    ``service_setup_failed`` is the progress contract's catch-all server-side
+    code; the contract has no dedicated lease-loss code.
+    """
+    return ComposerProgressEvent(
+        phase="failed",
+        headline="The server could not keep this composer request running.",
+        evidence=("The server lost this request's lease before the composer finished.",),
+        likely_next="Resubmit the message.",
+        reason="service_setup_failed",
+    )
+
+
+def _composer_heartbeat_http_error(cancel: _ComposerHeartbeatCancel) -> HTTPException:
+    """Structured, retryable 503 for a request the heartbeat cancelled."""
+    if cancel.kind == "transient_exhausted":
+        # Same envelope text as the app's OperationalError handler, which is
+        # what this request answered before the heartbeat learned to retry.
+        return HTTPException(
+            status_code=503,
+            detail={
+                "error_type": "database_unavailable",
+                "detail": "Database is currently unavailable. Please retry in a moment.",
+            },
+        )
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error_type": "composer_request_lease_lost",
+            "detail": "The server lost this composer request's lease before it finished. Please resubmit.",
+        },
+    )
+
+
+@dataclass(slots=True)
+class ComposerRequestLifecycle:
+    """Exact app-owned progress lease and its durable completion carrier."""
+
+    lease: ComposerRequestLease
+    durable_completed: bool = False
+    durable_terminal_status: _ComposerRequestTerminalStatus | None = None
+
+
+@contextlib.asynccontextmanager
+async def composer_request_lifecycle(
+    registry: ComposerProgressRegistry | DatabaseComposerProgressRegistry,
+    *,
+    session_id: str,
+    user_id: str,
+    owner_task: asyncio.Task[object],
+    timer: _ComposerHeartbeatTimer | None = None,
+) -> AsyncIterator[ComposerRequestLifecycle]:
+    """Renew exact work custody independently of any HTTP subscription."""
+    surface: Literal["freeform"] = "freeform"
+    timer = timer if timer is not None else _COMPOSER_HEARTBEAT_TIMER
+    # Read before the call that creates the lease: the database stamps its
+    # expiry during that call, so the lease lasts at least
+    # _COMPOSER_REQUEST_LEASE_SECONDS from this reading.
+    lease_started_at = timer.now()
+    lease = await registry.start_request(session_id, user_id)
+    lifecycle = ComposerRequestLifecycle(lease=lease)
+    metrics_token = begin_composer_request_metrics(surface=surface)
+    terminal_status: _ComposerRequestTerminalStatus = "completed"
+
+    async def renew() -> None:
+        # Every exit except a transient retry cancels the owner and re-raises,
+        # so the heartbeat task ends holding the renewal failure. exc_info is
+        # deliberately omitted from the diagnostics: SQLAlchemy cause chains
+        # carry the database URL.
+        #
+        # Lease headroom is time, not a failure count: a pool checkout that
+        # times out takes 30 s to fail, so three counted failures ran 75 s past
+        # a 60 s lease. ``renewed_at`` is read before the call that last
+        # extended the lease, for the same reason as ``lease_started_at``.
+        renewed_at = lease_started_at
+        consecutive_failures = 0
+
+        def lease_headroom_exhausted(exc: Exception) -> bool:
+            # Records a transient failure; True when the next attempt would
+            # start outside the lease, so the owner must be cancelled now.
+            nonlocal consecutive_failures
+            consecutive_failures += 1
+            seconds_since_renewal = timer.now() - renewed_at
+            exhausted = seconds_since_renewal + _COMPOSER_HEARTBEAT_SECONDS >= _COMPOSER_REQUEST_LEASE_SECONDS
+            if exhausted:
+                _log_last_resort_diagnostic(
+                    slog.error,
+                    "compose.heartbeat_cancelled_request",
+                    kind=_COMPOSER_HEARTBEAT_TRANSIENT_EXHAUSTED.kind,
+                    exc_class=type(exc).__name__,
+                    consecutive_failures=consecutive_failures,
+                    seconds_since_renewal=round(seconds_since_renewal, 1),
+                )
+            else:
+                _log_last_resort_diagnostic(
+                    slog.warning,
+                    "compose.heartbeat_renewal_retrying",
+                    exc_class=type(exc).__name__,
+                    consecutive_failures=consecutive_failures,
+                    seconds_since_renewal=round(seconds_since_renewal, 1),
+                )
+            return exhausted
+
+        while True:
+            await timer.wait(_COMPOSER_HEARTBEAT_SECONDS)
+            attempt_started_at = timer.now()
+            # A renewal still unresolved when the lease runs out is abandoned
+            # rather than left to hold the request past its lease.
+            lease_deadline = asyncio.timeout(renewed_at + _COMPOSER_REQUEST_LEASE_SECONDS - attempt_started_at)
+            try:
+                async with lease_deadline:
+                    await registry.renew_request(lease)
+            except (OperationalError, SQLAlchemyPoolTimeoutError) as exc:
+                # The one failure family that models a transient blip (a
+                # connection dropped mid-transaction, pool exhaustion, a
+                # failover): retried only while the next attempt would still
+                # start inside the lease.
+                if lease_headroom_exhausted(exc):
+                    owner_task.cancel(_COMPOSER_HEARTBEAT_TRANSIENT_EXHAUSTED)
+                    raise
+            except TimeoutError as exc:
+                if not lease_deadline.expired():
+                    # A TimeoutError the renewal raised itself, not the lease
+                    # deadline above: treated like any other renewal defect.
+                    owner_task.cancel(_COMPOSER_HEARTBEAT_RENEWAL_DEFECT)
+                    raise
+                # The lease deadline expired with the renewal unresolved.
+                if lease_headroom_exhausted(exc):
+                    owner_task.cancel(_COMPOSER_HEARTBEAT_TRANSIENT_EXHAUSTED)
+                    raise
+            except (ComposerRequestLeaseLost, PermissionError) as exc:
+                # The lease row is gone, expired or no longer ours: renewing
+                # again cannot restore it.
+                _log_last_resort_diagnostic(
+                    slog.error,
+                    "compose.heartbeat_cancelled_request",
+                    kind=_COMPOSER_HEARTBEAT_LEASE_LOST.kind,
+                    exc_class=type(exc).__name__,
+                    consecutive_failures=consecutive_failures,
+                )
+                owner_task.cancel(_COMPOSER_HEARTBEAT_LEASE_LOST)
+                raise
+            except Exception:
+                # Anything else is a first-party defect: the owning request
+                # raises it (see the CancelledError arm below).
+                owner_task.cancel(_COMPOSER_HEARTBEAT_RENEWAL_DEFECT)
+                raise
+            else:
+                renewed_at = attempt_started_at
+                consecutive_failures = 0
+
+    heartbeat = asyncio.create_task(renew())
+    try:
+        yield lifecycle
+    except asyncio.CancelledError as exc:
+        heartbeat_cancel = _composer_heartbeat_cancel_of(exc)
+        if heartbeat_cancel is None:
+            terminal_status = "completed" if lifecycle.durable_completed else "cancelled"
+            raise
+        # The heartbeat re-raised in the same step that cancelled this task,
+        # so it is done and holds the renewal failure; retrieving it here is
+        # what keeps teardown from ever re-raising it.
+        renewal_failure = heartbeat.exception()
+        # Convert only when the heartbeat's cancel is the task's sole pending
+        # request (the disconnect watcher's rule): an external cancel (server
+        # shutdown) racing it keeps unwinding as genuinely cancelled.
+        if owner_task.uncancel() > 0:
+            terminal_status = "completed" if lifecycle.durable_completed else "cancelled"
+            raise
+        terminal_status = "completed" if lifecycle.durable_completed else "failed"
+        if renewal_failure is None:
+            raise RuntimeError("Composer heartbeat cancelled its request without a renewal failure") from exc
+        if heartbeat_cancel is _COMPOSER_HEARTBEAT_RENEWAL_DEFECT:
+            # Keep the defect's own cause chain; the cancellation is only the
+            # delivery mechanism, not its cause.
+            raise renewal_failure from renewal_failure.__cause__
+        raise _composer_heartbeat_http_error(heartbeat_cancel) from exc
+    except TimeoutError:
+        terminal_status = "completed" if lifecycle.durable_completed else "timed_out"
+        raise
+    except HTTPException as exc:
+        if lifecycle.durable_completed:
+            terminal_status = "completed"
+        elif exc.status_code in {408, 504}:
+            terminal_status = "timed_out"
+        elif exc.status_code == 499:
+            terminal_status = "cancelled"
+        else:
+            terminal_status = "failed"
+        raise
+    except Exception:
+        terminal_status = "completed" if lifecycle.durable_completed else "failed"
+        raise
+    finally:
+        primary_error = sys.exception()
+        try:
+            try:
+                # A heartbeat that already ended holds the renewal failure it
+                # cancelled this request over; awaiting it would re-raise that
+                # failure over the request's own outcome (finding #28).
+                if not heartbeat.done():
+                    heartbeat.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await heartbeat
+                elif not heartbeat.cancelled():
+                    # The detached worker may have consumed cancellation and
+                    # committed its failed terminal before leaving this scope.
+                    # Retrieve the owned renewal outcome in that arm too.
+                    heartbeat.exception()
+            finally:
+                await registry.finish_request(lease)
+        finally:
+            finish_composer_request_metrics(
+                metrics_token,
+                status=lifecycle.durable_terminal_status or terminal_status,
+                primary_error=primary_error,
+            )
+
+
+async def composer_progress_sink_for_lease(
+    registry: ComposerProgressRegistry | DatabaseComposerProgressRegistry,
+    *,
+    lease: ComposerRequestLease,
+    session_id: str,
+    request_id: str | None,
+    user_id: str,
+    operation_id: str | None = None,
+    session_operation_id: str | None = None,
+    session_operation_epoch: int | None = None,
+) -> ComposerProgressSink:
+    """Bind a safe progress sink to the exact action and lifecycle token."""
+    return await registry.claim_request(
+        session_id=session_id,
+        request_id=request_id,
+        user_id=user_id,
+        lease=lease,
+        operation_id=operation_id,
+        session_operation_id=session_operation_id,
+        session_operation_epoch=session_operation_epoch,
+    )
+
+
+async def _state_data_from_composer_state(
+    state: CompositionState,
+    *,
+    settings: Any,
+    secret_service: Any | None,
+    user_id: str | None,
+    session_id: str | UUID,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    profile_registry: OperatorProfileRegistry,
+    catalog: CatalogServiceProtocol,
+    runtime_preflight: _RuntimePreflightOutcome,
+    preflight_exception_policy: _PreflightExceptionPolicy,
+    initial_version: int | None,
+    telemetry_source: _ComposerPreflightTelemetrySource,
+    composer_meta: Mapping[str, Any] | None = None,
+    prior_completion_gates: CompletionGatesDict | None = None,
+    advisor_gate_decision: AdvisorGateDecision | None = None,
+) -> tuple[CompositionStateData, ValidationSummary]:
+    try:
+        authoring = validate_authored_composition_state(
+            state,
+            snapshot=plugin_snapshot,
+            profile_registry=profile_registry,
+            catalog=catalog,
+        ).validation
+    except (ValueError, TypeError, KeyError) as val_err:
+        _record_composer_authoring_validation_telemetry(
+            "exception",
+            source=telemetry_source,
+            exception_class=type(val_err).__name__,
+        )
+        authoring = ValidationSummary(
+            is_valid=False,
+            errors=(ValidationEntry("validation", "validation_failed", "high"),),
+        )
+    else:
+        _record_composer_authoring_validation_telemetry(
+            "passed" if authoring.is_valid else "failed",
+            source=telemetry_source,
+        )
+
+    runtime = runtime_preflight
+    if runtime is None and authoring.is_valid:
+        try:
+            runtime = await _runtime_preflight_for_state(
+                state,
+                settings=settings,
+                secret_service=secret_service,
+                user_id=user_id,
+                session_id=session_id,
+                plugin_snapshot=plugin_snapshot,
+                profile_registry=profile_registry,
+                catalog=catalog,
+            )
+        except Exception as exc:
+            # Telemetry MUST fire on both policy branches. Emitting before
+            # the policy split preserves originating-route attribution
+            # (source=compose|recompose|...) on the raise path, which would
+            # otherwise be lost — the recovery handler's re-call relabels its
+            # own emission as source=runtime_preflight, so without this
+            # primary emission the dashboards cannot distinguish failures
+            # by originating route. The dual emission per failure (primary +
+            # recovery) is intentional: each event represents a distinct
+            # observable — primary failure occurred, then recovery handled
+            # it. Operators query them with different source filters.
+            _record_composer_runtime_preflight_telemetry(
+                "exception",
+                source=telemetry_source,
+                exception_class=type(exc).__name__,
+            )
+            if preflight_exception_policy == "raise":
+                raise ComposerRuntimePreflightError.capture(
+                    exc,
+                    state=state,
+                    initial_version=initial_version if initial_version is not None else state.version,
+                ) from exc
+            # persist_invalid path: capture structured diagnostics
+            # (exception class + first message line + bounded frames)
+            # so the persisted state's validation_errors row is
+            # self-describing instead of the opaque legacy sentinel.
+            # Frames are file:line:function only — no source text, no
+            # local-variable repr — so secrets in plugin config dicts
+            # / DB URLs / bound SQL params do not enter the audit row.
+            runtime = _capture_runtime_preflight_failure(exc)
+    # Exact-type dispatch on our own ``_RuntimePreflightOutcome`` union:
+    # ``runtime`` is a passing/failing ``ValidationResult`` only when the
+    # preflight actually ran (not a captured ``_RuntimePreflightFailed`` and
+    # not ``None``). ``type() is`` because ``ValidationResult`` is a
+    # first-party, non-subclassed Pydantic model.
+    if type(runtime) is ValidationResult:
+        _record_composer_runtime_preflight_telemetry(
+            "passed" if runtime.is_valid else "failed",
+            source=telemetry_source,
+        )
+    persisted_is_valid, persisted_errors = _composer_persisted_validation(
+        authoring,
+        runtime,
+    )
+    state_d = state.to_dict()
+    surface_meta = dict(deep_thaw(composer_meta)) if composer_meta is not None else {}
+    # Which predicate produced this row's ``is_valid``: this writer always
+    # derives it through the strict authoring+runtime pipeline above
+    # (``_composer_persisted_validation``), so the lane marker is
+    # unconditionally "strict" — overwriting any "authoring_only" marker
+    # carried forward from a mid-turn compose row (elspeth-67c6fa691d;
+    # column doc at web/sessions/models.py ``composer_meta``).
+    surface_meta["validation_lane"] = "strict"
+    persisted_composer_meta = merge_implicit_decisions_meta(surface_meta, state)
+    # Runtime validation is not an advisor verdict. Only an explicit END
+    # decision can replace a prior fact, including on graph-unchanged saves.
+    prior_facts = parse_completion_gates(
+        {COMPLETION_GATES_META_KEY: prior_completion_gates} if prior_completion_gates is not None else composer_meta
+    )
+    completion_gates_value = completion_gates_meta_from_facts(resolve_completion_gate_facts(prior_facts, advisor_gate_decision, state))
+    persisted_composer_meta = {
+        **persisted_composer_meta,
+        COMPLETION_GATES_META_KEY: completion_gates_value,
+    }
+    return (
+        CompositionStateData(
+            sources=state_d["sources"],
+            nodes=state_d["nodes"],
+            edges=state_d["edges"],
+            outputs=state_d["outputs"],
+            metadata_=state_d["metadata"],
+            is_valid=persisted_is_valid,
+            validation_errors=persisted_errors,
+            composer_meta=persisted_composer_meta,
+        ),
+        authoring,
+    )
+
+
+async def _verify_session_ownership(
+    session_id: UUID,
+    user: UserIdentity,
+    request: Request,
+) -> SessionRecord:
+    """Verify the session exists and belongs to the current user.
+
+    Returns 404 (not 403) to avoid leaking session existence (IDOR, W5).
+    """
+    service: SessionServiceProtocol = request.app.state.session_service
+    try:
+        session = await service.get_session(session_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Session not found") from None
+
+    settings = request.app.state.settings
+    if session.archived_at is not None or session.user_id != user.user_id or session.auth_provider_type != settings.auth_provider:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return session
+
+
+async def _failed_turn_response_body(
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    failed_turn: FailedTurnMetadata,
+) -> dict[str, object]:
+    """Return the stable response fragment for a persisted failed compose turn."""
+
+    tool_responses_persisted = failed_turn.tool_responses_persisted
+    if tool_responses_persisted is None:
+        tool_responses_persisted = await service.count_tool_responses_for_assistant_async(
+            session_id=str(session_id),
+            assistant_message_id=failed_turn.assistant_message_id,
+        )
+    return {
+        "assistant_message_id": failed_turn.assistant_message_id,
+        "tool_calls_attempted": failed_turn.tool_calls_attempted,
+        "tool_responses_persisted": tool_responses_persisted,
+        "transcript_url": None,
+    }
+
+
+# Closed planner-failure taxonomy. ``COST_CAP_EXCEEDED`` and
+# ``REQUEST_BYTES_EXHAUSTED`` fall through to ``operation_failed``.
+#
+# ``policy_blocked`` is NOT keyed on ``PipelinePlannerError.code`` at all — it is
+# keyed on the rejection's ``detail_codes`` (see
+# :data:`PLANNER_POLICY_DETAIL_CODES`), because a deployment-policy refusal
+# surfaces under whichever planner code the refusal happened to exhaust
+# (``REPAIR_EXHAUSTED`` when the model burnt its budget re-authoring the same
+# prohibited component; ``VALIDATION_FAILED`` from commit-time re-validation, and
+# historically from the server-derived gate). The code
+# alone cannot distinguish "the model produced garbage" from "the deployment
+# forbids this", so the detail-code test runs first.
+_FREEFORM_PLANNER_INVALID_PROVIDER_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "COMPLETION_TOKENS_EXCEEDED",
+        "COMPOSITION_EXHAUSTED",
+        "DISCOVERY_CYCLE",
+        "DISCOVERY_EXHAUSTED",
+        "DISCOVERY_ONLY",
+        "MALFORMED_RESPONSE",
+        "PROVIDER_CALLS_EXHAUSTED",
+        "RESPONSE_TRUNCATED",
+        "TOOL_CALLS_EXHAUSTED",
+        "VALIDATION_FAILED",
+    }
+)
+# The closed validation codes that mean "a deployment policy categorically
+# refuses this component", as opposed to "this candidate is wired wrong". A
+# rejection carrying any of them is PERMANENT: no repair to the pipeline and no
+# retry of the request can clear it, so the route must answer
+# ``policy_blocked`` rather than a retryable provider fault.
+#
+# ``plugin_not_allowed_on_web`` is derived from
+# ``PluginUnavailableReason.WEB_SURFACE_PROHIBITED`` rather than restated;
+# ``aws_s3_source_not_allowed`` is the authoritative source
+# gate's own code (``composer/tools/sessions.py``, ``execution/validation.py``),
+# which predates the snapshot-level reason and is emitted by a different seam.
+# A new categorical policy refusal MUST be added here or it silently reads as a
+# provider fault.
+PLANNER_POLICY_DETAIL_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "aws_s3_source_not_allowed",
+        PluginUnavailableReason.WEB_SURFACE_PROHIBITED.value,
+    }
+)
+# ``failure_code -> (http_status, safe static detail)``. The detail text is
+# provider-safe (no exception message, no provider content).
+_FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
+    "cost_unavailable": (
+        503,
+        "The composer could not determine the model cost. Ask an administrator to configure or correct model pricing before trying again.",
+    ),
+    "provider_timeout": (504, "The composer model timed out before producing a pipeline. Retry the request."),
+    "provider_unavailable": (503, "The composer model is unavailable. Retry the request."),
+    "invalid_provider_response": (502, "The composer model returned an unusable pipeline plan. Retry the request."),
+    # Planner-owned non-convergence (elspeth-5904b1683a): the model answered
+    # every repair turn; the planner loop could not produce a candidate that
+    # passed validation. 500 (our loop, not a gateway fault) with an honest
+    # retry offer — the first candidate is model-stochastic.
+    "planner_repair_exhausted": (
+        500,
+        "The composer could not produce a valid pipeline within its repair budget. Retry the request, or revise it if this recurs.",
+    ),
+    # A deployment-policy refusal is not a provider failure. The detail names
+    # neither provider nor operation id and offers no retry.
+    "policy_blocked": (
+        422,
+        "This pipeline is blocked by a deployment policy and cannot be built as configured. "
+        "Change the blocked component — retrying will fail the same way.",
+    ),
+    "operation_failed": (500, "The composer could not build a pipeline for this request."),
+}
+
+
+def planner_failure_is_policy_blocked(exc: PipelinePlannerError) -> bool:
+    """Return whether a planner failure was a categorical deployment-policy refusal.
+
+    This predicate is evaluated before mapping a planner error code because a
+    policy refusal may surface under several planner codes.
+    """
+    return any(code in PLANNER_POLICY_DETAIL_CODES for code in exc.detail_codes)
+
+
+# ``PipelinePlannerError.code -> ComposerProgressReason`` for the freeform failed-progress
+# event. Only codes whose ACTOR is the planner appear here; everything else falls through to
+# ``provider_unavailable``, which is honest for a genuine upstream fault.
+#
+# This exists because the freeform raise site hardcoded ``provider_unavailable`` for every
+# planner code, so a discovery-budget exhaustion, a tool-call cap and a real provider outage
+# were one indistinguishable reason (elspeth-ad5628ecda). The vocabulary already anticipated
+# the split — ``planner_repair_exhausted`` is documented in ``contracts/composer_progress.py``
+# as existing "so the failed progress event stops blaming the provider".
+#
+# ``PROVIDER_CALLS_EXHAUSTED`` is deliberately ABSENT: it is planner-owned (our budget on
+# physical provider attempts) but the closed vocabulary has no member for it, and widening
+# that vocabulary is a frontend/contract change rather than an attribution fix. It therefore
+# still reads ``provider_unavailable`` — a known residual, not an oversight.
+_FREEFORM_PLANNER_PROGRESS_REASONS: Final[dict[str, ComposerProgressReason]] = {
+    "COST_UNAVAILABLE": "service_setup_failed",
+    "REPAIR_EXHAUSTED": "planner_repair_exhausted",
+    "COMPOSITION_EXHAUSTED": "convergence_composition_budget",
+    "DISCOVERY_EXHAUSTED": "convergence_discovery_budget",
+    "TOOL_CALLS_EXHAUSTED": "tool_call_cap_exceeded",
+    "TIMEOUT": "convergence_wall_clock_timeout",
+}
+
+
+def freeform_planner_progress_reason(planner_code: str) -> ComposerProgressReason:
+    """Attribute a freeform planner failure to its actual actor for the progress snapshot."""
+    if planner_code in _FREEFORM_PLANNER_PROGRESS_REASONS:
+        return _FREEFORM_PLANNER_PROGRESS_REASONS[planner_code]
+    return "provider_unavailable"
+
+
+def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
+    """Map a ``PipelinePlannerError.code`` to a closed freeform failure code.
+
+    Use closed, provider-safe codes for the HTTP response.
+    """
+    if planner_failure_is_policy_blocked(exc):
+        return "policy_blocked"
+    if exc.code == "TIMEOUT":
+        return "provider_timeout"
+    if exc.code == "PROVIDER_ERROR":
+        return "provider_unavailable"
+    if exc.code == "COST_UNAVAILABLE":
+        return "cost_unavailable"
+    if exc.code == "REPAIR_EXHAUSTED":
+        # The provider answered every repair turn; the planner loop could not
+        # converge.
+        return "planner_repair_exhausted"
+    if exc.code in _FREEFORM_PLANNER_INVALID_PROVIDER_CODES:
+        return "invalid_provider_response"
+    return "operation_failed"
+
+
+async def _handle_planner_failure(
+    exc: PipelinePlannerError,
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    llm_composition_state_id: UUID | None,
+    *,
+    session_operation_context: SessionOperationContext,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
+) -> tuple[int, dict[str, object]]:
+    """Translate a freeform ``PipelinePlannerError`` into a safe HTTP outcome.
+
+    Persists one durable, redacted terminal failure-disposition audit
+    row carrying the mapped closed failure code, then returns the
+    ``(status, body)`` the route raises. Shared by ``send_message`` and
+    ``recompose`` so the two freeform routes cannot drift on planner-failure UX.
+
+    The planner's LLM-call audit evidence is already durable — ``plan_pipeline``
+    stamps it onto the escaping exception via ``attach_llm_calls`` and
+    ``_plan_and_stage_empty_pipeline`` persists it before re-raise (which also
+    sets ``llm_calls_durable``) — so this MUST NOT re-persist it. The
+    disposition row is a distinct ``_kind`` and carries only the closed code, no
+    provider content, usage, or model metadata.
+    """
+    failure_code = _freeform_planner_failure_code(exc)
+    status_code, detail = _FREEFORM_PLANNER_FAILURE_HTTP[failure_code]
+    envelope: dict[str, object] = {
+        "_kind": "planner_failure_disposition",
+        "surface": "freeform",
+        "failure_code": failure_code,
+        # The raw PipelinePlannerError code: failure_code buckets many codes
+        # (e.g. DISCOVERY_CYCLE and MALFORMED_RESPONSE both read
+        # invalid_provider_response) and the code is the closed, leak-safe
+        # discriminant a live 5xx investigation actually needs.
+        "planner_code": exc.code,
+    }
+    # The closed validation codes of the last candidate rejection when the
+    # failure is an exhaustion — names the wall a live 5xx hit without a temp
+    # diagnostic (empty for non-rejection failures).
+    if exc.detail_codes:
+        envelope["rejection_codes"] = sorted(set(exc.detail_codes))
+    # role="audit" keeps this out of the user-visible conversation channel
+    # (``_is_composer_audit_tool_message`` excludes every audit row) exactly as
+    # the per-LLM-call audit sidecars are; the distinct ``_kind`` keeps it out
+    # of the ``llm_call_audit`` opt-in view as well.
+    await service.add_message(
+        session_id,
+        "audit",
+        json.dumps(envelope),
+        tool_calls=[envelope],
+        composition_state_id=llm_composition_state_id,
+        writer_principal="compose_loop",
+        session_operation_context=session_operation_context,
+    )
+    return status_code, {
+        "error_type": "composer_planner_failure",
+        "failure_code": failure_code,
+        # The closed planner code reaches the CLIENT, not only the durable audit row above.
+        # `failure_code` buckets eleven codes into `invalid_provider_response`, so without this
+        # a caller cannot tell a product terminal (the planner reached a verdict and said why)
+        # from a substrate fault (the process died) — both are a bare 502. That ambiguity read
+        # three edge-truncated battery runs as a planner regression (elspeth-ad5628ecda). Safe
+        # to expose for the same reason the audit row carries it: it is a closed vocabulary
+        # with no provider content, usage, or model metadata.
+        "planner_code": exc.code,
+        "detail": detail,
+    }
+
+
+async def _handle_convergence_error(
+    exc: ComposerConvergenceError,
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    user_id: str,
+    log_prefix: str,
+    llm_composition_state_id: UUID | None,
+    settings: Any,
+    secret_service: Any | None,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    profile_registry: OperatorProfileRegistry,
+    catalog: CatalogServiceProtocol,
+    session_operation_context: SessionOperationContext,
+    ingress: CompositionIngressRecord | None = None,
+    chat_ingress_inputs: list[ChatIngressInput] | None = None,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
+    budget_seconds: float | None = None,
+) -> dict[str, object]:
+    """Build 422 response body and persist partial state for convergence errors.
+
+    Shared by send_message and recompose — only the structlog event prefix
+    differs between callers.
+
+    Symmetric with :func:`_handle_plugin_crash` and
+    :func:`_handle_runtime_preflight_failure` — the same recovery shape
+    (``preflight_exception_policy="persist_invalid"``, partial-state
+    persistence, SQLAlchemyError fail-soft).
+
+    Args:
+        exc: The convergence error with optional partial_state.
+        service: Session service for DB persistence.
+        session_id: Session to persist partial state to.
+        user_id: Authenticated user id. Forwarded to
+            :func:`_state_data_from_composer_state` so the partial-state
+            runtime preflight can resolve user-scoped secret refs.
+            Without this, validation.py:248 skips the secret-ref
+            resolution block, unresolved ``{secret_ref: ...}`` dicts
+            flow into plugin instantiation, and typical plugin code
+            (``config["api_key"].lower()`` etc.) raises AttributeError —
+            a programmer-bug class that escapes ``validate_pipeline``'s
+            typed catches and reduces the persisted audit row to the
+            uninformative ``["runtime_preflight_failed"]`` sentinel.
+        log_prefix: Prefix for structlog event names (e.g. "convergence" or "recompose_convergence").
+        settings: App settings (forwarded to _state_data_from_composer_state).
+        secret_service: Scoped secret resolver (forwarded to runtime preflight).
+
+    Returns:
+        Response body dict for HTTPException(status_code=422).
+    """
+    if required_work is not None and type(required_work) is not RequiredWorkCoordinator:
+        raise AuditIntegrityError("Composer recovery requires an owned required-work coordinator")
+    # Build the discriminated progress event ONCE so the 422 body and the
+    # /composer-progress snapshot share a single canonical taxonomy. Without
+    # this parity, the chat-side error UX (driven by detail + recovery_text)
+    # could drift from the polling-side reason — exactly the failure mode
+    # elspeth-5030f7373d called out, but at a different layer.
+    progress = convergence_progress_event(budget_exhausted=exc.budget_exhausted)
+    response_body: dict[str, object] = {
+        "error_type": "convergence",
+        "detail": str(exc),
+        "turns_used": exc.max_turns,
+        "budget_exhausted": exc.budget_exhausted,
+        # ``reason`` is the public taxonomy the SPA / LLM recovery loop branch
+        # on. Distinct from ``budget_exhausted`` (engine-internal triple) so
+        # the two enums can evolve independently — e.g. a future
+        # ``convergence_provider_quota_timeout`` would land here without
+        # widening ``budget_exhausted``.
+        "reason": progress.reason,
+        # ``recovery_text`` mirrors the progress ``likely_next`` so the chat
+        # error message can name the next practical action without parsing
+        # the headline. Required by the issue's "user-facing recovery text
+        # names the next practical action for each class" criterion.
+        "recovery_text": progress.likely_next,
+    }
+    if progress.reason == "convergence_wall_clock_timeout":
+        # The elapsed budget, server-authoritative (R2-F9,
+        # elspeth-114dd261bc). The SPA's timeout copy names this number, and
+        # the only honest source is the deployment's configured wall clock —
+        # NOT the client's own abort ceiling, which is that value plus a
+        # grace constant and falls back to a checked-in default whenever the
+        # boot /api/system/status fetch has not landed. Carried ONLY on the
+        # timeout reason: the two turn-budget causes did not exhaust a clock,
+        # so the field would be noise there.
+        response_body["timeout_seconds"] = settings.composer_timeout_seconds if budget_seconds is None else budget_seconds
+    if exc.failed_turn is not None:
+        response_body["failed_turn"] = await _failed_turn_response_body(service, session_id, exc.failed_turn)
+    required_state_failure: SQLAlchemyError | None = None
+    persisted_state_id: UUID | None = None
+    if exc.partial_state is not None:
+        # Persistence guard: DB write failure should not upgrade the
+        # response from 422 (convergence error) to 500 (internal).
+        #
+        # SQLAlchemyError ONLY — narrowed per the Tier 1 semantics in
+        # docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model.
+        # _state_data_from_composer_state's internal validate() guard catches
+        # (ValueError, TypeError, KeyError) from structurally damaged partial
+        # state — those are acceptable there. A TypeError/KeyError from
+        # state.to_dict() or CompositionStateData(...) is a Tier 1 invariant
+        # bug and must propagate. This catch is the SQLAlchemy persistence
+        # layer only.
+        #
+        # Audit-integrity failures remain Tier 1: they must bubble through
+        # the app-level fail-closed handler, not become a recovery detail.
+        try:
+            state_data, _validation = await _state_data_from_composer_state(
+                exc.partial_state,
+                settings=settings,
+                secret_service=secret_service,
+                user_id=user_id,
+                session_id=session_id,
+                plugin_snapshot=plugin_snapshot,
+                profile_registry=profile_registry,
+                catalog=catalog,
+                runtime_preflight=None,
+                preflight_exception_policy="persist_invalid",
+                initial_version=None,
+                telemetry_source="convergence",
+                prior_completion_gates=await _durable_completion_gates(service, session_id),
+                composer_meta={
+                    **({"ingress": ingress} if ingress is not None else {}),
+                    **({"chat_ingress_inputs": chat_ingress_inputs} if chat_ingress_inputs is not None else {}),
+                }
+                if ingress is not None or chat_ingress_inputs is not None
+                else None,
+            )
+            if required_work is None:
+                partial_record = await service.save_composition_state(
+                    session_id,
+                    state_data,
+                    provenance="convergence_persist",
+                    session_operation_context=session_operation_context,
+                )
+            else:
+                partial_sql = required_work.reserve(RequiredWorkSource.RECOVERY_PARTIAL_STATE_SQL)
+                partial_record = await service.save_composition_state(
+                    session_id,
+                    state_data,
+                    provenance="convergence_persist",
+                    session_operation_context=session_operation_context,
+                    required_work=partial_sql,
+                )
+            persisted_state_id = partial_record.id
+            response_body["partial_state"] = _recovery_partial_state_response(partial_record)
+        except SQLAlchemyError as save_err:
+            if required_audit:
+                required_state_failure = save_err
+            # Full SQLAlchemyError family — ``IntegrityError`` alone would
+            # let ``OperationalError`` (lock timeout / pool disconnect /
+            # deadlock), ``ProgrammingError`` (schema drift), and siblings
+            # escape, upgrading 422 → unstructured 500.
+            # exc_info deliberately omitted: SQLAlchemyError __cause__
+            # chains can carry DB connection strings, schema introspection
+            # detail, or operational secrets that structured server logs
+            # must not retain.
+            slog.error(
+                f"{log_prefix}_partial_state_save_failed",
+                session_id=str(session_id),
+                exc_class=type(save_err).__name__,
+            )
+            response_body["partial_state_save_failed"] = True
+            # Class name only. ``str(save_err)`` on SQLAlchemyError
+            # subclasses expands to ``[SQL: ...]`` + ``[parameters: ...]``
+            # (the bound composition-state payload, which may reference
+            # secrets) and appends ``__cause__`` text that can carry DB
+            # URLs or credentials on ``OperationalError``. The slog above
+            # is the triage surface; the HTTP body must not re-expose the
+            # same material the ``exc_info`` omission was protecting.
+            response_body["partial_state_save_error"] = type(save_err).__name__
+
+    # Persist the per-tool-call audit trail regardless of whether
+    # partial_state was set. tool_invocations is populated even when the
+    # convergence happened before any state mutation (e.g. budget hit on
+    # discovery-only turns), so failed runs without state changes still
+    # leave a record of what the LLM tried.
+    # Compose-loop carriers with failed_turn were already committed by
+    # persist_compose_turn_async; only pre-cutover/non-loop carriers drain here.
+    # Tool rows and LLM sidecars settle as ONE cohort in a single
+    # transaction (elspeth-90231248dc) despite their differing state ids.
+    try:
+        await _persist_turn_audit_cohort(
+            service,
+            session_id,
+            exc.tool_invocations if exc.failed_turn is None else (),
+            exc.llm_calls,
+            tool_composition_state_id=persisted_state_id,
+            llm_composition_state_id=llm_composition_state_id,
+            plugin_crash_pending=True,
+            required_audit=required_audit,
+            required_work=required_work,
+            session_operation_context=session_operation_context,
+        )
+    except BaseException as audit_failure:
+        if required_state_failure is not None:
+            raise BaseExceptionGroup("Composer recovery and required audit failed", [required_state_failure, audit_failure]) from None
+        raise
+    if required_state_failure is not None:
+        raise ComposerRequiredRecoveryFailure(required_state_failure)
+    return response_body
+
+
+async def _handle_plugin_crash(
+    exc: ComposerPluginCrashError,
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    user_id: str,
+    log_prefix: str,
+    llm_composition_state_id: UUID | None,
+    settings: Any,
+    secret_service: Any | None,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    profile_registry: OperatorProfileRegistry,
+    catalog: CatalogServiceProtocol,
+    session_operation_context: SessionOperationContext,
+    ingress: CompositionIngressRecord | None = None,
+    chat_ingress_inputs: list[ChatIngressInput] | None = None,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
+) -> dict[str, object]:
+    """Build 500 response body and persist partial state for plugin crashes.
+
+    Symmetric with :func:`_handle_convergence_error` — same validation
+    guard, same persistence guard, same response-body shape. The only
+    differences are the exception class and the HTTP status (500 vs 422):
+    a plugin crash is a server-side bug, not a user-driven failure.
+
+    Args:
+        exc: The plugin-crash wrapper with optional ``partial_state``.
+        service: Session service for DB persistence of partial state.
+        session_id: Session to persist partial state to.
+        user_id: Authenticated user id (logged for triage).
+        log_prefix: Prefix for structlog event names
+            (e.g. "compose" or "recompose").
+        settings: App settings (forwarded to _state_data_from_composer_state)
+        secret_service: Scoped secret resolver (forwarded to runtime preflight)
+
+    Returns:
+        Response body dict for ``HTTPException(status_code=500, ...)``.
+    """
+    if required_work is not None and type(required_work) is not RequiredWorkCoordinator:
+        raise AuditIntegrityError("Composer recovery requires an owned required-work coordinator")
+    response_body: dict[str, object] = {
+        "error_type": "composer_plugin_error",
+        # Honest detail (elspeth-2c3d63037c): the prior wording promised
+        # "see server logs for the traceback" but the slog event below
+        # deliberately omits ``exc_info`` to keep secret-bearing
+        # ``__cause__`` chains out of journald. Operators following the
+        # claim found nothing to read.
+        #
+        # Stage attribution: this helper handles plugin crashes inside
+        # the compose loop's ``execute_tool()`` (per
+        # ``ComposerPluginCrashError``'s docstring). It is NOT the
+        # runtime-preflight path — that's
+        # :func:`_handle_runtime_preflight_failure`. The diagnostic
+        # surface for the primary plugin crash is the structured slog
+        # event ``{log_prefix}_plugin_crash`` with ``exc_class``
+        # (existing tech debt being migrated under elspeth-940bfe3a0d).
+        # If the partial-state runtime preflight ALSO crashes
+        # downstream, that secondary failure's structured frames land
+        # in the persisted state's ``validation_errors`` via the
+        # post-elspeth-2c3d63037c capture helper — but we don't promise
+        # frames in the response detail because the dominant case is
+        # a single plugin crash with only the slog ``exc_class`` to
+        # show for it.
+        "detail": (
+            "A composer plugin crashed during a composer tool call. "
+            "The exception class is recorded in the structured server "
+            "log event for triage. This is not a user-retryable error."
+        ),
+    }
+    if exc.failed_turn is not None:
+        response_body["failed_turn"] = await _failed_turn_response_body(service, session_id, exc.failed_turn)
+
+    required_state_failure: SQLAlchemyError | None = None
+    persisted_state_id_pc: UUID | None = None
+    if exc.partial_state is not None:
+        # Persistence guard: DB write failure MUST NOT mask the original
+        # plugin crash (response stays as the 500 below, the save failure
+        # is recorded as a separate audit-system-failure slog event).
+        #
+        # SQLAlchemyError ONLY — narrowed per the Tier 1 semantics in
+        # docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model.
+        # _state_data_from_composer_state's validate() guard catches
+        # (ValueError, TypeError, KeyError) from structurally damaged partial
+        # state — those are acceptable there. TypeError/KeyError from
+        # state.to_dict() or CompositionStateData(...) is a Tier 1 invariant
+        # bug and must propagate. Symmetric with _handle_convergence_error;
+        # see the comment there for the full rationale.
+        try:
+            state_data, _validation = await _state_data_from_composer_state(
+                exc.partial_state,
+                settings=settings,
+                secret_service=secret_service,
+                user_id=user_id,
+                session_id=session_id,
+                plugin_snapshot=plugin_snapshot,
+                profile_registry=profile_registry,
+                catalog=catalog,
+                runtime_preflight=None,
+                preflight_exception_policy="persist_invalid",
+                initial_version=None,
+                telemetry_source="plugin_crash",
+                prior_completion_gates=await _durable_completion_gates(service, session_id),
+                composer_meta={
+                    **({"ingress": ingress} if ingress is not None else {}),
+                    **({"chat_ingress_inputs": chat_ingress_inputs} if chat_ingress_inputs is not None else {}),
+                }
+                if ingress is not None or chat_ingress_inputs is not None
+                else None,
+            )
+            if required_work is None:
+                partial_record = await service.save_composition_state(
+                    session_id,
+                    state_data,
+                    provenance="plugin_crash_persist",
+                    session_operation_context=session_operation_context,
+                )
+            else:
+                partial_sql = required_work.reserve(RequiredWorkSource.RECOVERY_PARTIAL_STATE_SQL)
+                partial_record = await service.save_composition_state(
+                    session_id,
+                    state_data,
+                    provenance="plugin_crash_persist",
+                    session_operation_context=session_operation_context,
+                    required_work=partial_sql,
+                )
+            persisted_state_id_pc = partial_record.id
+            response_body["partial_state"] = _recovery_partial_state_response(partial_record)
+        except SQLAlchemyError as save_err:
+            if required_audit:
+                required_state_failure = save_err
+            # Full SQLAlchemyError family — a narrow ``IntegrityError``
+            # catch would let ``OperationalError`` / ``ProgrammingError`` /
+            # siblings escape and mask the primary plugin-crash response.
+            # exc_info deliberately omitted: ``str(save_err)`` and
+            # ``__cause__`` text can carry SQL + bound parameters (the
+            # composition-state payload, which may reference secrets) and
+            # DB connection strings on ``OperationalError``.
+            slog.error(
+                f"{log_prefix}_plugin_crash_partial_state_save_failed",
+                session_id=str(session_id),
+                exc_class=type(save_err).__name__,
+            )
+            # Symmetry with _handle_convergence_error: frontend recovery UX
+            # needs the same ``partial_state_save_failed`` signal on the
+            # 500 path it already branches on for the 422 path. Without
+            # this, a plugin crash whose partial-state persist also failed
+            # looks identical to a plugin crash that succeeded in
+            # persisting — the UI can't distinguish "state is captured,
+            # safe to retry later" from "state is lost, start over."
+            # Class name only; see the save_error comment in
+            # _handle_convergence_error for the leak rationale.
+            response_body["partial_state_save_failed"] = True
+            response_body["partial_state_save_error"] = type(save_err).__name__
+
+    # exc_info deliberately omitted: exc.original_exc / its __cause__ chain
+    # may carry DB URLs, filesystem paths, or secret fragments. The
+    # structured exc_class + session_id correlation is the complete
+    # triage surface. The broader slog-for-run-events migration is
+    # tracked in elspeth-940bfe3a0d.
+    slog.error(
+        f"{log_prefix}_plugin_crash",
+        session_id=str(session_id),
+        user_id=user_id,
+        exc_class=exc.exc_class,
+    )
+
+    # Persist the per-tool-call audit trail. The crashing call itself
+    # is the LAST entry in tool_invocations with status=PLUGIN_CRASH;
+    # earlier entries are the calls that successfully ran before the
+    # plugin bug fired.
+    # Compose-loop plugin-crash rows commit before the carrier is raised.
+    # Retain this drain only for older/non-loop carriers with no failed_turn.
+    # Tool rows and LLM sidecars settle as ONE cohort in a single
+    # transaction (elspeth-90231248dc) despite their differing state ids.
+    try:
+        await _persist_turn_audit_cohort(
+            service,
+            session_id,
+            exc.tool_invocations if exc.failed_turn is None else (),
+            exc.llm_calls,
+            tool_composition_state_id=persisted_state_id_pc,
+            llm_composition_state_id=llm_composition_state_id,
+            plugin_crash_pending=True,
+            required_audit=required_audit,
+            required_work=required_work,
+            session_operation_context=session_operation_context,
+        )
+    except BaseException as audit_failure:
+        if required_state_failure is not None:
+            raise BaseExceptionGroup("Composer recovery and required audit failed", [required_state_failure, audit_failure]) from None
+        raise
+    if required_state_failure is not None:
+        raise ComposerRequiredRecoveryFailure(required_state_failure)
+    return response_body
+
+
+async def _handle_runtime_preflight_failure(
+    exc: ComposerRuntimePreflightError,
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    user_id: str,
+    log_prefix: str,
+    llm_composition_state_id: UUID | None,
+    settings: Any,
+    secret_service: Any | None,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    profile_registry: OperatorProfileRegistry,
+    catalog: CatalogServiceProtocol,
+    session_operation_context: SessionOperationContext,
+    ingress: CompositionIngressRecord | None = None,
+    chat_ingress_inputs: list[ChatIngressInput] | None = None,
+    required_audit: bool = False,
+    required_work: RequiredWorkCoordinator | None = None,
+) -> dict[str, object]:
+    """Build 500 response body and persist partial state for runtime-preflight failures.
+
+    Symmetric with :func:`_handle_plugin_crash` — same partial-state
+    persistence guard, same response-body shape, same SQLAlchemyError
+    fail-soft contract. The exception class is the only structural
+    difference: ``ComposerRuntimePreflightError`` carries
+    ``original_exc`` instead of the plugin-crash wrapper's ``exc_class``
+    string, but the recovery semantics are identical.
+
+    Two raise sites converge here:
+
+    1. **Cached path** — :func:`elspeth.web.composer.service._raise_cached_runtime_preflight_failure`
+       inside ``composer.compose()`` re-raises a previously-cached
+       runtime-preflight failure when the LLM's final state matches a
+       cached failure key. Caught at the route's top-level compose-time
+       except clause.
+
+    2. **Post-compose path** — :func:`_state_data_from_composer_state`
+       called with ``preflight_exception_policy="raise"`` on the
+       post-compose state-save block. This raise site sits *after* the
+       compose-time try/except, so the caller wraps the post-compose
+       block in its own try/except that delegates here.
+
+    Telemetry attribution
+    ---------------------
+    Every invocation of this helper produces a recovery emission, paired
+    with a primary emission attributed to the originating raise site:
+
+    * Primary site (path-2) — ``_state_data_from_composer_state`` lifts
+      its exception telemetry above the policy split, so the raise arm
+      fires
+      ``composer.runtime_preflight.total{result=exception,
+      source=<originating>, exception_class=...}`` (where
+      ``<originating>`` is ``"compose"`` or ``"recompose"``) before
+      propagating the ``ComposerRuntimePreflightError``. This preserves
+      originating-route attribution that would otherwise be lost.
+
+    * Primary site (path-1, elspeth-0891e8da73) — the route catch around
+      ``composer.compose()`` fires
+      ``composer.runtime_preflight.total{result=exception,
+      source=cached_preflight, exception_class=...}`` before delegating
+      here. The cached raise site lives in the composer service rather
+      than ``_state_data_from_composer_state``, so the primary emission
+      cannot be lifted into the helper itself; the route catch is the
+      first place that knows the failure mode is a runtime-preflight
+      cache re-raise.
+
+    * Recovery site (both paths) — this helper emits
+      ``source=runtime_preflight`` exactly once per invocation. When
+      ``exc.partial_state is not None``, the emission is fired
+      automatically by the persist_invalid arm of the re-call to
+      ``_state_data_from_composer_state``. When ``exc.partial_state is
+      None`` (the path-1 cached re-raise with no LLM mutation case), the
+      persist_invalid re-call is skipped and the helper instead fires
+      the recovery emission inline. Either way, the recovery counter
+      increments once per handler invocation.
+
+    Operators querying primary failure rate filter on
+    ``source ∈ {compose, recompose, cached_preflight, plugin_crash,
+    convergence, yaml_export}``; querying recovery handler invocations
+    filters on ``source = runtime_preflight``. The two sources represent
+    distinct observable events (failure occurred; recovery ran), not
+    double-counting.
+
+    Caveat: the persist_invalid arm only re-runs the runtime preflight
+    when the partial state is *authoring-valid* (the
+    ``runtime is None and authoring.is_valid`` branch in
+    :func:`_state_data_from_composer_state`). For a partial state captured
+    immediately after a runtime-preflight raise — the dominant case for
+    both raise sites — authoring is valid by construction, so the counter
+    increments. If a future caller passes a partial that fails authoring
+    validation, the runtime-preflight counter will not increment for that
+    invocation; only the authoring-validation counter will. That is the
+    correct attribution: a state that can't be authoring-validated cannot
+    have a meaningful runtime-preflight outcome to attribute.
+
+    Logging policy
+    --------------
+    Unlike :func:`_handle_plugin_crash` and
+    :func:`_handle_convergence_error`, this helper does **not** emit a
+    ``slog.error`` triage event. Per CLAUDE.md telemetry/logging primacy,
+    the OpenTelemetry counter above is the canonical triage surface for
+    runtime-preflight outcomes. The slog calls in the sibling helpers
+    are pre-existing tech debt being migrated under elspeth-940bfe3a0d;
+    new code does not adopt the pattern.
+
+    The persistence-failure ``slog.error`` inside the SQLAlchemyError
+    catch is the audit-system-failure exemption — when DB persistence
+    itself breaks, slog is the appropriate last-resort channel — and is
+    retained here for parity with the sibling helpers' fallback path.
+
+    Args:
+        exc: The runtime-preflight wrapper with ``original_exc`` and
+            optional ``partial_state``.
+        service: Session service for DB persistence of partial state.
+        session_id: Session to persist partial state to.
+        user_id: Authenticated user id (logged on the SQLAlchemyError
+            audit-failure path for triage correlation).
+        log_prefix: Prefix for the SQLAlchemyError audit-failure event
+            name (e.g. ``"compose"`` or ``"recompose"``).
+        settings: App settings (forwarded to
+            :func:`_state_data_from_composer_state`).
+        secret_service: Scoped secret resolver (forwarded to runtime
+            preflight on the recovery re-call).
+
+    Returns:
+        Response body dict for ``HTTPException(status_code=500, ...)``.
+    """
+    if required_work is not None and type(required_work) is not RequiredWorkCoordinator:
+        raise AuditIntegrityError("Composer recovery requires an owned required-work coordinator")
+    response_body: dict[str, object] = {
+        "error_type": "composer_plugin_error",
+        # Honest detail (elspeth-2c3d63037c): the prior wording promised
+        # "see server logs for the traceback" but this helper deliberately
+        # emits no slog.error triage event (per the "Logging policy"
+        # section above) and the sibling helpers' slog calls omit
+        # exc_info to avoid leaking secret-bearing __cause__ chains. The
+        # diagnostic surface is now the persisted state's
+        # validation_errors row (see :func:`_runtime_preflight_failure_errors`
+        # — exception_class + first-line message + bounded
+        # file:line:function frames) plus the OTel
+        # ``composer.runtime_preflight.total`` counter, bucketed by
+        # ``exception_class``.
+        "detail": (
+            "A composer plugin crashed during runtime preflight. "
+            "Diagnostic frames are recorded in the persisted state's "
+            "validation_errors when a partial state was captured. "
+            "This is not a user-retryable error."
+        ),
+    }
+    if exc.failed_turn is not None:
+        response_body["failed_turn"] = await _failed_turn_response_body(service, session_id, exc.failed_turn)
+
+    required_state_failure: SQLAlchemyError | None = None
+    persisted_state_id_rpf: UUID | None = None
+    if exc.partial_state is not None:
+        # Persistence guard: DB write failure MUST NOT mask the original
+        # runtime-preflight failure (response stays as the 500 below; the
+        # save failure is recorded as a separate audit-system-failure
+        # slog event — that slog event is the persistence-fallback
+        # exemption, NOT a normal-flow log).
+        #
+        # SQLAlchemyError ONLY — narrowed per the Tier 1 semantics in
+        # docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model,
+        # symmetric with the sibling _handle_plugin_crash /
+        # _handle_convergence_error helpers. See the comment in
+        # _handle_convergence_error for the full rationale on the
+        # SQLAlchemyError width.
+        try:
+            state_data, _validation = await _state_data_from_composer_state(
+                exc.partial_state,
+                settings=settings,
+                secret_service=secret_service,
+                user_id=user_id,
+                session_id=session_id,
+                plugin_snapshot=plugin_snapshot,
+                profile_registry=profile_registry,
+                catalog=catalog,
+                runtime_preflight=None,
+                preflight_exception_policy="persist_invalid",
+                initial_version=None,
+                telemetry_source="runtime_preflight",
+                prior_completion_gates=await _durable_completion_gates(service, session_id),
+                composer_meta={
+                    **({"ingress": ingress} if ingress is not None else {}),
+                    **({"chat_ingress_inputs": chat_ingress_inputs} if chat_ingress_inputs is not None else {}),
+                }
+                if ingress is not None or chat_ingress_inputs is not None
+                else None,
+            )
+            if required_work is None:
+                partial_record = await service.save_composition_state(
+                    session_id,
+                    state_data,
+                    provenance="preflight_persist",
+                    session_operation_context=session_operation_context,
+                )
+            else:
+                partial_sql = required_work.reserve(RequiredWorkSource.RECOVERY_PARTIAL_STATE_SQL)
+                partial_record = await service.save_composition_state(
+                    session_id,
+                    state_data,
+                    provenance="preflight_persist",
+                    session_operation_context=session_operation_context,
+                    required_work=partial_sql,
+                )
+            persisted_state_id_rpf = partial_record.id
+            response_body["partial_state"] = _recovery_partial_state_response(partial_record)
+        except SQLAlchemyError as save_err:
+            if required_audit:
+                required_state_failure = save_err
+            # See sibling helpers for redaction rationale (exc_info
+            # omitted; class name only on the response body).
+            slog.error(
+                f"{log_prefix}_runtime_preflight_partial_state_save_failed",
+                session_id=str(session_id),
+                user_id=user_id,
+                exc_class=type(save_err).__name__,
+            )
+            response_body["partial_state_save_failed"] = True
+            response_body["partial_state_save_error"] = type(save_err).__name__
+    else:
+        # Recovery acknowledgment (elspeth-0891e8da73). When no partial
+        # state is captured (the path-1 cached re-raise with no LLM
+        # mutation case), the persist_invalid re-call above is skipped,
+        # so its source=runtime_preflight emission inside
+        # _state_data_from_composer_state never fires. The no-silent-failures
+        # rule (the logging-telemetry-policy skill §Telemetry (Operational
+        # Visibility)) — every telemetry emission point must send what it has
+        # or explicitly acknowledge "I have nothing" — requires the
+        # recovery handler to count its own invocation regardless of
+        # whether persistence work occurred — otherwise dashboards
+        # filtering composer.runtime_preflight.total{source=
+        # runtime_preflight} silently under-count handler invocations
+        # by exactly the count of "no partial state" recoveries.
+        _record_composer_runtime_preflight_telemetry(
+            "exception",
+            source="runtime_preflight",
+            exception_class=exc.exc_class,
+        )
+
+    # Persist the per-tool-call audit trail. Preview-path runtime
+    # preflight failures now record the preview_pipeline tool invocation
+    # before raising; other runtime-preflight failures may still carry an
+    # empty tuple (the both-empty no-op inside the helper handles that).
+    # Runtime-preflight carriers from the compose loop use the committed
+    # failed_turn row; post-compose/non-loop carriers still drain here.
+    # Tool rows and LLM sidecars settle as ONE cohort in a single
+    # transaction (elspeth-90231248dc) despite their differing state ids.
+    try:
+        await _persist_turn_audit_cohort(
+            service,
+            session_id,
+            exc.tool_invocations if exc.failed_turn is None else (),
+            exc.llm_calls,
+            tool_composition_state_id=persisted_state_id_rpf,
+            llm_composition_state_id=llm_composition_state_id,
+            plugin_crash_pending=True,
+            required_audit=required_audit,
+            required_work=required_work,
+            session_operation_context=session_operation_context,
+        )
+    except BaseException as audit_failure:
+        if required_state_failure is not None:
+            raise BaseExceptionGroup("Composer recovery and required audit failed", [required_state_failure, audit_failure]) from None
+        raise
+    if required_state_failure is not None:
+        raise ComposerRequiredRecoveryFailure(required_state_failure)
+    return response_body
+
+
+def _initial_composition_state() -> CompositionState:
+    """Initialize freeform authoring."""
+    return CompositionState(
+        source=None,
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+__all__ = [
+    "AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST",
+    "PLANNER_POLICY_DETAIL_CODES",
+    "SESSION_TERMINAL_RUN_STATUS_VALUES",
+    "UTC",
+    "UUID",
+    "_COMPOSER_AUTHORING_VALIDATION_COUNTER",
+    "_COMPOSER_EXCEPTION_CLASS_BUCKETS",
+    "_COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER",
+    "_COMPOSER_REQUESTS_INFLIGHT",
+    "_COMPOSER_REQUEST_TERMINAL_COUNTER",
+    "_COMPOSER_RUNTIME_PREFLIGHT_COUNTER",
+    "_COMPOSER_TIER1_VIOLATION_COUNTER",
+    "_MAX_PROVIDER_DETAIL_CHARS",
+    "_OTHER_COMPOSER_EXCEPTION_CLASS",
+    "_PROVIDER_DETAIL_REDACTED",
+    "_REDACTED_SECRET_DETAIL",
+    "_RUNTIME_PREFLIGHT_FAILED",
+    "_RUNTIME_PREFLIGHT_FRAME_LIMIT",
+    "_RUNTIME_PREFLIGHT_MESSAGE_LIMIT",
+    "APIRouter",
+    "AcceptProposalRequest",
+    "Any",
+    "AuditIntegrityError",
+    "AuditStoryIntegrityError",
+    "AuditStoryService",
+    "BlobQuotaExceededError",
+    "BufferingRecorder",
+    "CatalogServiceProtocol",
+    "ChatMessageRecord",
+    "ChatMessageResponse",
+    "ChatMessageRole",
+    "ComposerConvergenceError",
+    "ComposerLLMCall",
+    "ComposerPluginCrashError",
+    "ComposerPreferencesResponse",
+    "ComposerProgressEvent",
+    "ComposerProgressRegistry",
+    "ComposerProgressSink",
+    "ComposerProgressSnapshot",
+    "ComposerRuntimePreflightError",
+    "ComposerService",
+    "ComposerServiceError",
+    "ComposerSessionPreferencesRecord",
+    "ComposerToolInvocation",
+    "ComposerToolStatus",
+    "CompositionProposalRecord",
+    "CompositionProposalResponse",
+    "CompositionState",
+    "CompositionStateData",
+    "CompositionStateRecord",
+    "CompositionStateResponse",
+    "CreateSessionRequest",
+    "Depends",
+    "FailedTurnMetadata",
+    "ForkSessionRequest",
+    "ForkSessionResponse",
+    "GraphValidationError",
+    "HTTPException",
+    "InterpretationChoice",
+    "InterpretationEventAlreadyResolvedError",
+    "InterpretationEventNotFoundError",
+    "InterpretationEventRecord",
+    "InterpretationEventResponse",
+    "InterpretationNodeMissingError",
+    "InterpretationNodePluginMutatedError",
+    "InterpretationOptOutResponse",
+    "InterpretationPlaceholderConsumedError",
+    "InterpretationResolveRequest",
+    "InterpretationResolveResponse",
+    "InterpretationSource",
+    "InterpretationSourceDataContractDriftError",
+    "InterpretationUnsupportedChoiceError",
+    "InvalidForkTargetError",
+    "InvariantError",
+    "LandscapeDB",
+    "ListInterpretationEventsResponse",
+    "Literal",
+    "Mapping",
+    "MessageWithStateResponse",
+    "OptOutSummaryResponse",
+    "PipelineMetadata",
+    "PipelinePlannerError",
+    "PluginConfigError",
+    "PluginNotFoundError",
+    "ProposalEventRecord",
+    "ProposalEventResponse",
+    "ProposalLifecycleStatus",
+    "PydanticValidationError",
+    "Query",
+    "RejectProposalRequest",
+    "Request",
+    "RevertStateRequest",
+    "RunAccounting",
+    "RunAuditStoryResponse",
+    "RunRecord",
+    "RunResponse",
+    "RunStatusResponse",
+    "SQLAlchemyError",
+    "SendMessageRequest",
+    "Sequence",
+    "SessionRecord",
+    "SessionResponse",
+    "SessionServiceProtocol",
+    "SessionsTelemetry",
+    "TransitionAssistantDraft",
+    "UpdateComposerPreferencesRequest",
+    "UpdateSessionRequest",
+    "UserIdentity",
+    "ValidationEntry",
+    "ValidationEntryResponse",
+    "ValidationResult",
+    "ValidationSummary",
+    "WebRateLimiter",
+    "_ComposerPreflightTelemetryResult",
+    "_ComposerPreflightTelemetrySource",
+    "_ComposerRequestEndpoint",
+    "_ComposerRequestTerminalStatus",
+    "_PreflightExceptionPolicy",
+    "_RuntimePreflightFailed",
+    "_RuntimePreflightOutcome",
+    "_SessionComposeLockRegistry",
+    "_bounded_composer_exception_class",
+    "_capture_runtime_preflight_failure",
+    "_composer_chat_history",
+    "_composer_conversation_messages",
+    "_composer_conversation_or_llm_audit_messages",
+    "_composer_conversation_or_tool_messages",
+    "_composer_conversation_tool_or_llm_audit_messages",
+    "_composer_heartbeat_cancel_of",
+    "_composer_heartbeat_failed_progress_event",
+    "_composer_history_content",
+    "_composer_persisted_validation",
+    "_composer_preferences_response",
+    "_composer_progress_sink",
+    "_composition_proposal_response",
+    "_extract_runtime_model_snapshot",
+    "_failed_turn_response_body",
+    "_first_message_line",
+    "_get_composer_progress_registry",
+    "_get_session_compose_lock_registry",
+    "_handle_composer_chargeable_refusal",
+    "_handle_composer_provider_failure",
+    "_handle_convergence_error",
+    "_handle_planner_failure",
+    "_handle_plugin_crash",
+    "_handle_runtime_preflight_failure",
+    "_initial_composition_state",
+    "_interpretation_event_response",
+    "_is_composer_audit_tool_message",
+    "_is_composer_llm_audit_tool_message",
+    "_litellm_error_detail",
+    "_llm_calls_from_exception",
+    "_log_last_resort_diagnostic",
+    "_message_response",
+    "_pending_proposal_responses",
+    "_persist_llm_calls",
+    "_persist_tool_invocations",
+    "_persist_turn_audit_cohort",
+    "_proposal_event_response",
+    "_publish_progress",
+    "_record_composer_authoring_validation_telemetry",
+    "_record_composer_request_terminal",
+    "_record_composer_runtime_preflight_telemetry",
+    "_rejections_by_tool_call_id",
+    "_replace",
+    "_run_accounting_integrity_http",
+    "_runtime_preflight_failure_errors",
+    "_runtime_preflight_for_state",
+    "_safe_frame_strings",
+    "_session_response",
+    "_state_data_from_composer_state",
+    "_state_from_record",
+    "_state_response",
+    "_validate_run_status_accounting_for_list",
+    "_verify_session_ownership",
+    "annotations",
+    "asyncio",
+    "audit_envelope",
+    "cast",
+    "client_cancelled_progress_event",
+    "composer_completion_events_table",
+    "contextlib",
+    "convergence_progress_event",
+    "dataclass",
+    "datetime",
+    "deep_thaw",
+    "execute_tool",
+    "generate_public_yaml",
+    "get_rate_limiter",
+    "insert",
+    "json",
+    "llm_call_audit_envelope",
+    "llm_call_audit_summary",
+    "load_run_accounting_for_settings",
+    "maybe_auto_title_session",
+    "merge_composer_meta_updates",
+    "merge_implicit_decisions_meta",
+    "metrics",
+    "planner_failure_is_policy_blocked",
+    "record_session_completed",
+    "record_session_switched",
+    "redact_source_storage_path",
+    "require_pipeline_user",
+    "run_sync_in_worker",
+    "scrub_text_for_audit",
+    "slog",
+    "stable_hash",
+    "structlog",
+    "sys",
+    "uuid4",
+    "validate_pipeline",
+    "yaml_generator",
+]

@@ -1,0 +1,59 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 211 items
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py .............. [  6%]
+.............................F
+
+=================================== FAILURES ===================================
+_____________ test_every_shipped_envelope_key_is_taught_or_fenced ______________
+
+    def test_every_shipped_envelope_key_is_taught_or_fenced() -> None:
+        fenced = {(e.surface, e.tool, e.key) for e in load_fence()}
+>       unexplained = {k: v for k, v in untaught_keys().items() if k not in fenced}
+                                        ^^^^^^^^^^^^^^^
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2520: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2477: in untaught_keys
+    blocks = _teaching_blocks()
+             ^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2457: in _teaching_blocks
+    validate_teaching_scopes(blocks, frozenset((row.surface, row.tool, row.key) for row in shipped_keys()))
+                                                                                           ^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2396: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_every_shipped_envelope_key_is_taught_or_fenced
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+========================= 1 failed, 43 passed in 2.37s =========================

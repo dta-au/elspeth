@@ -1,0 +1,379 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 2 items
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py F [ 50%]
+.                                                                        [100%]
+
+=================================== FAILURES ===================================
+_ test_complete_auto_same_bytes_new_source_authority_is_published[same-inline-bytes-new-custody] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-154/test_complete_auto_same_bytes_0')
+replacement = 'inline'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("replacement", ["inline", "existing-blob"], ids=["same-inline-bytes-new-custody", "only-blob-identity-changed"])
+    async def test_complete_auto_same_bytes_new_source_authority_is_published(tmp_path: Path, replacement: str) -> None:
+        from elspeth.web.composer.pipeline_proposal import composition_content_hash
+        from tests.helpers.session_fences import fenced_operation_context
+    
+        harness = _harness(tmp_path)
+        arguments = _inline_pipeline_args(tmp_path)
+        inline = arguments["source"]["inline_blob"]
+        content = inline["content"].encode("utf-8")
+        await harness.sessions.update_composer_preferences(
+            UUID(harness.session_id),
+            trust_mode="auto_commit",
+            density_default="high",
+            actor="user:proposal-prevalidation-user",
+        )
+        if replacement == "inline":
+            seed_llm = _ScriptedLLM(_tool_turn("call_seed_inline_authority", "set_pipeline", arguments))
+            with patch.object(harness.service._provider_gateway, "_call_llm", new=seed_llm):
+                seed_result = await harness.service.compose(
+                    "Prepare the first inline artifact.",
+                    [],
+                    _incremental_base_state(tmp_path),
+                    session_id=harness.session_id,
+                    user_id="proposal-prevalidation-user",
+                    user_message_id=harness.user_message_id,
+                )
+            current = seed_result.state
+            assert len(seed_result.tool_invocations) == 1
+            with harness.engine.connect() as conn:
+                original = conn.execute(select(blobs_table)).one()
+        else:
+            del arguments["source"]["inline_blob"]
+            with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as context:
+                original = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+                    UUID(harness.session_id),
+                    inline["filename"],
+                    content,
+                    inline["mime_type"],
+                    session_operation_context=context,
+                )
+                replacement_blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+                    UUID(harness.session_id),
+                    inline["filename"],
+                    content,
+                    inline["mime_type"],
+                    session_operation_context=context,
+                )
+            arguments["source"]["blob_id"] = str(original.id)
+            snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.catalog)
+            view = PolicyCatalogView.for_trained_operator(harness.catalog, snapshot)
+            with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.COMPOSE) as context:
+                seeded = real_execute_tool(
+                    "set_pipeline",
+                    arguments,
+                    _incremental_base_state(tmp_path),
+                    view,
+                    plugin_snapshot=snapshot,
+                    data_dir=str(tmp_path),
+                    session_engine=harness.engine,
+                    session_id=harness.session_id,
+                    session_operation_context=context,
+                    session_operation_authority=harness.sessions.session_operation_authority,
+                    user_id="proposal-prevalidation-user",
+                    validate_arguments=True,
+                    require_data_dir_for_paths=True,
+                    raise_schema_argument_errors=True,
+                )
+            assert seeded.success and seeded.validation.is_valid
+            current = seeded.updated_state
+            arguments["source"]["blob_id"] = str(replacement_blob.id)
+        assert current.sources and current.outputs
+        assert current.sources["source"].options["blob_ref"] == str(original.id)
+        llm = _ScriptedLLM(_tool_turn("call_complete_new_authority", "set_pipeline", arguments))
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as executor,
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+>           result = await harness.service.compose(
+                "Use a new source artifact with the same bytes.",
+                [],
+                current,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                user_message_id=harness.user_message_id,
+            )
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:2501: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/helpers/composer_lease.py:165: in compose
+    return await _with_lease(self, session_id, kwargs, call, bind_provider_owner=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:108: in _with_lease
+    return await _with_provider_owner(self, forwarded, call, lease) if bind_provider_owner else await call(**forwarded)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:50: in _with_provider_owner
+    return await call(**forwarded)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:163: in call
+    return await real_compose(self, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:1274: in compose
+    return await self._compose_loop(
+src/elspeth/web/composer/service.py:2870: in _compose_loop
+    ) = await _await_tool_turn_with_deferred_cancellation(
+src/elspeth/web/composer/service.py:204: in _await_tool_turn_with_deferred_cancellation
+    return await asyncio.shield(task), deferred
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:2826: in _dispatch_and_persist_tool_turn
+    persist_result = await self._persist_turn_audit(
+src/elspeth/web/composer/service.py:1562: in _persist_turn_audit
+    return await persist_turn_audit(
+src/elspeth/web/composer/turn_audit.py:511: in persist_turn_audit
+    audit_outcome = await sessions_service.persist_compose_turn_async(
+tests/unit/web/sessions/session_test_authority.py:57: in persist_compose_turn_async
+    return await super().persist_compose_turn_async(**kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:2470: in persist_compose_turn_async
+    return await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_composer_sql(_sync)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:383: in run_required_sql_in_worker
+    _raise_lifecycle_originals(cancellations, [outcome.error])
+src/elspeth/web/async_workers.py:340: in _raise_lifecycle_originals
+    raise originals[0]
+src/elspeth/web/async_workers.py:424: in run_required_sql_finish_once
+    value = future.result()
+            ^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+src/elspeth/web/required_work.py:578: in observe_actual_outcome
+    self._result = self._future.result()
+                   ^^^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/required_executor.py:119: in invoke
+    return callable_()
+           ^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:2454: in _sync
+    return self.persist_compose_turn(
+tests/unit/web/sessions/session_test_authority.py:52: in persist_compose_turn
+    return super().persist_compose_turn(**kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <tests.unit.web.sessions.session_test_authority.FencedSessionServiceHarness object at 0x7f2b20356b70>
+
+    def persist_compose_turn(
+        self,
+        *,
+        session_id: str,
+        assistant_content: str,
+        raw_content: str | None = None,
+        redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...],
+        redacted_tool_rows: tuple[RedactedToolRow, ...],
+        private_tool_evidence: tuple[ComposerDiagnosticEvidence, ...],
+        private_tool_failures: tuple[ComposerDiagnosticEvidence, ...] = (),
+        rejection_records: tuple[RejectionRecord, ...] = (),
+        parent_composition_state_id: str | None,
+        expected_current_state_id: str | None,
+        writer_principal: ChatMessageWriterPrincipal,
+        plugin_crash_pending: bool,
+        session_operation_context: SessionOperationContext,
+    ) -> AuditOutcome:
+        """Synchronous, single-transaction persistence of one compose turn.
+    
+        Spec §5.2.2. Concrete sync primitive. Production async callers MUST
+        invoke ``await self.persist_compose_turn_async(...)`` through
+        :class:`SessionServiceProtocol`; that dispatcher uses ``_run_sync``
+        under the hood. Calling this sync primitive directly from async land
+        would block the event loop because the body opens a synchronous
+        SQLAlchemy transaction.
+    
+        The async-loop guard below uses ``asyncio.get_running_loop()`` to
+        detect misuse: if there is a running loop in the calling thread,
+        we are in async land and MUST refuse. ``RuntimeError`` is the
+        canonical "you called the wrong API" signal — the call site is
+        a bug, not a recoverable user error. Closes synthesised review
+        finding SA-7 / M1.
+    
+        Order of work (load-bearing):
+    
+        1. Pre-DB transcript validation (``_validate_tool_call_id_set_equality``).
+           Pure function of caller args; runs BEFORE ``_engine.begin()`` so
+           a contract violation cannot leave a half-written audit trail.
+        2. Open transaction; acquire session write lock.
+        3. Cross-session guard on ``parent_composition_state_id`` (B5).
+        4. Stale-state guard on ``expected_current_state_id``.
+        5. Reserve sequence range for assistant + N tool rows.
+        6. Insert assistant row (with optional ``raw_content``,
+           B2 audit-attribution).
+        7. For each tool row: optionally insert composition state under
+           the held lock, then insert tool chat row referencing it.
+    
+        ``raw_content`` is the audit-attribution column for assistant
+        messages whose visible ``content`` was rewritten by runtime
+        preflight redaction. Routes already pass
+        ``raw_content=result.raw_assistant_content`` to ``add_message``;
+        compose-loop call sites use ``persist_compose_turn``, so the
+        primitive must accept and persist the column today (B2).
+        """
+        import asyncio
+    
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop in this thread -- we are in a worker thread
+            # or pure sync test context. Proceed.
+            pass
+        else:
+            raise RuntimeError(
+                "persist_compose_turn must be dispatched via "
+                "await self.persist_compose_turn_async(...) -- "
+                "calling it directly from a coroutine blocks the event "
+                "loop on synchronous DB I/O."
+            )
+    
+        # Q-F1 (Step 3c): transcript validation BEFORE _engine.begin().
+        # Pre-lock, pre-transaction; pure function of caller args.
+        _validate_tool_call_id_set_equality(
+            redacted_assistant_tool_calls=redacted_assistant_tool_calls,
+            redacted_tool_rows=redacted_tool_rows,
+        )
+    
+        # Rejection records are caller-supplied context for tool rows in THIS
+        # turn: an id naming no persisted tool row would orphan the reason.
+        # Same pre-transaction posture as the transcript validation above.
+        tool_row_ids = {row.tool_call_id for row in redacted_tool_rows}
+        from elspeth.web.composer.visible_tool_event import VisibleToolEvent
+    
+        assistant_calls_by_id = {call["id"]: call for call in redacted_assistant_tool_calls}
+        for tool_row in redacted_tool_rows:
+            if tool_row.visible_event is not None:
+                if type(tool_row.visible_event) is not VisibleToolEvent or writer_principal != "compose_loop":
+                    raise AuditIntegrityError("Visible tool evidence lacks its exact producer")
+                call = assistant_calls_by_id[tool_row.tool_call_id]
+                tool_row.visible_event.validate(
+                    context=session_operation_context,
+                    session_id=session_id,
+                    tool_call_id=tool_row.tool_call_id,
+                    tool_name=call["function"]["name"],
+                    display_arguments=call["function"]["arguments"],
+                    display_result=tool_row.content,
+                )
+        if (tool_row_ids or private_tool_evidence) and writer_principal != "compose_loop":
+            raise AuditIntegrityError("private tool evidence requires compose_loop writer custody")
+        from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, diagnostic_evidence_identity
+    
+        evidence_by_id: dict[str, ComposerDiagnosticEvidence] = {}
+        for evidence in private_tool_evidence:
+            if type(evidence) is not ComposerDiagnosticEvidence:
+                raise AuditIntegrityError("normal tool evidence requires an owned diagnostic record")
+            if evidence.tool_call_id in evidence_by_id:
+                raise AuditIntegrityError("normal tool evidence repeats a tool call")
+            if (
+                evidence.session_id != session_id
+                or evidence.operation_id != session_operation_context.fence.operation_id
+                or evidence.operation_epoch != session_operation_context.fence.operation_epoch
+            ):
+                raise AuditIntegrityError("normal tool evidence has unrelated operation authority")
+            evidence_by_id[evidence.tool_call_id] = evidence
+        if set(evidence_by_id) != tool_row_ids:
+            raise AuditIntegrityError("normal tool evidence does not match the exact persisted tool set")
+        if len({evidence.evidence_id for evidence in (*private_tool_evidence, *private_tool_failures)}) != len(private_tool_evidence) + len(
+            private_tool_failures
+        ):
+            raise AuditIntegrityError("private tool authoring and failure evidence identities collide")
+        failure_ids: set[str] = set()
+        for failure in private_tool_failures:
+            if (
+                type(failure) is not ComposerDiagnosticEvidence
+                or failure.tool_call_id not in tool_row_ids
+                or failure.tool_call_id in failure_ids
+                or failure.evidence_id != diagnostic_evidence_identity("tool-failure", failure.tool_call_id)
+                or failure.tool_name != "composer_failure"
+                or failure.status != "tool_failure"
+                or failure.session_id != session_id
+                or failure.operation_id != session_operation_context.fence.operation_id
+                or failure.operation_epoch != session_operation_context.fence.operation_epoch
+            ):
+                raise AuditIntegrityError("private tool failure has unrelated or repeated owned identity")
+            failure_ids.add(failure.tool_call_id)
+        for record in rejection_records:
+            if record.tool_call_id not in tool_row_ids:
+                raise ValueError(
+                    "persist_compose_turn: rejection record names tool_call_id "
+                    f"{record.tool_call_id!r} which is not among this turn's "
+                    f"tool rows {sorted(tool_row_ids)!r}"
+                )
+        now = self._now()
+        # IntegrityError disposition (spec §4.5): the catch is
+        # OUTSIDE ``with self._engine.begin()`` deliberately. Order is
+        # load-bearing — the ``with`` context's ``__exit__`` runs first
+        # (rolling back the transaction so no partial audit row survives),
+        # THEN we increment the operational counter, THEN the exception
+        # re-raises so the caller observes the actual constraint
+        # violation. Putting the catch INSIDE the ``with`` would fire
+        # before rollback completes and could mask the original error.
+        #
+        # Audit primacy: telemetry signals operational rate; the
+        # exception itself is the authoritative signal to the caller.
+        # Both channels fire; neither is suppressed. Catch is exactly
+        # ``IntegrityError`` -- not ``Exception``, not ``SQLAlchemyError``
+        # -- because only constraint violations belong on this counter.
+        try:
+            with self._session_process_locked_begin(session_id) as conn:
+                with (
+                    self._session_write_lock(conn, session_id),
+                    self._session_composer_mutation_transaction(
+                        conn,
+                        session_id=session_id,
+                        session_operation_context=session_operation_context,
+                        expected_kind=SessionOperationKind.COMPOSE,
+                    ),
+                ):
+                    # B5: if a parent
+                    # composition state is supplied, it MUST belong to this
+                    # session.
+                    if parent_composition_state_id is not None:
+                        _assert_state_in_session(
+                            conn,
+                            state_id=parent_composition_state_id,
+                            expected_session_id=session_id,
+                            caller="persist_compose_turn",
+                        )
+    
+                    current_state_id = conn.execute(
+                        select(composition_states_table.c.id)
+                        .where(composition_states_table.c.session_id == session_id)
+                        .order_by(composition_states_table.c.version.desc())
+                        .limit(1)
+                    ).scalar_one_or_none()
+                    if current_state_id != expected_current_state_id:
+>                       raise StaleComposeStateError(
+                            "persist_compose_turn: current composition state changed "
+                            f"for session_id={session_id!r}; "
+                            f"expected={expected_current_state_id!r}, "
+                            f"actual={current_state_id!r}. Refusing to persist a "
+                            "compose result based on a stale state."
+                        )
+E                       elspeth.web.sessions.protocol.StaleComposeStateError: persist_compose_turn: current composition state changed for session_id='00000000-0000-4000-8000-000000000001'; expected=None, actual='df96360e-350f-4dac-9b66-2041fc35260d'. Refusing to persist a compose result based on a stale state.
+
+src/elspeth/web/sessions/service.py:2107: StaleComposeStateError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 14:27:51 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 14:27:53 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 14:27:53 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 14:27:53 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+2026-11-09 14:27:53 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+=========================== short test summary info ============================
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_complete_auto_same_bytes_new_source_authority_is_published[same-inline-bytes-new-custody]
+========================= 1 failed, 1 passed in 6.91s ==========================

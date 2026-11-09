@@ -1,0 +1,1930 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 71 items
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py .... [  5%]
+.FF                                                                      [  9%]
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py FFFFFFFF [ 21%]
+FFFFF..                                                                  [ 30%]
+tests/unit/web/sessions/test_pipeline_rejection_callers.py .....FFFF.... [ 49%]
+..............................                                           [ 91%]
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py . [ 92%]
+.FF                                                                      [ 97%]
+tests/integration/web/composer/test_pipeline_proposal_lifecycle.py .F    [100%]
+
+=================================== FAILURES ===================================
+_____ test_executor_argument_error_persists_its_category_as_the_error_code _____
+
+proposal = _Proposal(service=<elspeth.web.sessions.service.SessionServiceImpl object at 0x7fe800e4b920>, engine=Engine(sqlite:///...1ad29834575f5d94b228c0a4eb88468b4'), root=PosixPath('/tmp/pytest-of-agent/pytest-130/test_executor_argument_error_p0'))
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe800ecae40>
+
+    @pytest.mark.asyncio
+    async def test_executor_argument_error_persists_its_category_as_the_error_code(
+        proposal: _Proposal,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The commit dispatch's ARG_ERROR payload carries the closed category.
+    
+        ``error_code`` is the ``ToolArgumentErrorCategory`` value (a registered
+        code), not the exception's own ``code`` (``SCHEMA_VALIDATION``) or a
+        generic ``argument_error``; ``error_class`` is the class raised.
+        """
+    
+        def reject_schema(*_args: Any, **_kwargs: Any) -> Any:
+            raise ToolArgumentError(
+                argument="set_pipeline arguments",
+                expected="object conforming to SetPipelineArgumentsModel (arguments contains unsupported properties)",
+                actual_type="invalid_schema",
+                code="SCHEMA_VALIDATION",
+                category=ToolArgumentErrorCategory.SCHEMA_SHAPE,
+            )
+    
+        monkeypatch.setattr(pipeline_commit, "execute_tool", reject_schema)
+        operations = proposal.service.session_operation_authority
+        context = operations.acquire(
+            session_id=proposal.authority.row.session_id,
+            operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=proposal.service.session_operation_owner_instance_id,
+            lease_seconds=300,
+        )
+        recorder = BufferingRecorder()
+        try:
+            with pytest.raises(PipelineCommitError) as caught:
+>               await _prepare(proposal, context, recorder=recorder)
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:358: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:175: in _prepare
+    result = await prepare_pipeline_proposal_commit(
+src/elspeth/web/composer/pipeline_commit.py:600: in prepare_pipeline_proposal_commit
+    outcome = await dispatch_with_audit(
+src/elspeth/web/composer/audit.py:1186: in dispatch_with_audit
+    result = await do_dispatch()
+             ^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/pipeline_commit.py:568: in execute_exact
+    await bounded(
+src/elspeth/web/composer/pipeline_commit.py:488: in bounded
+    return await asyncio.wait_for(run_sync_in_worker(func, *args, **kwargs), timeout=remaining)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/tasks.py:520: in wait_for
+    return await fut
+           ^^^^^^^^^
+src/elspeth/web/async_workers.py:650: in run_sync_in_worker
+    return await _await_worker_future(concurrent_future, cancel_queued=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:720: in _await_worker_future
+    return future.result()
+           ^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/required_executor.py:119: in invoke
+    return callable_()
+           ^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+_args = ('set_pipeline', {'edges': [], 'nodes': [], 'outputs': [{'on_write_failure': 'discard', 'options': {'collision_policy'...'), version=1, sources=mappingproxy({})), <elspeth.web.catalog.policy_view.PolicyCatalogView object at 0x7fe801c6f6b0>)
+_kwargs = {'_interpretation_requirements_are_internal': True, 'baseline': CompositionState(nodes=(), edges=(), outputs=(), metad..., version=1, sources=mappingproxy({})), 'composer_model_identifier': 'test-model', 'composer_model_version': 'v1', ...}
+
+    def reject_schema(*_args: Any, **_kwargs: Any) -> Any:
+>       raise ToolArgumentError(
+            argument="set_pipeline arguments",
+            expected="object conforming to SetPipelineArgumentsModel (arguments contains unsupported properties)",
+            actual_type="invalid_schema",
+            code="SCHEMA_VALIDATION",
+            category=ToolArgumentErrorCategory.SCHEMA_SHAPE,
+        )
+E       elspeth.web.composer.protocol.ToolArgumentError: 'set_pipeline arguments' must be object conforming to SetPipelineArgumentsModel, got invalid_schema
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:339: ToolArgumentError
+_______ test_candidate_argument_error_has_no_executor_or_success_binding _______
+
+proposal = _Proposal(service=<elspeth.web.sessions.service.SessionServiceImpl object at 0x7fe800eef7d0>, engine=Engine(sqlite:///...1ad29834575f5d94b228c0a4eb88468b4'), root=PosixPath('/tmp/pytest-of-agent/pytest-130/test_candidate_argument_error_0'))
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe801cc16d0>
+
+    @pytest.mark.asyncio
+    async def test_candidate_argument_error_has_no_executor_or_success_binding(proposal: _Proposal, monkeypatch: pytest.MonkeyPatch) -> None:
+        original = ToolArgumentError(argument="source", expected="an object", actual_type="str")
+    
+        def invalid_candidate(*_args: Any, **_kwargs: Any) -> Any:
+            raise original
+    
+        monkeypatch.setattr(pipeline_commit, "build_set_pipeline_candidate", invalid_candidate)
+        operations = proposal.service.session_operation_authority
+        context = operations.acquire(
+            session_id=proposal.authority.row.session_id,
+            operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=proposal.service.session_operation_owner_instance_id,
+            lease_seconds=300,
+        )
+        recorder = BufferingRecorder()
+        try:
+            with pytest.raises(PipelineCommitError) as caught:
+>               await _prepare(proposal, context, recorder=recorder)
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:402: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:175: in _prepare
+    result = await prepare_pipeline_proposal_commit(
+src/elspeth/web/composer/pipeline_commit.py:531: in prepare_pipeline_proposal_commit
+    candidate = await bounded(
+src/elspeth/web/composer/pipeline_commit.py:488: in bounded
+    return await asyncio.wait_for(run_sync_in_worker(func, *args, **kwargs), timeout=remaining)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/tasks.py:520: in wait_for
+    return await fut
+           ^^^^^^^^^
+src/elspeth/web/async_workers.py:650: in run_sync_in_worker
+    return await _await_worker_future(concurrent_future, cancel_queued=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:720: in _await_worker_future
+    return future.result()
+           ^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/required_executor.py:119: in invoke
+    return callable_()
+           ^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+_args = ({'edges': [], 'nodes': [], 'outputs': [{'on_write_failure': 'discard', 'options': {'collision_policy': 'auto_incremen...890becb0', reviewed_source_authority=None, executing_proposal_id=None, _interpretation_requirements_are_internal=True))
+_kwargs = {}
+
+    def invalid_candidate(*_args: Any, **_kwargs: Any) -> Any:
+>       raise original
+E       elspeth.web.composer.protocol.ToolArgumentError: 'tool argument' must be a valid value, got str
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:389: ToolArgumentError
+_ test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-explicit_approve-explicit_approve] _
+
+snapshot = 'explicit_approve', live = 'explicit_approve'
+
+    @pytest.mark.parametrize("snapshot,live", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve")])
+    async def test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged(snapshot: str, live: str) -> None:
+        state = replace(_empty_state(), version=7)
+>       result, sessions = await _stage(
+            trust_mode=snapshot, live_trust_mode=live, preflight=AssertionError("no new runtime claim"),
+            candidate_state=replace(state, version=8), state=state,
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:261: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:230: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:663: in _stage_pipeline_plan
+    redacted_arguments = redact_tool_call_arguments(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tool_name = 'set_pipeline'
+arguments = {'authority_kind': 'owned_composition_state.v1', 'edges': [], 'metadata': {'description': '', 'name': 'Untitled Pipeline'}, 'nodes': [], ...}
+
+    def redact_tool_call_arguments(
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        telemetry: RedactionTelemetry,
+    ) -> dict[str, Any]:
+        """Produce the redacted arguments dict that lands in
+        ``chat_messages.tool_calls`` JSON (spec §4.2.6).
+    
+        Disposition by manifest-entry shape:
+    
+        **Type-driven entry (``argument_model`` set):**
+          Emit the ``manifest_dispatch`` beacon (BEFORE ``model_validate`` so a
+          Tier-3 ``ValidationError`` still records the dispatch); validate the
+          raw arguments against ``argument_model``; walk via
+          :func:`_redact_via_schema`. ``Sensitive[T]`` fields at any path
+          (top-level, nested, list-element, dict-element, tuple-element) are
+          substituted with the summarizer output or
+          ``REDACTED_SENSITIVE_NO_SUMMARIZER`` when no summarizer is declared.
+    
+          The handler MUST catch :class:`pydantic.ValidationError` raised here
+          and re-raise as :class:`ToolArgumentError` so the compose loop's
+          ARG_ERROR routing at ``service.py:2480`` receives the right exception
+          class.  A bare ``ValidationError`` escaping the handler hits the
+          catch-all and becomes :class:`ComposerPluginCrashError` → HTTP 500 —
+          the wrong disposition for Tier-3 input.
+    
+        **Declarative entry (``policy`` set):**
+          Emit the ``manifest_dispatch`` beacon; walk ``arguments`` by
+          ``policy.sensitive_argument_keys``.  Missing keys are no-ops; present
+          keys are summarized (via ``policy.argument_summarizers[key]``) or
+          sentinel-substituted (``REDACTED_SENSITIVE_NO_SUMMARIZER``).  Keys
+          not in ``sensitive_argument_keys`` are passthrough unless the policy
+          declares ``known_argument_keys`` or enables
+          ``redact_unknown_argument_keys``; in that case unknown argument key names
+          are removed and replaced with a generic ``REDACTED_UNKNOWN_ARGUMENT_KEY``
+          marker under ``REDACTED_UNKNOWN_ARGUMENTS_FIELD``.
+    
+        **Failure modes (all raise AuditIntegrityError):**
+          - Manifest entry missing for ``tool_name`` (registry-consistency
+            invariant; distinct from Tier-3 LLM-hallucinated tool name which is
+            caught earlier in the dispatcher).
+          - Summarizer raises → ``telemetry.summarizer_error(tool_name=...)``
+            BEFORE raise; ``AuditIntegrityError`` chained from the underlying
+            exception (M.8).
+          - Summarizer returns non-str → ``telemetry.summarizer_error(...)``
+            BEFORE raise; ``AuditIntegrityError`` with a typed message.
+    
+        **Walker atomicity:** the output dict is built in a local variable and
+        only returned on success.  A mid-walk raise leaves no partial dict
+        observable to the caller (rev-3 W8b / rev-4 W8b).
+        """
+        if tool_name not in MANIFEST:
+            raise AuditIntegrityError(
+                f"redact_tool_call_arguments called for unknown tool {tool_name!r}; "
+                "the manifest is the source of truth for the registry/redaction "
+                "set-equality invariant.  Add a manifest entry for this tool or "
+                "verify that the dispatch path passes the correct tool name."
+            )
+        entry = MANIFEST[tool_name]
+        if entry.argument_model is not None:
+            # Emit BEFORE model_validate: dispatch happened regardless of Tier-3
+            # validation outcome.  A ValidationError escapes here and the handler
+            # wraps it as ToolArgumentError; the dispatch beacon must not depend on
+            # validation success.
+            telemetry.manifest_dispatch(tool_name=tool_name, shape="type_driven")
+>           validated = entry.argument_model.model_validate(arguments)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           pydantic_core._pydantic_core.ValidationError: 1 validation error for SetPipelineArgumentsModel
+E           authority_kind
+E             Extra inputs are not permitted [type=extra_forbidden, input_value='owned_composition_state.v1', input_type=str]
+E               For further information visit https://errors.pydantic.dev/2.13/v/extra_forbidden
+
+src/elspeth/web/composer/redaction.py:2574: ValidationError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:09 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:09 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:09 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-auto_commit-auto_commit] _
+
+snapshot = 'auto_commit', live = 'auto_commit'
+
+    @pytest.mark.parametrize("snapshot,live", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve")])
+    async def test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged(snapshot: str, live: str) -> None:
+        state = replace(_empty_state(), version=7)
+>       result, sessions = await _stage(
+            trust_mode=snapshot, live_trust_mode=live, preflight=AssertionError("no new runtime claim"),
+            candidate_state=replace(state, version=8), state=state,
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:261: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:230: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:663: in _stage_pipeline_plan
+    redacted_arguments = redact_tool_call_arguments(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tool_name = 'set_pipeline'
+arguments = {'authority_kind': 'owned_composition_state.v1', 'edges': [], 'metadata': {'description': '', 'name': 'Untitled Pipeline'}, 'nodes': [], ...}
+
+    def redact_tool_call_arguments(
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        telemetry: RedactionTelemetry,
+    ) -> dict[str, Any]:
+        """Produce the redacted arguments dict that lands in
+        ``chat_messages.tool_calls`` JSON (spec §4.2.6).
+    
+        Disposition by manifest-entry shape:
+    
+        **Type-driven entry (``argument_model`` set):**
+          Emit the ``manifest_dispatch`` beacon (BEFORE ``model_validate`` so a
+          Tier-3 ``ValidationError`` still records the dispatch); validate the
+          raw arguments against ``argument_model``; walk via
+          :func:`_redact_via_schema`. ``Sensitive[T]`` fields at any path
+          (top-level, nested, list-element, dict-element, tuple-element) are
+          substituted with the summarizer output or
+          ``REDACTED_SENSITIVE_NO_SUMMARIZER`` when no summarizer is declared.
+    
+          The handler MUST catch :class:`pydantic.ValidationError` raised here
+          and re-raise as :class:`ToolArgumentError` so the compose loop's
+          ARG_ERROR routing at ``service.py:2480`` receives the right exception
+          class.  A bare ``ValidationError`` escaping the handler hits the
+          catch-all and becomes :class:`ComposerPluginCrashError` → HTTP 500 —
+          the wrong disposition for Tier-3 input.
+    
+        **Declarative entry (``policy`` set):**
+          Emit the ``manifest_dispatch`` beacon; walk ``arguments`` by
+          ``policy.sensitive_argument_keys``.  Missing keys are no-ops; present
+          keys are summarized (via ``policy.argument_summarizers[key]``) or
+          sentinel-substituted (``REDACTED_SENSITIVE_NO_SUMMARIZER``).  Keys
+          not in ``sensitive_argument_keys`` are passthrough unless the policy
+          declares ``known_argument_keys`` or enables
+          ``redact_unknown_argument_keys``; in that case unknown argument key names
+          are removed and replaced with a generic ``REDACTED_UNKNOWN_ARGUMENT_KEY``
+          marker under ``REDACTED_UNKNOWN_ARGUMENTS_FIELD``.
+    
+        **Failure modes (all raise AuditIntegrityError):**
+          - Manifest entry missing for ``tool_name`` (registry-consistency
+            invariant; distinct from Tier-3 LLM-hallucinated tool name which is
+            caught earlier in the dispatcher).
+          - Summarizer raises → ``telemetry.summarizer_error(tool_name=...)``
+            BEFORE raise; ``AuditIntegrityError`` chained from the underlying
+            exception (M.8).
+          - Summarizer returns non-str → ``telemetry.summarizer_error(...)``
+            BEFORE raise; ``AuditIntegrityError`` with a typed message.
+    
+        **Walker atomicity:** the output dict is built in a local variable and
+        only returned on success.  A mid-walk raise leaves no partial dict
+        observable to the caller (rev-3 W8b / rev-4 W8b).
+        """
+        if tool_name not in MANIFEST:
+            raise AuditIntegrityError(
+                f"redact_tool_call_arguments called for unknown tool {tool_name!r}; "
+                "the manifest is the source of truth for the registry/redaction "
+                "set-equality invariant.  Add a manifest entry for this tool or "
+                "verify that the dispatch path passes the correct tool name."
+            )
+        entry = MANIFEST[tool_name]
+        if entry.argument_model is not None:
+            # Emit BEFORE model_validate: dispatch happened regardless of Tier-3
+            # validation outcome.  A ValidationError escapes here and the handler
+            # wraps it as ToolArgumentError; the dispatch beacon must not depend on
+            # validation success.
+            telemetry.manifest_dispatch(tool_name=tool_name, shape="type_driven")
+>           validated = entry.argument_model.model_validate(arguments)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           pydantic_core._pydantic_core.ValidationError: 1 validation error for SetPipelineArgumentsModel
+E           authority_kind
+E             Extra inputs are not permitted [type=extra_forbidden, input_value='owned_composition_state.v1', input_type=str]
+E               For further information visit https://errors.pydantic.dev/2.13/v/extra_forbidden
+
+src/elspeth/web/composer/redaction.py:2574: ValidationError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:10 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:10 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:10 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-auto_commit-explicit_approve] _
+
+snapshot = 'auto_commit', live = 'explicit_approve'
+
+    @pytest.mark.parametrize("snapshot,live", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve")])
+    async def test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged(snapshot: str, live: str) -> None:
+        state = replace(_empty_state(), version=7)
+>       result, sessions = await _stage(
+            trust_mode=snapshot, live_trust_mode=live, preflight=AssertionError("no new runtime claim"),
+            candidate_state=replace(state, version=8), state=state,
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:261: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:230: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:663: in _stage_pipeline_plan
+    redacted_arguments = redact_tool_call_arguments(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tool_name = 'set_pipeline'
+arguments = {'authority_kind': 'owned_composition_state.v1', 'edges': [], 'metadata': {'description': '', 'name': 'Untitled Pipeline'}, 'nodes': [], ...}
+
+    def redact_tool_call_arguments(
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        telemetry: RedactionTelemetry,
+    ) -> dict[str, Any]:
+        """Produce the redacted arguments dict that lands in
+        ``chat_messages.tool_calls`` JSON (spec §4.2.6).
+    
+        Disposition by manifest-entry shape:
+    
+        **Type-driven entry (``argument_model`` set):**
+          Emit the ``manifest_dispatch`` beacon (BEFORE ``model_validate`` so a
+          Tier-3 ``ValidationError`` still records the dispatch); validate the
+          raw arguments against ``argument_model``; walk via
+          :func:`_redact_via_schema`. ``Sensitive[T]`` fields at any path
+          (top-level, nested, list-element, dict-element, tuple-element) are
+          substituted with the summarizer output or
+          ``REDACTED_SENSITIVE_NO_SUMMARIZER`` when no summarizer is declared.
+    
+          The handler MUST catch :class:`pydantic.ValidationError` raised here
+          and re-raise as :class:`ToolArgumentError` so the compose loop's
+          ARG_ERROR routing at ``service.py:2480`` receives the right exception
+          class.  A bare ``ValidationError`` escaping the handler hits the
+          catch-all and becomes :class:`ComposerPluginCrashError` → HTTP 500 —
+          the wrong disposition for Tier-3 input.
+    
+        **Declarative entry (``policy`` set):**
+          Emit the ``manifest_dispatch`` beacon; walk ``arguments`` by
+          ``policy.sensitive_argument_keys``.  Missing keys are no-ops; present
+          keys are summarized (via ``policy.argument_summarizers[key]``) or
+          sentinel-substituted (``REDACTED_SENSITIVE_NO_SUMMARIZER``).  Keys
+          not in ``sensitive_argument_keys`` are passthrough unless the policy
+          declares ``known_argument_keys`` or enables
+          ``redact_unknown_argument_keys``; in that case unknown argument key names
+          are removed and replaced with a generic ``REDACTED_UNKNOWN_ARGUMENT_KEY``
+          marker under ``REDACTED_UNKNOWN_ARGUMENTS_FIELD``.
+    
+        **Failure modes (all raise AuditIntegrityError):**
+          - Manifest entry missing for ``tool_name`` (registry-consistency
+            invariant; distinct from Tier-3 LLM-hallucinated tool name which is
+            caught earlier in the dispatcher).
+          - Summarizer raises → ``telemetry.summarizer_error(tool_name=...)``
+            BEFORE raise; ``AuditIntegrityError`` chained from the underlying
+            exception (M.8).
+          - Summarizer returns non-str → ``telemetry.summarizer_error(...)``
+            BEFORE raise; ``AuditIntegrityError`` with a typed message.
+    
+        **Walker atomicity:** the output dict is built in a local variable and
+        only returned on success.  A mid-walk raise leaves no partial dict
+        observable to the caller (rev-3 W8b / rev-4 W8b).
+        """
+        if tool_name not in MANIFEST:
+            raise AuditIntegrityError(
+                f"redact_tool_call_arguments called for unknown tool {tool_name!r}; "
+                "the manifest is the source of truth for the registry/redaction "
+                "set-equality invariant.  Add a manifest entry for this tool or "
+                "verify that the dispatch path passes the correct tool name."
+            )
+        entry = MANIFEST[tool_name]
+        if entry.argument_model is not None:
+            # Emit BEFORE model_validate: dispatch happened regardless of Tier-3
+            # validation outcome.  A ValidationError escapes here and the handler
+            # wraps it as ToolArgumentError; the dispatch beacon must not depend on
+            # validation success.
+            telemetry.manifest_dispatch(tool_name=tool_name, shape="type_driven")
+>           validated = entry.argument_model.model_validate(arguments)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           pydantic_core._pydantic_core.ValidationError: 1 validation error for SetPipelineArgumentsModel
+E           authority_kind
+E             Extra inputs are not permitted [type=extra_forbidden, input_value='owned_composition_state.v1', input_type=str]
+E               For further information visit https://errors.pydantic.dev/2.13/v/extra_forbidden
+
+src/elspeth/web/composer/redaction.py:2574: ValidationError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:10 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:10 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:10 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+___ test_changed_plan_downgrade_retains_review_and_green_preflight[asyncio] ____
+
+    async def test_changed_plan_downgrade_retains_review_and_green_preflight() -> None:
+>       result, sessions = await _stage(
+            trust_mode="auto_commit", live_trust_mode="explicit_approve", preflight=_green_result(), candidate_state=_changed_state(),
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:276: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:230: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:663: in _stage_pipeline_plan
+    redacted_arguments = redact_tool_call_arguments(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tool_name = 'set_pipeline'
+arguments = {'authority_kind': 'owned_composition_state.v1', 'edges': [], 'metadata': {'description': '', 'name': 'Changed pipeline'}, 'nodes': [], ...}
+
+    def redact_tool_call_arguments(
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        telemetry: RedactionTelemetry,
+    ) -> dict[str, Any]:
+        """Produce the redacted arguments dict that lands in
+        ``chat_messages.tool_calls`` JSON (spec §4.2.6).
+    
+        Disposition by manifest-entry shape:
+    
+        **Type-driven entry (``argument_model`` set):**
+          Emit the ``manifest_dispatch`` beacon (BEFORE ``model_validate`` so a
+          Tier-3 ``ValidationError`` still records the dispatch); validate the
+          raw arguments against ``argument_model``; walk via
+          :func:`_redact_via_schema`. ``Sensitive[T]`` fields at any path
+          (top-level, nested, list-element, dict-element, tuple-element) are
+          substituted with the summarizer output or
+          ``REDACTED_SENSITIVE_NO_SUMMARIZER`` when no summarizer is declared.
+    
+          The handler MUST catch :class:`pydantic.ValidationError` raised here
+          and re-raise as :class:`ToolArgumentError` so the compose loop's
+          ARG_ERROR routing at ``service.py:2480`` receives the right exception
+          class.  A bare ``ValidationError`` escaping the handler hits the
+          catch-all and becomes :class:`ComposerPluginCrashError` → HTTP 500 —
+          the wrong disposition for Tier-3 input.
+    
+        **Declarative entry (``policy`` set):**
+          Emit the ``manifest_dispatch`` beacon; walk ``arguments`` by
+          ``policy.sensitive_argument_keys``.  Missing keys are no-ops; present
+          keys are summarized (via ``policy.argument_summarizers[key]``) or
+          sentinel-substituted (``REDACTED_SENSITIVE_NO_SUMMARIZER``).  Keys
+          not in ``sensitive_argument_keys`` are passthrough unless the policy
+          declares ``known_argument_keys`` or enables
+          ``redact_unknown_argument_keys``; in that case unknown argument key names
+          are removed and replaced with a generic ``REDACTED_UNKNOWN_ARGUMENT_KEY``
+          marker under ``REDACTED_UNKNOWN_ARGUMENTS_FIELD``.
+    
+        **Failure modes (all raise AuditIntegrityError):**
+          - Manifest entry missing for ``tool_name`` (registry-consistency
+            invariant; distinct from Tier-3 LLM-hallucinated tool name which is
+            caught earlier in the dispatcher).
+          - Summarizer raises → ``telemetry.summarizer_error(tool_name=...)``
+            BEFORE raise; ``AuditIntegrityError`` chained from the underlying
+            exception (M.8).
+          - Summarizer returns non-str → ``telemetry.summarizer_error(...)``
+            BEFORE raise; ``AuditIntegrityError`` with a typed message.
+    
+        **Walker atomicity:** the output dict is built in a local variable and
+        only returned on success.  A mid-walk raise leaves no partial dict
+        observable to the caller (rev-3 W8b / rev-4 W8b).
+        """
+        if tool_name not in MANIFEST:
+            raise AuditIntegrityError(
+                f"redact_tool_call_arguments called for unknown tool {tool_name!r}; "
+                "the manifest is the source of truth for the registry/redaction "
+                "set-equality invariant.  Add a manifest entry for this tool or "
+                "verify that the dispatch path passes the correct tool name."
+            )
+        entry = MANIFEST[tool_name]
+        if entry.argument_model is not None:
+            # Emit BEFORE model_validate: dispatch happened regardless of Tier-3
+            # validation outcome.  A ValidationError escapes here and the handler
+            # wraps it as ToolArgumentError; the dispatch beacon must not depend on
+            # validation success.
+            telemetry.manifest_dispatch(tool_name=tool_name, shape="type_driven")
+>           validated = entry.argument_model.model_validate(arguments)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           pydantic_core._pydantic_core.ValidationError: 1 validation error for SetPipelineArgumentsModel
+E           authority_kind
+E             Extra inputs are not permitted [type=extra_forbidden, input_value='owned_composition_state.v1', input_type=str]
+E               For further information visit https://errors.pydantic.dev/2.13/v/extra_forbidden
+
+src/elspeth/web/composer/redaction.py:2574: ValidationError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:10 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:10 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:10 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+____ test_green_preflight_keeps_auto_commit_and_validated_wording[asyncio] _____
+
+    async def test_green_preflight_keeps_auto_commit_and_validated_wording() -> None:
+>       result, _ = await _stage(
+            trust_mode="auto_commit",
+            preflight=_green_result(),
+            candidate_state=_changed_state(),
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:291: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:230: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:663: in _stage_pipeline_plan
+    redacted_arguments = redact_tool_call_arguments(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tool_name = 'set_pipeline'
+arguments = {'authority_kind': 'owned_composition_state.v1', 'edges': [], 'metadata': {'description': '', 'name': 'Changed pipeline'}, 'nodes': [], ...}
+
+    def redact_tool_call_arguments(
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        telemetry: RedactionTelemetry,
+    ) -> dict[str, Any]:
+        """Produce the redacted arguments dict that lands in
+        ``chat_messages.tool_calls`` JSON (spec §4.2.6).
+    
+        Disposition by manifest-entry shape:
+    
+        **Type-driven entry (``argument_model`` set):**
+          Emit the ``manifest_dispatch`` beacon (BEFORE ``model_validate`` so a
+          Tier-3 ``ValidationError`` still records the dispatch); validate the
+          raw arguments against ``argument_model``; walk via
+          :func:`_redact_via_schema`. ``Sensitive[T]`` fields at any path
+          (top-level, nested, list-element, dict-element, tuple-element) are
+          substituted with the summarizer output or
+          ``REDACTED_SENSITIVE_NO_SUMMARIZER`` when no summarizer is declared.
+    
+          The handler MUST catch :class:`pydantic.ValidationError` raised here
+          and re-raise as :class:`ToolArgumentError` so the compose loop's
+          ARG_ERROR routing at ``service.py:2480`` receives the right exception
+          class.  A bare ``ValidationError`` escaping the handler hits the
+          catch-all and becomes :class:`ComposerPluginCrashError` → HTTP 500 —
+          the wrong disposition for Tier-3 input.
+    
+        **Declarative entry (``policy`` set):**
+          Emit the ``manifest_dispatch`` beacon; walk ``arguments`` by
+          ``policy.sensitive_argument_keys``.  Missing keys are no-ops; present
+          keys are summarized (via ``policy.argument_summarizers[key]``) or
+          sentinel-substituted (``REDACTED_SENSITIVE_NO_SUMMARIZER``).  Keys
+          not in ``sensitive_argument_keys`` are passthrough unless the policy
+          declares ``known_argument_keys`` or enables
+          ``redact_unknown_argument_keys``; in that case unknown argument key names
+          are removed and replaced with a generic ``REDACTED_UNKNOWN_ARGUMENT_KEY``
+          marker under ``REDACTED_UNKNOWN_ARGUMENTS_FIELD``.
+    
+        **Failure modes (all raise AuditIntegrityError):**
+          - Manifest entry missing for ``tool_name`` (registry-consistency
+            invariant; distinct from Tier-3 LLM-hallucinated tool name which is
+            caught earlier in the dispatcher).
+          - Summarizer raises → ``telemetry.summarizer_error(tool_name=...)``
+            BEFORE raise; ``AuditIntegrityError`` chained from the underlying
+            exception (M.8).
+          - Summarizer returns non-str → ``telemetry.summarizer_error(...)``
+            BEFORE raise; ``AuditIntegrityError`` with a typed message.
+    
+        **Walker atomicity:** the output dict is built in a local variable and
+        only returned on success.  A mid-walk raise leaves no partial dict
+        observable to the caller (rev-3 W8b / rev-4 W8b).
+        """
+        if tool_name not in MANIFEST:
+            raise AuditIntegrityError(
+                f"redact_tool_call_arguments called for unknown tool {tool_name!r}; "
+                "the manifest is the source of truth for the registry/redaction "
+                "set-equality invariant.  Add a manifest entry for this tool or "
+                "verify that the dispatch path passes the correct tool name."
+            )
+        entry = MANIFEST[tool_name]
+        if entry.argument_model is not None:
+            # Emit BEFORE model_validate: dispatch happened regardless of Tier-3
+            # validation outcome.  A ValidationError escapes here and the handler
+            # wraps it as ToolArgumentError; the dispatch beacon must not depend on
+            # validation success.
+            telemetry.manifest_dispatch(tool_name=tool_name, shape="type_driven")
+>           validated = entry.argument_model.model_validate(arguments)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           pydantic_core._pydantic_core.ValidationError: 1 validation error for SetPipelineArgumentsModel
+E           authority_kind
+E             Extra inputs are not permitted [type=extra_forbidden, input_value='owned_composition_state.v1', input_type=str]
+E               For further information visit https://errors.pydantic.dev/2.13/v/extra_forbidden
+
+src/elspeth/web/composer/redaction.py:2574: ValidationError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:10 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:10 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:10 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_green_preflight_under_explicit_approve_uses_validated_review_wording[asyncio] _
+
+    async def test_green_preflight_under_explicit_approve_uses_validated_review_wording() -> None:
+>       result, _ = await _stage(
+            trust_mode="explicit_approve",
+            preflight=_green_result(),
+            candidate_state=_changed_state(),
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:305: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:230: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:663: in _stage_pipeline_plan
+    redacted_arguments = redact_tool_call_arguments(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tool_name = 'set_pipeline'
+arguments = {'authority_kind': 'owned_composition_state.v1', 'edges': [], 'metadata': {'description': '', 'name': 'Changed pipeline'}, 'nodes': [], ...}
+
+    def redact_tool_call_arguments(
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        telemetry: RedactionTelemetry,
+    ) -> dict[str, Any]:
+        """Produce the redacted arguments dict that lands in
+        ``chat_messages.tool_calls`` JSON (spec §4.2.6).
+    
+        Disposition by manifest-entry shape:
+    
+        **Type-driven entry (``argument_model`` set):**
+          Emit the ``manifest_dispatch`` beacon (BEFORE ``model_validate`` so a
+          Tier-3 ``ValidationError`` still records the dispatch); validate the
+          raw arguments against ``argument_model``; walk via
+          :func:`_redact_via_schema`. ``Sensitive[T]`` fields at any path
+          (top-level, nested, list-element, dict-element, tuple-element) are
+          substituted with the summarizer output or
+          ``REDACTED_SENSITIVE_NO_SUMMARIZER`` when no summarizer is declared.
+    
+          The handler MUST catch :class:`pydantic.ValidationError` raised here
+          and re-raise as :class:`ToolArgumentError` so the compose loop's
+          ARG_ERROR routing at ``service.py:2480`` receives the right exception
+          class.  A bare ``ValidationError`` escaping the handler hits the
+          catch-all and becomes :class:`ComposerPluginCrashError` → HTTP 500 —
+          the wrong disposition for Tier-3 input.
+    
+        **Declarative entry (``policy`` set):**
+          Emit the ``manifest_dispatch`` beacon; walk ``arguments`` by
+          ``policy.sensitive_argument_keys``.  Missing keys are no-ops; present
+          keys are summarized (via ``policy.argument_summarizers[key]``) or
+          sentinel-substituted (``REDACTED_SENSITIVE_NO_SUMMARIZER``).  Keys
+          not in ``sensitive_argument_keys`` are passthrough unless the policy
+          declares ``known_argument_keys`` or enables
+          ``redact_unknown_argument_keys``; in that case unknown argument key names
+          are removed and replaced with a generic ``REDACTED_UNKNOWN_ARGUMENT_KEY``
+          marker under ``REDACTED_UNKNOWN_ARGUMENTS_FIELD``.
+    
+        **Failure modes (all raise AuditIntegrityError):**
+          - Manifest entry missing for ``tool_name`` (registry-consistency
+            invariant; distinct from Tier-3 LLM-hallucinated tool name which is
+            caught earlier in the dispatcher).
+          - Summarizer raises → ``telemetry.summarizer_error(tool_name=...)``
+            BEFORE raise; ``AuditIntegrityError`` chained from the underlying
+            exception (M.8).
+          - Summarizer returns non-str → ``telemetry.summarizer_error(...)``
+            BEFORE raise; ``AuditIntegrityError`` with a typed message.
+    
+        **Walker atomicity:** the output dict is built in a local variable and
+        only returned on success.  A mid-walk raise leaves no partial dict
+        observable to the caller (rev-3 W8b / rev-4 W8b).
+        """
+        if tool_name not in MANIFEST:
+            raise AuditIntegrityError(
+                f"redact_tool_call_arguments called for unknown tool {tool_name!r}; "
+                "the manifest is the source of truth for the registry/redaction "
+                "set-equality invariant.  Add a manifest entry for this tool or "
+                "verify that the dispatch path passes the correct tool name."
+            )
+        entry = MANIFEST[tool_name]
+        if entry.argument_model is not None:
+            # Emit BEFORE model_validate: dispatch happened regardless of Tier-3
+            # validation outcome.  A ValidationError escapes here and the handler
+            # wraps it as ToolArgumentError; the dispatch beacon must not depend on
+            # validation success.
+            telemetry.manifest_dispatch(tool_name=tool_name, shape="type_driven")
+>           validated = entry.argument_model.model_validate(arguments)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           pydantic_core._pydantic_core.ValidationError: 1 validation error for SetPipelineArgumentsModel
+E           authority_kind
+E             Extra inputs are not permitted [type=extra_forbidden, input_value='owned_composition_state.v1', input_type=str]
+E               For further information visit https://errors.pydantic.dev/2.13/v/extra_forbidden
+
+src/elspeth/web/composer/redaction.py:2574: ValidationError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:10 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:10 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:10 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_________ test_red_preflight_downgrades_auto_commit_to_review[asyncio] _________
+
+    async def test_red_preflight_downgrades_auto_commit_to_review() -> None:
+>       result, sessions = await _stage(
+            trust_mode="auto_commit",
+            preflight=_red_result(),
+            candidate_state=_changed_state(),
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:323: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:230: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:663: in _stage_pipeline_plan
+    redacted_arguments = redact_tool_call_arguments(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tool_name = 'set_pipeline'
+arguments = {'authority_kind': 'owned_composition_state.v1', 'edges': [], 'metadata': {'description': '', 'name': 'Changed pipeline'}, 'nodes': [], ...}
+
+    def redact_tool_call_arguments(
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        telemetry: RedactionTelemetry,
+    ) -> dict[str, Any]:
+        """Produce the redacted arguments dict that lands in
+        ``chat_messages.tool_calls`` JSON (spec §4.2.6).
+    
+        Disposition by manifest-entry shape:
+    
+        **Type-driven entry (``argument_model`` set):**
+          Emit the ``manifest_dispatch`` beacon (BEFORE ``model_validate`` so a
+          Tier-3 ``ValidationError`` still records the dispatch); validate the
+          raw arguments against ``argument_model``; walk via
+          :func:`_redact_via_schema`. ``Sensitive[T]`` fields at any path
+          (top-level, nested, list-element, dict-element, tuple-element) are
+          substituted with the summarizer output or
+          ``REDACTED_SENSITIVE_NO_SUMMARIZER`` when no summarizer is declared.
+    
+          The handler MUST catch :class:`pydantic.ValidationError` raised here
+          and re-raise as :class:`ToolArgumentError` so the compose loop's
+          ARG_ERROR routing at ``service.py:2480`` receives the right exception
+          class.  A bare ``ValidationError`` escaping the handler hits the
+          catch-all and becomes :class:`ComposerPluginCrashError` → HTTP 500 —
+          the wrong disposition for Tier-3 input.
+    
+        **Declarative entry (``policy`` set):**
+          Emit the ``manifest_dispatch`` beacon; walk ``arguments`` by
+          ``policy.sensitive_argument_keys``.  Missing keys are no-ops; present
+          keys are summarized (via ``policy.argument_summarizers[key]``) or
+          sentinel-substituted (``REDACTED_SENSITIVE_NO_SUMMARIZER``).  Keys
+          not in ``sensitive_argument_keys`` are passthrough unless the policy
+          declares ``known_argument_keys`` or enables
+          ``redact_unknown_argument_keys``; in that case unknown argument key names
+          are removed and replaced with a generic ``REDACTED_UNKNOWN_ARGUMENT_KEY``
+          marker under ``REDACTED_UNKNOWN_ARGUMENTS_FIELD``.
+    
+        **Failure modes (all raise AuditIntegrityError):**
+          - Manifest entry missing for ``tool_name`` (registry-consistency
+            invariant; distinct from Tier-3 LLM-hallucinated tool name which is
+            caught earlier in the dispatcher).
+          - Summarizer raises → ``telemetry.summarizer_error(tool_name=...)``
+            BEFORE raise; ``AuditIntegrityError`` chained from the underlying
+            exception (M.8).
+          - Summarizer returns non-str → ``telemetry.summarizer_error(...)``
+            BEFORE raise; ``AuditIntegrityError`` with a typed message.
+    
+        **Walker atomicity:** the output dict is built in a local variable and
+        only returned on success.  A mid-walk raise leaves no partial dict
+        observable to the caller (rev-3 W8b / rev-4 W8b).
+        """
+        if tool_name not in MANIFEST:
+            raise AuditIntegrityError(
+                f"redact_tool_call_arguments called for unknown tool {tool_name!r}; "
+                "the manifest is the source of truth for the registry/redaction "
+                "set-equality invariant.  Add a manifest entry for this tool or "
+                "verify that the dispatch path passes the correct tool name."
+            )
+        entry = MANIFEST[tool_name]
+        if entry.argument_model is not None:
+            # Emit BEFORE model_validate: dispatch happened regardless of Tier-3
+            # validation outcome.  A ValidationError escapes here and the handler
+            # wraps it as ToolArgumentError; the dispatch beacon must not depend on
+            # validation success.
+            telemetry.manifest_dispatch(tool_name=tool_name, shape="type_driven")
+>           validated = entry.argument_model.model_validate(arguments)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           pydantic_core._pydantic_core.ValidationError: 1 validation error for SetPipelineArgumentsModel
+E           authority_kind
+E             Extra inputs are not permitted [type=extra_forbidden, input_value='owned_composition_state.v1', input_type=str]
+E               For further information visit https://errors.pydantic.dev/2.13/v/extra_forbidden
+
+src/elspeth/web/composer/redaction.py:2574: ValidationError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:10 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:10 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:10 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+____________ test_red_preflight_on_review_arm_is_truthful[asyncio] _____________
+
+    async def test_red_preflight_on_review_arm_is_truthful() -> None:
+>       result, _ = await _stage(
+            trust_mode="explicit_approve",
+            preflight=_red_result(),
+            candidate_state=_changed_state(),
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:340: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:230: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:663: in _stage_pipeline_plan
+    redacted_arguments = redact_tool_call_arguments(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tool_name = 'set_pipeline'
+arguments = {'authority_kind': 'owned_composition_state.v1', 'edges': [], 'metadata': {'description': '', 'name': 'Changed pipeline'}, 'nodes': [], ...}
+
+    def redact_tool_call_arguments(
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        telemetry: RedactionTelemetry,
+    ) -> dict[str, Any]:
+        """Produce the redacted arguments dict that lands in
+        ``chat_messages.tool_calls`` JSON (spec §4.2.6).
+    
+        Disposition by manifest-entry shape:
+    
+        **Type-driven entry (``argument_model`` set):**
+          Emit the ``manifest_dispatch`` beacon (BEFORE ``model_validate`` so a
+          Tier-3 ``ValidationError`` still records the dispatch); validate the
+          raw arguments against ``argument_model``; walk via
+          :func:`_redact_via_schema`. ``Sensitive[T]`` fields at any path
+          (top-level, nested, list-element, dict-element, tuple-element) are
+          substituted with the summarizer output or
+          ``REDACTED_SENSITIVE_NO_SUMMARIZER`` when no summarizer is declared.
+    
+          The handler MUST catch :class:`pydantic.ValidationError` raised here
+          and re-raise as :class:`ToolArgumentError` so the compose loop's
+          ARG_ERROR routing at ``service.py:2480`` receives the right exception
+          class.  A bare ``ValidationError`` escaping the handler hits the
+          catch-all and becomes :class:`ComposerPluginCrashError` → HTTP 500 —
+          the wrong disposition for Tier-3 input.
+    
+        **Declarative entry (``policy`` set):**
+          Emit the ``manifest_dispatch`` beacon; walk ``arguments`` by
+          ``policy.sensitive_argument_keys``.  Missing keys are no-ops; present
+          keys are summarized (via ``policy.argument_summarizers[key]``) or
+          sentinel-substituted (``REDACTED_SENSITIVE_NO_SUMMARIZER``).  Keys
+          not in ``sensitive_argument_keys`` are passthrough unless the policy
+          declares ``known_argument_keys`` or enables
+          ``redact_unknown_argument_keys``; in that case unknown argument key names
+          are removed and replaced with a generic ``REDACTED_UNKNOWN_ARGUMENT_KEY``
+          marker under ``REDACTED_UNKNOWN_ARGUMENTS_FIELD``.
+    
+        **Failure modes (all raise AuditIntegrityError):**
+          - Manifest entry missing for ``tool_name`` (registry-consistency
+            invariant; distinct from Tier-3 LLM-hallucinated tool name which is
+            caught earlier in the dispatcher).
+          - Summarizer raises → ``telemetry.summarizer_error(tool_name=...)``
+            BEFORE raise; ``AuditIntegrityError`` chained from the underlying
+            exception (M.8).
+          - Summarizer returns non-str → ``telemetry.summarizer_error(...)``
+            BEFORE raise; ``AuditIntegrityError`` with a typed message.
+    
+        **Walker atomicity:** the output dict is built in a local variable and
+        only returned on success.  A mid-walk raise leaves no partial dict
+        observable to the caller (rev-3 W8b / rev-4 W8b).
+        """
+        if tool_name not in MANIFEST:
+            raise AuditIntegrityError(
+                f"redact_tool_call_arguments called for unknown tool {tool_name!r}; "
+                "the manifest is the source of truth for the registry/redaction "
+                "set-equality invariant.  Add a manifest entry for this tool or "
+                "verify that the dispatch path passes the correct tool name."
+            )
+        entry = MANIFEST[tool_name]
+        if entry.argument_model is not None:
+            # Emit BEFORE model_validate: dispatch happened regardless of Tier-3
+            # validation outcome.  A ValidationError escapes here and the handler
+            # wraps it as ToolArgumentError; the dispatch beacon must not depend on
+            # validation success.
+            telemetry.manifest_dispatch(tool_name=tool_name, shape="type_driven")
+>           validated = entry.argument_model.model_validate(arguments)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           pydantic_core._pydantic_core.ValidationError: 1 validation error for SetPipelineArgumentsModel
+E           authority_kind
+E             Extra inputs are not permitted [type=extra_forbidden, input_value='owned_composition_state.v1', input_type=str]
+E               For further information visit https://errors.pydantic.dev/2.13/v/extra_forbidden
+
+src/elspeth/web/composer/redaction.py:2574: ValidationError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:10 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:10 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:10 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+________ test_pending_interpretation_review_blocks_auto_commit[asyncio] ________
+
+    async def test_pending_interpretation_review_blocks_auto_commit() -> None:
+        """A pending review is not a validator objection, but is not runnable either.
+    
+        A bare ``completion_ready`` predicate would auto-commit it unreviewed, so
+        it must downgrade like any other non-green verdict.
+        """
+>       result, _ = await _stage(
+            trust_mode="auto_commit",
+            preflight=_pending_review_result(),
+            candidate_state=_changed_state(),
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:357: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:230: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:663: in _stage_pipeline_plan
+    redacted_arguments = redact_tool_call_arguments(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tool_name = 'set_pipeline'
+arguments = {'authority_kind': 'owned_composition_state.v1', 'edges': [], 'metadata': {'description': '', 'name': 'Changed pipeline'}, 'nodes': [], ...}
+
+    def redact_tool_call_arguments(
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        telemetry: RedactionTelemetry,
+    ) -> dict[str, Any]:
+        """Produce the redacted arguments dict that lands in
+        ``chat_messages.tool_calls`` JSON (spec §4.2.6).
+    
+        Disposition by manifest-entry shape:
+    
+        **Type-driven entry (``argument_model`` set):**
+          Emit the ``manifest_dispatch`` beacon (BEFORE ``model_validate`` so a
+          Tier-3 ``ValidationError`` still records the dispatch); validate the
+          raw arguments against ``argument_model``; walk via
+          :func:`_redact_via_schema`. ``Sensitive[T]`` fields at any path
+          (top-level, nested, list-element, dict-element, tuple-element) are
+          substituted with the summarizer output or
+          ``REDACTED_SENSITIVE_NO_SUMMARIZER`` when no summarizer is declared.
+    
+          The handler MUST catch :class:`pydantic.ValidationError` raised here
+          and re-raise as :class:`ToolArgumentError` so the compose loop's
+          ARG_ERROR routing at ``service.py:2480`` receives the right exception
+          class.  A bare ``ValidationError`` escaping the handler hits the
+          catch-all and becomes :class:`ComposerPluginCrashError` → HTTP 500 —
+          the wrong disposition for Tier-3 input.
+    
+        **Declarative entry (``policy`` set):**
+          Emit the ``manifest_dispatch`` beacon; walk ``arguments`` by
+          ``policy.sensitive_argument_keys``.  Missing keys are no-ops; present
+          keys are summarized (via ``policy.argument_summarizers[key]``) or
+          sentinel-substituted (``REDACTED_SENSITIVE_NO_SUMMARIZER``).  Keys
+          not in ``sensitive_argument_keys`` are passthrough unless the policy
+          declares ``known_argument_keys`` or enables
+          ``redact_unknown_argument_keys``; in that case unknown argument key names
+          are removed and replaced with a generic ``REDACTED_UNKNOWN_ARGUMENT_KEY``
+          marker under ``REDACTED_UNKNOWN_ARGUMENTS_FIELD``.
+    
+        **Failure modes (all raise AuditIntegrityError):**
+          - Manifest entry missing for ``tool_name`` (registry-consistency
+            invariant; distinct from Tier-3 LLM-hallucinated tool name which is
+            caught earlier in the dispatcher).
+          - Summarizer raises → ``telemetry.summarizer_error(tool_name=...)``
+            BEFORE raise; ``AuditIntegrityError`` chained from the underlying
+            exception (M.8).
+          - Summarizer returns non-str → ``telemetry.summarizer_error(...)``
+            BEFORE raise; ``AuditIntegrityError`` with a typed message.
+    
+        **Walker atomicity:** the output dict is built in a local variable and
+        only returned on success.  A mid-walk raise leaves no partial dict
+        observable to the caller (rev-3 W8b / rev-4 W8b).
+        """
+        if tool_name not in MANIFEST:
+            raise AuditIntegrityError(
+                f"redact_tool_call_arguments called for unknown tool {tool_name!r}; "
+                "the manifest is the source of truth for the registry/redaction "
+                "set-equality invariant.  Add a manifest entry for this tool or "
+                "verify that the dispatch path passes the correct tool name."
+            )
+        entry = MANIFEST[tool_name]
+        if entry.argument_model is not None:
+            # Emit BEFORE model_validate: dispatch happened regardless of Tier-3
+            # validation outcome.  A ValidationError escapes here and the handler
+            # wraps it as ToolArgumentError; the dispatch beacon must not depend on
+            # validation success.
+            telemetry.manifest_dispatch(tool_name=tool_name, shape="type_driven")
+>           validated = entry.argument_model.model_validate(arguments)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           pydantic_core._pydantic_core.ValidationError: 1 validation error for SetPipelineArgumentsModel
+E           authority_kind
+E             Extra inputs are not permitted [type=extra_forbidden, input_value='owned_composition_state.v1', input_type=str]
+E               For further information visit https://errors.pydantic.dev/2.13/v/extra_forbidden
+
+src/elspeth/web/composer/redaction.py:2574: ValidationError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:10 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:10 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:10 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+___ test_pending_interpretation_review_is_not_reported_as_findings[asyncio] ____
+
+    async def test_pending_interpretation_review_is_not_reported_as_findings() -> None:
+        """The pending handoff gets its OWN wording, not the validator-objection one.
+    
+        Both shapes are ``is_valid=False``, so a predicate that split on validity
+        alone would tell the operator to fix "issues" when the only outstanding
+        work is resolving a review card. That is the ticket's over-claim in mirror
+        image: a truthful-sounding message pointing at a defect that is not there.
+        """
+>       result, _ = await _stage(
+            trust_mode="auto_commit",
+            preflight=_pending_review_result(),
+            candidate_state=_changed_state(),
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:375: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:230: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:663: in _stage_pipeline_plan
+    redacted_arguments = redact_tool_call_arguments(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tool_name = 'set_pipeline'
+arguments = {'authority_kind': 'owned_composition_state.v1', 'edges': [], 'metadata': {'description': '', 'name': 'Changed pipeline'}, 'nodes': [], ...}
+
+    def redact_tool_call_arguments(
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        telemetry: RedactionTelemetry,
+    ) -> dict[str, Any]:
+        """Produce the redacted arguments dict that lands in
+        ``chat_messages.tool_calls`` JSON (spec §4.2.6).
+    
+        Disposition by manifest-entry shape:
+    
+        **Type-driven entry (``argument_model`` set):**
+          Emit the ``manifest_dispatch`` beacon (BEFORE ``model_validate`` so a
+          Tier-3 ``ValidationError`` still records the dispatch); validate the
+          raw arguments against ``argument_model``; walk via
+          :func:`_redact_via_schema`. ``Sensitive[T]`` fields at any path
+          (top-level, nested, list-element, dict-element, tuple-element) are
+          substituted with the summarizer output or
+          ``REDACTED_SENSITIVE_NO_SUMMARIZER`` when no summarizer is declared.
+    
+          The handler MUST catch :class:`pydantic.ValidationError` raised here
+          and re-raise as :class:`ToolArgumentError` so the compose loop's
+          ARG_ERROR routing at ``service.py:2480`` receives the right exception
+          class.  A bare ``ValidationError`` escaping the handler hits the
+          catch-all and becomes :class:`ComposerPluginCrashError` → HTTP 500 —
+          the wrong disposition for Tier-3 input.
+    
+        **Declarative entry (``policy`` set):**
+          Emit the ``manifest_dispatch`` beacon; walk ``arguments`` by
+          ``policy.sensitive_argument_keys``.  Missing keys are no-ops; present
+          keys are summarized (via ``policy.argument_summarizers[key]``) or
+          sentinel-substituted (``REDACTED_SENSITIVE_NO_SUMMARIZER``).  Keys
+          not in ``sensitive_argument_keys`` are passthrough unless the policy
+          declares ``known_argument_keys`` or enables
+          ``redact_unknown_argument_keys``; in that case unknown argument key names
+          are removed and replaced with a generic ``REDACTED_UNKNOWN_ARGUMENT_KEY``
+          marker under ``REDACTED_UNKNOWN_ARGUMENTS_FIELD``.
+    
+        **Failure modes (all raise AuditIntegrityError):**
+          - Manifest entry missing for ``tool_name`` (registry-consistency
+            invariant; distinct from Tier-3 LLM-hallucinated tool name which is
+            caught earlier in the dispatcher).
+          - Summarizer raises → ``telemetry.summarizer_error(tool_name=...)``
+            BEFORE raise; ``AuditIntegrityError`` chained from the underlying
+            exception (M.8).
+          - Summarizer returns non-str → ``telemetry.summarizer_error(...)``
+            BEFORE raise; ``AuditIntegrityError`` with a typed message.
+    
+        **Walker atomicity:** the output dict is built in a local variable and
+        only returned on success.  A mid-walk raise leaves no partial dict
+        observable to the caller (rev-3 W8b / rev-4 W8b).
+        """
+        if tool_name not in MANIFEST:
+            raise AuditIntegrityError(
+                f"redact_tool_call_arguments called for unknown tool {tool_name!r}; "
+                "the manifest is the source of truth for the registry/redaction "
+                "set-equality invariant.  Add a manifest entry for this tool or "
+                "verify that the dispatch path passes the correct tool name."
+            )
+        entry = MANIFEST[tool_name]
+        if entry.argument_model is not None:
+            # Emit BEFORE model_validate: dispatch happened regardless of Tier-3
+            # validation outcome.  A ValidationError escapes here and the handler
+            # wraps it as ToolArgumentError; the dispatch beacon must not depend on
+            # validation success.
+            telemetry.manifest_dispatch(tool_name=tool_name, shape="type_driven")
+>           validated = entry.argument_model.model_validate(arguments)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           pydantic_core._pydantic_core.ValidationError: 1 validation error for SetPipelineArgumentsModel
+E           authority_kind
+E             Extra inputs are not permitted [type=extra_forbidden, input_value='owned_composition_state.v1', input_type=str]
+E               For further information visit https://errors.pydantic.dev/2.13/v/extra_forbidden
+
+src/elspeth/web/composer/redaction.py:2574: ValidationError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:10 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:10 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:10 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+______ test_preflight_failure_is_not_run_and_blocks_auto_commit[asyncio] _______
+
+    async def test_preflight_failure_is_not_run_and_blocks_auto_commit() -> None:
+        """A raising preflight reports; it does not 500 an otherwise stageable plan."""
+>       result, sessions = await _stage(
+            trust_mode="auto_commit",
+            preflight=ComposerRuntimePreflightError(
+                original_exc=RuntimeError("preflight exploded"),
+                partial_state=None,
+            ),
+            candidate_state=_changed_state(),
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:393: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:230: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:663: in _stage_pipeline_plan
+    redacted_arguments = redact_tool_call_arguments(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tool_name = 'set_pipeline'
+arguments = {'authority_kind': 'owned_composition_state.v1', 'edges': [], 'metadata': {'description': '', 'name': 'Changed pipeline'}, 'nodes': [], ...}
+
+    def redact_tool_call_arguments(
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        telemetry: RedactionTelemetry,
+    ) -> dict[str, Any]:
+        """Produce the redacted arguments dict that lands in
+        ``chat_messages.tool_calls`` JSON (spec §4.2.6).
+    
+        Disposition by manifest-entry shape:
+    
+        **Type-driven entry (``argument_model`` set):**
+          Emit the ``manifest_dispatch`` beacon (BEFORE ``model_validate`` so a
+          Tier-3 ``ValidationError`` still records the dispatch); validate the
+          raw arguments against ``argument_model``; walk via
+          :func:`_redact_via_schema`. ``Sensitive[T]`` fields at any path
+          (top-level, nested, list-element, dict-element, tuple-element) are
+          substituted with the summarizer output or
+          ``REDACTED_SENSITIVE_NO_SUMMARIZER`` when no summarizer is declared.
+    
+          The handler MUST catch :class:`pydantic.ValidationError` raised here
+          and re-raise as :class:`ToolArgumentError` so the compose loop's
+          ARG_ERROR routing at ``service.py:2480`` receives the right exception
+          class.  A bare ``ValidationError`` escaping the handler hits the
+          catch-all and becomes :class:`ComposerPluginCrashError` → HTTP 500 —
+          the wrong disposition for Tier-3 input.
+    
+        **Declarative entry (``policy`` set):**
+          Emit the ``manifest_dispatch`` beacon; walk ``arguments`` by
+          ``policy.sensitive_argument_keys``.  Missing keys are no-ops; present
+          keys are summarized (via ``policy.argument_summarizers[key]``) or
+          sentinel-substituted (``REDACTED_SENSITIVE_NO_SUMMARIZER``).  Keys
+          not in ``sensitive_argument_keys`` are passthrough unless the policy
+          declares ``known_argument_keys`` or enables
+          ``redact_unknown_argument_keys``; in that case unknown argument key names
+          are removed and replaced with a generic ``REDACTED_UNKNOWN_ARGUMENT_KEY``
+          marker under ``REDACTED_UNKNOWN_ARGUMENTS_FIELD``.
+    
+        **Failure modes (all raise AuditIntegrityError):**
+          - Manifest entry missing for ``tool_name`` (registry-consistency
+            invariant; distinct from Tier-3 LLM-hallucinated tool name which is
+            caught earlier in the dispatcher).
+          - Summarizer raises → ``telemetry.summarizer_error(tool_name=...)``
+            BEFORE raise; ``AuditIntegrityError`` chained from the underlying
+            exception (M.8).
+          - Summarizer returns non-str → ``telemetry.summarizer_error(...)``
+            BEFORE raise; ``AuditIntegrityError`` with a typed message.
+    
+        **Walker atomicity:** the output dict is built in a local variable and
+        only returned on success.  A mid-walk raise leaves no partial dict
+        observable to the caller (rev-3 W8b / rev-4 W8b).
+        """
+        if tool_name not in MANIFEST:
+            raise AuditIntegrityError(
+                f"redact_tool_call_arguments called for unknown tool {tool_name!r}; "
+                "the manifest is the source of truth for the registry/redaction "
+                "set-equality invariant.  Add a manifest entry for this tool or "
+                "verify that the dispatch path passes the correct tool name."
+            )
+        entry = MANIFEST[tool_name]
+        if entry.argument_model is not None:
+            # Emit BEFORE model_validate: dispatch happened regardless of Tier-3
+            # validation outcome.  A ValidationError escapes here and the handler
+            # wraps it as ToolArgumentError; the dispatch beacon must not depend on
+            # validation success.
+            telemetry.manifest_dispatch(tool_name=tool_name, shape="type_driven")
+>           validated = entry.argument_model.model_validate(arguments)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           pydantic_core._pydantic_core.ValidationError: 1 validation error for SetPipelineArgumentsModel
+E           authority_kind
+E             Extra inputs are not permitted [type=extra_forbidden, input_value='owned_composition_state.v1', input_type=str]
+E               For further information visit https://errors.pydantic.dev/2.13/v/extra_forbidden
+
+src/elspeth/web/composer/redaction.py:2574: ValidationError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:10 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:10 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:10 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+__________________ test_preflight_timeout_is_not_run[asyncio] __________________
+
+    async def test_preflight_timeout_is_not_run() -> None:
+        """A timeout reaches the caller as ComposerRuntimePreflightError, not TimeoutError.
+    
+        ``RuntimePreflightCoordinator`` converts every ``Exception`` — the worker's
+        via ``_capture``, the caller's timeout via ``run`` — into a
+        ``RuntimePreflightFailure``, which ``_cached_runtime_preflight`` re-raises
+        in that single envelope. Scripting a bare ``TimeoutError`` here would test
+        a path production cannot produce and would license a dead ``except`` arm.
+        """
+>       result, _ = await _stage(
+            trust_mode="auto_commit",
+            preflight=ComposerRuntimePreflightError(
+                original_exc=TimeoutError("deadline expired"),
+                partial_state=None,
+            ),
+            candidate_state=_changed_state(),
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:419: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:230: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:663: in _stage_pipeline_plan
+    redacted_arguments = redact_tool_call_arguments(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tool_name = 'set_pipeline'
+arguments = {'authority_kind': 'owned_composition_state.v1', 'edges': [], 'metadata': {'description': '', 'name': 'Changed pipeline'}, 'nodes': [], ...}
+
+    def redact_tool_call_arguments(
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        telemetry: RedactionTelemetry,
+    ) -> dict[str, Any]:
+        """Produce the redacted arguments dict that lands in
+        ``chat_messages.tool_calls`` JSON (spec §4.2.6).
+    
+        Disposition by manifest-entry shape:
+    
+        **Type-driven entry (``argument_model`` set):**
+          Emit the ``manifest_dispatch`` beacon (BEFORE ``model_validate`` so a
+          Tier-3 ``ValidationError`` still records the dispatch); validate the
+          raw arguments against ``argument_model``; walk via
+          :func:`_redact_via_schema`. ``Sensitive[T]`` fields at any path
+          (top-level, nested, list-element, dict-element, tuple-element) are
+          substituted with the summarizer output or
+          ``REDACTED_SENSITIVE_NO_SUMMARIZER`` when no summarizer is declared.
+    
+          The handler MUST catch :class:`pydantic.ValidationError` raised here
+          and re-raise as :class:`ToolArgumentError` so the compose loop's
+          ARG_ERROR routing at ``service.py:2480`` receives the right exception
+          class.  A bare ``ValidationError`` escaping the handler hits the
+          catch-all and becomes :class:`ComposerPluginCrashError` → HTTP 500 —
+          the wrong disposition for Tier-3 input.
+    
+        **Declarative entry (``policy`` set):**
+          Emit the ``manifest_dispatch`` beacon; walk ``arguments`` by
+          ``policy.sensitive_argument_keys``.  Missing keys are no-ops; present
+          keys are summarized (via ``policy.argument_summarizers[key]``) or
+          sentinel-substituted (``REDACTED_SENSITIVE_NO_SUMMARIZER``).  Keys
+          not in ``sensitive_argument_keys`` are passthrough unless the policy
+          declares ``known_argument_keys`` or enables
+          ``redact_unknown_argument_keys``; in that case unknown argument key names
+          are removed and replaced with a generic ``REDACTED_UNKNOWN_ARGUMENT_KEY``
+          marker under ``REDACTED_UNKNOWN_ARGUMENTS_FIELD``.
+    
+        **Failure modes (all raise AuditIntegrityError):**
+          - Manifest entry missing for ``tool_name`` (registry-consistency
+            invariant; distinct from Tier-3 LLM-hallucinated tool name which is
+            caught earlier in the dispatcher).
+          - Summarizer raises → ``telemetry.summarizer_error(tool_name=...)``
+            BEFORE raise; ``AuditIntegrityError`` chained from the underlying
+            exception (M.8).
+          - Summarizer returns non-str → ``telemetry.summarizer_error(...)``
+            BEFORE raise; ``AuditIntegrityError`` with a typed message.
+    
+        **Walker atomicity:** the output dict is built in a local variable and
+        only returned on success.  A mid-walk raise leaves no partial dict
+        observable to the caller (rev-3 W8b / rev-4 W8b).
+        """
+        if tool_name not in MANIFEST:
+            raise AuditIntegrityError(
+                f"redact_tool_call_arguments called for unknown tool {tool_name!r}; "
+                "the manifest is the source of truth for the registry/redaction "
+                "set-equality invariant.  Add a manifest entry for this tool or "
+                "verify that the dispatch path passes the correct tool name."
+            )
+        entry = MANIFEST[tool_name]
+        if entry.argument_model is not None:
+            # Emit BEFORE model_validate: dispatch happened regardless of Tier-3
+            # validation outcome.  A ValidationError escapes here and the handler
+            # wraps it as ToolArgumentError; the dispatch beacon must not depend on
+            # validation success.
+            telemetry.manifest_dispatch(tool_name=tool_name, shape="type_driven")
+>           validated = entry.argument_model.model_validate(arguments)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           pydantic_core._pydantic_core.ValidationError: 1 validation error for SetPipelineArgumentsModel
+E           authority_kind
+E             Extra inputs are not permitted [type=extra_forbidden, input_value='owned_composition_state.v1', input_type=str]
+E               For further information visit https://errors.pydantic.dev/2.13/v/extra_forbidden
+
+src/elspeth/web/composer/redaction.py:2574: ValidationError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:10 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:10 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:10 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+______ test_cancellation_is_not_swallowed_into_a_staged_proposal[asyncio] ______
+
+    async def test_cancellation_is_not_swallowed_into_a_staged_proposal() -> None:
+        """CancelledError is a BaseException — it must abort, not stage.
+    
+        Broadening the ``except`` to ``Exception`` (or catching ``BaseException``
+        defensively) would turn a cancelled request into a staged proposal carrying
+        a verdict nobody waited for.
+        """
+        with pytest.raises(asyncio.CancelledError):
+>           await _stage(
+                trust_mode="auto_commit",
+                preflight=asyncio.CancelledError(),
+                candidate_state=_changed_state(),
+            )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:440: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:230: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:663: in _stage_pipeline_plan
+    redacted_arguments = redact_tool_call_arguments(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tool_name = 'set_pipeline'
+arguments = {'authority_kind': 'owned_composition_state.v1', 'edges': [], 'metadata': {'description': '', 'name': 'Changed pipeline'}, 'nodes': [], ...}
+
+    def redact_tool_call_arguments(
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        telemetry: RedactionTelemetry,
+    ) -> dict[str, Any]:
+        """Produce the redacted arguments dict that lands in
+        ``chat_messages.tool_calls`` JSON (spec §4.2.6).
+    
+        Disposition by manifest-entry shape:
+    
+        **Type-driven entry (``argument_model`` set):**
+          Emit the ``manifest_dispatch`` beacon (BEFORE ``model_validate`` so a
+          Tier-3 ``ValidationError`` still records the dispatch); validate the
+          raw arguments against ``argument_model``; walk via
+          :func:`_redact_via_schema`. ``Sensitive[T]`` fields at any path
+          (top-level, nested, list-element, dict-element, tuple-element) are
+          substituted with the summarizer output or
+          ``REDACTED_SENSITIVE_NO_SUMMARIZER`` when no summarizer is declared.
+    
+          The handler MUST catch :class:`pydantic.ValidationError` raised here
+          and re-raise as :class:`ToolArgumentError` so the compose loop's
+          ARG_ERROR routing at ``service.py:2480`` receives the right exception
+          class.  A bare ``ValidationError`` escaping the handler hits the
+          catch-all and becomes :class:`ComposerPluginCrashError` → HTTP 500 —
+          the wrong disposition for Tier-3 input.
+    
+        **Declarative entry (``policy`` set):**
+          Emit the ``manifest_dispatch`` beacon; walk ``arguments`` by
+          ``policy.sensitive_argument_keys``.  Missing keys are no-ops; present
+          keys are summarized (via ``policy.argument_summarizers[key]``) or
+          sentinel-substituted (``REDACTED_SENSITIVE_NO_SUMMARIZER``).  Keys
+          not in ``sensitive_argument_keys`` are passthrough unless the policy
+          declares ``known_argument_keys`` or enables
+          ``redact_unknown_argument_keys``; in that case unknown argument key names
+          are removed and replaced with a generic ``REDACTED_UNKNOWN_ARGUMENT_KEY``
+          marker under ``REDACTED_UNKNOWN_ARGUMENTS_FIELD``.
+    
+        **Failure modes (all raise AuditIntegrityError):**
+          - Manifest entry missing for ``tool_name`` (registry-consistency
+            invariant; distinct from Tier-3 LLM-hallucinated tool name which is
+            caught earlier in the dispatcher).
+          - Summarizer raises → ``telemetry.summarizer_error(tool_name=...)``
+            BEFORE raise; ``AuditIntegrityError`` chained from the underlying
+            exception (M.8).
+          - Summarizer returns non-str → ``telemetry.summarizer_error(...)``
+            BEFORE raise; ``AuditIntegrityError`` with a typed message.
+    
+        **Walker atomicity:** the output dict is built in a local variable and
+        only returned on success.  A mid-walk raise leaves no partial dict
+        observable to the caller (rev-3 W8b / rev-4 W8b).
+        """
+        if tool_name not in MANIFEST:
+            raise AuditIntegrityError(
+                f"redact_tool_call_arguments called for unknown tool {tool_name!r}; "
+                "the manifest is the source of truth for the registry/redaction "
+                "set-equality invariant.  Add a manifest entry for this tool or "
+                "verify that the dispatch path passes the correct tool name."
+            )
+        entry = MANIFEST[tool_name]
+        if entry.argument_model is not None:
+            # Emit BEFORE model_validate: dispatch happened regardless of Tier-3
+            # validation outcome.  A ValidationError escapes here and the handler
+            # wraps it as ToolArgumentError; the dispatch beacon must not depend on
+            # validation success.
+            telemetry.manifest_dispatch(tool_name=tool_name, shape="type_driven")
+>           validated = entry.argument_model.model_validate(arguments)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           pydantic_core._pydantic_core.ValidationError: 1 validation error for SetPipelineArgumentsModel
+E           authority_kind
+E             Extra inputs are not permitted [type=extra_forbidden, input_value='owned_composition_state.v1', input_type=str]
+E               For further information visit https://errors.pydantic.dev/2.13/v/extra_forbidden
+
+src/elspeth/web/composer/redaction.py:2574: ValidationError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:10 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:10 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:10 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body[NO_CHANGE-no_change-False] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-130/test_actual_canonical_failure_2/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe800eee8d0>, UUID('3913eb65-1d66-4eb1-b634-f9c56797ac44'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-130/test_actual_canonical_failure_2')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe7ff2aa960>
+manual = False, code = 'NO_CHANGE', reason = 'no_change'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("manual", [False, True])
+    @pytest.mark.parametrize("code,reason", [("VALIDATION_FAILED", "validation_failed"), ("NO_CHANGE", "no_change"), ("ARGUMENT_ERROR", "validation_failed")])
+    async def test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body(operation_store, tmp_path, monkeypatch, manual, code, reason):
+        engine, repository, _authority, _service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        app = mounted_app(operation_store, tmp_path)
+        body = PipelineCommitError("actual controlled validation failure", code=code)
+    
+        async def fail_candidate(**kwargs):
+            raise body
+    
+        monkeypatch.setattr(pipeline_settlement, "prepare_pipeline_proposal_commit", fail_candidate)
+        if manual:
+            repository.release(running.session_operation_context)
+            from elspeth.web.coordination.lifecycle import SessionOperationLease
+    
+            bound = []
+            original_bind = SessionOperationLease.bind_required_work
+    
+            def observe_bind(lease, coordinator):
+                original_bind(lease, coordinator)
+                bound.append(coordinator)
+    
+            monkeypatch.setattr(SessionOperationLease, "bind_required_work", observe_bind)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                response = await client.post(
+                    f"/api/sessions/{sid}/proposals/{expected.authority.row.id}/accept",
+                    json={"draft_hash": expected.authority.proposal.draft_hash},
+                )
+            assert response.status_code == 422
+            if code in {"NO_CHANGE", "ARGUMENT_ERROR"}:
+                payload = response.json()
+                assert payload["error_type"] == ("proposal_no_change" if code == "NO_CHANGE" else "proposal_argument_invalid")
+                assert payload["tool_name"] == "set_pipeline"
+                assert "automatically rejected" in payload["detail"]
+            assert len(bound) == 1
+            bound[0].assert_completed()
+            receipts = bound[0].failure_receipts()
+            assert any(
+                receipt.key.source is RequiredWorkSource.REQUIRED_CONTINUATION_PRODUCER
+                and any(leaf is body for leaf in originals(receipt.original_root))
+                for receipt in receipts
+            )
+            assert all(receipt.child_outcome is None for receipt in receipts)
+        else:
+            parent = RequiredWorkCoordinator(
+                RequiredWorkAuthority(
+                    RequiredAuthorityKind.DURABLE_COMPOSE, running.session_operation_context, running.claim.operation_id, running.claim.attempt
+                )
+            )
+            binding = RequiredWorkBinding(parent, 9, 13, RequiredWorkRole.TURN, running)
+            try:
+                with pytest.raises(BaseExceptionGroup) as caught:
+                    await pipeline_settlement.settle_pipeline_proposal_under_compose_lock(
+                        services=composer_app_services(app),
+                        user_id="alice",
+                        authority=expected.authority,
+                        draft_hash=expected.authority.proposal.draft_hash,
+                        session_operation_context=running.session_operation_context,
+                        commit_timeout_seconds=5,
+                        running=running,
+                        required_work=parent,
+                        required_binding=binding,
+                    )
+                assert any(leaf is body for leaf in originals(caught.value))
+                parent.assert_completed()
+                receipts = parent.failure_receipts()
+                producer = next(receipt for receipt in receipts if receipt.key.source is RequiredWorkSource.REQUIRED_CONTINUATION_PRODUCER)
+                assert any(leaf is body for leaf in originals(producer.original_root))
+                assert producer.child_outcome is None
+                assert producer.key.transition_ordinal == 9
+                assert producer.key.semantic_ordinal == 13
+            finally:
+                repository.release(running.session_operation_context)
+        events = proposal_events(engine, expected.authority.row.id)
+>       assert len(events) == 1
+E       assert 0 == 1
+E        +  where 0 = len([])
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:312: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:18 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:18 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:19 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+_ test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body[NO_CHANGE-no_change-True] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-130/test_actual_canonical_failure_3/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe7ff1145f0>, UUID('29d60b23-69c0-4e3e-950c-8ce3b64c5171'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-130/test_actual_canonical_failure_3')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe8077b4980>
+manual = True, code = 'NO_CHANGE', reason = 'no_change'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("manual", [False, True])
+    @pytest.mark.parametrize("code,reason", [("VALIDATION_FAILED", "validation_failed"), ("NO_CHANGE", "no_change"), ("ARGUMENT_ERROR", "validation_failed")])
+    async def test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body(operation_store, tmp_path, monkeypatch, manual, code, reason):
+        engine, repository, _authority, _service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        app = mounted_app(operation_store, tmp_path)
+        body = PipelineCommitError("actual controlled validation failure", code=code)
+    
+        async def fail_candidate(**kwargs):
+            raise body
+    
+        monkeypatch.setattr(pipeline_settlement, "prepare_pipeline_proposal_commit", fail_candidate)
+        if manual:
+            repository.release(running.session_operation_context)
+            from elspeth.web.coordination.lifecycle import SessionOperationLease
+    
+            bound = []
+            original_bind = SessionOperationLease.bind_required_work
+    
+            def observe_bind(lease, coordinator):
+                original_bind(lease, coordinator)
+                bound.append(coordinator)
+    
+            monkeypatch.setattr(SessionOperationLease, "bind_required_work", observe_bind)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                response = await client.post(
+                    f"/api/sessions/{sid}/proposals/{expected.authority.row.id}/accept",
+                    json={"draft_hash": expected.authority.proposal.draft_hash},
+                )
+            assert response.status_code == 422
+            if code in {"NO_CHANGE", "ARGUMENT_ERROR"}:
+                payload = response.json()
+>               assert payload["error_type"] == ("proposal_no_change" if code == "NO_CHANGE" else "proposal_argument_invalid")
+                       ^^^^^^^^^^^^^^^^^^^^^
+E               KeyError: 'error_type'
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:269: KeyError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:19 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:20 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:20 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+_ test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body[ARGUMENT_ERROR-validation_failed-False] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-130/test_actual_canonical_failure_4/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe801d01160>, UUID('2fee3020-2a40-4a87-8b62-d3a845f739ca'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-130/test_actual_canonical_failure_4')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe800eefd40>
+manual = False, code = 'ARGUMENT_ERROR', reason = 'validation_failed'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("manual", [False, True])
+    @pytest.mark.parametrize("code,reason", [("VALIDATION_FAILED", "validation_failed"), ("NO_CHANGE", "no_change"), ("ARGUMENT_ERROR", "validation_failed")])
+    async def test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body(operation_store, tmp_path, monkeypatch, manual, code, reason):
+        engine, repository, _authority, _service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        app = mounted_app(operation_store, tmp_path)
+        body = PipelineCommitError("actual controlled validation failure", code=code)
+    
+        async def fail_candidate(**kwargs):
+            raise body
+    
+        monkeypatch.setattr(pipeline_settlement, "prepare_pipeline_proposal_commit", fail_candidate)
+        if manual:
+            repository.release(running.session_operation_context)
+            from elspeth.web.coordination.lifecycle import SessionOperationLease
+    
+            bound = []
+            original_bind = SessionOperationLease.bind_required_work
+    
+            def observe_bind(lease, coordinator):
+                original_bind(lease, coordinator)
+                bound.append(coordinator)
+    
+            monkeypatch.setattr(SessionOperationLease, "bind_required_work", observe_bind)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                response = await client.post(
+                    f"/api/sessions/{sid}/proposals/{expected.authority.row.id}/accept",
+                    json={"draft_hash": expected.authority.proposal.draft_hash},
+                )
+            assert response.status_code == 422
+            if code in {"NO_CHANGE", "ARGUMENT_ERROR"}:
+                payload = response.json()
+                assert payload["error_type"] == ("proposal_no_change" if code == "NO_CHANGE" else "proposal_argument_invalid")
+                assert payload["tool_name"] == "set_pipeline"
+                assert "automatically rejected" in payload["detail"]
+            assert len(bound) == 1
+            bound[0].assert_completed()
+            receipts = bound[0].failure_receipts()
+            assert any(
+                receipt.key.source is RequiredWorkSource.REQUIRED_CONTINUATION_PRODUCER
+                and any(leaf is body for leaf in originals(receipt.original_root))
+                for receipt in receipts
+            )
+            assert all(receipt.child_outcome is None for receipt in receipts)
+        else:
+            parent = RequiredWorkCoordinator(
+                RequiredWorkAuthority(
+                    RequiredAuthorityKind.DURABLE_COMPOSE, running.session_operation_context, running.claim.operation_id, running.claim.attempt
+                )
+            )
+            binding = RequiredWorkBinding(parent, 9, 13, RequiredWorkRole.TURN, running)
+            try:
+                with pytest.raises(BaseExceptionGroup) as caught:
+                    await pipeline_settlement.settle_pipeline_proposal_under_compose_lock(
+                        services=composer_app_services(app),
+                        user_id="alice",
+                        authority=expected.authority,
+                        draft_hash=expected.authority.proposal.draft_hash,
+                        session_operation_context=running.session_operation_context,
+                        commit_timeout_seconds=5,
+                        running=running,
+                        required_work=parent,
+                        required_binding=binding,
+                    )
+                assert any(leaf is body for leaf in originals(caught.value))
+                parent.assert_completed()
+                receipts = parent.failure_receipts()
+                producer = next(receipt for receipt in receipts if receipt.key.source is RequiredWorkSource.REQUIRED_CONTINUATION_PRODUCER)
+                assert any(leaf is body for leaf in originals(producer.original_root))
+                assert producer.child_outcome is None
+                assert producer.key.transition_ordinal == 9
+                assert producer.key.semantic_ordinal == 13
+            finally:
+                repository.release(running.session_operation_context)
+        events = proposal_events(engine, expected.authority.row.id)
+>       assert len(events) == 1
+E       assert 0 == 1
+E        +  where 0 = len([])
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:312: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:21 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:21 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:22 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+_ test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body[ARGUMENT_ERROR-validation_failed-True] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-130/test_actual_canonical_failure_5/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe7fe59afc0>, UUID('62d9957d-5562-47a8-8205-e854661b05ee'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-130/test_actual_canonical_failure_5')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe801d01fa0>
+manual = True, code = 'ARGUMENT_ERROR', reason = 'validation_failed'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("manual", [False, True])
+    @pytest.mark.parametrize("code,reason", [("VALIDATION_FAILED", "validation_failed"), ("NO_CHANGE", "no_change"), ("ARGUMENT_ERROR", "validation_failed")])
+    async def test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body(operation_store, tmp_path, monkeypatch, manual, code, reason):
+        engine, repository, _authority, _service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        app = mounted_app(operation_store, tmp_path)
+        body = PipelineCommitError("actual controlled validation failure", code=code)
+    
+        async def fail_candidate(**kwargs):
+            raise body
+    
+        monkeypatch.setattr(pipeline_settlement, "prepare_pipeline_proposal_commit", fail_candidate)
+        if manual:
+            repository.release(running.session_operation_context)
+            from elspeth.web.coordination.lifecycle import SessionOperationLease
+    
+            bound = []
+            original_bind = SessionOperationLease.bind_required_work
+    
+            def observe_bind(lease, coordinator):
+                original_bind(lease, coordinator)
+                bound.append(coordinator)
+    
+            monkeypatch.setattr(SessionOperationLease, "bind_required_work", observe_bind)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                response = await client.post(
+                    f"/api/sessions/{sid}/proposals/{expected.authority.row.id}/accept",
+                    json={"draft_hash": expected.authority.proposal.draft_hash},
+                )
+            assert response.status_code == 422
+            if code in {"NO_CHANGE", "ARGUMENT_ERROR"}:
+                payload = response.json()
+>               assert payload["error_type"] == ("proposal_no_change" if code == "NO_CHANGE" else "proposal_argument_invalid")
+                       ^^^^^^^^^^^^^^^^^^^^^
+E               KeyError: 'error_type'
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:269: KeyError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:23 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:23 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:23 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+_ test_identical_canonical_candidate_returns_unchanged_without_proposal[auto_commit-singleton-source] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-130/test_identical_canonical_candi2')
+named_sources = False, trust_mode = 'auto_commit'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("named_sources", (False, True), ids=("singleton-source", "named-source"))
+    @pytest.mark.parametrize("trust_mode", ("explicit_approve", "auto_commit"))
+    async def test_identical_canonical_candidate_returns_unchanged_without_proposal(tmp_path: Path, named_sources: bool, trust_mode: str) -> None:
+        harness = _harness(tmp_path)
+        await harness.sessions.update_composer_preferences(
+            UUID(harness.session_id), trust_mode=trust_mode, density_default="high", actor="user:proposal-prevalidation-user"
+        )
+        arguments = _valid_pipeline_args(tmp_path)
+        if named_sources:
+            arguments["sources"] = {"orders": arguments.pop("source")}
+        state = CompositionState.from_dict(
+            {
+                **arguments,
+                "version": 7,
+                "metadata": {"description": "", **arguments["metadata"]},
+                "outputs": [{"name": output["sink_name"], **output} for output in arguments["outputs"]],
+            }
+        )
+        llm = _ScriptedLLM(
+            _tool_turn("call_identical", "set_pipeline", arguments),
+            _fake_llm_response(content="The pipeline is unchanged."),
+        )
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as executor,
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Keep the current pipeline.",
+                [],
+                state,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                user_message_id=harness.user_message_id,
+            )
+        assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
+>       assert result.state is state
+E       AssertionError: assert CompositionState(nodes=(), edges=(), outputs=(OutputSpec(name='main', plugin='json', options=mappingproxy({'path': '/t...00001/input.csv', 'schema': mappingproxy({'mode': 'observed'})}), on_validation_failure='discard', description=None)})) is CompositionState(nodes=(), edges=(), outputs=(OutputSpec(name='main', plugin='json', options=mappingproxy({'path': '/t...00001/input.csv', 'schema': mappingproxy({'mode': 'observed'})}), on_validation_failure='discard', description=None)}))
+E        +  where CompositionState(nodes=(), edges=(), outputs=(OutputSpec(name='main', plugin='json', options=mappingproxy({'path': '/t...00001/input.csv', 'schema': mappingproxy({'mode': 'observed'})}), on_validation_failure='discard', description=None)})) = ComposerResult(message='The pipeline is unchanged.\n\n---\n\n[ELSPETH-SYSTEM] Checkpoint save status: Verified checkpo...tches_terminal_model_turn=False, advisor_terminal_publication=None, final_persisted_state_id=None, repair_turns_used=0).state
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1723: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:55 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:55 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:55 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 13:42:55 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_identical_canonical_candidate_returns_unchanged_without_proposal[auto_commit-named-source] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-130/test_identical_canonical_candi3')
+named_sources = True, trust_mode = 'auto_commit'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("named_sources", (False, True), ids=("singleton-source", "named-source"))
+    @pytest.mark.parametrize("trust_mode", ("explicit_approve", "auto_commit"))
+    async def test_identical_canonical_candidate_returns_unchanged_without_proposal(tmp_path: Path, named_sources: bool, trust_mode: str) -> None:
+        harness = _harness(tmp_path)
+        await harness.sessions.update_composer_preferences(
+            UUID(harness.session_id), trust_mode=trust_mode, density_default="high", actor="user:proposal-prevalidation-user"
+        )
+        arguments = _valid_pipeline_args(tmp_path)
+        if named_sources:
+            arguments["sources"] = {"orders": arguments.pop("source")}
+        state = CompositionState.from_dict(
+            {
+                **arguments,
+                "version": 7,
+                "metadata": {"description": "", **arguments["metadata"]},
+                "outputs": [{"name": output["sink_name"], **output} for output in arguments["outputs"]],
+            }
+        )
+        llm = _ScriptedLLM(
+            _tool_turn("call_identical", "set_pipeline", arguments),
+            _fake_llm_response(content="The pipeline is unchanged."),
+        )
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as executor,
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Keep the current pipeline.",
+                [],
+                state,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                user_message_id=harness.user_message_id,
+            )
+        assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
+>       assert result.state is state
+E       AssertionError: assert CompositionState(nodes=(), edges=(), outputs=(OutputSpec(name='main', plugin='json', options=mappingproxy({'path': '/t...00001/input.csv', 'schema': mappingproxy({'mode': 'observed'})}), on_validation_failure='discard', description=None)})) is CompositionState(nodes=(), edges=(), outputs=(OutputSpec(name='main', plugin='json', options=mappingproxy({'path': '/t...00001/input.csv', 'schema': mappingproxy({'mode': 'observed'})}), on_validation_failure='discard', description=None)}))
+E        +  where CompositionState(nodes=(), edges=(), outputs=(OutputSpec(name='main', plugin='json', options=mappingproxy({'path': '/t...00001/input.csv', 'schema': mappingproxy({'mode': 'observed'})}), on_validation_failure='discard', description=None)})) = ComposerResult(message='The pipeline is unchanged.\n\n---\n\n[ELSPETH-SYSTEM] Checkpoint save status: Verified checkpo...tches_terminal_model_turn=False, advisor_terminal_publication=None, final_persisted_state_id=None, repair_turns_used=0).state
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1723: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:42:55 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:42:55 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:42:55 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 13:42:56 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_pipeline_rejection_uses_closed_versioned_reason_and_is_exactly_idempotent[no_change] _
+
+service = <tests.unit.web.sessions.session_test_authority.FencedSessionServiceHarness object at 0x7fe7fe375a60>
+reason = 'no_change'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", ["operator_rejected", "no_change"])
+    async def test_pipeline_rejection_uses_closed_versioned_reason_and_is_exactly_idempotent(service: SessionServiceImpl, reason: str) -> None:
+        session_id = uuid4()
+        _insert_session(service, session_id)
+        plan = _plan()
+        row = await _create(service, session_id, plan)
+    
+>       first = await service.reject_pipeline_composition_proposal(
+            session_id=session_id,
+            proposal_id=row.id,
+            draft_hash=plan.proposal.draft_hash,
+            reason=reason,
+            dispatch=None,
+            actor="user:alice",
+        )
+
+tests/integration/web/composer/test_pipeline_proposal_lifecycle.py:1245: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/sessions/session_test_authority.py:222: in _wrapped
+    return await parent(*args, session_operation_context=context, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:4470: in reject_pipeline_composition_proposal
+    result = await self._reject_pipeline_composition_proposal(
+src/elspeth/web/sessions/service.py:4598: in _reject_pipeline_composition_proposal
+    reason = _validated_pipeline_rejection_reason(reason)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+value = 'no_change'
+
+    def _validated_pipeline_rejection_reason(value: object) -> PipelineProposalRejectionReason:
+        if type(value) is not str or value not in _PIPELINE_REJECTION_REASONS:
+>           raise AuditIntegrityError("pipeline proposal rejection reason is outside the closed vocabulary")
+E           elspeth.contracts.errors.AuditIntegrityError: pipeline proposal rejection reason is outside the closed vocabulary
+
+src/elspeth/web/sessions/proposal_authority.py:305: AuditIntegrityError
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_pipeline_commit_operation_authority.py::test_executor_argument_error_persists_its_category_as_the_error_code
+FAILED tests/unit/web/composer/test_pipeline_commit_operation_authority.py::test_candidate_argument_error_has_no_executor_or_success_binding
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-explicit_approve-explicit_approve]
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-auto_commit-auto_commit]
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-auto_commit-explicit_approve]
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_changed_plan_downgrade_retains_review_and_green_preflight[asyncio]
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_green_preflight_keeps_auto_commit_and_validated_wording[asyncio]
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_green_preflight_under_explicit_approve_uses_validated_review_wording[asyncio]
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_red_preflight_downgrades_auto_commit_to_review[asyncio]
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_red_preflight_on_review_arm_is_truthful[asyncio]
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_pending_interpretation_review_blocks_auto_commit[asyncio]
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_pending_interpretation_review_is_not_reported_as_findings[asyncio]
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_preflight_failure_is_not_run_and_blocks_auto_commit[asyncio]
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_preflight_timeout_is_not_run[asyncio]
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_cancellation_is_not_swallowed_into_a_staged_proposal[asyncio]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body[NO_CHANGE-no_change-False]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body[NO_CHANGE-no_change-True]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body[ARGUMENT_ERROR-validation_failed-False]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body[ARGUMENT_ERROR-validation_failed-True]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_identical_canonical_candidate_returns_unchanged_without_proposal[auto_commit-singleton-source]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_identical_canonical_candidate_returns_unchanged_without_proposal[auto_commit-named-source]
+FAILED tests/integration/web/composer/test_pipeline_proposal_lifecycle.py::test_pipeline_rejection_uses_closed_versioned_reason_and_is_exactly_idempotent[no_change]
+======================== 22 failed, 49 passed in 54.45s ========================

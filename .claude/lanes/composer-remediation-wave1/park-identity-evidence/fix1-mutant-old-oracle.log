@@ -1,0 +1,96 @@
+FFFF                                                                     [100%]
+=================================== FAILURES ===================================
+_ test_refused_provider_recovery_retains_exact_private_control_and_physical_binding[False-braced-False] _
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1_refusal_old_oracle.py:112: in test_refused_provider_recovery_retains_exact_private_control_and_physical_binding
+    session = await service.create_session("alice", "Private recovery audit", "local")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/sessions/service.py:2481: in create_session
+    await self._run_sync(
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/sessions/service.py:1030: in _run_sync
+    return await run_sync_in_worker(func, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/async_workers.py:649: in run_sync_in_worker
+    concurrent_future = await _submit_shared(functools.partial(func, *args, **kwargs))
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/async_workers.py:188: in _submit_shared
+    executor = _get_shared_executor()
+               ^^^^^^^^^^^^^^^^^^^^^^
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/async_workers.py:499: in _get_shared_executor
+    _assert_recovery_registered()
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/async_workers.py:103: in _assert_recovery_registered
+    raise AuditIntegrityError("Shared executor recovery callback absent")
+E   elspeth.contracts.errors.AuditIntegrityError: Shared executor recovery callback absent
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:54:43 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+_ test_refused_provider_recovery_retains_exact_private_control_and_physical_binding[False-braced-True] _
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1_refusal_old_oracle.py:112: in test_refused_provider_recovery_retains_exact_private_control_and_physical_binding
+    session = await service.create_session("alice", "Private recovery audit", "local")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/sessions/service.py:2481: in create_session
+    await self._run_sync(
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/sessions/service.py:1030: in _run_sync
+    return await run_sync_in_worker(func, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/async_workers.py:649: in run_sync_in_worker
+    concurrent_future = await _submit_shared(functools.partial(func, *args, **kwargs))
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/async_workers.py:188: in _submit_shared
+    executor = _get_shared_executor()
+               ^^^^^^^^^^^^^^^^^^^^^^
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/async_workers.py:499: in _get_shared_executor
+    _assert_recovery_registered()
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/async_workers.py:103: in _assert_recovery_registered
+    raise AuditIntegrityError("Shared executor recovery callback absent")
+E   elspeth.contracts.errors.AuditIntegrityError: Shared executor recovery callback absent
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:54:44 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+_ test_refused_provider_recovery_retains_exact_private_control_and_physical_binding[True-braced-False] _
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1_refusal_old_oracle.py:112: in test_refused_provider_recovery_retains_exact_private_control_and_physical_binding
+    session = await service.create_session("alice", "Private recovery audit", "local")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/sessions/service.py:2481: in create_session
+    await self._run_sync(
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/sessions/service.py:1030: in _run_sync
+    return await run_sync_in_worker(func, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/async_workers.py:649: in run_sync_in_worker
+    concurrent_future = await _submit_shared(functools.partial(func, *args, **kwargs))
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/async_workers.py:188: in _submit_shared
+    executor = _get_shared_executor()
+               ^^^^^^^^^^^^^^^^^^^^^^
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/async_workers.py:499: in _get_shared_executor
+    _assert_recovery_registered()
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/async_workers.py:103: in _assert_recovery_registered
+    raise AuditIntegrityError("Shared executor recovery callback absent")
+E   elspeth.contracts.errors.AuditIntegrityError: Shared executor recovery callback absent
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:54:45 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+_ test_refused_provider_recovery_retains_exact_private_control_and_physical_binding[True-braced-True] _
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1_refusal_old_oracle.py:112: in test_refused_provider_recovery_retains_exact_private_control_and_physical_binding
+    session = await service.create_session("alice", "Private recovery audit", "local")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/sessions/service.py:2481: in create_session
+    await self._run_sync(
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/sessions/service.py:1030: in _run_sync
+    return await run_sync_in_worker(func, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/async_workers.py:649: in run_sync_in_worker
+    concurrent_future = await _submit_shared(functools.partial(func, *args, **kwargs))
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/async_workers.py:188: in _submit_shared
+    executor = _get_shared_executor()
+               ^^^^^^^^^^^^^^^^^^^^^^
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/async_workers.py:499: in _get_shared_executor
+    _assert_recovery_registered()
+../../lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/async_workers.py:103: in _assert_recovery_registered
+    raise AuditIntegrityError("Shared executor recovery callback absent")
+E   elspeth.contracts.errors.AuditIntegrityError: Shared executor recovery callback absent
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:54:45 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+=========================== short test summary info ============================
+FAILED ../../lanes/composer-remediation-wave1/park-identity-evidence/fix1_refusal_old_oracle.py::test_refused_provider_recovery_retains_exact_private_control_and_physical_binding[False-braced-False]
+FAILED ../../lanes/composer-remediation-wave1/park-identity-evidence/fix1_refusal_old_oracle.py::test_refused_provider_recovery_retains_exact_private_control_and_physical_binding[False-braced-True]
+FAILED ../../lanes/composer-remediation-wave1/park-identity-evidence/fix1_refusal_old_oracle.py::test_refused_provider_recovery_retains_exact_private_control_and_physical_binding[True-braced-False]
+FAILED ../../lanes/composer-remediation-wave1/park-identity-evidence/fix1_refusal_old_oracle.py::test_refused_provider_recovery_retains_exact_private_control_and_physical_binding[True-braced-True]
+4 failed, 24 deselected in 8.76s

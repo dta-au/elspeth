@@ -1,0 +1,593 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 14 items
+
+tests/unit/web/composer/test_audit_cohort_settlement.py .......FFFFFFF   [100%]
+
+=================================== FAILURES ===================================
+_ test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index[equal-control] _
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f0e3e89b590>
+result_session_id = '2845a1f0-6aef-4bd9-befe-6e0e1ab7af14'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f0e3eafcf80>
+fail_at = None, equal = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fail_at", [None, 0, 1, 2, 3, 4, 5], ids=["control", "index0", "index1", "index2", "index3", "index4", "index5"])
+    @pytest.mark.parametrize("equal", [False, True], ids=["changed", "equal"])
+    async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        monkeypatch: pytest.MonkeyPatch,
+        fail_at: int | None,
+        equal: bool,
+    ) -> None:
+        """``_stage_pipeline_plan``: a failure at any cohort row leaves zero rows AND no proposal."""
+        service = composer_service_with_real_sessions
+        sessions_service = service._sessions_service  # type: ignore[attr-defined]
+        user_message_id = await _seed_user_message(sessions_service, result_session_id)
+        injector = _InsertInjector(sessions_service, fail_at)
+        injector.install(monkeypatch)
+        preflight = AsyncMock(spec=service._preflight.cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
+    
+        async def _stage() -> Any:
+            async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
+                return await service._planning_application._stage_pipeline_plan(
+                    session_operation_context=compose_context,
+                    plan=_plan(equal=equal),
+                    state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+                    session_id=UUID(result_session_id),
+                    current_state_id=None,
+                    user_message_id=user_message_id,
+                    user_id="phase3-test-user",
+                    preferences=_FakePreferences(trust_mode="explicit_approve"),
+                    recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
+                    planner_llm_calls=(),
+                    planner_private_candidates=(),
+                    planner_attempts=(),
+                    planner_invocations=_PLANNER_COHORT,
+                    planner_withheld_replies=(),
+                    plugin_snapshot=None,
+                )
+    
+        with patch.object(service._preflight, "cached_runtime_preflight", preflight):
+            if fail_at is None:
+                result = await _stage()
+                assert result.message
+                rows = _chat_rows(sessions_service, result_session_id)
+>               assert _invocation_occurrences(rows) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
+E               AssertionError: assert {} == {'call_planne...planner_2': 1}
+E                 
+E                 Right contains 3 more items:
+E                 {'call_planner_0': 1, 'call_planner_1': 1, 'call_planner_2': 1}
+E                 Use -v to get more diff
+
+tests/unit/web/composer/test_audit_cohort_settlement.py:475: AssertionError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 14:11:30 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 14:11:30 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 14:11:30 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index[equal-index0] _
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f0e3e89bce0>
+result_session_id = '1fc89a26-9fb6-43bf-b9db-37a33fa3ef62'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f0e3e81a4e0>
+fail_at = 0, equal = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fail_at", [None, 0, 1, 2, 3, 4, 5], ids=["control", "index0", "index1", "index2", "index3", "index4", "index5"])
+    @pytest.mark.parametrize("equal", [False, True], ids=["changed", "equal"])
+    async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        monkeypatch: pytest.MonkeyPatch,
+        fail_at: int | None,
+        equal: bool,
+    ) -> None:
+        """``_stage_pipeline_plan``: a failure at any cohort row leaves zero rows AND no proposal."""
+        service = composer_service_with_real_sessions
+        sessions_service = service._sessions_service  # type: ignore[attr-defined]
+        user_message_id = await _seed_user_message(sessions_service, result_session_id)
+        injector = _InsertInjector(sessions_service, fail_at)
+        injector.install(monkeypatch)
+        preflight = AsyncMock(spec=service._preflight.cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
+    
+        async def _stage() -> Any:
+            async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
+                return await service._planning_application._stage_pipeline_plan(
+                    session_operation_context=compose_context,
+                    plan=_plan(equal=equal),
+                    state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+                    session_id=UUID(result_session_id),
+                    current_state_id=None,
+                    user_message_id=user_message_id,
+                    user_id="phase3-test-user",
+                    preferences=_FakePreferences(trust_mode="explicit_approve"),
+                    recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
+                    planner_llm_calls=(),
+                    planner_private_candidates=(),
+                    planner_attempts=(),
+                    planner_invocations=_PLANNER_COHORT,
+                    planner_withheld_replies=(),
+                    plugin_snapshot=None,
+                )
+    
+        with patch.object(service._preflight, "cached_runtime_preflight", preflight):
+            if fail_at is None:
+                result = await _stage()
+                assert result.message
+                rows = _chat_rows(sessions_service, result_session_id)
+                assert _invocation_occurrences(rows) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
+                assert _proposal_count(sessions_service, result_session_id) == (0 if equal else 1)
+                assert injector.calls == 2 * len(_PLANNER_COHORT)
+                if equal:
+                    preflight.assert_not_awaited()
+                    assert result.state.version == 1
+                    assert result.raw_assistant_content == ""
+                    assert result.runtime_preflight is None and result.pipeline_commit_intent is None
+                    assert result.tool_invocations == () and result.llm_calls == ()
+                    from elspeth.web.sessions.routes._helpers import _composer_history_content, composer_turn_end_assistant_row
+    
+                    draft = composer_turn_end_assistant_row(result)
+                    assert draft.content == result.message and draft.raw_content == ""
+                    async with acquire_compose_context(sessions_service, result_session_id) as context:
+                        stored = await sessions_service.add_message(
+                            UUID(result_session_id),
+                            "assistant",
+                            draft.content,
+                            raw_content=draft.raw_content,
+                            writer_principal="compose_loop",
+                            session_operation_context=context,
+                        )
+                    assert stored.content == result.message and stored.raw_content == ""
+                    assert _composer_history_content(stored) == ""
+                return
+    
+>           with pytest.raises(AuditIntegrityError, match="pipeline planner audit persistence failed before proposal creation"):
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           Failed: DID NOT RAISE <class 'elspeth.contracts.errors.AuditIntegrityError'>
+
+tests/unit/web/composer/test_audit_cohort_settlement.py:501: Failed
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 14:11:31 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 14:11:31 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 14:11:31 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index[equal-index1] _
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f0e3e4b08f0>
+result_session_id = 'ba397caf-9e4c-4e23-972d-2ed687c2193e'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f0e3e81a6f0>
+fail_at = 1, equal = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fail_at", [None, 0, 1, 2, 3, 4, 5], ids=["control", "index0", "index1", "index2", "index3", "index4", "index5"])
+    @pytest.mark.parametrize("equal", [False, True], ids=["changed", "equal"])
+    async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        monkeypatch: pytest.MonkeyPatch,
+        fail_at: int | None,
+        equal: bool,
+    ) -> None:
+        """``_stage_pipeline_plan``: a failure at any cohort row leaves zero rows AND no proposal."""
+        service = composer_service_with_real_sessions
+        sessions_service = service._sessions_service  # type: ignore[attr-defined]
+        user_message_id = await _seed_user_message(sessions_service, result_session_id)
+        injector = _InsertInjector(sessions_service, fail_at)
+        injector.install(monkeypatch)
+        preflight = AsyncMock(spec=service._preflight.cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
+    
+        async def _stage() -> Any:
+            async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
+                return await service._planning_application._stage_pipeline_plan(
+                    session_operation_context=compose_context,
+                    plan=_plan(equal=equal),
+                    state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+                    session_id=UUID(result_session_id),
+                    current_state_id=None,
+                    user_message_id=user_message_id,
+                    user_id="phase3-test-user",
+                    preferences=_FakePreferences(trust_mode="explicit_approve"),
+                    recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
+                    planner_llm_calls=(),
+                    planner_private_candidates=(),
+                    planner_attempts=(),
+                    planner_invocations=_PLANNER_COHORT,
+                    planner_withheld_replies=(),
+                    plugin_snapshot=None,
+                )
+    
+        with patch.object(service._preflight, "cached_runtime_preflight", preflight):
+            if fail_at is None:
+                result = await _stage()
+                assert result.message
+                rows = _chat_rows(sessions_service, result_session_id)
+                assert _invocation_occurrences(rows) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
+                assert _proposal_count(sessions_service, result_session_id) == (0 if equal else 1)
+                assert injector.calls == 2 * len(_PLANNER_COHORT)
+                if equal:
+                    preflight.assert_not_awaited()
+                    assert result.state.version == 1
+                    assert result.raw_assistant_content == ""
+                    assert result.runtime_preflight is None and result.pipeline_commit_intent is None
+                    assert result.tool_invocations == () and result.llm_calls == ()
+                    from elspeth.web.sessions.routes._helpers import _composer_history_content, composer_turn_end_assistant_row
+    
+                    draft = composer_turn_end_assistant_row(result)
+                    assert draft.content == result.message and draft.raw_content == ""
+                    async with acquire_compose_context(sessions_service, result_session_id) as context:
+                        stored = await sessions_service.add_message(
+                            UUID(result_session_id),
+                            "assistant",
+                            draft.content,
+                            raw_content=draft.raw_content,
+                            writer_principal="compose_loop",
+                            session_operation_context=context,
+                        )
+                    assert stored.content == result.message and stored.raw_content == ""
+                    assert _composer_history_content(stored) == ""
+                return
+    
+>           with pytest.raises(AuditIntegrityError, match="pipeline planner audit persistence failed before proposal creation"):
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           Failed: DID NOT RAISE <class 'elspeth.contracts.errors.AuditIntegrityError'>
+
+tests/unit/web/composer/test_audit_cohort_settlement.py:501: Failed
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 14:11:31 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 14:11:31 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 14:11:31 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index[equal-index2] _
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f0e3ec0aff0>
+result_session_id = '724868f0-2f56-4791-bb1a-e7dbd75ed976'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f0e3e6bc0e0>
+fail_at = 2, equal = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fail_at", [None, 0, 1, 2, 3, 4, 5], ids=["control", "index0", "index1", "index2", "index3", "index4", "index5"])
+    @pytest.mark.parametrize("equal", [False, True], ids=["changed", "equal"])
+    async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        monkeypatch: pytest.MonkeyPatch,
+        fail_at: int | None,
+        equal: bool,
+    ) -> None:
+        """``_stage_pipeline_plan``: a failure at any cohort row leaves zero rows AND no proposal."""
+        service = composer_service_with_real_sessions
+        sessions_service = service._sessions_service  # type: ignore[attr-defined]
+        user_message_id = await _seed_user_message(sessions_service, result_session_id)
+        injector = _InsertInjector(sessions_service, fail_at)
+        injector.install(monkeypatch)
+        preflight = AsyncMock(spec=service._preflight.cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
+    
+        async def _stage() -> Any:
+            async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
+                return await service._planning_application._stage_pipeline_plan(
+                    session_operation_context=compose_context,
+                    plan=_plan(equal=equal),
+                    state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+                    session_id=UUID(result_session_id),
+                    current_state_id=None,
+                    user_message_id=user_message_id,
+                    user_id="phase3-test-user",
+                    preferences=_FakePreferences(trust_mode="explicit_approve"),
+                    recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
+                    planner_llm_calls=(),
+                    planner_private_candidates=(),
+                    planner_attempts=(),
+                    planner_invocations=_PLANNER_COHORT,
+                    planner_withheld_replies=(),
+                    plugin_snapshot=None,
+                )
+    
+        with patch.object(service._preflight, "cached_runtime_preflight", preflight):
+            if fail_at is None:
+                result = await _stage()
+                assert result.message
+                rows = _chat_rows(sessions_service, result_session_id)
+                assert _invocation_occurrences(rows) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
+                assert _proposal_count(sessions_service, result_session_id) == (0 if equal else 1)
+                assert injector.calls == 2 * len(_PLANNER_COHORT)
+                if equal:
+                    preflight.assert_not_awaited()
+                    assert result.state.version == 1
+                    assert result.raw_assistant_content == ""
+                    assert result.runtime_preflight is None and result.pipeline_commit_intent is None
+                    assert result.tool_invocations == () and result.llm_calls == ()
+                    from elspeth.web.sessions.routes._helpers import _composer_history_content, composer_turn_end_assistant_row
+    
+                    draft = composer_turn_end_assistant_row(result)
+                    assert draft.content == result.message and draft.raw_content == ""
+                    async with acquire_compose_context(sessions_service, result_session_id) as context:
+                        stored = await sessions_service.add_message(
+                            UUID(result_session_id),
+                            "assistant",
+                            draft.content,
+                            raw_content=draft.raw_content,
+                            writer_principal="compose_loop",
+                            session_operation_context=context,
+                        )
+                    assert stored.content == result.message and stored.raw_content == ""
+                    assert _composer_history_content(stored) == ""
+                return
+    
+>           with pytest.raises(AuditIntegrityError, match="pipeline planner audit persistence failed before proposal creation"):
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           Failed: DID NOT RAISE <class 'elspeth.contracts.errors.AuditIntegrityError'>
+
+tests/unit/web/composer/test_audit_cohort_settlement.py:501: Failed
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 14:11:31 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 14:11:31 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 14:11:31 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index[equal-index3] _
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f0e3e499040>
+result_session_id = '93e1ae17-fd7a-4a72-a633-a9b81d556b59'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f0e3e4c06b0>
+fail_at = 3, equal = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fail_at", [None, 0, 1, 2, 3, 4, 5], ids=["control", "index0", "index1", "index2", "index3", "index4", "index5"])
+    @pytest.mark.parametrize("equal", [False, True], ids=["changed", "equal"])
+    async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        monkeypatch: pytest.MonkeyPatch,
+        fail_at: int | None,
+        equal: bool,
+    ) -> None:
+        """``_stage_pipeline_plan``: a failure at any cohort row leaves zero rows AND no proposal."""
+        service = composer_service_with_real_sessions
+        sessions_service = service._sessions_service  # type: ignore[attr-defined]
+        user_message_id = await _seed_user_message(sessions_service, result_session_id)
+        injector = _InsertInjector(sessions_service, fail_at)
+        injector.install(monkeypatch)
+        preflight = AsyncMock(spec=service._preflight.cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
+    
+        async def _stage() -> Any:
+            async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
+                return await service._planning_application._stage_pipeline_plan(
+                    session_operation_context=compose_context,
+                    plan=_plan(equal=equal),
+                    state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+                    session_id=UUID(result_session_id),
+                    current_state_id=None,
+                    user_message_id=user_message_id,
+                    user_id="phase3-test-user",
+                    preferences=_FakePreferences(trust_mode="explicit_approve"),
+                    recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
+                    planner_llm_calls=(),
+                    planner_private_candidates=(),
+                    planner_attempts=(),
+                    planner_invocations=_PLANNER_COHORT,
+                    planner_withheld_replies=(),
+                    plugin_snapshot=None,
+                )
+    
+        with patch.object(service._preflight, "cached_runtime_preflight", preflight):
+            if fail_at is None:
+                result = await _stage()
+                assert result.message
+                rows = _chat_rows(sessions_service, result_session_id)
+                assert _invocation_occurrences(rows) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
+                assert _proposal_count(sessions_service, result_session_id) == (0 if equal else 1)
+                assert injector.calls == 2 * len(_PLANNER_COHORT)
+                if equal:
+                    preflight.assert_not_awaited()
+                    assert result.state.version == 1
+                    assert result.raw_assistant_content == ""
+                    assert result.runtime_preflight is None and result.pipeline_commit_intent is None
+                    assert result.tool_invocations == () and result.llm_calls == ()
+                    from elspeth.web.sessions.routes._helpers import _composer_history_content, composer_turn_end_assistant_row
+    
+                    draft = composer_turn_end_assistant_row(result)
+                    assert draft.content == result.message and draft.raw_content == ""
+                    async with acquire_compose_context(sessions_service, result_session_id) as context:
+                        stored = await sessions_service.add_message(
+                            UUID(result_session_id),
+                            "assistant",
+                            draft.content,
+                            raw_content=draft.raw_content,
+                            writer_principal="compose_loop",
+                            session_operation_context=context,
+                        )
+                    assert stored.content == result.message and stored.raw_content == ""
+                    assert _composer_history_content(stored) == ""
+                return
+    
+>           with pytest.raises(AuditIntegrityError, match="pipeline planner audit persistence failed before proposal creation"):
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           Failed: DID NOT RAISE <class 'elspeth.contracts.errors.AuditIntegrityError'>
+
+tests/unit/web/composer/test_audit_cohort_settlement.py:501: Failed
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 14:11:31 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 14:11:31 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 14:11:31 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index[equal-index4] _
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f0e3e6b2300>
+result_session_id = 'b8add1cb-c5fb-499d-9761-7a61a508ce89'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f0e3e5460f0>
+fail_at = 4, equal = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fail_at", [None, 0, 1, 2, 3, 4, 5], ids=["control", "index0", "index1", "index2", "index3", "index4", "index5"])
+    @pytest.mark.parametrize("equal", [False, True], ids=["changed", "equal"])
+    async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        monkeypatch: pytest.MonkeyPatch,
+        fail_at: int | None,
+        equal: bool,
+    ) -> None:
+        """``_stage_pipeline_plan``: a failure at any cohort row leaves zero rows AND no proposal."""
+        service = composer_service_with_real_sessions
+        sessions_service = service._sessions_service  # type: ignore[attr-defined]
+        user_message_id = await _seed_user_message(sessions_service, result_session_id)
+        injector = _InsertInjector(sessions_service, fail_at)
+        injector.install(monkeypatch)
+        preflight = AsyncMock(spec=service._preflight.cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
+    
+        async def _stage() -> Any:
+            async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
+                return await service._planning_application._stage_pipeline_plan(
+                    session_operation_context=compose_context,
+                    plan=_plan(equal=equal),
+                    state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+                    session_id=UUID(result_session_id),
+                    current_state_id=None,
+                    user_message_id=user_message_id,
+                    user_id="phase3-test-user",
+                    preferences=_FakePreferences(trust_mode="explicit_approve"),
+                    recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
+                    planner_llm_calls=(),
+                    planner_private_candidates=(),
+                    planner_attempts=(),
+                    planner_invocations=_PLANNER_COHORT,
+                    planner_withheld_replies=(),
+                    plugin_snapshot=None,
+                )
+    
+        with patch.object(service._preflight, "cached_runtime_preflight", preflight):
+            if fail_at is None:
+                result = await _stage()
+                assert result.message
+                rows = _chat_rows(sessions_service, result_session_id)
+                assert _invocation_occurrences(rows) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
+                assert _proposal_count(sessions_service, result_session_id) == (0 if equal else 1)
+                assert injector.calls == 2 * len(_PLANNER_COHORT)
+                if equal:
+                    preflight.assert_not_awaited()
+                    assert result.state.version == 1
+                    assert result.raw_assistant_content == ""
+                    assert result.runtime_preflight is None and result.pipeline_commit_intent is None
+                    assert result.tool_invocations == () and result.llm_calls == ()
+                    from elspeth.web.sessions.routes._helpers import _composer_history_content, composer_turn_end_assistant_row
+    
+                    draft = composer_turn_end_assistant_row(result)
+                    assert draft.content == result.message and draft.raw_content == ""
+                    async with acquire_compose_context(sessions_service, result_session_id) as context:
+                        stored = await sessions_service.add_message(
+                            UUID(result_session_id),
+                            "assistant",
+                            draft.content,
+                            raw_content=draft.raw_content,
+                            writer_principal="compose_loop",
+                            session_operation_context=context,
+                        )
+                    assert stored.content == result.message and stored.raw_content == ""
+                    assert _composer_history_content(stored) == ""
+                return
+    
+>           with pytest.raises(AuditIntegrityError, match="pipeline planner audit persistence failed before proposal creation"):
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           Failed: DID NOT RAISE <class 'elspeth.contracts.errors.AuditIntegrityError'>
+
+tests/unit/web/composer/test_audit_cohort_settlement.py:501: Failed
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 14:11:32 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 14:11:32 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 14:11:32 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index[equal-index5] _
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f0e3e89b4d0>
+result_session_id = '5e129dbc-0c6b-46c9-b3a8-8916375057da'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f0e3e3de780>
+fail_at = 5, equal = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fail_at", [None, 0, 1, 2, 3, 4, 5], ids=["control", "index0", "index1", "index2", "index3", "index4", "index5"])
+    @pytest.mark.parametrize("equal", [False, True], ids=["changed", "equal"])
+    async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        monkeypatch: pytest.MonkeyPatch,
+        fail_at: int | None,
+        equal: bool,
+    ) -> None:
+        """``_stage_pipeline_plan``: a failure at any cohort row leaves zero rows AND no proposal."""
+        service = composer_service_with_real_sessions
+        sessions_service = service._sessions_service  # type: ignore[attr-defined]
+        user_message_id = await _seed_user_message(sessions_service, result_session_id)
+        injector = _InsertInjector(sessions_service, fail_at)
+        injector.install(monkeypatch)
+        preflight = AsyncMock(spec=service._preflight.cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
+    
+        async def _stage() -> Any:
+            async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
+                return await service._planning_application._stage_pipeline_plan(
+                    session_operation_context=compose_context,
+                    plan=_plan(equal=equal),
+                    state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+                    session_id=UUID(result_session_id),
+                    current_state_id=None,
+                    user_message_id=user_message_id,
+                    user_id="phase3-test-user",
+                    preferences=_FakePreferences(trust_mode="explicit_approve"),
+                    recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
+                    planner_llm_calls=(),
+                    planner_private_candidates=(),
+                    planner_attempts=(),
+                    planner_invocations=_PLANNER_COHORT,
+                    planner_withheld_replies=(),
+                    plugin_snapshot=None,
+                )
+    
+        with patch.object(service._preflight, "cached_runtime_preflight", preflight):
+            if fail_at is None:
+                result = await _stage()
+                assert result.message
+                rows = _chat_rows(sessions_service, result_session_id)
+                assert _invocation_occurrences(rows) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
+                assert _proposal_count(sessions_service, result_session_id) == (0 if equal else 1)
+                assert injector.calls == 2 * len(_PLANNER_COHORT)
+                if equal:
+                    preflight.assert_not_awaited()
+                    assert result.state.version == 1
+                    assert result.raw_assistant_content == ""
+                    assert result.runtime_preflight is None and result.pipeline_commit_intent is None
+                    assert result.tool_invocations == () and result.llm_calls == ()
+                    from elspeth.web.sessions.routes._helpers import _composer_history_content, composer_turn_end_assistant_row
+    
+                    draft = composer_turn_end_assistant_row(result)
+                    assert draft.content == result.message and draft.raw_content == ""
+                    async with acquire_compose_context(sessions_service, result_session_id) as context:
+                        stored = await sessions_service.add_message(
+                            UUID(result_session_id),
+                            "assistant",
+                            draft.content,
+                            raw_content=draft.raw_content,
+                            writer_principal="compose_loop",
+                            session_operation_context=context,
+                        )
+                    assert stored.content == result.message and stored.raw_content == ""
+                    assert _composer_history_content(stored) == ""
+                return
+    
+>           with pytest.raises(AuditIntegrityError, match="pipeline planner audit persistence failed before proposal creation"):
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           Failed: DID NOT RAISE <class 'elspeth.contracts.errors.AuditIntegrityError'>
+
+tests/unit/web/composer/test_audit_cohort_settlement.py:501: Failed
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 14:11:32 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 14:11:32 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 14:11:32 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_audit_cohort_settlement.py::test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index[equal-control]
+FAILED tests/unit/web/composer/test_audit_cohort_settlement.py::test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index[equal-index0]
+FAILED tests/unit/web/composer/test_audit_cohort_settlement.py::test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index[equal-index1]
+FAILED tests/unit/web/composer/test_audit_cohort_settlement.py::test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index[equal-index2]
+FAILED tests/unit/web/composer/test_audit_cohort_settlement.py::test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index[equal-index3]
+FAILED tests/unit/web/composer/test_audit_cohort_settlement.py::test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index[equal-index4]
+FAILED tests/unit/web/composer/test_audit_cohort_settlement.py::test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index[equal-index5]
+========================= 7 failed, 7 passed in 6.39s ==========================

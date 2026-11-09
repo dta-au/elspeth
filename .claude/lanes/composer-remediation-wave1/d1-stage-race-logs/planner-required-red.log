@@ -1,0 +1,171 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 1 item
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py F             [100%]
+
+=================================== FAILURES ===================================
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes0-True] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-116/test_actual_planner_resource_r0/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7f5fc506e900>, UUID('ceda270e-586f-4414-91d8-666af82fa4b5'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-116/test_actual_planner_resource_r0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5fc508f590>
+required = True, trust_modes = ('explicit_approve', 'explicit_approve')
+cancel_creation = False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [False, True])
+    @pytest.mark.parametrize("trust_modes", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")])
+    @pytest.mark.parametrize("cancel_creation", [False, True])
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness, _valid_pipeline_args
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+        planner._sessions_service_optional = service
+        blob = await BlobServiceImpl(engine, tmp_path).create_blob(
+            sid, "input.csv", b"value\n1\n", "text/csv", session_operation_context=running.session_operation_context
+        )
+        pipeline = _valid_pipeline_args(tmp_path)
+        pipeline["source"]["blob_id"] = str(blob.id)
+        proposal = PipelineProposal.create(pipeline=pipeline, base=expected.authority.proposal.base, repair_count=0, skill_hash="a" * 64)
+        plan = PipelinePlanResult(proposal=proposal, tool_call_id="raced-planner", custody_result="not_required",
+                                  model_identifier="model", model_version="version", provider="test")
+        # The same authority passed admission; the resource changes only afterward.
+        from elspeth.web.sessions.proposal_blob_refs import validate_proposal_blob_references
+    
+        with engine.begin() as conn:
+            validate_proposal_blob_references(conn, session_id=str(sid), tool_name="set_pipeline", arguments=pipeline)
+            conn.execute(update(blobs_table).where(blobs_table.c.id == str(blob.id)).values(status="pending"))
+            conn.execute(update(sessions_table).where(sessions_table.c.id == str(sid)).values(trust_mode=trust_modes[1]))
+        preferences = replace(await service.get_composer_preferences(sid), trust_mode=trust_modes[0])
+        parent = RequiredWorkCoordinator(RequiredWorkAuthority(RequiredAuthorityKind.DURABLE_COMPOSE,
+            running.session_operation_context, running.claim.operation_id, running.claim.attempt))
+        binding = RequiredWorkBinding(parent, 7, 12, RequiredWorkRole.TURN, running) if required else None
+        entered, release = threading.Event(), threading.Event()
+        deliveries = []
+        actual_shield = asyncio.shield
+    
+        async def observe_shield(awaitable):
+            try:
+                return await actual_shield(awaitable)
+            except asyncio.CancelledError as delivery:
+                deliveries.append(delivery)
+                raise
+    
+        def park_validator(_conn, _cursor, statement, _parameters, _context, _many):
+            if statement.startswith("SELECT blobs.session_id, blobs.status"):
+                entered.set()
+                assert release.wait(5)
+    
+        monkeypatch.setattr(asyncio, "shield", observe_shield)
+        event.listen(engine, "before_cursor_execute", park_validator)
+        state = _initial_composition_state()
+        task = asyncio.create_task(planner._stage_pipeline_plan(
+            plan=plan, state=state, session_id=sid, current_state_id=None, user_message_id=expected.authority.row.user_message_id,
+            user_id="alice", session_operation_context=running.session_operation_context, preferences=preferences,
+            recorder=BufferingRecorder(), planner_llm_calls=(), planner_private_candidates=(), planner_attempts=(),
+            planner_invocations=(), planner_withheld_replies=(), required_work=binding,
+        ))
+        try:
+            async with asyncio.timeout(5):
+                while not entered.is_set():
+                    if task.done():
+                        await task
+                    await asyncio.sleep(0.01)
+            if cancel_creation:
+                task.cancel("original failed creation cancellation")
+                async with asyncio.timeout(5):
+                    while not deliveries:
+                        await asyncio.sleep(0)
+                assert not task.done()
+            release.set()
+            if cancel_creation:
+                with pytest.raises(BaseException) as caught:
+                    await task
+                leaves = originals(caught.value)
+                assert any(leaf is deliveries[0] for leaf in leaves)
+                if not required:
+                    assert caught.value is deliveries[0]
+                    assert type(caught.value.__cause__).__name__ == "ProposalResourceUnavailableError"
+            else:
+>               result = await task
+                         ^^^^^^^^^^
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:544: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/composer/planning_application.py:794: in _stage_pipeline_plan
+    raise original_outcome_group(
+src/elspeth/web/async_workers.py:424: in run_required_sql_finish_once
+    value = future.result()
+            ^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+src/elspeth/web/required_work.py:578: in observe_actual_outcome
+    self._result = self._future.result()
+                   ^^^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/required_executor.py:119: in invoke
+    return callable_()
+           ^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3349: in _sync
+    return transaction.composer.create_pipeline_composition_proposal(
+src/elspeth/web/sessions/mutation_capabilities.py:217: in create_pipeline_composition_proposal
+    validate_proposal_blob_references(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+conn = <sqlalchemy.engine.base.Connection object at 0x7f5fc3c4c4d0>
+
+    def validate_proposal_blob_references(
+        conn: Connection,
+        *,
+        session_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> None:
+        """Require every authoritative proposal blob to be owned and ready."""
+        for blob_id in proposal_blob_reference_ids(tool_name, arguments):
+            row = conn.execute(select(blobs_table.c.session_id, blobs_table.c.status).where(blobs_table.c.id == blob_id)).first()
+            if row is None:
+                raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
+            if row.session_id != session_id:
+                raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
+            if type(row.status) is not str or row.status not in BLOB_STATUSES:
+                raise AuditIntegrityError("Tier 1: owned proposal blob has invalid persisted status")
+            if row.status != "ready":
+>               raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
+E               elspeth.web.sessions.proposal_blob_refs.ProposalResourceUnavailableError: I couldn't prepare this proposal because a referenced file is no longer available for this session. Please choose the file again and retry.
+
+src/elspeth/web/sessions/proposal_blob_refs.py:191: ProposalResourceUnavailableError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:16:11 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:16:11 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:16:11 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+=========================== short test summary info ============================
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes0-True]
+============================== 1 failed in 5.06s ===============================

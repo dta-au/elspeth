@@ -1,0 +1,1810 @@
+diff --git a/config/cicd/soft-mapping-census.yaml b/config/cicd/soft-mapping-census.yaml
+index a6498ebd0..de176a41d 100644
+--- a/config/cicd/soft-mapping-census.yaml
++++ b/config/cicd/soft-mapping-census.yaml
+@@ -92,6 +92,8 @@ files:
+     dict[str, Any]: 18
+   src/elspeth/contracts/preflight.py:
+     Mapping[str, Any]: 1
++  src/elspeth/contracts/process_watchdog_wire.py:
++    dict[str, object]: 2
+   src/elspeth/contracts/prompt_guard.py:
+     Mapping[str, Any]: 5
+     dict[str, Any]: 3
+@@ -1026,8 +1028,6 @@ files:
+     dict[str, object]: 3
+   src/elspeth/web/preferences/service.py:
+     dict[str, object]: 2
+-  src/elspeth/web/process_watchdog_codec.py:
+-    dict[str, object]: 2
+   src/elspeth/web/provider_config_policy.py:
+     Mapping[str, Any]: 4
+   src/elspeth/web/readiness.py:
+diff --git a/src/elspeth/web/process_watchdog.py b/src/elspeth/web/process_watchdog.py
+index 5ce1535a2..3dcb01ff6 100644
+--- a/src/elspeth/web/process_watchdog.py
++++ b/src/elspeth/web/process_watchdog.py
+@@ -14,11 +14,12 @@ import threading
+ import time
+ from abc import ABC, abstractmethod
+ from collections.abc import Callable
+-from dataclasses import dataclass
+ from pathlib import Path
+-from typing import final
+ 
+-from elspeth.web.process_watchdog_codec import (
++from elspeth.contracts.process_watchdog_wire import (
++    BootstrapCompletionWitness as BootstrapCompletionWitness,
++)
++from elspeth.contracts.process_watchdog_wire import (
+     FrameKind,
+     FrameReader,
+     RecoveryReason,
+@@ -26,6 +27,15 @@ from elspeth.web.process_watchdog_codec import (
+     WatchdogProtocolError,
+     encode_frame,
+ )
++from elspeth.contracts.process_watchdog_wire import (
++    GraceAcknowledgement as GraceAcknowledgement,
++)
++from elspeth.contracts.process_watchdog_wire import (
++    ProcessCompletionWitness as ProcessCompletionWitness,
++)
++from elspeth.contracts.process_watchdog_wire import (
++    ProcessWatchdogTarget as ProcessWatchdogTarget,
++)
+ 
+ WEB_PROCESS_RECOVERY_GRACE_SECONDS = 30.0
+ 
+@@ -34,37 +44,6 @@ class ProcessWatchdogFailure(RuntimeError):
+     """Required private process supervision failed."""
+ 
+ 
+-@final
+-@dataclass(frozen=True, slots=True)
+-class ProcessWatchdogTarget:
+-    pid: int
+-    nonce: str
+-
+-
+-@final
+-@dataclass(frozen=True, slots=True)
+-class GraceAcknowledgement:
+-    target: ProcessWatchdogTarget
+-    armed_at_ns: int
+-    deadline_ns: int
+-
+-
+-@final
+-@dataclass(frozen=True, slots=True)
+-class ProcessCompletionWitness:
+-    """Owned lifecycle creates this only after all joins and engine finalization."""
+-
+-    target: ProcessWatchdogTarget
+-
+-
+-@final
+-@dataclass(frozen=True, slots=True)
+-class BootstrapCompletionWitness:
+-    """Owned factory creates this only while no construction effects entered."""
+-
+-    target: ProcessWatchdogTarget
+-
+-
+ class ProcessWatchdogControl(ABC):
+     @property
+     @abstractmethod
+diff --git a/src/elspeth/web/process_watchdog_codec.py b/src/elspeth/web/process_watchdog_codec.py
+index c97e8e314..f39ee261f 100644
+--- a/src/elspeth/web/process_watchdog_codec.py
++++ b/src/elspeth/web/process_watchdog_codec.py
+@@ -1,165 +1,32 @@
+-"""Stdlib-only, bounded private watchdog wire admission."""
+-
+-from __future__ import annotations
+-
+-import hmac
+-import json
+-from dataclasses import dataclass
+-from enum import Enum
+-
+-GRACE_NS = 30_000_000_000
+-FRAME_LIMIT = 1024
+-FRAME_COUNT_LIMIT = 8
+-
+-
+-class WatchdogProtocolError(Exception):
+-    """A private frame failed the closed protocol."""
+-
+-
+-class RecoveryReason(Enum):
+-    REQUIRED_GENERATION_UNRESOLVED = "REQUIRED_GENERATION_UNRESOLVED"
+-    REQUIRED_WORKER_LOST = "REQUIRED_WORKER_LOST"
+-    NORMAL_SHUTDOWN = "NORMAL_SHUTDOWN"
+-    FAILED_STARTUP = "FAILED_STARTUP"
+-    WATCHDOG_CHANNEL_FAILURE = "WATCHDOG_CHANNEL_FAILURE"
+-
+-
+-class FrameKind(Enum):
+-    HELLO = "HELLO"
+-    WATCHING_ACK = "WATCHING_ACK"
+-    BEGIN_RECOVERY = "BEGIN_RECOVERY"
+-    GRACE_ACK = "GRACE_ACK"
+-    COMPLETE = "COMPLETE"
+-    DISARM_ACK = "DISARM_ACK"
+-
+-
+-@dataclass(frozen=True, slots=True)
+-class WatchdogFrame:
+-    kind: FrameKind
+-    nonce: str
+-    target_pid: int
+-    reason: RecoveryReason | None = None
+-    armed_at_ns: int | None = None
+-    deadline_ns: int | None = None
+-
+-    def __post_init__(self) -> None:
+-        if (
+-            type(self.kind) is not FrameKind
+-            or type(self.nonce) is not str
+-            or len(self.nonce) != 64
+-            or any(c not in "0123456789abcdef" for c in self.nonce)
+-        ):
+-            raise WatchdogProtocolError("Invalid watchdog frame identity")
+-        if type(self.target_pid) is not int or self.target_pid < 1:
+-            raise WatchdogProtocolError("Invalid watchdog target")
+-        if (self.kind is FrameKind.BEGIN_RECOVERY) != (type(self.reason) is RecoveryReason):
+-            raise WatchdogProtocolError("Invalid watchdog reason")
+-        if self.kind is FrameKind.GRACE_ACK:
+-            if (
+-                type(self.armed_at_ns) is not int
+-                or type(self.deadline_ns) is not int
+-                or self.armed_at_ns < 1
+-                or self.deadline_ns - self.armed_at_ns != GRACE_NS
+-            ):
+-                raise WatchdogProtocolError("Invalid watchdog clock receipt")
+-        elif self.armed_at_ns is not None or self.deadline_ns is not None:
+-            raise WatchdogProtocolError("Unexpected watchdog clock")
+-
+-    def validate_target(self, *, nonce: str, target_pid: int) -> None:
+-        if not hmac.compare_digest(self.nonce, nonce) or self.target_pid != target_pid:
+-            raise WatchdogProtocolError("Watchdog authority mismatch")
+-
+-
+-def _reject_number(value: str) -> object:
+-    raise WatchdogProtocolError("Noninteger watchdog value")
+-
+-
+-def _unique_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+-    result: dict[str, object] = {}
+-    for key, value in pairs:
+-        if key in result:
+-            raise WatchdogProtocolError("Duplicate watchdog field")
+-        result[key] = value
+-    return result
+-
+-
+-def decode_frame(payload: bytes) -> WatchdogFrame:
+-    try:
+-        value: object = json.loads(
+-            payload.decode("utf-8"), object_pairs_hook=_unique_pairs, parse_float=_reject_number, parse_constant=_reject_number
+-        )
+-        if not isinstance(value, dict):
+-            raise WatchdogProtocolError("Watchdog frame must be one object")
+-        if type(value["v"]) is not int or value["v"] != 1 or type(value["kind"]) is not str:
+-            raise WatchdogProtocolError("Unknown watchdog frame version")
+-        kind = FrameKind(value["kind"])
+-        expected = {"v", "kind", "nonce", "target_pid"}
+-        if kind in (FrameKind.HELLO, FrameKind.WATCHING_ACK):
+-            expected.add("grace_ns")
+-        elif kind is FrameKind.BEGIN_RECOVERY:
+-            expected.add("reason")
+-        elif kind is FrameKind.GRACE_ACK:
+-            expected.update(("grace_ns", "armed_at_ns", "deadline_ns"))
+-        else:
+-            expected.add("completion_seq")
+-        if set(value) != expected or any(type(field) not in (str, int) for field in value.values()):
+-            raise WatchdogProtocolError("Watchdog frame fields disagree with schema")
+-        if "grace_ns" in value and (type(value["grace_ns"]) is not int or value["grace_ns"] != GRACE_NS):
+-            raise WatchdogProtocolError("Watchdog grace disagreement")
+-        if "completion_seq" in value and (type(value["completion_seq"]) is not int or value["completion_seq"] != 1):
+-            raise WatchdogProtocolError("Watchdog completion sequence disagreement")
+-        return WatchdogFrame(
+-            kind,
+-            value["nonce"],
+-            value["target_pid"],
+-            RecoveryReason(value["reason"]) if kind is FrameKind.BEGIN_RECOVERY else None,
+-            value["armed_at_ns"] if kind is FrameKind.GRACE_ACK else None,
+-            value["deadline_ns"] if kind is FrameKind.GRACE_ACK else None,
+-        )
+-    except (KeyError, TypeError, ValueError, UnicodeError) as error:
+-        raise WatchdogProtocolError("Invalid watchdog frame") from error
+-
+-
+-def encode_frame(frame: WatchdogFrame) -> bytes:
+-    fields: dict[str, str | int] = {"v": 1, "kind": frame.kind.value, "nonce": frame.nonce, "target_pid": frame.target_pid}
+-    if frame.kind in (FrameKind.HELLO, FrameKind.WATCHING_ACK, FrameKind.GRACE_ACK):
+-        fields["grace_ns"] = GRACE_NS
+-    if frame.reason is not None:
+-        fields["reason"] = frame.reason.value
+-    if frame.kind is FrameKind.GRACE_ACK:
+-        assert frame.armed_at_ns is not None and frame.deadline_ns is not None
+-        fields.update(armed_at_ns=frame.armed_at_ns, deadline_ns=frame.deadline_ns)
+-    if frame.kind in (FrameKind.COMPLETE, FrameKind.DISARM_ACK):
+-        fields["completion_seq"] = 1
+-    payload = json.dumps(fields, separators=(",", ":"), allow_nan=False).encode("utf-8")
+-    if not 1 <= len(payload) <= FRAME_LIMIT:
+-        raise WatchdogProtocolError("Watchdog payload length refused")
+-    return len(payload).to_bytes(4, "big") + payload
+-
+-
+-class FrameReader:
+-    def __init__(self) -> None:
+-        self._buffer = bytearray()
+-        self._count = 0
+-
+-    def feed(self, data: bytes) -> tuple[WatchdogFrame, ...]:
+-        if len(self._buffer) + len(data) > FRAME_LIMIT + 8:
+-            raise WatchdogProtocolError("Watchdog receive buffer exceeded")
+-        self._buffer.extend(data)
+-        frames: list[WatchdogFrame] = []
+-        while len(self._buffer) >= 4:
+-            length = int.from_bytes(self._buffer[:4], "big")
+-            if not 1 <= length <= FRAME_LIMIT:
+-                raise WatchdogProtocolError("Watchdog frame length refused")
+-            if len(self._buffer) < length + 4:
+-                break
+-            self._count += 1
+-            if self._count > FRAME_COUNT_LIMIT:
+-                raise WatchdogProtocolError("Watchdog frame count exceeded")
+-            frames.append(decode_frame(bytes(self._buffer[4 : 4 + length])))
+-            del self._buffer[: 4 + length]
+-        return tuple(frames)
+-
+-    @property
+-    def read_capacity(self) -> int:
+-        return FRAME_LIMIT + 4 - len(self._buffer)
++"""Compatibility exports for the shared, stdlib-only watchdog wire contract."""
++
++from elspeth.contracts.process_watchdog_wire import (
++    FRAME_COUNT_LIMIT as FRAME_COUNT_LIMIT,
++)
++from elspeth.contracts.process_watchdog_wire import (
++    FRAME_LIMIT as FRAME_LIMIT,
++)
++from elspeth.contracts.process_watchdog_wire import (
++    GRACE_NS as GRACE_NS,
++)
++from elspeth.contracts.process_watchdog_wire import (
++    FrameKind as FrameKind,
++)
++from elspeth.contracts.process_watchdog_wire import (
++    FrameReader as FrameReader,
++)
++from elspeth.contracts.process_watchdog_wire import (
++    RecoveryReason as RecoveryReason,
++)
++from elspeth.contracts.process_watchdog_wire import (
++    WatchdogFrame as WatchdogFrame,
++)
++from elspeth.contracts.process_watchdog_wire import (
++    WatchdogProtocolError as WatchdogProtocolError,
++)
++from elspeth.contracts.process_watchdog_wire import (
++    decode_frame as decode_frame,
++)
++from elspeth.contracts.process_watchdog_wire import (
++    encode_frame as encode_frame,
++)
+diff --git a/src/elspeth/web/process_watchdog_helper.py b/src/elspeth/web/process_watchdog_helper.py
+index 3a9ffad04..0a395eea9 100644
+--- a/src/elspeth/web/process_watchdog_helper.py
++++ b/src/elspeth/web/process_watchdog_helper.py
+@@ -8,12 +8,14 @@ import signal
+ import socket
+ import sys
+ import time
++from pathlib import Path
+ from typing import TYPE_CHECKING
+ 
+ if TYPE_CHECKING:
+-    from elspeth.web.process_watchdog_codec import GRACE_NS, FrameKind, FrameReader, WatchdogFrame, WatchdogProtocolError, encode_frame
++    from elspeth.contracts.process_watchdog_wire import GRACE_NS, FrameKind, FrameReader, WatchdogFrame, WatchdogProtocolError, encode_frame
+ else:
+-    from process_watchdog_codec import GRACE_NS, FrameKind, FrameReader, WatchdogFrame, WatchdogProtocolError, encode_frame
++    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "contracts"))
++    from process_watchdog_wire import GRACE_NS, FrameKind, FrameReader, WatchdogFrame, WatchdogProtocolError, encode_frame
+ 
+ 
+ def _verify_pidfd(pidfd: int, reflected_pid: int) -> None:
+diff --git a/src/elspeth/composer_mcp/portable_bootstrap.py b/src/elspeth/composer_mcp/portable_bootstrap.py
+new file mode 100644
+index 000000000..565032ac4
+--- /dev/null
++++ b/src/elspeth/composer_mcp/portable_bootstrap.py
+@@ -0,0 +1,104 @@
++"""Consume private bootstrap authority before importing application runtime."""
++
++from __future__ import annotations
++
++import os
++import selectors
++import socket
++import time
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from elspeth.contracts.process_watchdog_wire import ProcessWatchdogTarget, WatchdogFrame
++
++PORT_ENV = "_ELSPETH_COMPOSER_CONTROL_PORT"
++NONCE_ENV = "_ELSPETH_COMPOSER_CONTROL_NONCE"
++_BOOTSTRAP_AUTHORITY = object()
++
++
++class AuthenticatedSupervisor:
++    """Single-use connection receipt issued only after WATCHING_ACK."""
++
++    def __init__(self, channel: socket.socket, target: ProcessWatchdogTarget, authority: object) -> None:
++        if authority is not _BOOTSTRAP_AUTHORITY:
++            raise RuntimeError("Composer connection receipt requires authenticated bootstrap")
++        self._channel = channel
++        self._target = target
++        self._claimed = False
++
++    def claim(self) -> tuple[socket.socket, ProcessWatchdogTarget]:
++        if self._claimed:
++            raise RuntimeError("Composer connection receipt already claimed")
++        self._claimed = True
++        return self._channel, self._target
++
++
++def exchange_sync(channel: socket.socket, frame: WatchdogFrame) -> WatchdogFrame:
++    from elspeth.contracts.process_watchdog_wire import FrameReader, WatchdogProtocolError, encode_frame
++
++    reader = FrameReader()
++    outgoing = memoryview(encode_frame(frame))
++    deadline = time.monotonic() + 1.0
++    with selectors.DefaultSelector() as selector:
++        selector.register(channel, selectors.EVENT_READ | selectors.EVENT_WRITE)
++        while True:
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise WatchdogProtocolError("Private Composer exchange timed out")
++            for _, events in selector.select(remaining):
++                if events & selectors.EVENT_WRITE and outgoing:
++                    try:
++                        count = channel.send(outgoing)
++                    except BlockingIOError:
++                        count = 0
++                    outgoing = outgoing[count:]
++                    if not outgoing:
++                        selector.modify(channel, selectors.EVENT_READ)
++                if events & selectors.EVENT_READ:
++                    try:
++                        data = channel.recv(reader.read_capacity)
++                    except BlockingIOError:
++                        continue
++                    if not data:
++                        raise WatchdogProtocolError("Private Composer channel closed")
++                    frames = reader.feed(data)
++                    if frames:
++                        if len(frames) != 1 or outgoing:
++                            raise WatchdogProtocolError("Unexpected Composer bootstrap frame")
++                        reply = frames[0]
++                        reply.validate_target(nonce=frame.nonce, target_pid=frame.target_pid)
++                        return reply
++
++
++def connect_supervisor() -> AuthenticatedSupervisor:
++    # Pop both even on malformed/missing bootstrap. No runtime/plugin imports
++    # or nested subprocess may inherit this launch's private nonce.
++    port_text = os.environ.pop(PORT_ENV, None)
++    nonce = os.environ.pop(NONCE_ENV, None)
++    from elspeth.contracts.process_watchdog_wire import FrameKind, ProcessWatchdogTarget, WatchdogFrame, WatchdogProtocolError
++
++    if port_text is None or nonce is None or len(port_text) > 5 or not port_text.isascii() or not port_text.isdecimal():
++        raise WatchdogProtocolError("Private Composer bootstrap is required")
++    port = int(port_text)
++    if not 1 <= port <= 65535:
++        raise WatchdogProtocolError("Private Composer bootstrap port refused")
++    target = ProcessWatchdogTarget(os.getpid(), nonce)
++    hello = WatchdogFrame(FrameKind.HELLO, nonce, target.pid)
++    channel = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++    channel.setblocking(False)
++    deadline = time.monotonic() + 1.0
++    try:
++        # Nonblocking connect is observed through the socket selector only.
++        error = channel.connect_ex(("127.0.0.1", port))
++        if error:
++            with selectors.DefaultSelector() as selector:
++                selector.register(channel, selectors.EVENT_WRITE)
++                if not selector.select(max(0.0, deadline - time.monotonic())) or channel.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR):
++                    raise WatchdogProtocolError("Private Composer supervisor connection failed")
++        reply = exchange_sync(channel, hello)
++        if reply.kind is not FrameKind.WATCHING_ACK:
++            raise WatchdogProtocolError("Private Composer ownership acknowledgement refused")
++        return AuthenticatedSupervisor(channel, target, _BOOTSTRAP_AUTHORITY)
++    except BaseException:
++        channel.close()
++        raise
+diff --git a/src/elspeth/composer_mcp/portable_control.py b/src/elspeth/composer_mcp/portable_control.py
+new file mode 100644
+index 000000000..6a766113f
+--- /dev/null
++++ b/src/elspeth/composer_mcp/portable_control.py
+@@ -0,0 +1,182 @@
++"""Authenticated child endpoint implementing the real recovery owner contract."""
++
++from __future__ import annotations
++
++import asyncio
++import os
++import threading
++
++from elspeth.composer_mcp.portable_bootstrap import AuthenticatedSupervisor, exchange_sync
++from elspeth.contracts.process_watchdog_wire import (
++    BootstrapCompletionWitness,
++    FrameKind,
++    FrameReader,
++    GraceAcknowledgement,
++    ProcessCompletionWitness,
++    ProcessWatchdogTarget,
++    RecoveryReason,
++    WatchdogFrame,
++    WatchdogProtocolError,
++    encode_frame,
++)
++from elspeth.web.process_watchdog import ProcessWatchdogControl, ProcessWatchdogFailure
++
++
++class PortableProcessWatchdog(ProcessWatchdogControl):
++    """One root task, one socket reader and one retained exchange per phase.
++
++    Construct only with connect_supervisor's authenticated channel. Bind the
++    actual serving root before worker admission; bootstrap completion is then
++    permanently unavailable. A witness is a nominal lifecycle assertion, not
++    an introspection substitute for the caller's required joins.
++    """
++
++    def __init__(self, connection: AuthenticatedSupervisor, instance_draining: threading.Event) -> None:
++        if type(connection) is not AuthenticatedSupervisor:
++            raise ProcessWatchdogFailure("Composer endpoint requires authenticated bootstrap")
++        channel, target = connection.claim()
++        if type(target) is not ProcessWatchdogTarget or target.pid != os.getpid():
++            channel.close()
++            raise ProcessWatchdogFailure("Composer endpoint target mismatch")
++        self._channel = channel
++        self._target = target
++        self._draining = instance_draining
++        self._root: asyncio.Task[None] | None = None
++        self._reader: asyncio.Task[None] | None = None
++        self._pending: asyncio.Future[WatchdogFrame] | None = None
++        self._expected: FrameKind | None = None
++        self._exchange_lock = asyncio.Lock()
++        self._recovery: asyncio.Task[GraceAcknowledgement] | None = None
++        self._completion: asyncio.Task[None] | None = None
++        self._disarmed = False
++        self._graceful_requested = False
++
++    @property
++    def target(self) -> ProcessWatchdogTarget:
++        return self._target
++
++    def bind_root_task(self, root: asyncio.Task[None]) -> None:
++        if self._root is not None or self._disarmed or root.done() or root.get_loop() is not asyncio.get_running_loop():
++            raise ProcessWatchdogFailure("Composer serving root already bound or unavailable")
++        self._root = root
++        self._reader = asyncio.create_task(self._read_frames(), name="composer-control-reader")
++
++    def assert_watching(self) -> None:
++        if self._disarmed or self._root is None or self._reader is None or self._reader.done():
++            raise ProcessWatchdogFailure("Required Composer supervision is not active")
++
++    async def _read_frames(self) -> None:
++        reader = FrameReader()
++        loop = asyncio.get_running_loop()
++        try:
++            while True:
++                data = await loop.sock_recv(self._channel, reader.read_capacity)
++                if not data:
++                    raise ProcessWatchdogFailure("Private Composer supervisor channel closed")
++                for frame in reader.feed(data):
++                    frame.validate_target(nonce=self.target.nonce, target_pid=self.target.pid)
++                    if frame.kind is FrameKind.SHUTDOWN_REQUEST:
++                        self.request_graceful_termination()
++                    elif self._pending is not None and not self._pending.done() and frame.kind is self._expected:
++                        self._pending.set_result(frame)
++                        if frame.kind is FrameKind.DISARM_ACK:
++                            self._disarmed = True
++                            return
++                    else:
++                        raise WatchdogProtocolError("Unexpected Composer control reply")
++        except (OSError, WatchdogProtocolError, ProcessWatchdogFailure) as error:
++            failure = ProcessWatchdogFailure("Private Composer supervisor channel failed")
++            if self._pending is not None and not self._pending.done():
++                self._pending.set_exception(failure)
++            raise failure from error
++        finally:
++            self._channel.close()
++
++    async def _request(self, frame: WatchdogFrame, expected: FrameKind) -> WatchdogFrame:
++        async with self._exchange_lock:
++            self.assert_watching()
++            self._pending = asyncio.get_running_loop().create_future()
++            self._expected = expected
++            try:
++                async with asyncio.timeout(1.0):
++                    await asyncio.get_running_loop().sock_sendall(self._channel, encode_frame(frame))
++                    return await self._pending
++            except (OSError, TimeoutError) as error:
++                self._channel.close()
++                raise ProcessWatchdogFailure("Private Composer exchange failed") from error
++            finally:
++                self._pending = None
++                self._expected = None
++
++    async def _begin_recovery(self, reason: RecoveryReason) -> GraceAcknowledgement:
++        frame = await self._request(
++            WatchdogFrame(FrameKind.BEGIN_RECOVERY, self.target.nonce, self.target.pid, reason), FrameKind.GRACE_ACK
++        )
++        assert frame.armed_at_ns is not None and frame.deadline_ns is not None
++        return GraceAcknowledgement(self.target, frame.armed_at_ns, frame.deadline_ns)
++
++    async def begin_recovery(self, reason: RecoveryReason) -> GraceAcknowledgement:
++        self._draining.set()
++        if self._recovery is None:
++            self.assert_watching()
++            self._recovery = asyncio.create_task(self._begin_recovery(reason), name="composer-recovery-exchange")
++        # Cancellation never transfers reader ownership or discards a late ACK.
++        return await asyncio.shield(self._recovery)
++
++    async def _complete(self) -> None:
++        if self._recovery is not None:
++            await asyncio.shield(self._recovery)
++        await self._request(WatchdogFrame(FrameKind.COMPLETE, self.target.nonce, self.target.pid), FrameKind.DISARM_ACK)
++        assert self._reader is not None
++        await asyncio.shield(self._reader)
++
++    async def complete(self, witness: ProcessCompletionWitness) -> None:
++        if type(witness) is not ProcessCompletionWitness or witness.target != self.target:
++            raise ProcessWatchdogFailure("Composer completion witness mismatch")
++        if self._completion is None:
++            self.assert_watching()
++            self._completion = asyncio.create_task(self._complete(), name="composer-completion-exchange")
++        await asyncio.shield(self._completion)
++
++    def complete_bootstrap(self, witness: BootstrapCompletionWitness) -> None:
++        if type(witness) is not BootstrapCompletionWitness or witness.target != self.target or self._root is not None or self._disarmed:
++            raise ProcessWatchdogFailure("Composer bootstrap completion witness or phase mismatch")
++        try:
++            reply = exchange_sync(self._channel, WatchdogFrame(FrameKind.COMPLETE, self.target.nonce, self.target.pid))
++            if reply.kind is not FrameKind.DISARM_ACK:
++                raise ProcessWatchdogFailure("Composer bootstrap completion refused")
++            self._disarmed = True
++        finally:
++            self._channel.close()
++
++    def abort_bootstrap(self, reason: RecoveryReason, witness: BootstrapCompletionWitness | None = None) -> None:
++        if reason is not RecoveryReason.FAILED_STARTUP or self._root is not None:
++            raise ProcessWatchdogFailure("Composer bootstrap abort phase mismatch")
++        if witness is not None:
++            self.complete_bootstrap(witness)
++            return
++        self._draining.set()
++        try:
++            reply = exchange_sync(self._channel, WatchdogFrame(FrameKind.BEGIN_RECOVERY, self.target.nonce, self.target.pid, reason))
++            if reply.kind is not FrameKind.GRACE_ACK:
++                raise ProcessWatchdogFailure("Composer bootstrap recovery refused")
++        except BaseException:
++            self.force_termination()
++            raise
++
++    async def observe_helper_outcome(self) -> None:
++        self.assert_watching()
++        assert self._reader is not None
++        await asyncio.shield(self._reader)
++
++    def request_graceful_termination(self) -> None:
++        if self._root is None:
++            raise ProcessWatchdogFailure("Composer serving root is not bound")
++        self._draining.set()
++        if not self._graceful_requested:
++            self._graceful_requested = True
++            self._root.cancel("Composer process shutdown")
++
++    def force_termination(self) -> None:
++        # Self-only authority; independent parent still enforces a stuck loop.
++        os._exit(70)
+diff --git a/src/elspeth/composer_mcp/portable_supervisor.py b/src/elspeth/composer_mcp/portable_supervisor.py
+new file mode 100644
+index 000000000..b0f4a0c47
+--- /dev/null
++++ b/src/elspeth/composer_mcp/portable_supervisor.py
+@@ -0,0 +1,278 @@
++"""Private, dedicated Popen lifetime owner. Requires IPv4 loopback binding.
++
++Execute this file directly to keep the supervisor stdlib-only. It must not be
++embedded in a host with competing child reapers. Stdio belongs directly to the
++runner; this owner never reads stdin or writes stdout. There is no public entry
++point until the Composer lifespan is integrated.
++"""
++
++from __future__ import annotations
++
++import os
++import secrets
++import selectors
++import signal
++import socket
++import subprocess
++import sys
++import time
++from collections.abc import Callable, Sequence
++from pathlib import Path
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING or __package__:
++    from elspeth.contracts.process_watchdog_wire import GRACE_NS, FrameKind, FrameReader, WatchdogFrame, WatchdogProtocolError, encode_frame
++else:
++    # The contract file itself has only stdlib dependencies. Importing the
++    # contracts package would execute its eager application re-exports.
++    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "contracts"))
++    from process_watchdog_wire import GRACE_NS, FrameKind, FrameReader, WatchdogFrame, WatchdogProtocolError, encode_frame
++
++STARTUP_NS = 2_000_000_000
++EXIT_NS = 2_000_000_000
++POLL_SECONDS = 0.02
++PEER_LIMIT = 8
++PORT_ENV = "_ELSPETH_COMPOSER_CONTROL_PORT"
++NONCE_ENV = "_ELSPETH_COMPOSER_CONTROL_NONCE"
++_CREATE_NEW_PROCESS_GROUP = 0x00000200  # Win32 CREATE_NEW_PROCESS_GROUP
++
++
++def _launch_child(command: Sequence[str], environment: dict[str, str], *, windows: bool) -> subprocess.Popen[bytes]:
++    return subprocess.Popen(
++        command,
++        env=environment,
++        close_fds=True,
++        creationflags=_CREATE_NEW_PROCESS_GROUP if windows else 0,
++        start_new_session=not windows,
++    )
++
++
++class SupervisorFailure(RuntimeError):
++    """The owned child could not be terminated/reaped truthfully."""
++
++
++class _Supervisor:
++    """Single-threaded owner. The clock seam is private subprocess-test support."""
++
++    def __init__(self, command: Sequence[str], *, _clock_ns: Callable[[], int] = time.monotonic_ns) -> None:
++        self.command = command
++        self.clock = _clock_ns
++        self.child: subprocess.Popen[bytes] | None = None
++        self.stop_requested = False
++        self.armed_at: int | None = None
++        self.deadline: int | None = None
++        self.failed = False
++        self.completed = False
++
++    def _stop(self, signum: int, frame: object) -> None:
++        # No socket, signal or wait operations in a signal handler.
++        self.stop_requested = True
++
++    def _arm(self) -> None:
++        if self.armed_at is None:
++            self.armed_at = self.clock()
++            recovery_deadline = self.armed_at + GRACE_NS
++            self.deadline = min(self.deadline, recovery_deadline) if self.deadline is not None else recovery_deadline
++
++    def _kill_and_reap(self) -> int:
++        assert self.child is not None
++        # This loop is the exclusive poll/signal/reap authority. Never signal
++        # after observed exit; on Windows Popen.kill uses the retained handle.
++        status = self.child.poll()
++        if status is not None:
++            return status
++        try:
++            self.child.kill()
++            return self.child.wait(timeout=1.0)
++        except (OSError, subprocess.TimeoutExpired) as error:
++            raise SupervisorFailure("Owned Composer child termination/reap failed") from error
++
++    def run(self) -> int:
++        previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
++        previous_chld = None
++        if os.name != "nt":
++            previous_chld = signal.getsignal(signal.SIGCHLD)
++            # Inherited SIG_IGN can discard wait status and lose PID custody.
++            signal.signal(signal.SIGCHLD, signal.SIG_DFL)
++        for sig in previous:
++            signal.signal(sig, self._stop)
++        try:
++            return self._run_owned()
++        finally:
++            for sig, handler in previous.items():
++                signal.signal(sig, handler)
++            if os.name != "nt":
++                signal.signal(signal.SIGCHLD, previous_chld)
++
++    def _run_owned(self) -> int:
++        nonce = secrets.token_hex(32)
++        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener, selectors.DefaultSelector() as selector:
++            listener.bind(("127.0.0.1", 0))
++            listener.listen(PEER_LIMIT)
++            listener.setblocking(False)
++            selector.register(listener, selectors.EVENT_READ)
++            environment = os.environ.copy()
++            environment[PORT_ENV] = str(listener.getsockname()[1])
++            environment[NONCE_ENV] = nonce
++            # No received identity ever influences this process reference.
++            self.child = _launch_child(self.command, environment, windows=os.name == "nt")
++            environment.pop(NONCE_ENV)
++            peers: dict[socket.socket, FrameReader] = {}
++            control: socket.socket | None = None
++            outgoing = bytearray()
++            attempts = 0
++            startup_deadline = self.clock() + STARTUP_NS
++            shutdown_sent = False
++            listener_open = True
++
++            def close_peer(peer: socket.socket) -> None:
++                selector.unregister(peer)
++                peer.close()
++                del peers[peer]
++
++            def fail_channel() -> None:
++                nonlocal control
++                self.failed = True
++                self._arm()
++                if control is not None:
++                    close_peer(control)
++                    control = None
++                outgoing.clear()
++
++            def queue(frame: WatchdogFrame) -> None:
++                assert control is not None
++                outgoing.extend(encode_frame(frame))
++                if len(outgoing) > 1028:
++                    raise WatchdogProtocolError("Supervisor outgoing buffer exceeded")
++                selector.modify(control, selectors.EVENT_READ | selectors.EVENT_WRITE)
++
++            try:
++                while True:
++                    status = self.child.poll()
++                    if status is not None:
++                        return status if status != 0 else 0 if self.completed and not self.failed else 2
++                    now = self.clock()
++                    if control is None and not self.completed and listener_open and now >= startup_deadline:
++                        self.failed = True
++                        return self._kill_and_reap() or 2
++                    if self.deadline is not None and now >= self.deadline:
++                        self.failed = True
++                        return self._kill_and_reap() or 2
++                    if self.stop_requested:
++                        self._arm()
++                        if control is not None and not shutdown_sent and not self.completed:
++                            try:
++                                queue(WatchdogFrame(FrameKind.SHUTDOWN_REQUEST, nonce, self.child.pid))
++                                shutdown_sent = True
++                            except (OSError, WatchdogProtocolError):
++                                fail_channel()
++                    nearest = self.deadline
++                    if listener_open:
++                        nearest = min(nearest, startup_deadline) if nearest is not None else startup_deadline
++                    timeout = POLL_SECONDS if nearest is None else min(POLL_SECONDS, max(0.0, (nearest - now) / 1e9))
++                    for key, events in selector.select(timeout):
++                        if key.fileobj is listener:
++                            try:
++                                accepted, _ = listener.accept()
++                            except BlockingIOError:
++                                continue
++                            attempts += 1
++                            if attempts > PEER_LIMIT:
++                                accepted.close()
++                                continue
++                            accepted.setblocking(False)
++                            peers[accepted] = FrameReader()
++                            selector.register(accepted, selectors.EVENT_READ)
++                            continue
++                        peer = key.fileobj
++                        assert isinstance(peer, socket.socket)
++                        if peer not in peers:
++                            continue
++                        try:
++                            if events & selectors.EVENT_WRITE and outgoing and peer is control:
++                                try:
++                                    sent = peer.send(outgoing)
++                                except BlockingIOError:
++                                    sent = 0
++                                del outgoing[:sent]
++                                if not outgoing:
++                                    selector.modify(peer, selectors.EVENT_READ)
++                            if events & selectors.EVENT_READ:
++                                try:
++                                    raw = peer.recv(peers[peer].read_capacity)
++                                except BlockingIOError:
++                                    continue
++                                if not raw:
++                                    if peer is control and self.completed:
++                                        close_peer(peer)
++                                        control = None
++                                        continue
++                                    raise WatchdogProtocolError("Supervisor channel closed")
++                                for frame in peers[peer].feed(raw):
++                                    frame.validate_target(nonce=nonce, target_pid=self.child.pid)
++                                    if control is None and listener_open:
++                                        if frame.kind is not FrameKind.HELLO:
++                                            raise WatchdogProtocolError("Supervisor requires HELLO")
++                                        control = peer
++                                        selector.unregister(listener)
++                                        listener.close()
++                                        listener_open = False
++                                        for other in tuple(peers):
++                                            if other is not peer:
++                                                close_peer(other)
++                                        queue(WatchdogFrame(FrameKind.WATCHING_ACK, nonce, self.child.pid))
++                                    elif peer is not control or self.completed:
++                                        raise WatchdogProtocolError("Unexpected supervisor frame")
++                                    elif frame.kind is FrameKind.BEGIN_RECOVERY:
++                                        self._arm()
++                                        queue(
++                                            WatchdogFrame(
++                                                FrameKind.GRACE_ACK,
++                                                nonce,
++                                                self.child.pid,
++                                                armed_at_ns=self.armed_at,
++                                                deadline_ns=self.deadline,
++                                            )
++                                        )
++                                    elif frame.kind is FrameKind.COMPLETE:
++                                        self.completed = True
++                                        exit_deadline = self.clock() + EXIT_NS
++                                        self.deadline = min(self.deadline, exit_deadline) if self.deadline is not None else exit_deadline
++                                        queue(WatchdogFrame(FrameKind.DISARM_ACK, nonce, self.child.pid))
++                                    else:
++                                        raise WatchdogProtocolError("Wrong supervisor frame direction")
++                        except (OSError, WatchdogProtocolError):
++                            if peer is control:
++                                fail_channel()
++                            elif peer in peers:
++                                close_peer(peer)
++            except BaseException:
++                self._kill_and_reap()
++                raise
++            finally:
++                for peer in tuple(peers):
++                    close_peer(peer)
++
++
++def main() -> int:
++    if len(sys.argv) < 2:
++        sys.stderr.write("Private Composer supervisor requires an owned runner command\n")
++        return 2
++    try:
++        return _Supervisor(sys.argv[1:]).run()
++    except (OSError, SupervisorFailure):
++        sys.stderr.write("Private Composer supervisor startup or process custody failed\n")
++        return 2
++
++
++if __name__ == "__main__":
++    result = main()
++    if result < 0 and os.name != "nt":
++        # Custody ended in main: the child has already been reaped. Reflect its
++        # actual signal status to stdio clients observing this launcher Popen.
++        terminated_by = -result
++        if terminated_by != signal.SIGKILL:
++            signal.signal(terminated_by, signal.SIG_DFL)
++        signal.pthread_sigmask(signal.SIG_UNBLOCK, {terminated_by})
++        os.kill(os.getpid(), terminated_by)
++    raise SystemExit(128 - result if result < 0 else result)
+diff --git a/src/elspeth/contracts/process_watchdog_wire.py b/src/elspeth/contracts/process_watchdog_wire.py
+new file mode 100644
+index 000000000..761c45333
+--- /dev/null
++++ b/src/elspeth/contracts/process_watchdog_wire.py
+@@ -0,0 +1,198 @@
++"""Stdlib-only, bounded private watchdog wire admission."""
++
++from __future__ import annotations
++
++import hmac
++import json
++from dataclasses import dataclass
++from enum import Enum
++from typing import final
++
++GRACE_NS = 30_000_000_000
++FRAME_LIMIT = 1024
++FRAME_COUNT_LIMIT = 8
++
++
++class WatchdogProtocolError(Exception):
++    """A private frame failed the closed protocol."""
++
++
++class RecoveryReason(Enum):
++    REQUIRED_GENERATION_UNRESOLVED = "REQUIRED_GENERATION_UNRESOLVED"
++    REQUIRED_WORKER_LOST = "REQUIRED_WORKER_LOST"
++    NORMAL_SHUTDOWN = "NORMAL_SHUTDOWN"
++    FAILED_STARTUP = "FAILED_STARTUP"
++    WATCHDOG_CHANNEL_FAILURE = "WATCHDOG_CHANNEL_FAILURE"
++
++
++class FrameKind(Enum):
++    HELLO = "HELLO"
++    WATCHING_ACK = "WATCHING_ACK"
++    BEGIN_RECOVERY = "BEGIN_RECOVERY"
++    GRACE_ACK = "GRACE_ACK"
++    COMPLETE = "COMPLETE"
++    DISARM_ACK = "DISARM_ACK"
++    SHUTDOWN_REQUEST = "SHUTDOWN_REQUEST"
++
++
++@dataclass(frozen=True, slots=True)
++class WatchdogFrame:
++    kind: FrameKind
++    nonce: str
++    target_pid: int
++    reason: RecoveryReason | None = None
++    armed_at_ns: int | None = None
++    deadline_ns: int | None = None
++
++    def __post_init__(self) -> None:
++        if (
++            type(self.kind) is not FrameKind
++            or type(self.nonce) is not str
++            or len(self.nonce) != 64
++            or any(c not in "0123456789abcdef" for c in self.nonce)
++        ):
++            raise WatchdogProtocolError("Invalid watchdog frame identity")
++        if type(self.target_pid) is not int or self.target_pid < 1:
++            raise WatchdogProtocolError("Invalid watchdog target")
++        if (self.kind is FrameKind.BEGIN_RECOVERY) != (type(self.reason) is RecoveryReason):
++            raise WatchdogProtocolError("Invalid watchdog reason")
++        if self.kind is FrameKind.GRACE_ACK:
++            if (
++                type(self.armed_at_ns) is not int
++                or type(self.deadline_ns) is not int
++                or self.armed_at_ns < 1
++                or self.deadline_ns - self.armed_at_ns != GRACE_NS
++            ):
++                raise WatchdogProtocolError("Invalid watchdog clock receipt")
++        elif self.armed_at_ns is not None or self.deadline_ns is not None:
++            raise WatchdogProtocolError("Unexpected watchdog clock")
++
++    def validate_target(self, *, nonce: str, target_pid: int) -> None:
++        if not hmac.compare_digest(self.nonce, nonce) or self.target_pid != target_pid:
++            raise WatchdogProtocolError("Watchdog authority mismatch")
++
++
++@final
++@dataclass(frozen=True, slots=True)
++class ProcessWatchdogTarget:
++    pid: int
++    nonce: str
++
++
++@final
++@dataclass(frozen=True, slots=True)
++class GraceAcknowledgement:
++    target: ProcessWatchdogTarget
++    armed_at_ns: int
++    deadline_ns: int
++
++
++@final
++@dataclass(frozen=True, slots=True)
++class ProcessCompletionWitness:
++    """Owned lifecycle creates this only after all joins and engine finalization."""
++
++    target: ProcessWatchdogTarget
++
++
++@final
++@dataclass(frozen=True, slots=True)
++class BootstrapCompletionWitness:
++    """Owned factory creates this only while no construction effects entered."""
++
++    target: ProcessWatchdogTarget
++
++
++def _reject_number(value: str) -> object:
++    raise WatchdogProtocolError("Noninteger watchdog value")
++
++
++def _unique_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
++    result: dict[str, object] = {}
++    for key, value in pairs:
++        if key in result:
++            raise WatchdogProtocolError("Duplicate watchdog field")
++        result[key] = value
++    return result
++
++
++def decode_frame(payload: bytes) -> WatchdogFrame:
++    try:
++        value: object = json.loads(
++            payload.decode("utf-8"), object_pairs_hook=_unique_pairs, parse_float=_reject_number, parse_constant=_reject_number
++        )
++        if not isinstance(value, dict):
++            raise WatchdogProtocolError("Watchdog frame must be one object")
++        if type(value["v"]) is not int or value["v"] != 1 or type(value["kind"]) is not str:
++            raise WatchdogProtocolError("Unknown watchdog frame version")
++        kind = FrameKind(value["kind"])
++        expected = {"v", "kind", "nonce", "target_pid"}
++        if kind in (FrameKind.HELLO, FrameKind.WATCHING_ACK):
++            expected.add("grace_ns")
++        elif kind is FrameKind.BEGIN_RECOVERY:
++            expected.add("reason")
++        elif kind is FrameKind.GRACE_ACK:
++            expected.update(("grace_ns", "armed_at_ns", "deadline_ns"))
++        elif kind in (FrameKind.COMPLETE, FrameKind.DISARM_ACK):
++            expected.add("completion_seq")
++        if set(value) != expected or any(type(field) not in (str, int) for field in value.values()):
++            raise WatchdogProtocolError("Watchdog frame fields disagree with schema")
++        if "grace_ns" in value and (type(value["grace_ns"]) is not int or value["grace_ns"] != GRACE_NS):
++            raise WatchdogProtocolError("Watchdog grace disagreement")
++        if "completion_seq" in value and (type(value["completion_seq"]) is not int or value["completion_seq"] != 1):
++            raise WatchdogProtocolError("Watchdog completion sequence disagreement")
++        return WatchdogFrame(
++            kind,
++            value["nonce"],
++            value["target_pid"],
++            RecoveryReason(value["reason"]) if kind is FrameKind.BEGIN_RECOVERY else None,
++            value["armed_at_ns"] if kind is FrameKind.GRACE_ACK else None,
++            value["deadline_ns"] if kind is FrameKind.GRACE_ACK else None,
++        )
++    except (KeyError, TypeError, ValueError, UnicodeError) as error:
++        raise WatchdogProtocolError("Invalid watchdog frame") from error
++
++
++def encode_frame(frame: WatchdogFrame) -> bytes:
++    fields: dict[str, str | int] = {"v": 1, "kind": frame.kind.value, "nonce": frame.nonce, "target_pid": frame.target_pid}
++    if frame.kind in (FrameKind.HELLO, FrameKind.WATCHING_ACK, FrameKind.GRACE_ACK):
++        fields["grace_ns"] = GRACE_NS
++    if frame.reason is not None:
++        fields["reason"] = frame.reason.value
++    if frame.kind is FrameKind.GRACE_ACK:
++        assert frame.armed_at_ns is not None and frame.deadline_ns is not None
++        fields.update(armed_at_ns=frame.armed_at_ns, deadline_ns=frame.deadline_ns)
++    if frame.kind in (FrameKind.COMPLETE, FrameKind.DISARM_ACK):
++        fields["completion_seq"] = 1
++    payload = json.dumps(fields, separators=(",", ":"), allow_nan=False).encode("utf-8")
++    if not 1 <= len(payload) <= FRAME_LIMIT:
++        raise WatchdogProtocolError("Watchdog payload length refused")
++    return len(payload).to_bytes(4, "big") + payload
++
++
++class FrameReader:
++    def __init__(self) -> None:
++        self._buffer = bytearray()
++        self._count = 0
++
++    def feed(self, data: bytes) -> tuple[WatchdogFrame, ...]:
++        if len(self._buffer) + len(data) > FRAME_LIMIT + 8:
++            raise WatchdogProtocolError("Watchdog receive buffer exceeded")
++        self._buffer.extend(data)
++        frames: list[WatchdogFrame] = []
++        while len(self._buffer) >= 4:
++            length = int.from_bytes(self._buffer[:4], "big")
++            if not 1 <= length <= FRAME_LIMIT:
++                raise WatchdogProtocolError("Watchdog frame length refused")
++            if len(self._buffer) < length + 4:
++                break
++            self._count += 1
++            if self._count > FRAME_COUNT_LIMIT:
++                raise WatchdogProtocolError("Watchdog frame count exceeded")
++            frames.append(decode_frame(bytes(self._buffer[4 : 4 + length])))
++            del self._buffer[: 4 + length]
++        return tuple(frames)
++
++    @property
++    def read_capacity(self) -> int:
++        return FRAME_LIMIT + 4 - len(self._buffer)
+diff --git a/tests/helpers/portable_supervisor_probe.py b/tests/helpers/portable_supervisor_probe.py
+new file mode 100644
+index 000000000..cc28d1271
+--- /dev/null
++++ b/tests/helpers/portable_supervisor_probe.py
+@@ -0,0 +1,332 @@
++"""Isolated probes using production custody and recovery, never a test owner."""
++
++from __future__ import annotations
++
++import json
++import os
++import signal
++import sys
++import time
++from contextlib import suppress
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++def event(directory: Path, name: str) -> None:
++    (directory / name).write_text(str(os.getpid()))
++
++
++def supervise(directory: Path, mode: str, speed: int, ignored_chld: bool) -> int:
++    import runpy
++
++    namespace = runpy.run_path(str(ROOT / "src/elspeth/composer_mcp/portable_supervisor.py"))
++    phase_started = None
++
++    def clock():
++        nonlocal phase_started
++        now = time.monotonic_ns()
++        if owner.armed_at is not None:
++            return owner.armed_at + (now - owner.armed_at) * speed
++        if owner.completed:
++            if phase_started is None:
++                phase_started = now
++            return phase_started + (now - phase_started) * speed
++        return now
++
++    owner = namespace["_Supervisor"](
++        [sys.executable, str(Path(__file__)), "child", str(directory), mode],
++        _clock_ns=clock,
++    )
++    if ignored_chld:
++        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
++
++    def expired(signum: int, frame: object) -> None:
++        raise TimeoutError("Outer owned-process probe expired")
++
++    signal.signal(signal.SIGALRM, expired)
++    signal.alarm(45 if speed == 1 else 12)
++    try:
++        result = owner.run()
++        assert owner.child is not None
++        (directory / "supervisor.json").write_text(
++            json.dumps(
++                {
++                    "pid": owner.child.pid,
++                    "returncode": owner.child.returncode,
++                    "reaped": owner.child.poll() is not None,
++                    "failed": owner.failed,
++                    "completed": owner.completed,
++                    "result": result,
++                }
++            )
++        )
++        return 128 - result if result < 0 else result
++    finally:
++        signal.alarm(0)
++
++
++def raw_child(directory: Path, mode: str) -> int:
++    import socket
++
++    from elspeth.contracts.process_watchdog_wire import FrameKind, FrameReader, RecoveryReason, WatchdogFrame, encode_frame
++
++    port = int(os.environ.pop("_ELSPETH_COMPOSER_CONTROL_PORT"))
++    nonce = os.environ.pop("_ELSPETH_COMPOSER_CONTROL_NONCE")
++    if mode == "peer-flood":
++        held = []
++        for _ in range(12):
++            peer = socket.create_connection(("127.0.0.1", port), timeout=1)
++            peer.sendall(b"\x00")
++            held.append(peer)
++        while True:
++            time.sleep(1)
++    if mode == "no-handshake":
++        while True:
++            time.sleep(1)
++    channel = socket.create_connection(("127.0.0.1", port), timeout=1)
++    channel.settimeout(1)
++    reader = FrameReader()
++
++    def send(kind, *, identity_nonce=nonce, pid=None):
++        channel.sendall(
++            encode_frame(
++                WatchdogFrame(
++                    kind,
++                    identity_nonce,
++                    os.getpid() if pid is None else pid,
++                    RecoveryReason.NORMAL_SHUTDOWN if kind is FrameKind.BEGIN_RECOVERY else None,
++                )
++            )
++        )
++
++    def receive():
++        while True:
++            frames = reader.feed(channel.recv(reader.read_capacity))
++            if frames:
++                assert len(frames) == 1
++                return frames[0]
++
++    if mode == "wrong-nonce":
++        send(FrameKind.HELLO, identity_nonce="0" * 64)
++    elif mode == "wrong-pid":
++        send(FrameKind.HELLO, pid=os.getppid())
++    elif mode == "partial-hello":
++        channel.sendall(b"\x00\x00")
++    else:
++        extra = None
++        if mode == "extra-peer":
++            extra = socket.create_connection(("127.0.0.1", port), timeout=1)
++            extra.sendall(b"\x00")
++        send(FrameKind.HELLO)
++        assert receive().kind is FrameKind.WATCHING_ACK
++        event(directory, "authenticated")
++        if extra is not None:
++            with suppress(ConnectionResetError):
++                assert extra.recv(1) == b""
++            extra.close()
++        if mode == "wrong-direction":
++            send(FrameKind.SHUTDOWN_REQUEST)
++        elif mode == "reflected-pid":
++            send(FrameKind.BEGIN_RECOVERY, pid=os.getppid())
++        elif mode == "frame-flood":
++            for _ in range(9):
++                try:
++                    send(FrameKind.BEGIN_RECOVERY)
++                    receive()
++                except (OSError, AssertionError):
++                    break
++        elif mode in ("replay", "partial-flood"):
++            send(FrameKind.BEGIN_RECOVERY)
++            first = receive()
++            assert first.kind is FrameKind.GRACE_ACK
++            event(directory, "armed")
++            if mode == "replay":
++                time.sleep(0.08)
++                send(FrameKind.BEGIN_RECOVERY)
++                assert receive() == first
++                event(directory, "immutable")
++            else:
++                channel.sendall(b"\x00\x00\x03\xff")
++                while True:
++                    try:
++                        channel.sendall(b" ")
++                        time.sleep(0.025)
++                    except OSError:
++                        break
++        elif mode == "channel-loss":
++            channel.close()
++        elif mode in ("extra-peer", "raw-normal"):
++            send(FrameKind.COMPLETE)
++            assert receive().kind is FrameKind.DISARM_ACK
++            channel.close()
++            return 0
++    while True:
++        time.sleep(1)
++
++
++def child(directory: Path, mode: str) -> int:
++    if mode in {
++        "no-handshake",
++        "peer-flood",
++        "wrong-nonce",
++        "wrong-pid",
++        "partial-hello",
++        "extra-peer",
++        "wrong-direction",
++        "reflected-pid",
++        "frame-flood",
++        "replay",
++        "partial-flood",
++        "channel-loss",
++        "raw-normal",
++    }:
++        return raw_child(directory, mode)
++    # This is deliberately the first application-facing import/call. Bootstrap
++    # environment must disappear before runtime imports or worker construction.
++    from elspeth.composer_mcp.portable_bootstrap import connect_supervisor
++
++    connection = connect_supervisor()
++    assert "_ELSPETH_COMPOSER_CONTROL_NONCE" not in os.environ
++    assert "_ELSPETH_COMPOSER_CONTROL_PORT" not in os.environ
++    import asyncio
++    import atexit
++    import threading
++
++    from elspeth.composer_mcp.portable_control import PortableProcessWatchdog
++    from elspeth.contracts.process_watchdog_wire import (
++        BootstrapCompletionWitness,
++        ProcessCompletionWitness,
++        ProcessWatchdogTarget,
++        RecoveryReason,
++    )
++    from elspeth.web.process_recovery import ProcessRecovery
++    from elspeth.web.process_watchdog import ProcessWatchdogFailure
++
++    draining = threading.Event()
++    control = PortableProcessWatchdog(connection, draining)
++    if mode in ("bootstrap", "no-root"):
++        if mode == "no-root":
++            try:
++                control.assert_watching()
++            except ProcessWatchdogFailure:
++                event(directory, "unbound-refused")
++            else:
++                raise AssertionError("unbound root admitted workers")
++        control.complete_bootstrap(BootstrapCompletionWitness(control.target))
++        event(directory, "bootstrap-completed")
++        return 0
++
++    async def run():
++        root = asyncio.current_task()
++        assert root is not None
++        control.bind_root_task(root)
++        recovery = ProcessRecovery(watchdog=control, instance_draining=draining)
++        recovery.start_monitor()
++        event(directory, "ready")
++        if mode == "wrong-witness":
++            for witness in (
++                BootstrapCompletionWitness(control.target),
++                ProcessCompletionWitness(ProcessWatchdogTarget(control.target.pid, "0" * 64)),
++                ProcessCompletionWitness(ProcessWatchdogTarget(control.target.pid + 1, control.target.nonce)),
++            ):
++                try:
++                    await control.complete(witness)
++                except ProcessWatchdogFailure:
++                    pass
++                else:
++                    raise AssertionError("invalid completion witness accepted")
++            try:
++                control.complete_bootstrap(BootstrapCompletionWitness(control.target))
++            except ProcessWatchdogFailure:
++                pass
++            else:
++                raise AssertionError("bootstrap completed after root binding")
++            event(directory, "witnesses-refused")
++        if mode == "required-worker":
++            from elspeth.web import async_workers
++
++            async_workers.configure_required_executor_recovery(
++                drain_seconds=0.1,
++                instance_draining=draining,
++                generation_unavailable=threading.Event(),
++                recovery_callback=recovery.required_generation_expired,
++            )
++            entered = threading.Event()
++
++            def blocked():
++                entered.set()
++                threading.Event().wait()
++
++            worker = asyncio.create_task(async_workers.run_sync_in_worker(blocked))
++            while not entered.is_set():
++                await asyncio.sleep(0.005)
++            assert async_workers._GENERATION_CUSTODIAN is not None
++            async_workers._GENERATION_CUSTODIAN.quarantine()
++            try:
++                await asyncio.Event().wait()
++            except asyncio.CancelledError:
++                await recovery.join_escalation()
++                assert recovery._observations
++                event(directory, "required-observed")
++                # The real executor join remains blocked. Withhold COMPLETE.
++                await async_workers.shutdown_async_workers()
++                await worker
++                raise AssertionError("blocked worker unexpectedly settled") from None
++        if mode in ("recovery-block-loop", "production-grace"):
++            recovery.request_shutdown()
++            with suppress(asyncio.CancelledError):
++                await recovery.join_escalation()
++            event(directory, "armed")
++            while True:
++                time.sleep(1)
++        if mode in ("wait-stop", "unresponsive-stop", "supervisor-loss"):
++            if mode == "unresponsive-stop":
++                while True:
++                    time.sleep(1)
++            try:
++                await asyncio.Event().wait()
++            except asyncio.CancelledError:
++                assert draining.is_set()
++                cancellations = root.cancelling()
++                control.request_graceful_termination()
++                control.request_graceful_termination()
++                assert root.cancelling() == cancellations
++                event(directory, "stopped")
++        if mode == "repeated-cancel":
++            begin = asyncio.create_task(control.begin_recovery(RecoveryReason.NORMAL_SHUTDOWN))
++            await asyncio.sleep(0)
++            begin.cancel()
++            begin.cancel()
++            with suppress(asyncio.CancelledError):
++                await begin
++            first = await control.begin_recovery(RecoveryReason.REQUIRED_WORKER_LOST)
++            assert await control.begin_recovery(RecoveryReason.NORMAL_SHUTDOWN) is first
++            event(directory, "retained")
++        recovery.begin_shutdown()
++        await recovery.join_escalation()
++        if mode == "cancel-completion":
++            completion = asyncio.create_task(control.complete(ProcessCompletionWitness(control.target)))
++            await asyncio.sleep(0)
++            completion.cancel()
++            completion.cancel()
++            with suppress(asyncio.CancelledError):
++                await completion
++        await control.complete(ProcessCompletionWitness(control.target))
++        await recovery.join_monitor_after_completion()
++        event(directory, "completed")
++
++    asyncio.run(run())
++    if mode == "atexit-hang":
++        atexit.register(lambda: threading.Event().wait())
++    if mode == "stdio":
++        sys.stdout.write("MCP-PROBE\n")
++    return 7 if mode == "exit-seven" else 0
++
++
++if __name__ == "__main__":
++    role, directory_text, mode, *options = sys.argv[1:]
++    directory = Path(directory_text)
++    if role == "supervisor":
++        raise SystemExit(supervise(directory, mode, int(options[0]), len(options) > 1))
++    raise SystemExit(child(directory, mode))
+diff --git a/tests/unit/composer_mcp/test_portable_supervisor.py b/tests/unit/composer_mcp/test_portable_supervisor.py
+new file mode 100644
+index 000000000..a5f75e4f0
+--- /dev/null
++++ b/tests/unit/composer_mcp/test_portable_supervisor.py
+@@ -0,0 +1,361 @@
++"""Private portable owner controls; destructive faults stay in owned children."""
++
++import json
++import os
++import signal
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++from elspeth.web.process_watchdog_codec import FrameReader, encode_frame
++
++ROOT = Path(__file__).resolve().parents[3]
++PROBE = ROOT / "tests/helpers/portable_supervisor_probe.py"
++
++
++def launch(directory, mode, *, speed=1, ignored_chld=False):
++    command = [sys.executable, str(PROBE), "supervisor", str(directory), mode, str(speed)]
++    if ignored_chld:
++        command.append("ignored-chld")
++    return subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ.copy())
++
++
++def finish(process, directory, *, timeout=15):
++    # The probe's shorter outer alarm unwinds the real production owner, which
++    # kills/reaps its own Popen child before this outer process timeout expires.
++    out, err = process.communicate(timeout=timeout)
++    (directory / "stdout").write_bytes(out)
++    (directory / "stderr").write_bytes(err)
++    (directory / "exit").write_text(str(process.returncode))
++    assert not err, err.decode()
++    return out, json.loads((directory / "supervisor.json").read_text())
++
++
++def wait_event(process, directory, name):
++    deadline = time.monotonic() + 5
++    while not (directory / name).exists():
++        assert process.poll() is None
++        assert time.monotonic() < deadline
++        time.sleep(0.01)
++
++
++def test_shutdown_intent_has_closed_roundtrip():
++    # Positive HELLO prevents vacuous rejection by a broken parser.
++    from elspeth.web.process_watchdog_codec import FrameKind, WatchdogFrame
++
++    hello = WatchdogFrame(FrameKind.HELLO, "a" * 64, 1)
++    assert FrameReader().feed(encode_frame(hello)) == (hello,)
++    payload = json.dumps({"v": 1, "kind": "SHUTDOWN_REQUEST", "nonce": "a" * 64, "target_pid": 1}).encode()
++    (frame,) = FrameReader().feed(len(payload).to_bytes(4, "big") + payload)
++    assert frame.kind.value == "SHUTDOWN_REQUEST"
++    assert encode_frame(frame) == len(payload.replace(b" ", b"")).to_bytes(4, "big") + payload.replace(b" ", b"")
++
++
++@pytest.mark.parametrize("extra", [{"completion_seq": 1}, {"reason": "NORMAL_SHUTDOWN"}, {"grace_ns": 30_000_000_000}])
++def test_shutdown_intent_refuses_non_schema_fields(extra):
++    from elspeth.web.process_watchdog_codec import WatchdogProtocolError
++
++    payload = json.dumps({"v": 1, "kind": "SHUTDOWN_REQUEST", "nonce": "a" * 64, "target_pid": 1, **extra}).encode()
++    with pytest.raises(WatchdogProtocolError):
++        FrameReader().feed(len(payload).to_bytes(4, "big") + payload)
++
++
++@pytest.mark.parametrize(
++    "mode",
++    [
++        "normal",
++        "bootstrap",
++        "no-root",
++        "wrong-witness",
++        "repeated-cancel",
++        "cancel-completion",
++        "extra-peer",
++        "raw-normal",
++        "stdio",
++        "exit-seven",
++    ],
++)
++def test_real_owned_completion_and_status(tmp_path, mode):
++    process = launch(tmp_path, mode)
++    out, receipt = finish(process, tmp_path)
++    expected = 7 if mode == "exit-seven" else 0
++    assert process.returncode == receipt["result"] == expected
++    assert receipt["returncode"] == expected
++    assert receipt["completed"] and receipt["reaped"] and not receipt["failed"]
++    assert out == (b"MCP-PROBE\n" if mode == "stdio" else b"")
++    if mode == "wrong-witness":
++        assert (tmp_path / "witnesses-refused").exists()
++    if mode == "repeated-cancel":
++        assert (tmp_path / "retained").exists()
++    if mode == "no-root":
++        assert (tmp_path / "unbound-refused").exists()
++
++
++@pytest.mark.parametrize("mode", ["wrong-nonce", "wrong-pid", "partial-hello", "no-handshake", "peer-flood"])
++def test_authentication_and_partial_startup_fail_closed(tmp_path, mode):
++    process = launch(tmp_path, mode)
++    out, receipt = finish(process, tmp_path)
++    assert process.returncode != 0 and out == b""
++    assert receipt["returncode"] == -signal.SIGKILL
++    assert receipt["failed"] and receipt["reaped"] and not receipt["completed"]
++    assert not (tmp_path / "authenticated").exists()
++
++
++@pytest.mark.parametrize(
++    "mode",
++    [
++        "wrong-direction",
++        "reflected-pid",
++        "frame-flood",
++        "replay",
++        "partial-flood",
++        "channel-loss",
++        "recovery-block-loop",
++        "required-worker",
++    ],
++)
++def test_deadline_survives_real_protocol_and_child_faults(tmp_path, mode):
++    started = time.monotonic()
++    process = launch(tmp_path, mode, speed=50)
++    out, receipt = finish(process, tmp_path)
++    assert process.returncode != 0 and out == b""
++    assert receipt["returncode"] == -signal.SIGKILL
++    assert receipt["failed"] and receipt["reaped"] and not receipt["completed"]
++    assert time.monotonic() - started < 5
++    if mode == "replay":
++        assert (tmp_path / "immutable").exists()
++    if mode == "required-worker":
++        assert (tmp_path / "required-observed").exists()
++
++
++def test_production_grace_independently_kills_stuck_loop(tmp_path):
++    process = launch(tmp_path, "production-grace", speed=1)
++    wait_event(process, tmp_path, "armed")
++    armed = time.monotonic()
++    out, receipt = finish(process, tmp_path, timeout=40)
++    elapsed = time.monotonic() - armed
++    assert 28 <= elapsed <= 35
++    assert out == b"" and process.returncode != 0
++    assert receipt["returncode"] == -signal.SIGKILL and receipt["reaped"]
++
++
++@pytest.mark.parametrize("mode", ["wait-stop", "unresponsive-stop"])
++def test_catchable_parent_stop_is_channel_intent_then_exact_kill(tmp_path, mode):
++    process = launch(tmp_path, mode, speed=50 if mode == "unresponsive-stop" else 1)
++    wait_event(process, tmp_path, "ready")
++    process.send_signal(signal.SIGTERM)
++    process.send_signal(signal.SIGINT)
++    out, receipt = finish(process, tmp_path)
++    assert out == b"" and receipt["reaped"]
++    if mode == "wait-stop":
++        assert process.returncode == 0
++        assert (tmp_path / "stopped").exists() and (tmp_path / "completed").exists()
++    else:
++        assert process.returncode != 0 and receipt["returncode"] == -signal.SIGKILL
++
++
++def test_complete_does_not_strand_parent_in_atexit(tmp_path):
++    process = launch(tmp_path, "atexit-hang")
++    out, receipt = finish(process, tmp_path)
++    assert out == b"" and process.returncode != 0
++    assert (tmp_path / "completed").exists()
++    assert receipt["completed"] and receipt["failed"] and receipt["returncode"] == -signal.SIGKILL
++
++
++def test_inherited_sigchld_ignore_is_reset_before_actual_spawn(tmp_path):
++    process = launch(tmp_path, "exit-seven", ignored_chld=True)
++    out, receipt = finish(process, tmp_path)
++    assert out == b"" and process.returncode == 7
++    assert receipt["returncode"] == 7 and receipt["reaped"]
++
++
++def test_healthy_child_fails_closed_when_supervisor_is_killed(tmp_path):
++    process = launch(tmp_path, "supervisor-loss")
++    wait_event(process, tmp_path, "ready")
++    child_pid = int((tmp_path / "ready").read_text())
++    process.kill()  # Only the actual Popen-owned supervisor, never a received PID.
++    out, err = process.communicate(timeout=5)
++    assert process.returncode == -signal.SIGKILL
++    assert out == err == b""
++    deadline = time.monotonic() + 5
++    state_file = Path(f"/proc/{child_pid}/stat")
++    while state_file.exists() and state_file.read_text().split()[2] != "Z":
++        assert time.monotonic() < deadline
++        time.sleep(0.01)
++    # Its supervisor was destroyed: adoption/reaping belongs to init, so this
++    # establishes actual exit, not a claim that the dead supervisor reaped it.
++    assert not (tmp_path / "completed").exists()
++    if state_file.exists():
++        assert int(state_file.read_text().split()[51]) == 70 << 8
++
++
++def test_private_bootstrap_missing_authority_refuses_and_consumes_environment(tmp_path):
++    code = """import os
++from elspeth.composer_mcp.portable_bootstrap import connect_supervisor
++os.environ['_ELSPETH_COMPOSER_CONTROL_NONCE']='invalid'
++try:
++    connect_supervisor()
++except Exception:
++    assert '_ELSPETH_COMPOSER_CONTROL_NONCE' not in os.environ
++    assert '_ELSPETH_COMPOSER_CONTROL_PORT' not in os.environ
++else:
++    raise AssertionError('missing authority admitted')
++"""
++    result = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=5)
++    assert result.returncode == 0 and result.stdout == result.stderr == b""
++
++
++def test_dedicated_supervisor_has_stdlib_only_startup_and_clean_stdout():
++    script = str(ROOT / "src/elspeth/composer_mcp/portable_supervisor.py")
++    absent = subprocess.run([sys.executable, "-S", script], capture_output=True, timeout=5)
++    assert absent.returncode == 2 and absent.stdout == b""
++    assert absent.stderr == b"Private Composer supervisor requires an owned runner command\n"
++    exited = subprocess.run([sys.executable, "-S", script, sys.executable, "-c", "raise SystemExit(7)"], capture_output=True, timeout=5)
++    assert exited.returncode == 7 and exited.stdout == exited.stderr == b""
++    signaled = subprocess.run(
++        [sys.executable, "-S", script, sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"],
++        capture_output=True,
++        timeout=5,
++    )
++    assert signaled.returncode == -signal.SIGTERM and signaled.stdout == signaled.stderr == b""
++
++
++@pytest.mark.parametrize("windows", [False, True])
++def test_native_launch_adapter_pins_group_and_inherited_stdio(monkeypatch, windows):
++    # Pure adapter evidence: this does not execute Windows or qualify its OS.
++    from elspeth.composer_mcp import portable_supervisor as production
++
++    recorded = []
++    sentinel = object()
++
++    def popen(command, **options):
++        recorded.append((command, options))
++        return sentinel
++
++    monkeypatch.setattr(production.subprocess, "Popen", popen)
++    command = ["private-runner"]
++    environment = {"CONTROL": "private-test"}
++    assert production._launch_child(command, environment, windows=windows) is sentinel
++    assert recorded == [
++        (
++            command,
++            {
++                "env": environment,
++                "close_fds": True,
++                "creationflags": 0x200 if windows else 0,
++                "start_new_session": not windows,
++            },
++        )
++    ]
++
++
++@pytest.mark.parametrize("status", [None, 0, 7, -9])
++def test_exact_retained_process_adapter_never_signals_observed_exit(status):
++    from elspeth.composer_mcp.portable_supervisor import _Supervisor
++
++    calls = []
++
++    class RetainedProcess:
++        def poll(self):
++            calls.append("poll")
++            return status
++
++        def kill(self):
++            calls.append("kill-retained-handle")
++
++        def wait(self, *, timeout):
++            calls.append(("wait", timeout))
++            return -9
++
++    owner = _Supervisor(["unused"])
++    owner.child = RetainedProcess()
++    assert owner._kill_and_reap() == (-9 if status is None else status)
++    assert calls == (["poll", "kill-retained-handle", ("wait", 1.0)] if status is None else ["poll"])
++
++
++def test_termination_failure_is_visible_and_never_completion():
++    from elspeth.composer_mcp.portable_supervisor import SupervisorFailure, _Supervisor
++
++    class FailedProcess:
++        def poll(self):
++            return None
++
++        def kill(self):
++            raise OSError("controlled handle failure")
++
++    owner = _Supervisor(["unused"])
++    owner.child = FailedProcess()
++    with pytest.raises(SupervisorFailure, match="termination/reap failed"):
++        owner._kill_and_reap()
++    assert not owner.completed
++
++
++def test_first_deadline_and_completion_exit_bound_never_extend():
++    from elspeth.composer_mcp.portable_supervisor import GRACE_NS, _Supervisor
++
++    now = 1
++    owner = _Supervisor(["unused"], _clock_ns=lambda: now)
++    owner._arm()
++    first = owner.armed_at, owner.deadline
++    now = 100
++    owner._arm()
++    assert (owner.armed_at, owner.deadline) == first == (1, 1 + GRACE_NS)
++    post_complete = _Supervisor(["unused"], _clock_ns=lambda: now)
++    post_complete.deadline = 200
++    post_complete._arm()
++    assert post_complete.deadline == 200
++
++
++def test_web_compatibility_exports_preserve_nominal_identity():
++    from elspeth.contracts import process_watchdog_wire as shared
++    from elspeth.web import process_watchdog as web
++    from elspeth.web import process_watchdog_codec as codec
++
++    assert web.ProcessCompletionWitness is shared.ProcessCompletionWitness
++    assert web.BootstrapCompletionWitness is shared.BootstrapCompletionWitness
++    assert web.ProcessWatchdogTarget is shared.ProcessWatchdogTarget
++    assert web.GraceAcknowledgement is shared.GraceAcknowledgement
++    assert codec.WatchdogFrame is shared.WatchdogFrame
++    assert codec.FrameKind is shared.FrameKind
++    assert codec.RecoveryReason is shared.RecoveryReason
++
++
++def test_linux_web_helper_still_rejects_portable_shutdown_intent(tmp_path):
++    import socket
++
++    from elspeth.web.process_watchdog_codec import FrameKind, WatchdogFrame
++
++    target = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    pidfd = os.pidfd_open(target.pid, 0)
++    parent, child = socket.socketpair()
++    helper = subprocess.Popen(
++        [
++            sys.executable,
++            "-S",
++            str(ROOT / "src/elspeth/web/process_watchdog_helper.py"),
++            str(child.fileno()),
++            str(pidfd),
++        ],
++        pass_fds=(child.fileno(), pidfd),
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++    )
++    child.close()
++    os.close(pidfd)
++    try:
++        parent.settimeout(2)
++        parent.sendall(encode_frame(WatchdogFrame(FrameKind.HELLO, "a" * 64, target.pid)))
++        assert FrameReader().feed(parent.recv(1028))[0].kind is FrameKind.WATCHING_ACK
++        parent.sendall(encode_frame(WatchdogFrame(FrameKind.SHUTDOWN_REQUEST, "a" * 64, target.pid)))
++        assert parent.recv(1028) == b""  # Unsupported direction closes channel.
++        assert helper.poll() is None and target.poll() is None
++    finally:
++        parent.close()
++        if target.poll() is None:
++            target.kill()
++        target.wait(timeout=3)
++        out, err = helper.communicate(timeout=3)
++    assert helper.returncode == 0 and out == err == b""

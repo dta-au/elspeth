@@ -1,0 +1,803 @@
+"""Durable token scheduler repository — compatibility facade.
+
+The v1 scheduler is intentionally embedded-database backed and single-process
+friendly. It records enough state for a run to resume without rediscovering
+source rows: ready work, active leases, delayed retry availability, queue or
+barrier blocking keys, and terminal/failed states.
+
+The behaviour lives in the cohesive components under
+:mod:`elspeth.core.landscape.scheduler` (archived issue elspeth-ef9c36d767):
+queueing (:class:`SchedulerQueueRepository`), leasing
+(:class:`SchedulerLeaseRepository`), dispositions
+(:class:`SchedulerDispositionRepository`), the barrier journal
+(:class:`BarrierJournalRepository`), the group-loss ledger
+(:class:`GroupLossRepository`), scheduler events
+(:class:`SchedulerEventStore`), read models (:class:`SchedulerReadModel`)
+and the pure payload codec. :class:`TokenSchedulerRepository` composes them
+behind the historical surface so call sites can migrate incrementally —
+new code should prefer the component attributes (``.queue``, ``.leases``,
+``.dispositions``, ``.barriers``, ``.group_losses``, ``.reads``,
+``.events``) over the flat delegators.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from elspeth.contracts.coordination import (
+    DEFAULT_ITEM_STALL_BUDGET_SECONDS,
+    DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+    CoordinationToken,
+    WorkerMembershipToken,
+)
+from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.identity import LineageFrame
+from elspeth.contracts.scheduler import (
+    BarrierEmission,
+    BarrierTerminalOutcomeSpec,
+    BatchMembershipSpec,
+    BlockedPendingSinkHandoff,
+    BufferedOutcomeSpec,
+    GroupLossSpec,
+    SchedulerEventType,
+    SourceIngestSpec,
+    TokenWorkItem,
+    TokenWorkStatus,
+)
+from elspeth.core.landscape.database import Tier1Engine, verify_sqlite_tier1_pragmas
+from elspeth.core.landscape.scheduler import (
+    BarrierAdoptionResult,
+    BarrierJournalRepository,
+    GroupLoss,
+    GroupLossRepository,
+    SchedulerDispositionRepository,
+    SchedulerEventStore,
+    SchedulerLeaseRepository,
+    SchedulerQueueRepository,
+    SchedulerReadModel,
+    record_group_loss,
+    token_from_journal_item,
+)
+from elspeth.core.landscape.scheduler.payload_codec import deserialize_row_payload, serialize_row_payload
+from elspeth.core.landscape.scheduler.work_items import ready_work_item_values
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+    from datetime import datetime
+
+    from elspeth.contracts.audit import RoutingEvent, Row, Token
+    from elspeth.contracts.errors import ExecutionError
+    from elspeth.contracts.schema_contract import PipelineRow
+    from elspeth.core.landscape.data_flow_repository import DataFlowRepository
+    from elspeth.core.landscape.execution_repository import ExecutionRepository
+
+__all__ = [
+    "BarrierAdoptionResult",
+    "BarrierEmission",
+    "BatchMembershipSpec",
+    "BlockedPendingSinkHandoff",
+    "BufferedOutcomeSpec",
+    "GroupLoss",
+    "GroupLossSpec",
+    "SchedulerEventType",
+    "TokenSchedulerRepository",
+    "TokenWorkItem",
+    "TokenWorkStatus",
+    "record_group_loss",
+    "token_from_journal_item",
+]
+
+
+class TokenSchedulerRepository:
+    """Persistence boundary for token scheduler work items.
+
+    Compatibility facade over the scheduler components: every historical
+    verb delegates to exactly one component, and the components share ONE
+    :class:`SchedulerEventStore` so the audit event plane stays a single
+    seam. Construction runs the Tier-1 PRAGMA probe once, here.
+    """
+
+    def __init__(self, engine: Tier1Engine) -> None:
+        # Runtime SQLite PRAGMA probe — defence in depth against a caller that
+        # slips a bare SQLite engine past the type checker. Non-SQLite Tier-1
+        # engines skip this SQLite-only syntax. Probed ONCE at the composition
+        # root; the components trust the branded engine handed to them.
+        verify_sqlite_tier1_pragmas(engine, owner="TokenSchedulerRepository")
+        self._engine = engine
+        self.events = SchedulerEventStore()
+        self.leases = SchedulerLeaseRepository(engine, events=self.events)
+        self.queue = SchedulerQueueRepository(engine, events=self.events, leases=self.leases)
+        self.dispositions = SchedulerDispositionRepository(engine, events=self.events)
+        self.barriers = BarrierJournalRepository(engine, events=self.events)
+        self.group_losses = GroupLossRepository(engine)
+        self.reads = SchedulerReadModel(engine)
+
+    # ------------------------------------------------------------------
+    # Queue intake (SchedulerQueueRepository)
+    # ------------------------------------------------------------------
+
+    def enqueue_ready(
+        self,
+        *,
+        member_token: WorkerMembershipToken,
+        token_id: str,
+        row_id: str,
+        node_id: str | None,
+        step_index: int,
+        ingest_sequence: int,
+        row_payload_json: str,
+        attempt: int = 1,
+        queue_key: str | None = None,
+        barrier_key: str | None = None,
+        on_success_sink: str | None = None,
+        join_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
+        coalesce_node_id: str | None = None,
+        coalesce_name: str | None = None,
+        row_union_name: str | None = None,
+        collector_name: str | None = None,
+    ) -> TokenWorkItem:
+        """Persist a READY token continuation (see :meth:`SchedulerQueueRepository.enqueue_ready`)."""
+        return self.queue.enqueue_ready(
+            member_token=member_token,
+            token_id=token_id,
+            row_id=row_id,
+            node_id=node_id,
+            step_index=step_index,
+            ingest_sequence=ingest_sequence,
+            row_payload_json=row_payload_json,
+            attempt=attempt,
+            queue_key=queue_key,
+            barrier_key=barrier_key,
+            on_success_sink=on_success_sink,
+            join_group_id=join_group_id,
+            lineage_path=lineage_path,
+            coalesce_node_id=coalesce_node_id,
+            coalesce_name=coalesce_name,
+            row_union_name=row_union_name,
+            collector_name=collector_name,
+        )
+
+    def enqueue_ready_claimed(
+        self,
+        *,
+        member_token: WorkerMembershipToken,
+        token_id: str,
+        row_id: str,
+        node_id: str | None,
+        step_index: int,
+        ingest_sequence: int,
+        row_payload_json: str,
+        lease_owner: str,
+        lease_seconds: int,
+        attempt: int = 1,
+        queue_key: str | None = None,
+        barrier_key: str | None = None,
+        on_success_sink: str | None = None,
+        join_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
+        coalesce_node_id: str | None = None,
+        coalesce_name: str | None = None,
+        row_union_name: str | None = None,
+        collector_name: str | None = None,
+    ) -> TokenWorkItem:
+        """Persist and claim READY work for an active registered worker."""
+        return self.queue.enqueue_ready_claimed(
+            member_token=member_token,
+            token_id=token_id,
+            row_id=row_id,
+            node_id=node_id,
+            step_index=step_index,
+            ingest_sequence=ingest_sequence,
+            row_payload_json=row_payload_json,
+            lease_owner=lease_owner,
+            lease_seconds=lease_seconds,
+            attempt=attempt,
+            queue_key=queue_key,
+            barrier_key=barrier_key,
+            on_success_sink=on_success_sink,
+            join_group_id=join_group_id,
+            lineage_path=lineage_path,
+            coalesce_node_id=coalesce_node_id,
+            coalesce_name=coalesce_name,
+            row_union_name=row_union_name,
+            collector_name=collector_name,
+        )
+
+    def ingest_row_with_initial_claim(
+        self,
+        *,
+        coordination_token: CoordinationToken,
+        source: SourceIngestSpec,
+        data_flow: DataFlowRepository,
+        execution: ExecutionRepository,
+        node_id: str | None,
+        step_index: int,
+        row_payload_json: str,
+        lease_owner: str,
+        lease_seconds: int,
+        queue_key: str | None = None,
+        barrier_key: str | None = None,
+        on_success_sink: str | None = None,
+        join_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
+        coalesce_node_id: str | None = None,
+        coalesce_name: str | None = None,
+        row_union_name: str | None = None,
+        collector_name: str | None = None,
+    ) -> tuple[Row, Token, TokenWorkItem]:
+        """Fenced leader INGEST (see :meth:`SchedulerQueueRepository.ingest_row_with_initial_claim`)."""
+        return self.queue.ingest_row_with_initial_claim(
+            coordination_token=coordination_token,
+            source=source,
+            data_flow=data_flow,
+            execution=execution,
+            node_id=node_id,
+            step_index=step_index,
+            row_payload_json=row_payload_json,
+            lease_owner=lease_owner,
+            lease_seconds=lease_seconds,
+            queue_key=queue_key,
+            barrier_key=barrier_key,
+            on_success_sink=on_success_sink,
+            join_group_id=join_group_id,
+            lineage_path=lineage_path,
+            coalesce_node_id=coalesce_node_id,
+            coalesce_name=coalesce_name,
+            row_union_name=row_union_name,
+            collector_name=collector_name,
+        )
+
+    def ingest_quarantine_row_with_pending_sink(
+        self,
+        *,
+        coordination_token: CoordinationToken,
+        source: SourceIngestSpec,
+        data_flow: DataFlowRepository,
+        execution: ExecutionRepository,
+        validation_error_id: str | None,
+        source_state_id: str,
+        failure: ExecutionError,
+        divert_event: RoutingEvent,
+        pending_sink: BarrierEmission,
+    ) -> tuple[Row, Token, TokenWorkItem]:
+        """Fenced leader QUARANTINE INGEST (see :meth:`SchedulerQueueRepository.ingest_quarantine_row_with_pending_sink`)."""
+        return self.queue.ingest_quarantine_row_with_pending_sink(
+            coordination_token=coordination_token,
+            source=source,
+            data_flow=data_flow,
+            execution=execution,
+            validation_error_id=validation_error_id,
+            source_state_id=source_state_id,
+            failure=failure,
+            divert_event=divert_event,
+            pending_sink=pending_sink,
+        )
+
+    def _ready_work_item_values(
+        self,
+        *,
+        run_id: str,
+        token_id: str,
+        row_id: str,
+        node_id: str | None,
+        step_index: int,
+        ingest_sequence: int,
+        row_payload_json: str,
+        available_at: datetime,
+        attempt: int,
+        queue_key: str | None,
+        barrier_key: str | None,
+        on_success_sink: str | None,
+        join_group_id: str | None,
+        coalesce_node_id: str | None,
+        coalesce_name: str | None,
+        row_union_name: str | None = None,
+        collector_name: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
+    ) -> dict[str, object]:
+        """Historical test seam over :func:`ready_work_item_values`."""
+        return ready_work_item_values(
+            run_id=run_id,
+            token_id=token_id,
+            row_id=row_id,
+            node_id=node_id,
+            step_index=step_index,
+            ingest_sequence=ingest_sequence,
+            row_payload_json=row_payload_json,
+            available_at=available_at,
+            attempt=attempt,
+            queue_key=queue_key,
+            barrier_key=barrier_key,
+            on_success_sink=on_success_sink,
+            join_group_id=join_group_id,
+            lineage_path=lineage_path,
+            coalesce_node_id=coalesce_node_id,
+            coalesce_name=coalesce_name,
+            row_union_name=row_union_name,
+            collector_name=collector_name,
+        )
+
+    # ------------------------------------------------------------------
+    # Payload codec (pure functions)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def serialize_row_payload(row: PipelineRow) -> str:
+        """Serialize a token row for durable resume (see :func:`serialize_row_payload`)."""
+        return serialize_row_payload(row)
+
+    @staticmethod
+    def deserialize_row_payload(row_payload_json: str) -> PipelineRow:
+        """Restore a scheduler row payload written by :meth:`serialize_row_payload`."""
+        return deserialize_row_payload(row_payload_json)
+
+    # ------------------------------------------------------------------
+    # Leases (SchedulerLeaseRepository)
+    # ------------------------------------------------------------------
+
+    def claim_ready(
+        self,
+        *,
+        member_token: WorkerMembershipToken,
+        lease_owner: str,
+        lease_seconds: int,
+    ) -> TokenWorkItem | None:
+        """Claim the next available READY work item for a bounded lease."""
+        return self.leases.claim_ready(member_token=member_token, lease_owner=lease_owner, lease_seconds=lease_seconds)
+
+    def claim_pending_sink(
+        self,
+        *,
+        coordination_token: CoordinationToken,
+        lease_owner: str,
+        lease_seconds: int,
+    ) -> TokenWorkItem | None:
+        """Claim a sink-bound token whose transform work is already durable."""
+        return self.leases.claim_pending_sink(coordination_token=coordination_token, lease_owner=lease_owner, lease_seconds=lease_seconds)
+
+    def recover_expired_leases(
+        self,
+        *,
+        coordination_token: CoordinationToken,
+        grace_seconds: float = DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+        stall_budget_seconds: float = DEFAULT_ITEM_STALL_BUDGET_SECONDS,
+    ) -> int:
+        """Return expired LEASED work to READY (see :meth:`SchedulerLeaseRepository.recover_expired_leases`)."""
+        return self.leases.recover_expired_leases(
+            coordination_token=coordination_token,
+            grace_seconds=grace_seconds,
+            stall_budget_seconds=stall_budget_seconds,
+        )
+
+    def heartbeat_lease(
+        self,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item_id: str,
+        lease_owner: str,
+        lease_seconds: int,
+    ) -> datetime:
+        """Extend a held lease (see :meth:`SchedulerLeaseRepository.heartbeat_lease`)."""
+        return self.leases.heartbeat_lease(
+            member_token=member_token,
+            work_item_id=work_item_id,
+            lease_owner=lease_owner,
+            lease_seconds=lease_seconds,
+        )
+
+    def peer_active_leases(
+        self,
+        *,
+        run_id: str,
+        caller_owner: str,
+    ) -> tuple[str, ...]:
+        """Distinct lease_owners of unexpired LEASED rows held by peers."""
+        return self.leases.peer_active_leases(run_id=run_id, caller_owner=caller_owner)
+
+    # ------------------------------------------------------------------
+    # Dispositions (SchedulerDispositionRepository)
+    # ------------------------------------------------------------------
+
+    def mark_blocked(
+        self,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item_id: str,
+        queue_key: str | None,
+        barrier_key: str | None,
+        row_payload_json: str,
+        expected_lease_owner: str,
+    ) -> TokenWorkItem:
+        """Move an item to BLOCKED at a queue or barrier, recording the token as held."""
+        return self.dispositions.mark_blocked(
+            member_token=member_token,
+            work_item_id=work_item_id,
+            queue_key=queue_key,
+            barrier_key=barrier_key,
+            row_payload_json=row_payload_json,
+            expected_lease_owner=expected_lease_owner,
+        )
+
+    def mark_terminal(
+        self,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item_id: str,
+        expected_lease_owner: str,
+        group_losses: tuple[GroupLossSpec, ...] = (),
+    ) -> TokenWorkItem:
+        """Mark a leased work item terminal."""
+        return self.dispositions.mark_terminal(
+            member_token=member_token,
+            work_item_id=work_item_id,
+            expected_lease_owner=expected_lease_owner,
+            group_losses=group_losses,
+        )
+
+    def mark_terminal_with_ready_children(
+        self,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item_id: str,
+        emitted_ready: Sequence[BarrierEmission],
+        expected_lease_owner: str,
+        group_losses: tuple[GroupLossSpec, ...] = (),
+    ) -> tuple[TokenWorkItem, tuple[TokenWorkItem, ...]]:
+        """Atomically enqueue child continuations and terminalize their parent."""
+        return self.dispositions.mark_terminal_with_ready_children(
+            member_token=member_token,
+            work_item_id=work_item_id,
+            emitted_ready=emitted_ready,
+            expected_lease_owner=expected_lease_owner,
+            group_losses=group_losses,
+        )
+
+    def mark_failed(
+        self,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item_id: str,
+        expected_lease_owner: str,
+        group_losses: tuple[GroupLossSpec, ...] = (),
+    ) -> TokenWorkItem:
+        """Mark a leased work item failed after retries are exhausted."""
+        return self.dispositions.mark_failed(
+            member_token=member_token,
+            work_item_id=work_item_id,
+            expected_lease_owner=expected_lease_owner,
+            group_losses=group_losses,
+        )
+
+    def mark_failed_with_ready_children(
+        self,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item_id: str,
+        emitted_ready: Sequence[BarrierEmission],
+        expected_lease_owner: str,
+        group_losses: tuple[GroupLossSpec, ...] = (),
+    ) -> tuple[TokenWorkItem, tuple[TokenWorkItem, ...]]:
+        """Atomically enqueue child continuations and fail their parent."""
+        return self.dispositions.mark_failed_with_ready_children(
+            member_token=member_token,
+            work_item_id=work_item_id,
+            emitted_ready=emitted_ready,
+            expected_lease_owner=expected_lease_owner,
+            group_losses=group_losses,
+        )
+
+    def mark_pending_sink(
+        self,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item_id: str,
+        row_payload_json: str,
+        sink_name: str,
+        outcome: str,
+        path: str,
+        error_hash: str | None,
+        error_message: str | None,
+        expected_lease_owner: str,
+        group_losses: tuple[GroupLossSpec, ...] = (),
+    ) -> TokenWorkItem:
+        """Move a claimed item to a durable sink handoff state."""
+        return self.dispositions.mark_pending_sink(
+            member_token=member_token,
+            work_item_id=work_item_id,
+            row_payload_json=row_payload_json,
+            sink_name=sink_name,
+            outcome=outcome,
+            path=path,
+            error_hash=error_hash,
+            error_message=error_message,
+            expected_lease_owner=expected_lease_owner,
+            group_losses=group_losses,
+        )
+
+    def mark_pending_sink_with_ready_children(
+        self,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item_id: str,
+        emitted_ready: Sequence[BarrierEmission],
+        row_payload_json: str,
+        sink_name: str,
+        outcome: str,
+        path: str,
+        error_hash: str | None,
+        error_message: str | None,
+        expected_lease_owner: str,
+        group_losses: tuple[GroupLossSpec, ...] = (),
+    ) -> tuple[TokenWorkItem, tuple[TokenWorkItem, ...]]:
+        """Atomically enqueue children and durably park their parent for a sink."""
+        return self.dispositions.mark_pending_sink_with_ready_children(
+            member_token=member_token,
+            work_item_id=work_item_id,
+            emitted_ready=emitted_ready,
+            row_payload_json=row_payload_json,
+            sink_name=sink_name,
+            outcome=outcome,
+            path=path,
+            error_hash=error_hash,
+            error_message=error_message,
+            expected_lease_owner=expected_lease_owner,
+            group_losses=group_losses,
+        )
+
+    def mark_pending_sink_terminal(
+        self,
+        *,
+        token_id: str,
+        expected_lease_owner: str,
+        coordination_token: CoordinationToken,
+    ) -> int:
+        """Terminalize pending sink scheduler work after token outcome durability."""
+        return self.dispositions.mark_pending_sink_terminal(
+            token_id=token_id,
+            expected_lease_owner=expected_lease_owner,
+            coordination_token=coordination_token,
+        )
+
+    def mark_pending_sink_terminal_many(
+        self,
+        *,
+        token_ids: tuple[str, ...],
+        expected_lease_owner: str,
+        coordination_token: CoordinationToken,
+    ) -> int:
+        """Terminalize sink-bound scheduler work for a durable sink batch."""
+        return self.dispositions.mark_pending_sink_terminal_many(
+            token_ids=token_ids,
+            expected_lease_owner=expected_lease_owner,
+            coordination_token=coordination_token,
+        )
+
+    def terminalize_pending_sinks_with_terminal_outcomes(
+        self,
+        *,
+        caller_owner: str,
+        coordination_token: CoordinationToken,
+    ) -> int:
+        """Repair PENDING_SINK work whose terminal token outcome is already durable."""
+        return self.dispositions.terminalize_pending_sinks_with_terminal_outcomes(
+            caller_owner=caller_owner,
+            coordination_token=coordination_token,
+        )
+
+    # ------------------------------------------------------------------
+    # Barrier journal (BarrierJournalRepository)
+    # ------------------------------------------------------------------
+
+    def complete_barrier(
+        self,
+        *,
+        barrier_key: str,
+        consumed_token_ids: Sequence[str],
+        emitted_pending_sink: Sequence[BarrierEmission],
+        emitted_ready: Sequence[BarrierEmission],
+        require_exhaustive_release: bool = True,
+        scope_row_id: str | None = None,
+        intake_snapshot_token_ids: frozenset[str] | None = None,
+        release_context: Mapping[str, object] | None = None,
+        coordination_token: CoordinationToken,
+        pending_sink_lease_owner: str | None = None,
+        group_losses: Sequence[GroupLossSpec] = (),
+        terminal_outcomes: Sequence[BarrierTerminalOutcomeSpec] = (),
+    ) -> int:
+        """Complete a barrier atomically (see :meth:`BarrierJournalRepository.complete_barrier`)."""
+        return self.barriers.complete_barrier(
+            barrier_key=barrier_key,
+            consumed_token_ids=consumed_token_ids,
+            emitted_pending_sink=emitted_pending_sink,
+            emitted_ready=emitted_ready,
+            require_exhaustive_release=require_exhaustive_release,
+            scope_row_id=scope_row_id,
+            intake_snapshot_token_ids=intake_snapshot_token_ids,
+            release_context=release_context,
+            coordination_token=coordination_token,
+            pending_sink_lease_owner=pending_sink_lease_owner,
+            group_losses=group_losses,
+            terminal_outcomes=terminal_outcomes,
+        )
+
+    def mark_blocked_barrier_pending_sink_many(
+        self,
+        *,
+        barrier_key: str,
+        handoffs: Mapping[str, BlockedPendingSinkHandoff],
+        coordination_token: CoordinationToken,
+        pending_sink_lease_owner: str | None = None,
+    ) -> int:
+        """Move BLOCKED barrier work to PENDING_SINK before external sink writes."""
+        return self.barriers.mark_blocked_barrier_pending_sink_many(
+            barrier_key=barrier_key,
+            handoffs=handoffs,
+            coordination_token=coordination_token,
+            pending_sink_lease_owner=pending_sink_lease_owner,
+        )
+
+    def mark_blocked_barrier_terminal(
+        self,
+        *,
+        barrier_key: str,
+        token_ids: tuple[str, ...],
+        coordination_token: CoordinationToken,
+        release_context: Mapping[str, object] | None = None,
+        group_losses: Sequence[GroupLossSpec] = (),
+    ) -> int:
+        """Mark BLOCKED work consumed by a resolved barrier as terminal."""
+        return self.barriers.mark_blocked_barrier_terminal(
+            barrier_key=barrier_key,
+            token_ids=token_ids,
+            coordination_token=coordination_token,
+            release_context=release_context,
+            group_losses=group_losses,
+        )
+
+    def adopt_blocked_barrier_item(
+        self,
+        *,
+        work_item_id: str,
+        token_id: str,
+        barrier_key: str,
+        membership: BatchMembershipSpec | None,
+        buffered_outcome: BufferedOutcomeSpec | None,
+        coordination_token: CoordinationToken,
+    ) -> BarrierAdoptionResult:
+        """Fenced, backdated adoption of one durable BLOCKED barrier hold (SE.2)."""
+        return self.barriers.adopt_blocked_barrier_item(
+            work_item_id=work_item_id,
+            token_id=token_id,
+            barrier_key=barrier_key,
+            membership=membership,
+            buffered_outcome=buffered_outcome,
+            coordination_token=coordination_token,
+        )
+
+    def list_blocked_barrier_items(self, *, run_id: str) -> list[TokenWorkItem]:
+        """Return BLOCKED barrier holds for a run in deterministic order."""
+        return self.barriers.list_blocked_barrier_items(run_id=run_id)
+
+    def count_blocked_barrier_items(self, *, run_id: str) -> int:
+        """Count journal BLOCKED barrier holds for a run."""
+        return self.barriers.count_blocked_barrier_items(run_id=run_id)
+
+    def list_pending_blocked_barrier_items(self, *, run_id: str) -> list[TokenWorkItem]:
+        """Return intake-pending BLOCKED barrier holds (``barrier_adopted_epoch IS NULL``)."""
+        return self.barriers.list_pending_blocked_barrier_items(run_id=run_id)
+
+    def reset_adoption_marker_to_pending(
+        self,
+        *,
+        work_item_ids: Sequence[str],
+        coordination_token: CoordinationToken,
+    ) -> int:
+        """Reset ``barrier_adopted_epoch`` to NULL for crash-window BLOCKED rows (leader-fenced)."""
+        return self.barriers.reset_adoption_marker_to_pending(work_item_ids=work_item_ids, coordination_token=coordination_token)
+
+    # ------------------------------------------------------------------
+    # Group-loss ledger (GroupLossRepository)
+    # ------------------------------------------------------------------
+
+    def list_unadopted_group_losses(self, *, run_id: str) -> list[GroupLoss]:
+        """Group-loss rows not yet replayed into leader memory (SE.5 intake read)."""
+        return self.group_losses.list_unadopted_group_losses(run_id=run_id)
+
+    def list_group_losses(
+        self,
+        *,
+        run_id: str,
+        closer_names: frozenset[str] | None = None,
+    ) -> list[GroupLoss]:
+        """ALL group-loss rows, adopted or not (SE.4 takeover restore read)."""
+        return self.group_losses.list_group_losses(run_id=run_id, closer_names=closer_names)
+
+    def adopt_group_losses(
+        self,
+        *,
+        loss_ids: Sequence[str],
+        coordination_token: CoordinationToken,
+    ) -> int:
+        """Fenced replay-cursor mark: ``adopted_epoch NULL -> epoch`` (SE.5)."""
+        return self.group_losses.adopt_group_losses(
+            loss_ids=loss_ids,
+            coordination_token=coordination_token,
+        )
+
+    def stage_escalation_loss(
+        self,
+        *,
+        spec: GroupLossSpec,
+        frame_kind: FrameKind,
+        declared_roster: tuple[str, ...] | None,
+        recorded_by: str,
+        coordination_token: CoordinationToken,
+    ) -> bool:
+        """Fenced escalation staging (spec §6.3, Task 8): authenticate + append."""
+        return self.group_losses.stage_escalation_loss(
+            spec=spec,
+            frame_kind=frame_kind,
+            declared_roster=declared_roster,
+            recorded_by=recorded_by,
+            coordination_token=coordination_token,
+        )
+
+    # ------------------------------------------------------------------
+    # Read models (SchedulerReadModel)
+    # ------------------------------------------------------------------
+
+    def database_now(self) -> datetime:
+        """Landscape database time, read once outside any decision transaction (ADR-047).
+
+        The engine measures a barrier hold's age as this instant minus the
+        row's database-stamped ``barrier_blocked_at``; both operands come from
+        the database, never from a process clock.
+        """
+        return self.barriers.database_now()
+
+    def count_ready_in_set(self, *, run_id: str, work_item_ids: Sequence[str]) -> int:
+        """Count how many of the given work item IDs are in READY status."""
+        return self.reads.count_ready_in_set(run_id=run_id, work_item_ids=work_item_ids)
+
+    def count_failed_in_set(self, *, run_id: str, work_item_ids: Sequence[str]) -> int:
+        """Count how many of the given work item IDs are in FAILED status."""
+        return self.reads.count_failed_in_set(run_id=run_id, work_item_ids=work_item_ids)
+
+    def has_peer_owned_work(
+        self,
+        *,
+        run_id: str,
+        caller_owner: str,
+        work_item_ids: Sequence[str] | None = None,
+    ) -> bool:
+        """Return True if any non-terminal row is owned by a DIFFERENT worker."""
+        return self.reads.has_peer_owned_work(
+            run_id=run_id,
+            caller_owner=caller_owner,
+            work_item_ids=work_item_ids,
+        )
+
+    def count_active_work(self, *, run_id: str) -> int:
+        """Count non-terminal scheduler work for a run."""
+        return self.reads.count_active_work(run_id=run_id)
+
+    def count_unquiesced_work(self, *, run_id: str) -> int:
+        """Count work items still able to deposit new barrier arrivals (SD step 2)."""
+        return self.reads.count_unquiesced_work(run_id=run_id)
+
+    def summarize_unquiesced_work(self, *, run_id: str) -> tuple[str, ...]:
+        """Summarize SD step-2 unquiesced work for invariant diagnostics."""
+        return self.reads.summarize_unquiesced_work(run_id=run_id)
+
+    def count_unresolved_work(self, *, run_id: str) -> int:
+        """Count scheduler work not yet resolved into a durable sink handoff."""
+        return self.reads.count_unresolved_work(run_id=run_id)
+
+    def summarize_unresolved_work(self, *, run_id: str) -> tuple[str, ...]:
+        """Summarize unresolved work grouped by status and blocking keys."""
+        return self.reads.summarize_unresolved_work(run_id=run_id)
+
+    def summarize_active_work(self, *, run_id: str) -> tuple[str, ...]:
+        """Summarize active work grouped by status and blocking keys."""
+        return self.reads.summarize_active_work(run_id=run_id)

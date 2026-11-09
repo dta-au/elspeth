@@ -1,0 +1,42 @@
+FF......                                                                 [100%]
+=================================== FAILURES ===================================
+_ TestRegistryCensus.test_diagnostic_code_forwarder_is_reviewed_at_its_exact_site[error_text] _
+
+self = <tests.unit.web.composer.test_error_code_redaction.TestRegistryCensus object at 0x7f81e01fbb00>
+expression = 'error_text'
+
+    @pytest.mark.parametrize("expression", ["error_text", "matched_code"])
+    def test_diagnostic_code_forwarder_is_reviewed_at_its_exact_site(self, expression: str) -> None:
+        source = f"def _execute_explain_validation_error():\n    return {{'error_code': {expression}}}\n"
+        sites = _code_sites("composer/tools/generation.py", source)
+        assert len(sites) == 1 and not sites[0].is_literal, "probe premise: one nonliteral forwarding site"
+>       assert _unreviewed_forwarders(sites) == set()
+E       AssertionError: assert {('composer/t...'error_text')} == set()
+E         
+E         Extra items in the left set:
+E         ('composer/tools/generation.py', '_execute_explain_validation_error', 'error_text')
+E         Use -v to get more diff
+
+tests/unit/web/composer/test_error_code_redaction.py:342: AssertionError
+_ TestRegistryCensus.test_diagnostic_code_forwarder_is_reviewed_at_its_exact_site[matched_code] _
+
+self = <tests.unit.web.composer.test_error_code_redaction.TestRegistryCensus object at 0x7f81e01fbc20>
+expression = 'matched_code'
+
+    @pytest.mark.parametrize("expression", ["error_text", "matched_code"])
+    def test_diagnostic_code_forwarder_is_reviewed_at_its_exact_site(self, expression: str) -> None:
+        source = f"def _execute_explain_validation_error():\n    return {{'error_code': {expression}}}\n"
+        sites = _code_sites("composer/tools/generation.py", source)
+        assert len(sites) == 1 and not sites[0].is_literal, "probe premise: one nonliteral forwarding site"
+>       assert _unreviewed_forwarders(sites) == set()
+E       AssertionError: assert {('composer/t...atched_code')} == set()
+E         
+E         Extra items in the left set:
+E         ('composer/tools/generation.py', '_execute_explain_validation_error', 'matched_code')
+E         Use -v to get more diff
+
+tests/unit/web/composer/test_error_code_redaction.py:342: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_error_code_redaction.py::TestRegistryCensus::test_diagnostic_code_forwarder_is_reviewed_at_its_exact_site[error_text]
+FAILED tests/unit/web/composer/test_error_code_redaction.py::TestRegistryCensus::test_diagnostic_code_forwarder_is_reviewed_at_its_exact_site[matched_code]
+2 failed, 6 passed, 76 deselected in 0.51s

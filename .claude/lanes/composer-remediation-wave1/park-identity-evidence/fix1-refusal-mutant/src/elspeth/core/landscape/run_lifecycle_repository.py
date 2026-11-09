@@ -1,0 +1,2207 @@
+"""Run lifecycle repository for Landscape audit records.
+
+Owns all run lifecycle operations: begin, complete, finalize, status updates,
+schema contracts, secret resolutions, export status, and reproducibility grading.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Final, get_args
+
+from sqlalchemy import func, or_, select
+from sqlalchemy.engine import Connection
+from sqlalchemy.exc import SQLAlchemyError
+
+from elspeth.contracts import (
+    CallType,
+    ContractAuditRecord,
+    ExportStatus,
+    NodeType,
+    ReproducibilityGrade,
+    Run,
+    RunStatus,
+    SecretResolution,
+    SecretResolutionInput,
+)
+from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.auth import AuthProviderType
+from elspeth.contracts.coordination import (
+    DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+    CoordinationToken,
+    WorkerMembershipToken,
+    mint_worker_id,
+)
+from elspeth.contracts.enums import RunMode, TerminalPath
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, RunLeadershipLostError
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
+from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence, decode_admission_decision
+from elspeth.contracts.preflight import PreflightResult
+from elspeth.contracts.run_start import RunStartPermitBinding
+from elspeth.contracts.runtime_val_manifest import cached_frozen_runtime_val_manifest_json
+from elspeth.contracts.scheduler import TokenWorkStatus
+from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.core.ids import generate_id
+from elspeth.core.landscape._database_ops import DatabaseOps, _safe_database_error_message
+from elspeth.core.landscape._helpers import now
+from elspeth.core.landscape.data_flow.outcomes import TokenOutcomeRepository, TokenOutcomeWrite
+from elspeth.core.landscape.data_flow.ownership import RowTokenOwnership
+from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.errors import LandscapeRecordError, LandscapeRecordNotFoundError
+from elspeth.core.landscape.execution.operations import OperationRepository
+from elspeth.core.landscape.model_loaders import OperationLoader, RunLoader, TokenOutcomeLoader
+from elspeth.core.landscape.reproducibility import compute_grade
+from elspeth.core.landscape.run_coordination_repository import (
+    CoordinationEventRow,
+    RunCoordinationRepository,
+    fenced_leader_transaction,
+    fenced_member_transaction,
+    record_coordination_events,
+)
+from elspeth.core.landscape.run_start_admission import RunStartAdmissionRepository, RunStartAdmissionState
+from elspeth.core.landscape.schema import (
+    SOURCE_COMPLETE_LIFECYCLE_STATES,
+    RunSourceLifecycleState,
+    calls_table,
+    checkpoints_table,
+    node_states_table,
+    nodes_table,
+    operations_table,
+    preflight_results_table,
+    run_attributions_table,
+    run_sources_table,
+    run_start_admissions_table,
+    run_web_plugin_policy_table,
+    run_workers_table,
+    runs_table,
+    secret_resolutions_table,
+    token_decided_clause,
+    token_outcomes_table,
+    token_work_items_table,
+    tokens_table,
+)
+
+if TYPE_CHECKING:
+    from datetime import datetime
+
+    from elspeth.contracts.schema_contract import SchemaContract
+
+
+@dataclass(frozen=True, slots=True)
+class RunSourceResumeRecord:
+    """Per-source audit metadata required to replay rows during resume."""
+
+    source_node_id: str
+    source_name: str
+    lifecycle_state: str
+    source_schema_json: str
+    schema_contract: SchemaContract
+
+
+@dataclass(frozen=True, slots=True)
+class RunSourceLifecycleRecord:
+    """Per-source lifecycle metadata used before resume replay reconstruction."""
+
+    source_node_id: str
+    source_name: str
+    lifecycle_state: str
+    source_schema_json: str | None = None
+    normalization_version: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RunSourceFieldResolutionRecord:
+    """Per-source source header resolution metadata."""
+
+    source_node_id: str
+    source_name: str
+    resolution_mapping: Mapping[str, str] | None
+
+    def __post_init__(self) -> None:
+        # Frozen-dataclass deep-freeze contract: resolution_mapping
+        # is a container field, so frozen=True alone leaves its contents mutable
+        # through the attribute reference. Gate on `is not None` — the field is
+        # nullable (sources that resolved no headers record None).
+        if self.resolution_mapping is not None:
+            freeze_fields(self, "resolution_mapping")
+
+
+# Phase 2.2 (elspeth-0de989c56d): COMPLETED_WITH_FAILURES and EMPTY join the
+# terminal set so the engine can finalize runs into the four-value taxonomy
+# without a separate "intermediate" lifecycle hop.  The same terminal-write
+# guarantees apply: completed_at is set, the row becomes immutable, and
+# update_run_status() can no longer overwrite it.
+_TERMINAL_RUN_STATUSES = frozenset(
+    {
+        RunStatus.COMPLETED,
+        RunStatus.COMPLETED_WITH_FAILURES,
+        RunStatus.FAILED,
+        RunStatus.EMPTY,
+        RunStatus.INTERRUPTED,
+    }
+)
+_IMMUTABLE_SUCCESS_RUN_STATUSES = frozenset(
+    {
+        RunStatus.COMPLETED,
+        RunStatus.COMPLETED_WITH_FAILURES,
+        RunStatus.EMPTY,
+    }
+)
+_IMMUTABLE_SUCCESS_RUN_STATUS_VALUES = tuple(status.value for status in _IMMUTABLE_SUCCESS_RUN_STATUSES)
+
+# Derived from the L0 contract rather than restated: this is a write-side
+# guard, and a guard that restates its authority drifts from it silently.
+# The schema CHECK stays hand-written on purpose -- changing what the
+# database admits must cost an epoch bump, not follow a Literal edit.
+_AUTH_PROVIDER_TYPES: Final[frozenset[str]] = frozenset(get_args(AuthProviderType))
+_OPENROUTER_CATALOG_SOURCES = frozenset({"live", "bundled"})
+_NON_RESUMABLE_EFFECT_OPERATION_ERROR: Final[str] = "run finalized as non-resumable before sink effect completed"
+
+# 64 lowercase hex chars — matches the canonical sha256 hex digest format
+# produced by ``hashlib.sha256(...).hexdigest()``. Used by the Tier-1
+# write-side guards in this module and
+# ``web/execution/service.py`` to reject malformed snapshot ids that
+# would otherwise corrupt the audit trail without a downstream signal.
+_SHA256_HEX_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{64}")
+
+
+def is_valid_sha256_hex(value: str) -> bool:
+    """Return True if ``value`` is exactly 64 lowercase hex chars.
+
+    Canonical home for the sha256-hex shape check; imported by
+    ``web/execution/service.py`` so both
+    write-side guards reject the same out-of-domain values (empty,
+    whitespace-only, non-hex strings, upper-case, wrong length).
+    """
+    return _SHA256_HEX_RE.fullmatch(value) is not None
+
+
+def validate_run_attribution(*, initiated_by_user_id: str | None, auth_provider_type: str | None) -> None:
+    if initiated_by_user_id is None and auth_provider_type is None:
+        return
+    if type(initiated_by_user_id) is not str or not initiated_by_user_id.strip():
+        raise AuditIntegrityError("run attribution requires a non-blank initiated_by_user_id")
+    if auth_provider_type not in _AUTH_PROVIDER_TYPES:
+        raise AuditIntegrityError(f"run attribution requires auth_provider_type to be one of {sorted(_AUTH_PROVIDER_TYPES)!r}")
+
+
+def _validate_openrouter_catalog_snapshot(*, sha256: str, source: str) -> None:
+    """Tier-1 write-side guard for the OpenRouter catalog snapshot fields.
+
+    Both fields are NOT NULL on the ``runs`` table and define the
+    audit-trail anchor for "which catalog blessed this run's model
+    decisions". A defective caller passing an empty string or an
+    out-of-domain source value would silently corrupt the audit record;
+    catch it here so the failure points at the wiring bug.
+    """
+    if type(sha256) is not str or not is_valid_sha256_hex(sha256):
+        raise AuditIntegrityError(f"openrouter_catalog_sha256 must be 64 lowercase hex chars, got {sha256!r}")
+    if source not in _OPENROUTER_CATALOG_SOURCES:
+        raise AuditIntegrityError(f"openrouter_catalog_source must be one of {sorted(_OPENROUTER_CATALOG_SOURCES)!r}, got {source!r}")
+
+
+def _already_terminal_error(run_id: str, existing_status: str) -> AuditIntegrityError:
+    return AuditIntegrityError(
+        f"Cannot complete run {run_id}: already terminal "
+        f"(status={existing_status!r}). Terminal runs are immutable — "
+        f"the audit record's status and completed_at timestamp cannot "
+        f"be overwritten. Resume path must transition to RUNNING via "
+        f"update_run_status() before re-completing."
+    )
+
+
+class RunLifecycleRepository:
+    """Run lifecycle operations for the Landscape audit trail.
+
+    Handles: begin, complete, finalize, status updates, schema contracts,
+    secret resolutions, export status, and reproducibility grading.
+    """
+
+    def __init__(self, db: LandscapeDB, ops: DatabaseOps, run_loader: RunLoader) -> None:
+        self._db = db
+        self._ops = ops
+        self._run_loader = run_loader
+        # Lazy (epoch 21): begin_run composes the leader seat mint into its
+        # transaction. Constructed on first begin_run rather than here so a
+        # read-only LandscapeDB handle (which never calls begin_run) does not
+        # pay — or fail — the coordination repository's Tier-1 PRAGMA probe.
+        self._run_coordination: RunCoordinationRepository | None = None
+        # Lazy (ADR-038): complete_run's abandonment sweep records
+        # (NULL, ABANDONED) token outcomes through the real outcomes recorder
+        # so its Tier-1 pair validation applies identically; constructed on
+        # first FAILED/INTERRUPTED finalize.
+        self._token_outcomes: TokenOutcomeRepository | None = None
+        # Lazy (TS19/F14): non-resumable finalization closes open durable
+        # sink-effect operations through a caller-owned transaction primitive.
+        self._operation_repository: OperationRepository | None = None
+
+    @property
+    def _coordination_repo(self) -> RunCoordinationRepository:
+        if self._run_coordination is None:
+            self._run_coordination = RunCoordinationRepository(self._db.engine)
+        return self._run_coordination
+
+    @property
+    def _outcomes_repo(self) -> TokenOutcomeRepository:
+        if self._token_outcomes is None:
+            self._token_outcomes = TokenOutcomeRepository(
+                self._db,
+                self._ops,
+                token_outcome_loader=TokenOutcomeLoader(),
+                ownership=RowTokenOwnership(self._ops),
+            )
+        return self._token_outcomes
+
+    @property
+    def _operations_repo(self) -> OperationRepository:
+        if self._operation_repository is None:
+            self._operation_repository = OperationRepository(
+                self._db,
+                self._ops,
+                operation_loader=OperationLoader(),
+            )
+        return self._operation_repository
+
+    def begin_run(
+        self,
+        config: Mapping[str, Any],
+        canonical_version: str,
+        *,
+        run_id: str | None = None,
+        reproducibility_grade: ReproducibilityGrade | None = None,
+        status: RunStatus = RunStatus.RUNNING,
+        source_schema_json: str | None = None,
+        initiated_by_user_id: str | None = None,
+        auth_provider_type: str | None = None,
+        openrouter_catalog_sha256: str,
+        openrouter_catalog_source: str,
+        leader_worker_id: str | None = None,
+        web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        run_start_permit: RunStartPermitBinding | None = None,
+        run_mode: RunMode = RunMode.LIVE,
+        replay_from_run_id: str | None = None,
+    ) -> Run:
+        """Begin a new pipeline run.
+
+        Args:
+            config: Resolved configuration dictionary
+            canonical_version: Version of canonical hash algorithm
+            run_id: Optional run ID (generated if not provided)
+            reproducibility_grade: Optional grade (FULL_REPRODUCIBLE, etc.)
+            status: Initial RunStatus (defaults to RUNNING)
+            source_schema_json: Optional serialized source schema for resume type restoration.
+                Should be Pydantic model_json_schema() output. Required for proper resume
+                type fidelity (datetime/Decimal restoration from payload JSON strings).
+            initiated_by_user_id: Optional authenticated user ID that initiated the run.
+            auth_provider_type: Optional auth provider namespace for the initiating user.
+            openrouter_catalog_sha256: Canonical sha256 of the OpenRouter
+                model catalog active at run-create time. Required (Tier-1
+                audit completeness): every run records which catalog
+                blessed its model decisions. Resolved at the L3 entry
+                point via :func:`elspeth.plugins.transforms.llm.model_catalog.read_openrouter_catalog_snapshot_id`.
+            openrouter_catalog_source: ``"live"`` if the lifespan probed
+                OpenRouter successfully, ``"bundled"`` if the fallback
+                served the snapshot. Required (NOT NULL on the column).
+            leader_worker_id: Worker identity registered as the run's leader
+                (epoch 21, ADR-030 uniformity rule: N=1 = leader-of-its-own-
+                run). When None, a fresh ``worker:{run_id}:{uuid}`` identity
+                is self-minted — this is what makes every repository-level
+                caller satisfy the uniformity rule for free. The engine
+                passes the identity it minted so it can construct the
+                epoch-1 :class:`~elspeth.contracts.coordination.CoordinationToken`
+                without a read-back.
+            web_plugin_policy_evidence: Optional sanitized web-policy decision.
+                Web execution supplies one row; CLI execution passes None.
+
+        Returns:
+            Run model with generated run_id
+
+        Notes:
+            Per ADR-025 §3 Decision 5 (G6) schema contracts are stored
+            per-source in the ``run_sources`` table — written by
+            ``record_run_source`` / ``update_run_source_contract`` as each
+            source iterates. The run-level singleton (``runs.schema_contract_json``
+            column and the matching ``schema_contract`` parameter) was deleted
+            because writers and readers had drifted: writers populated the
+            singleton, integrity verification consulted ``run_sources``, and
+            the audit trail recorded contracts in one surface while resume
+            validated against another.
+        """
+        if status == RunStatus.COMPLETED:
+            raise AuditIntegrityError(
+                "begin_run() cannot create a COMPLETED run. Use complete_run() so completed_at is recorded in the audit trail."
+            )
+        if type(run_mode) is not RunMode:
+            raise AuditIntegrityError("run_mode must be a RunMode")
+        if (run_mode is RunMode.LIVE) != (replay_from_run_id is None):
+            raise AuditIntegrityError("live runs have no replay source; replay/verify runs require one")
+        validate_run_attribution(initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type)
+        _validate_openrouter_catalog_snapshot(
+            sha256=openrouter_catalog_sha256,
+            source=openrouter_catalog_source,
+        )
+        if web_plugin_policy_evidence is not None and not isinstance(web_plugin_policy_evidence, WebPluginPolicyEvidence):
+            raise AuditIntegrityError("web_plugin_policy_evidence must be a WebPluginPolicyEvidence value")
+
+        run_id = run_id or generate_id()
+        if replay_from_run_id == run_id:
+            raise AuditIntegrityError("a replay/verify run cannot cite itself as its source")
+        if run_start_permit is not None and (type(run_start_permit) is not RunStartPermitBinding or run_start_permit.run_id != run_id):
+            raise AuditIntegrityError("Run start permit must bind the exact run UUID")
+        settings_json = canonical_json(config)
+        config_hash = stable_hash(config)
+        timestamp = now()
+
+        # ADR-010 §Decision 3 M3: record the declaration +
+        # Tier-1 registries that were in force at run start. Canonicalised
+        # JSON so the value is stable across Python invocations and suitable
+        # for hash-based cross-run regression detection. Must run AFTER the
+        # orchestrator has frozen both registries; begin_run is called from
+        # Orchestrator.run() which sequences prepare_for_run() (which
+        # freezes) before this call.
+        runtime_val_manifest_json = cached_frozen_runtime_val_manifest_json()
+
+        run = Run(
+            run_id=run_id,
+            started_at=timestamp,
+            config_hash=config_hash,
+            settings_json=settings_json,
+            canonical_version=canonical_version,
+            status=status,
+            run_mode=run_mode,
+            replay_from_run_id=replay_from_run_id,
+            reproducibility_grade=reproducibility_grade,
+        )
+
+        # Epoch 21 (ADR-030 §B.4 closing line): "begin_run creates the
+        # run_coordination row and acquires epoch 1 in the same transaction".
+        # One BEGIN IMMEDIATE write transaction carries the runs INSERT, the
+        # optional run_attributions INSERT, and the leader seat mint — a run
+        # row without its seat row is unrepresentable (the takeover CAS
+        # treats a missing seat as audit corruption).
+        worker_id = leader_worker_id or mint_worker_id(run.run_id)
+        # Construct (and PRAGMA-probe) the coordination repository BEFORE
+        # opening the write transaction: on :memory: databases the engine's
+        # StaticPool shares one underlying connection, so probing inside the
+        # transaction would attempt BEGIN-within-BEGIN.
+        coordination = self._coordination_repo
+        try:
+            with self._db.write_connection() as conn:
+                if run_start_permit is not None:
+                    existing = self._observe_permitted_run_on(
+                        conn,
+                        run_start_permit,
+                        config_hash=config_hash,
+                        canonical_version=canonical_version,
+                        openrouter_catalog_sha256=openrouter_catalog_sha256,
+                        openrouter_catalog_source=openrouter_catalog_source,
+                        initiated_by_user_id=initiated_by_user_id,
+                        auth_provider_type=auth_provider_type,
+                        source_schema_json=source_schema_json,
+                        runtime_val_manifest_json=runtime_val_manifest_json,
+                        web_plugin_policy_evidence=web_plugin_policy_evidence,
+                    )
+                    if existing is not None:
+                        return existing
+                conn.execute(
+                    runs_table.insert().values(
+                        run_id=run.run_id,
+                        started_at=run.started_at,
+                        config_hash=run.config_hash,
+                        settings_json=run.settings_json,
+                        canonical_version=run.canonical_version,
+                        status=run.status.value,
+                        run_mode=run.run_mode.value,
+                        replay_from_run_id=run.replay_from_run_id,
+                        reproducibility_grade=run.reproducibility_grade,
+                        source_schema_json=source_schema_json,
+                        runtime_val_manifest_json=runtime_val_manifest_json,
+                        llm_call_count=None,
+                        seeded_from_cache=False,
+                        cache_key=None,
+                        openrouter_catalog_sha256=openrouter_catalog_sha256,
+                        openrouter_catalog_source=openrouter_catalog_source,
+                    )
+                )
+                if run_start_permit is not None:
+                    conn.execute(
+                        run_start_admissions_table.insert().values(
+                            run_id=run_id,
+                            permit_id=run_start_permit.permit_id,
+                            permit_epoch=run_start_permit.permit_epoch,
+                            subject_hash=run_start_permit.subject_hash,
+                            state="prepared",
+                        )
+                    )
+                if initiated_by_user_id is not None and auth_provider_type is not None:
+                    conn.execute(
+                        run_attributions_table.insert().values(
+                            run_id=run.run_id,
+                            recorded_at=timestamp,
+                            initiated_by_user_id=initiated_by_user_id,
+                            auth_provider_type=auth_provider_type,
+                        )
+                    )
+                if web_plugin_policy_evidence is not None:
+                    self._insert_web_plugin_policy_evidence(
+                        conn,
+                        run_id=run.run_id,
+                        evidence=web_plugin_policy_evidence,
+                    )
+                # Composes into THIS transaction (connection-accepting form):
+                # the runs row above satisfies the run_coordination FK. The
+                # seat's deadline is Landscape database time (ADR-047); the
+                # forensic ``timestamp`` above never reaches it.
+                leader_token = coordination.register_run_leader_on(
+                    conn,
+                    run_id=run.run_id,
+                    worker_id=worker_id,
+                    window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                    entry_point="run",
+                )
+                coordination._finalize_leader_registration_on(conn, token=leader_token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)
+        except SQLAlchemyError as exc:
+            # A concurrent identical creator may win the unique run UUID.
+            # Observe only after our failed transaction has rolled back; never
+            # return its initial token or allocate a second leadership epoch.
+            if run_start_permit is not None:
+                with self._db.engine.connect() as conn:
+                    existing = self._observe_permitted_run_on(
+                        conn,
+                        run_start_permit,
+                        config_hash=config_hash,
+                        canonical_version=canonical_version,
+                        openrouter_catalog_sha256=openrouter_catalog_sha256,
+                        openrouter_catalog_source=openrouter_catalog_source,
+                        initiated_by_user_id=initiated_by_user_id,
+                        auth_provider_type=auth_provider_type,
+                        source_schema_json=source_schema_json,
+                        runtime_val_manifest_json=runtime_val_manifest_json,
+                        web_plugin_policy_evidence=web_plugin_policy_evidence,
+                    )
+                    if existing is not None:
+                        return existing
+            # Preserve the pre-epoch-21 error contract: begin_run surfaced
+            # constraint violations (e.g. duplicate run_id) as
+            # LandscapeRecordError via DatabaseOps.execute_insert.
+            raise LandscapeRecordError(f"begin_run — database rejected audit write: {type(exc).__name__}") from exc
+
+        return run
+
+    def _observe_permitted_run_on(
+        self,
+        conn: Connection,
+        binding: RunStartPermitBinding,
+        *,
+        config_hash: str,
+        canonical_version: str,
+        openrouter_catalog_sha256: str,
+        openrouter_catalog_source: str,
+        initiated_by_user_id: str | None,
+        auth_provider_type: str | None,
+        source_schema_json: str | None,
+        runtime_val_manifest_json: str | None,
+        web_plugin_policy_evidence: WebPluginPolicyEvidence | None,
+    ) -> Run | None:
+        row = conn.execute(select(runs_table).where(runs_table.c.run_id == binding.run_id)).one_or_none()
+        if row is None:
+            return None
+        if RunStartAdmissionRepository.observe_on(conn, binding) is None:
+            raise AuditIntegrityError("Existing legacy run has no permit-bound baseline")
+        if (row.config_hash, row.canonical_version, row.openrouter_catalog_sha256, row.openrouter_catalog_source) != (
+            config_hash,
+            canonical_version,
+            openrouter_catalog_sha256,
+            openrouter_catalog_source,
+        ):
+            raise AuditIntegrityError("Permit retry changed immutable run configuration or catalog")
+        attribution = conn.execute(select(run_attributions_table).where(run_attributions_table.c.run_id == binding.run_id)).one_or_none()
+        actual_attribution = (None, None) if attribution is None else (attribution.initiated_by_user_id, attribution.auth_provider_type)
+        if actual_attribution != (initiated_by_user_id, auth_provider_type):
+            raise AuditIntegrityError("Permit retry changed run attribution")
+        if row.source_schema_json != source_schema_json or row.runtime_val_manifest_json != runtime_val_manifest_json:
+            raise AuditIntegrityError("Permit retry changed source schema or runtime VAL manifest")
+        policy = conn.execute(
+            select(run_web_plugin_policy_table).where(run_web_plugin_policy_table.c.run_id == binding.run_id)
+        ).one_or_none()
+        if web_plugin_policy_evidence is None:
+            if policy is not None:
+                raise AuditIntegrityError("Permit retry removed web plugin policy evidence")
+        elif policy is None:
+            raise AuditIntegrityError("Permit retry added web plugin policy evidence")
+        else:
+            evidence = web_plugin_policy_evidence
+            try:
+                admission_decision = decode_admission_decision(policy.admission_decision_json, policy.admission_decision_hash)
+            except ValueError as exc:
+                raise AuditIntegrityError("Permit retry found corrupt admission evidence") from exc
+            if (
+                policy.schema_version,
+                policy.policy_hash,
+                policy.snapshot_hash,
+                policy.authorized_plugin_ids_json,
+                policy.available_plugin_ids_json,
+                policy.control_modes_json,
+                policy.selected_implementations_json,
+                policy.selected_profile_aliases_json,
+                policy.plugin_code_identities_json,
+                policy.binding_generation_fingerprint,
+                policy.decision_codes_json,
+                admission_decision,
+            ) != (
+                evidence.schema_version,
+                evidence.policy_hash,
+                evidence.snapshot_hash,
+                canonical_json(evidence.authorized_plugin_ids),
+                canonical_json(evidence.available_plugin_ids),
+                canonical_json(evidence.control_modes),
+                canonical_json(evidence.selected_implementations),
+                canonical_json(evidence.selected_profile_aliases),
+                canonical_json(evidence.plugin_code_identities),
+                evidence.binding_generation_fingerprint,
+                canonical_json(evidence.decision_codes),
+                evidence.admission_decision,
+            ):
+                raise AuditIntegrityError("Permit retry changed web plugin policy evidence")
+        return self._run_loader.load(row)
+
+    def materialize_cancelled_permit(
+        self,
+        binding: RunStartPermitBinding,
+        config: Mapping[str, Any],
+        canonical_version: str,
+        *,
+        openrouter_catalog_sha256: str,
+        openrouter_catalog_source: str,
+        initiated_by_user_id: str | None = None,
+        auth_provider_type: str | None = None,
+        web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
+    ) -> Run:
+        """Record issued-permit cancellation without loading any pipeline plugin.
+
+        A retry observes immutable terminal truth. An incumbent live leader
+        defers through the ordinary leadership CAS; no token is refreshed.
+        """
+        if pre_effect_guard is not None:
+            pre_effect_guard()
+        worker_id = mint_worker_id(binding.run_id)
+        # Cancellation does not execute under this image's runtime registry or
+        # source schema. Preserve those original facts on an existing header.
+        with self._db.engine.connect() as conn:
+            header = conn.execute(select(runs_table).where(runs_table.c.run_id == binding.run_id)).one_or_none()
+            run = (
+                None
+                if header is None
+                else self._observe_permitted_run_on(
+                    conn,
+                    binding,
+                    config_hash=stable_hash(config),
+                    canonical_version=canonical_version,
+                    openrouter_catalog_sha256=openrouter_catalog_sha256,
+                    openrouter_catalog_source=openrouter_catalog_source,
+                    initiated_by_user_id=initiated_by_user_id,
+                    auth_provider_type=auth_provider_type,
+                    source_schema_json=header.source_schema_json,
+                    runtime_val_manifest_json=header.runtime_val_manifest_json,
+                    web_plugin_policy_evidence=web_plugin_policy_evidence,
+                )
+            )
+        if run is None:
+            run = self.begin_run(
+                config,
+                canonical_version,
+                run_id=binding.run_id,
+                openrouter_catalog_sha256=openrouter_catalog_sha256,
+                openrouter_catalog_source=openrouter_catalog_source,
+                initiated_by_user_id=initiated_by_user_id,
+                auth_provider_type=auth_provider_type,
+                web_plugin_policy_evidence=web_plugin_policy_evidence,
+                leader_worker_id=worker_id,
+                run_start_permit=binding,
+            )
+        if run.status in _TERMINAL_RUN_STATUSES:
+            return run
+        admission = RunStartAdmissionRepository(self._db).observe(binding)
+        if admission is None or admission.state is not RunStartAdmissionState.PREPARED:
+            raise AuditIntegrityError("Cancellation materialization requires a prepared admission")
+        leader = self._coordination_repo.live_leader(run_id=binding.run_id)
+        if leader is not None and leader.leader_worker_id == worker_id:
+            # This invocation just minted this identity. No prior owner's
+            # token can reach this arm, including an exact duplicate retry.
+            token = CoordinationToken(binding.run_id, worker_id, leader.leader_epoch)
+        else:
+            token = self._coordination_repo.acquire_run_leadership(
+                run_id=binding.run_id,
+                worker_id=worker_id,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                entry_point="cancel-prepared",
+            )
+        try:
+            if pre_effect_guard is not None:
+                pre_effect_guard()
+            # The pre-acquisition observation was advisory. A predecessor may
+            # have crossed the first-effect boundary before losing its seat.
+            admission = RunStartAdmissionRepository(self._db).observe(binding)
+            if admission is None or admission.state is not RunStartAdmissionState.PREPARED:
+                raise AuditIntegrityError("Prepared cancellation lost its pre-effect baseline")
+            self.complete_run(RunStatus.INTERRUPTED, coordination_token=token)
+        finally:
+            self._coordination_repo.release_seat(token=token)
+        result = self.get_run(binding.run_id)
+        if result is None:
+            raise AuditIntegrityError("Cancelled admission lost its run record")
+        return result
+
+    def _insert_web_plugin_policy_evidence(
+        self,
+        conn: Connection,
+        *,
+        run_id: str,
+        evidence: WebPluginPolicyEvidence,
+    ) -> None:
+        """Compose the optional epoch-23 evidence row into begin_run's transaction."""
+        conn.execute(
+            run_web_plugin_policy_table.insert().values(
+                run_id=run_id,
+                schema_version=evidence.schema_version,
+                policy_hash=evidence.policy_hash,
+                snapshot_hash=evidence.snapshot_hash,
+                authorized_plugin_ids_json=canonical_json(evidence.authorized_plugin_ids),
+                available_plugin_ids_json=canonical_json(evidence.available_plugin_ids),
+                control_modes_json=canonical_json(evidence.control_modes),
+                selected_implementations_json=canonical_json(evidence.selected_implementations),
+                selected_profile_aliases_json=canonical_json(evidence.selected_profile_aliases),
+                plugin_code_identities_json=canonical_json(evidence.plugin_code_identities),
+                binding_generation_fingerprint=evidence.binding_generation_fingerprint,
+                decision_codes_json=canonical_json(evidence.decision_codes),
+                admission_decision_json=(
+                    evidence.admission_decision.model_dump_json() if evidence.admission_decision is not None else None
+                ),
+                admission_decision_hash=(evidence.admission_decision.canonical_hash if evidence.admission_decision is not None else None),
+            )
+        )
+
+    def get_web_plugin_policy_evidence(self, run_id: str) -> WebPluginPolicyEvidence | None:
+        """Return the optional web-policy evidence row, failing on corrupt JSON."""
+        with self._db.read_only_connection() as conn:
+            row = conn.execute(select(run_web_plugin_policy_table).where(run_web_plugin_policy_table.c.run_id == run_id)).one_or_none()
+        if row is None:
+            return None
+        try:
+            return WebPluginPolicyEvidence(
+                schema_version=row.schema_version,
+                policy_hash=row.policy_hash,
+                snapshot_hash=row.snapshot_hash,
+                authorized_plugin_ids=tuple(json.loads(row.authorized_plugin_ids_json)),
+                available_plugin_ids=tuple(json.loads(row.available_plugin_ids_json)),
+                control_modes=tuple(tuple(item) for item in json.loads(row.control_modes_json)),
+                selected_implementations=tuple(tuple(item) for item in json.loads(row.selected_implementations_json)),
+                selected_profile_aliases=tuple(tuple(item) for item in json.loads(row.selected_profile_aliases_json)),
+                plugin_code_identities=tuple(tuple(item) for item in json.loads(row.plugin_code_identities_json)),
+                binding_generation_fingerprint=row.binding_generation_fingerprint,
+                decision_codes=tuple(json.loads(row.decision_codes_json)),
+                admission_decision=decode_admission_decision(row.admission_decision_json, row.admission_decision_hash),
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AuditIntegrityError(f"Web plugin-policy evidence is corrupt for run {run_id}") from exc
+
+    def complete_run(
+        self,
+        status: RunStatus,
+        *,
+        reproducibility_grade: ReproducibilityGrade | None = None,
+        coordination_token: CoordinationToken,
+    ) -> Run:
+        """Complete the run the token leads (§D run finalization, ADR-030 / ADR-048).
+
+        One leader-fenced write transaction carries, in order:
+
+        1. the verify-and-extend leader epoch fence (FIRST statement) — a
+           deposed leader's finalize is refused with
+           ``RunLeadershipLostError`` and a ``fence_refusal`` event;
+        2. lock the active follower roster before run or token writes, in the
+           same membership-before-token order used by follower audit writes;
+        3. the terminal conditional UPDATE — for SUCCESS statuses
+           (COMPLETED / COMPLETED_WITH_FAILURES / EMPTY) it carries the
+           in-statement quiescence arm ``NOT EXISTS (READY/LEASED/BLOCKED/
+           PENDING_SINK token_work_items)`` so a run can never be stamped
+           successful over residual scheduler work, and a second arm
+           ``NOT EXISTS (token of the run with no completed token_outcomes
+           row)`` so it is never stamped successful over a row that has not
+           reached a recorded outcome — a claim that died mid-row, or a token
+           no scheduler work covers; FAILED/INTERRUPTED check only fence +
+           immutability (the journal is left intact for resume);
+        4. ADR-038 abandonment of undecided tokens when the run is
+           non-resumable, plus fail-open of effect-linked operations;
+        5. follower departure hygiene (no-op at N=1) + ``worker_depart``
+           events;
+        6. the ``finalize`` run_coordination event.
+
+        The run is ``coordination_token.run_id``: there is no second run id
+        to disagree with the authority (ADR-048 §2).
+
+        rowcount-0 diagnosis order (§D): **already-terminal ⇒
+        AuditIntegrityError** (the durable immutability backstop — this
+        diagnosis wins even over a fence miss: a deposed leader finalizing a
+        run the new leader already finalized is re-diagnosed from
+        ``RunLeadershipLostError`` to the already-terminal refusal, the
+        fence_refusal event standing as forensics); **fence mismatch on a
+        non-terminal run ⇒ RunLeadershipLostError**; **residual work ⇒
+        OrchestrationInvariantError**; run-not-found ⇒ AuditIntegrityError.
+
+        Raises:
+            AuditIntegrityError: If status is not a terminal run status
+            AuditIntegrityError: If the run is not found or already terminal
+            OrchestrationInvariantError: If a SUCCESS finalize found residual
+                scheduler work, or a token with no completed terminal outcome
+                (quiescence violation)
+            RunLeadershipLostError: If ``coordination_token`` is stale
+        """
+        if status not in _TERMINAL_RUN_STATUSES:
+            raise AuditIntegrityError(
+                f"complete_run() requires terminal status, got {status.value!r}. "
+                f"Valid terminal statuses: {sorted(s.value for s in _TERMINAL_RUN_STATUSES)}"
+            )
+
+        timestamp = now()
+
+        # Only include reproducibility_grade in UPDATE when explicitly provided.
+        # Passing None would overwrite an existing grade with NULL (Bug 318f74).
+        values: dict[str, Any] = {
+            "status": status.value,
+            "completed_at": timestamp,
+        }
+        if reproducibility_grade is not None:
+            values["reproducibility_grade"] = reproducibility_grade
+
+        # §D quiescence predicate: a SUCCESS terminal status asserts the
+        # journal is quiescent, in the SAME statement that stamps it.
+        is_success_status = status in _IMMUTABLE_SUCCESS_RUN_STATUSES
+        residual_work_exists = (
+            select(token_work_items_table.c.work_item_id)
+            .where(token_work_items_table.c.run_id == coordination_token.run_id)
+            .where(
+                token_work_items_table.c.status.in_(
+                    (
+                        TokenWorkStatus.READY.value,
+                        TokenWorkStatus.LEASED.value,
+                        TokenWorkStatus.BLOCKED.value,
+                        TokenWorkStatus.PENDING_SINK.value,
+                    )
+                )
+            )
+            .exists()
+        )
+        terminal_values = [s.value for s in _TERMINAL_RUN_STATUSES]
+
+        try:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="complete_run",
+            ) as conn:
+                self._complete_run_in(
+                    conn,
+                    run_id=coordination_token.run_id,
+                    status=status,
+                    values=values,
+                    is_success_status=is_success_status,
+                    residual_work_exists=residual_work_exists,
+                    terminal_values=terminal_values,
+                    timestamp=timestamp,
+                    coordination_token=coordination_token,
+                )
+        except RunLeadershipLostError:
+            # §D rowcount-0 diagnosis ORDER: already-terminal wins over fence.
+            # The fence is structurally the FIRST statement of the fenced
+            # transaction, so it discriminates its arm before the terminal
+            # UPDATE can — but a deposed leader finalizing a run the new
+            # leader already finalized is, to the operator, an immutability
+            # outcome, not a coordination one. Re-diagnose on a plain read
+            # connection (the refused transaction has rolled back; the
+            # fence_refusal event stands as honest forensics that a fence
+            # WAS refused).
+            existing_status = self._terminal_status_after_refusal(coordination_token.run_id, terminal_values=terminal_values)
+            if existing_status is not None:
+                raise _already_terminal_error(coordination_token.run_id, existing_status) from None
+            raise
+
+        run = self.get_run(coordination_token.run_id)
+        if run is None:
+            raise AuditIntegrityError(
+                f"Run {coordination_token.run_id} not found after UPDATE - database corruption or transaction failure"
+            )
+        return run
+
+    def _terminal_status_after_refusal(self, run_id: str, *, terminal_values: list[str]) -> str | None:
+        """The run's status when it is already terminal, read after a refused fence; else None."""
+        with self._db.engine.connect() as read_conn:
+            existing = read_conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).fetchone()
+        if existing is not None and existing.status in terminal_values:
+            return str(existing.status)
+        return None
+
+    def _complete_run_in(
+        self,
+        conn: Connection,
+        *,
+        run_id: str,
+        status: RunStatus,
+        values: Mapping[str, object],
+        is_success_status: bool,
+        residual_work_exists: Any,
+        terminal_values: list[str],
+        timestamp: datetime,
+        coordination_token: CoordinationToken,
+    ) -> None:
+        """The fenced transaction body of :meth:`complete_run`, on the caller's fenced connection."""
+        # Follower audit writes hold membership before token rows. Acquire the
+        # departure roster in that order too, before abandonment can hold a
+        # token needed by an in-flight follower. Admission also locks the seat,
+        # so no new follower can enter after this roster has been locked.
+        follower_ids = (
+            conn.execute(
+                select(run_workers_table.c.worker_id)
+                .where(run_workers_table.c.run_id == run_id)
+                .where(run_workers_table.c.status == "active")
+                .where(run_workers_table.c.role == "follower")
+                .order_by(run_workers_table.c.worker_id)
+                .with_for_update()
+            )
+            .scalars()
+            .all()
+        )
+        # Every token of a successful run has exactly one completed outcome
+        # (the partial unique index caps it at one, so NOT EXISTS of a decided
+        # outcome is the whole check). An undecided token is a row that never
+        # reached a recorded outcome, whatever left it so: a claim that died
+        # mid-row (a FAILED item, which resume returns to READY), or a token
+        # with no scheduler work at all, which quiescence alone cannot see.
+        undecided_tokens = select(tokens_table.c.token_id).where(tokens_table.c.run_id == run_id).where(~token_decided_clause())
+        # The SUCCESS quiescence arms ride in the SAME statement as the stamp;
+        # ``where()`` with no clauses is a no-op for the FAILED/INTERRUPTED arm.
+        quiescence_clauses = [~residual_work_exists, ~undecided_tokens.exists()] if is_success_status else []
+        state_llm_calls = (
+            select(func.count())
+            .select_from(calls_table.join(node_states_table, calls_table.c.state_id == node_states_table.c.state_id))
+            .where(node_states_table.c.run_id == run_id, calls_table.c.call_type == CallType.LLM.value)
+            .scalar_subquery()
+        )
+        operation_llm_calls = (
+            select(func.count())
+            .select_from(calls_table.join(operations_table, calls_table.c.operation_id == operations_table.c.operation_id))
+            .where(operations_table.c.run_id == run_id, calls_table.c.call_type == CallType.LLM.value)
+            .scalar_subquery()
+        )
+        result = conn.execute(
+            runs_table.update()
+            .where(runs_table.c.run_id == run_id)
+            .where(runs_table.c.status.notin_(terminal_values))
+            .where(*quiescence_clauses)
+            .values(**values, llm_call_count=state_llm_calls + operation_llm_calls)
+        )
+        if result.rowcount == 0:
+            existing = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).fetchone()
+            if existing is not None and existing.status in terminal_values:
+                raise _already_terminal_error(run_id, str(existing.status))
+            if existing is None:
+                raise AuditIntegrityError(f"Cannot complete run {run_id}: run not found")
+            # Run exists, not terminal ⇒ a quiescence arm refused
+            # (only reachable for SUCCESS statuses).
+            if conn.execute(select(residual_work_exists)).scalar_one():
+                raise OrchestrationInvariantError(
+                    f"Cannot complete run {run_id} as {status.value!r}: residual scheduler work "
+                    "(READY/LEASED/BLOCKED/PENDING_SINK token_work_items rows) exists. A run "
+                    "cannot be stamped successful over an unquiesced journal (ADR-030 §D)."
+                )
+            undecided_count = conn.execute(select(func.count()).select_from(undecided_tokens.subquery())).scalar_one()
+            first_undecided = conn.execute(undecided_tokens.order_by(tokens_table.c.token_id).limit(10)).scalars().all()
+            raise OrchestrationInvariantError(
+                f"Cannot complete run {run_id} as {status.value!r}: {undecided_count} token(s) have no completed "
+                f"terminal outcome (first 10: {list(first_undecided)!r}). A run cannot be stamped successful while "
+                "a row has not reached a recorded outcome. A token whose claim died mid-row (a FAILED work item) is "
+                "returned to READY and re-driven by `elspeth resume`; a token with no scheduler work at all cannot "
+                "be re-driven and resume refuses it."
+            )
+
+        # ADR-038 fate decision: the terminal stamp above succeeded, so the
+        # run is now immutably dead and its resumability facts are frozen.
+        # If no resume can ever decide the run's undecided tokens, record
+        # that — inside this same fenced transaction, so a deposed leader's
+        # refused stamp never leaves false abandonment records behind.
+        if status in (RunStatus.FAILED, RunStatus.INTERRUPTED):
+            non_resumable_arms, incomplete_sources = self._non_resumability_in(conn, run_id=run_id)
+            if non_resumable_arms:
+                self._abandon_undecided_tokens_in(
+                    conn,
+                    run_id=run_id,
+                    status=status,
+                    non_resumable_arms=non_resumable_arms,
+                    incomplete_sources=incomplete_sources,
+                )
+                self._operations_repo.fail_open_effect_operations_for_run(
+                    run_id,
+                    completed_at=timestamp,
+                    error_message=_NON_RESUMABLE_EFFECT_OPERATION_ERROR,
+                    conn=conn,
+                )
+
+        # §D follower-departure hygiene (no-op at N=1, evented).
+        if follower_ids:
+            conn.execute(
+                run_workers_table.update()
+                .where(run_workers_table.c.worker_id.in_(follower_ids))
+                .where(run_workers_table.c.status == "active")
+                .values(status="departed", departed_at=timestamp)
+            )
+
+        # §D ledger rows for this finalize — one ``worker_depart`` per departed
+        # follower and the ``finalize`` event attributed to the fencing token —
+        # in ONE statement (ADR-048: a helper's DML executes once per fence,
+        # never per iteration).
+        record_coordination_events(
+            conn,
+            run_id=run_id,
+            events=(
+                *(
+                    CoordinationEventRow(
+                        event_type="worker_depart",
+                        worker_id=follower_id,
+                        leader_epoch=None,
+                        recorded_at=timestamp,
+                        context={"reason": "run_finalized"},
+                    )
+                    for follower_id in follower_ids
+                ),
+                CoordinationEventRow(
+                    event_type="finalize",
+                    worker_id=coordination_token.worker_id,
+                    leader_epoch=coordination_token.leader_epoch,
+                    recorded_at=timestamp,
+                    context={"status": status.value},
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _non_resumability_in(conn: Connection, *, run_id: str) -> tuple[tuple[str, ...], dict[str, str]]:
+        """Compute the structural resume refusal once for all finalization sweeps."""
+        source_states = conn.execute(
+            select(run_sources_table.c.source_name, run_sources_table.c.lifecycle_state).where(run_sources_table.c.run_id == run_id)
+        ).fetchall()
+        incomplete_sources = {
+            str(row.source_name): str(row.lifecycle_state)
+            for row in source_states
+            if str(row.lifecycle_state) not in SOURCE_COMPLETE_LIFECYCLE_STATES
+        }
+        checkpoint_exists = bool(
+            conn.execute(select(select(checkpoints_table.c.checkpoint_id).where(checkpoints_table.c.run_id == run_id).exists())).scalar()
+        )
+        non_resumable_arms: list[str] = []
+        if not checkpoint_exists:
+            non_resumable_arms.append("no_checkpoint")
+        if not source_states:
+            non_resumable_arms.append("no_source_records")
+        if incomplete_sources:
+            non_resumable_arms.append("incomplete_sources")
+        return tuple(non_resumable_arms), incomplete_sources
+
+    def _abandon_undecided_tokens_in(
+        self,
+        conn: Connection,
+        *,
+        run_id: str,
+        status: RunStatus,
+        non_resumable_arms: tuple[str, ...],
+        incomplete_sources: Mapping[str, str],
+    ) -> None:
+        """ADR-038: record (NULL, ABANDONED) for tokens nothing will ever decide.
+
+        Runs inside :meth:`_complete_run_in`'s transaction — only on the
+        FENCED arm (the caller gates on ``token is not None``), after the
+        FAILED/INTERRUPTED terminal UPDATE has succeeded. Fires only when the
+        run is non-resumable, tested arm for arm against the structural
+        refusals a future resume would hit (``engine/orchestrator/resume.py``):
+
+        - no checkpoint rows            → no resume point exists;
+        - no ``run_sources`` records    → ``EmptyResumeStateError``;
+        - any source lifecycle outside ``SOURCE_COMPLETE_LIFECYCLE_STATES``
+                                        → ``IncompleteSourceResumeError``.
+
+        When the run IS resumable, undecided tokens keep their BUFFERED
+        acceptances and accounting stays honestly ``closure='open'`` — a
+        resume may yet decide them. The write is idempotent under the
+        documented re-finalize path (terminal → ``update_run_status(RUNNING)``
+        → re-complete): tokens already bearing an ABANDONED row are excluded.
+        On any other path the terminal UPDATE's already-terminal refusal is
+        the single-winner gate, so the sweep cannot run twice.
+        """
+        decided_or_abandoned = (
+            select(token_outcomes_table.c.outcome_id)
+            .where(token_outcomes_table.c.run_id == run_id)
+            .where(token_outcomes_table.c.token_id == tokens_table.c.token_id)
+            .where(
+                or_(
+                    token_outcomes_table.c.completed == 1,
+                    token_outcomes_table.c.path == TerminalPath.ABANDONED.value,
+                )
+            )
+            .exists()
+        )
+        # PostgreSQL needs two statements under READ COMMITTED. First lock
+        # every token for the dying run in stable order. A single
+        # ``NOT EXISTS ... FOR UPDATE`` statement is insufficient: when it
+        # waits behind a decided writer, the subquery may retain the
+        # statement's pre-wait snapshot and still classify that token as
+        # undecided. The second statement below begins only after all token
+        # locks are held, so it receives a fresh snapshot containing every
+        # outcome committed by a lock winner. Outcome writers use the same
+        # token-first order and, after acquiring it, refuse a pre-existing
+        # ABANDONED row. Together those two arms forbid either race winner
+        # from producing decided-plus-abandoned history.
+        #
+        # SQLite ignores FOR UPDATE, but its BEGIN IMMEDIATE transaction
+        # already owns the single writer slot for both statements.
+        conn.execute(
+            select(tokens_table.c.token_id)
+            .where(tokens_table.c.run_id == run_id)
+            .order_by(tokens_table.c.token_id)
+            .with_for_update(of=tokens_table)
+        ).fetchall()
+        undecided_token_ids = (
+            conn.execute(
+                select(tokens_table.c.token_id)
+                .where(tokens_table.c.run_id == run_id)
+                .where(~decided_or_abandoned)
+                .order_by(tokens_table.c.token_id)
+            )
+            .scalars()
+            .all()
+        )
+        if not undecided_token_ids:
+            return
+
+        context = {
+            "abandoned_by": "run_finalization",
+            "run_status": status.value,
+            "non_resumable_arms": non_resumable_arms,
+            "incomplete_sources": incomplete_sources,
+        }
+        self._outcomes_repo.record_token_outcomes_on(
+            conn,
+            run_id=run_id,
+            outcomes=tuple(
+                TokenOutcomeWrite(
+                    TokenRef(token_id=str(token_id), run_id=run_id),
+                    None,
+                    TerminalPath.ABANDONED,
+                    context=context,
+                )
+                for token_id in undecided_token_ids
+            ),
+            dependencies_prelocked=True,
+        )
+
+    def get_run(self, run_id: str) -> Run | None:
+        """Get a run by ID.
+
+        Args:
+            run_id: Run ID to retrieve
+
+        Returns:
+            Run model or None if not found
+        """
+        query = select(runs_table).where(runs_table.c.run_id == run_id)
+        row = self._ops.execute_fetchone(query)
+        if row is None:
+            return None
+        return self._run_loader.load(row)
+
+    def get_run_attribution(self, run_id: str) -> tuple[str, str] | None:
+        """Return ``(initiated_by_user_id, auth_provider_type)`` for a run if present."""
+        query = select(
+            run_attributions_table.c.initiated_by_user_id,
+            run_attributions_table.c.auth_provider_type,
+        ).where(run_attributions_table.c.run_id == run_id)
+        row = self._ops.execute_fetchone(query)
+        if row is None:
+            return None
+        initiated_by_user_id = row.initiated_by_user_id
+        auth_provider_type = row.auth_provider_type
+        validate_run_attribution(initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type)
+        return initiated_by_user_id, auth_provider_type
+
+    def get_source_schema(self, run_id: str) -> str:
+        """Get source schema JSON for a run (for resume/type restoration).
+
+        Args:
+            run_id: Run to query
+
+        Returns:
+            Source schema JSON string
+
+        Raises:
+            AuditIntegrityError: If run not found or has no source schema
+
+        Note:
+            This encapsulates Landscape schema access for Orchestrator resume.
+            Schema is required for type fidelity when restoring rows from payloads.
+        """
+        query = select(runs_table.c.source_schema_json).where(runs_table.c.run_id == run_id)
+        run_row = self._ops.execute_fetchone(query)
+
+        if run_row is None:
+            raise AuditIntegrityError(f"Run {run_id} not found in database")
+
+        source_schema_json = run_row.source_schema_json
+        if source_schema_json is None:
+            raise AuditIntegrityError(
+                f"Run {run_id} has no source schema stored. "
+                f"This run was created before source schema storage was implemented. "
+                f"Cannot resume without schema - type fidelity would be violated."
+            )
+
+        if type(source_schema_json) is not str:
+            raise AuditIntegrityError(
+                f"Run {run_id} source_schema_json is {type(source_schema_json).__name__}, "
+                f"expected str — audit data corruption (Tier 1 violation)"
+            )
+        return source_schema_json
+
+    def get_runtime_val_manifest(self, run_id: str) -> str:
+        """Get the runtime-VAL manifest captured at run start."""
+        query = select(runs_table.c.runtime_val_manifest_json).where(runs_table.c.run_id == run_id)
+        run_row = self._ops.execute_fetchone(query)
+
+        if run_row is None:
+            raise AuditIntegrityError(f"Run {run_id} not found in database")
+
+        runtime_val_manifest_json = run_row.runtime_val_manifest_json
+        if runtime_val_manifest_json is None:
+            raise AuditIntegrityError(
+                f"Run {run_id} has no runtime VAL manifest stored. "
+                "Resume cannot verify declaration-contract or Tier-1 registry parity "
+                "without this evidence — audit trail is incomplete."
+            )
+
+        if type(runtime_val_manifest_json) is not str:
+            raise AuditIntegrityError(
+                f"Run {run_id} runtime_val_manifest_json is {type(runtime_val_manifest_json).__name__}, "
+                "expected str — audit data corruption (Tier 1 violation)"
+            )
+        return runtime_val_manifest_json
+
+    def record_source_field_resolution(
+        self,
+        resolution_mapping: Mapping[str, str],
+        normalization_version: str | None,
+        *,
+        coordination_token: CoordinationToken,
+    ) -> None:
+        """Record the field resolution mapping computed during source.load().
+
+        This captures the mapping from original header names (as read from the file)
+        to final field names (after normalization and/or field_mapping applied).
+        Must be called after source.load() completes but before processing begins.
+
+        Args:
+            resolution_mapping: Dict mapping original header name → final field name
+            normalization_version: Algorithm version used for normalization, or None if
+                                   no normalization was applied (passthrough or explicit columns)
+            coordination_token: The run's current leader token; the run is its ``run_id``.
+
+        Note:
+            This is necessary because field resolution depends on actual file headers
+            which are only known after load() runs, but node config is registered
+            before load(). Without this, audit trail cannot recover original headers.
+        """
+        resolution_data = {
+            "resolution_mapping": resolution_mapping,
+            "normalization_version": normalization_version,
+        }
+        resolution_json = canonical_json(resolution_data)
+
+        try:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="record_source_field_resolution",
+            ) as conn:
+                result = conn.execute(
+                    runs_table.update()
+                    .where(runs_table.c.run_id == coordination_token.run_id)
+                    .values(source_field_resolution_json=resolution_json)
+                )
+                if result.rowcount == 0:
+                    raise AuditIntegrityError(f"Cannot record source field resolution for run {coordination_token.run_id!r}: run not found")
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(
+                _safe_database_error_message(
+                    operation="record_source_field_resolution",
+                    action="update",
+                    exc=exc,
+                    context=f"run_id={coordination_token.run_id}",
+                )
+            ) from exc
+
+    def record_run_source(
+        self,
+        *,
+        source_node_id: str,
+        source_name: str,
+        plugin_name: str,
+        config_hash: str,
+        lifecycle_state: str | RunSourceLifecycleState,
+        source_schema_json: str | None = None,
+        schema_contract: SchemaContract | None = None,
+        field_resolution_mapping: Mapping[str, str] | None = None,
+        normalization_version: str | None = None,
+        coordination_token: CoordinationToken,
+    ) -> None:
+        """Record per-source run metadata keyed by source node.
+
+        Multi-source runs cannot honestly store schema, field resolution, or
+        lifecycle as run-level singleton columns. This table preserves the
+        configuration source name and source node identity for audit queries.
+        The node existence check, the upsert decision and the write share one
+        leader-fenced transaction (ADR-048).
+        """
+        try:
+            lifecycle = RunSourceLifecycleState(lifecycle_state)
+        except ValueError as exc:
+            allowed = ", ".join(state.value for state in RunSourceLifecycleState)
+            raise AuditIntegrityError(f"Invalid run source lifecycle_state={lifecycle_state!r}; expected one of: {allowed}.") from exc
+
+        schema_contract_json: str | None = None
+        schema_contract_hash: str | None = None
+        if schema_contract is not None:
+            audit_record = ContractAuditRecord.from_contract(schema_contract)
+            schema_contract_json = audit_record.to_json()
+            schema_contract_hash = schema_contract.version_hash()
+
+        field_resolution_json: str | None = None
+        if field_resolution_mapping is not None:
+            field_resolution_json = canonical_json(
+                {
+                    "resolution_mapping": field_resolution_mapping,
+                    "normalization_version": normalization_version,
+                }
+            )
+
+        values = {
+            "source_name": source_name,
+            "plugin_name": plugin_name,
+            "config_hash": config_hash,
+            "schema_json": source_schema_json,
+            "schema_contract_json": schema_contract_json,
+            "schema_contract_hash": schema_contract_hash,
+            "field_resolution_json": field_resolution_json,
+            "lifecycle_state": lifecycle.value,
+            "recorded_at": now(),
+        }
+        try:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="record_run_source",
+            ) as conn:
+                source_node = conn.execute(
+                    select(nodes_table.c.node_type)
+                    .where(nodes_table.c.run_id == coordination_token.run_id)
+                    .where(nodes_table.c.node_id == source_node_id)
+                ).fetchone()
+                if source_node is None:
+                    raise AuditIntegrityError(
+                        f"run_sources source_node_id={source_node_id!r} does not exist for run_id={coordination_token.run_id!r}; "
+                        "per-source resume metadata must reference a registered graph node."
+                    )
+                if source_node.node_type != NodeType.SOURCE.value:
+                    raise AuditIntegrityError(
+                        f"run_sources source_node_id={source_node_id!r} for run_id={coordination_token.run_id!r} references "
+                        f"node_type={source_node.node_type!r}; expected {NodeType.SOURCE.value!r}."
+                    )
+                existing = conn.execute(
+                    select(run_sources_table.c.source_node_id)
+                    .where(run_sources_table.c.run_id == coordination_token.run_id)
+                    .where(run_sources_table.c.source_node_id == source_node_id)
+                ).fetchone()
+                if existing is None:
+                    inserted = conn.execute(
+                        run_sources_table.insert().values(
+                            run_id=coordination_token.run_id,
+                            source_node_id=source_node_id,
+                            **values,
+                        )
+                    )
+                    if inserted.rowcount == 0:
+                        raise LandscapeRecordError("run_sources — zero rows affected (audit write failure)")
+                    return
+                updated = conn.execute(
+                    run_sources_table.update()
+                    .where(run_sources_table.c.run_id == coordination_token.run_id)
+                    .where(run_sources_table.c.source_node_id == source_node_id)
+                    .values(**values)
+                )
+                if updated.rowcount == 0:
+                    raise LandscapeRecordNotFoundError("run_sources — zero rows affected; target row vanished inside the transaction")
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(
+                _safe_database_error_message(
+                    operation="record_run_source",
+                    action="write",
+                    exc=exc,
+                    context=f"run_id={coordination_token.run_id} source_node_id={source_node_id}",
+                )
+            ) from exc
+
+    def update_run_source_contract(
+        self,
+        *,
+        source_node_id: str,
+        schema_contract: SchemaContract,
+        coordination_token: CoordinationToken,
+    ) -> None:
+        """Persist a first-row-inferred schema contract for one source.
+
+        ``record_run_source(..., lifecycle_state="loading")`` runs before a
+        generator source has yielded its first valid row. Observed/flexible
+        sources can only lock their contract at that first row, so the
+        orchestrator must backfill the matching ``run_sources`` row before row
+        processing can fail. Missing rows or mismatched existing contracts are
+        audit corruption, not resume-time data quality issues.
+        """
+        audit_record = ContractAuditRecord.from_contract(schema_contract)
+        schema_contract_json = audit_record.to_json()
+        schema_contract_hash = schema_contract.version_hash()
+        run_id = coordination_token.run_id
+
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="update_run_source_contract",
+        ) as conn:
+            result = conn.execute(
+                run_sources_table.update()
+                .where(run_sources_table.c.run_id == coordination_token.run_id)
+                .where(run_sources_table.c.source_node_id == source_node_id)
+                .where(run_sources_table.c.schema_contract_json.is_(None))
+                .values(
+                    schema_contract_json=schema_contract_json,
+                    schema_contract_hash=schema_contract_hash,
+                    recorded_at=now(),
+                )
+            )
+            if result.rowcount == 1:
+                return
+
+            existing = conn.execute(
+                select(
+                    run_sources_table.c.schema_contract_json,
+                    run_sources_table.c.schema_contract_hash,
+                )
+                .where(run_sources_table.c.run_id == coordination_token.run_id)
+                .where(run_sources_table.c.source_node_id == source_node_id)
+            ).fetchone()
+            if existing is None:
+                raise AuditIntegrityError(
+                    f"Cannot update source schema contract for run {run_id} source_node_id={source_node_id!r}: "
+                    "run_sources row does not exist."
+                )
+            if existing.schema_contract_json is None:
+                raise AuditIntegrityError(
+                    f"Cannot update source schema contract for run {run_id} source_node_id={source_node_id!r}: "
+                    "contract JSON is NULL but conditional update affected no rows."
+                )
+            if existing.schema_contract_hash is None:
+                raise AuditIntegrityError(
+                    f"Cannot update source schema contract for run {run_id} source_node_id={source_node_id!r}: "
+                    "existing contract JSON has no hash."
+                )
+            existing_contract = ContractAuditRecord.from_json(existing.schema_contract_json).to_schema_contract()
+            existing_hash = existing_contract.version_hash()
+            if existing_hash != existing.schema_contract_hash:
+                raise AuditIntegrityError(
+                    f"Existing source schema contract hash mismatch for run {run_id} source_node_id={source_node_id!r}: "
+                    f"stored={existing.schema_contract_hash}, recomputed={existing_hash}."
+                )
+            if existing.schema_contract_hash != schema_contract_hash:
+                raise AuditIntegrityError(
+                    f"Cannot overwrite source schema contract for run {run_id} source_node_id={source_node_id!r}: "
+                    f"existing={existing.schema_contract_hash}, new={schema_contract_hash}."
+                )
+
+    def get_run_source_resume_records(self, run_id: str) -> dict[str, RunSourceResumeRecord]:
+        """Return per-source schema and contract records for resume.
+
+        The returned mapping is keyed by ``source_node_id`` because rows carry
+        source-node identity. Missing schema or contract data is audit
+        corruption for resume: replaying rows without it would either lose type
+        fidelity or apply the wrong schema contract.
+        """
+        rows = self._ops.execute_fetchall(
+            select(
+                run_sources_table.c.source_node_id,
+                run_sources_table.c.source_name,
+                run_sources_table.c.lifecycle_state,
+                run_sources_table.c.schema_json,
+                run_sources_table.c.schema_contract_json,
+                run_sources_table.c.schema_contract_hash,
+            ).where(run_sources_table.c.run_id == run_id)
+        )
+        records: dict[str, RunSourceResumeRecord] = {}
+        for row in rows:
+            if row.schema_json is None:
+                raise AuditIntegrityError(
+                    f"Run {run_id} source {row.source_name!r} ({row.source_node_id}) has no source schema stored. "
+                    "Resume cannot preserve type fidelity without per-source schema JSON."
+                )
+            if row.schema_contract_json is None:
+                raise AuditIntegrityError(
+                    f"Run {run_id} source {row.source_name!r} ({row.source_node_id}) has no schema contract stored. "
+                    "Resume cannot safely wrap rows without the source-scoped contract."
+                )
+            if row.schema_contract_hash is None:
+                raise AuditIntegrityError(
+                    f"Run {run_id} source {row.source_name!r} ({row.source_node_id}) has contract JSON but no contract hash."
+                )
+            contract = ContractAuditRecord.from_json(row.schema_contract_json).to_schema_contract()
+            if contract.version_hash() != row.schema_contract_hash:
+                raise AuditIntegrityError(
+                    f"Run {run_id} source {row.source_name!r} ({row.source_node_id}) contract hash mismatch. "
+                    f"Expected {row.schema_contract_hash}, got {contract.version_hash()}."
+                )
+            records[row.source_node_id] = RunSourceResumeRecord(
+                source_node_id=row.source_node_id,
+                source_name=row.source_name,
+                lifecycle_state=row.lifecycle_state,
+                source_schema_json=row.schema_json,
+                schema_contract=contract,
+            )
+        return records
+
+    def get_run_source_config_hashes(self, run_id: str) -> dict[str, str]:
+        """Return stored source configuration identities for early archive admission."""
+        rows = self._ops.execute_fetchall(
+            select(run_sources_table.c.source_node_id, run_sources_table.c.config_hash).where(run_sources_table.c.run_id == run_id)
+        )
+        return {row.source_node_id: row.config_hash for row in rows}
+
+    def get_run_source_lifecycle_records(self, run_id: str) -> dict[str, RunSourceLifecycleRecord]:
+        """Return per-source lifecycle records without requiring replay schemas.
+
+        Resume must refuse incomplete sources before reconstructing row replay
+        schemas. A declared source that never started is intentionally
+        lifecycle_state=ready and may not yet have first-row-inferred contract
+        data; treating that as schema corruption would hide the clearer
+        source-exhaustion refusal.
+        """
+        rows = self._ops.execute_fetchall(
+            select(
+                run_sources_table.c.source_node_id,
+                run_sources_table.c.source_name,
+                run_sources_table.c.lifecycle_state,
+                run_sources_table.c.schema_json,
+                run_sources_table.c.field_resolution_json,
+            ).where(run_sources_table.c.run_id == run_id)
+        )
+        return {
+            row.source_node_id: RunSourceLifecycleRecord(
+                source_node_id=row.source_node_id,
+                source_name=row.source_name,
+                lifecycle_state=row.lifecycle_state,
+                source_schema_json=row.schema_json,
+                normalization_version=(
+                    json.loads(row.field_resolution_json)["normalization_version"] if row.field_resolution_json is not None else None
+                ),
+            )
+            for row in rows
+        }
+
+    def get_source_field_resolution(self, run_id: str) -> dict[str, str] | None:
+        """Get source field resolution mapping for a run.
+
+        Returns the mapping from original header names to final (normalized) field names.
+        Used by sinks with headers: original to restore original headers.
+
+        Args:
+            run_id: Run to query
+
+        Returns:
+            Dict mapping original header name -> final field name, or None if no
+            field resolution was recorded.
+
+        Note:
+            For reverse lookup (final -> original), callers should invert this dict:
+            `{v: k for k, v in mapping.items()}`
+        """
+        query = select(runs_table.c.source_field_resolution_json).where(runs_table.c.run_id == run_id)
+        result = self._ops.execute_fetchone(query)
+
+        if result is None:
+            raise AuditIntegrityError(f"Run {run_id} not found in database")
+
+        resolution_json = result.source_field_resolution_json
+        if resolution_json is None:
+            return None
+
+        return self._parse_field_resolution_mapping(
+            run_id=run_id,
+            resolution_json=resolution_json,
+            location="run-level source_field_resolution_json",
+        )
+
+    def get_source_field_resolutions(self, run_id: str) -> dict[str, RunSourceFieldResolutionRecord]:
+        """Get source-scoped field resolution mappings for a run.
+
+        Multi-source runs store field resolution by ``source_node_id``. A
+        ``None`` mapping is preserved for sources that did not record one so
+        callers can distinguish "single missing mapping" from "no source
+        metadata exists".
+        """
+        run_exists = self._ops.execute_fetchone(select(runs_table.c.run_id).where(runs_table.c.run_id == run_id))
+        if run_exists is None:
+            raise AuditIntegrityError(f"Run {run_id} not found in database")
+
+        rows = self._ops.execute_fetchall(
+            select(
+                run_sources_table.c.source_node_id,
+                run_sources_table.c.source_name,
+                run_sources_table.c.field_resolution_json,
+            )
+            .where(run_sources_table.c.run_id == run_id)
+            .order_by(run_sources_table.c.source_name, run_sources_table.c.source_node_id)
+        )
+        records: dict[str, RunSourceFieldResolutionRecord] = {}
+        for row in rows:
+            mapping = None
+            if row.field_resolution_json is not None:
+                mapping = self._parse_field_resolution_mapping(
+                    run_id=run_id,
+                    resolution_json=row.field_resolution_json,
+                    location=f"run_sources field_resolution_json for source {row.source_name!r} ({row.source_node_id})",
+                )
+            records[row.source_node_id] = RunSourceFieldResolutionRecord(
+                source_node_id=row.source_node_id,
+                source_name=row.source_name,
+                resolution_mapping=mapping,
+            )
+        return records
+
+    def get_resume_field_resolution(self, run_id: str) -> dict[str, str] | None:
+        """Return the only safe field-resolution mapping for sink resume.
+
+        Current sink resume hooks accept one mapping per sink, not one mapping
+        per source token. For multi-source runs, using the legacy run-level
+        singleton can silently apply the wrong source's original headers. This
+        method fails closed unless every recorded source mapping is present and
+        identical.
+        """
+        source_records = self.get_source_field_resolutions(run_id)
+        if not source_records:
+            return self.get_source_field_resolution(run_id)
+
+        if len(source_records) == 1:
+            record = next(iter(source_records.values()))
+            if record.resolution_mapping is not None:
+                return dict(record.resolution_mapping)
+            return self.get_source_field_resolution(run_id)
+
+        missing_sources = [record.source_name for record in source_records.values() if record.resolution_mapping is None]
+        if missing_sources:
+            missing = ", ".join(sorted(missing_sources))
+            raise AuditIntegrityError(
+                f"Cannot resume headers: original for multi-source run {run_id}: "
+                f"source field-resolution mapping is missing for source(s): {missing}. "
+                "A single sink resume mapping would be ambiguous."
+            )
+
+        by_fingerprint: dict[str, dict[str, str]] = {}
+        by_fingerprint_sources: dict[str, list[str]] = {}
+        for record in source_records.values():
+            if record.resolution_mapping is None:
+                raise AssertionError("missing_sources gate should have rejected None mappings")
+            fingerprint = canonical_json(record.resolution_mapping)
+            if fingerprint not in by_fingerprint:
+                by_fingerprint[fingerprint] = dict(record.resolution_mapping)
+                by_fingerprint_sources[fingerprint] = []
+            by_fingerprint_sources[fingerprint].append(record.source_name)
+
+        if len(by_fingerprint) > 1:
+            source_groups = [f"{', '.join(sorted(source_names))}" for source_names in by_fingerprint_sources.values()]
+            raise AuditIntegrityError(
+                f"Cannot resume headers: original for multi-source run {run_id}: "
+                "recorded sources have different original-header mappings "
+                f"({'; '.join(source_groups)}). The current sink resume contract accepts "
+                "one mapping, so resume must use a source-scoped sink path or fail closed."
+            )
+
+        return next(iter(by_fingerprint.values()))
+
+    def _parse_field_resolution_mapping(
+        self,
+        *,
+        run_id: str,
+        resolution_json: str,
+        location: str,
+    ) -> dict[str, str]:
+        # Parse the stored JSON structure. This is Tier 1 (our data) — crash on any anomaly.
+        try:
+            resolution_data = json.loads(resolution_json)
+        except json.JSONDecodeError as exc:
+            raise AuditIntegrityError(
+                f"Corrupt field resolution JSON for run {run_id} in {location}: "
+                f"failed to parse stored JSON — database corruption (Tier 1 violation). "
+                f"Parse error: {exc}"
+            ) from exc
+        # Tier 1 (our data): record_source_field_resolution() always stores
+        # {"resolution_mapping": {str: str}}. Direct access — shape corruption
+        # crashes as AuditIntegrityError derived from the NATURAL failure
+        # (KeyError/TypeError/AttributeError), never from a defensive
+        # isinstance re-check of our own fixed contract (ADR-032).
+        try:
+            resolution_mapping = resolution_data["resolution_mapping"]
+        except KeyError as exc:
+            raise AuditIntegrityError(
+                f"Corrupt field resolution data for run {run_id} in {location}: "
+                f"missing required key 'resolution_mapping'. "
+                f"This indicates database corruption — field resolution writers always store this key."
+            ) from exc
+        except TypeError as exc:
+            raise AuditIntegrityError(
+                f"Corrupt field resolution data for run {run_id} in {location}: expected dict, got {type(resolution_data).__name__}"
+            ) from exc
+
+        try:
+            entries = resolution_mapping.items()
+        except AttributeError as exc:
+            raise AuditIntegrityError(
+                f"Corrupt resolution_mapping for run {run_id} in {location}: expected dict, got {type(resolution_mapping).__name__}"
+            ) from exc
+
+        validated_mapping: dict[str, str] = {}
+        for key, value in entries:
+            # json.loads guarantees str keys; values must be exactly str per
+            # the writer's fixed contract — exact-type check, crash on
+            # corruption (no hypothetical-deserializer key re-check).
+            if type(value) is not str:
+                raise AuditIntegrityError(
+                    f"Corrupt resolution_mapping entry for run {run_id} in {location}: "
+                    f"expected str->str, got {type(key).__name__}->{type(value).__name__}"
+                )
+            validated_mapping[key] = value
+
+        return validated_mapping
+
+    def update_run_status(self, status: RunStatus, *, coordination_token: CoordinationToken) -> None:
+        """Update the led run's status without setting completed_at.
+
+        Used for intermediate status changes. For final completion, use
+        complete_run() instead. (Epoch 21: the resume path's FAILED/
+        INTERRUPTED→RUNNING flip no longer goes through this verb — it rides
+        the ``acquire_run_leadership`` takeover CAS transaction, ADR-030
+        §B.4.)
+
+        Args:
+            status: New RunStatus
+            coordination_token: Leader fencing token (ADR-030 §C.4 row 4,
+                ADR-048). The verify-and-extend epoch fence is the FIRST
+                statement of this verb's transaction; the immutability
+                predicates stay beneath as the durable backstop.
+
+        Raises:
+            AuditIntegrityError: If the run is not found or its status is COMPLETED (immutable)
+            RunLeadershipLostError: If ``coordination_token`` is stale
+
+        Note:
+            COMPLETED runs are immutable — a completed run succeeded and its audit
+            record is final. FAILED and INTERRUPTED runs CAN be transitioned back
+            to RUNNING during resume (orchestrator recovery path).
+        """
+        if status in _IMMUTABLE_SUCCESS_RUN_STATUSES:
+            raise AuditIntegrityError(
+                f"update_run_status() cannot set status to {status.value!r}. "
+                "Use complete_run() so completed_at is recorded in the audit trail."
+            )
+        run_id = coordination_token.run_id
+
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="update_run_status",
+        ) as conn:
+            # When resuming to RUNNING, clear completed_at atomically.
+            # A run cannot be simultaneously RUNNING and completed — that's
+            # an impossible state that confuses operational tooling and auditors.
+            values: dict[str, Any] = {"status": status.value}
+            if status == RunStatus.RUNNING:
+                values["completed_at"] = None
+                values["reproducibility_grade"] = None
+            result = conn.execute(
+                runs_table.update()
+                .where(runs_table.c.run_id == coordination_token.run_id)
+                .where(runs_table.c.status.notin_(_IMMUTABLE_SUCCESS_RUN_STATUS_VALUES))
+                .values(**values)
+            )
+            if result.rowcount == 0:
+                existing = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == coordination_token.run_id)).fetchone()
+                if existing is not None and existing.status in _IMMUTABLE_SUCCESS_RUN_STATUS_VALUES:
+                    existing_status = RunStatus(existing.status)
+                    raise AuditIntegrityError(
+                        f"Cannot transition run {run_id} from {existing_status.name} ({existing_status.value!r}) to {status.value!r}. "
+                        f"Successful terminal runs are immutable. "
+                        f"FAILED/INTERRUPTED runs can be resumed via update_run_status."
+                    )
+                raise AuditIntegrityError(f"Cannot update run status to {status.value!r}: run {run_id} not found")
+
+    def record_secret_resolutions(
+        self,
+        resolutions: list[SecretResolutionInput],
+        *,
+        coordination_token: CoordinationToken,
+    ) -> None:
+        """Record secret resolution events from deferred records.
+
+        Called by orchestrator after run is created. The resolution records
+        were captured during load_secrets_from_config() before the run existed.
+
+        All rows go in ONE leader-fenced INSERT — either all resolutions are
+        recorded or none are.
+
+        Args:
+            resolutions: Typed resolution records from load_secrets_from_config().
+            coordination_token: The run's current leader token; the run is its ``run_id``.
+        """
+        if not resolutions:
+            return
+        rows = [
+            {
+                "resolution_id": generate_id(),
+                "run_id": coordination_token.run_id,
+                "timestamp": rec.timestamp,
+                "env_var_name": rec.env_var_name,
+                "source": rec.source,
+                "vault_url": rec.vault_url,
+                "secret_name": rec.secret_name,
+                "fingerprint": rec.fingerprint,
+                "resolution_latency_ms": rec.resolution_latency_ms,
+            }
+            for rec in resolutions
+        ]
+        try:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="record_secret_resolutions",
+            ) as conn:
+                conn.execute(secret_resolutions_table.insert(), rows)
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(
+                _safe_database_error_message(
+                    operation="record_secret_resolutions",
+                    action="write",
+                    exc=exc,
+                    context=f"run_id={coordination_token.run_id}",
+                )
+            ) from exc
+
+    def get_secret_resolutions_for_run(self, run_id: str) -> list[SecretResolution]:
+        """Get all secret resolution records for a run.
+
+        These records document which secrets were loaded from Key Vault
+        for this run, including their HMAC fingerprints (not values).
+
+        Args:
+            run_id: Run ID to query
+
+        Returns:
+            List of SecretResolution models, ordered by timestamp
+        """
+        query = (
+            select(secret_resolutions_table)
+            .where(secret_resolutions_table.c.run_id == run_id)
+            .order_by(secret_resolutions_table.c.timestamp)
+        )
+        db_rows = self._ops.execute_fetchall(query)
+        return [
+            SecretResolution(
+                resolution_id=row.resolution_id,
+                run_id=row.run_id,
+                timestamp=row.timestamp,
+                env_var_name=row.env_var_name,
+                source=row.source,
+                vault_url=row.vault_url,
+                secret_name=row.secret_name,
+                fingerprint=row.fingerprint,
+                resolution_latency_ms=row.resolution_latency_ms,
+            )
+            for row in db_rows
+        ]
+
+    def record_preflight_results(
+        self,
+        preflight: PreflightResult,
+        *,
+        coordination_token: CoordinationToken,
+    ) -> None:
+        """Record pre-flight dependency and gate results in the audit trail.
+
+        Called by orchestrator after run is created. Pre-flight results were
+        captured during bootstrap_and_run() before the run existed.
+
+        All rows go in ONE leader-fenced INSERT.
+
+        Args:
+            preflight: Combined pre-flight results (dependencies + gates)
+            coordination_token: The run's current leader token; the run is its ``run_id``.
+        """
+        rows_to_insert = []
+
+        for dep in preflight.dependency_runs:
+            rows_to_insert.append(
+                {
+                    "result_id": generate_id(),
+                    "run_id": coordination_token.run_id,
+                    "result_type": "dependency_run",
+                    "name": dep.name,
+                    "result_json": canonical_json(
+                        {
+                            "run_id": dep.run_id,
+                            "settings_hash": dep.settings_hash,
+                            "duration_ms": dep.duration_ms,
+                            "indexed_at": dep.indexed_at,
+                        }
+                    ),
+                    "created_at": now(),
+                }
+            )
+
+        for gate in preflight.gate_results:
+            rows_to_insert.append(
+                {
+                    "result_id": generate_id(),
+                    "run_id": coordination_token.run_id,
+                    "result_type": "commencement_gate",
+                    "name": gate.name,
+                    "result_json": canonical_json(
+                        {
+                            "condition": gate.condition,
+                            "result": gate.result,
+                            "context_snapshot": deep_thaw(gate.context_snapshot),
+                        }
+                    ),
+                    "created_at": now(),
+                }
+            )
+
+        if not rows_to_insert:
+            return
+
+        try:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="record_preflight_results",
+            ) as conn:
+                conn.execute(preflight_results_table.insert(), rows_to_insert)
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(
+                _safe_database_error_message(
+                    operation="record_preflight_results",
+                    action="write",
+                    exc=exc,
+                    context=f"run_id={coordination_token.run_id}",
+                )
+            ) from exc
+
+    def record_readiness_check(
+        self,
+        *,
+        name: str,
+        collection: str,
+        reachable: bool,
+        count: int | None,
+        message: str,
+        member_token: WorkerMembershipToken,
+    ) -> None:
+        """Record this worker's readiness check result in the audit trail.
+
+        Called by transforms during on_start() after a provider readiness
+        check passes. Records the collection state at startup time so
+        auditors can answer "what was the collection state when this ran?"
+        The token reaches here by value through ``PluginContext`` (ADR-048 §3).
+        """
+        row_data = {
+            "result_id": generate_id(),
+            "run_id": member_token.run_id,
+            "result_type": "readiness_check",
+            "name": name,
+            "result_json": canonical_json(
+                {
+                    "collection": collection,
+                    "reachable": reachable,
+                    "count": count,
+                    "message": message,
+                    "worker_id": member_token.worker_id,
+                }
+            ),
+            "created_at": now(),
+        }
+
+        try:
+            with fenced_member_transaction(
+                self._db.engine,
+                member_token=member_token,
+                verb="record_readiness_check",
+            ) as conn:
+                conn.execute(preflight_results_table.insert().values(**row_data))
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(
+                _safe_database_error_message(
+                    operation="record_readiness_check",
+                    action="write",
+                    exc=exc,
+                    context=f"run_id={member_token.run_id}",
+                )
+            ) from exc
+
+    def list_runs(self, *, status: RunStatus | None = None) -> list[Run]:
+        """List all runs in the database.
+
+        Args:
+            status: Optional RunStatus filter
+
+        Returns:
+            List of Run models, ordered by started_at (newest first)
+        """
+        query = select(runs_table).order_by(runs_table.c.started_at.desc())
+
+        if status is not None:
+            query = query.where(runs_table.c.status == status.value)
+
+        rows = self._ops.execute_fetchall(query)
+        return [self._run_loader.load(row) for row in rows]
+
+    def set_export_status(
+        self,
+        status: ExportStatus,
+        *,
+        error: str | None = None,
+        export_format: str | None = None,
+        export_sink: str | None = None,
+        coordination_token: CoordinationToken,
+    ) -> None:
+        """Set export status for the led run.
+
+        This is separate from run status so export failures don't mask
+        successful pipeline completion.
+
+        Args:
+            status: ExportStatus (PENDING, COMPLETED, or FAILED)
+            error: Error message if status is FAILED
+            export_format: Format used (csv, json)
+            export_sink: Sink name used for export
+            coordination_token: The run's current leader token; the run is its ``run_id``.
+        """
+        # Validate error/status consistency — error is only meaningful with FAILED
+        if error is not None and status != ExportStatus.FAILED:
+            raise AuditIntegrityError(
+                f"Cannot set export_error with status={status.value}. Error messages are only valid with FAILED status."
+            )
+
+        updates: dict[str, Any] = {
+            "export_status": status,
+            "exported_at": None,
+        }
+
+        if status == ExportStatus.COMPLETED:
+            updates["exported_at"] = now()
+            # Clear stale error when transitioning to completed
+            updates["export_error"] = None
+        elif status == ExportStatus.PENDING:
+            # Clear stale error when transitioning to pending
+            updates["export_error"] = None
+
+        # Only set error if explicitly provided (for FAILED status)
+        if error is not None:
+            updates["export_error"] = error
+
+        if export_format is not None:
+            updates["export_format"] = export_format
+        if export_sink is not None:
+            updates["export_sink"] = export_sink
+
+        try:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="set_export_status",
+            ) as conn:
+                result = conn.execute(runs_table.update().where(runs_table.c.run_id == coordination_token.run_id).values(**updates))
+                if result.rowcount == 0:
+                    raise AuditIntegrityError(f"Cannot set export status to {status.value!r}: run {coordination_token.run_id} not found")
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(
+                _safe_database_error_message(
+                    operation="set_export_status",
+                    action="update",
+                    exc=exc,
+                    context=f"run_id={coordination_token.run_id} status={status.value}",
+                )
+            ) from exc
+
+    def set_export_failed_unless_completed(self, *, error: str, coordination_token: CoordinationToken) -> bool:
+        """Record FAILED unless a concurrent exporter already completed.
+
+        Returns ``True`` when FAILED was recorded and ``False`` when an
+        existing COMPLETED status won the race. The compare-and-set and the
+        winner read share one leader-fenced write transaction, so a timeout
+        path cannot regress durable completion evidence.
+        """
+        if type(error) is not str:
+            raise TypeError("error must be an exact string")
+        run_id = coordination_token.run_id
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="set_export_failed_unless_completed",
+        ) as conn:
+            updated = conn.execute(
+                runs_table.update()
+                .where(
+                    runs_table.c.run_id == coordination_token.run_id,
+                    or_(
+                        runs_table.c.export_status.is_(None),
+                        runs_table.c.export_status != ExportStatus.COMPLETED.value,
+                    ),
+                )
+                .values(
+                    export_status=ExportStatus.FAILED.value,
+                    exported_at=None,
+                    export_error=error,
+                )
+            )
+            if updated.rowcount == 1:
+                return True
+            current_status = conn.scalar(select(runs_table.c.export_status).where(runs_table.c.run_id == coordination_token.run_id))
+            if current_status is None:
+                raise AuditIntegrityError(f"Cannot set export status to 'failed': run {run_id} not found")
+            if current_status != ExportStatus.COMPLETED.value:
+                raise AuditIntegrityError(
+                    f"Cannot set export status to 'failed': run {run_id} changed to unsupported status {current_status!r}"
+                )
+            return False
+
+    def set_export_pending_unless_completed(
+        self,
+        *,
+        export_format: str | None = None,
+        export_sink: str | None = None,
+        coordination_token: CoordinationToken,
+    ) -> bool:
+        """Record PENDING unless a concurrent exporter already completed.
+
+        Returns ``True`` when PENDING was recorded and ``False`` when durable
+        COMPLETED status won the race. This is the resume admission CAS: a
+        delayed recovery worker cannot regress peer completion after its
+        earlier eligibility read.
+        """
+        updates: dict[str, Any] = {
+            "export_status": ExportStatus.PENDING.value,
+            "exported_at": None,
+            "export_error": None,
+        }
+        if export_format is not None:
+            updates["export_format"] = export_format
+        if export_sink is not None:
+            updates["export_sink"] = export_sink
+        run_id = coordination_token.run_id
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="set_export_pending_unless_completed",
+        ) as conn:
+            updated = conn.execute(
+                runs_table.update()
+                .where(
+                    runs_table.c.run_id == coordination_token.run_id,
+                    or_(
+                        runs_table.c.export_status.is_(None),
+                        runs_table.c.export_status != ExportStatus.COMPLETED.value,
+                    ),
+                )
+                .values(**updates)
+            )
+            if updated.rowcount == 1:
+                return True
+            current_status = conn.scalar(select(runs_table.c.export_status).where(runs_table.c.run_id == coordination_token.run_id))
+            if current_status is None:
+                raise AuditIntegrityError(f"Cannot set export status to 'pending': run {run_id} not found")
+            if current_status != ExportStatus.COMPLETED.value:
+                raise AuditIntegrityError(
+                    f"Cannot set export status to 'pending': run {run_id} changed to unsupported status {current_status!r}"
+                )
+            return False
+
+    def finalize_run(self, status: RunStatus, *, coordination_token: CoordinationToken) -> Run:
+        """Finalize the led run by computing its grade and completing it.
+
+        Convenience method that:
+        1. Computes the reproducibility grade based on node determinism
+        2. Completes the run with the specified status and computed grade
+
+        Args:
+            status: Final RunStatus (COMPLETED, FAILED, or INTERRUPTED)
+            coordination_token: Leader fencing token (ADR-030), threaded
+                through to ``complete_run`` where the verify-and-extend epoch
+                fence is the first statement of the terminal transaction. A
+                deposed leader's finalize (incl. the FAILED/INTERRUPTED
+                ceremonies) is refused with ``RunLeadershipLostError`` — "the
+                run is no longer its to fail" (§C.4 row 4).
+
+        Returns:
+            Updated Run model
+
+        Note:
+            Grade computation and run completion execute in separate transactions.
+            This is an accepted limitation — the invariant that all nodes are registered
+            before finalize_run is called ensures the grade is stable between reads.
+        """
+        grade = self.compute_reproducibility_grade(coordination_token.run_id)
+        return self.complete_run(status, reproducibility_grade=grade, coordination_token=coordination_token)
+
+    def compute_reproducibility_grade(self, run_id: str) -> ReproducibilityGrade:
+        """Compute reproducibility grade for a run based on node determinism.
+
+        Logic:
+        - If any node has determinism='nondeterministic', returns REPLAY_REPRODUCIBLE
+        - Otherwise returns FULL_REPRODUCIBLE
+        - 'seeded' counts as reproducible
+
+        Args:
+            run_id: Run ID to compute grade for
+
+        Returns:
+            ReproducibilityGrade enum value
+
+        Note:
+            Uses self._db directly (bypassing DatabaseOps) because compute_grade()
+            needs raw connection access for multi-statement reads within a single
+            connection. This dual access pattern (self._ops + self._db) is accepted:
+            future repositories (B2/B3) will also need self._db for atomic
+            multi-table transactions. Both are injected via __init__.
+        """
+        return compute_grade(self._db, run_id)

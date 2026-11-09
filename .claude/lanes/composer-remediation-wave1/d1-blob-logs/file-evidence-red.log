@@ -1,0 +1,93 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 148 items / 145 deselected / 3 selected
+
+tests/unit/web/blobs/test_mutation_admission.py FFF                      [100%]
+
+=================================== FAILURES ===================================
+_ test_deletion_facet_admission_preserves_exact_prepare_file_evidence_contract[evidence0-TypeError] _
+
+blob_service = <elspeth.web.blobs.service.BlobServiceImpl object at 0x7fc51ad979b0>
+db_engine = Engine(sqlite:///:memory:)
+session_id = UUID('e6303526-6fbf-497c-8cb3-95fa49eaaf79')
+compose_context = SessionOperationContext(fence=SessionOperationFence(session_id='e6303526-6fbf-497c-8cb3-95fa49eaaf79', operation_id='8...token='e48131f5ff0441dc866feda8778f0f82', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>)
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-89/test_deletion_facet_admission_0')
+evidence = (1, 3, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+error = <class 'TypeError'>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("evidence,error", [((1, 3, "a" * 64), TypeError), ((True, 3, "invalid-hash"), ValueError), ((True, 3, None), ValueError)])
+    async def test_deletion_facet_admission_preserves_exact_prepare_file_evidence_contract(
+        blob_service, db_engine, session_id, compose_context, tmp_path, evidence, error
+    ):
+        record = await blob_service.create_blob(session_id, "evidence.csv", b"old", "text/csv", session_operation_context=compose_context)
+        with db_engine.begin() as connection:
+            connection.execute(update(blobs_table).where(blobs_table.c.id == str(record.id)).values(status="pending", content_hash=None))
+        authority = blob_service._session_operation_authority
+        expected = authority.mutate(compose_context, lambda transaction: transaction.blobs.read_blob(blob_id=record.id))
+        before = _resources(db_engine, tmp_path)
+>       with pytest.raises(error):
+             ^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'TypeError'>
+
+tests/unit/web/blobs/test_mutation_admission.py:929: Failed
+_ test_deletion_facet_admission_preserves_exact_prepare_file_evidence_contract[evidence1-ValueError] _
+
+blob_service = <elspeth.web.blobs.service.BlobServiceImpl object at 0x7fc51ad975c0>
+db_engine = Engine(sqlite:///:memory:)
+session_id = UUID('2044a3fe-97cb-40f9-b78a-274ace6c1878')
+compose_context = SessionOperationContext(fence=SessionOperationFence(session_id='2044a3fe-97cb-40f9-b78a-274ace6c1878', operation_id='d...token='f4a7cb588320485a98d1bcda478e2a92', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>)
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-89/test_deletion_facet_admission_1')
+evidence = (True, 3, 'invalid-hash'), error = <class 'ValueError'>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("evidence,error", [((1, 3, "a" * 64), TypeError), ((True, 3, "invalid-hash"), ValueError), ((True, 3, None), ValueError)])
+    async def test_deletion_facet_admission_preserves_exact_prepare_file_evidence_contract(
+        blob_service, db_engine, session_id, compose_context, tmp_path, evidence, error
+    ):
+        record = await blob_service.create_blob(session_id, "evidence.csv", b"old", "text/csv", session_operation_context=compose_context)
+        with db_engine.begin() as connection:
+            connection.execute(update(blobs_table).where(blobs_table.c.id == str(record.id)).values(status="pending", content_hash=None))
+        authority = blob_service._session_operation_authority
+        expected = authority.mutate(compose_context, lambda transaction: transaction.blobs.read_blob(blob_id=record.id))
+        before = _resources(db_engine, tmp_path)
+>       with pytest.raises(error):
+             ^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'ValueError'>
+
+tests/unit/web/blobs/test_mutation_admission.py:929: Failed
+_ test_deletion_facet_admission_preserves_exact_prepare_file_evidence_contract[evidence2-ValueError] _
+
+blob_service = <elspeth.web.blobs.service.BlobServiceImpl object at 0x7fc51a9a7050>
+db_engine = Engine(sqlite:///:memory:)
+session_id = UUID('aa943705-fd3d-45c9-b5e5-a6935105789c')
+compose_context = SessionOperationContext(fence=SessionOperationFence(session_id='aa943705-fd3d-45c9-b5e5-a6935105789c', operation_id='9...token='9bfc697565d945caa1b27679f4ac2979', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>)
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-89/test_deletion_facet_admission_2')
+evidence = (True, 3, None), error = <class 'ValueError'>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("evidence,error", [((1, 3, "a" * 64), TypeError), ((True, 3, "invalid-hash"), ValueError), ((True, 3, None), ValueError)])
+    async def test_deletion_facet_admission_preserves_exact_prepare_file_evidence_contract(
+        blob_service, db_engine, session_id, compose_context, tmp_path, evidence, error
+    ):
+        record = await blob_service.create_blob(session_id, "evidence.csv", b"old", "text/csv", session_operation_context=compose_context)
+        with db_engine.begin() as connection:
+            connection.execute(update(blobs_table).where(blobs_table.c.id == str(record.id)).values(status="pending", content_hash=None))
+        authority = blob_service._session_operation_authority
+        expected = authority.mutate(compose_context, lambda transaction: transaction.blobs.read_blob(blob_id=record.id))
+        before = _resources(db_engine, tmp_path)
+>       with pytest.raises(error):
+             ^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'ValueError'>
+
+tests/unit/web/blobs/test_mutation_admission.py:929: Failed
+=========================== short test summary info ============================
+FAILED tests/unit/web/blobs/test_mutation_admission.py::test_deletion_facet_admission_preserves_exact_prepare_file_evidence_contract[evidence0-TypeError]
+FAILED tests/unit/web/blobs/test_mutation_admission.py::test_deletion_facet_admission_preserves_exact_prepare_file_evidence_contract[evidence1-ValueError]
+FAILED tests/unit/web/blobs/test_mutation_admission.py::test_deletion_facet_admission_preserves_exact_prepare_file_evidence_contract[evidence2-ValueError]
+====================== 3 failed, 145 deselected in 1.20s =======================

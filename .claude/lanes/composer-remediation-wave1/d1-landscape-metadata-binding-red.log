@@ -1,0 +1,417 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 13 items
+
+tests/unit/architecture/test_web_landscape_mutation_fencing.py FFFFFFFFF [ 69%]
+FFFF                                                                     [100%]
+
+=================================== FAILURES ===================================
+_ test_new_landscape_stamp_requires_exact_locked_empty_target_sources[src/elspeth/web/schema_probe.py-conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")-other.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")] _
+
+path = 'src/elspeth/web/schema_probe.py'
+before = 'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")'
+after = 'other.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")'
+
+    @pytest.mark.parametrize(
+        ("path", "before", "after"),
+        [
+            (
+                "src/elspeth/web/schema_probe.py",
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+                'other.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+            ),
+            (
+                "src/elspeth/web/schema_probe.py",
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH + 1}")',
+            ),
+            ("src/elspeth/web/schema_probe.py", 'if conn.dialect.name == "sqlite":', "if True:"),
+            ("src/elspeth/web/schema_probe.py", "if state is SchemaState.MISSING:", "if state in (SchemaState.MISSING, SchemaState.PARTIAL):"),
+            ("src/elspeth/web/schema_probe.py", "_run_locked(engine, target=_LOCK_TARGET, body=body, verify=verify)", "body(engine.connect())"),
+            (
+                "src/elspeth/core/landscape/database.py",
+                "return LandscapeSchemaShape.EMPTY if database_target_is_empty(bind) else LandscapeSchemaShape.DIVERGENT",
+                "return LandscapeSchemaShape.EMPTY",
+            ),
+            ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA application_id").scalar_one() == 0', "and True"),
+            ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA user_version").scalar_one() == 0', "and True"),
+        ],
+    )
+    def test_new_landscape_stamp_requires_exact_locked_empty_target_sources(path: str, before: str, after: str) -> None:
+        units = _new_landscape_stamp_control_units()
+        unit = units[0]
+        call = _new_landscape_stamp_control_call(unit)
+>       assert _new_landscape_schema_stamp_is_proven(unit, call, units)
+E       assert False
+E        +  where False = _new_landscape_schema_stamp_is_proven(SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initia...else None,\n        overflow if type(overflow) is int else None,\n    )\n', tree=<ast.Module object at 0x7f4148377fd0>), <ast.Call object at 0x7f41483c1650>, (SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initi...lse name, repr(sql), count) for (name, sql), count in counter.items())\n', tree=<ast.Module object at 0x7f41476ba650>)))
+
+tests/unit/architecture/test_web_landscape_mutation_fencing.py:21476: AssertionError
+_ test_new_landscape_stamp_requires_exact_locked_empty_target_sources[src/elspeth/web/schema_probe.py-conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")-conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH + 1}")] _
+
+path = 'src/elspeth/web/schema_probe.py'
+before = 'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")'
+after = 'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH + 1}")'
+
+    @pytest.mark.parametrize(
+        ("path", "before", "after"),
+        [
+            (
+                "src/elspeth/web/schema_probe.py",
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+                'other.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+            ),
+            (
+                "src/elspeth/web/schema_probe.py",
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH + 1}")',
+            ),
+            ("src/elspeth/web/schema_probe.py", 'if conn.dialect.name == "sqlite":', "if True:"),
+            ("src/elspeth/web/schema_probe.py", "if state is SchemaState.MISSING:", "if state in (SchemaState.MISSING, SchemaState.PARTIAL):"),
+            ("src/elspeth/web/schema_probe.py", "_run_locked(engine, target=_LOCK_TARGET, body=body, verify=verify)", "body(engine.connect())"),
+            (
+                "src/elspeth/core/landscape/database.py",
+                "return LandscapeSchemaShape.EMPTY if database_target_is_empty(bind) else LandscapeSchemaShape.DIVERGENT",
+                "return LandscapeSchemaShape.EMPTY",
+            ),
+            ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA application_id").scalar_one() == 0', "and True"),
+            ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA user_version").scalar_one() == 0', "and True"),
+        ],
+    )
+    def test_new_landscape_stamp_requires_exact_locked_empty_target_sources(path: str, before: str, after: str) -> None:
+        units = _new_landscape_stamp_control_units()
+        unit = units[0]
+        call = _new_landscape_stamp_control_call(unit)
+>       assert _new_landscape_schema_stamp_is_proven(unit, call, units)
+E       assert False
+E        +  where False = _new_landscape_schema_stamp_is_proven(SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initia...else None,\n        overflow if type(overflow) is int else None,\n    )\n', tree=<ast.Module object at 0x7f41440cbfd0>), <ast.Call object at 0x7f4144107a10>, (SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initi...lse name, repr(sql), count) for (name, sql), count in counter.items())\n', tree=<ast.Module object at 0x7f413c7646d0>)))
+
+tests/unit/architecture/test_web_landscape_mutation_fencing.py:21476: AssertionError
+_ test_new_landscape_stamp_requires_exact_locked_empty_target_sources[src/elspeth/web/schema_probe.py-if conn.dialect.name == "sqlite":-if True:] _
+
+path = 'src/elspeth/web/schema_probe.py'
+before = 'if conn.dialect.name == "sqlite":', after = 'if True:'
+
+    @pytest.mark.parametrize(
+        ("path", "before", "after"),
+        [
+            (
+                "src/elspeth/web/schema_probe.py",
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+                'other.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+            ),
+            (
+                "src/elspeth/web/schema_probe.py",
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH + 1}")',
+            ),
+            ("src/elspeth/web/schema_probe.py", 'if conn.dialect.name == "sqlite":', "if True:"),
+            ("src/elspeth/web/schema_probe.py", "if state is SchemaState.MISSING:", "if state in (SchemaState.MISSING, SchemaState.PARTIAL):"),
+            ("src/elspeth/web/schema_probe.py", "_run_locked(engine, target=_LOCK_TARGET, body=body, verify=verify)", "body(engine.connect())"),
+            (
+                "src/elspeth/core/landscape/database.py",
+                "return LandscapeSchemaShape.EMPTY if database_target_is_empty(bind) else LandscapeSchemaShape.DIVERGENT",
+                "return LandscapeSchemaShape.EMPTY",
+            ),
+            ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA application_id").scalar_one() == 0', "and True"),
+            ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA user_version").scalar_one() == 0', "and True"),
+        ],
+    )
+    def test_new_landscape_stamp_requires_exact_locked_empty_target_sources(path: str, before: str, after: str) -> None:
+        units = _new_landscape_stamp_control_units()
+        unit = units[0]
+        call = _new_landscape_stamp_control_call(unit)
+>       assert _new_landscape_schema_stamp_is_proven(unit, call, units)
+E       assert False
+E        +  where False = _new_landscape_schema_stamp_is_proven(SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initia...else None,\n        overflow if type(overflow) is int else None,\n    )\n', tree=<ast.Module object at 0x7f413fd8bfd0>), <ast.Call object at 0x7f413fdd8790>, (SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initi...lse name, repr(sql), count) for (name, sql), count in counter.items())\n', tree=<ast.Module object at 0x7f413fb45510>)))
+
+tests/unit/architecture/test_web_landscape_mutation_fencing.py:21476: AssertionError
+_ test_new_landscape_stamp_requires_exact_locked_empty_target_sources[src/elspeth/web/schema_probe.py-if state is SchemaState.MISSING:-if state in (SchemaState.MISSING, SchemaState.PARTIAL):] _
+
+path = 'src/elspeth/web/schema_probe.py'
+before = 'if state is SchemaState.MISSING:'
+after = 'if state in (SchemaState.MISSING, SchemaState.PARTIAL):'
+
+    @pytest.mark.parametrize(
+        ("path", "before", "after"),
+        [
+            (
+                "src/elspeth/web/schema_probe.py",
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+                'other.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+            ),
+            (
+                "src/elspeth/web/schema_probe.py",
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH + 1}")',
+            ),
+            ("src/elspeth/web/schema_probe.py", 'if conn.dialect.name == "sqlite":', "if True:"),
+            ("src/elspeth/web/schema_probe.py", "if state is SchemaState.MISSING:", "if state in (SchemaState.MISSING, SchemaState.PARTIAL):"),
+            ("src/elspeth/web/schema_probe.py", "_run_locked(engine, target=_LOCK_TARGET, body=body, verify=verify)", "body(engine.connect())"),
+            (
+                "src/elspeth/core/landscape/database.py",
+                "return LandscapeSchemaShape.EMPTY if database_target_is_empty(bind) else LandscapeSchemaShape.DIVERGENT",
+                "return LandscapeSchemaShape.EMPTY",
+            ),
+            ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA application_id").scalar_one() == 0', "and True"),
+            ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA user_version").scalar_one() == 0', "and True"),
+        ],
+    )
+    def test_new_landscape_stamp_requires_exact_locked_empty_target_sources(path: str, before: str, after: str) -> None:
+        units = _new_landscape_stamp_control_units()
+        unit = units[0]
+        call = _new_landscape_stamp_control_call(unit)
+>       assert _new_landscape_schema_stamp_is_proven(unit, call, units)
+E       assert False
+E        +  where False = _new_landscape_schema_stamp_is_proven(SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initia...else None,\n        overflow if type(overflow) is int else None,\n    )\n', tree=<ast.Module object at 0x7f413fadfd50>), <ast.Call object at 0x7f413fafd610>, (SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initi...lse name, repr(sql), count) for (name, sql), count in counter.items())\n', tree=<ast.Module object at 0x7f413bac6350>)))
+
+tests/unit/architecture/test_web_landscape_mutation_fencing.py:21476: AssertionError
+_ test_new_landscape_stamp_requires_exact_locked_empty_target_sources[src/elspeth/web/schema_probe.py-_run_locked(engine, target=_LOCK_TARGET, body=body, verify=verify)-body(engine.connect())] _
+
+path = 'src/elspeth/web/schema_probe.py'
+before = '_run_locked(engine, target=_LOCK_TARGET, body=body, verify=verify)'
+after = 'body(engine.connect())'
+
+    @pytest.mark.parametrize(
+        ("path", "before", "after"),
+        [
+            (
+                "src/elspeth/web/schema_probe.py",
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+                'other.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+            ),
+            (
+                "src/elspeth/web/schema_probe.py",
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH + 1}")',
+            ),
+            ("src/elspeth/web/schema_probe.py", 'if conn.dialect.name == "sqlite":', "if True:"),
+            ("src/elspeth/web/schema_probe.py", "if state is SchemaState.MISSING:", "if state in (SchemaState.MISSING, SchemaState.PARTIAL):"),
+            ("src/elspeth/web/schema_probe.py", "_run_locked(engine, target=_LOCK_TARGET, body=body, verify=verify)", "body(engine.connect())"),
+            (
+                "src/elspeth/core/landscape/database.py",
+                "return LandscapeSchemaShape.EMPTY if database_target_is_empty(bind) else LandscapeSchemaShape.DIVERGENT",
+                "return LandscapeSchemaShape.EMPTY",
+            ),
+            ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA application_id").scalar_one() == 0', "and True"),
+            ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA user_version").scalar_one() == 0', "and True"),
+        ],
+    )
+    def test_new_landscape_stamp_requires_exact_locked_empty_target_sources(path: str, before: str, after: str) -> None:
+        units = _new_landscape_stamp_control_units()
+        unit = units[0]
+        call = _new_landscape_stamp_control_call(unit)
+>       assert _new_landscape_schema_stamp_is_proven(unit, call, units)
+E       assert False
+E        +  where False = _new_landscape_schema_stamp_is_proven(SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initia...else None,\n        overflow if type(overflow) is int else None,\n    )\n', tree=<ast.Module object at 0x7f4149130550>), <ast.Call object at 0x7f413f6e2110>, (SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initi...lse name, repr(sql), count) for (name, sql), count in counter.items())\n', tree=<ast.Module object at 0x7f413c71a990>)))
+
+tests/unit/architecture/test_web_landscape_mutation_fencing.py:21476: AssertionError
+_ test_new_landscape_stamp_requires_exact_locked_empty_target_sources[src/elspeth/core/landscape/database.py-return LandscapeSchemaShape.EMPTY if database_target_is_empty(bind) else LandscapeSchemaShape.DIVERGENT-return LandscapeSchemaShape.EMPTY] _
+
+path = 'src/elspeth/core/landscape/database.py'
+before = 'return LandscapeSchemaShape.EMPTY if database_target_is_empty(bind) else LandscapeSchemaShape.DIVERGENT'
+after = 'return LandscapeSchemaShape.EMPTY'
+
+    @pytest.mark.parametrize(
+        ("path", "before", "after"),
+        [
+            (
+                "src/elspeth/web/schema_probe.py",
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+                'other.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+            ),
+            (
+                "src/elspeth/web/schema_probe.py",
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH + 1}")',
+            ),
+            ("src/elspeth/web/schema_probe.py", 'if conn.dialect.name == "sqlite":', "if True:"),
+            ("src/elspeth/web/schema_probe.py", "if state is SchemaState.MISSING:", "if state in (SchemaState.MISSING, SchemaState.PARTIAL):"),
+            ("src/elspeth/web/schema_probe.py", "_run_locked(engine, target=_LOCK_TARGET, body=body, verify=verify)", "body(engine.connect())"),
+            (
+                "src/elspeth/core/landscape/database.py",
+                "return LandscapeSchemaShape.EMPTY if database_target_is_empty(bind) else LandscapeSchemaShape.DIVERGENT",
+                "return LandscapeSchemaShape.EMPTY",
+            ),
+            ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA application_id").scalar_one() == 0', "and True"),
+            ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA user_version").scalar_one() == 0', "and True"),
+        ],
+    )
+    def test_new_landscape_stamp_requires_exact_locked_empty_target_sources(path: str, before: str, after: str) -> None:
+        units = _new_landscape_stamp_control_units()
+        unit = units[0]
+        call = _new_landscape_stamp_control_call(unit)
+>       assert _new_landscape_schema_stamp_is_proven(unit, call, units)
+E       assert False
+E        +  where False = _new_landscape_schema_stamp_is_proven(SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initia...else None,\n        overflow if type(overflow) is int else None,\n    )\n', tree=<ast.Module object at 0x7f413fd0bfd0>), <ast.Call object at 0x7f413fd1e950>, (SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initi...lse name, repr(sql), count) for (name, sql), count in counter.items())\n', tree=<ast.Module object at 0x7f413bbd3690>)))
+
+tests/unit/architecture/test_web_landscape_mutation_fencing.py:21476: AssertionError
+_ test_new_landscape_stamp_requires_exact_locked_empty_target_sources[src/elspeth/core/schema_shape.py-and bind.exec_driver_sql("PRAGMA application_id").scalar_one() == 0-and True] _
+
+path = 'src/elspeth/core/schema_shape.py'
+before = 'and bind.exec_driver_sql("PRAGMA application_id").scalar_one() == 0'
+after = 'and True'
+
+    @pytest.mark.parametrize(
+        ("path", "before", "after"),
+        [
+            (
+                "src/elspeth/web/schema_probe.py",
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+                'other.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+            ),
+            (
+                "src/elspeth/web/schema_probe.py",
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH + 1}")',
+            ),
+            ("src/elspeth/web/schema_probe.py", 'if conn.dialect.name == "sqlite":', "if True:"),
+            ("src/elspeth/web/schema_probe.py", "if state is SchemaState.MISSING:", "if state in (SchemaState.MISSING, SchemaState.PARTIAL):"),
+            ("src/elspeth/web/schema_probe.py", "_run_locked(engine, target=_LOCK_TARGET, body=body, verify=verify)", "body(engine.connect())"),
+            (
+                "src/elspeth/core/landscape/database.py",
+                "return LandscapeSchemaShape.EMPTY if database_target_is_empty(bind) else LandscapeSchemaShape.DIVERGENT",
+                "return LandscapeSchemaShape.EMPTY",
+            ),
+            ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA application_id").scalar_one() == 0', "and True"),
+            ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA user_version").scalar_one() == 0', "and True"),
+        ],
+    )
+    def test_new_landscape_stamp_requires_exact_locked_empty_target_sources(path: str, before: str, after: str) -> None:
+        units = _new_landscape_stamp_control_units()
+        unit = units[0]
+        call = _new_landscape_stamp_control_call(unit)
+>       assert _new_landscape_schema_stamp_is_proven(unit, call, units)
+E       assert False
+E        +  where False = _new_landscape_schema_stamp_is_proven(SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initia...else None,\n        overflow if type(overflow) is int else None,\n    )\n', tree=<ast.Module object at 0x7f413fff7fd0>), <ast.Call object at 0x7f413b036990>, (SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initi...lse name, repr(sql), count) for (name, sql), count in counter.items())\n', tree=<ast.Module object at 0x7f413c150510>)))
+
+tests/unit/architecture/test_web_landscape_mutation_fencing.py:21476: AssertionError
+_ test_new_landscape_stamp_requires_exact_locked_empty_target_sources[src/elspeth/core/schema_shape.py-and bind.exec_driver_sql("PRAGMA user_version").scalar_one() == 0-and True] _
+
+path = 'src/elspeth/core/schema_shape.py'
+before = 'and bind.exec_driver_sql("PRAGMA user_version").scalar_one() == 0'
+after = 'and True'
+
+    @pytest.mark.parametrize(
+        ("path", "before", "after"),
+        [
+            (
+                "src/elspeth/web/schema_probe.py",
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+                'other.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+            ),
+            (
+                "src/elspeth/web/schema_probe.py",
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")',
+                'conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH + 1}")',
+            ),
+            ("src/elspeth/web/schema_probe.py", 'if conn.dialect.name == "sqlite":', "if True:"),
+            ("src/elspeth/web/schema_probe.py", "if state is SchemaState.MISSING:", "if state in (SchemaState.MISSING, SchemaState.PARTIAL):"),
+            ("src/elspeth/web/schema_probe.py", "_run_locked(engine, target=_LOCK_TARGET, body=body, verify=verify)", "body(engine.connect())"),
+            (
+                "src/elspeth/core/landscape/database.py",
+                "return LandscapeSchemaShape.EMPTY if database_target_is_empty(bind) else LandscapeSchemaShape.DIVERGENT",
+                "return LandscapeSchemaShape.EMPTY",
+            ),
+            ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA application_id").scalar_one() == 0', "and True"),
+            ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA user_version").scalar_one() == 0', "and True"),
+        ],
+    )
+    def test_new_landscape_stamp_requires_exact_locked_empty_target_sources(path: str, before: str, after: str) -> None:
+        units = _new_landscape_stamp_control_units()
+        unit = units[0]
+        call = _new_landscape_stamp_control_call(unit)
+>       assert _new_landscape_schema_stamp_is_proven(unit, call, units)
+E       assert False
+E        +  where False = _new_landscape_schema_stamp_is_proven(SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initia...else None,\n        overflow if type(overflow) is int else None,\n    )\n', tree=<ast.Module object at 0x7f413bb48150>), <ast.Call object at 0x7f413bb40f90>, (SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initi...lse name, repr(sql), count) for (name, sql), count in counter.items())\n', tree=<ast.Module object at 0x7f413fcd0c90>)))
+
+tests/unit/architecture/test_web_landscape_mutation_fencing.py:21476: AssertionError
+__ test_new_landscape_stamp_refuses_incomplete_or_foreign_authority[missing] ___
+
+fault = 'missing'
+
+    @pytest.mark.parametrize("fault", ["missing", "duplicate", "foreign-scope", "foreign-path", "mutated-tree"])
+    def test_new_landscape_stamp_refuses_incomplete_or_foreign_authority(fault: str) -> None:
+        units = _new_landscape_stamp_control_units()
+        unit = units[0]
+        call = _new_landscape_stamp_control_call(unit)
+>       assert _new_landscape_schema_stamp_is_proven(unit, call, units)
+E       assert False
+E        +  where False = _new_landscape_schema_stamp_is_proven(SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initia...else None,\n        overflow if type(overflow) is int else None,\n    )\n', tree=<ast.Module object at 0x7f413bbc3fd0>), <ast.Call object at 0x7f413bb84ad0>, (SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initi...lse name, repr(sql), count) for (name, sql), count in counter.items())\n', tree=<ast.Module object at 0x7f413be25850>)))
+
+tests/unit/architecture/test_web_landscape_mutation_fencing.py:21493: AssertionError
+_ test_new_landscape_stamp_refuses_incomplete_or_foreign_authority[duplicate] __
+
+fault = 'duplicate'
+
+    @pytest.mark.parametrize("fault", ["missing", "duplicate", "foreign-scope", "foreign-path", "mutated-tree"])
+    def test_new_landscape_stamp_refuses_incomplete_or_foreign_authority(fault: str) -> None:
+        units = _new_landscape_stamp_control_units()
+        unit = units[0]
+        call = _new_landscape_stamp_control_call(unit)
+>       assert _new_landscape_schema_stamp_is_proven(unit, call, units)
+E       assert False
+E        +  where False = _new_landscape_schema_stamp_is_proven(SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initia...else None,\n        overflow if type(overflow) is int else None,\n    )\n', tree=<ast.Module object at 0x7f413c8bfdd0>), <ast.Call object at 0x7f413c8e5610>, (SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initi...lse name, repr(sql), count) for (name, sql), count in counter.items())\n', tree=<ast.Module object at 0x7f413ac26350>)))
+
+tests/unit/architecture/test_web_landscape_mutation_fencing.py:21493: AssertionError
+_ test_new_landscape_stamp_refuses_incomplete_or_foreign_authority[foreign-scope] _
+
+fault = 'foreign-scope'
+
+    @pytest.mark.parametrize("fault", ["missing", "duplicate", "foreign-scope", "foreign-path", "mutated-tree"])
+    def test_new_landscape_stamp_refuses_incomplete_or_foreign_authority(fault: str) -> None:
+        units = _new_landscape_stamp_control_units()
+        unit = units[0]
+        call = _new_landscape_stamp_control_call(unit)
+>       assert _new_landscape_schema_stamp_is_proven(unit, call, units)
+E       assert False
+E        +  where False = _new_landscape_schema_stamp_is_proven(SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initia...else None,\n        overflow if type(overflow) is int else None,\n    )\n', tree=<ast.Module object at 0x7f413c638250>), <ast.Call object at 0x7f413fd41ed0>, (SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initi...lse name, repr(sql), count) for (name, sql), count in counter.items())\n', tree=<ast.Module object at 0x7f413fb36790>)))
+
+tests/unit/architecture/test_web_landscape_mutation_fencing.py:21493: AssertionError
+_ test_new_landscape_stamp_refuses_incomplete_or_foreign_authority[foreign-path] _
+
+fault = 'foreign-path'
+
+    @pytest.mark.parametrize("fault", ["missing", "duplicate", "foreign-scope", "foreign-path", "mutated-tree"])
+    def test_new_landscape_stamp_refuses_incomplete_or_foreign_authority(fault: str) -> None:
+        units = _new_landscape_stamp_control_units()
+        unit = units[0]
+        call = _new_landscape_stamp_control_call(unit)
+>       assert _new_landscape_schema_stamp_is_proven(unit, call, units)
+E       assert False
+E        +  where False = _new_landscape_schema_stamp_is_proven(SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initia...else None,\n        overflow if type(overflow) is int else None,\n    )\n', tree=<ast.Module object at 0x7f413c6ebfd0>), <ast.Call object at 0x7f413c61a410>, (SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initi...lse name, repr(sql), count) for (name, sql), count in counter.items())\n', tree=<ast.Module object at 0x7f413ff37190>)))
+
+tests/unit/architecture/test_web_landscape_mutation_fencing.py:21493: AssertionError
+_ test_new_landscape_stamp_refuses_incomplete_or_foreign_authority[mutated-tree] _
+
+fault = 'mutated-tree'
+
+    @pytest.mark.parametrize("fault", ["missing", "duplicate", "foreign-scope", "foreign-path", "mutated-tree"])
+    def test_new_landscape_stamp_refuses_incomplete_or_foreign_authority(fault: str) -> None:
+        units = _new_landscape_stamp_control_units()
+        unit = units[0]
+        call = _new_landscape_stamp_control_call(unit)
+>       assert _new_landscape_schema_stamp_is_proven(unit, call, units)
+E       assert False
+E        +  where False = _new_landscape_schema_stamp_is_proven(SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initia...else None,\n        overflow if type(overflow) is int else None,\n    )\n', tree=<ast.Module object at 0x7f413b45ffd0>), <ast.Call object at 0x7f413b48af90>, (SourceUnit(path='src/elspeth/web/schema_probe.py', source='"""Fail-closed schema probes and serialized database initi...lse name, repr(sql), count) for (name, sql), count in counter.items())\n', tree=<ast.Module object at 0x7f413a173cd0>)))
+
+tests/unit/architecture/test_web_landscape_mutation_fencing.py:21493: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_new_landscape_stamp_requires_exact_locked_empty_target_sources[src/elspeth/web/schema_probe.py-conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")-other.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")]
+FAILED tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_new_landscape_stamp_requires_exact_locked_empty_target_sources[src/elspeth/web/schema_probe.py-conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")-conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH + 1}")]
+FAILED tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_new_landscape_stamp_requires_exact_locked_empty_target_sources[src/elspeth/web/schema_probe.py-if conn.dialect.name == "sqlite":-if True:]
+FAILED tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_new_landscape_stamp_requires_exact_locked_empty_target_sources[src/elspeth/web/schema_probe.py-if state is SchemaState.MISSING:-if state in (SchemaState.MISSING, SchemaState.PARTIAL):]
+FAILED tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_new_landscape_stamp_requires_exact_locked_empty_target_sources[src/elspeth/web/schema_probe.py-_run_locked(engine, target=_LOCK_TARGET, body=body, verify=verify)-body(engine.connect())]
+FAILED tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_new_landscape_stamp_requires_exact_locked_empty_target_sources[src/elspeth/core/landscape/database.py-return LandscapeSchemaShape.EMPTY if database_target_is_empty(bind) else LandscapeSchemaShape.DIVERGENT-return LandscapeSchemaShape.EMPTY]
+FAILED tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_new_landscape_stamp_requires_exact_locked_empty_target_sources[src/elspeth/core/schema_shape.py-and bind.exec_driver_sql("PRAGMA application_id").scalar_one() == 0-and True]
+FAILED tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_new_landscape_stamp_requires_exact_locked_empty_target_sources[src/elspeth/core/schema_shape.py-and bind.exec_driver_sql("PRAGMA user_version").scalar_one() == 0-and True]
+FAILED tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_new_landscape_stamp_refuses_incomplete_or_foreign_authority[missing]
+FAILED tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_new_landscape_stamp_refuses_incomplete_or_foreign_authority[duplicate]
+FAILED tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_new_landscape_stamp_refuses_incomplete_or_foreign_authority[foreign-scope]
+FAILED tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_new_landscape_stamp_refuses_incomplete_or_foreign_authority[foreign-path]
+FAILED tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_new_landscape_stamp_refuses_incomplete_or_foreign_authority[mutated-tree]
+============================= 13 failed in 14.66s ==============================

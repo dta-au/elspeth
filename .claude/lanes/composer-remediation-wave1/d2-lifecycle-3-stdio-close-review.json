@@ -1,0 +1,29 @@
+{
+  "python": "3.12.14 (main, Aug 25 2026, 14:00:49) [Clang 22.1.3 ]",
+  "diagnostic_source": "import sys,os,json,time\nclosefd = [sys.stdin.buffer.raw.closefd,sys.stdout.buffer.raw.closefd]\nsys.stdin.close()\nsys.stdout.close()\nif sys.argv[1] == 'descriptors':\n    os.close(0)\n    os.close(1)\nopen_fds = []\nfor fd in (0,1):\n    try: os.fstat(fd)\n    except OSError: pass\n    else: open_fds.append(fd)\nprint(json.dumps({'closefd':closefd,'open_fds':open_fds}),file=sys.stderr,flush=True)\ntime.sleep(0.3)\n",
+  "cases": [
+    {
+      "mode": "wrappers",
+      "closefd": [
+        false,
+        false
+      ],
+      "open_fds": [
+        0,
+        1
+      ],
+      "stdout_eof_while_process_alive": false,
+      "exit": 0
+    },
+    {
+      "mode": "descriptors",
+      "closefd": [
+        false,
+        false
+      ],
+      "open_fds": [],
+      "stdout_eof_while_process_alive": true,
+      "exit": 0
+    }
+  ]
+}

@@ -1,0 +1,795 @@
+.FFFFFF.FFFFFF......FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF                 [100%]
+=================================== FAILURES ===================================
+_ test_restore_intent_and_parser_canonicalize_only_external_park_selector[uppercase] _
+tests/unit/web/composer/test_graph_recovery.py:180: in test_restore_intent_and_parser_canonicalize_only_external_park_selector
+    assert direct.park_id == BLOB_UUID
+E   AssertionError: assert 'ABCDEFAB-CDE...-ABCDEFABCDEF' == 'abcdefab-cde...-abcdefabcdef'
+E     
+E     - abcdefab-cdef-4abc-8def-abcdefabcdef
+E     + ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF
+_ test_restore_intent_and_parser_canonicalize_only_external_park_selector[mixed] _
+tests/unit/web/composer/test_graph_recovery.py:180: in test_restore_intent_and_parser_canonicalize_only_external_park_selector
+    assert direct.park_id == BLOB_UUID
+E   AssertionError: assert 'Abcdefab-cde...-abcdefabcdef' == 'abcdefab-cde...-abcdefabcdef'
+E     
+E     - abcdefab-cdef-4abc-8def-abcdefabcdef
+E     ? ^
+E     + Abcdefab-cdef-4abc-8def-abcdefabcdef
+E     ? ^
+_ test_restore_intent_and_parser_canonicalize_only_external_park_selector[braced] _
+tests/unit/web/composer/test_graph_recovery.py:180: in test_restore_intent_and_parser_canonicalize_only_external_park_selector
+    assert direct.park_id == BLOB_UUID
+E   AssertionError: assert '{abcdefab-cd...abcdefabcdef}' == 'abcdefab-cde...-abcdefabcdef'
+E     
+E     - abcdefab-cdef-4abc-8def-abcdefabcdef
+E     + {abcdefab-cdef-4abc-8def-abcdefabcdef}
+E     ? +                                    +
+_ test_restore_intent_and_parser_canonicalize_only_external_park_selector[hyphenless] _
+tests/unit/web/composer/test_graph_recovery.py:180: in test_restore_intent_and_parser_canonicalize_only_external_park_selector
+    assert direct.park_id == BLOB_UUID
+E   AssertionError: assert 'abcdefabcdef...fabcdefabcdef' == 'abcdefab-cde...-abcdefabcdef'
+E     
+E     - abcdefab-cdef-4abc-8def-abcdefabcdef
+E     + abcdefabcdef4abc8defabcdefabcdef
+_ test_restore_intent_and_parser_canonicalize_only_external_park_selector[urn] _
+tests/unit/web/composer/test_graph_recovery.py:180: in test_restore_intent_and_parser_canonicalize_only_external_park_selector
+    assert direct.park_id == BLOB_UUID
+E   AssertionError: assert 'urn:uuid:abc...-abcdefabcdef' == 'abcdefab-cde...-abcdefabcdef'
+E     
+E     - abcdefab-cdef-4abc-8def-abcdefabcdef
+E     + urn:uuid:abcdefab-cdef-4abc-8def-abcdefabcdef
+E     ? +++++++++
+_ test_restore_intent_and_parser_canonicalize_only_external_park_selector[padded] _
+tests/unit/web/composer/test_graph_recovery.py:180: in test_restore_intent_and_parser_canonicalize_only_external_park_selector
+    assert direct.park_id == BLOB_UUID
+E   AssertionError: assert ' \tabcdefab-...bcdefabcdef\n' == 'abcdefab-cde...-abcdefabcdef'
+E     
+E     - abcdefab-cdef-4abc-8def-abcdefabcdef
+E     +  	abcdefab-cdef-4abc-8def-abcdefabcdef
+E     ? ++                                    +
+______ test_explicit_restore_uses_parked_identity_across_turns[uppercase] ______
+tests/unit/web/coordination/test_graph_recovery_persistence.py:374: in test_explicit_restore_uses_parked_identity_across_turns
+    assert restore.target_state_id == park.state_id and not restore.empty_fallback
+E   AssertionError: assert (None == UUID('a11e1dc2-507e-4196-9693-50976eae5513'))
+E    +  where None = GraphRecoverySettlement(session_id=UUID('a38d86f8-9fda-4a9e-882d-157ebf3a52d0'), operation_id='d565181f-6176-44d1-9b66...se, failure_reason='target_unavailable', receipt_id=UUID('6821baf1-8b5c-4839-a7e5-475d7483eda3'), malformed_head=False).target_state_id
+E    +  and   UUID('a11e1dc2-507e-4196-9693-50976eae5513') = GraphRecoverySettlement(session_id=UUID('a38d86f8-9fda-4a9e-882d-157ebf3a52d0'), operation_id='8e5d87d2-f696-43d4-84aa...pty_fallback=False, failure_reason=None, receipt_id=UUID('a4ca655a-e762-4058-8c95-2c322afb583c'), malformed_head=False).state_id
+________ test_explicit_restore_uses_parked_identity_across_turns[mixed] ________
+tests/unit/web/coordination/test_graph_recovery_persistence.py:374: in test_explicit_restore_uses_parked_identity_across_turns
+    assert restore.target_state_id == park.state_id and not restore.empty_fallback
+E   AssertionError: assert (None == UUID('a38106ed-7f79-4ab9-8ced-f6ac1b651f92'))
+E    +  where None = GraphRecoverySettlement(session_id=UUID('dfbf8c45-216d-4482-a05f-a830989c0bdd'), operation_id='4fe1804a-3f36-49d4-97aa...se, failure_reason='target_unavailable', receipt_id=UUID('3d962f9e-5f36-4476-8746-92a7e5532e0d'), malformed_head=False).target_state_id
+E    +  and   UUID('a38106ed-7f79-4ab9-8ced-f6ac1b651f92') = GraphRecoverySettlement(session_id=UUID('dfbf8c45-216d-4482-a05f-a830989c0bdd'), operation_id='dcc40c44-c91c-4329-a79d...pty_fallback=False, failure_reason=None, receipt_id=UUID('ad4a2951-bb60-4c7d-b779-f754c00ff85a'), malformed_head=False).state_id
+_______ test_explicit_restore_uses_parked_identity_across_turns[braced] ________
+tests/unit/web/coordination/test_graph_recovery_persistence.py:374: in test_explicit_restore_uses_parked_identity_across_turns
+    assert restore.target_state_id == park.state_id and not restore.empty_fallback
+E   AssertionError: assert (None == UUID('adfa8b85-9f17-4162-b6a1-ca9b08078629'))
+E    +  where None = GraphRecoverySettlement(session_id=UUID('8a42da07-151f-4c17-a9ad-849beca90d14'), operation_id='b243acdf-6bdf-4a52-a4dc...se, failure_reason='target_unavailable', receipt_id=UUID('602f888d-0276-46c6-a409-6de362f770ad'), malformed_head=False).target_state_id
+E    +  and   UUID('adfa8b85-9f17-4162-b6a1-ca9b08078629') = GraphRecoverySettlement(session_id=UUID('8a42da07-151f-4c17-a9ad-849beca90d14'), operation_id='ff1fca6c-e9dd-4ce7-8b33...pty_fallback=False, failure_reason=None, receipt_id=UUID('acc881ee-af7a-4cf8-a2a2-98683a842b55'), malformed_head=False).state_id
+_____ test_explicit_restore_uses_parked_identity_across_turns[hyphenless] ______
+tests/unit/web/coordination/test_graph_recovery_persistence.py:374: in test_explicit_restore_uses_parked_identity_across_turns
+    assert restore.target_state_id == park.state_id and not restore.empty_fallback
+E   AssertionError: assert (None == UUID('a5b1626c-c49a-4046-9d6f-50c0ce57da86'))
+E    +  where None = GraphRecoverySettlement(session_id=UUID('ef95a790-97a4-4896-8313-54bafe2a9714'), operation_id='9a5755b7-8e92-42f2-9253...se, failure_reason='target_unavailable', receipt_id=UUID('2c0bfe97-533c-4020-a3f8-4492212267cc'), malformed_head=False).target_state_id
+E    +  and   UUID('a5b1626c-c49a-4046-9d6f-50c0ce57da86') = GraphRecoverySettlement(session_id=UUID('ef95a790-97a4-4896-8313-54bafe2a9714'), operation_id='004682ed-1a3a-494d-b348...pty_fallback=False, failure_reason=None, receipt_id=UUID('ac96eab5-a022-4bc9-a117-3398054d325c'), malformed_head=False).state_id
+_________ test_explicit_restore_uses_parked_identity_across_turns[urn] _________
+tests/unit/web/coordination/test_graph_recovery_persistence.py:374: in test_explicit_restore_uses_parked_identity_across_turns
+    assert restore.target_state_id == park.state_id and not restore.empty_fallback
+E   AssertionError: assert (None == UUID('aef51487-b538-4b35-b7c4-d3a8e49ab3b0'))
+E    +  where None = GraphRecoverySettlement(session_id=UUID('637bfcdd-2e53-4068-aabe-4dbc81fe86b9'), operation_id='bbdfef3e-af21-40ab-b1a8...se, failure_reason='target_unavailable', receipt_id=UUID('dc12996d-a011-41c2-aab5-94dfc29bdfc6'), malformed_head=False).target_state_id
+E    +  and   UUID('aef51487-b538-4b35-b7c4-d3a8e49ab3b0') = GraphRecoverySettlement(session_id=UUID('637bfcdd-2e53-4068-aabe-4dbc81fe86b9'), operation_id='80c16db4-5709-4285-8264...pty_fallback=False, failure_reason=None, receipt_id=UUID('a7345b24-ea6b-439b-8787-718d4efc7450'), malformed_head=False).state_id
+_______ test_explicit_restore_uses_parked_identity_across_turns[padded] ________
+tests/unit/web/coordination/test_graph_recovery_persistence.py:374: in test_explicit_restore_uses_parked_identity_across_turns
+    assert restore.target_state_id == park.state_id and not restore.empty_fallback
+E   AssertionError: assert (None == UUID('a1366238-8f08-4c83-9372-57b4ca010eb0'))
+E    +  where None = GraphRecoverySettlement(session_id=UUID('cdb9b7b6-d593-4c2f-b61a-a34bce9cecae'), operation_id='35ecee68-4ace-4b2e-94a3...se, failure_reason='target_unavailable', receipt_id=UUID('c041d1ed-490f-41a3-ad47-7e7e709676fd'), malformed_head=False).target_state_id
+E    +  and   UUID('a1366238-8f08-4c83-9372-57b4ca010eb0') = GraphRecoverySettlement(session_id=UUID('cdb9b7b6-d593-4c2f-b61a-a34bce9cecae'), operation_id='2b4d5d5e-83fc-40c6-9971...pty_fallback=False, failure_reason=None, receipt_id=UUID('aca6aaf7-fc38-449e-810b-661af4474f0b'), malformed_head=False).state_id
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-none-freeform] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:37:45 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:45 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:45 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:37:45 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:37:45 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=02182c7d-29ec-4153-9637-c8713170b571 state_is_structurally_empty=False
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-none-planner] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:37:46 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:46 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:46 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:37:46 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:37:46 [info     ] composer_authoring_surface_selected authoring_surface=planner session_id=836cbb5e-0aac-49df-ac00-59f89db2812b state_is_structurally_empty=True
+2026-11-09 20:37:46 [info     ] composer.planner_attempt       attempt=1 led_to=terminal operation_id=None outcome=declined phase=prose planner_code=DECLINED rejection_codes=[] repeated_fingerprint=False session_id=836cbb5e-0aac-49df-ac00-59f89db2812b surface=freeform tool_calls=1
+2026-11-09 20:37:46 [warning  ] composer.planner_summary       final_outcome=declined operation_id=None phase_counts={'prose': 1} rejection_history=[] session_id=836cbb5e-0aac-49df-ac00-59f89db2812b surface=freeform total_attempts=1
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-none-malformed-head] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:37:47 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:47 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:47 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:37:47 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-openai_strict-freeform] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:37:47 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:47 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:47 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:37:47 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:37:48 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=d325b28e-1025-4579-b9e7-41403f3f1bca state_is_structurally_empty=False
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-openai_strict-planner] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:37:48 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:48 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:48 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:37:48 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:37:48 [info     ] composer_authoring_surface_selected authoring_surface=planner session_id=2e23512b-af1b-43e4-bd17-2895213469b3 state_is_structurally_empty=True
+2026-11-09 20:37:49 [info     ] composer.planner_attempt       attempt=1 led_to=terminal operation_id=None outcome=declined phase=prose planner_code=DECLINED rejection_codes=[] repeated_fingerprint=False session_id=2e23512b-af1b-43e4-bd17-2895213469b3 surface=freeform tool_calls=1
+2026-11-09 20:37:49 [warning  ] composer.planner_summary       final_outcome=declined operation_id=None phase_counts={'prose': 1} rejection_history=[] session_id=2e23512b-af1b-43e4-bd17-2895213469b3 surface=freeform total_attempts=1
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-openai_strict-malformed-head] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:37:49 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:50 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:50 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:37:50 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-none-freeform] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:37:50 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:50 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:50 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:37:50 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:37:50 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=02290e2d-e208-49cd-99bc-8119d1f9628f state_is_structurally_empty=False
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-none-planner] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:37:51 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:51 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:51 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:37:51 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:37:51 [info     ] composer_authoring_surface_selected authoring_surface=planner session_id=71136bf2-fe42-43d7-9bce-3bdcf6050101 state_is_structurally_empty=True
+2026-11-09 20:37:52 [info     ] composer.planner_attempt       attempt=1 led_to=terminal operation_id=None outcome=declined phase=prose planner_code=DECLINED rejection_codes=[] repeated_fingerprint=False session_id=71136bf2-fe42-43d7-9bce-3bdcf6050101 surface=freeform tool_calls=1
+2026-11-09 20:37:52 [warning  ] composer.planner_summary       final_outcome=declined operation_id=None phase_counts={'prose': 1} rejection_history=[] session_id=71136bf2-fe42-43d7-9bce-3bdcf6050101 surface=freeform total_attempts=1
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-none-malformed-head] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:37:52 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:52 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:52 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:37:52 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-openai_strict-freeform] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:37:53 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:53 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:53 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:37:53 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:37:53 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=f52989fa-f877-40a7-b4f8-43c9c2086f48 state_is_structurally_empty=False
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-openai_strict-planner] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:37:54 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:54 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:54 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:37:54 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:37:54 [info     ] composer_authoring_surface_selected authoring_surface=planner session_id=1900e3db-ff1b-4d4b-9d11-c64bb421d98f state_is_structurally_empty=True
+2026-11-09 20:37:55 [info     ] composer.planner_attempt       attempt=1 led_to=terminal operation_id=None outcome=declined phase=prose planner_code=DECLINED rejection_codes=[] repeated_fingerprint=False session_id=1900e3db-ff1b-4d4b-9d11-c64bb421d98f surface=freeform tool_calls=1
+2026-11-09 20:37:55 [warning  ] composer.planner_summary       final_outcome=declined operation_id=None phase_counts={'prose': 1} rejection_history=[] session_id=1900e3db-ff1b-4d4b-9d11-c64bb421d98f surface=freeform total_attempts=1
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-openai_strict-malformed-head] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:37:55 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:55 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:55 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:37:55 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-none-freeform] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:37:56 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:56 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:56 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:37:56 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:37:56 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=cbf9c86c-d598-42fc-bc61-379e7bd2b1de state_is_structurally_empty=False
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-none-planner] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:37:57 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:57 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:57 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:37:57 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:37:57 [info     ] composer_authoring_surface_selected authoring_surface=planner session_id=5a6f4226-b330-4882-8054-b4cd07c21ac6 state_is_structurally_empty=True
+2026-11-09 20:37:57 [info     ] composer.planner_attempt       attempt=1 led_to=terminal operation_id=None outcome=declined phase=prose planner_code=DECLINED rejection_codes=[] repeated_fingerprint=False session_id=5a6f4226-b330-4882-8054-b4cd07c21ac6 surface=freeform tool_calls=1
+2026-11-09 20:37:57 [warning  ] composer.planner_summary       final_outcome=declined operation_id=None phase_counts={'prose': 1} rejection_history=[] session_id=5a6f4226-b330-4882-8054-b4cd07c21ac6 surface=freeform total_attempts=1
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-none-malformed-head] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:37:57 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:58 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:58 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:37:58 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-openai_strict-freeform] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:37:58 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:58 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:37:58 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:37:58 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:37:58 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=233b53d1-05ca-4854-bb0e-e4ab07e60f7f state_is_structurally_empty=False
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-openai_strict-planner] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:37:59 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:00 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:00 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:38:00 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:38:00 [info     ] composer_authoring_surface_selected authoring_surface=planner session_id=0dc6fae0-e85d-4718-bd7e-1d4beb11240d state_is_structurally_empty=True
+2026-11-09 20:38:00 [info     ] composer.planner_attempt       attempt=1 led_to=terminal operation_id=None outcome=declined phase=prose planner_code=DECLINED rejection_codes=[] repeated_fingerprint=False session_id=0dc6fae0-e85d-4718-bd7e-1d4beb11240d surface=freeform tool_calls=1
+2026-11-09 20:38:00 [warning  ] composer.planner_summary       final_outcome=declined operation_id=None phase_counts={'prose': 1} rejection_history=[] session_id=0dc6fae0-e85d-4718-bd7e-1d4beb11240d surface=freeform total_attempts=1
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-openai_strict-malformed-head] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:00 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:01 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:01 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:38:01 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-none-freeform] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:01 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:01 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:01 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:38:01 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:38:01 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=1568afc2-1511-45f1-a538-1ede3b0a2d8b state_is_structurally_empty=False
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-none-planner] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:02 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:02 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:02 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:38:02 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:38:02 [info     ] composer_authoring_surface_selected authoring_surface=planner session_id=3225abd9-bed4-4b92-867d-2a659c2850ce state_is_structurally_empty=True
+2026-11-09 20:38:02 [info     ] composer.planner_attempt       attempt=1 led_to=terminal operation_id=None outcome=declined phase=prose planner_code=DECLINED rejection_codes=[] repeated_fingerprint=False session_id=3225abd9-bed4-4b92-867d-2a659c2850ce surface=freeform tool_calls=1
+2026-11-09 20:38:02 [warning  ] composer.planner_summary       final_outcome=declined operation_id=None phase_counts={'prose': 1} rejection_history=[] session_id=3225abd9-bed4-4b92-867d-2a659c2850ce surface=freeform total_attempts=1
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-none-malformed-head] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:03 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:03 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:03 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:38:03 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-openai_strict-freeform] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:03 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:04 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:04 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:38:04 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:38:04 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=e07c61f4-ba68-4a21-a8ad-9187bd946473 state_is_structurally_empty=False
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-openai_strict-planner] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:04 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:05 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:05 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:38:05 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:38:05 [info     ] composer_authoring_surface_selected authoring_surface=planner session_id=28e83650-1aaa-4b09-976a-4872d2492d2d state_is_structurally_empty=True
+2026-11-09 20:38:05 [info     ] composer.planner_attempt       attempt=1 led_to=terminal operation_id=None outcome=declined phase=prose planner_code=DECLINED rejection_codes=[] repeated_fingerprint=False session_id=28e83650-1aaa-4b09-976a-4872d2492d2d surface=freeform tool_calls=1
+2026-11-09 20:38:05 [warning  ] composer.planner_summary       final_outcome=declined operation_id=None phase_counts={'prose': 1} rejection_history=[] session_id=28e83650-1aaa-4b09-976a-4872d2492d2d surface=freeform total_attempts=1
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-openai_strict-malformed-head] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:06 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:06 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:06 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:38:06 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-none-freeform] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:06 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:07 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:07 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:38:07 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:38:07 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00caafaa-b192-4c89-aaa2-76d281816770 state_is_structurally_empty=False
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-none-planner] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:07 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:07 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:07 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:38:07 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:38:08 [info     ] composer_authoring_surface_selected authoring_surface=planner session_id=60ada185-909a-479e-879c-599a13ec2353 state_is_structurally_empty=True
+2026-11-09 20:38:08 [info     ] composer.planner_attempt       attempt=1 led_to=terminal operation_id=None outcome=declined phase=prose planner_code=DECLINED rejection_codes=[] repeated_fingerprint=False session_id=60ada185-909a-479e-879c-599a13ec2353 surface=freeform tool_calls=1
+2026-11-09 20:38:08 [warning  ] composer.planner_summary       final_outcome=declined operation_id=None phase_counts={'prose': 1} rejection_history=[] session_id=60ada185-909a-479e-879c-599a13ec2353 surface=freeform total_attempts=1
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-none-malformed-head] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:08 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:08 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:08 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:38:08 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-openai_strict-freeform] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:09 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:09 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:09 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:38:09 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:38:09 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=e042400a-327d-41dd-a197-7bc11de95f98 state_is_structurally_empty=False
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-openai_strict-planner] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:09 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:10 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:10 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:38:10 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:38:10 [info     ] composer_authoring_surface_selected authoring_surface=planner session_id=f1e27d50-a988-4749-b352-66cae34bb4e5 state_is_structurally_empty=True
+2026-11-09 20:38:10 [info     ] composer.planner_attempt       attempt=1 led_to=terminal operation_id=None outcome=declined phase=prose planner_code=DECLINED rejection_codes=[] repeated_fingerprint=False session_id=f1e27d50-a988-4749-b352-66cae34bb4e5 surface=freeform tool_calls=1
+2026-11-09 20:38:10 [warning  ] composer.planner_summary       final_outcome=declined operation_id=None phase_counts={'prose': 1} rejection_history=[] session_id=f1e27d50-a988-4749-b352-66cae34bb4e5 surface=freeform total_attempts=1
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-openai_strict-malformed-head] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:10 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:11 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:11 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:38:11 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-none-freeform] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:12 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:12 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:12 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:38:12 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:38:12 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=2f5d6658-0c39-4bcb-b7c8-ca1f515e9a74 state_is_structurally_empty=False
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-none-planner] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:13 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:13 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:13 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:38:13 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:38:13 [info     ] composer_authoring_surface_selected authoring_surface=planner session_id=dad084ea-d428-4ebc-a808-6c04b0c07002 state_is_structurally_empty=True
+2026-11-09 20:38:13 [info     ] composer.planner_attempt       attempt=1 led_to=terminal operation_id=None outcome=declined phase=prose planner_code=DECLINED rejection_codes=[] repeated_fingerprint=False session_id=dad084ea-d428-4ebc-a808-6c04b0c07002 surface=freeform tool_calls=1
+2026-11-09 20:38:13 [warning  ] composer.planner_summary       final_outcome=declined operation_id=None phase_counts={'prose': 1} rejection_history=[] session_id=dad084ea-d428-4ebc-a808-6c04b0c07002 surface=freeform total_attempts=1
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-none-malformed-head] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:14 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:14 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:14 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:38:14 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-openai_strict-freeform] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:14 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:14 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:14 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:38:14 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:38:15 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=28b2ad8c-e89b-47a8-90b0-1dc5d78fa0b9 state_is_structurally_empty=False
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-openai_strict-planner] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:15 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:15 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:15 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:38:15 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:38:15 [info     ] composer_authoring_surface_selected authoring_surface=planner session_id=0c88c7d7-f82a-4672-ada0-a68050ebefd2 state_is_structurally_empty=True
+2026-11-09 20:38:16 [info     ] composer.planner_attempt       attempt=1 led_to=terminal operation_id=None outcome=declined phase=prose planner_code=DECLINED rejection_codes=[] repeated_fingerprint=False session_id=0c88c7d7-f82a-4672-ada0-a68050ebefd2 surface=freeform tool_calls=1
+2026-11-09 20:38:16 [warning  ] composer.planner_summary       final_outcome=declined operation_id=None phase_counts={'prose': 1} rejection_history=[] session_id=0c88c7d7-f82a-4672-ada0-a68050ebefd2 surface=freeform total_attempts=1
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-openai_strict-malformed-head] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:38:16 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:16 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:38:16 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=35 loop_tool_count=45 planner_diagnostic=None planner_dialect=openai_strict planner_transport=forwarding setting=preferred
+2026-11-09 20:38:16 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+------------------------------ Captured log call -------------------------------
+WARNING  elspeth.web.composer.reasoning:reasoning.py:87 composer primary model 'openrouter/openai/gpt-4o' is not reasoning-capable per litellm's registry; reasoning effort 'high' is sent on every call and a provider or gateway that cannot honour it will refuse the call — composer and advisor must be reasoning models (the registry has gaps: openrouter/ model strings and gateway aliases may be reasoning-capable regardless)
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_graph_recovery.py::test_restore_intent_and_parser_canonicalize_only_external_park_selector[uppercase]
+FAILED tests/unit/web/composer/test_graph_recovery.py::test_restore_intent_and_parser_canonicalize_only_external_park_selector[mixed]
+FAILED tests/unit/web/composer/test_graph_recovery.py::test_restore_intent_and_parser_canonicalize_only_external_park_selector[braced]
+FAILED tests/unit/web/composer/test_graph_recovery.py::test_restore_intent_and_parser_canonicalize_only_external_park_selector[hyphenless]
+FAILED tests/unit/web/composer/test_graph_recovery.py::test_restore_intent_and_parser_canonicalize_only_external_park_selector[urn]
+FAILED tests/unit/web/composer/test_graph_recovery.py::test_restore_intent_and_parser_canonicalize_only_external_park_selector[padded]
+FAILED tests/unit/web/coordination/test_graph_recovery_persistence.py::test_explicit_restore_uses_parked_identity_across_turns[uppercase]
+FAILED tests/unit/web/coordination/test_graph_recovery_persistence.py::test_explicit_restore_uses_parked_identity_across_turns[mixed]
+FAILED tests/unit/web/coordination/test_graph_recovery_persistence.py::test_explicit_restore_uses_parked_identity_across_turns[braced]
+FAILED tests/unit/web/coordination/test_graph_recovery_persistence.py::test_explicit_restore_uses_parked_identity_across_turns[hyphenless]
+FAILED tests/unit/web/coordination/test_graph_recovery_persistence.py::test_explicit_restore_uses_parked_identity_across_turns[urn]
+FAILED tests/unit/web/coordination/test_graph_recovery_persistence.py::test_explicit_restore_uses_parked_identity_across_turns[padded]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-none-freeform]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-none-planner]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-none-malformed-head]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-openai_strict-freeform]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-openai_strict-planner]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-openai_strict-malformed-head]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-none-freeform]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-none-planner]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-none-malformed-head]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-openai_strict-freeform]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-openai_strict-planner]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-openai_strict-malformed-head]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-none-freeform]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-none-planner]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-none-malformed-head]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-openai_strict-freeform]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-openai_strict-planner]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-openai_strict-malformed-head]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-none-freeform]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-none-planner]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-none-malformed-head]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-openai_strict-freeform]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-openai_strict-planner]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-openai_strict-malformed-head]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-none-freeform]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-none-planner]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-none-malformed-head]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-openai_strict-freeform]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-openai_strict-planner]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-openai_strict-malformed-head]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-none-freeform]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-none-planner]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-none-malformed-head]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-openai_strict-freeform]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-openai_strict-planner]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-openai_strict-malformed-head]
+48 failed, 8 passed in 43.07s

@@ -1,0 +1,13 @@
+RUF043 Pattern passed to `match=` contains metacharacters but is neither escaped nor raw
+   --> tests/unit/web/blobs/test_mutation_admission.py:697:61
+    |
+695 |         listener = _forbid_effects(guards, db_engine)
+696 |         try:
+697 |             with pytest.raises(pytest.fail.Exception, match="resource write|attempted DML"):
+    |                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+698 |                 if mutation == "handler":
+699 |                     # An isolated admission mutant that dispatches the actual
+    |
+help: Use a raw string or `re.escape()` to make the intention explicit
+
+Found 3 errors (2 fixed, 1 remaining).

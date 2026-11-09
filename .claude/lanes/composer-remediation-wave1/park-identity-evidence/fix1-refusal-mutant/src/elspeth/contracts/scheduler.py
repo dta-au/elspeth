@@ -1,0 +1,320 @@
+"""Durable token scheduler contracts."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime
+from enum import StrEnum
+
+from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.freeze import freeze_fields, require_int
+from elspeth.contracts.identity import LineageFrame
+
+
+class TokenWorkStatus(StrEnum):
+    """Durable token work-item lifecycle states."""
+
+    READY = "ready"
+    LEASED = "leased"
+    BLOCKED = "blocked"
+    PENDING_SINK = "pending_sink"
+    TERMINAL = "terminal"
+    FAILED = "failed"
+
+
+class SchedulerEventType(StrEnum):
+    """Durable scheduler state-transition audit event types."""
+
+    ENQUEUE = "enqueue"
+    CLAIM_READY = "claim_ready"
+    CLAIM_PENDING_SINK = "claim_pending_sink"
+    RECOVER_EXPIRED_LEASE = "recover_expired_lease"
+    LEASE_LOST = "lease_lost"
+    MARK_BLOCKED = "mark_blocked"
+    MARK_TERMINAL = "mark_terminal"
+    MARK_FAILED = "mark_failed"
+    MARK_PENDING_SINK = "mark_pending_sink"
+    MARK_PENDING_SINK_TERMINAL = "mark_pending_sink_terminal"
+    MARK_BLOCKED_BARRIER_TERMINAL = "mark_blocked_barrier_terminal"
+    # Resume returns a FAILED item whose token has no completed outcome (a claim
+    # that died on an exception mid-row) to READY for re-drive.
+    RESUME_REQUEUE_FAILED = "resume_requeue_failed"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceIngestSpec:
+    """Source identity and detached data for one atomic scheduler ingest."""
+
+    source_node_id: str
+    row_index: int
+    source_row_index: int
+    ingest_sequence: int
+    row_id: str
+    token_id: str
+    data: Mapping[str, object]
+    source_contract_json: str | None = None
+
+    def __post_init__(self) -> None:
+        require_int(self.row_index, "row_index", min_value=0)
+        require_int(self.source_row_index, "source_row_index", min_value=0)
+        require_int(self.ingest_sequence, "ingest_sequence", min_value=0)
+        freeze_fields(self, "data")
+
+
+@dataclass(frozen=True)
+class BatchMembershipSpec:
+    """Aggregation-arm adoption payload: the ``batch_members`` row to write.
+
+    Coalesce adoptions pass ``None`` (their held-arrival durable bookkeeping
+    is a node_states row written by ``begin_node_state``; the adoption's
+    durable payload is the CAS marker alone).
+    """
+
+    batch_id: str
+    ordinal: int
+
+
+@dataclass(frozen=True)
+class BufferedOutcomeSpec:
+    """Aggregation-arm adoption payload: the BUFFERED ``token_outcomes`` row.
+
+    ``batch_id`` is the same batch as the membership spec — kept explicit
+    because the outcome row carries its own ``batch_id`` column (ADR-019
+    BUFFERED rule: ``batch_id`` REQUIRED for ``path='buffered'``).
+    """
+
+    batch_id: str
+    context: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "context")
+
+
+@dataclass(frozen=True)
+class GroupLossSpec:
+    """Durable group-loss record riding a lossy disposition (spec §6.2, rev 3.2).
+
+    The unified replacement for the retired ``BranchLossSpec``: one loss
+    names one member of one group at one closer. Natural key = (run_id,
+    closer_name, group_id, member_key) — group-scoped, so the rev-2 ledger
+    key collision is structurally impossible. ``token_id`` is recorded for
+    lineage-corruption detection (same-key different-token raises Tier-1).
+    ``reason`` stays within the categorical branch-loss vocabulary — bare
+    shared tokens, never prose. ``recorded_by`` deliberately does NOT ride
+    the spec: the staging repository verb stamps the lease owner it already
+    holds.
+    """
+
+    closer_name: str
+    group_id: str
+    member_key: str
+    token_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class BarrierTerminalOutcomeSpec:
+    """One token terminal written atomically with barrier completion."""
+
+    token_id: str
+    outcome: TerminalOutcome
+    path: TerminalPath
+    error_hash: str | None = None
+
+
+def _validate_scheduler_enum(value: object, enum_type: type[StrEnum], field_name: str, *, optional: bool = False) -> None:
+    if value is None:
+        if optional:
+            return
+        raise TypeError(f"{field_name} must be {enum_type.__name__}, got None")
+    if type(value) is not enum_type:
+        raise TypeError(f"{field_name} must be {enum_type.__name__}, got {type(value).__name__}: {value!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class TokenWorkItem:
+    """A schedulable token continuation.
+
+    The scheduler row is authoritative for resume. It carries the current row
+    payload, node cursor, terminal sink context, token lineage, and coalesce
+    cursor needed to rebuild a ``WorkItem`` in a fresh process without relying
+    on in-memory ``pending_items`` state.
+    """
+
+    work_item_id: str
+    run_id: str
+    token_id: str
+    row_id: str
+    node_id: str | None
+    step_index: int
+    ingest_sequence: int
+    row_payload_json: str
+    status: TokenWorkStatus
+    attempt: int
+    available_at: datetime
+    created_at: datetime
+    updated_at: datetime
+    queue_key: str | None = None
+    barrier_key: str | None = None
+    on_success_sink: str | None = None
+    pending_sink_name: str | None = None
+    pending_outcome: str | None = None
+    pending_path: str | None = None
+    pending_error_hash: str | None = None
+    pending_error_message: str | None = None
+    join_group_id: str | None = None
+    # Epoch 35: typed lineage path (outermost first); column form is lineage_path_json.
+    lineage_path: tuple[LineageFrame, ...] = ()
+    coalesce_node_id: str | None = None
+    coalesce_name: str | None = None
+    row_union_name: str | None = None
+    # WS4 Task 6: the collector's barrier BINDING address (closer's address,
+    # not lineage — spec §4.3). barrier_key = "collector:<collector_name>:<group_id>"
+    # (compound, unlike coalesce/row_union's bare-name key) for a BLOCKED
+    # collector arrival row.
+    collector_name: str | None = None
+    lease_owner: str | None = None
+    lease_expires_at: datetime | None = None
+    barrier_blocked_at: datetime | None = None
+    # ADR-030 §E.2 (slice 3): the leader epoch that durably adopted this
+    # BLOCKED barrier hold into executor memory via adopt_blocked_barrier_item.
+    # NULL = intake-pending (deposited but not yet adopted); the per-iteration
+    # journal-first intake filters on IS NULL.
+    barrier_adopted_epoch: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BarrierEmission:
+    """One output emitted by an atomic barrier completion (``complete_barrier``).
+
+    Two lanes consume this contract:
+
+    - ``emitted_pending_sink``: a sink-bound output. If the token already has a
+      BLOCKED row under the completing barrier (a buffered passthrough token),
+      that row transitions BLOCKED -> PENDING_SINK in place and only the
+      handoff bundle (``row_payload_json``, ``sink_name``, ``outcome``,
+      ``path``, ``error_hash``, ``error_message``) is read. Otherwise a fresh
+      PENDING_SINK row is inserted on the node_id-NULL terminal lane, which
+      additionally requires ``row_id``, ``step_index`` and ``ingest_sequence``
+      (and ``node_id`` must stay ``None``).
+    - ``emitted_ready``: a READY continuation (an aggregation/coalesce output
+      re-entering the DAG). Requires ``row_id``, ``step_index``,
+      ``ingest_sequence`` and the target ``node_id`` cursor.
+
+    Lineage and coalesce cursor fields mirror ``TokenWorkItem``: they are
+    durable resume metadata for the inserted row.
+    """
+
+    token_id: str
+    row_payload_json: str
+    sink_name: str | None = None
+    outcome: str | None = None
+    path: str | None = None
+    error_hash: str | None = None
+    error_message: str | None = None
+    row_id: str | None = None
+    node_id: str | None = None
+    step_index: int | None = None
+    ingest_sequence: int | None = None
+    queue_key: str | None = None
+    barrier_key: str | None = None
+    on_success_sink: str | None = None
+    join_group_id: str | None = None
+    # Epoch 35: typed lineage path (outermost first); column form is lineage_path_json.
+    lineage_path: tuple[LineageFrame, ...] = ()
+    coalesce_node_id: str | None = None
+    coalesce_name: str | None = None
+    row_union_name: str | None = None
+    collector_name: str | None = None
+    attempt: int = 1
+
+    def __post_init__(self) -> None:
+        require_int(self.attempt, "attempt", min_value=1)
+        require_int(self.step_index, "step_index", optional=True, min_value=0)
+        require_int(self.ingest_sequence, "ingest_sequence", optional=True, min_value=0)
+
+
+@dataclass(frozen=True, slots=True)
+class BlockedPendingSinkHandoff:
+    """Sink handoff metadata for a BLOCKED scheduler row released by a barrier."""
+
+    row_payload_json: str
+    sink_name: str
+    outcome: str
+    path: str
+    error_hash: str | None
+    error_message: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SchedulerEvent:
+    """Immutable audit event for a scheduler work-item transition.
+
+    ``seq`` is the row identity and the authoritative replay order (epoch 38);
+    ``event_id`` is a content digest of the transition and is not unique.
+    ``recorded_at`` is evidence, never an ordering key.
+    """
+
+    seq: int
+    event_id: str
+    run_id: str
+    token_id: str
+    work_item_id: str
+    event_type: SchedulerEventType
+    to_status: TokenWorkStatus
+    to_attempt: int
+    recorded_at: datetime
+    node_id: str | None = None
+    from_status: TokenWorkStatus | None = None
+    from_lease_owner: str | None = None
+    to_lease_owner: str | None = None
+    from_lease_expires_at: datetime | None = None
+    to_lease_expires_at: datetime | None = None
+    from_attempt: int | None = None
+    caller_owner: str | None = None
+    context_json: str = "{}"
+
+    def __post_init__(self) -> None:
+        require_int(self.seq, "seq", min_value=1)
+        _validate_scheduler_enum(self.event_type, SchedulerEventType, "event_type")
+        _validate_scheduler_enum(self.from_status, TokenWorkStatus, "from_status", optional=True)
+        _validate_scheduler_enum(self.to_status, TokenWorkStatus, "to_status")
+        require_int(self.from_attempt, "from_attempt", optional=True, min_value=0)
+        require_int(self.to_attempt, "to_attempt", min_value=0)
+
+
+# How many token ids a resume refusal names in its recorded event and message:
+# enough to start an investigation, bounded independent of the run's size.
+RESUME_REFUSAL_TOKEN_ID_LIMIT = 10
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeCoverageRefusal:
+    """The resume coverage check's refusal: undecided tokens no scheduler work covers.
+
+    Resume re-drives only durable scheduler work and never re-derives a row,
+    so every token of a resumable run is decided (a completed outcome) or
+    covered by a READY / LEASED / BLOCKED / PENDING_SINK item. This names the
+    tokens that are neither. Carries ELSPETH token identifiers and a count
+    only — never row values. ``first_token_ids`` is the sorted head of the
+    offending set, bounded by ``RESUME_REFUSAL_TOKEN_ID_LIMIT``.
+    """
+
+    token_count: int
+    first_token_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        require_int(self.token_count, "token_count", min_value=1)
+        if type(self.first_token_ids) is not tuple:
+            raise TypeError(f"first_token_ids must be a tuple, got {type(self.first_token_ids).__name__}")
+        for token_id in self.first_token_ids:
+            if type(token_id) is not str or not token_id:
+                raise ValueError(f"first_token_ids entries must be non-empty strings, got {token_id!r}")
+        if len(self.first_token_ids) != min(self.token_count, RESUME_REFUSAL_TOKEN_ID_LIMIT):
+            raise ValueError(
+                f"first_token_ids must name min(token_count, {RESUME_REFUSAL_TOKEN_ID_LIMIT}) tokens; "
+                f"got {len(self.first_token_ids)} for token_count={self.token_count}"
+            )
+        if list(self.first_token_ids) != sorted(set(self.first_token_ids)):
+            raise ValueError("first_token_ids must be sorted and distinct")

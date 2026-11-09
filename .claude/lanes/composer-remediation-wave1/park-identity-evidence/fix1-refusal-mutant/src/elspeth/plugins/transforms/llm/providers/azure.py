@@ -1,0 +1,448 @@
+"""Azure OpenAI LLM provider.
+
+Thin wrapper over AuditedLLMClient that normalizes LLMResponse into
+LLMQueryResult. All audit recording, telemetry, and error classification
+happen inside AuditedLLMClient — this provider just manages client lifecycle
+and response normalization.
+
+Client caching is per-audit-parent with a threading lock. The cache identity
+is snapshotted at method entry (not read from a mutable context) to prevent
+evicting the wrong cache entry during retry races.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from threading import Lock
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal
+
+import structlog
+from pydantic import Field, field_validator, model_validator
+
+from elspeth.contracts import CallType
+from elspeth.contracts.audit_protocols import PluginAuditWriter
+from elspeth.contracts.call_governance import LLMCallGovernance
+from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.value_source import ValueSource
+from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, ContentPolicyError, LLMClientError, build_llm_call_request
+from elspeth.plugins.llm.config_validation import (
+    AZURE_MODEL_VALUE_SOURCES,
+    derive_azure_model,
+    validate_azure_api_version,
+    validate_azure_endpoint,
+)
+from elspeth.plugins.transforms.llm.base import LLMConfig
+from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent, LLMQueryResult, finish_reason_from_raw_response
+from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, TracingConfig
+
+if TYPE_CHECKING:
+    from elspeth.contracts.call_mode import CallModeSession
+    from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
+
+logger = structlog.get_logger(__name__)
+
+# Azure OpenAI takes the output budget as ``max_completion_tokens``. Reasoning
+# deployments reject the deprecated ``max_tokens`` with HTTP 400, gpt-4o and
+# later non-reasoning deployments accept either, and a deployment name is
+# operator-chosen so the model family cannot be inferred from it — every
+# Azure call sends the current name. ``validate_azure_api_version`` holds the
+# API version at or above the first one that defines it.
+_AZURE_MAX_TOKENS_PARAM: Final = "max_completion_tokens"
+
+# ``max_completion_tokens`` counts reasoning tokens as well as the visible
+# reply, so a budget sized for "ok" alone is spent before a reasoning
+# deployment emits any content and the preflight reads as an empty completion.
+# The cap never binds on a non-reasoning deployment (the reply is a few
+# tokens); it is well above Azure's floor of 16, below which the API returns
+# HTTP 400 "integer_below_min_value" before any model work.
+_PREFLIGHT_MAX_COMPLETION_TOKENS: Final = 2048
+
+
+class AzureOpenAIConfig(LLMConfig):
+    """Azure OpenAI-specific configuration.
+
+    Extends LLMConfig with Azure-specific settings:
+    - deployment_name: Azure deployment name (required) - used as model identifier
+    - endpoint: Azure OpenAI endpoint URL (required)
+    - api_key (str): Azure OpenAI API key (required)
+    - api_version: Azure API version (default: 2024-10-21)
+
+    Pooling options (inherited from LLMConfig):
+    - pool_size: Number of concurrent workers (1=sequential, >1=pooled)
+    - max_dispatch_delay_ms: Maximum AIMD backoff delay
+    - max_capacity_retry_seconds: Timeout for capacity error retries
+
+    Note: The 'model' field from LLMConfig is automatically set to
+    deployment_name if not explicitly provided.
+    """
+
+    # Azure configs always have provider="azure" — narrowed Literal prevents misconfiguration
+    provider: Literal["azure"] = Field(default="azure", description="LLM provider")
+
+    # Override model to make it optional - will default to deployment_name
+    model: str = Field(default="", description="Model identifier (defaults to deployment_name)")
+
+    temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature. Omitted or null uses the deployment default; set explicitly for deployments supporting sampling.",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+
+    deployment_name: str = Field(..., description="Azure deployment name")
+    endpoint: str = Field(..., description="Azure OpenAI endpoint URL")
+    api_key: str = Field(..., description="Azure OpenAI API key", repr=False)
+    api_version: str = Field(default="2024-10-21", description="Azure API version")
+
+    # Tier 2: Plugin-internal tracing (optional)
+    # Use environment variables for secrets: ${APPLICATIONINSIGHTS_CONNECTION_STRING}
+    tracing: dict[str, Any] | None = Field(
+        default=None,
+        description="Tier 2 tracing configuration (azure_ai, langfuse, or none)",
+    )
+
+    @field_validator("endpoint")
+    @classmethod
+    def _validate_endpoint_url(cls, value: str) -> str:
+        return validate_azure_endpoint(value)
+
+    @field_validator("api_version")
+    @classmethod
+    def _validate_api_version(cls, value: str) -> str:
+        return validate_azure_api_version(value)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _set_model_from_deployment(cls, data: Any) -> Any:
+        """Set model to deployment_name if not explicitly provided."""
+        return derive_azure_model(data)
+
+    # Value-source declaration: ``model`` is derived from ``deployment_name``.
+    # The ``_set_model_from_deployment`` validator above fills the field when
+    # empty; the value-source compliance walker confirms post-validation that
+    # ``model == deployment_name`` (or that ``model`` was empty in the original
+    # config — accepted because the validator substitutes the sibling).
+    VALUE_SOURCES: ClassVar[tuple[ValueSource, ...]] = AZURE_MODEL_VALUE_SOURCES
+
+
+class AzureLLMProvider:
+    """Azure OpenAI provider — wraps AuditedLLMClient.
+
+    Responsibilities:
+    1. Create/cache AuditedLLMClient per audit parent (thread-safe)
+    2. Create/cache underlying AzureOpenAI SDK client (thread-safe)
+    3. Map LLMResponse → LLMQueryResult (content, usage, model, finish_reason)
+    4. Let LLMClientError subclasses propagate unchanged
+
+    Does NOT own:
+    - Audit recording (AuditedLLMClient does this)
+    - Error classification (AuditedLLMClient does this)
+    - Tracing setup (transform lifecycle manages azure_ai tracing)
+    """
+
+    def __init__(
+        self,
+        *,
+        endpoint: str,
+        api_key: str,
+        api_version: str,
+        deployment_name: str,
+        recorder: PluginAuditWriter,
+        run_id: str,
+        telemetry_emit: TelemetryEmitCallback,
+        limiter: Any = None,
+        approved_prompt_artifact_hash: str | None = None,
+        llm_call_governance: LLMCallGovernance | None = None,
+        pricing_model: str | None = None,
+        call_mode_session: CallModeSession | None = None,
+    ) -> None:
+        self._endpoint = endpoint
+        self._api_key: str | None = api_key
+        self._api_version = api_version
+        self._deployment_name = deployment_name
+        self._recorder = recorder
+        self._run_id = run_id
+        self._telemetry_emit = telemetry_emit
+        self._limiter = limiter
+        # Phase 5b Task 9 — cross-DB hash anchor. Forwarded to every
+        # ``client.chat_completion`` call so the Landscape ``calls`` row
+        # carries the matching SHA-256.
+        self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
+        self._llm_call_governance = llm_call_governance
+        self._pricing_model = pricing_model
+        self._call_mode_session = call_mode_session
+
+        # Client caches — lock ordering: _llm_clients_lock → _underlying_client_lock
+        # (always acquire _llm_clients_lock first to prevent deadlock)
+        self._llm_clients: dict[str, AuditedLLMClient] = {}
+        self._llm_clients_lock = Lock()
+        self._underlying_client: Any = None  # AzureOpenAI | None
+        self._underlying_client_lock = Lock()
+
+    def execute_query(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        model: str,
+        temperature: float | None,
+        max_tokens: int | None,
+        audit_parent: LLMAuditParent,
+        response_format: dict[str, Any] | None = None,
+    ) -> LLMQueryResult:
+        """Execute LLM query via Azure OpenAI SDK.
+
+        Args:
+            messages: Chat messages (system + user)
+            model: Model/deployment name
+            temperature: Sampling temperature (None = omitted, provider default)
+            max_tokens: Max response tokens, sent as ``max_completion_tokens``
+                (None = provider default)
+            audit_parent: Validated row or operation audit parent
+            response_format: OpenAI response_format dict (e.g., {"type": "json_object"})
+
+        Returns:
+            Normalized LLMQueryResult
+
+        Raises:
+            RateLimitError, NetworkError, ServerError: Retryable
+            ContentPolicyError, ContextLengthError, LLMClientError: Not retryable
+        """
+        # Snapshot cache identity — do not read from mutable ctx later.
+        # This prevents the openrouter.py bug where ctx.state_id was read
+        # in the finally block, evicting the wrong cache entry during retries.
+        cache_key = audit_parent.cache_key
+
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            request = build_llm_call_request(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                provider="azure",
+                max_tokens=max_tokens,
+                max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
+                response_format=response_format,
+            )
+            self._call_mode_session.preflight_verify_request(
+                call_type=CallType.LLM,
+                request_data=request.to_dict(),
+                current_state_id=audit_parent.state_id,
+                current_operation_id=audit_parent.operation_id,
+            )
+
+        try:
+            client = self._get_llm_client(audit_parent)
+
+            response = client.chat_completion(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
+            )
+
+            # raw_response is the Azure SDK's deserialized API response: a
+            # Tier 3 envelope read through the declared boundary.
+            finish_reason = finish_reason_from_raw_response(response.raw_response)
+
+            # Empty/whitespace content — AuditedLLMClient converts None→""
+            # (known fabrication). Detect here and raise typed errors so the
+            # transform's except LLMClientError handler catches them.
+            if not response.content or not response.content.strip():
+                if finish_reason == FinishReason.TOOL_CALLS:
+                    raise LLMClientError(
+                        "Azure returned tool_calls response (not supported by ELSPETH)",
+                        retryable=False,
+                    )
+                raise ContentPolicyError(
+                    f"LLM returned empty content (finish_reason={finish_reason})",
+                )
+
+            return LLMQueryResult(
+                content=response.content,
+                usage=response.usage,
+                model=response.model,
+                finish_reason=finish_reason,
+            )
+        finally:
+            # Clean up cached client for this audit parent to prevent unbounded growth.
+            # Uses the snapshotted key to avoid evicting the wrong entry.
+            with self._llm_clients_lock:
+                self._llm_clients.pop(cache_key, None)
+
+    def runtime_preflight(self, *, operation_id: str, model: str, temperature: float | None, coordination_token: CoordinationToken) -> None:
+        """Run a minimal audited Azure OpenAI call under an operation parent."""
+        smoke_messages = [ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")]
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            request = build_llm_call_request(
+                model=model,
+                messages=smoke_messages,
+                temperature=temperature,
+                provider="azure",
+                max_tokens=_PREFLIGHT_MAX_COMPLETION_TOKENS,
+                max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
+            )
+            self._call_mode_session.preflight_verify_request(
+                call_type=CallType.LLM,
+                request_data=request.to_dict(),
+                current_state_id=None,
+                current_operation_id=operation_id,
+            )
+        client = AuditedLLMClient(
+            execution=self._recorder,
+            state_id=None,
+            operation_id=operation_id,
+            coordination_token=coordination_token,
+            run_id=self._run_id,
+            telemetry_emit=self._telemetry_emit,
+            underlying_client=None
+            if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY
+            else self._get_underlying_client(),
+            provider="azure",
+            pricing_model=self._pricing_model,
+            limiter=self._limiter,
+            llm_call_governance=self._llm_call_governance,
+            max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
+            call_mode_session=self._call_mode_session,
+        )
+        try:
+            response = client.chat_completion(
+                model=model,
+                messages=smoke_messages,
+                # Readiness must exercise the operator's resolved sampling
+                # value, including omission, just like normal completions.
+                temperature=temperature,
+                max_tokens=_PREFLIGHT_MAX_COMPLETION_TOKENS,
+            )
+            if not response.content.strip():
+                raise ContentPolicyError("Azure preflight returned empty content")
+            finish_reason = finish_reason_from_raw_response(response.raw_response)
+            if finish_reason not in (None, FinishReason.STOP):
+                raise LLMClientError("Azure preflight returned an unusable finish reason", retryable=False)
+        finally:
+            client.close()
+
+    def _get_underlying_client(self) -> Any:
+        """Get or create the underlying AzureOpenAI SDK client (thread-safe)."""
+        with self._underlying_client_lock:
+            if self._underlying_client is None:
+                from openai import AzureOpenAI
+
+                self._underlying_client = AzureOpenAI(
+                    azure_endpoint=self._endpoint,
+                    api_key=self._api_key,
+                    api_version=self._api_version,
+                    max_retries=0,
+                )
+                # Clear plaintext key — SDK client holds its own copy
+                self._api_key = None
+            return self._underlying_client
+
+    def _get_llm_client(self, audit_parent: LLMAuditParent) -> AuditedLLMClient:
+        """Get or create AuditedLLMClient for an audit parent (thread-safe)."""
+        cache_key = audit_parent.cache_key
+        with self._llm_clients_lock:
+            if cache_key not in self._llm_clients:
+                self._llm_clients[cache_key] = AuditedLLMClient(
+                    execution=self._recorder,
+                    run_id=self._run_id,
+                    telemetry_emit=self._telemetry_emit,
+                    underlying_client=None
+                    if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY
+                    else self._get_underlying_client(),
+                    provider="azure",
+                    pricing_model=self._pricing_model,
+                    limiter=self._limiter,
+                    llm_call_governance=self._llm_call_governance,
+                    max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
+                    call_mode_session=self._call_mode_session,
+                    **audit_parent.client_kwargs(),
+                )
+            return self._llm_clients[cache_key]
+
+    def close(self) -> None:
+        """Release all cached clients."""
+        with self._llm_clients_lock:
+            self._llm_clients.clear()
+        with self._underlying_client_lock:
+            if self._underlying_client is not None:
+                self._underlying_client.close()
+            self._underlying_client = None
+
+
+# Optional SDK import — module-level so tests can mock it.
+_imported_configure_azure_monitor: Callable[..., None] | None
+try:
+    from azure.monitor.opentelemetry import (
+        configure_azure_monitor as _azure_monitor_sdk_configure,
+    )
+except ImportError:
+    _imported_configure_azure_monitor = None
+else:
+    _imported_configure_azure_monitor = _azure_monitor_sdk_configure
+
+configure_azure_monitor: Callable[..., None] | None = _imported_configure_azure_monitor
+
+# Module-level idempotency guard — Azure Monitor is process-global.
+_azure_monitor_configured: bool = False
+
+
+def _reset_azure_monitor_state() -> None:
+    """Reset module state for testing only."""
+    global _azure_monitor_configured
+    _azure_monitor_configured = False
+
+
+def _configure_azure_monitor(config: TracingConfig) -> bool:
+    """Configure Azure Monitor (module-level to allow mocking).
+
+    Returns True on success, False on failure.
+    Idempotent: second call logs a warning and returns True.
+    """
+    global _azure_monitor_configured
+
+    if not isinstance(config, AzureAITracingConfig):
+        return False
+
+    if _azure_monitor_configured:
+        logger.warning(
+            "Azure Monitor already configured — skipping duplicate initialization",
+        )
+        return True
+
+    if configure_azure_monitor is None:
+        raise ImportError(
+            "azure-monitor-opentelemetry is not installed but azure_ai tracing was configured. "
+            "This should not happen — the SDK is bundled with elspeth[azure]. "
+            "Reinstall with: uv pip install 'elspeth[azure]'"
+        )
+
+    configure_azure_monitor(
+        connection_string=config.connection_string,
+        enable_live_metrics=config.enable_live_metrics,
+    )
+
+    # Wire enable_content_recording to the Azure AI Inference tracing SDK.
+    # Without this, the config field is accepted and logged but never applied,
+    # leaving operators with a false sense of their content recording policy.
+    # Fail-closed on absence: enable_content_recording is policy-bearing, and
+    # no verifiable downstream control applies it when the instrumentor is
+    # missing — an environment-variable fallback asserts a policy nothing is
+    # proven to read (same posture as the configure_azure_monitor check above).
+    try:
+        from azure.ai.inference.tracing import AIInferenceInstrumentor
+    except ImportError as exc:
+        raise ImportError(
+            "azure-ai-inference is not installed but azure_ai tracing was configured. "
+            "The content-recording policy (enable_content_recording) is applied through "
+            "AIInferenceInstrumentor and cannot be verifiably enforced without it. "
+            "Install with: uv pip install azure-ai-inference"
+        ) from exc
+
+    AIInferenceInstrumentor().instrument(enable_content_recording=config.enable_content_recording)
+
+    _azure_monitor_configured = True
+    return True

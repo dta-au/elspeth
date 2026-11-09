@@ -1,0 +1,17 @@
+{
+  "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1",
+  "evidence_prefix": "fix1-format-final",
+  "argv": [
+    "/workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1/.venv/bin/python",
+    "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-gate-fix1-verify.py",
+    "-n",
+    "0",
+    "-o",
+    "pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1/src /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1/elspeth-lints/src",
+    "tests/unit/web/composer/test_compose_loop_persistence.py::test_explicit_approval_batch_caps_after_first_ten_admitted_publications",
+    "tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_cap_excludes_schema_errors_and_semantic_refusals",
+    "tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_attempt_cap_includes_approval_required_blob_only_mutation"
+  ],
+  "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1:/workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1/src:/workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1/elspeth-lints/src",
+  "head": "14fef5e5342ccbd79b4fdd69b276c20f77d66dc1"
+}

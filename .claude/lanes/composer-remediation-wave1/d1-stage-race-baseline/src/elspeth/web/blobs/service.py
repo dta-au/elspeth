@@ -1,0 +1,4555 @@
+"""BlobServiceImpl — filesystem-backed blob persistence."""
+
+from __future__ import annotations
+
+import asyncio
+import errno
+import hashlib
+import hmac
+import json
+import os
+import re
+import stat
+import threading
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from functools import partial
+from pathlib import Path
+from typing import Any, Never, TypedDict, TypeVar, cast
+from uuid import UUID, uuid4, uuid5
+
+from opentelemetry import metrics
+from sqlalchemy import Engine, func, select
+from sqlalchemy.engine import Connection, Row
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+
+from elspeth.contracts.blobs import BlobAtomicDeletionObligation, BlobCreationObligation, BlobDeletionPlan, blob_record_snapshot_hash
+from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+from elspeth.web.async_workers import run_sync_in_worker
+from elspeth.web.blobs.protocol import (
+    ALLOWED_MIME_TYPES,
+    BLOB_CREATORS,
+    BLOB_RUN_LINK_DIRECTIONS,
+    BLOB_STATUSES,
+    STORAGE_MIME_TYPES,
+    AllowedMimeType,
+    BlobActiveRunError,
+    BlobContentMissingError,
+    BlobCreator,
+    BlobError,
+    BlobFinalizationError,
+    BlobFinalizationResult,
+    BlobForkCleanupError,
+    BlobForkCleanupResult,
+    BlobForkFenceLostError,
+    BlobForkPlanEntry,
+    BlobForkWriteFence,
+    BlobInProgressForkError,
+    BlobIntegrityError,
+    BlobNotFoundError,
+    BlobPendingProposalError,
+    BlobQuotaExceededError,
+    BlobRecord,
+    BlobRunLinkDirection,
+    BlobRunLinkRecord,
+    BlobStateError,
+    InlineCustodyRequest,
+    StorageAccountingUnavailableError,
+    StorageMimeType,
+    fork_blob_id,
+    names_same_blob,
+)
+from elspeth.web.composer.yaml_generator import LoweredPipelineDocument
+from elspeth.web.coordination.quota_authority import (
+    QuotaExceeded,
+    admit_storage_bytes_on_connection,
+    refuse_unrecorded_quota_exceeded,
+    session_storage_bytes_on_connection,
+)
+from elspeth.web.sessions.converters import pipeline_dict_from_record
+from elspeth.web.sessions.locking import _blob_custody_session_lock as _blob_custody_session_lock
+from elspeth.web.sessions.locking import (
+    _run_lock_cleanup,
+    acquire_session_advisory_xact_lock,
+)
+from elspeth.web.sessions.models import (
+    blob_deletion_cleanups_table,
+    blob_run_links_table,
+    blobs_table,
+    chat_messages_table,
+    composition_states_table,
+    runs_table,
+    session_operation_receipts_table,
+    sessions_table,
+)
+from elspeth.web.sessions.proposal_blob_refs import pending_proposal_reference_id
+from elspeth.web.sessions.protocol import (
+    CompositionStateRecord,
+    SessionOperationAuthority,
+    SessionOperationMutationTransaction,
+    decode_stored_composition_validation_errors,
+)
+from elspeth.web.sessions.state_envelope import unwrap_state_column
+
+_T = TypeVar("_T")
+
+_BLOB_COPY_FORK_ORPHAN_ROWS_COUNTER = metrics.get_meter(__name__).create_counter("blob_copy_fork.orphan_rows_left_behind")
+
+_FORK_COPY_LEASE_CHECKPOINT_INTERVAL_SECONDS = 30.0
+_FORK_COPY_WRITE_CHUNK_BYTES = 1024 * 1024
+_STREAM_CHUNK_BYTES = 1024 * 1024
+
+_INLINE_CUSTODY_NAMESPACE = UUID("8ef5fd65-8a90-5fe4-9084-eab5b9d2d2db")
+_INLINE_CUSTODY_SCHEMA = "elspeth.inline-custody.v1"
+_LOWERCASE_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_LOWERCASE_UUID_HEX = re.compile(r"[0-9a-f]{32}\Z")
+_INLINE_CUSTODY_STAGE_SUFFIX = ".inline-custody-staged"
+
+
+def _blob_operation_path_token(
+    *,
+    operation_id: str,
+    operation_epoch: int,
+    operation_kind: SessionOperationKind,
+) -> str:
+    """Return a filesystem-safe digest of one exact operation identity."""
+    return hashlib.sha256(
+        canonical_json(
+            {
+                "operation_id": operation_id,
+                "operation_epoch": operation_epoch,
+                "operation_kind": operation_kind.value,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+# Session-operation kinds admitted to each blob effect. A context whose
+# operation kind is outside the set for an effect is refused before any
+# database or filesystem access: the fence names WHAT the operation is, and a
+# blob create under an ARCHIVE fence (or a delete under a BLOB_READ fence) is
+# a programming error, never something to tolerate.
+_CREATE_BLOB_OPERATION_KINDS = frozenset(
+    {
+        SessionOperationKind.CREATE,
+        SessionOperationKind.COMPOSE,
+        SessionOperationKind.PROPOSAL,
+    }
+)
+_READ_BLOB_OPERATION_KINDS = frozenset(
+    {
+        SessionOperationKind.BLOB_READ,
+        SessionOperationKind.COMPOSE,
+        SessionOperationKind.PROPOSAL,
+        SessionOperationKind.EXECUTE,
+        SessionOperationKind.SESSION_FORK,
+    }
+)
+_DELETE_BLOB_OPERATION_KINDS = frozenset(
+    {
+        SessionOperationKind.ARCHIVE,
+        SessionOperationKind.COMPOSE,
+    }
+)
+_EXECUTE_BLOB_OPERATION_KINDS = frozenset({SessionOperationKind.EXECUTE})
+# The raced-deletion errnos a content read translates into the typed
+# ``BlobContentMissingError``: ENOENT when the file vanished between the
+# existence guard and the open, ESTALE when a sibling replica's delete revoked
+# the inode under an already-open handle on a shared NFS mount (replicas > 1;
+# elspeth-632373963d). Every other errno is a real I/O fault and propagates.
+_RACED_DELETION_ERRNOS = frozenset({errno.ENOENT, errno.ESTALE})
+
+
+def _require_blob_operation_context(
+    context: SessionOperationContext,
+    *,
+    allowed_kinds: frozenset[SessionOperationKind],
+) -> None:
+    """Refuse anything but an exact context of an admitted operation kind."""
+    if type(context) is not SessionOperationContext:
+        raise TypeError("session_operation_context must be an exact SessionOperationContext")
+    if context.operation_kind not in allowed_kinds:
+        raise ValueError("session operation context has an invalid operation kind for this blob effect")
+
+
+_INLINE_CUSTODY_STAGE_TEMP_SUFFIX = f"{_INLINE_CUSTODY_STAGE_SUFFIX}.custody.tmp"
+
+
+class _NormalizedInlineCustodyFields(TypedDict):
+    session_id: str
+    filename: str
+    mime_type: AllowedMimeType
+    source_description: str | None
+    creation_modality: CreationModality
+    created_from_message_id: str
+    creating_model_identifier: str | None
+    creating_model_version: str | None
+    creating_provider: str | None
+    creating_composer_skill_hash: str | None
+    creating_arguments_hash: str | None
+    content_hash: str
+    size_bytes: int
+
+
+class _ExpectedBlobFields(TypedDict):
+    session_id: str
+    filename: str
+    mime_type: StorageMimeType
+    source_description: str | None
+    creation_modality: CreationModality
+    created_from_message_id: str | None
+    creating_model_identifier: str | None
+    creating_model_version: str | None
+    creating_provider: str | None
+    creating_composer_skill_hash: str | None
+    creating_arguments_hash: str | None
+    content_hash: str
+    size_bytes: int
+    created_by: BlobCreator
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedBlobDeletion:
+    """Same-directory tombstone retained until the metadata commit wins."""
+
+    storage: Path
+    tombstone: Path | None
+
+
+@dataclass(frozen=True, slots=True)
+class InlineCustodyPublication:
+    """Tracked filesystem stage awaiting its enclosing transaction outcome."""
+
+    session_id: str
+    blob_id: str
+    storage: Path
+    staging: Path
+    expected_hash: str
+    cleanup_after_rollback: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StagedInlineCustody:
+    """Validated metadata and staged bytes prepared before the cohort opens."""
+
+    record: BlobRecord
+    publication: InlineCustodyPublication
+
+
+_ACTIVE_RUN_COMPOSITION_COLUMNS = (
+    runs_table.c.id.label("run_id"),
+    composition_states_table.c.id.label("state_id"),
+    composition_states_table.c.session_id.label("state_session_id"),
+    composition_states_table.c.version.label("state_version"),
+    composition_states_table.c.source,
+    composition_states_table.c.sources,
+    composition_states_table.c.nodes,
+    composition_states_table.c.edges,
+    composition_states_table.c.outputs,
+    composition_states_table.c.metadata_,
+    composition_states_table.c.is_valid,
+    composition_states_table.c.validation_errors,
+    composition_states_table.c.created_at,
+    composition_states_table.c.derived_from_state_id,
+    composition_states_table.c.composer_meta,
+)
+
+
+def _uuid_from_db(value: Any) -> UUID:
+    return UUID(str(value))
+
+
+def _active_run_pipeline_dict(active_run: Any) -> LoweredPipelineDocument:
+    """Convert an active-run join row to canonical runtime/YAML shape.
+
+    The JSON columns arrive in their on-disk envelope; reading them raw
+    misread every production row (the guard raised TypeError instead of
+    refusing the mutation), so each column goes through the one envelope rule.
+    """
+    return pipeline_dict_from_record(
+        CompositionStateRecord(
+            id=_uuid_from_db(active_run.state_id),
+            session_id=_uuid_from_db(active_run.state_session_id),
+            version=active_run.state_version,
+            source=unwrap_state_column(active_run.source),
+            sources=unwrap_state_column(active_run.sources),
+            nodes=unwrap_state_column(active_run.nodes),
+            edges=unwrap_state_column(active_run.edges),
+            outputs=unwrap_state_column(active_run.outputs),
+            metadata_=unwrap_state_column(active_run.metadata_),
+            is_valid=bool(active_run.is_valid),
+            validation_errors=decode_stored_composition_validation_errors(active_run.validation_errors),
+            created_at=active_run.created_at,
+            derived_from_state_id=_uuid_from_db(active_run.derived_from_state_id) if active_run.derived_from_state_id is not None else None,
+            composer_meta=unwrap_state_column(active_run.composer_meta),
+        )
+    )
+
+
+def inline_custody_storage_path(data_dir: Path, *, session_id: str, blob_id: str, filename: str) -> Path:
+    """Derive the storage path an inline-custody blob settles to.
+
+    ONE formula shared by :func:`persist_inline_custody_blob_on_connection`
+    (which writes the file at settlement) and the planner's deferred
+    ``PendingCustodyBlobView`` (which must predict the identical path at
+    custody-safe revalidation time, elspeth-282f392fae). Deriving it twice
+    is how the sealed candidate state and the settled blob row drift apart.
+    """
+    return data_dir.expanduser().resolve() / "blobs" / session_id / f"{blob_id}_{filename}"
+
+
+def content_hash(data: bytes) -> str:
+    """Compute SHA-256 hex digest of raw content bytes.
+
+    This is the shared hash helper referenced by AD-5 and AD-7 in
+    docs/plans/rc4.2-ux-remediation/2026-03-30-02-blob-manager-subplan.md.
+    When a pipeline reads from a blob, the engine records the raw data
+    hash in PayloadStore. Using the same algorithm here guarantees the
+    hashes match when the bytes match. Output is SHA-256 hex, 64
+    lowercase characters — the canonical form the authority facet
+    validates at the write side and ``hmac.compare_digest`` compares at
+    the read side.
+    """
+    return hashlib.sha256(data).hexdigest()
+
+
+def sanitize_filename(filename: str) -> str:
+    """Extract a safe basename from a potentially malicious filename.
+
+    Strips all directory components (path traversal protection) and
+    rejects empty results or dot-only names.
+    """
+    sanitized = Path(filename).name
+    if not sanitized or sanitized in (".", ".."):
+        raise ValueError(f"Invalid filename: {filename!r}")
+    # Cap length to leave room for UUID prefix in storage path
+    if len(sanitized.encode("utf-8")) > 200:
+        # Preserve the extension
+        stem = Path(sanitized).stem
+        suffix = Path(sanitized).suffix
+        suffix = suffix.encode("utf-8")[:200].decode(errors="ignore") if len(suffix.encode("utf-8")) >= 200 else suffix
+        sanitized = stem.encode("utf-8")[: 200 - len(suffix.encode("utf-8"))].decode(errors="ignore") + suffix
+    return sanitized
+
+
+def _normalized_optional_text(value: str | None, *, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be str or None, got {type(value).__name__}")
+    normalized = value.strip()
+    return normalized if normalized else None
+
+
+def _normalized_optional_sha256(value: str | None, *, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be str or None, got {type(value).__name__}")
+    if _LOWERCASE_SHA256.fullmatch(value) is None:
+        raise AuditIntegrityError(f"{field_name} must be an exact lowercase SHA-256 digest")
+    return value
+
+
+def _normalized_inline_custody_fields(request: InlineCustodyRequest) -> _NormalizedInlineCustodyFields:
+    """Validate and normalize the identity-bearing custody fields."""
+    if type(request.content) is not bytes:
+        raise TypeError(f"InlineCustodyRequest.content must be bytes, got {type(request.content).__name__}")
+    if type(request.session_id) is not UUID:
+        raise TypeError(f"InlineCustodyRequest.session_id must be UUID, got {type(request.session_id).__name__}")
+    if type(request.filename) is not str:
+        raise TypeError(f"InlineCustodyRequest.filename must be str, got {type(request.filename).__name__}")
+    filename = sanitize_filename(request.filename)
+    untrusted_mime_type: object = request.mime_type
+    if type(untrusted_mime_type) is not str:
+        raise TypeError(f"InlineCustodyRequest.mime_type must be str, got {type(untrusted_mime_type).__name__}")
+    mime_type_value = untrusted_mime_type.strip().lower()
+    if mime_type_value not in ALLOWED_MIME_TYPES:
+        raise RuntimeError(f"Invalid mime_type {mime_type_value!r} — not in the allowed MIME set")
+    mime_type = cast(AllowedMimeType, mime_type_value)
+    if type(request.creation_modality) is not CreationModality:
+        raise TypeError(f"InlineCustodyRequest.creation_modality must be CreationModality, got {type(request.creation_modality).__name__}")
+    message_id = _normalized_optional_text(request.created_from_message_id, field_name="created_from_message_id")
+    if message_id is None:
+        raise AuditIntegrityError("Inline custody requires a non-blank originating message id")
+    description = _normalized_optional_text(request.source_description, field_name="source_description")
+    model_identifier = _normalized_optional_text(request.creating_model_identifier, field_name="creating_model_identifier")
+    model_version = _normalized_optional_text(request.creating_model_version, field_name="creating_model_version")
+    provider = _normalized_optional_text(request.creating_provider, field_name="creating_provider")
+    skill_hash = _normalized_optional_sha256(
+        request.creating_composer_skill_hash,
+        field_name="creating_composer_skill_hash",
+    )
+    arguments_hash = _normalized_optional_sha256(
+        request.creating_arguments_hash,
+        field_name="creating_arguments_hash",
+    )
+    llm_fields = (model_identifier, model_version, provider, skill_hash, arguments_hash)
+    if request.creation_modality.requires_llm_provenance():
+        if any(value is None for value in llm_fields):
+            raise AuditIntegrityError("LLM-authored inline custody requires complete composer provenance")
+    elif any(value is not None for value in llm_fields):
+        raise AuditIntegrityError("Verbatim inline custody must not carry LLM composer provenance")
+    return {
+        "session_id": str(request.session_id),
+        "filename": filename,
+        "mime_type": mime_type,
+        "source_description": description,
+        "creation_modality": request.creation_modality,
+        "created_from_message_id": message_id,
+        "creating_model_identifier": model_identifier,
+        "creating_model_version": model_version,
+        "creating_provider": provider,
+        "creating_composer_skill_hash": skill_hash,
+        "creating_arguments_hash": arguments_hash,
+        "content_hash": content_hash(request.content),
+        "size_bytes": len(request.content),
+    }
+
+
+def inline_custody_blob_id(request: InlineCustodyRequest) -> UUID:
+    """Return the domain-separated deterministic UUID5 for a custody request."""
+    fields = _normalized_inline_custody_fields(request)
+    identity = {
+        "schema": _INLINE_CUSTODY_SCHEMA,
+        "session_id": fields["session_id"],
+        "originating_message_id": fields["created_from_message_id"],
+        "filename": fields["filename"],
+        "mime_type": fields["mime_type"],
+        "description": fields["source_description"],
+        "content_hash": fields["content_hash"],
+        "creation_provenance": {
+            "modality": fields["creation_modality"].value,
+            "model_identifier": fields["creating_model_identifier"],
+            "model_version": fields["creating_model_version"],
+            "provider": fields["creating_provider"],
+            "composer_skill_hash": fields["creating_composer_skill_hash"],
+        },
+    }
+    return uuid5(_INLINE_CUSTODY_NAMESPACE, canonical_json(identity))
+
+
+def _validated_fork_session_ids(
+    source_session_id: UUID,
+    target_session_id: UUID,
+) -> tuple[str, str]:
+    """Validate the exact public fork-custody identity boundary."""
+    if type(source_session_id) is not UUID:
+        raise TypeError(f"source_session_id must be UUID, got {type(source_session_id).__name__}")
+    if type(target_session_id) is not UUID:
+        raise TypeError(f"target_session_id must be UUID, got {type(target_session_id).__name__}")
+    if source_session_id == target_session_id:
+        raise ValueError("source and target sessions must differ")
+    return str(source_session_id), str(target_session_id)
+
+
+def _verify_fork_child_custody(
+    conn: Connection,
+    *,
+    source_session_id: str,
+    target_session_id: str,
+) -> None:
+    """Prove target is the named source's same-principal fork child."""
+    source = conn.execute(
+        select(
+            sessions_table.c.user_id,
+            sessions_table.c.auth_provider_type,
+        ).where(sessions_table.c.id == source_session_id)
+    ).first()
+    if source is None:
+        raise AuditIntegrityError(f"source session {source_session_id} does not exist")
+
+    target = conn.execute(
+        select(
+            sessions_table.c.user_id,
+            sessions_table.c.auth_provider_type,
+            sessions_table.c.forked_from_session_id,
+            sessions_table.c.archived_at,
+        ).where(sessions_table.c.id == target_session_id)
+    ).first()
+    if target is None:
+        raise AuditIntegrityError(f"target session {target_session_id} does not exist")
+    if target.forked_from_session_id != source_session_id:
+        raise AuditIntegrityError(f"target session {target_session_id} is not a fork child of source session {source_session_id}")
+    if target.archived_at is None:
+        raise AuditIntegrityError(f"target session {target_session_id} is not an archived staged fork child")
+    if target.user_id != source.user_id or target.auth_provider_type != source.auth_provider_type:
+        raise AuditIntegrityError(f"target session {target_session_id} principal does not match source session {source_session_id}")
+
+
+def _require_live_fork_write_fence(conn: Connection, fence: BlobForkWriteFence) -> None:
+    """Fail before reservation unless the exact parent lease still owns this child."""
+    row = conn.execute(
+        select(session_operation_receipts_table.c.session_id).where(
+            session_operation_receipts_table.c.session_id == str(fence.source_session_id),
+            session_operation_receipts_table.c.operation_id == fence.operation_id,
+            session_operation_receipts_table.c.kind == "session_fork",
+            session_operation_receipts_table.c.status == "in_progress",
+            session_operation_receipts_table.c.result_session_id == str(fence.target_session_id),
+            session_operation_receipts_table.c.lease_token == fence.lease_token,
+            session_operation_receipts_table.c.attempt == fence.attempt,
+            session_operation_receipts_table.c.lease_expires_at > func.current_timestamp(),
+        )
+    ).one_or_none()
+    if row is None:
+        raise BlobForkFenceLostError(fence.operation_id, attempt=fence.attempt)
+
+
+def _require_live_blob_write_fence(
+    conn: Connection,
+    *,
+    session_id: str,
+    fork_write_fence: BlobForkWriteFence | None,
+) -> None:
+    if fork_write_fence is not None:
+        if str(fork_write_fence.target_session_id) != session_id:
+            raise AuditIntegrityError("Fork blob write fence targets a different session")
+        _require_live_fork_write_fence(conn, fork_write_fence)
+
+
+def _require_fork_cleanup_authorization(
+    conn: Connection,
+    *,
+    source_session_id: str,
+    target_session_id: str,
+    operation_id: str,
+    live_write_fence: BlobForkWriteFence | None,
+) -> None:
+    """Require one exact live or failed operation plus its retained plan."""
+    if live_write_fence is None:
+        operation = conn.execute(
+            select(session_operation_receipts_table.c.status).where(
+                session_operation_receipts_table.c.session_id == source_session_id,
+                session_operation_receipts_table.c.operation_id == operation_id,
+                session_operation_receipts_table.c.kind == "session_fork",
+                session_operation_receipts_table.c.status == "failed",
+                session_operation_receipts_table.c.result_session_id.is_(None),
+            )
+        ).one_or_none()
+        if operation is None:
+            raise AuditIntegrityError("Fork blob cleanup is not authorized by the exact failed parent operation")
+    else:
+        _require_live_fork_write_fence(conn, live_write_fence)
+
+    matching_plans = 0
+    rows = conn.execute(
+        select(chat_messages_table.c.content).where(
+            chat_messages_table.c.session_id == target_session_id,
+            chat_messages_table.c.role == "audit",
+            chat_messages_table.c.writer_principal == "session_fork",
+        )
+    ).all()
+    for row in rows:
+        # Every role="audit" row session_fork writes is a canonical-JSON plan
+        # envelope, so undecodable content is a corrupt audit trail, not a
+        # foreign row: refuse cleanup rather than count past it.
+        try:
+            content = json.loads(row.content)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise AuditIntegrityError("Fork blob cleanup found an undecodable session_fork audit row") from exc
+        if (
+            type(content) is dict
+            and "schema" in content
+            and content["schema"] == "session-fork-blob-plan.v1"
+            and "source_session_id" in content
+            and content["source_session_id"] == source_session_id
+            and "child_session_id" in content
+            and content["child_session_id"] == target_session_id
+            and "operation_id" in content
+            and content["operation_id"] == operation_id
+        ):
+            matching_plans += 1
+    if matching_plans != 1:
+        raise AuditIntegrityError("Fork blob cleanup requires exactly one matching retained blob plan")
+
+
+def _atomic_write_blob(
+    storage: Path,
+    content: bytes,
+    *,
+    write_guard: Callable[[], None] | None = None,
+    directory_fd: int | None = None,
+) -> None:
+    if write_guard is not None:
+        write_guard()
+    if directory_fd is None:
+        storage.parent.mkdir(parents=True, exist_ok=True)
+        _remove_blob_temp_artifacts(storage)
+    temp_path = storage.with_name(f".{storage.name}.custody.tmp")
+    if directory_fd is not None and temp_path.name in os.listdir(directory_fd):
+        observed_temp = os.stat(temp_path.name, dir_fd=directory_fd, follow_symlinks=False)
+        if not stat.S_ISREG(observed_temp.st_mode):
+            raise AuditIntegrityError(f"Blob custody candidate is not a regular file: {temp_path}")
+        os.unlink(temp_path.name, dir_fd=directory_fd)
+    fd = os.open(
+        temp_path if directory_fd is None else temp_path.name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            if write_guard is None:
+                handle.write(content)
+            else:
+                content_view = memoryview(content)
+                for offset in range(0, len(content_view), _FORK_COPY_WRITE_CHUNK_BYTES):
+                    write_guard()
+                    handle.write(content_view[offset : offset + _FORK_COPY_WRITE_CHUNK_BYTES])
+            if write_guard is not None:
+                write_guard()
+            handle.flush()
+            if write_guard is not None:
+                write_guard()
+            os.fsync(handle.fileno())
+        if write_guard is not None:
+            write_guard()
+        if directory_fd is None:
+            os.replace(temp_path, storage)
+            _fsync_parent_directory(storage.parent)
+        else:
+            os.replace(
+                temp_path.name,
+                storage.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            os.fsync(directory_fd)
+        if write_guard is not None:
+            try:
+                write_guard()
+            except BaseException as guard_exc:
+                try:
+                    if directory_fd is None:
+                        storage.unlink(missing_ok=True)
+                        _fsync_parent_directory(storage.parent)
+                    elif storage.name in os.listdir(directory_fd):
+                        os.unlink(storage.name, dir_fd=directory_fd)
+                        os.fsync(directory_fd)
+                except OSError as rollback_exc:
+                    guard_exc.add_note(
+                        f"Rollback failed: could not remove fork blob published after lease loss "
+                        f"({type(rollback_exc).__name__}: {rollback_exc})"
+                    )
+                raise
+    finally:
+        if directory_fd is None:
+            temp_path.unlink(missing_ok=True)
+        elif temp_path.name in os.listdir(directory_fd):
+            os.unlink(temp_path.name, dir_fd=directory_fd)
+
+
+def _fsync_parent_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _blob_temp_artifacts(storage: Path) -> tuple[Path, ...]:
+    deterministic = storage.with_name(f".{storage.name}.custody.tmp")
+    legacy = tuple(storage.parent.glob(f".{storage.name}.*.tmp")) if storage.parent.exists() else ()
+    return tuple(dict.fromkeys((deterministic, *legacy)))
+
+
+def _remove_blob_temp_artifacts(storage: Path) -> None:
+    for path in _blob_temp_artifacts(storage):
+        path.unlink(missing_ok=True)
+
+
+def _stage_blob_deletion(storage: Path) -> _StagedBlobDeletion:
+    """Atomically move canonical bytes aside while metadata is transactional."""
+
+    if not storage.exists():
+        return _StagedBlobDeletion(storage=storage, tombstone=None)
+    tombstone = storage.with_name(f".{_blob_storage_id(storage)}.delete-{uuid4().hex}")
+    os.replace(storage, tombstone)
+    stage = _StagedBlobDeletion(storage=storage, tombstone=tombstone)
+    try:
+        _fsync_parent_directory(storage.parent)
+    except BaseException as primary_exc:
+        _restore_staged_blob_deletion(stage, primary_exc)
+        raise
+    return stage
+
+
+def _restore_staged_blob_deletion(stage: _StagedBlobDeletion, primary_exc: BaseException) -> None:
+    """Restore canonical bytes after a SQL/delete-commit failure."""
+
+    tombstone = stage.tombstone
+    if tombstone is None or not tombstone.exists():
+        return
+    try:
+        if stage.storage.exists():
+            raise FileExistsError(f"refusing to overwrite replacement blob content at {stage.storage}")
+        os.replace(tombstone, stage.storage)
+        _fsync_parent_directory(stage.storage.parent)
+    except OSError as rollback_exc:
+        primary_exc.add_note(
+            f"Rollback failed: could not restore deleted blob file {stage.storage} from tombstone "
+            f"{tombstone} ({type(rollback_exc).__name__}: {rollback_exc}). "
+            "Blob row and storage may now diverge; manual reconciliation required."
+        )
+
+
+def _cleanup_error_detail(exc: BaseException) -> str:
+    """Preserve the primary message and PEP 678 notes without hiding formatting failures."""
+    detail = str(exc)
+    try:
+        notes = exc.__notes__
+    except AttributeError:
+        # BaseException creates this optional attribute on the first add_note.
+        return detail
+    if type(notes) is not list or any(type(note) is not str for note in notes):
+        raise TypeError("exception __notes__ must be a list of strings")
+    return "\n".join((detail, *notes))
+
+
+def _finalize_staged_blob_deletion(stage: _StagedBlobDeletion) -> None:
+    """Purge staged bytes only after the metadata transaction committed."""
+
+    if stage.tombstone is not None:
+        stage.tombstone.unlink(missing_ok=True)
+        _fsync_parent_directory(stage.storage.parent)
+    _remove_blob_temp_artifacts(stage.storage)
+
+
+def _validated_atomic_blob_deletion_paths(
+    obligation: BlobAtomicDeletionObligation,
+    *,
+    data_dir: Path,
+) -> _StagedBlobDeletion:
+    """Validate paths recorded by the current atomic producer (no hash claim)."""
+    storage = Path(obligation.storage_path)
+    expected_parent = data_dir / "blobs" / str(obligation.session_id)
+    if storage.parent != expected_parent or _blob_storage_id(storage) != str(obligation.blob_id):
+        raise AuditIntegrityError(f"Blob deletion cleanup storage path escapes blob custody: {storage}")
+    if obligation.tombstone_path is None:
+        tombstone = None
+    else:
+        tombstone = Path(obligation.tombstone_path)
+        tombstone_prefix = f".{obligation.blob_id}.delete-"
+        tombstone_suffix = tombstone.name.removeprefix(tombstone_prefix)
+        if (
+            tombstone.parent != expected_parent
+            or not tombstone.name.startswith(tombstone_prefix)
+            or _LOWERCASE_UUID_HEX.fullmatch(tombstone_suffix) is None
+        ):
+            raise AuditIntegrityError(f"Blob deletion cleanup tombstone path escapes blob custody: {tombstone}")
+    return _StagedBlobDeletion(storage=storage, tombstone=tombstone)
+
+
+def _atomic_blob_deletion_stage(
+    obligation: BlobAtomicDeletionObligation,
+    *,
+    data_dir: Path,
+) -> _StagedBlobDeletion:
+    stage = _validated_atomic_blob_deletion_paths(obligation, data_dir=data_dir)
+    if stage.storage.exists() or stage.storage.is_symlink():
+        raise AuditIntegrityError("committed atomic deletion unexpectedly retained canonical bytes")
+    return stage
+
+
+def _registered_blob_deletion_stage(
+    row: Row[Any],
+    *,
+    data_dir: Path,
+    blob_id: str,
+    session_id: str,
+) -> _StagedBlobDeletion:
+    """Validate either live producer's exact post-commit journal schema.
+
+    The caller proves live metadata is absent under its custody lock. Atomic
+    rows carry only path/time evidence; phased rows additionally prove the
+    operation-qualified path, committed phase, and any remaining bytes.
+    """
+    if row.blob_id != blob_id or row.session_id != session_id:
+        raise AuditIntegrityError("Blob deletion cleanup identity does not match the requested blob custody")
+    try:
+        if all(
+            value is None
+            for value in (
+                row.operation_id,
+                row.operation_epoch,
+                row.operation_kind,
+                row.phase,
+                row.blob_snapshot_hash,
+                row.expected_file_present,
+                row.expected_file_size,
+                row.expected_file_hash,
+            )
+        ):
+            obligation = BlobAtomicDeletionObligation(
+                blob_id=UUID(row.blob_id),
+                session_id=UUID(row.session_id),
+                storage_path=row.storage_path,
+                tombstone_path=row.tombstone_path,
+                created_at=_aware_utc(row.created_at),
+                updated_at=_aware_utc(row.updated_at),
+            )
+            return _atomic_blob_deletion_stage(obligation, data_dir=data_dir)
+        plan = BlobDeletionPlan(
+            blob_id=UUID(row.blob_id),
+            session_id=UUID(row.session_id),
+            storage_path=row.storage_path,
+            tombstone_path=row.tombstone_path,
+            operation_id=row.operation_id,
+            operation_epoch=row.operation_epoch,
+            operation_kind=SessionOperationKind(row.operation_kind),
+            phase=row.phase,
+            blob_snapshot_hash=row.blob_snapshot_hash,
+            expected_file_present=row.expected_file_present,
+            expected_file_size=row.expected_file_size,
+            expected_file_hash=row.expected_file_hash,
+            created_at=_aware_utc(row.created_at),
+            updated_at=_aware_utc(row.updated_at),
+            blob=None,
+        )
+    except (TypeError, ValueError) as exc:
+        raise AuditIntegrityError("blob deletion cleanup contains malformed durable evidence") from exc
+    if plan.phase != "purge_pending":
+        raise AuditIntegrityError("uncommitted blob deletion cleanup cannot authorize post-commit purge")
+    storage = Path(plan.storage_path)
+    if storage.parent != data_dir / "blobs" / session_id or _blob_storage_id(storage) != blob_id:
+        raise AuditIntegrityError("blob deletion cleanup storage path escapes exact custody")
+    token = _blob_operation_path_token(
+        operation_id=plan.operation_id,
+        operation_epoch=plan.operation_epoch,
+        operation_kind=plan.operation_kind,
+    )
+    tombstone = storage.with_name(f".{blob_id}.delete-{token}")
+    if Path(plan.tombstone_path) != tombstone:
+        raise AuditIntegrityError("blob deletion cleanup tombstone is not the exact operation-qualified path")
+    if storage.exists() or storage.is_symlink():
+        raise AuditIntegrityError("committed blob deletion unexpectedly retained canonical bytes")
+    if tombstone.exists():
+        BlobServiceImpl._require_exact_deletion_bytes(tombstone, plan)
+    return _StagedBlobDeletion(storage=storage, tombstone=tombstone)
+
+
+def blob_pre_update_sidecar(storage: Path) -> Path:
+    """Deterministic sidecar path holding a blob's pre-update bytes.
+
+    ``_execute_update_blob`` parks the prior bytes here across its
+    swap+commit window so a crash anywhere inside that window leaves the
+    filesystem one rename away from the committed row state.  The dot
+    prefix keeps the sidecar out of listings that assume blob files are
+    exactly ``{blob_id}_*``, and the suffix deliberately does NOT match
+    the ``.{name}.*.tmp`` temp-artifact glob — the sidecar is a durable
+    journal, not a discardable tempfile.
+    """
+    return storage.with_name(f".{storage.name}.pre-update")
+
+
+def _blob_storage_id(storage: Path) -> str:
+    """Extract the canonical blob UUID for bounded filesystem artifacts."""
+    blob_id, separator, filename = storage.name.partition("_")
+    try:
+        parsed_blob_id = UUID(blob_id)
+    except ValueError as exc:
+        raise AuditIntegrityError(f"Blob custody storage has an invalid blob identity: {storage}") from exc
+    if separator != "_" or not filename or str(parsed_blob_id) != blob_id:
+        raise AuditIntegrityError(f"Blob custody storage has an invalid name: {storage}")
+    return blob_id
+
+
+def inline_custody_staging_path(storage: Path) -> Path:
+    """Return the bounded deterministic stage for pre-commit inline custody."""
+    blob_id = _blob_storage_id(storage)
+    return storage.with_name(f".{blob_id}{_INLINE_CUSTODY_STAGE_SUFFIX}")
+
+
+def _inline_custody_staging_temp_path(staging: Path) -> Path:
+    return staging.with_name(f".{staging.name}.custody.tmp")
+
+
+def _inline_custody_artifact_blob_id(artifact: Path) -> str:
+    name = artifact.name
+    if name.startswith("..") and name.endswith(_INLINE_CUSTODY_STAGE_TEMP_SUFFIX):
+        blob_id = name[2 : -len(_INLINE_CUSTODY_STAGE_TEMP_SUFFIX)]
+    elif name.startswith(".") and name.endswith(_INLINE_CUSTODY_STAGE_SUFFIX):
+        blob_id = name[1 : -len(_INLINE_CUSTODY_STAGE_SUFFIX)]
+    else:
+        raise AuditIntegrityError(f"Inline custody artifact has an invalid name: {artifact}")
+    try:
+        parsed_blob_id = UUID(blob_id)
+    except ValueError as exc:
+        raise AuditIntegrityError(f"Inline custody artifact has an invalid blob identity: {artifact}") from exc
+    if str(parsed_blob_id) != blob_id:
+        raise AuditIntegrityError(f"Inline custody artifact has a non-canonical blob identity: {artifact}")
+    return blob_id
+
+
+def _regular_custody_file_exists(path: Path, *, directory_fd: int | None = None) -> bool:
+    """Check one custody entry without following its final symlink."""
+    if directory_fd is None:
+        if not os.path.lexists(path):
+            return False
+        observed = os.stat(path, follow_symlinks=False)
+    else:
+        if path.name not in os.listdir(directory_fd):
+            return False
+        observed = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+    if not stat.S_ISREG(observed.st_mode):
+        raise AuditIntegrityError(f"Blob custody candidate is not a regular file: {path}")
+    return True
+
+
+def _open_stable_custody_root(custody_root: Path) -> int | None:
+    """Pin the blob root without following a repository-controlled symlink."""
+    if not os.path.lexists(custody_root):
+        return None
+    try:
+        descriptor = os.open(
+            custody_root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        raise AuditIntegrityError(f"Blob custody root is not a stable directory: {custody_root}") from exc
+    observed = os.stat(custody_root, follow_symlinks=False)
+    opened = os.fstat(descriptor)
+    if not stat.S_ISDIR(observed.st_mode) or observed.st_dev != opened.st_dev or observed.st_ino != opened.st_ino:
+        os.close(descriptor)
+        raise AuditIntegrityError(f"Blob custody root is not a stable directory: {custody_root}")
+    return descriptor
+
+
+def _require_stable_custody_root(custody_root: Path, descriptor: int) -> None:
+    observed = os.stat(custody_root, follow_symlinks=False)
+    opened = os.fstat(descriptor)
+    if not stat.S_ISDIR(observed.st_mode) or observed.st_dev != opened.st_dev or observed.st_ino != opened.st_ino:
+        raise AuditIntegrityError(f"Blob custody root changed during reconciliation: {custody_root}")
+
+
+def _open_stable_custody_session(
+    custody_root_fd: int,
+    *,
+    session_name: str,
+    expected_identity: os.stat_result,
+    session_dir: Path,
+) -> int:
+    try:
+        descriptor = os.open(
+            session_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=custody_root_fd,
+        )
+    except OSError as exc:
+        raise AuditIntegrityError(f"Inline custody session directory is not stable: {session_dir}") from exc
+    opened = os.fstat(descriptor)
+    if not stat.S_ISDIR(opened.st_mode) or expected_identity.st_dev != opened.st_dev or expected_identity.st_ino != opened.st_ino:
+        os.close(descriptor)
+        raise AuditIntegrityError(f"Inline custody session directory is not stable: {session_dir}")
+    return descriptor
+
+
+def _require_stable_custody_session(
+    custody_root_fd: int,
+    *,
+    session_name: str,
+    descriptor: int,
+    session_dir: Path,
+) -> None:
+    try:
+        observed = os.stat(session_name, dir_fd=custody_root_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise AuditIntegrityError(f"Inline custody session directory changed during reconciliation: {session_dir}") from exc
+    opened = os.fstat(descriptor)
+    if not stat.S_ISDIR(observed.st_mode) or observed.st_dev != opened.st_dev or observed.st_ino != opened.st_ino:
+        raise AuditIntegrityError(f"Inline custody session directory changed during reconciliation: {session_dir}")
+
+
+@contextmanager
+def _inline_custody_directory_fds(
+    storage: Path,
+    *,
+    session_id: str,
+    create: bool,
+) -> Iterator[tuple[int, int] | None]:
+    """Pin the exact root/session directories used by one live publication."""
+    session_dir = storage.parent
+    custody_root = session_dir.parent
+    if session_dir.name != session_id or custody_root.name != "blobs":
+        raise AuditIntegrityError(f"Inline custody storage escapes its session directory: {storage}")
+    if create:
+        data_dir = custody_root.parent
+        data_dir.mkdir(parents=True, exist_ok=True)
+        custody_root.mkdir(mode=0o700, exist_ok=True)
+        try:
+            data_dir_fd = os.open(
+                data_dir,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        except OSError as exc:
+            raise AuditIntegrityError(f"Inline custody data directory is not stable: {data_dir}") from exc
+        try:
+            data_dir_observed = os.stat(data_dir, follow_symlinks=False)
+            data_dir_opened = os.fstat(data_dir_fd)
+            if (
+                not stat.S_ISDIR(data_dir_observed.st_mode)
+                or data_dir_observed.st_dev != data_dir_opened.st_dev
+                or data_dir_observed.st_ino != data_dir_opened.st_ino
+            ):
+                raise AuditIntegrityError(f"Inline custody data directory is not stable: {data_dir}")
+            os.fsync(data_dir_fd)
+        finally:
+            os.close(data_dir_fd)
+    custody_root_fd = _open_stable_custody_root(custody_root)
+    if custody_root_fd is None:
+        yield None
+        return
+    try:
+        session_exists = session_id in os.listdir(custody_root_fd)
+        if not session_exists:
+            if not create:
+                yield None
+                return
+            os.mkdir(session_id, mode=0o700, dir_fd=custody_root_fd)
+        if create:
+            os.fsync(custody_root_fd)
+        try:
+            session_observed = os.stat(session_id, dir_fd=custody_root_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise AuditIntegrityError(f"Inline custody session directory is not stable: {session_dir}") from exc
+        if not stat.S_ISDIR(session_observed.st_mode):
+            raise AuditIntegrityError(f"Inline custody session directory is not stable: {session_dir}")
+        session_fd = _open_stable_custody_session(
+            custody_root_fd,
+            session_name=session_id,
+            expected_identity=session_observed,
+            session_dir=session_dir,
+        )
+        try:
+            yield custody_root_fd, session_fd
+        finally:
+            os.close(session_fd)
+    finally:
+        os.close(custody_root_fd)
+
+
+def _content_hash_from_file(path: Path, *, directory_fd: int | None = None) -> str:
+    """Hash one stable regular file through a no-follow directory anchor."""
+    opened_directory_fd: int | None = None
+    descriptor: int | None = None
+    try:
+        if directory_fd is None:
+            opened_directory_fd = os.open(
+                path.parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            directory_fd = opened_directory_fd
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise AuditIntegrityError(f"Blob custody candidate is not a regular file: {path}")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, _STREAM_CHUNK_BYTES):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        observed = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or observed.st_dev != after.st_dev
+            or observed.st_ino != after.st_ino
+            or observed.st_size != after.st_size
+            or observed.st_mtime_ns != after.st_mtime_ns
+        ):
+            raise AuditIntegrityError(f"Blob custody candidate changed while hashing: {path}")
+        return digest.hexdigest()
+    except AuditIntegrityError:
+        raise
+    except OSError as exc:
+        raise AuditIntegrityError(f"Blob custody candidate is not a stable regular file: {path}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if opened_directory_fd is not None:
+            os.close(opened_directory_fd)
+
+
+def _unlink_custody_file(path: Path, *, directory_fd: int | None = None, missing_ok: bool = False) -> None:
+    if directory_fd is None:
+        path.unlink(missing_ok=missing_ok)
+    elif not missing_ok or path.name in os.listdir(directory_fd):
+        os.unlink(path.name, dir_fd=directory_fd)
+
+
+def _replace_custody_file(source: Path, destination: Path, *, directory_fd: int | None = None) -> None:
+    if directory_fd is None:
+        os.replace(source, destination)
+    else:
+        os.replace(
+            source.name,
+            destination.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+
+
+def _fsync_custody_directory(directory: Path, *, directory_fd: int | None = None) -> None:
+    if directory_fd is None:
+        _fsync_parent_directory(directory)
+    else:
+        os.fsync(directory_fd)
+
+
+def reconcile_blob_storage_versions(
+    storage: Path,
+    *,
+    expected_hash: str | None,
+    directory_fd: int | None = None,
+    write_guard: Callable[[], None] | None = None,
+) -> None:
+    """Restore ONE authoritative blob version from crash leftovers.
+
+    The committed row's ``content_hash`` is the arbiter.  Three journal
+    shapes can survive a crash:
+
+    * ``.{blob_id}.inline-custody-staged`` — bytes staged before their
+      caller-owned database transaction commits. A live ready row promotes
+      them; an already-published canonical file makes the stage stale. Its
+      deterministic ``.custody.tmp`` write artifact is always disposable:
+      it can survive before its bytes were fsynced and never arbitrates row
+      authority.
+    * ``.{name}.pre-update`` — update's pre-swap bytes.  If the storage
+      file already matches the committed hash the update committed and the
+      sidecar is stale (purge it); if the sidecar matches, the update never
+      committed (restore it over whatever half-state the crash left).
+    * ``.{blob_id}.delete-<hex>`` — delete's staged bytes.  A live row whose
+      storage file is missing but whose single tombstone matches the
+      committed hash is an uncommitted delete (restore it).
+
+    When neither candidate matches the committed hash nothing is touched —
+    the caller's integrity verification escalates, preserving the
+    fail-closed corruption contract.  MUST be called under the
+    same-session custody lock: reconciliation renames storage files and is
+    only safe while mutators and other readers are excluded.
+    """
+    if expected_hash is None:
+        return
+    inline_staging = inline_custody_staging_path(storage)
+    inline_temp = _inline_custody_staging_temp_path(inline_staging)
+    if _regular_custody_file_exists(inline_temp, directory_fd=directory_fd):
+        if write_guard is not None:
+            write_guard()
+        _unlink_custody_file(inline_temp, directory_fd=directory_fd)
+        _fsync_custody_directory(storage.parent, directory_fd=directory_fd)
+    if _regular_custody_file_exists(inline_staging, directory_fd=directory_fd):
+        if (
+            _regular_custody_file_exists(storage, directory_fd=directory_fd)
+            and _content_hash_from_file(storage, directory_fd=directory_fd) == expected_hash
+        ):
+            if write_guard is not None:
+                write_guard()
+            _unlink_custody_file(inline_staging, directory_fd=directory_fd)
+            _fsync_custody_directory(storage.parent, directory_fd=directory_fd)
+        elif _content_hash_from_file(inline_staging, directory_fd=directory_fd) == expected_hash:
+            if write_guard is not None:
+                write_guard()
+            _replace_custody_file(inline_staging, storage, directory_fd=directory_fd)
+            _fsync_custody_directory(storage.parent, directory_fd=directory_fd)
+        return
+    sidecar = blob_pre_update_sidecar(storage)
+    if _regular_custody_file_exists(sidecar, directory_fd=directory_fd):
+        if (
+            _regular_custody_file_exists(storage, directory_fd=directory_fd)
+            and _content_hash_from_file(storage, directory_fd=directory_fd) == expected_hash
+        ):
+            if write_guard is not None:
+                write_guard()
+            _unlink_custody_file(sidecar, directory_fd=directory_fd, missing_ok=True)
+            _fsync_custody_directory(storage.parent, directory_fd=directory_fd)
+        elif _content_hash_from_file(sidecar, directory_fd=directory_fd) == expected_hash:
+            if write_guard is not None:
+                write_guard()
+            _replace_custody_file(sidecar, storage, directory_fd=directory_fd)
+            _fsync_custody_directory(storage.parent, directory_fd=directory_fd)
+        return
+    if not _regular_custody_file_exists(storage, directory_fd=directory_fd):
+        if directory_fd is None:
+            if not storage.parent.exists():
+                return
+            tombstones = sorted(storage.parent.glob(f".{_blob_storage_id(storage)}.delete-*"))
+        else:
+            tombstone_prefix = f".{_blob_storage_id(storage)}.delete-"
+            tombstones = [storage.parent / name for name in sorted(os.listdir(directory_fd)) if name.startswith(tombstone_prefix)]
+        if (
+            len(tombstones) == 1
+            and _regular_custody_file_exists(tombstones[0], directory_fd=directory_fd)
+            and _content_hash_from_file(tombstones[0], directory_fd=directory_fd) == expected_hash
+        ):
+            if write_guard is not None:
+                write_guard()
+            _replace_custody_file(tombstones[0], storage, directory_fd=directory_fd)
+            _fsync_custody_directory(storage.parent, directory_fd=directory_fd)
+
+
+def _validate_reusable_blob_row(
+    row: Row[Any],
+    *,
+    expected: _ExpectedBlobFields,
+    blob_id: str,
+    storage_path: Path,
+) -> None:
+    expected_fields = {
+        "session_id": expected["session_id"],
+        "filename": expected["filename"],
+        "mime_type": expected["mime_type"],
+        "size_bytes": expected["size_bytes"],
+        "content_hash": expected["content_hash"],
+        "storage_path": str(storage_path),
+        "created_by": expected["created_by"],
+        "source_description": expected["source_description"],
+        "creation_modality": expected["creation_modality"].value,
+        "created_from_message_id": expected["created_from_message_id"],
+        "creating_model_identifier": expected["creating_model_identifier"],
+        "creating_model_version": expected["creating_model_version"],
+        "creating_provider": expected["creating_provider"],
+        "creating_composer_skill_hash": expected["creating_composer_skill_hash"],
+        "creating_arguments_hash": expected["creating_arguments_hash"],
+    }
+    row_mapping = row._mapping
+    for field_name, expected_value in expected_fields.items():
+        if row_mapping[field_name] != expected_value:
+            raise AuditIntegrityError(f"Inline custody blob {blob_id} has mismatched {field_name}")
+    status = row_mapping["status"]
+    if status not in {"pending", "ready"}:
+        raise AuditIntegrityError(f"Inline custody blob {blob_id} has invalid reuse status {status!r}")
+
+
+@contextmanager
+def _blob_phase_transaction(engine: Engine, held_connection: Connection | None) -> Iterator[Connection]:
+    if held_connection is None:
+        with engine.begin() as conn:
+            yield conn
+        return
+    if held_connection.closed or held_connection.invalidated:
+        held_connection.close()
+        raise AuditIntegrityError("Blob phase cannot reuse a connection without its custody lock")
+    body_exc: BaseException | None = None
+    try:
+        with held_connection.begin():
+            try:
+                yield held_connection
+            except BaseException as exc:
+                body_exc = exc
+                raise
+    except BaseException as transaction_exc:
+        primary_exc = body_exc if body_exc is not None else transaction_exc
+        try:
+            if held_connection.closed or held_connection.invalidated:
+                raise AuditIntegrityError("Blob phase lost its custody connection during the transaction")
+            held_connection.rollback()
+            if held_connection.closed or held_connection.invalidated:
+                raise AuditIntegrityError("Blob phase lost its custody connection during rollback")
+            # A failed commit callback can deactivate SQLAlchemy's transaction
+            # while leaving the DBAPI transaction open. Reset that transaction
+            # before any outcome observation; keep the session custody lock.
+            held_connection.connection.rollback()
+        except BaseException as cleanup_exc:
+            try:
+                held_connection.close()
+            except BaseException as close_exc:
+                cleanup_exc.add_note(f"Closing the unusable custody connection also failed: {close_exc!r}")
+            if isinstance(primary_exc, Exception):
+                primary_exc.add_note(f"Blob transaction reset failed: {cleanup_exc!r}")
+                raise AuditIntegrityError("Blob transaction outcome cannot be observed under retained custody") from primary_exc
+            raise primary_exc from cleanup_exc
+        if primary_exc is not transaction_exc:
+            raise primary_exc from transaction_exc
+        raise
+
+
+def _acquire_blob_phase_lock(conn: Connection, session_id: str) -> None:
+    if conn.dialect.name == "postgresql":
+        acquire_session_advisory_xact_lock(conn, session_id)
+
+
+def _enforce_session_blob_quota(
+    conn: Connection,
+    session_id: str,
+    *,
+    additional_bytes: int,
+    max_storage_per_session: int,
+    exclude_blob_id: str | None = None,
+) -> None:
+    """Raise ``BlobQuotaExceededError`` if adding bytes would exceed the session ceiling.
+
+    Runs against the caller's connection inside the caller's transaction and
+    quota lock; it owns no locking or commit protocol of its own.
+    """
+    current_total = session_storage_bytes_on_connection(conn, session_id=session_id)
+    if exclude_blob_id is not None:
+        excluded_size = conn.execute(
+            select(blobs_table.c.size_bytes).where(blobs_table.c.id == exclude_blob_id, blobs_table.c.session_id == session_id)
+        ).scalar_one_or_none()
+        if excluded_size is not None:
+            current_total -= excluded_size
+    # COALESCE guarantees an exact int; bool/subclasses or any other type
+    # are Tier 1 anomalies. Explicit raise so the guard survives python -O.
+    if type(current_total) is not int:
+        raise AuditIntegrityError(f"Tier 1: COALESCE(SUM) returned {type(current_total).__name__}, expected int")
+    if current_total + additional_bytes > max_storage_per_session:
+        raise BlobQuotaExceededError(
+            session_id,
+            current_bytes=current_total,
+            limit_bytes=max_storage_per_session,
+        )
+
+
+def _insert_pending_blob_row(
+    conn: Connection,
+    *,
+    blob_id: str,
+    storage: Path,
+    expected: _ExpectedBlobFields,
+) -> None:
+    """Insert the pending custody row shared by the committed and inline-custody paths.
+
+    Runs against the caller's connection; any duplicate-id race handling
+    (``begin_nested`` / ``IntegrityError``) belongs to the caller.
+    """
+    conn.execute(
+        blobs_table.insert().values(
+            id=blob_id,
+            session_id=expected["session_id"],
+            filename=expected["filename"],
+            mime_type=expected["mime_type"],
+            size_bytes=expected["size_bytes"],
+            content_hash=expected["content_hash"],
+            storage_path=str(storage),
+            created_at=datetime.now(UTC),
+            created_by=expected["created_by"],
+            source_description=expected["source_description"],
+            status="pending",
+            creation_modality=expected["creation_modality"].value,
+            created_from_message_id=expected["created_from_message_id"],
+            creating_model_identifier=expected["creating_model_identifier"],
+            creating_model_version=expected["creating_model_version"],
+            creating_provider=expected["creating_provider"],
+            creating_composer_skill_hash=expected["creating_composer_skill_hash"],
+            creating_arguments_hash=expected["creating_arguments_hash"],
+        )
+    )
+
+
+def _reserve_pending_blob(
+    *,
+    engine: Engine,
+    held_connection: Connection | None,
+    blob_id: str,
+    storage: Path,
+    expected: _ExpectedBlobFields,
+    max_storage_per_session: int,
+    idempotent: bool,
+    fork_write_fence: BlobForkWriteFence | None,
+    quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
+) -> tuple[Row[Any], bool]:
+    session_id = expected["session_id"]
+    with _blob_phase_transaction(engine, held_connection) as conn:
+        _acquire_blob_phase_lock(conn, session_id)
+        _lock_session_for_blob_quota(conn, session_id)
+        _require_live_blob_write_fence(
+            conn,
+            session_id=session_id,
+            fork_write_fence=fork_write_fence,
+        )
+        row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).first()
+        if row is None:
+            _enforce_session_blob_quota(
+                conn,
+                session_id,
+                additional_bytes=expected["size_bytes"],
+                max_storage_per_session=max_storage_per_session,
+            )
+            admit_storage_bytes_on_connection(
+                conn,
+                session_id=session_id,
+                additional_bytes=expected["size_bytes"],
+                operation="session_fork",
+                record=quota_exceeded_recorder,
+            )
+            try:
+                with conn.begin_nested():
+                    _insert_pending_blob_row(conn, blob_id=blob_id, storage=storage, expected=expected)
+            except IntegrityError as exc:
+                row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).first()
+                if row is None:
+                    raise
+                if not idempotent:
+                    raise AuditIntegrityError(f"Unexpected duplicate blob id {blob_id}") from exc
+                created_reservation = False
+            else:
+                created_reservation = True
+                row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
+        elif not idempotent:
+            raise AuditIntegrityError(f"Unexpected duplicate blob id {blob_id}")
+        else:
+            created_reservation = False
+        _validate_reusable_blob_row(row, expected=expected, blob_id=blob_id, storage_path=storage)
+        return row, created_reservation
+
+
+def _write_or_validate_reserved_blob(
+    *,
+    row: Row[Any],
+    storage: Path,
+    content: bytes,
+    expected_hash: str,
+    blob_id: str,
+    write_guard: Callable[[], None] | None = None,
+) -> bool:
+    if storage.exists():
+        existing_content = storage.read_bytes()
+        actual_hash = content_hash(existing_content)
+        if not hmac.compare_digest(existing_content, content) or not hmac.compare_digest(actual_hash, expected_hash):
+            raise BlobIntegrityError(blob_id, expected=expected_hash, actual=actual_hash)
+        return False
+    if row.status == "ready":
+        raise BlobContentMissingError(blob_id, storage_path=str(storage))
+    if write_guard is None:
+        _atomic_write_blob(storage, content)
+    else:
+        _atomic_write_blob(storage, content, write_guard=write_guard)
+    return True
+
+
+def _finalize_reserved_blob(
+    *,
+    engine: Engine,
+    held_connection: Connection | None,
+    blob_id: str,
+    storage: Path,
+    expected: _ExpectedBlobFields,
+    fork_write_fence: BlobForkWriteFence | None,
+) -> Row[Any]:
+    session_id = expected["session_id"]
+    with _blob_phase_transaction(engine, held_connection) as conn:
+        _acquire_blob_phase_lock(conn, session_id)
+        _require_live_blob_write_fence(
+            conn,
+            session_id=session_id,
+            fork_write_fence=fork_write_fence,
+        )
+        row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
+        _validate_reusable_blob_row(row, expected=expected, blob_id=blob_id, storage_path=storage)
+        if row.status == "pending":
+            conn.execute(blobs_table.update().where(blobs_table.c.id == blob_id).values(status="ready"))
+        final_row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
+        _guard_blob_row_literals(final_row)
+        return final_row
+
+
+def _discard_nonidempotent_reservation(
+    *,
+    engine: Engine,
+    held_connection: Connection | None,
+    blob_id: str,
+    session_id: str,
+    storage: Path,
+    remove_storage: bool,
+) -> None:
+    if remove_storage:
+        storage.unlink(missing_ok=True)
+    with _blob_phase_transaction(engine, held_connection) as conn:
+        _acquire_blob_phase_lock(conn, session_id)
+        conn.execute(blobs_table.delete().where(blobs_table.c.id == blob_id).where(blobs_table.c.status == "pending"))
+
+
+def _persist_blob_content(
+    *,
+    engine: Engine,
+    data_dir: Path,
+    max_storage_per_session: int,
+    blob_id: UUID,
+    session_id: UUID | str,
+    filename: str,
+    content: bytes,
+    mime_type: StorageMimeType,
+    created_by: BlobCreator,
+    source_description: str | None,
+    creation_modality: CreationModality,
+    created_from_message_id: str | None,
+    creating_model_identifier: str | None,
+    creating_model_version: str | None,
+    creating_provider: str | None,
+    creating_composer_skill_hash: str | None,
+    creating_arguments_hash: str | None,
+    idempotent: bool,
+    fork_write_fence: BlobForkWriteFence | None = None,
+    write_guard: Callable[[], None] | None = None,
+    session_operation_authority: SessionOperationAuthority | None = None,
+    session_operation_context: SessionOperationContext | None = None,
+    quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
+) -> Row[Any] | BlobRecord:
+    """Persist one blob through committed reservation, file, and ready phases."""
+    if type(blob_id) is not UUID:
+        raise TypeError(f"blob_id must be UUID, got {type(blob_id).__name__}")
+    if type(session_id) not in {UUID, str}:
+        raise TypeError(f"session_id must be UUID or str, got {type(session_id).__name__}")
+    if type(filename) is not str:
+        raise TypeError(f"filename must be str, got {type(filename).__name__}")
+    if type(content) is not bytes:
+        raise TypeError(f"Blob content must be bytes, got {type(content).__name__}")
+    untrusted_mime_type: object = mime_type
+    if type(untrusted_mime_type) is not str:
+        raise TypeError(f"mime_type must be str, got {type(untrusted_mime_type).__name__}")
+    if untrusted_mime_type not in STORAGE_MIME_TYPES:
+        raise RuntimeError(f"Invalid mime_type {untrusted_mime_type!r} — not in the storage MIME set")
+    untrusted_created_by: object = created_by
+    if type(untrusted_created_by) is not str:
+        raise TypeError(f"created_by must be str, got {type(untrusted_created_by).__name__}")
+    if untrusted_created_by not in BLOB_CREATORS:
+        raise RuntimeError(f"Invalid created_by {untrusted_created_by!r} — must be one of {sorted(BLOB_CREATORS)}")
+    if type(creation_modality) is not CreationModality:
+        raise TypeError(f"creation_modality must be CreationModality, got {type(creation_modality).__name__}")
+    if write_guard is not None and not callable(write_guard):
+        raise TypeError("write_guard must be callable")
+    source_description = _normalized_optional_text(source_description, field_name="source_description")
+    created_from_message_id = _normalized_optional_text(created_from_message_id, field_name="created_from_message_id")
+    creating_model_identifier = _normalized_optional_text(
+        creating_model_identifier,
+        field_name="creating_model_identifier",
+    )
+    creating_model_version = _normalized_optional_text(creating_model_version, field_name="creating_model_version")
+    creating_provider = _normalized_optional_text(creating_provider, field_name="creating_provider")
+    creating_composer_skill_hash = _normalized_optional_sha256(
+        creating_composer_skill_hash,
+        field_name="creating_composer_skill_hash",
+    )
+    creating_arguments_hash = _normalized_optional_sha256(
+        creating_arguments_hash,
+        field_name="creating_arguments_hash",
+    )
+    llm_provenance = (
+        creating_model_identifier,
+        creating_model_version,
+        creating_provider,
+        creating_composer_skill_hash,
+        creating_arguments_hash,
+    )
+    if creation_modality.requires_llm_provenance():
+        if created_from_message_id is None or any(value is None for value in llm_provenance):
+            raise AuditIntegrityError("LLM-authored blob persistence requires complete composer provenance")
+    elif any(value is not None for value in llm_provenance):
+        raise AuditIntegrityError("Verbatim blob persistence must not carry LLM composer provenance")
+    session_id_str = str(session_id)
+    if not session_id_str or Path(session_id_str).name != session_id_str or session_id_str in {".", ".."}:
+        raise AuditIntegrityError("session_id must be a non-empty opaque path segment")
+    blob_id_str = str(blob_id)
+    safe_filename = sanitize_filename(filename)
+    storage = data_dir.expanduser().resolve() / "blobs" / session_id_str / f"{blob_id_str}_{safe_filename}"
+    expected: _ExpectedBlobFields = {
+        "session_id": session_id_str,
+        "filename": safe_filename,
+        "mime_type": mime_type,
+        "size_bytes": len(content),
+        "content_hash": content_hash(content),
+        "created_by": created_by,
+        "source_description": source_description,
+        "creation_modality": creation_modality,
+        "created_from_message_id": created_from_message_id,
+        "creating_model_identifier": creating_model_identifier,
+        "creating_model_version": creating_model_version,
+        "creating_provider": creating_provider,
+        "creating_composer_skill_hash": creating_composer_skill_hash,
+        "creating_arguments_hash": creating_arguments_hash,
+    }
+    if (session_operation_authority is None) is not (session_operation_context is None):
+        raise AuditIntegrityError("blob persistence requires both session authority and context")
+    if session_operation_context is not None:
+        _require_blob_operation_context(session_operation_context, allowed_kinds=_CREATE_BLOB_OPERATION_KINDS)
+        if session_operation_authority is None:
+            raise AuditIntegrityError("blob persistence lost its session authority")
+        if fork_write_fence is not None:
+            raise AuditIntegrityError("session-operation persistence cannot weaken composite fork authority")
+        if session_operation_context.fence.session_id != session_id_str:
+            raise AuditIntegrityError("blob persistence context targets another session")
+        reservation = BlobRecord(
+            id=blob_id,
+            session_id=UUID(session_id_str),
+            filename=safe_filename,
+            mime_type=mime_type,
+            size_bytes=len(content),
+            content_hash=expected["content_hash"],
+            storage_path=str(storage),
+            created_at=datetime.now(UTC),
+            created_by=created_by,
+            source_description=source_description,
+            status="pending",
+            creation_modality=creation_modality,
+            created_from_message_id=created_from_message_id,
+            creating_model_identifier=creating_model_identifier,
+            creating_model_version=creating_model_version,
+            creating_provider=creating_provider,
+            creating_composer_skill_hash=creating_composer_skill_hash,
+            creating_arguments_hash=creating_arguments_hash,
+        )
+        service = BlobServiceImpl(
+            engine,
+            data_dir,
+            max_storage_per_session,
+            session_operation_authority=session_operation_authority,
+            quota_exceeded_recorder=quota_exceeded_recorder,
+        )
+        return service._persist_fenced_blob_record(
+            reservation,
+            content,
+            session_operation_context,
+            idempotent=idempotent,
+        )
+    if fork_write_fence is None:
+        raise AuditIntegrityError("blob persistence requires exact session-operation or composite fork authority")
+    with _blob_custody_session_lock(engine, session_id_str) as held_connection:
+        created_reservation = False
+        created_storage = False
+        try:
+            row, created_reservation = _reserve_pending_blob(
+                engine=engine,
+                held_connection=held_connection,
+                blob_id=blob_id_str,
+                storage=storage,
+                expected=expected,
+                max_storage_per_session=max_storage_per_session,
+                idempotent=idempotent,
+                fork_write_fence=fork_write_fence,
+                quota_exceeded_recorder=quota_exceeded_recorder,
+            )
+            storage_existed_before_write = storage.exists()
+            try:
+                created_storage = _write_or_validate_reserved_blob(
+                    row=row,
+                    storage=storage,
+                    content=content,
+                    expected_hash=expected["content_hash"],
+                    blob_id=blob_id_str,
+                    write_guard=write_guard,
+                )
+            except Exception:
+                created_storage = not storage_existed_before_write and storage.exists()
+                raise
+            return _finalize_reserved_blob(
+                engine=engine,
+                held_connection=held_connection,
+                blob_id=blob_id_str,
+                storage=storage,
+                expected=expected,
+                fork_write_fence=fork_write_fence,
+            )
+        except Exception:
+            if not idempotent and created_reservation:
+                _discard_nonidempotent_reservation(
+                    engine=engine,
+                    held_connection=held_connection,
+                    blob_id=blob_id_str,
+                    session_id=session_id_str,
+                    storage=storage,
+                    remove_storage=created_storage,
+                )
+            raise
+
+
+def _stage_inline_custody_blob(
+    *,
+    storage: Path,
+    content: bytes,
+    expected_hash: str,
+    blob_id: str,
+    session_id: str,
+    write_guard: Callable[[], None] | None = None,
+) -> InlineCustodyPublication:
+    staging = inline_custody_staging_path(storage)
+    staging_temp = _inline_custody_staging_temp_path(staging)
+    with _inline_custody_directory_fds(storage, session_id=session_id, create=True) as directory_fds:
+        if directory_fds is None:
+            raise AuditIntegrityError(f"Inline custody directory disappeared before staging: {storage.parent}")
+        custody_root_fd, session_fd = directory_fds
+        storage_exists = _regular_custody_file_exists(storage, directory_fd=session_fd)
+        staging_exists = _regular_custody_file_exists(staging, directory_fd=session_fd)
+        _regular_custody_file_exists(staging_temp, directory_fd=session_fd)
+        candidate = storage if storage_exists else staging if staging_exists else None
+        created_stage = False
+        if candidate is not None:
+            actual_hash = _content_hash_from_file(candidate, directory_fd=session_fd)
+            if not hmac.compare_digest(actual_hash, expected_hash):
+                raise BlobIntegrityError(blob_id, expected=expected_hash, actual=actual_hash)
+        else:
+            publication = InlineCustodyPublication(
+                session_id=session_id,
+                blob_id=blob_id,
+                storage=storage,
+                staging=staging,
+                expected_hash=expected_hash,
+                cleanup_after_rollback=True,
+            )
+            try:
+                _atomic_write_blob(staging, content, directory_fd=session_fd, write_guard=write_guard)
+                created_stage = True
+                _require_stable_custody_session(
+                    custody_root_fd,
+                    session_name=session_id,
+                    descriptor=session_fd,
+                    session_dir=storage.parent,
+                )
+                _require_stable_custody_root(storage.parent.parent, custody_root_fd)
+            except BaseException as primary_exc:
+                _discard_inline_custody_publication_at(
+                    publication,
+                    directory_fd=session_fd,
+                    primary_exc=primary_exc,
+                )
+                raise
+        return InlineCustodyPublication(
+            session_id=session_id,
+            blob_id=blob_id,
+            storage=storage,
+            staging=staging,
+            expected_hash=expected_hash,
+            cleanup_after_rollback=created_stage,
+        )
+
+
+def _discard_inline_custody_publication_at(
+    publication: InlineCustodyPublication,
+    *,
+    directory_fd: int,
+    primary_exc: BaseException | None = None,
+) -> None:
+    def _remove_stage() -> None:
+        artifacts = (
+            publication.staging,
+            _inline_custody_staging_temp_path(publication.staging),
+        )
+        removed = False
+        for artifact in artifacts:
+            if _regular_custody_file_exists(artifact, directory_fd=directory_fd):
+                _unlink_custody_file(artifact, directory_fd=directory_fd)
+                removed = True
+        if not removed:
+            return
+        _fsync_custody_directory(publication.staging.parent, directory_fd=directory_fd)
+
+    _run_lock_cleanup(
+        _remove_stage,
+        label="Inline custody rollback cleanup",
+        primary_exc=primary_exc,
+    )
+
+
+def discard_inline_custody_publication(
+    publication: InlineCustodyPublication,
+    *,
+    primary_exc: BaseException | None = None,
+    regardless_of_origin: bool = False,
+) -> None:
+    """Remove a rowless stage after rollback without masking its cause."""
+    if not regardless_of_origin and not publication.cleanup_after_rollback:
+        return
+
+    def _discard_anchored_stage() -> None:
+        with _inline_custody_directory_fds(
+            publication.storage,
+            session_id=publication.session_id,
+            create=False,
+        ) as directory_fds:
+            if directory_fds is None:
+                return
+            custody_root_fd, session_fd = directory_fds
+            _discard_inline_custody_publication_at(
+                publication,
+                directory_fd=session_fd,
+            )
+            _require_stable_custody_session(
+                custody_root_fd,
+                session_name=publication.session_id,
+                descriptor=session_fd,
+                session_dir=publication.storage.parent,
+            )
+            _require_stable_custody_root(publication.storage.parent.parent, custody_root_fd)
+
+    _run_lock_cleanup(
+        _discard_anchored_stage,
+        label="Inline custody rollback cleanup",
+        primary_exc=primary_exc,
+    )
+
+
+def publish_inline_custody_publication(engine: Engine, publication: InlineCustodyPublication) -> None:
+    """Promote a committed inline-custody stage under its custody lock."""
+    with _blob_custody_session_lock(engine, publication.session_id):
+        publish_inline_custody_publication_locked(engine, publication)
+
+
+def publish_inline_custody_publication_locked(engine: Engine, publication: InlineCustodyPublication) -> None:
+    """Publish while the caller retains BLOB_CUSTODY, with a short metadata read."""
+    with (
+        _inline_custody_directory_fds(
+            publication.storage,
+            session_id=publication.session_id,
+            create=False,
+        ) as directory_fds,
+    ):
+        with engine.begin() as conn:
+            _acquire_blob_phase_lock(conn, publication.session_id)
+            row = conn.execute(select(blobs_table).where(blobs_table.c.id == publication.blob_id)).one_or_none()
+        if row is None:
+            if directory_fds is not None:
+                _, session_fd = directory_fds
+                _discard_inline_custody_publication_at(
+                    publication,
+                    directory_fd=session_fd,
+                )
+            return
+        _guard_blob_row_literals(row)
+        if row.session_id != publication.session_id or row.storage_path != str(publication.storage):
+            raise AuditIntegrityError(f"Inline custody publication {publication.blob_id} does not match its committed row")
+        if row.status == "pending" and row.content_hash == publication.expected_hash and publication.cleanup_after_rollback:
+            if directory_fds is not None:
+                _, session_fd = directory_fds
+                _discard_inline_custody_publication_at(
+                    publication,
+                    directory_fd=session_fd,
+                )
+            return
+        if row.status != "ready" or row.content_hash != publication.expected_hash:
+            raise AuditIntegrityError(f"Inline custody publication {publication.blob_id} has non-authoritative committed state")
+        if directory_fds is None:
+            raise BlobContentMissingError(publication.blob_id, storage_path=str(publication.storage))
+        custody_root_fd, session_fd = directory_fds
+        reconcile_blob_storage_versions(
+            publication.storage,
+            expected_hash=publication.expected_hash,
+            directory_fd=session_fd,
+        )
+        if not _regular_custody_file_exists(publication.storage, directory_fd=session_fd):
+            raise BlobContentMissingError(publication.blob_id, storage_path=str(publication.storage))
+        actual_hash = _content_hash_from_file(publication.storage, directory_fd=session_fd)
+        if not hmac.compare_digest(actual_hash, publication.expected_hash):
+            raise BlobIntegrityError(publication.blob_id, expected=publication.expected_hash, actual=actual_hash)
+        _require_stable_custody_session(
+            custody_root_fd,
+            session_name=publication.session_id,
+            descriptor=session_fd,
+            session_dir=publication.storage.parent,
+        )
+        _require_stable_custody_root(publication.storage.parent.parent, custody_root_fd)
+
+
+def reconcile_inline_custody_publications(engine: Engine, data_dir: Path) -> None:
+    """Complete committed inline stages and purge stages whose rows rolled back."""
+    custody_root = data_dir.expanduser().resolve() / "blobs"
+    custody_root_fd = _open_stable_custody_root(custody_root)
+    if custody_root_fd is None:
+        return
+    try:
+        for session_name in sorted(os.listdir(custody_root_fd)):
+            session_observed = os.stat(session_name, dir_fd=custody_root_fd, follow_symlinks=False)
+            session_dir = custody_root / session_name
+            if stat.S_ISLNK(session_observed.st_mode):
+                raise AuditIntegrityError(f"Inline custody session directory is a symbolic link: {session_dir}")
+            if not stat.S_ISDIR(session_observed.st_mode):
+                continue
+            session_id = session_name
+            with _blob_custody_session_lock(engine, session_id) as held_connection:
+                _require_stable_custody_root(custody_root, custody_root_fd)
+                session_fd = _open_stable_custody_session(
+                    custody_root_fd,
+                    session_name=session_name,
+                    expected_identity=session_observed,
+                    session_dir=session_dir,
+                )
+                try:
+                    artifact_names = sorted(
+                        name
+                        for name in os.listdir(session_fd)
+                        if (name.startswith(".") and name.endswith(_INLINE_CUSTODY_STAGE_SUFFIX))
+                        or (name.startswith("..") and name.endswith(_INLINE_CUSTODY_STAGE_TEMP_SUFFIX))
+                    )
+                    artifacts_by_blob: dict[str, list[Path]] = {}
+                    for artifact_name in artifact_names:
+                        artifact = session_dir / artifact_name
+                        if not _regular_custody_file_exists(artifact, directory_fd=session_fd):
+                            continue
+                        blob_id = _inline_custody_artifact_blob_id(artifact)
+                        if blob_id not in artifacts_by_blob:
+                            artifacts_by_blob[blob_id] = []
+                        artifacts_by_blob[blob_id].append(artifact)
+
+                    for blob_id, blob_artifacts in artifacts_by_blob.items():
+                        removed_temp = False
+                        durable_stages: list[Path] = []
+                        for artifact in blob_artifacts:
+                            if artifact.name.startswith(".."):
+                                _unlink_custody_file(artifact, directory_fd=session_fd)
+                                removed_temp = True
+                            else:
+                                durable_stages.append(artifact)
+                        if removed_temp:
+                            _fsync_custody_directory(session_dir, directory_fd=session_fd)
+                        with _blob_phase_transaction(engine, held_connection) as conn:
+                            _acquire_blob_phase_lock(conn, session_id)
+                            row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one_or_none()
+                        if row is None:
+                            for staging in durable_stages:
+                                _unlink_custody_file(staging, directory_fd=session_fd)
+                            if durable_stages:
+                                _fsync_custody_directory(session_dir, directory_fd=session_fd)
+                            continue
+                        _guard_blob_row_literals(row)
+                        if type(row.storage_path) is not str or type(row.filename) is not str:
+                            raise AuditIntegrityError(f"Inline custody artifact for {blob_id} has a non-string storage path")
+                        storage = Path(row.storage_path)
+                        sanitized_filename = sanitize_filename(row.filename)
+                        expected_storage = inline_custody_storage_path(
+                            data_dir,
+                            session_id=session_id,
+                            blob_id=blob_id,
+                            filename=sanitized_filename,
+                        )
+                        if row.session_id != session_id or sanitized_filename != row.filename or storage != expected_storage:
+                            raise AuditIntegrityError(f"Inline custody artifact for {blob_id} does not match its committed row")
+                        if row.status == "pending":
+                            for staging in durable_stages:
+                                _unlink_custody_file(staging, directory_fd=session_fd)
+                            if durable_stages:
+                                _fsync_custody_directory(session_dir, directory_fd=session_fd)
+                            continue
+                        if row.status != "ready" or row.content_hash is None:
+                            raise AuditIntegrityError(f"Inline custody artifact for {blob_id} has non-authoritative committed state")
+                        reconcile_blob_storage_versions(
+                            storage,
+                            expected_hash=row.content_hash,
+                            directory_fd=session_fd,
+                        )
+                        if not _regular_custody_file_exists(storage, directory_fd=session_fd):
+                            raise BlobContentMissingError(blob_id, storage_path=str(storage))
+                        actual_hash = _content_hash_from_file(storage, directory_fd=session_fd)
+                        if not hmac.compare_digest(actual_hash, row.content_hash):
+                            raise BlobIntegrityError(blob_id, expected=row.content_hash, actual=actual_hash)
+                    _require_stable_custody_session(
+                        custody_root_fd,
+                        session_name=session_name,
+                        descriptor=session_fd,
+                        session_dir=session_dir,
+                    )
+                    _require_stable_custody_root(custody_root, custody_root_fd)
+                finally:
+                    os.close(session_fd)
+    finally:
+        os.close(custody_root_fd)
+
+
+def prepare_inline_custody_blob(
+    *,
+    data_dir: Path,
+    request: InlineCustodyRequest,
+    write_guard: Callable[[], None],
+) -> StagedInlineCustody:
+    """Stage bytes under caller-held BLOB_CUSTODY before metadata settlement."""
+    write_guard()
+    fields = _normalized_inline_custody_fields(request)
+    blob_id = str(inline_custody_blob_id(request))
+    session_id = fields["session_id"]
+    storage = inline_custody_storage_path(data_dir, session_id=session_id, blob_id=blob_id, filename=fields["filename"])
+    record = BlobRecord(
+        id=UUID(blob_id),
+        session_id=request.session_id,
+        filename=fields["filename"],
+        mime_type=fields["mime_type"],
+        size_bytes=fields["size_bytes"],
+        content_hash=fields["content_hash"],
+        storage_path=str(storage),
+        created_at=datetime.now(UTC),
+        created_by="assistant",
+        source_description=fields["source_description"],
+        status="pending",
+        creation_modality=fields["creation_modality"],
+        created_from_message_id=fields["created_from_message_id"],
+        creating_model_identifier=fields["creating_model_identifier"],
+        creating_model_version=fields["creating_model_version"],
+        creating_provider=fields["creating_provider"],
+        creating_composer_skill_hash=fields["creating_composer_skill_hash"],
+        creating_arguments_hash=fields["creating_arguments_hash"],
+    )
+    publication = _stage_inline_custody_blob(
+        storage=storage,
+        content=request.content,
+        expected_hash=fields["content_hash"],
+        blob_id=blob_id,
+        session_id=session_id,
+        write_guard=write_guard,
+    )
+    write_guard()
+    return StagedInlineCustody(record=record, publication=publication)
+
+
+def persist_inline_custody_blob_on_connection(
+    conn: Connection,
+    *,
+    staged: StagedInlineCustody,
+    max_storage_per_session: int,
+    quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
+) -> tuple[Row[Any], InlineCustodyPublication]:
+    """Insert pre-staged metadata into the originating message/proposal cohort.
+
+    The caller retains BLOB_CUSTODY from preparation until publication. This
+    function performs only SQL; the lineage FK becomes satisfiable after the
+    message insert in this transaction. The existing exact operation and
+    session-operation proof is repeated by the cohort and this boundary.
+    """
+    if type(staged) is not StagedInlineCustody:
+        raise TypeError("staged must be an exact StagedInlineCustody")
+    if type(max_storage_per_session) is not int or max_storage_per_session <= 0:
+        raise ValueError("max_storage_per_session must be a positive exact integer")
+    record = staged.record
+    blob_id = str(record.id)
+    session_id = str(record.session_id)
+    storage = Path(record.storage_path)
+    if record.content_hash is None:
+        raise AuditIntegrityError("pre-staged inline custody lacks its content hash")
+    expected: _ExpectedBlobFields = {
+        "session_id": session_id,
+        "filename": record.filename,
+        "mime_type": record.mime_type,
+        "size_bytes": record.size_bytes,
+        "content_hash": record.content_hash,
+        "created_by": record.created_by,
+        "source_description": record.source_description,
+        "creation_modality": record.creation_modality,
+        "created_from_message_id": record.created_from_message_id,
+        "creating_model_identifier": record.creating_model_identifier,
+        "creating_model_version": record.creating_model_version,
+        "creating_provider": record.creating_provider,
+        "creating_composer_skill_hash": record.creating_composer_skill_hash,
+        "creating_arguments_hash": record.creating_arguments_hash,
+    }
+    _acquire_blob_phase_lock(conn, session_id)
+    _lock_session_for_blob_quota(conn, session_id)
+    _require_live_blob_write_fence(
+        conn,
+        session_id=session_id,
+        fork_write_fence=None,
+    )
+    row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).first()
+    if row is None:
+        _enforce_session_blob_quota(
+            conn,
+            session_id,
+            additional_bytes=expected["size_bytes"],
+            max_storage_per_session=max_storage_per_session,
+        )
+        admit_storage_bytes_on_connection(
+            conn,
+            session_id=session_id,
+            additional_bytes=expected["size_bytes"],
+            operation="inline_custody",
+            record=quota_exceeded_recorder,
+        )
+        _insert_pending_blob_row(conn, blob_id=blob_id, storage=storage, expected=expected)
+        row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
+    _validate_reusable_blob_row(row, expected=expected, blob_id=blob_id, storage_path=storage)
+    if row.status == "pending":
+        conn.execute(
+            blobs_table.update()
+            .where(blobs_table.c.id == blob_id)
+            .values(status="ready", custody_operation_id=None, custody_operation_epoch=None, custody_operation_kind=None)
+        )
+    final_row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
+    _guard_blob_row_literals(final_row)
+    return final_row, staged.publication
+
+
+def _option_value_references_blob(value: Any, blob_id: str, storage_path: str) -> bool:
+    """Recursively inspect an option value for blob identity markers.
+
+    Id values are compared by UUID identity (``names_same_blob``): the binding
+    path accepts either hex case, so a spelling comparison read a bound blob
+    as unbound (elspeth-f123a7b3d2). A present-but-non-str id value is a
+    non-match here, as it always was on this walker; the composer-side walker
+    is the one that escalates it.
+    """
+    if type(value) is dict:
+        if "blob_ref" in value and type(value["blob_ref"]) is str and names_same_blob(value["blob_ref"], blob_id):
+            return True
+        # blob_rows persists custody as blobs[].blob_id (elspeth-0c6a343921);
+        # without this the delete guard misses the window between run
+        # creation and _link_blob_rows_to_run, when only this composition
+        # scan protects a pending run's inputs.
+        if "blob_id" in value and type(value["blob_id"]) is str and names_same_blob(value["blob_id"], blob_id):
+            return True
+        if any(key in value and value[key] == storage_path for key in ("path", "file")):
+            return True
+        return any(_option_value_references_blob(child, blob_id, storage_path) for child in value.values())
+    if type(value) is list:
+        return any(_option_value_references_blob(child, blob_id, storage_path) for child in value)
+    return False
+
+
+def _options_reference_blob(options: Any, blob_id: str, storage_path: str, owner: str) -> bool:
+    if type(options) is not dict:
+        raise AuditIntegrityError(f"Tier 1: composition_states.{owner}.options is {type(options).__name__}, expected dict")
+    return _option_value_references_blob(options, blob_id, storage_path)
+
+
+def _composition_references_blob(
+    composition_state: Any,
+    blob_id: str,
+    storage_path: str,
+) -> bool:
+    """Check whether any runtime/YAML-shape composition section references a blob.
+
+    ``composition_state`` must be the canonical pipeline dict emitted by
+    ``generate_pipeline_dict()`` or ``pipeline_dict_from_record()``. It walks
+    source options, node-collection options, and sink options for either a
+    matching ``blob_ref`` marker or a path/file value matching ``storage_path``.
+
+    Tier 1 guards: malformed present sections are DB/audit corruption, so they
+    raise ``AuditIntegrityError`` instead of becoming silent false negatives.
+    """
+    if composition_state is None:
+        return False
+    if type(composition_state) is not dict:
+        raise AuditIntegrityError(f"Tier 1: composition_states is {type(composition_state).__name__}, expected dict")
+
+    if "sources" in composition_state:
+        sources = composition_state["sources"]
+        # Per ADR-025 §1, the canonical pipeline dict emits `sources` as a
+        # non-null dict whenever any source is present. A null `sources` map
+        # in a persisted composition_state is internal corruption (Tier 1).
+        if sources is None:
+            raise AuditIntegrityError("Tier 1: composition_states.sources is null, expected dict")
+        if type(sources) is not dict:
+            raise AuditIntegrityError(f"Tier 1: composition_states.sources is {type(sources).__name__}, expected dict")
+        for source_name, source in sources.items():
+            if source is None:
+                raise AuditIntegrityError(f"Tier 1: composition_states.sources[{source_name!r}] is null, expected dict")
+            if type(source) is not dict:
+                raise AuditIntegrityError(f"Tier 1: composition_states.sources[{source_name!r}] is {type(source).__name__}, expected dict")
+            if _options_reference_blob(source["options"], blob_id, storage_path, f"sources[{source_name!r}]"):
+                return True
+
+    # AUTHORITY: ``generate_pipeline_dict`` — the sole producer of the dict
+    # this walks (``pipeline_dict_from_record`` is
+    # ``generate_pipeline_dict(state_from_record(record))``). Asking it what it
+    # emits gives the options-bearing sections: ``sources``, ``transforms``,
+    # ``aggregations``, ``collectors``, ``sinks``. ``gates`` and ``coalesce``
+    # are emitted without options. The blob authoring tool also rejects every
+    # plugin-free structural node before mutation, because no inline marker
+    # could survive into runtime YAML. Both legacy keys below are kept as
+    # tolerant defence-in-depth for a non-canonical persisted dict rather than
+    # removed for tidiness.
+    # ``collectors`` was the live gap: a blob referenced only from a collector's
+    # options read as unreferenced and deletion was permitted under an active
+    # run (elspeth-ca79b2c63a).
+    #
+    # Do NOT swap in ``core/config.py``'s ``_plugin_bearing_sections()``. It is
+    # derived and returns these same names today, which is what makes the
+    # substitution look safe — but it requires ``plugin`` AND ``options``, and
+    # this guard cares about ``options`` ALONE. A section carrying options
+    # without a plugin is the case it would skip while reporting success. No
+    # such section exists today, so the mismatch is latent, not live.
+    # ``tests/unit/web/blobs/test_composition_references_blob.py`` derives the
+    # coverage from the emitter, so a new options-bearing kind fails there on
+    # the day it is emitted.
+    for collection_key in ("transforms", "gates", "aggregations", "coalesce", "collectors"):
+        if collection_key not in composition_state:
+            continue
+        nodes = composition_state[collection_key]
+        if type(nodes) is not list:
+            raise AuditIntegrityError(f"Tier 1: composition_states.{collection_key} is {type(nodes).__name__}, expected list")
+        for index, node in enumerate(nodes):
+            if type(node) is not dict:
+                raise AuditIntegrityError(f"Tier 1: composition_states.{collection_key}[{index}] is {type(node).__name__}, expected dict")
+            if "options" in node and _options_reference_blob(node["options"], blob_id, storage_path, f"{collection_key}[{index}]"):
+                return True
+
+    if "sinks" not in composition_state:
+        return False
+    sinks = composition_state["sinks"]
+    if type(sinks) is not dict:
+        raise AuditIntegrityError(f"Tier 1: composition_states.sinks is {type(sinks).__name__}, expected dict")
+    for sink_name, sink in sinks.items():
+        if type(sink) is not dict:
+            raise AuditIntegrityError(f"Tier 1: composition_states.sinks[{sink_name!r}] is {type(sink).__name__}, expected dict")
+        if "options" in sink and _options_reference_blob(sink["options"], blob_id, storage_path, f"sinks[{sink_name!r}]"):
+            return True
+    return False
+
+
+def _session_quota_lock_statement(session_id_str: str) -> Any:
+    """Build the per-session row lock used to serialize quota writers."""
+    return select(sessions_table.c.id).where(sessions_table.c.id == session_id_str).with_for_update()
+
+
+def _lock_session_for_blob_quota(conn: Connection, session_id_str: str) -> None:
+    """Lock the owning session row before a quota read/write sequence.
+
+    On PostgreSQL this emits ``SELECT ... FOR UPDATE`` and serializes all
+    same-session blob quota writers. SQLite ignores the row-lock clause, but
+    its coarse write serialization already preserves the current behavior.
+    """
+    locked = conn.execute(_session_quota_lock_statement(session_id_str)).first()
+    if locked is None:
+        raise RuntimeError(f"Blob quota lock target session {session_id_str!r} does not exist")
+
+
+def _guard_blob_row_literals(row: Any) -> None:
+    """Validate closed-set blob row fields at the DB read boundary."""
+    # Tier 1 read guards — BlobRecord's fields are declared as closed
+    # Literal types, but the DB can be tampered with via direct SQL
+    # or a migration bug. Crash on any value outside the enum so the
+    # audit trail never silently returns a record whose static type
+    # is a lie. Aligns with the frozenset CHECK constraints in
+    # web/sessions/models.py (ck_blobs_status, ck_blobs_created_by)
+    # and the MIME allowlist enforced at create_blob().
+    #
+    # Explicit raise (not ``assert``): ``python -O`` strips asserts,
+    # so an optimised interpreter would silently pass a tampered row
+    # through these guards. AuditIntegrityError is the contract for
+    # Tier 1 DB-corruption conditions and survives ``-O`` execution.
+    if row.status not in BLOB_STATUSES:
+        raise AuditIntegrityError(f"Tier 1: blobs.status is {row.status!r}, expected one of {sorted(BLOB_STATUSES)}")
+    if row.created_by not in BLOB_CREATORS:
+        raise AuditIntegrityError(f"Tier 1: blobs.created_by is {row.created_by!r}, expected one of {sorted(BLOB_CREATORS)}")
+    if row.mime_type not in STORAGE_MIME_TYPES:
+        raise AuditIntegrityError(f"Tier 1: blobs.mime_type is {row.mime_type!r}, not in the storage MIME set")
+    # Tier 1 guard for the closed CreationModality enum (Phase 5a Task 2.5).
+    # Mirrors the ck_blobs_creation_modality DB CHECK; this Python guard
+    # catches tampered or migration-bug-introduced rows that bypassed the
+    # DB layer (e.g. a manual SQLite UPDATE).  AuditIntegrityError keeps
+    # the audit-trail correctness invariant — the read path never silently
+    # returns a record whose static type is a lie.
+    if row.creation_modality not in {m.value for m in CreationModality}:
+        raise AuditIntegrityError(
+            f"Tier 1: blobs.creation_modality is {row.creation_modality!r}, expected one of {sorted(m.value for m in CreationModality)}"
+        )
+
+
+def _aware_utc(value: datetime) -> datetime:
+    """Normalise a stored timestamp to aware UTC; SQLite returns the column naive.
+
+    The session-operation authority's blob facet applies the same rule, so a
+    record read through the fence and a record built here compare equal — the
+    fenced content reads depend on that equality.
+    """
+    if type(value) is not datetime:
+        raise AuditIntegrityError(f"Tier 1: blobs.created_at is {type(value).__name__}, expected datetime")
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _row_to_blob_record(row: Any) -> BlobRecord:
+    """Convert a blobs row into a guarded BlobRecord."""
+    _guard_blob_row_literals(row)
+    return BlobRecord(
+        id=UUID(row.id),
+        session_id=UUID(row.session_id),
+        filename=row.filename,
+        mime_type=row.mime_type,
+        size_bytes=row.size_bytes,
+        content_hash=row.content_hash,
+        storage_path=row.storage_path,
+        created_at=_aware_utc(row.created_at),
+        created_by=row.created_by,
+        source_description=row.source_description,
+        status=row.status,
+        # Tier 1 read: ``creation_modality`` has already been checked
+        # against the closed CreationModality enum in
+        # ``_guard_blob_row_literals``; coerce to the enum so consumers
+        # get the typed value rather than the bare wire-format string.
+        creation_modality=CreationModality(row.creation_modality),
+        created_from_message_id=row.created_from_message_id,
+        creating_model_identifier=row.creating_model_identifier,
+        creating_model_version=row.creating_model_version,
+        creating_provider=row.creating_provider,
+        creating_composer_skill_hash=row.creating_composer_skill_hash,
+        creating_arguments_hash=row.creating_arguments_hash,
+    )
+
+
+def _in_progress_session_fork_operation_id(conn: Connection, session_id: str) -> str | None:
+    """Return the operation retaining every blob in a session, if any."""
+    return conn.execute(
+        select(session_operation_receipts_table.c.operation_id)
+        .where(
+            session_operation_receipts_table.c.session_id == session_id,
+            session_operation_receipts_table.c.kind == "session_fork",
+            session_operation_receipts_table.c.status == "in_progress",
+        )
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+class _ForkCopyWriteAuthority:
+    """Cross-thread lease state consulted at every fork file mutation seam."""
+
+    def __init__(self, fence: BlobForkWriteFence) -> None:
+        self._fence = fence
+        self._lease_lost = threading.Event()
+        self._checkpoint_complete = threading.Event()
+        self._checkpoint_complete.set()
+
+    def checkpoint_started(self) -> None:
+        self._checkpoint_complete.clear()
+
+    def checkpoint_succeeded(self) -> None:
+        self._checkpoint_complete.set()
+
+    def lose(self) -> None:
+        self._lease_lost.set()
+        self._checkpoint_complete.set()
+
+    def require(self) -> None:
+        self._checkpoint_complete.wait()
+        if self._lease_lost.is_set():
+            raise BlobForkFenceLostError(self._fence.operation_id, attempt=self._fence.attempt)
+
+
+@dataclass(frozen=True, slots=True)
+class _DrainOutcome:
+    """Terminal state observed while draining a cancelled fork-copy worker."""
+
+    cancelled: bool = False
+    failure_class: str | None = None
+
+
+async def _drained_worker_outcome(task: asyncio.Future[Any]) -> _DrainOutcome:
+    """Await a cancelled worker to completion, reporting instead of suppressing.
+
+    The callers cancel the worker and must then wait for it to stop before
+    discarding temporary bytes. Its CancelledError is the expected terminal
+    state; any OTHER terminal exception was previously erased by a
+    ``suppress(BaseException)`` — now its class is reported so the caller can
+    attach it to the primary failure as a PEP 678 note.
+    """
+
+    try:
+        await task
+    except asyncio.CancelledError:
+        return _DrainOutcome(cancelled=True)
+    except BaseException as exc:
+        return _DrainOutcome(failure_class=type(exc).__name__)
+    return _DrainOutcome()
+
+
+async def _await_fork_copy_io_with_checkpoints[ResultT](
+    operation: Awaitable[ResultT],
+    *,
+    checkpoint: Callable[[], Awaitable[None]],
+    write_authority: _ForkCopyWriteAuthority | None = None,
+) -> ResultT:
+    """Await blocking fork I/O while renewing its parent operation lease.
+
+    A due checkpoint pauses the guarded writer at its next bounded mutation
+    seam.  Failure then publishes lease loss before this coroutine waits for
+    the worker to stop, so it can discard temporary bytes without releasing
+    target-session custody to a takeover worker first.
+    """
+    operation_task = asyncio.ensure_future(operation)
+    while True:
+        try:
+            done, _pending = await asyncio.wait(
+                {operation_task},
+                timeout=_FORK_COPY_LEASE_CHECKPOINT_INTERVAL_SECONDS,
+            )
+        except asyncio.CancelledError as primary:
+            if write_authority is not None:
+                write_authority.lose()
+            operation_task.cancel()
+            drained = await _drained_worker_outcome(operation_task)
+            if drained.failure_class is not None:
+                primary.add_note(f"fork-copy worker also failed during cancellation drain: {drained.failure_class}")
+            raise
+        if done:
+            return operation_task.result()
+        if write_authority is not None:
+            write_authority.checkpoint_started()
+        try:
+            await checkpoint()
+        except asyncio.CancelledError as primary:
+            if write_authority is not None:
+                write_authority.lose()
+            operation_task.cancel()
+            drained = await _drained_worker_outcome(operation_task)
+            if drained.failure_class is not None:
+                primary.add_note(f"fork-copy worker also failed during cancellation drain: {drained.failure_class}")
+            raise
+        except BaseException as primary:
+            if write_authority is not None:
+                write_authority.lose()
+            else:
+                operation_task.cancel()
+            drained = await _drained_worker_outcome(operation_task)
+            if drained.failure_class is not None:
+                primary.add_note(f"fork-copy worker also failed during checkpoint-failure drain: {drained.failure_class}")
+            raise
+        else:
+            if write_authority is not None:
+                write_authority.checkpoint_succeeded()
+
+
+class BlobServiceImpl:
+    """Filesystem-backed blob service.
+
+    Follows the same async-over-sync pattern as SessionServiceImpl:
+    all public methods are async, database I/O runs in a thread pool
+    executor via _run_sync().
+    """
+
+    def __init__(
+        self,
+        engine: Engine,
+        data_dir: Path,
+        max_storage_per_session: int = 500 * 1024 * 1024,
+        *,
+        session_operation_authority: SessionOperationAuthority | None = None,
+        quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
+    ) -> None:
+        self._engine = engine
+        self._data_dir = data_dir.expanduser().resolve()
+        self._max_storage_per_session = max_storage_per_session
+        self._quota_exceeded_recorder = quota_exceeded_recorder
+        if session_operation_authority is None:
+            # The dialect-derived default is the same authority the session
+            # service builds over this engine; a deployment that wires one
+            # explicitly (web/app.py) shares the instance instead.
+            if engine.dialect.name == "sqlite":
+                from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+
+                session_operation_authority = SQLiteLocalSessionOperationAuthority(engine, quota_exceeded_recorder=quota_exceeded_recorder)
+            elif engine.dialect.name == "postgresql":
+                from elspeth.web.coordination.repository import PostgresSessionOperationRepository
+
+                session_operation_authority = PostgresSessionOperationRepository(engine, quota_exceeded_recorder=quota_exceeded_recorder)
+            else:
+                raise NotImplementedError(f"Session operation authority is not implemented for dialect {engine.dialect.name}")
+        self._session_operation_authority = session_operation_authority
+
+    async def _run_sync(self, func: Callable[[], _T]) -> _T:
+        return await run_sync_in_worker(func)
+
+    def _fenced_blob_record(self, blob_id: UUID, context: SessionOperationContext) -> BlobRecord:
+        """Read one blob's metadata as the fence's session, through the authority.
+
+        One authority mutation: the exact context is compare-and-swapped and
+        the row is read under the session's fence lock, so a stale fence
+        raises ``SessionOperationFenceLost`` and a blob outside the fence's
+        session custody reads exactly like a missing one — the two are
+        indistinguishable by construction, not by a caller's comparison.
+        """
+        # Local import: coordination.repository imports the blob contracts at
+        # module scope; a module-level import here would close that cycle.
+        from elspeth.web.coordination.repository import SessionDerivedCustodyError
+
+        try:
+            return self._session_operation_authority.mutate(
+                context,
+                lambda transaction: transaction.blobs.read_blob(blob_id=blob_id),
+            )
+        except SessionDerivedCustodyError:
+            raise BlobNotFoundError(str(blob_id)) from None
+
+    def _read_bytes_or_missing(self, storage: Path, *, blob_id_str: str, storage_path: str) -> bytes:
+        """Read a ready blob's bytes, typing a raced deletion as missing content."""
+        try:
+            return storage.read_bytes()
+        except OSError as exc:
+            # The file may be deleted after the existence guard but before
+            # the descriptor is acquired (ENOENT), or a sibling replica's
+            # delete on a shared NFS mount may revoke the inode under the
+            # open handle (ESTALE). Both are the raced-deletion case the blob
+            # lifecycle contract types as missing content; any other errno is
+            # a real I/O fault and propagates (elspeth-632373963d).
+            if exc.errno in _RACED_DELETION_ERRNOS:
+                raise BlobContentMissingError(blob_id_str, storage_path=storage_path) from None
+            raise
+
+    async def reconcile_inline_custody_publications(self) -> None:
+        """Reconcile tracked pre-commit inline stages before serving traffic."""
+        await self._run_sync(lambda: reconcile_inline_custody_publications(self._engine, self._data_dir))
+
+    def _now(self) -> datetime:
+        return datetime.now(UTC)
+
+    def _blob_dir(self, session_id: str) -> Path:
+        return self._data_dir / "blobs" / session_id
+
+    def _storage_path(self, session_id: str, blob_id: str, filename: str) -> Path:
+        return self._blob_dir(session_id) / f"{blob_id}_{filename}"
+
+    def _reconcile_abandoned_creations_locked(self, context: SessionOperationContext) -> None:
+        """Remove operation-qualified pending reservations left by predecessors."""
+        obligations = self._session_operation_authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.list_abandoned_blob_reservations(),
+        )
+
+        def _retire(obligation: BlobCreationObligation) -> bool:
+            return self._session_operation_authority.mutate(
+                context,
+                lambda transaction: transaction.blobs.retire_abandoned_blob_reservation(obligation=obligation),
+            )
+
+        for obligation in obligations:
+            self._session_operation_authority.compare_and_swap(context)
+            record = obligation.record
+            storage = Path(record.storage_path)
+            expected_storage = self._storage_path(str(record.session_id), str(record.id), record.filename)
+            if storage != expected_storage:
+                raise AuditIntegrityError("abandoned blob reservation storage escaped exact custody")
+            temp = storage.with_name(f".{storage.name}.custody.tmp")
+            with _inline_custody_directory_fds(storage, session_id=str(record.session_id), create=False) as directory_fds:
+                if directory_fds is not None:
+                    custody_root_fd, session_fd = directory_fds
+                    storage_exists = _regular_custody_file_exists(storage, directory_fd=session_fd)
+                    temp_exists = _regular_custody_file_exists(temp, directory_fd=session_fd)
+                    if storage_exists:
+                        actual_hash = _content_hash_from_file(storage, directory_fd=session_fd)
+                        size_bytes = os.stat(storage.name, dir_fd=session_fd, follow_symlinks=False).st_size
+                        if size_bytes != record.size_bytes or not hmac.compare_digest(actual_hash, record.content_hash or ""):
+                            raise AuditIntegrityError("abandoned blob reservation canonical bytes changed")
+                    # Validate every candidate before mutating any of them. A
+                    # malformed temp preserves canonical bytes and the ledger.
+                    _require_stable_custody_session(
+                        custody_root_fd,
+                        session_name=str(record.session_id),
+                        descriptor=session_fd,
+                        session_dir=storage.parent,
+                    )
+                    _require_stable_custody_root(storage.parent.parent, custody_root_fd)
+                    if storage_exists:
+                        self._session_operation_authority.compare_and_swap(context)
+                        _unlink_custody_file(storage, directory_fd=session_fd)
+                    if temp_exists:
+                        self._session_operation_authority.compare_and_swap(context)
+                        _unlink_custody_file(temp, directory_fd=session_fd)
+                    if storage_exists or temp_exists:
+                        _fsync_custody_directory(storage.parent, directory_fd=session_fd)
+                    _require_stable_custody_session(
+                        custody_root_fd,
+                        session_name=str(record.session_id),
+                        descriptor=session_fd,
+                        session_dir=storage.parent,
+                    )
+                    _require_stable_custody_root(storage.parent.parent, custody_root_fd)
+            self._session_operation_authority.compare_and_swap(context)
+            retired = _retire(obligation)
+            if not retired:
+                raise AuditIntegrityError("abandoned blob reservation changed before retirement")
+
+    def _row_to_record(self, row: Any) -> BlobRecord:
+        return _row_to_blob_record(row)
+
+    def _reconcile_blob_deletions_locked(self, context: SessionOperationContext, *, exclude_blob_id: UUID | None = None) -> None:
+        """Recover committed versions under custody without retaining SESSIONS."""
+        from elspeth.web.blobs.replacement import BlobReplacementCoordinator
+
+        BlobReplacementCoordinator(
+            engine=self._engine,
+            data_dir=self._data_dir,
+            session_operation_authority=self._session_operation_authority,
+        )._reconcile_blob_replacements_locked(context)
+        plans = self._session_operation_authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.list_blob_deletions(),
+        )
+
+        def _abort(plan: BlobDeletionPlan) -> bool:
+            return self._session_operation_authority.mutate(
+                context,
+                lambda transaction: transaction.blobs.abort_blob_deletion(plan=plan),
+            )
+
+        for plan in plans:
+            if plan.blob_id == exclude_blob_id:
+                continue
+            self._session_operation_authority.compare_and_swap(context)
+            storage, tombstone, _temp = self._validated_blob_deletion_paths(plan)
+            if plan.phase in {"intent", "staged"}:
+                if plan.expected_file_present:
+                    if storage.exists() and tombstone.exists():
+                        raise AuditIntegrityError("uncommitted blob deletion retained canonical and tombstone bytes")
+                    if tombstone.exists():
+                        self._require_exact_deletion_bytes(tombstone, plan)
+                        self._session_operation_authority.compare_and_swap(context)
+                        os.replace(tombstone, storage)
+                        _fsync_parent_directory(storage.parent)
+                    elif storage.exists():
+                        self._require_exact_deletion_bytes(storage, plan)
+                    else:
+                        raise AuditIntegrityError("uncommitted blob deletion lost its exact bytes")
+                elif storage.exists() or tombstone.exists():
+                    raise AuditIntegrityError("absent-file deletion obligation unexpectedly retained bytes")
+                self._session_operation_authority.compare_and_swap(context)
+                if context.operation_kind is not SessionOperationKind.BLOB_READ:
+                    aborted = _abort(plan)
+                    if not aborted and self._read_blob_deletion_plan(context, plan.blob_id) is not None:
+                        raise AuditIntegrityError("blob deletion changed before recovery abort")
+                continue
+            if plan.phase == "purge_pending":
+                if context.operation_kind is SessionOperationKind.BLOB_READ:
+                    continue
+                if storage.exists():
+                    if tombstone.exists():
+                        raise AuditIntegrityError("committed blob deletion retained canonical and tombstone bytes")
+                    self._require_exact_deletion_bytes(storage, plan)
+                    self._session_operation_authority.compare_and_swap(context)
+                    os.replace(storage, tombstone)
+                    _fsync_parent_directory(storage.parent)
+                self._purge_blob_deletion_plan(context=context, plan=plan)
+                continue
+            raise AuditIntegrityError("blob deletion recovery found an invalid phase")
+
+    def _row_to_link_record(self, row: Any) -> BlobRunLinkRecord:
+        # Tier 1 read guard — mirrors the ck_blob_run_links_direction
+        # CHECK constraint.  A row with a bogus direction would leave
+        # BlobRunLinkRecord.direction (typed BlobRunLinkDirection)
+        # carrying a value outside its Literal set.  Explicit raise (not
+        # ``assert``) so the guard survives ``python -O``.
+        if row.direction not in BLOB_RUN_LINK_DIRECTIONS:
+            raise AuditIntegrityError(
+                f"Tier 1: blob_run_links.direction is {row.direction!r}, expected one of {sorted(BLOB_RUN_LINK_DIRECTIONS)}"
+            )
+        return BlobRunLinkRecord(
+            blob_id=UUID(row.blob_id),
+            run_id=UUID(row.run_id),
+            direction=row.direction,
+        )
+
+    async def create_blob(
+        self,
+        session_id: UUID,
+        filename: str,
+        content: bytes,
+        mime_type: StorageMimeType,
+        created_by: BlobCreator = "user",
+        source_description: str | None = None,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> BlobRecord:
+        """Create a blob from content bytes under the caller's CREATE/COMPOSE fence.
+
+        Accepts the STORAGE union: which subset applies (text/data vs
+        binary document) is decided by the authenticated boundary that
+        received the bytes — the upload route enforces the binary
+        signature agreement before this method runs (elspeth-0c6a343921).
+
+        Reservation and ready publication are exact-context authority
+        mutations. The intervening filesystem write re-proves that authority
+        before and after publication while the separate blob-custody lock
+        serialises same-session filesystem effects.
+        """
+        _require_blob_operation_context(session_operation_context, allowed_kinds=_CREATE_BLOB_OPERATION_KINDS)
+        if type(session_id) is not UUID:
+            raise TypeError(f"session_id must be UUID, got {type(session_id).__name__}")
+        if str(session_id) != session_operation_context.fence.session_id:
+            raise ValueError("session operation context does not own the blob session")
+        if type(filename) is not str:
+            raise TypeError(f"filename must be str, got {type(filename).__name__}")
+        if type(content) is not bytes:
+            raise TypeError(f"Blob content must be bytes, got {type(content).__name__}")
+        untrusted_created_by: object = created_by
+        if type(untrusted_created_by) is not str:
+            raise TypeError(f"created_by must be str, got {type(untrusted_created_by).__name__}")
+        if untrusted_created_by not in BLOB_CREATORS:
+            raise RuntimeError(f"Invalid created_by {untrusted_created_by!r} — must be one of {sorted(BLOB_CREATORS)}")
+        untrusted_mime_type: object = mime_type
+        if type(untrusted_mime_type) is not str:
+            raise TypeError(f"mime_type must be str, got {type(untrusted_mime_type).__name__}")
+        if untrusted_mime_type not in STORAGE_MIME_TYPES:
+            raise RuntimeError(f"Invalid mime_type {untrusted_mime_type!r} — not in the storage MIME set")
+        source_description = _normalized_optional_text(source_description, field_name="source_description")
+        blob_id = uuid4()
+        safe_filename = sanitize_filename(filename)
+        storage = self._storage_path(str(session_id), str(blob_id), safe_filename)
+        reservation = BlobRecord(
+            id=blob_id,
+            session_id=session_id,
+            filename=safe_filename,
+            mime_type=mime_type,
+            size_bytes=len(content),
+            content_hash=content_hash(content),
+            storage_path=str(storage),
+            created_at=self._now(),
+            created_by=created_by,
+            source_description=source_description,
+            status="pending",
+            creation_modality=CreationModality.VERBATIM,
+            created_from_message_id=None,
+            creating_model_identifier=None,
+            creating_model_version=None,
+            creating_provider=None,
+            creating_composer_skill_hash=None,
+            creating_arguments_hash=None,
+        )
+
+        return await self._run_sync(
+            lambda: self._persist_fenced_blob_record(reservation, content, session_operation_context, idempotent=False)
+        )
+
+    def _persist_fenced_blob_record(
+        self,
+        reservation: BlobRecord,
+        content: bytes,
+        session_operation_context: SessionOperationContext,
+        *,
+        idempotent: bool,
+    ) -> BlobRecord:
+        """Share exact-context reservation, publication and commit recovery."""
+        _require_blob_operation_context(session_operation_context, allowed_kinds=_CREATE_BLOB_OPERATION_KINDS)
+        session_id = reservation.session_id
+        blob_id = reservation.id
+        storage = Path(reservation.storage_path)
+        if str(session_id) != session_operation_context.fence.session_id:
+            raise AuditIntegrityError("blob reservation escaped the operation's session")
+
+        def _guard() -> None:
+            self._session_operation_authority.compare_and_swap(session_operation_context)
+
+        def _sync() -> BlobRecord:
+            with _blob_custody_session_lock(self._engine, str(session_id)):
+                self._reconcile_blob_deletions_locked(session_operation_context)
+                self._reconcile_abandoned_creations_locked(session_operation_context)
+                if storage.exists() and not idempotent:
+                    try:
+                        self._fenced_blob_record(blob_id, session_operation_context)
+                    except BlobNotFoundError:
+                        actual_hash = content_hash(storage.read_bytes())
+                        raise BlobIntegrityError(
+                            str(blob_id),
+                            expected=reservation.content_hash or "<missing>",
+                            actual=actual_hash,
+                        ) from None
+                    else:
+                        raise AuditIntegrityError(f"Unexpected duplicate blob id {blob_id}")
+                try:
+                    self._session_operation_authority.mutate(
+                        session_operation_context,
+                        lambda transaction: transaction.blobs.reserve_blob(
+                            record=reservation,
+                            max_storage_per_session=self._max_storage_per_session,
+                            idempotent=idempotent,
+                        ),
+                    )
+                    reserved = self._fenced_blob_record(blob_id, session_operation_context)
+                    if reserved.status == "ready" and not storage.exists():
+                        raise BlobContentMissingError(str(blob_id), storage_path=str(storage))
+                    if storage.exists():
+                        existing = storage.read_bytes()
+                        actual_hash = content_hash(existing)
+                        if len(existing) != len(content) or not hmac.compare_digest(actual_hash, reservation.content_hash or ""):
+                            raise BlobIntegrityError(str(blob_id), expected=reservation.content_hash or "<missing>", actual=actual_hash)
+                        _guard()
+                    else:
+                        _atomic_write_blob(storage, content, write_guard=_guard)
+                    if reserved.status == "ready":
+                        return self._fenced_blob_record(blob_id, session_operation_context)
+                    return self._session_operation_authority.mutate(
+                        session_operation_context,
+                        lambda transaction: transaction.blobs.mark_blob_ready(
+                            blob_id=blob_id,
+                        ),
+                    )
+                except BaseException as primary_exc:
+                    reconciled = self._session_operation_authority.reconcile_blob_reservation(
+                        session_operation_context,
+                        expected=reservation,
+                    )
+                    if reconciled is not None and reconciled.status == "ready":
+                        if not storage.exists():
+                            raise AuditIntegrityError("committed ready blob is missing canonical bytes during reconciliation") from None
+                        actual_hash = content_hash(storage.read_bytes())
+                        if not hmac.compare_digest(actual_hash, reconciled.content_hash or ""):
+                            raise BlobIntegrityError(
+                                str(blob_id),
+                                expected=reconciled.content_hash or "<missing>",
+                                actual=actual_hash,
+                            ) from None
+                        if not isinstance(primary_exc, Exception):
+                            raise
+                        return reconciled
+                    if reconciled is not None and not idempotent:
+                        try:
+                            self._session_operation_authority.compare_and_swap(session_operation_context)
+                            if storage.exists():
+                                actual_hash = content_hash(storage.read_bytes())
+                                if not hmac.compare_digest(actual_hash, reservation.content_hash or ""):
+                                    raise BlobIntegrityError(
+                                        str(blob_id),
+                                        expected=reservation.content_hash or "<missing>",
+                                        actual=actual_hash,
+                                    )
+                                storage.unlink()
+                                _fsync_parent_directory(storage.parent)
+                            discarded = self._session_operation_authority.mutate(
+                                session_operation_context,
+                                lambda transaction: transaction.blobs.discard_pending_blob(
+                                    blob_id=blob_id,
+                                ),
+                            )
+                            if not discarded:
+                                raise AuditIntegrityError("failed create reservation changed before exact discard")
+                        except Exception as cleanup_exc:
+                            primary_exc.add_note(
+                                f"Failed create cleanup requires reconciliation: {type(cleanup_exc).__name__}: {cleanup_exc}"
+                            )
+                            raise primary_exc from cleanup_exc
+                    raise
+
+        return _sync()
+
+    async def reserve_inline_custody(
+        self,
+        request: InlineCustodyRequest,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> BlobRecord:
+        """Idempotently materialize one composer inline source."""
+        fields = _normalized_inline_custody_fields(request)
+        blob_id = inline_custody_blob_id(request)
+        row = await self._run_sync(
+            lambda: _persist_blob_content(
+                engine=self._engine,
+                data_dir=self._data_dir,
+                max_storage_per_session=self._max_storage_per_session,
+                blob_id=blob_id,
+                session_id=request.session_id,
+                filename=fields["filename"],
+                content=request.content,
+                mime_type=fields["mime_type"],
+                created_by="assistant",
+                source_description=fields["source_description"],
+                creation_modality=request.creation_modality,
+                created_from_message_id=fields["created_from_message_id"],
+                creating_model_identifier=fields["creating_model_identifier"],
+                creating_model_version=fields["creating_model_version"],
+                creating_provider=fields["creating_provider"],
+                creating_composer_skill_hash=fields["creating_composer_skill_hash"],
+                creating_arguments_hash=fields["creating_arguments_hash"],
+                idempotent=True,
+                session_operation_context=session_operation_context,
+                session_operation_authority=self._session_operation_authority,
+            )
+        )
+        if not isinstance(row, BlobRecord):
+            raise AuditIntegrityError("fenced inline custody persistence returned a raw row")
+        return row
+
+    async def get_blob(
+        self,
+        blob_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> BlobRecord:
+        """Get blob metadata through the caller's exact session-operation fence."""
+        return await self._run_sync(lambda: self.get_blob_sync(blob_id, session_operation_context))
+
+    def get_blob_sync(self, blob_id: UUID, context: SessionOperationContext) -> BlobRecord:
+        """Get blob metadata in a synchronous preflight worker under its exact fence."""
+        _require_blob_operation_context(context, allowed_kinds=_READ_BLOB_OPERATION_KINDS)
+        return self._fenced_blob_record(blob_id, context)
+
+    async def list_blobs(
+        self,
+        session_id: UUID,
+        limit: int | None = 50,
+        offset: int = 0,
+    ) -> list[BlobRecord]:
+        """List blobs for a session, newest first."""
+        session_id_str = str(session_id)
+
+        def _sync() -> list[BlobRecord]:
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    select(blobs_table)
+                    .where(blobs_table.c.session_id == session_id_str)
+                    .order_by(blobs_table.c.created_at.desc())
+                    .limit(limit)
+                    .offset(offset)
+                ).fetchall()
+                return [self._row_to_record(r) for r in rows]
+
+        return await self._run_sync(_sync)
+
+    def _validated_blob_deletion_paths(self, plan: BlobDeletionPlan) -> tuple[Path, Path, Path]:
+        """Resolve the only three filesystem names one ledger may mutate."""
+        storage = Path(plan.storage_path)
+        expected_parent = self._blob_dir(str(plan.session_id))
+        if storage.parent != expected_parent or not storage.name.startswith(f"{plan.blob_id}_"):
+            raise AuditIntegrityError("blob deletion storage path escapes exact session custody")
+        operation_token = _blob_operation_path_token(
+            operation_id=plan.operation_id,
+            operation_epoch=plan.operation_epoch,
+            operation_kind=plan.operation_kind,
+        )
+        tombstone = storage.with_name(f".{plan.blob_id}.delete-{operation_token}")
+        if Path(plan.tombstone_path) != tombstone:
+            raise AuditIntegrityError("blob deletion tombstone is not the exact operation-qualified path")
+        temp = storage.with_name(f".{plan.blob_id}.{operation_token}.custody.tmp")
+        return storage, tombstone, temp
+
+    @staticmethod
+    def _read_deletion_content(path: Path, *, directory_fd: int) -> bytes | None:
+        if not _regular_custody_file_exists(path, directory_fd=directory_fd):
+            return None
+        descriptor = os.open(path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+        with os.fdopen(descriptor, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise AuditIntegrityError("blob deletion artifact changed to a nonregular file")
+            return source.read()
+
+    def _observe_blob_deletion_content(self, record: BlobRecord) -> tuple[bool, int | None, str | None]:
+        """Observe the direct driver's deliberate absent-file evidence safely."""
+        storage = Path(record.storage_path)
+        if storage != self._storage_path(str(record.session_id), str(record.id), record.filename):
+            raise AuditIntegrityError("blob deletion storage escaped exact custody")
+        with _inline_custody_directory_fds(storage, session_id=str(record.session_id), create=False) as descriptors:
+            data = None if descriptors is None else self._read_deletion_content(storage, directory_fd=descriptors[1])
+            if descriptors is not None:
+                self._require_stable_deletion_directory(storage, descriptors)
+        if data is None:
+            return False, None, None
+        digest = content_hash(data)
+        if record.size_bytes != len(data):
+            raise AuditIntegrityError("blob deletion bytes disagree with recorded size")
+        if record.content_hash is not None and not hmac.compare_digest(record.content_hash, digest):
+            raise BlobIntegrityError(str(record.id), expected=record.content_hash, actual=digest)
+        return True, len(data), digest
+
+    @staticmethod
+    def _require_stable_deletion_directory(storage: Path, descriptors: tuple[int, int]) -> None:
+        _require_stable_custody_root(storage.parent.parent, descriptors[0])
+        _require_stable_custody_session(
+            descriptors[0], session_name=storage.parent.name, descriptor=descriptors[1], session_dir=storage.parent
+        )
+
+    def _require_blob_deletion_recovery_content(self, plan: BlobDeletionPlan | BlobAtomicDeletionObligation) -> None:
+        """Validate interrupted evidence without staging, restoring or purging."""
+        paths: tuple[Path, ...]
+        if isinstance(plan, BlobAtomicDeletionObligation):
+            stage = _validated_atomic_blob_deletion_paths(plan, data_dir=self._data_dir)
+            storage, tombstone = stage.storage, stage.tombstone
+            paths = (storage,) if tombstone is None else (storage, tombstone)
+        else:
+            storage, tombstone, temporary = self._validated_blob_deletion_paths(plan)
+            paths = (storage, tombstone, temporary, storage.with_name(f".{storage.name}.custody.tmp"))
+        with _inline_custody_directory_fds(storage, session_id=str(plan.session_id), create=False) as descriptors:
+            observed = tuple(
+                False if descriptors is None else _regular_custody_file_exists(path, directory_fd=descriptors[1]) for path in paths
+            )
+            canonical_present = observed[0]
+            tombstone_present = tombstone is not None and len(observed) > 1 and observed[1]
+            if isinstance(plan, BlobAtomicDeletionObligation):
+                if canonical_present:
+                    raise AuditIntegrityError("committed atomic deletion unexpectedly retained canonical bytes")
+                if descriptors is not None:
+                    self._require_stable_deletion_directory(storage, descriptors)
+                return
+            if plan.phase == "purge_pending":
+                if canonical_present:
+                    raise AuditIntegrityError("committed blob deletion unexpectedly retained canonical bytes")
+            else:
+                self._require_uncommitted_deletion_presence(plan, canonical_present=canonical_present, tombstone_present=tombstone_present)
+            if descriptors is not None:
+                for path, present in ((storage, canonical_present), (tombstone, tombstone_present)):
+                    if path is not None and present:
+                        data = self._read_deletion_content(path, directory_fd=descriptors[1])
+                        if data is None:
+                            raise AuditIntegrityError(f"blob deletion expected exact bytes at {path}")
+                        self._require_deletion_content_evidence(data, plan)
+                self._require_stable_deletion_directory(storage, descriptors)
+
+    @staticmethod
+    def _require_uncommitted_deletion_presence(plan: BlobDeletionPlan, *, canonical_present: bool, tombstone_present: bool) -> None:
+        if plan.expected_file_present:
+            if canonical_present and tombstone_present:
+                raise AuditIntegrityError(
+                    "blob deletion found both canonical and tombstone bytes"
+                    if plan.phase == "intent"
+                    else "staged blob deletion has ambiguous filesystem state"
+                )
+            if not canonical_present and not tombstone_present:
+                raise AuditIntegrityError(
+                    "blob deletion lost both canonical and tombstone bytes"
+                    if plan.phase == "intent"
+                    else "staged blob deletion has ambiguous filesystem state"
+                )
+        elif canonical_present or tombstone_present:
+            raise AuditIntegrityError(
+                "blob deletion found bytes for an absent-file ledger"
+                if plan.phase == "intent"
+                else "staged absent-file deletion unexpectedly found bytes"
+            )
+
+    @staticmethod
+    def _require_deletion_content_evidence(data: bytes, plan: BlobDeletionPlan) -> None:
+        actual_hash = content_hash(data)
+        if (
+            plan.expected_file_size is None
+            or plan.expected_file_hash is None
+            or len(data) != plan.expected_file_size
+            or not hmac.compare_digest(actual_hash, plan.expected_file_hash)
+        ):
+            raise BlobIntegrityError(str(plan.blob_id), expected=plan.expected_file_hash or "<absent>", actual=actual_hash)
+
+    @staticmethod
+    def _require_exact_deletion_bytes(path: Path, plan: BlobDeletionPlan) -> None:
+        if not _regular_custody_file_exists(path):
+            raise AuditIntegrityError(f"blob deletion expected exact bytes at {path}")
+        data = path.read_bytes()
+        BlobServiceImpl._require_deletion_content_evidence(data, plan)
+
+    def _read_blob_deletion_plan(
+        self,
+        context: SessionOperationContext,
+        blob_id: UUID,
+    ) -> BlobDeletionPlan | None:
+        return self._session_operation_authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.read_blob_deletion(blob_id=blob_id),
+        )
+
+    def _observe_after_uncertain_deletion_mutation(
+        self,
+        *,
+        context: SessionOperationContext,
+        blob_id: UUID,
+        primary_exc: Exception,
+    ) -> BlobDeletionPlan | None:
+        """Re-read only if the same caller still owns current authority."""
+        try:
+            self._session_operation_authority.compare_and_swap(context)
+            return self._read_blob_deletion_plan(context, blob_id)
+        except Exception:
+            raise primary_exc from None
+
+    def _stage_blob_deletion_plan(
+        self,
+        *,
+        context: SessionOperationContext,
+        plan: BlobDeletionPlan,
+    ) -> BlobDeletionPlan:
+        storage, tombstone, _temp = self._validated_blob_deletion_paths(plan)
+        self._session_operation_authority.compare_and_swap(context)
+        try:
+            self._require_uncommitted_deletion_presence(plan, canonical_present=storage.exists(), tombstone_present=tombstone.exists())
+            if plan.expected_file_present:
+                if storage.exists():
+                    self._require_exact_deletion_bytes(storage, plan)
+                    self._session_operation_authority.compare_and_swap(context)
+                    os.replace(storage, tombstone)
+                    _fsync_parent_directory(storage.parent)
+                elif tombstone.exists():
+                    self._require_exact_deletion_bytes(tombstone, plan)
+            self._session_operation_authority.compare_and_swap(context)
+        except Exception as exc:
+            self._restore_and_abort_blob_deletion(
+                context=context,
+                plan=plan,
+                primary_exc=exc,
+            )
+        try:
+            return self._session_operation_authority.mutate(
+                context,
+                lambda transaction: transaction.blobs.mark_blob_deletion_staged(plan=plan),
+            )
+        except Exception as exc:
+            observed = self._observe_after_uncertain_deletion_mutation(
+                context=context,
+                blob_id=plan.blob_id,
+                primary_exc=exc,
+            )
+            if observed is not None and observed.phase in {"staged", "purge_pending"}:
+                return observed
+            if observed is not None and observed.phase == "intent":
+                self._restore_and_abort_blob_deletion(
+                    context=context,
+                    plan=observed,
+                    primary_exc=exc,
+                )
+            raise
+
+    def _restore_and_abort_blob_deletion(
+        self,
+        *,
+        context: SessionOperationContext,
+        plan: BlobDeletionPlan,
+        primary_exc: Exception,
+    ) -> Never:
+        """Restore a definite pre-commit failure and re-raise its original cause."""
+        from elspeth.web.coordination.contracts import SessionOperationFenceLost
+
+        storage, tombstone, _temp = self._validated_blob_deletion_paths(plan)
+        try:
+            self._session_operation_authority.compare_and_swap(context)
+        except (SessionOperationFenceLost, SQLAlchemyError):
+            raise primary_exc from None
+        try:
+            if tombstone.exists():
+                if storage.exists():
+                    raise AuditIntegrityError("cannot restore deletion tombstone over canonical bytes")
+                self._require_exact_deletion_bytes(tombstone, plan)
+                self._session_operation_authority.compare_and_swap(context)
+                os.replace(tombstone, storage)
+                _fsync_parent_directory(storage.parent)
+            self._session_operation_authority.compare_and_swap(context)
+            aborted = self._session_operation_authority.mutate(
+                context,
+                lambda transaction: transaction.blobs.abort_blob_deletion(plan=plan),
+            )
+            if not aborted and self._read_blob_deletion_plan(context, plan.blob_id) is not None:
+                raise AuditIntegrityError("blob deletion ledger changed before exact abort")
+        except Exception as recovery_exc:
+            primary_exc.add_note(
+                f"Deletion rollback failed: {type(recovery_exc).__name__}: {recovery_exc}. Exact ledger recovery remains required."
+            )
+            raise primary_exc from recovery_exc
+        raise primary_exc
+
+    def _commit_blob_deletion_plan(
+        self,
+        *,
+        context: SessionOperationContext,
+        plan: BlobDeletionPlan,
+        accepting_proposal_id: UUID | None = None,
+    ) -> BlobDeletionPlan:
+        storage, tombstone, _temp = self._validated_blob_deletion_paths(plan)
+        self._session_operation_authority.compare_and_swap(context)
+        self._require_uncommitted_deletion_presence(plan, canonical_present=storage.exists(), tombstone_present=tombstone.exists())
+        if plan.expected_file_present:
+            if storage.exists() and not tombstone.exists():
+                self._require_exact_deletion_bytes(storage, plan)
+                self._session_operation_authority.compare_and_swap(context)
+                os.replace(storage, tombstone)
+                _fsync_parent_directory(storage.parent)
+            self._require_exact_deletion_bytes(tombstone, plan)
+        self._session_operation_authority.compare_and_swap(context)
+        try:
+            return self._session_operation_authority.mutate(
+                context,
+                lambda transaction: transaction.blobs.commit_blob_deletion(
+                    plan=plan,
+                    accepting_proposal_id=accepting_proposal_id,
+                ),
+            )
+        except Exception as exc:
+            observed = self._observe_after_uncertain_deletion_mutation(
+                context=context,
+                blob_id=plan.blob_id,
+                primary_exc=exc,
+            )
+            if observed is not None and observed.phase == "purge_pending":
+                return observed
+            if observed is not None and observed.phase == "staged":
+                self._restore_and_abort_blob_deletion(
+                    context=context,
+                    plan=observed,
+                    primary_exc=exc,
+                )
+            raise
+
+    def _purge_blob_deletion_plan(
+        self,
+        *,
+        context: SessionOperationContext,
+        plan: BlobDeletionPlan,
+    ) -> None:
+        from elspeth.plugins.sinks._local_file_effects import local_file_storage_bytes
+
+        storage, tombstone, temp = self._validated_blob_deletion_paths(plan)
+        self._session_operation_authority.compare_and_swap(context)
+        if storage.exists() or storage.is_symlink():
+            raise AuditIntegrityError("committed blob deletion unexpectedly retained canonical bytes")
+        atomic_temp = storage.with_name(f".{storage.name}.custody.tmp")
+        temp_exists = _regular_custody_file_exists(temp)
+        atomic_temp_exists = _regular_custody_file_exists(atomic_temp)
+        if tombstone.exists():
+            self._require_exact_deletion_bytes(tombstone, plan)
+            self._session_operation_authority.compare_and_swap(context)
+            tombstone.unlink()
+        if temp_exists:
+            self._session_operation_authority.compare_and_swap(context)
+            temp.unlink()
+        if atomic_temp_exists:
+            self._session_operation_authority.compare_and_swap(context)
+            atomic_temp.unlink()
+        _fsync_parent_directory(storage.parent)
+        self._session_operation_authority.compare_and_swap(context)
+        remaining_output_storage_bytes = local_file_storage_bytes(storage)
+        try:
+            retired = self._session_operation_authority.mutate(
+                context,
+                lambda transaction: transaction.blobs.retire_blob_deletion(
+                    plan=plan, remaining_output_storage_bytes=remaining_output_storage_bytes
+                ),
+            )
+        except Exception as exc:
+            observed = self._observe_after_uncertain_deletion_mutation(
+                context=context,
+                blob_id=plan.blob_id,
+                primary_exc=exc,
+            )
+            if observed is None:
+                return
+            raise
+        if not retired:
+            observed = self._read_blob_deletion_plan(context, plan.blob_id)
+            if observed is not None:
+                raise AuditIntegrityError("blob deletion ledger changed before exact retirement")
+
+    def _delete_blob_with_ledger(
+        self,
+        *,
+        blob_id: UUID,
+        context: SessionOperationContext,
+        accepting_proposal_id: UUID | None = None,
+    ) -> None:
+        """Drive one idempotent deletion state machine without holding DB over FS."""
+        from elspeth.plugins.sinks._local_file_effects import local_file_storage_bytes
+        from elspeth.web.coordination.repository import SessionDerivedCustodyError
+
+        atomic = self._session_operation_authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.read_atomic_blob_deletion(blob_id=blob_id),
+        )
+        if atomic is not None:
+            stage = _atomic_blob_deletion_stage(atomic, data_dir=self._data_dir)
+            self._session_operation_authority.compare_and_swap(context)
+            _finalize_staged_blob_deletion(stage)
+            remaining_output_storage_bytes = local_file_storage_bytes(Path(atomic.storage_path))
+            # Retirement is fenced in its own transaction, not a raw write
+            # justified by an earlier compare-and-swap. A failed retirement
+            # retains durable evidence and is safe to retry after bytes vanish.
+            try:
+                self._session_operation_authority.mutate(
+                    context,
+                    lambda transaction: transaction.blobs.retire_atomic_blob_deletion(
+                        obligation=atomic, remaining_output_storage_bytes=remaining_output_storage_bytes
+                    ),
+                )
+            except (OSError, SQLAlchemyError) as exc:
+                try:
+                    # An exact idempotent retry either retires the still-present
+                    # obligation or proves ledger AND metadata already absent.
+                    # Lost custody cannot authorize this observation.
+                    self._session_operation_authority.mutate(
+                        context,
+                        lambda transaction: transaction.blobs.retire_atomic_blob_deletion(
+                            obligation=atomic, remaining_output_storage_bytes=remaining_output_storage_bytes
+                        ),
+                    )
+                except Exception as recovery_exc:
+                    exc.add_note(
+                        "Atomic blob deletion retirement outcome remains uncertain; "
+                        f"current-authority recovery failed ({type(recovery_exc).__name__}: {recovery_exc})."
+                    )
+                    raise exc from recovery_exc
+            return
+        plan = self._read_blob_deletion_plan(context, blob_id)
+        if plan is None:
+            try:
+                record = self._session_operation_authority.mutate(
+                    context,
+                    lambda transaction: transaction.blobs.read_blob(blob_id=blob_id),
+                )
+            except SessionDerivedCustodyError:
+                raise BlobNotFoundError(str(blob_id)) from None
+            if str(record.session_id) != context.fence.session_id:
+                raise AuditIntegrityError("fenced blob delete lost session custody")
+            expected_file_present, expected_file_size, expected_file_hash = self._observe_blob_deletion_content(record)
+            storage = Path(record.storage_path)
+            operation_token = _blob_operation_path_token(
+                operation_id=context.fence.operation_id,
+                operation_epoch=context.fence.operation_epoch,
+                operation_kind=context.operation_kind,
+            )
+            tombstone = storage.with_name(f".{blob_id}.delete-{operation_token}")
+            self._session_operation_authority.compare_and_swap(context)
+            try:
+                plan = self._session_operation_authority.mutate(
+                    context,
+                    lambda transaction: transaction.blobs.prepare_blob_deletion(
+                        blob_id=blob_id,
+                        tombstone_path=str(tombstone),
+                        blob_snapshot_hash=blob_record_snapshot_hash(record),
+                        expected_file_present=expected_file_present,
+                        expected_file_size=expected_file_size,
+                        expected_file_hash=expected_file_hash,
+                        accepting_proposal_id=accepting_proposal_id,
+                    ),
+                )
+            except Exception as exc:
+                observed = self._observe_after_uncertain_deletion_mutation(
+                    context=context,
+                    blob_id=blob_id,
+                    primary_exc=exc,
+                )
+                if observed is None:
+                    raise
+                plan = observed
+
+        if str(plan.session_id) != context.fence.session_id:
+            raise AuditIntegrityError("blob deletion ledger belongs to another session")
+        for _attempt in range(4):
+            if plan.phase == "intent":
+                plan = self._stage_blob_deletion_plan(context=context, plan=plan)
+                continue
+            if plan.phase == "staged":
+                plan = self._commit_blob_deletion_plan(context=context, plan=plan, accepting_proposal_id=accepting_proposal_id)
+                continue
+            if plan.phase == "purge_pending":
+                self._purge_blob_deletion_plan(context=context, plan=plan)
+                return
+            raise AuditIntegrityError("blob deletion ledger has an invalid phase")
+        raise AuditIntegrityError("blob deletion ledger did not converge")
+
+    async def delete_blob(
+        self,
+        blob_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> None:
+        """Delete one blob through its durable operation-qualified ledger."""
+        _require_blob_operation_context(session_operation_context, allowed_kinds=_DELETE_BLOB_OPERATION_KINDS)
+        if type(blob_id) is not UUID:
+            raise TypeError("blob_id must be an exact UUID")
+
+        def _sync() -> None:
+            with _blob_custody_session_lock(self._engine, session_operation_context.fence.session_id):
+                self._reconcile_blob_deletions_locked(session_operation_context, exclude_blob_id=blob_id)
+                self._delete_blob_with_ledger(
+                    blob_id=blob_id,
+                    context=session_operation_context,
+                )
+
+        await self._run_sync(_sync)
+
+    @contextmanager
+    def _locked_blob_row_for_read(self, blob_id_str: str, context: SessionOperationContext) -> Iterator[BlobRecord]:
+        """Yield one blob row observed under its session custody lock.
+
+        Blob mutation swaps/tombstones the storage file while holding the
+        blob-custody lock across its separate metadata transactions. A reader
+        must take that lock before the session transaction so reconciliation
+        cannot mistake an active writer's staged bytes for crash leftovers.
+        A reader that fetches the row and the
+        bytes without entering the same-session lock can pair one version's
+        metadata with another version's bytes — escalating a false-positive
+        ``BlobIntegrityError`` (or ``BlobContentMissingError``) for a blob
+        that was never corrupted (elspeth-3d1d1fcb6c).  Every content read
+        MUST perform its file I/O and hash verification inside this context.
+
+        Exact-context metadata reads bracket the filesystem phase. Neither
+        metadata transaction retains SESSIONS while bytes are inspected.
+        """
+        with _blob_custody_session_lock(self._engine, context.fence.session_id):
+            self._reconcile_blob_deletions_locked(context)
+            row = self._fenced_blob_record(UUID(blob_id_str), context)
+            # Crash leftovers (pre-update sidecar / delete tombstone) heal
+            # to the committed version before any caller touches the file.
+            reconcile_blob_storage_versions(
+                Path(row.storage_path),
+                expected_hash=row.content_hash,
+                write_guard=lambda: self._session_operation_authority.compare_and_swap(context),
+            )
+            yield row
+            after = self._fenced_blob_record(UUID(blob_id_str), context)
+            if after != row:
+                raise AuditIntegrityError("blob metadata changed during fenced content read")
+
+    async def read_blob_content(
+        self,
+        blob_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> bytes:
+        """Read the raw content of a blob under a read-capable fence.
+
+        Enforces three invariants before returning bytes:
+
+        1. **Fence and custody**: the exact context is compare-and-swapped
+           and the blob must be in the fence's session custody — before any
+           byte is read, and again after, so the metadata the bytes were
+           verified against is the metadata the caller's fence still sees.
+           A stale fence raises ``SessionOperationFenceLost`` and touches
+           neither the row nor the file.
+
+        2. **Lifecycle guard**: only ``ready`` blobs are readable.
+           Pending blobs have no finalized content; error blobs
+           represent failed runs whose output is not trustworthy.
+
+        3. **Integrity verification**: a ready blob must still have a
+           backing file on disk, and its bytes must match the stored
+           ``content_hash``. Missing bytes or hash mismatch indicate
+           filesystem corruption, silent data loss, tampering, or a
+           write-path bug — all Tier 1 anomalies.
+
+        Guards 2 and 3 evaluate inside the same-session custody lock
+        (``_locked_blob_row_for_read``) so the row and the bytes are one
+        version with respect to concurrent update/delete. The short authority
+        reads run inside BLOB_CUSTODY; the separate SESSIONS lock is released
+        before filesystem work starts.
+        """
+        _record, data = await self._run_sync(lambda: self.read_blob_content_sync(blob_id, session_operation_context))
+        return data
+
+    def read_blob_content_sync(self, blob_id: UUID, context: SessionOperationContext) -> tuple[BlobRecord, bytes]:
+        """Return one verified metadata/content version under the exact fence."""
+        _require_blob_operation_context(context, allowed_kinds=_READ_BLOB_OPERATION_KINDS)
+        blob_id_str = str(blob_id)
+        with self._locked_blob_row_for_read(blob_id_str, context) as record:
+            if record.status != "ready":
+                raise BlobStateError(
+                    blob_id_str,
+                    message=f"Cannot read blob {blob_id_str} — status is '{record.status}', expected 'ready'",
+                )
+            storage = Path(record.storage_path)
+            if not storage.exists():
+                raise BlobContentMissingError(blob_id_str, storage_path=record.storage_path)
+            data = self._read_bytes_or_missing(storage, blob_id_str=blob_id_str, storage_path=record.storage_path)
+            if record.content_hash is None:
+                raise AuditIntegrityError(f"Tier 1: ready blob {blob_id_str} has NULL content_hash — DB integrity anomaly, cannot verify")
+            actual = content_hash(data)
+            if not hmac.compare_digest(actual, record.content_hash):
+                raise BlobIntegrityError(blob_id_str, expected=record.content_hash, actual=actual)
+        return record, data
+
+    async def read_blob_content_prefix_verified(
+        self,
+        blob_id: UUID,
+        *,
+        prefix_bytes: int,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[bytes, str, int]:
+        """Stream a ready blob, verifying its full content hash incrementally.
+
+        Mirrors ``read_blob_content``'s fence, lifecycle and integrity guards
+        exactly (same fence bracket, same status check, same missing-file
+        check, same NULL-hash guard, same hash-mismatch guard) but never
+        holds the full blob in memory: bytes are read and fed into one
+        incremental sha256 digest in ``_STREAM_CHUNK_BYTES``-sized chunks,
+        and only the first ``prefix_bytes`` of those bytes are retained.
+        Memory use is bounded by chunk size + ``prefix_bytes`` regardless of
+        the blob's total size — this is what lets a bounded preview (e.g.
+        source inspection's 8 KiB peek) verify a full-content hash without
+        materializing a 100 MiB upload to do it.
+        """
+        _require_blob_operation_context(session_operation_context, allowed_kinds=_READ_BLOB_OPERATION_KINDS)
+        if prefix_bytes < 1:
+            raise ValueError("prefix_bytes must be >= 1")
+        blob_id_str = str(blob_id)
+
+        def _sync() -> tuple[bytes, str, int]:
+            with self._locked_blob_row_for_read(blob_id_str, session_operation_context) as row:
+                # Lifecycle guard — only ready blobs have finalized content
+                if row.status != "ready":
+                    raise BlobStateError(
+                        blob_id_str,
+                        message=f"Cannot read blob {blob_id_str} — status is '{row.status}', expected 'ready'",
+                    )
+
+                storage = Path(row.storage_path)
+                if not storage.exists():
+                    raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path)
+
+                # Integrity verification — Tier 1: our data must be pristine.
+                # A ready blob must always have a content_hash — it is set
+                # by create_blob() and required by the authority facet's
+                # mark_run_output_blob_ready when transitioning to ready.
+                # NULL here is a DB anomaly.
+                if row.content_hash is None:
+                    raise AuditIntegrityError(
+                        f"Tier 1: ready blob {blob_id_str} has NULL content_hash — DB integrity anomaly, cannot verify"
+                    )
+
+                digest = hashlib.sha256()
+                prefix = bytearray()
+                total_bytes = 0
+                try:
+                    with storage.open("rb") as handle:
+                        while True:
+                            chunk = handle.read(_STREAM_CHUNK_BYTES)
+                            if not chunk:
+                                break
+                            digest.update(chunk)
+                            total_bytes += len(chunk)
+                            if len(prefix) < prefix_bytes:
+                                prefix.extend(chunk[: prefix_bytes - len(prefix)])
+                except OSError as exc:
+                    # Raced deletion between the existence guard and the open
+                    # (ENOENT), or a sibling replica's delete revoking the
+                    # inode under the open handle on NFS (ESTALE): typed as
+                    # missing content; any other errno propagates
+                    # (elspeth-632373963d).
+                    if exc.errno in _RACED_DELETION_ERRNOS:
+                        raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path) from None
+                    raise
+
+                actual = digest.hexdigest()
+                if not hmac.compare_digest(actual, row.content_hash):
+                    raise BlobIntegrityError(blob_id_str, expected=row.content_hash, actual=actual)
+
+            return bytes(prefix[:prefix_bytes]), actual, total_bytes
+
+        return await self._run_sync(_sync)
+
+    async def read_blob_preview(
+        self,
+        blob_id: UUID,
+        *,
+        limit_bytes: int,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[bytes, bool]:
+        """Read a bounded prefix of a ready blob for inline UI preview.
+
+        This shares the full-content fence bracket and lifecycle/missing-file
+        guards but does not verify the full SHA-256 digest, because doing so
+        would require reading the whole blob and defeat the preview
+        endpoint's resource cap.
+        """
+        _require_blob_operation_context(session_operation_context, allowed_kinds=_READ_BLOB_OPERATION_KINDS)
+        if limit_bytes < 1:
+            raise ValueError("limit_bytes must be >= 1")
+
+        blob_id_str = str(blob_id)
+
+        def _sync() -> tuple[bytes, bool]:
+            with self._locked_blob_row_for_read(blob_id_str, session_operation_context) as row:
+                if row.status != "ready":
+                    raise BlobStateError(
+                        blob_id_str,
+                        message=f"Cannot preview blob {blob_id_str} — status is '{row.status}', expected 'ready'",
+                    )
+
+                storage = Path(row.storage_path)
+                if not storage.exists():
+                    raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path)
+
+                try:
+                    with storage.open("rb") as handle:
+                        data = handle.read(limit_bytes + 1)
+                except OSError as exc:
+                    # Raced deletion (ENOENT) or a sibling replica's delete
+                    # revoking the inode under the open handle on NFS
+                    # (ESTALE): typed as missing content; any other errno
+                    # propagates (elspeth-632373963d).
+                    if exc.errno in _RACED_DELETION_ERRNOS:
+                        raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path) from None
+                    raise
+            return data[:limit_bytes], len(data) > limit_bytes
+
+        return await self._run_sync(_sync)
+
+    async def link_blob_to_run(
+        self,
+        blob_id: UUID,
+        run_id: UUID,
+        direction: BlobRunLinkDirection,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> None:
+        """Record a blob-to-run linkage under the run's EXECUTE fence.
+
+        One authority mutation: the fence is compare-and-swapped inside it,
+        the blob must be in the custody of the fence's session (a foreign
+        blob links like a missing one), and the run must be too — a run
+        outside the session is a caller bug, named as such. The link itself
+        is the facet's ``insert_blob_run_link``, idempotent per direction.
+        """
+        _require_blob_operation_context(session_operation_context, allowed_kinds=_EXECUTE_BLOB_OPERATION_KINDS)
+        fence_session_id = session_operation_context.fence.session_id
+        if direction not in BLOB_RUN_LINK_DIRECTIONS:
+            raise RuntimeError(f"Invalid link direction '{direction}' — must be one of {sorted(BLOB_RUN_LINK_DIRECTIONS)}")
+
+        def _sync() -> None:
+            # Local import: coordination.repository imports the blob contracts
+            # at module scope (see _fenced_blob_record).
+            from elspeth.web.coordination.repository import SessionDerivedCustodyError
+
+            def _link(transaction: SessionOperationMutationTransaction) -> None:
+                try:
+                    transaction.blobs.read_blob(blob_id=blob_id)
+                except SessionDerivedCustodyError:
+                    # Custody is decided inside the fenced transaction: a blob
+                    # outside the fence's session links exactly like a missing one.
+                    raise BlobNotFoundError(str(blob_id)) from None
+                try:
+                    transaction.blobs.insert_blob_run_link(blob_id=blob_id, run_id=run_id, direction=direction)
+                except SessionDerivedCustodyError:
+                    # The blob was just read under this fence, so this refusal
+                    # names the run: a run outside the session is a contract
+                    # violation by the caller, never user input.
+                    raise RuntimeError(
+                        f"BlobServiceImpl.link_blob_to_run: run_id={str(run_id)!r} is not in the custody of "
+                        f"session {fence_session_id!r} — cross-session reference is a contract violation"
+                    ) from None
+
+            self._session_operation_authority.mutate(session_operation_context, _link)
+
+        await self._run_sync(_sync)
+
+    async def get_blob_run_links(
+        self,
+        blob_id: UUID,
+    ) -> list[BlobRunLinkRecord]:
+        """Get all run links for a blob."""
+        blob_id_str = str(blob_id)
+
+        def _sync() -> list[BlobRunLinkRecord]:
+            with self._engine.connect() as conn:
+                rows = conn.execute(select(blob_run_links_table).where(blob_run_links_table.c.blob_id == blob_id_str)).fetchall()
+                return [self._row_to_link_record(r) for r in rows]
+
+        return await self._run_sync(_sync)
+
+    @contextmanager
+    def run_output_write_admission(
+        self,
+        run_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> Iterator[None]:
+        """Bind physical output writes to durable capacity under the run fence.
+
+        Directory binding reaches sink worker threads without relying on
+        implicit context propagation. Existing reservations survive process
+        death; fresh-process recovery measures the retained target and staging
+        files before allowing another byte.
+        """
+        from elspeth.plugins.sinks._local_file_effects import local_file_storage_admission
+        from elspeth.web.paths import allowed_sink_directories
+
+        _require_blob_operation_context(session_operation_context, allowed_kinds=frozenset({SessionOperationKind.EXECUTE}))
+        context = session_operation_context
+        roots = allowed_sink_directories(str(self._data_dir), session_id=context.fence.session_id)
+
+        def _admit(target: Path, size_bytes: int) -> None:
+            canonical = target.resolve(strict=False)
+            if canonical != target or not any(canonical.is_relative_to(root) for root in roots):
+                raise AuditIntegrityError("output storage target escaped session custody")
+            self._session_operation_authority.mutate(
+                context,
+                lambda transaction: transaction.blobs.reserve_run_output_storage(
+                    run_id=run_id,
+                    target_path=str(canonical),
+                    size_bytes=size_bytes,
+                    max_storage_per_session=self._max_storage_per_session,
+                ),
+            )
+
+        with local_file_storage_admission(roots, _admit):
+            self._reconcile_run_output_storage(run_id, context=context)
+            try:
+                yield
+            finally:
+                self._reconcile_run_output_storage(run_id, context=context)
+
+    def _reconcile_run_output_storage(self, run_id: UUID, *, context: SessionOperationContext) -> None:
+        from elspeth.plugins.sinks._local_file_effects import local_file_storage_bytes
+        from elspeth.web.paths import allowed_sink_directories
+
+        roots = allowed_sink_directories(str(self._data_dir), session_id=context.fence.session_id)
+        paths = self._session_operation_authority.mutate(
+            context, lambda transaction: transaction.blobs.list_run_output_storage_paths(run_id=run_id)
+        )
+
+        def _record(transaction: SessionOperationMutationTransaction, *, target: Path, size_bytes: int) -> None:
+            transaction.blobs.reconcile_run_output_storage(
+                run_id=run_id,
+                target_path=str(target),
+                size_bytes=size_bytes,
+                max_storage_per_session=self._max_storage_per_session,
+            )
+
+        for path in paths:
+            target = Path(path)
+            if target.resolve(strict=False) != target or not any(target.is_relative_to(root) for root in roots):
+                raise AuditIntegrityError("output storage reconciliation escaped session custody")
+            size_bytes = local_file_storage_bytes(target)
+
+            self._session_operation_authority.mutate(context, partial(_record, target=target, size_bytes=size_bytes))
+
+    async def finalize_run_output_blobs(
+        self,
+        run_id: UUID,
+        success: bool,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> BlobFinalizationResult:
+        """Finalize pending output blobs for a completed/failed run.
+
+        On success: compute content_hash and size_bytes from the backing
+        file, set status to 'ready'. If the file wasn't written, mark
+        as 'error'.
+        On failure: delete the backing file (if any) and set status to
+        'error', leaving size/hash as None.  This ensures the filesystem
+        matches the DB metadata and prevents orphaned files from escaping
+        quota accounting.
+
+        Processes each blob independently — a per-blob operational error
+        does not abort finalization of remaining blobs.  Failed blobs are
+        transitioned to ``error`` status on a best-effort basis.
+
+        Returns a BlobFinalizationResult with both successfully finalized
+        blobs and per-blob error records.
+
+        Runs under the run's EXECUTE fence: the fence is compare-and-swapped
+        first and the run must be in the custody of the fence's session.
+        Every per-blob write is one authority mutation
+        (``mark_run_output_blob_ready`` / ``mark_run_output_blob_error``): the
+        facet binds a reservation to the EXECUTE operation that made it, so
+        an output another operation reserved is a Tier-1 anomaly
+        (``AuditIntegrityError``, which aborts the batch) rather than a row
+        finalized out from under that operation.
+        """
+        _require_blob_operation_context(session_operation_context, allowed_kinds=_EXECUTE_BLOB_OPERATION_KINDS)
+        if type(success) is not bool:
+            raise TypeError("success must be an exact bool")
+
+        def _sync() -> BlobFinalizationResult:
+            with _blob_custody_session_lock(self._engine, session_operation_context.fence.session_id):
+                records = self._session_operation_authority.mutate(
+                    session_operation_context,
+                    lambda transaction: transaction.blobs.list_pending_run_output_blobs(run_id=run_id),
+                )
+                output_records = self._session_operation_authority.mutate(
+                    session_operation_context,
+                    lambda transaction: transaction.blobs.list_run_output_blobs(run_id=run_id),
+                )
+                for output_record in output_records:
+                    if success or output_record.status != "pending":
+                        self._reconcile_output_blob_tombstone(
+                            output_record,
+                            session_operation_context=session_operation_context,
+                        )
+                finalized: list[BlobRecord] = []
+                errors: list[BlobFinalizationError] = []
+                for record in records:
+                    outcome = self._finalize_one_output_blob(
+                        run_id,
+                        record.id,
+                        Path(record.storage_path),
+                        success=success,
+                        session_operation_context=session_operation_context,
+                    )
+                    if isinstance(outcome, BlobRecord):
+                        finalized.append(outcome)
+                    else:
+                        errors.extend(outcome)
+                self._reconcile_run_output_storage(run_id, context=session_operation_context)
+                return BlobFinalizationResult(finalized=finalized, errors=errors)
+
+        return await self._run_sync(_sync)
+
+    def _validated_output_blob_tombstones(
+        self,
+        *,
+        blob_id: UUID,
+        storage: Path,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[Path, ...]:
+        """Return structurally valid operation-qualified output tombstones."""
+        expected_parent = self._blob_dir(session_operation_context.fence.session_id)
+        if storage.parent != expected_parent or not storage.name.startswith(f"{blob_id}_"):
+            raise AuditIntegrityError("output blob storage escaped exact session custody")
+        tombstones = tuple(storage.parent.glob(f".{blob_id}.output-delete-*"))
+        tombstone_prefix = f".{blob_id}.output-delete-"
+        for tombstone in tombstones:
+            operation_token = tombstone.name.removeprefix(tombstone_prefix)
+            tombstone_stat = tombstone.lstat()
+            if not _LOWERCASE_SHA256.fullmatch(operation_token) or not stat.S_ISREG(tombstone_stat.st_mode):
+                raise AuditIntegrityError("output cleanup found a malformed operation tombstone")
+        return tombstones
+
+    def _reconcile_output_blob_tombstone(
+        self,
+        record: BlobRecord,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> None:
+        """Settle an exact output tombstone left by a crashed finalizer."""
+        storage = Path(record.storage_path)
+        tombstones = self._validated_output_blob_tombstones(
+            blob_id=record.id,
+            storage=storage,
+            session_operation_context=session_operation_context,
+        )
+        if not tombstones:
+            return
+        if len(tombstones) != 1:
+            raise AuditIntegrityError("output cleanup found multiple operation tombstones")
+        tombstone = tombstones[0]
+        if storage.exists():
+            raise AuditIntegrityError("output cleanup found canonical and operation tombstone bytes")
+
+        self._session_operation_authority.compare_and_swap(session_operation_context)
+        if record.status == "pending":
+            os.replace(tombstone, storage)
+        elif record.status == "error":
+            tombstone.unlink()
+        elif record.status == "ready":
+            data = tombstone.read_bytes()
+            actual_hash = content_hash(data)
+            if record.size_bytes != len(data) or record.content_hash is None or not hmac.compare_digest(actual_hash, record.content_hash):
+                raise BlobIntegrityError(
+                    str(record.id),
+                    expected=record.content_hash or "<missing>",
+                    actual=actual_hash,
+                )
+            self._session_operation_authority.compare_and_swap(session_operation_context)
+            os.replace(tombstone, storage)
+        else:
+            raise AuditIntegrityError("output cleanup found an unknown blob status")
+        _fsync_parent_directory(storage.parent)
+        self._session_operation_authority.compare_and_swap(session_operation_context)
+
+    def _finalize_one_output_blob(
+        self,
+        run_id: UUID,
+        blob_id: UUID,
+        storage: Path,
+        *,
+        success: bool,
+        session_operation_context: SessionOperationContext,
+    ) -> BlobRecord | list[BlobFinalizationError]:
+        """Finalize a single output blob, returning an explicit per-blob outcome.
+
+        This is the per-item boundary for ``finalize_run_output_blobs``.
+        Filesystem and database faults are genuine I/O boundaries (Tier 3 in
+        the web-component sense — the disk and DB are external to our authored
+        values).  Rather than swallow such a fault, this method **returns** an
+        explicit list of :class:`BlobFinalizationError` records so the batch
+        caller can record them in ``BlobFinalizationResult.errors`` and proceed
+        to the next blob.  The suppressed set is exact: the facet's typed
+        custody refusal ``SessionDerivedCustodyError`` (the row is gone, or is
+        not an output of this run in the fence's session) and
+        ``BlobStateError`` (already finalized) are recorded as the whole
+        outcome — there is nothing left to transition; ``OSError`` and
+        ``SQLAlchemyError`` are recorded and followed by one best-effort
+        ``error`` mark.  Programmer bugs (TypeError, AttributeError,
+        AssertionError), any other RuntimeError, and the facet's
+        ``AuditIntegrityError`` for a row another EXECUTE operation reserved
+        all propagate.
+        """
+        # Local import: coordination.repository imports the blob contracts at
+        # module scope (see _fenced_blob_record).
+        from elspeth.web.coordination.repository import SessionDerivedCustodyError
+
+        blob_errors: list[BlobFinalizationError] = []
+        try:
+            if success:
+                if storage.exists():
+                    self._session_operation_authority.compare_and_swap(session_operation_context)
+                    file_bytes = storage.read_bytes()
+                    self._session_operation_authority.compare_and_swap(session_operation_context)
+                    try:
+                        record = self._mark_run_output_ready(
+                            session_operation_context,
+                            run_id=run_id,
+                            blob_id=blob_id,
+                            size_bytes=len(file_bytes),
+                            content_hash_val=content_hash(file_bytes),
+                        )
+                    except (BlobQuotaExceededError, StorageAccountingUnavailableError) as exc:
+                        blob_errors.append(BlobFinalizationError(blob_id=blob_id, exc_type=type(exc).__name__, detail=str(exc)))
+                        # A bound was exceeded or accounting could not be
+                        # measured. Keep the run output out of ready state.
+                        # Delete the backing file to prevent untracked
+                        # disk growth from repeated over-quota outputs.
+                        self._mark_output_blob_error_and_remove_bytes(
+                            run_id=run_id,
+                            blob_id=blob_id,
+                            storage=storage,
+                            session_operation_context=session_operation_context,
+                        )
+                        return blob_errors
+                else:
+                    record = self._mark_run_output_error(
+                        session_operation_context,
+                        run_id=run_id,
+                        blob_id=blob_id,
+                    )
+            else:
+                # Run failed — delete the backing file so the
+                # filesystem matches the DB metadata (size_bytes=0,
+                # content_hash=None).  Without this, repeated
+                # failed runs can grow disk usage without bound
+                # while quota accounting sees only zero-byte
+                # error rows.
+                record = self._mark_output_blob_error_and_remove_bytes(
+                    run_id=run_id,
+                    blob_id=blob_id,
+                    storage=storage,
+                    session_operation_context=session_operation_context,
+                )
+            return record
+        except (SessionDerivedCustodyError, BlobStateError) as exc:
+            # The row is gone, is not this run's output, or is already
+            # finalized: there is nothing left to transition, so the facet's
+            # refusal is the whole per-blob outcome.
+            blob_errors.append(BlobFinalizationError(blob_id=blob_id, exc_type=type(exc).__name__, detail=str(exc)))
+            return blob_errors
+        except (OSError, SQLAlchemyError) as exc:
+            # Best-effort: transition the failed blob to "error" so it does
+            # not remain permanently pending.  Return explicit error records
+            # (never a silent swallow) describing the primary fault and any
+            # recovery fault, so the batch caller surfaces both to auditors.
+            blob_errors.append(
+                BlobFinalizationError(
+                    blob_id=blob_id,
+                    exc_type=type(exc).__name__,
+                    detail=str(exc),
+                )
+            )
+            try:
+                self._mark_output_blob_error_and_remove_bytes(
+                    run_id=run_id,
+                    blob_id=blob_id,
+                    storage=storage,
+                    session_operation_context=session_operation_context,
+                )
+            except (OSError, SQLAlchemyError, BlobStateError) as staged_recovery_exc:
+                blob_errors.append(
+                    BlobFinalizationError(
+                        blob_id=blob_id,
+                        exc_type=f"RecoveryFailed[{type(staged_recovery_exc).__name__}]",
+                        detail=str(staged_recovery_exc),
+                    )
+                )
+            return blob_errors
+
+    def _mark_run_output_ready(
+        self,
+        context: SessionOperationContext,
+        *,
+        run_id: UUID,
+        blob_id: UUID,
+        size_bytes: int,
+        content_hash_val: str,
+    ) -> BlobRecord:
+        """Publish ready metadata through the exact EXECUTE reservation facet."""
+        return self._session_operation_authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.mark_run_output_blob_ready(
+                run_id=run_id,
+                blob_id=blob_id,
+                size_bytes=size_bytes,
+                content_hash=content_hash_val,
+                max_storage_per_session=self._max_storage_per_session,
+            ),
+        )
+
+    def _mark_run_output_error(
+        self,
+        context: SessionOperationContext,
+        *,
+        run_id: UUID,
+        blob_id: UUID,
+    ) -> BlobRecord:
+        """Publish error metadata through the exact EXECUTE reservation facet."""
+        return self._session_operation_authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.mark_run_output_blob_error(run_id=run_id, blob_id=blob_id),
+        )
+
+    def _mark_output_blob_error_and_remove_bytes(
+        self,
+        *,
+        run_id: UUID,
+        blob_id: UUID,
+        storage: Path,
+        session_operation_context: SessionOperationContext,
+    ) -> BlobRecord:
+        return self._stage_output_blob_error_and_remove_bytes(
+            blob_id=blob_id,
+            storage=storage,
+            session_operation_context=session_operation_context,
+            commit_error=lambda: self._mark_run_output_error(
+                session_operation_context,
+                run_id=run_id,
+                blob_id=blob_id,
+            ),
+        )
+
+    def _stage_output_blob_error_and_remove_bytes(
+        self,
+        *,
+        blob_id: UUID,
+        storage: Path,
+        session_operation_context: SessionOperationContext,
+        commit_error: Callable[[], BlobRecord],
+    ) -> BlobRecord:
+        """Stage exact output bytes, commit error metadata, then purge bytes."""
+        if not callable(commit_error):
+            raise TypeError("commit_error must be callable")
+        tombstones = self._validated_output_blob_tombstones(
+            blob_id=blob_id,
+            storage=storage,
+            session_operation_context=session_operation_context,
+        )
+        if len(tombstones) > 1:
+            raise AuditIntegrityError("output cleanup found multiple operation tombstones")
+        if tombstones and storage.exists():
+            raise AuditIntegrityError("output cleanup found canonical and operation tombstone bytes")
+        operation_token = _blob_operation_path_token(
+            operation_id=session_operation_context.fence.operation_id,
+            operation_epoch=session_operation_context.fence.operation_epoch,
+            operation_kind=session_operation_context.operation_kind,
+        )
+        tombstone = tombstones[0] if tombstones else storage.with_name(f".{blob_id}.output-delete-{operation_token}")
+        self._session_operation_authority.compare_and_swap(session_operation_context)
+        staged = bool(tombstones)
+        if storage.exists():
+            if tombstone.exists():
+                raise AuditIntegrityError("output cleanup found canonical and operation tombstone bytes")
+            os.replace(storage, tombstone)
+            _fsync_parent_directory(storage.parent)
+            staged = True
+        self._session_operation_authority.compare_and_swap(session_operation_context)
+        try:
+            record = commit_error()
+        except BaseException:
+            if staged:
+                with self._engine.connect() as conn:
+                    observed = conn.execute(
+                        select(
+                            blobs_table.c.status,
+                            blobs_table.c.size_bytes,
+                            blobs_table.c.content_hash,
+                        ).where(
+                            blobs_table.c.id == str(blob_id),
+                            blobs_table.c.session_id == session_operation_context.fence.session_id,
+                        )
+                    ).one_or_none()
+                observed_status = None if observed is None else observed.status
+                if observed_status == "pending":
+                    if storage.exists() or not tombstone.exists():
+                        raise AuditIntegrityError("output cleanup could not restore exact staged bytes") from None
+                    self._session_operation_authority.compare_and_swap(session_operation_context)
+                    os.replace(tombstone, storage)
+                    _fsync_parent_directory(storage.parent)
+                elif observed_status == "error":
+                    self._session_operation_authority.compare_and_swap(session_operation_context)
+                    tombstone.unlink(missing_ok=True)
+                    _fsync_parent_directory(storage.parent)
+                elif observed_status == "ready":
+                    if storage.exists() or not tombstone.exists():
+                        raise AuditIntegrityError("ready output cleanup could not restore exact staged bytes") from None
+                    data = tombstone.read_bytes()
+                    actual_hash = content_hash(data)
+                    if (
+                        observed is None
+                        or observed.size_bytes != len(data)
+                        or observed.content_hash is None
+                        or not hmac.compare_digest(actual_hash, observed.content_hash)
+                    ):
+                        raise BlobIntegrityError(
+                            str(blob_id),
+                            expected="<missing>" if observed is None else (observed.content_hash or "<missing>"),
+                            actual=actual_hash,
+                        ) from None
+                    self._session_operation_authority.compare_and_swap(session_operation_context)
+                    os.replace(tombstone, storage)
+                    _fsync_parent_directory(storage.parent)
+                else:
+                    raise AuditIntegrityError("output cleanup could not classify failed metadata commit") from None
+            raise
+        if staged:
+            self._session_operation_authority.compare_and_swap(session_operation_context)
+            tombstone.unlink()
+            _fsync_parent_directory(storage.parent)
+        return record
+
+    async def copy_blobs_for_fork(
+        self,
+        source_session_id: UUID,
+        target_session_id: UUID,
+        plan: tuple[BlobForkPlanEntry, ...],
+        write_fence: BlobForkWriteFence,
+        *,
+        checkpoint: Callable[[], Awaitable[None]],
+    ) -> dict[UUID, BlobRecord]:
+        """Idempotently copy exactly one staged fork's frozen blob plan."""
+        source_session_id_str, target_session_id_str = _validated_fork_session_ids(
+            source_session_id,
+            target_session_id,
+        )
+        if type(plan) is not tuple or any(type(entry) is not BlobForkPlanEntry for entry in plan):
+            raise TypeError("copy_blobs_for_fork plan must be an exact BlobForkPlanEntry tuple")
+        if type(write_fence) is not BlobForkWriteFence:
+            raise TypeError("copy_blobs_for_fork write_fence must be an exact BlobForkWriteFence")
+        if write_fence.source_session_id != source_session_id or write_fence.target_session_id != target_session_id:
+            raise AuditIntegrityError("copy_blobs_for_fork write fence does not match its source and target")
+        if not callable(checkpoint):
+            raise TypeError("copy_blobs_for_fork checkpoint must be callable")
+        if tuple(sorted(plan, key=lambda entry: str(entry.source_blob_id))) != plan:
+            raise AuditIntegrityError("fork blob plan must be in canonical source id order")
+        if len({entry.source_blob_id for entry in plan}) != len(plan):
+            raise AuditIntegrityError("fork blob plan repeats a source blob id")
+        for entry in plan:
+            if entry.target_blob_id != fork_blob_id(
+                target_session_id=target_session_id,
+                source_blob_id=entry.source_blob_id,
+            ):
+                raise AuditIntegrityError("fork blob plan contains a non-deterministic target blob id")
+
+        def _verify_plan_and_quota() -> tuple[BlobRecord, ...]:
+            with self._engine.connect() as conn:
+                _verify_fork_child_custody(
+                    conn,
+                    source_session_id=source_session_id_str,
+                    target_session_id=target_session_id_str,
+                )
+                expected_target_ids = {str(entry.target_blob_id) for entry in plan}
+                target_rows = conn.execute(select(blobs_table).where(blobs_table.c.session_id == target_session_id_str)).all()
+                target_ids = {row.id for row in target_rows}
+                extras = target_ids - expected_target_ids
+                if extras:
+                    raise AuditIntegrityError(f"staged fork child contains blobs outside its frozen plan: {sorted(extras)}")
+
+                source_records: list[BlobRecord] = []
+                for entry in plan:
+                    row = conn.execute(
+                        select(blobs_table).where(
+                            blobs_table.c.id == str(entry.source_blob_id),
+                            blobs_table.c.session_id == source_session_id_str,
+                        )
+                    ).one_or_none()
+                    if row is None or row.status != "ready" or row.content_hash != entry.content_hash or row.size_bytes != entry.size_bytes:
+                        raise AuditIntegrityError(f"frozen fork source blob {entry.source_blob_id} changed status, hash, size, or custody")
+                    source_records.append(self._row_to_record(row))
+
+                missing_bytes = sum(entry.size_bytes for entry in plan if str(entry.target_blob_id) not in target_ids)
+                # A plan that adds no new bytes deliberately skips the quota
+                # check: an already-materialized child stays valid even if the
+                # ceiling was lowered beneath its existing usage.
+                if missing_bytes > 0:
+                    _enforce_session_blob_quota(
+                        conn,
+                        target_session_id_str,
+                        additional_bytes=missing_bytes,
+                        max_storage_per_session=self._max_storage_per_session,
+                    )
+                    admit_storage_bytes_on_connection(
+                        conn,
+                        session_id=target_session_id_str,
+                        additional_bytes=missing_bytes,
+                        operation="session_fork",
+                        record=self._quota_exceeded_recorder,
+                    )
+                return tuple(source_records)
+
+        await checkpoint()
+        source_records = await self._run_sync(_verify_plan_and_quota)
+        blob_map: dict[UUID, BlobRecord] = {}
+        for entry, source_blob in zip(plan, source_records, strict=True):
+            await checkpoint()
+
+            def _read_frozen_source(
+                storage_path: str = source_blob.storage_path,
+                source_blob_id: UUID = source_blob.id,
+            ) -> bytes:
+                storage = Path(storage_path)
+                if not storage.exists():
+                    raise BlobContentMissingError(str(source_blob_id), storage_path=storage_path)
+                try:
+                    return storage.read_bytes()
+                except FileNotFoundError:
+                    # The file may be deleted after the existence guard but
+                    # before the descriptor is acquired. Preserve the blob
+                    # lifecycle error contract for that raced deletion.
+                    raise BlobContentMissingError(str(source_blob_id), storage_path=storage_path) from None
+
+            content = await _await_fork_copy_io_with_checkpoints(
+                self._run_sync(_read_frozen_source),
+                checkpoint=checkpoint,
+            )
+            actual_hash = hashlib.sha256(content).hexdigest()
+            if len(content) != entry.size_bytes or actual_hash != entry.content_hash:
+                raise BlobIntegrityError(
+                    str(entry.source_blob_id),
+                    expected=entry.content_hash,
+                    actual=actual_hash,
+                )
+
+            write_authority = _ForkCopyWriteAuthority(write_fence)
+
+            def _persist_copy(
+                source_blob: BlobRecord = source_blob,
+                content: bytes = content,
+                child_blob_id: UUID = entry.target_blob_id,
+                authority: _ForkCopyWriteAuthority = write_authority,
+            ) -> Row[Any]:
+                persisted = _persist_blob_content(
+                    engine=self._engine,
+                    data_dir=self._data_dir,
+                    max_storage_per_session=self._max_storage_per_session,
+                    blob_id=child_blob_id,
+                    session_id=target_session_id,
+                    filename=source_blob.filename,
+                    content=content,
+                    mime_type=source_blob.mime_type,
+                    created_by=source_blob.created_by,
+                    source_description=f"copied from session fork (original: {source_blob.id})",
+                    creation_modality=CreationModality.VERBATIM,
+                    created_from_message_id=None,
+                    creating_model_identifier=None,
+                    creating_model_version=None,
+                    creating_provider=None,
+                    creating_composer_skill_hash=None,
+                    creating_arguments_hash=None,
+                    idempotent=True,
+                    fork_write_fence=write_fence,
+                    write_guard=authority.require,
+                    quota_exceeded_recorder=self._quota_exceeded_recorder,
+                )
+                if isinstance(persisted, BlobRecord):
+                    raise AuditIntegrityError("composite fork persistence returned a session-operation record")
+                return persisted
+
+            row = await _await_fork_copy_io_with_checkpoints(
+                self._run_sync(_persist_copy),
+                checkpoint=checkpoint,
+                write_authority=write_authority,
+            )
+            copied = self._row_to_record(row)
+            if copied.id != entry.target_blob_id or copied.content_hash != entry.content_hash or copied.size_bytes != entry.size_bytes:
+                raise AuditIntegrityError(f"fork target blob {entry.target_blob_id} does not match its frozen plan")
+            blob_map[entry.source_blob_id] = copied
+            await checkpoint()
+
+        def _verify_exact_target() -> None:
+            with self._engine.connect() as conn:
+                actual = {
+                    UUID(row.id)
+                    for row in conn.execute(select(blobs_table.c.id).where(blobs_table.c.session_id == target_session_id_str)).all()
+                }
+                expected = {entry.target_blob_id for entry in plan}
+                if actual != expected:
+                    raise AuditIntegrityError("staged fork child blob set does not exactly match its frozen plan")
+
+        await self._run_sync(_verify_exact_target)
+
+        return blob_map
+
+    async def cleanup_blobs_for_fork(
+        self,
+        source_session_id: UUID,
+        target_session_id: UUID,
+        operation_id: str,
+        *,
+        live_write_fence: BlobForkWriteFence | None = None,
+    ) -> BlobForkCleanupResult:
+        """Clean an authorized fork child while holding its custody lock."""
+        source_session_id_str, target_session_id_str = _validated_fork_session_ids(
+            source_session_id,
+            target_session_id,
+        )
+        if type(operation_id) is not str or not 1 <= len(operation_id) <= 128:
+            raise ValueError("operation_id must be a non-empty bounded string")
+        if live_write_fence is not None:
+            if type(live_write_fence) is not BlobForkWriteFence:
+                raise TypeError("live_write_fence must be an exact BlobForkWriteFence")
+            if (
+                live_write_fence.source_session_id != source_session_id
+                or live_write_fence.target_session_id != target_session_id
+                or live_write_fence.operation_id != operation_id
+            ):
+                raise AuditIntegrityError("Fork blob cleanup write fence does not match its source, target, and operation")
+
+        return await self._run_sync(
+            lambda: self._cleanup_blobs_for_fork_sync(
+                source_session_id_str=source_session_id_str,
+                target_session_id_str=target_session_id_str,
+                operation_id=operation_id,
+                live_write_fence=live_write_fence,
+            )
+        )
+
+    def _delete_fork_blob_row_locked(
+        self,
+        conn: Connection,
+        *,
+        row: Row[Any],
+        blob_id_str: str,
+    ) -> _StagedBlobDeletion:
+        """Stage a composite-fork-owned row inside the caller's transaction."""
+        fork_operation_id = _in_progress_session_fork_operation_id(conn, row.session_id)
+        if fork_operation_id is not None:
+            raise BlobInProgressForkError(blob_id_str, operation_id=fork_operation_id)
+        retaining_proposal_id = pending_proposal_reference_id(conn, session_id=row.session_id, blob_id=blob_id_str)
+        if retaining_proposal_id is not None:
+            raise BlobPendingProposalError(blob_id_str, proposal_id=retaining_proposal_id)
+        active_link = conn.execute(
+            select(blob_run_links_table)
+            .join(runs_table, blob_run_links_table.c.run_id == runs_table.c.id)
+            .where(blob_run_links_table.c.blob_id == blob_id_str)
+            .where(runs_table.c.status.in_(["pending", "running"]))
+        ).first()
+        if active_link is not None:
+            raise BlobActiveRunError(blob_id_str, run_id=active_link.run_id)
+        active_run = conn.execute(
+            select(*_ACTIVE_RUN_COMPOSITION_COLUMNS)
+            .join(composition_states_table, runs_table.c.state_id == composition_states_table.c.id)
+            .where(runs_table.c.session_id == row.session_id)
+            .where(runs_table.c.status.in_(["pending", "running"]))
+        ).first()
+        if active_run is not None and _composition_references_blob(_active_run_pipeline_dict(active_run), blob_id_str, row.storage_path):
+            raise BlobActiveRunError(blob_id_str, run_id=active_run.run_id)
+        stage = _stage_blob_deletion(Path(row.storage_path))
+        try:
+            registered_at = self._now()
+            conn.execute(
+                blob_deletion_cleanups_table.insert().values(
+                    blob_id=blob_id_str,
+                    session_id=row.session_id,
+                    storage_path=str(stage.storage),
+                    tombstone_path=str(stage.tombstone) if stage.tombstone is not None else None,
+                    created_at=registered_at,
+                    updated_at=registered_at,
+                )
+            )
+            deleted = conn.execute(
+                blobs_table.delete().where(blobs_table.c.id == blob_id_str).where(blobs_table.c.session_id == row.session_id)
+            )
+            if deleted.rowcount != 1:
+                raise AuditIntegrityError(f"blob {blob_id_str} left session custody before its qualified delete completed")
+        except BaseException as primary_exc:
+            _restore_staged_blob_deletion(stage, primary_exc)
+            raise
+        return stage
+
+    def _finalize_registered_fork_blob_deletion(
+        self,
+        *,
+        held_connection: Connection | None,
+        blob_id_str: str,
+        session_id_str: str,
+        stage: _StagedBlobDeletion,
+    ) -> None:
+        """Purge fork bytes durably before retiring their atomic cleanup row."""
+        _finalize_staged_blob_deletion(stage)
+        with _blob_phase_transaction(self._engine, held_connection) as conn:
+            _acquire_blob_phase_lock(conn, session_id_str)
+            deleted = conn.execute(
+                blob_deletion_cleanups_table.delete()
+                .where(blob_deletion_cleanups_table.c.blob_id == blob_id_str)
+                .where(blob_deletion_cleanups_table.c.session_id == session_id_str)
+            )
+            if deleted.rowcount != 1:
+                raise AuditIntegrityError(f"blob {blob_id_str} lost its durable deletion cleanup record before purge completion")
+
+    def _cleanup_blobs_for_fork_sync(
+        self,
+        *,
+        source_session_id_str: str,
+        target_session_id_str: str,
+        operation_id: str,
+        live_write_fence: BlobForkWriteFence | None,
+    ) -> BlobForkCleanupResult:
+        """The synchronous body of ``cleanup_blobs_for_fork``, as an instance method.
+
+        A method rather than a closure so the writer inventory follows
+        ``self._delete_fork_blob_row_locked(conn, ...)``
+        only from a call made lexically inside a method (D6 family B,
+        elspeth-af0fdc3cc6).
+        """
+        deleted_ids: list[UUID] = []
+        errors: list[BlobForkCleanupError] = []
+        with _blob_custody_session_lock(self._engine, target_session_id_str) as held_connection:
+            with _blob_phase_transaction(self._engine, held_connection) as conn:
+                _acquire_blob_phase_lock(conn, target_session_id_str)
+                _verify_fork_child_custody(
+                    conn,
+                    source_session_id=source_session_id_str,
+                    target_session_id=target_session_id_str,
+                )
+                _require_fork_cleanup_authorization(
+                    conn,
+                    source_session_id=source_session_id_str,
+                    target_session_id=target_session_id_str,
+                    operation_id=operation_id,
+                    live_write_fence=live_write_fence,
+                )
+                snapshot_ids = tuple(
+                    sorted(
+                        {
+                            *(
+                                UUID(row.id)
+                                for row in conn.execute(
+                                    select(blobs_table.c.id).where(blobs_table.c.session_id == target_session_id_str)
+                                ).all()
+                            ),
+                            *(
+                                UUID(row.blob_id)
+                                for row in conn.execute(
+                                    select(blob_deletion_cleanups_table.c.blob_id).where(
+                                        blob_deletion_cleanups_table.c.session_id == target_session_id_str
+                                    )
+                                ).all()
+                            ),
+                        },
+                        key=str,
+                    )
+                )
+
+            for blob_id in snapshot_ids:
+                stage: _StagedBlobDeletion | None = None
+                deletion_record: BlobRecord | None = None
+                registered_cleanup: Row[Any] | None = None
+                restore_uncommitted_stage = False
+                try:
+                    try:
+                        with _blob_phase_transaction(self._engine, held_connection) as conn:
+                            _acquire_blob_phase_lock(conn, target_session_id_str)
+                            _verify_fork_child_custody(
+                                conn,
+                                source_session_id=source_session_id_str,
+                                target_session_id=target_session_id_str,
+                            )
+                            _require_fork_cleanup_authorization(
+                                conn,
+                                source_session_id=source_session_id_str,
+                                target_session_id=target_session_id_str,
+                                operation_id=operation_id,
+                                live_write_fence=live_write_fence,
+                            )
+                            row = conn.execute(
+                                select(blobs_table)
+                                .where(blobs_table.c.id == str(blob_id))
+                                .where(blobs_table.c.session_id == target_session_id_str)
+                                .with_for_update()
+                            ).one_or_none()
+                            cleanup_row = conn.execute(
+                                select(blob_deletion_cleanups_table)
+                                .where(blob_deletion_cleanups_table.c.blob_id == str(blob_id))
+                                .where(blob_deletion_cleanups_table.c.session_id == target_session_id_str)
+                                .with_for_update()
+                            ).one_or_none()
+                            if row is not None and cleanup_row is not None:
+                                raise AuditIntegrityError(f"blob {blob_id} has overlapping live and deletion cleanup state")
+                            if cleanup_row is not None:
+                                registered_cleanup = cleanup_row
+                            elif row is not None:
+                                deletion_record = _row_to_blob_record(row)
+                                stage = self._delete_fork_blob_row_locked(conn, row=row, blob_id_str=str(blob_id))
+                                restore_uncommitted_stage = True
+                    except BaseException as primary_exc:
+                        if restore_uncommitted_stage and stage is not None:
+                            try:
+                                with _blob_phase_transaction(self._engine, held_connection) as outcome_conn:
+                                    _acquire_blob_phase_lock(outcome_conn, target_session_id_str)
+                                    _verify_fork_child_custody(
+                                        outcome_conn,
+                                        source_session_id=source_session_id_str,
+                                        target_session_id=target_session_id_str,
+                                    )
+                                    _require_fork_cleanup_authorization(
+                                        outcome_conn,
+                                        source_session_id=source_session_id_str,
+                                        target_session_id=target_session_id_str,
+                                        operation_id=operation_id,
+                                        live_write_fence=live_write_fence,
+                                    )
+                                    surviving_row = outcome_conn.execute(
+                                        select(blobs_table)
+                                        .where(blobs_table.c.id == str(blob_id), blobs_table.c.session_id == target_session_id_str)
+                                        .with_for_update()
+                                    ).one_or_none()
+                                    committed_cleanup = outcome_conn.execute(
+                                        select(blob_deletion_cleanups_table)
+                                        .where(
+                                            blob_deletion_cleanups_table.c.blob_id == str(blob_id),
+                                            blob_deletion_cleanups_table.c.session_id == target_session_id_str,
+                                        )
+                                        .with_for_update()
+                                    ).one_or_none()
+                                if surviving_row is not None and committed_cleanup is None:
+                                    if deletion_record is None or _row_to_blob_record(surviving_row) != deletion_record:
+                                        raise AuditIntegrityError("fork deletion rollback no longer has its exact live metadata")
+                                    _restore_staged_blob_deletion(stage, primary_exc)
+                                elif surviving_row is None and committed_cleanup is not None:
+                                    observed_stage = _registered_blob_deletion_stage(
+                                        committed_cleanup,
+                                        data_dir=self._data_dir,
+                                        blob_id=str(blob_id),
+                                        session_id=target_session_id_str,
+                                    )
+                                    if observed_stage != stage:
+                                        raise AuditIntegrityError("fork deletion commit no longer has its exact cleanup paths")
+                                else:
+                                    raise AuditIntegrityError("fork deletion commit outcome has inconsistent metadata and cleanup evidence")
+                            except (OSError, SQLAlchemyError) as observation_exc:
+                                primary_exc.add_note(
+                                    "Fork deletion outcome could not be observed under current custody; "
+                                    "preserving staged bytes for successor recovery."
+                                )
+                                raise primary_exc from observation_exc
+                        raise
+                    if registered_cleanup is not None:
+                        stage = _registered_blob_deletion_stage(
+                            registered_cleanup,
+                            data_dir=self._data_dir,
+                            blob_id=str(blob_id),
+                            session_id=target_session_id_str,
+                        )
+                    if stage is not None:
+                        self._finalize_registered_fork_blob_deletion(
+                            held_connection=held_connection,
+                            blob_id_str=str(blob_id),
+                            session_id_str=target_session_id_str,
+                            stage=stage,
+                        )
+                except (BlobForkFenceLostError, BlobContentMissingError, BlobIntegrityError):
+                    raise
+                except (BlobError, SQLAlchemyError, OSError) as cleanup_exc:
+                    errors.append(
+                        BlobForkCleanupError(
+                            blob_id=blob_id,
+                            exc_type=type(cleanup_exc).__name__,
+                            # Rollback failures are PEP 678 notes on the
+                            # primary error; keep them in returned evidence.
+                            detail=_cleanup_error_detail(cleanup_exc),
+                        )
+                    )
+                    try:
+                        with _blob_phase_transaction(self._engine, held_connection) as conn:
+                            residual_row_exists = (
+                                conn.execute(
+                                    select(blobs_table.c.id)
+                                    .where(blobs_table.c.id == str(blob_id))
+                                    .where(blobs_table.c.session_id == target_session_id_str)
+                                ).first()
+                                is not None
+                            )
+                    except (SQLAlchemyError, OSError) as residual_check_exc:
+                        errors.append(
+                            BlobForkCleanupError(
+                                blob_id=blob_id,
+                                exc_type=f"RecoveryFailed[{type(residual_check_exc).__name__}]",
+                                detail=str(residual_check_exc),
+                            )
+                        )
+                        continue
+                    if residual_row_exists:
+                        # Exact identities remain in the cleanup result and
+                        # custody records, not process-global metric labels.
+                        _BLOB_COPY_FORK_ORPHAN_ROWS_COUNTER.add(
+                            1,
+                            {"exc_type": type(cleanup_exc).__name__},
+                        )
+                    continue
+                deleted_ids.append(blob_id)
+        return BlobForkCleanupResult(deleted_ids=deleted_ids, errors=errors)

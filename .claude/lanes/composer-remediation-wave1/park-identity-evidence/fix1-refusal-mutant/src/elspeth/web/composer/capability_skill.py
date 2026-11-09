@@ -1,0 +1,269 @@
+"""Canonical capability guidance and per-call planner integrity manifests."""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Final, cast
+
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.core.canonical import stable_hash
+from elspeth.web.composer.authority_hashing import canonical_json_and_hash
+from elspeth.web.composer.skills import load_skill_with_hash
+
+PLANNER_DISCOVERY_TOOL_NAMES: Final[tuple[str, ...]] = (
+    "diff_pipeline",
+    "explain_validation_error",
+    "get_audit_info",
+    "get_expression_grammar",
+    "get_pipeline_state",
+    "get_plugin_assistance",
+    "get_plugin_schema",
+    "list_models",
+    "list_sinks",
+    "list_sources",
+    "list_transforms",
+    "preview_pipeline",
+    "get_blob_content",
+    "read_attachment",
+    "get_blob_metadata",
+    "inspect_source",
+    "list_blobs",
+    "list_composer_blobs",
+    "list_secret_refs",
+    "validate_secret_ref",
+)
+PLANNER_TERMINAL_TOOL_NAME: Final[str] = "emit_pipeline_proposal"
+PLANNER_RECOVERY_TOOL_NAMES: Final[tuple[str, ...]] = ("handoff_to_user", "restore_parked_graph")
+PLANNER_IMPLEMENTATION_ID: Final[str] = "elspeth.web.composer.pipeline_planner.plan_pipeline"
+
+# HAND-WRITTEN ON PURPOSE — the keys are the operand the capability-skill
+# identity pin CHECKS against ``COMPOSER_NODE_TYPES`` (derived from the
+# ``NodeType`` Literal); the values are guidance prose that cannot be derived
+# without inventing it. Derive the keys and the pin is ``x == x``
+# (elspeth-b3117ec3ac, comment 7980).
+CAPABILITY_CORE_NODE_GUIDANCE: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "aggregation": "[capability-node:aggregation]",
+        "coalesce": "[capability-node:coalesce]",
+        "collector": "[capability-node:collector]",
+        "gate": "[capability-node:gate]",
+        "queue": "[capability-node:queue]",
+        "row_union": "[capability-node:row_union]",
+        "transform": "[capability-node:transform]",
+    }
+)
+
+_FIELD_INVENTORY_START: Final[str] = "<!-- canonical-field-inventory:start -->"
+_FIELD_INVENTORY_END: Final[str] = "<!-- canonical-field-inventory:end -->"
+_FIELD_ROW_RE: Final[re.Pattern[str]] = re.compile(r"^\| ([a-z_]+) \| (`[a-z_]+`(?:, `[a-z_]+`)*) \|$")
+
+
+def documented_capability_fields(text: str) -> Mapping[str, frozenset[str]]:
+    """Parse and validate the public canonical-field inventory.
+
+    The inventory is the human-visible authority.  Python derives its field
+    mapping from those exact bytes, then the planner compares it with the
+    terminal schema on every call.  There is deliberately no second list of
+    field names in code that can drift in lockstep with the schema.
+    """
+    if type(text) is not str:
+        raise TypeError("text must be an exact string")
+    if text.count(_FIELD_INVENTORY_START) != 1 or text.count(_FIELD_INVENTORY_END) != 1:
+        raise AuditIntegrityError("canonical capability field inventory anchors must occur exactly once")
+    remainder = text.split(_FIELD_INVENTORY_START, 1)[1]
+    block = remainder.split(_FIELD_INVENTORY_END, 1)[0]
+    lines = block.strip().splitlines()
+    if lines[:2] != ["| Family | Fields |", "| --- | --- |"]:
+        raise AuditIntegrityError("canonical capability field inventory header is malformed")
+    extracted: dict[str, frozenset[str]] = {}
+    for line in lines[2:]:
+        match = _FIELD_ROW_RE.fullmatch(line)
+        if match is None:
+            raise AuditIntegrityError("canonical capability field inventory row is malformed")
+        family, rendered_fields = match.groups()
+        if family in extracted:
+            raise AuditIntegrityError("canonical capability field inventory repeats a family")
+        extracted[family] = frozenset(item.removeprefix("`").removesuffix("`") for item in rendered_fields.split(", "))
+    return MappingProxyType(extracted)
+
+
+def _schema_mapping(value: object, *, path: str) -> Mapping[str, Any]:
+    if type(value) is not dict:
+        raise AuditIntegrityError(f"canonical capability schema node {path} must be an object")
+    return cast(Mapping[str, Any], value)
+
+
+def _property_names(schema: Mapping[str, Any], *, path: str) -> frozenset[str]:
+    properties = _schema_mapping(schema["properties"], path=f"{path}.properties")
+    if any(type(name) is not str for name in properties):
+        raise AuditIntegrityError(f"canonical capability schema property names at {path} must be exact strings")
+    return frozenset(properties)
+
+
+def canonical_capability_fields(schema: Mapping[str, Any]) -> Mapping[str, frozenset[str]]:
+    """Extract every authoring-structural field from the terminal schema."""
+    root = _schema_mapping(schema, path="$pipeline")
+    properties = _schema_mapping(root["properties"], path="$pipeline.properties")
+    source = _schema_mapping(properties["source"], path="$pipeline.properties.source")
+    sources = _schema_mapping(properties["sources"], path="$pipeline.properties.sources")
+    named_source = _schema_mapping(sources["additionalProperties"], path="$pipeline.properties.sources.*")
+    nodes = _schema_mapping(properties["nodes"], path="$pipeline.properties.nodes")
+    node = _schema_mapping(nodes["items"], path="$pipeline.properties.nodes.items")
+    node_properties = _schema_mapping(node["properties"], path="$pipeline.properties.nodes.items.properties")
+    trigger = _schema_mapping(node_properties["trigger"], path="$pipeline.properties.nodes.items.properties.trigger")
+    edges = _schema_mapping(properties["edges"], path="$pipeline.properties.edges")
+    edge = _schema_mapping(edges["items"], path="$pipeline.properties.edges.items")
+    outputs = _schema_mapping(properties["outputs"], path="$pipeline.properties.outputs")
+    output = _schema_mapping(outputs["items"], path="$pipeline.properties.outputs.items")
+    metadata = _schema_mapping(properties["metadata"], path="$pipeline.properties.metadata")
+    source_properties = _schema_mapping(source["properties"], path="$pipeline.properties.source.properties")
+    inline_blob = _schema_mapping(source_properties["inline_blob"], path="$pipeline.properties.source.properties.inline_blob")
+    extracted = {
+        "pipeline": frozenset(properties),
+        "source": _property_names(source, path="$pipeline.source"),
+        "named_source": _property_names(named_source, path="$pipeline.sources.*"),
+        "inline_blob": _property_names(inline_blob, path="$pipeline.source.inline_blob"),
+        "node": frozenset(node_properties),
+        "trigger": _property_names(trigger, path="$pipeline.nodes[].trigger"),
+        "edge": _property_names(edge, path="$pipeline.edges[]"),
+        "output": _property_names(output, path="$pipeline.outputs[]"),
+        "metadata": _property_names(metadata, path="$pipeline.metadata"),
+    }
+    return MappingProxyType(extracted)
+
+
+def validate_capability_field_contract(schema: Mapping[str, Any], documented_text: str) -> None:
+    """Fail when the visible field table and canonical schema do not agree."""
+    if canonical_capability_fields(schema) != documented_capability_fields(documented_text):
+        raise AuditIntegrityError("canonical pipeline schema and documented capability fields drifted")
+
+
+def load_pipeline_capability_core() -> str:
+    """Return the one static public capability core as exact UTF-8 text."""
+    text, _digest = load_skill_with_hash("pipeline_capabilities")
+    return text
+
+
+# Derived from the public, visible inventory rather than duplicated in code.
+CANONICAL_CAPABILITY_FIELDS: Final[Mapping[str, frozenset[str]]] = documented_capability_fields(load_pipeline_capability_core())
+
+
+def render_with_pipeline_capabilities(interaction_skill: str) -> str:
+    """Prepend the exact capability-core bytes to one interaction overlay."""
+    if type(interaction_skill) is not str or not interaction_skill.strip():
+        raise ValueError("interaction_skill must be a non-empty exact string")
+    return f"{load_pipeline_capability_core()}\n{interaction_skill.rstrip()}\n"
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerCapabilityManifest:
+    """Hash-only audit facts derived from one exact outbound planner call."""
+
+    planner_implementation_id: str
+    capability_core_hash: str
+    canonical_schema_hash: str
+    effective_tool_hash: str
+    rendered_prompt_hash: str
+
+    def __post_init__(self) -> None:
+        if type(self.planner_implementation_id) is not str or not self.planner_implementation_id:
+            raise ValueError("planner_implementation_id must be a non-empty exact string")
+        for name, value in (
+            ("capability_core_hash", self.capability_core_hash),
+            ("canonical_schema_hash", self.canonical_schema_hash),
+            ("effective_tool_hash", self.effective_tool_hash),
+            ("rendered_prompt_hash", self.rendered_prompt_hash),
+        ):
+            if type(value) is not str or len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+
+
+def build_planner_capability_manifest(
+    *,
+    messages: Sequence[Mapping[str, Any]],
+    tools: Sequence[Mapping[str, Any]],
+    canonical_schema: Mapping[str, Any],
+    capability_schema: Mapping[str, Any] | None = None,
+    tool_surface: str = "full",
+) -> PlannerCapabilityManifest:
+    """Validate and hash the exact messages/tools used by one planner call.
+
+    ``tool_surface`` names the advertised palette: ``"full"`` accepts the
+    request-owned, order-preserving discovery subset followed by recovery
+    controls and the proposal terminal; ``"terminal_only"`` retains both
+    recovery controls and the proposal on the escape-hatch overtime turn.
+    """
+    if tool_surface not in {"full", "terminal_only"}:
+        raise ValueError("tool_surface must be 'full' or 'terminal_only'")
+    _messages_canonical, rendered_prompt_hash = canonical_json_and_hash(messages)
+    _tools_canonical, effective_tool_hash = canonical_json_and_hash(tools)
+    core = load_pipeline_capability_core()
+    system_contents = [message["content"] for message in messages if message["role"] == "system"]
+    if not system_contents or type(system_contents[0]) is not str or not system_contents[0].startswith(core):
+        raise AuditIntegrityError("planner capability core is missing from the first system message")
+    if any(type(content) is not str for content in system_contents):
+        raise AuditIntegrityError("planner system message content must be exact text")
+    if sum(cast(str, content).count(core) for content in system_contents) != 1:
+        raise AuditIntegrityError("planner capability core must occur exactly once")
+
+    try:
+        tool_names = tuple(cast(str, tool["function"]["name"]) for tool in tools)
+    except (KeyError, TypeError) as exc:
+        raise AuditIntegrityError("planner advertised tool definitions are malformed") from exc
+    terminal_names = (*PLANNER_RECOVERY_TOOL_NAMES, PLANNER_TERMINAL_TOOL_NAME)
+    if tool_surface == "terminal_only":
+        valid_names = tool_names == terminal_names
+    else:
+        discovery_names = tool_names[: -len(terminal_names)]
+        positions = tuple(PLANNER_DISCOVERY_TOOL_NAMES.index(name) for name in discovery_names if name in PLANNER_DISCOVERY_TOOL_NAMES)
+        valid_names = (
+            bool(tool_names)
+            and tool_names[-len(terminal_names) :] == terminal_names
+            and len(positions) == len(discovery_names)
+            and len(set(discovery_names)) == len(discovery_names)
+            and positions == tuple(sorted(positions))
+        )
+    if not valid_names:
+        raise AuditIntegrityError("planner advertised tool identities or order drifted")
+    terminal = _schema_mapping(tools[-1]["function"], path="$tools[-1].function")
+    parameters = _schema_mapping(terminal["parameters"], path="$tools[-1].function.parameters")
+    properties = _schema_mapping(parameters["properties"], path="$tools[-1].function.parameters.properties")
+    advertised_schema = _schema_mapping(properties["pipeline"], path="$tools[-1].function.parameters.properties.pipeline")
+    canonical_schema_hash = stable_hash(advertised_schema)
+    if canonical_schema_hash != stable_hash(canonical_schema):
+        raise AuditIntegrityError("planner terminal does not advertise the canonical pipeline schema")
+    # Restricted request terminals are projections of the canonical authoring
+    # language, so their root field inventory intentionally differs.  The
+    # static capability core still documents that full language and remains
+    # pinned against its canonical schema independently of the exact selected
+    # terminal hashed above.
+    validate_capability_field_contract(capability_schema or canonical_schema, core)
+
+    return PlannerCapabilityManifest(
+        planner_implementation_id=PLANNER_IMPLEMENTATION_ID,
+        capability_core_hash=hashlib.sha256(core.encode("utf-8")).hexdigest(),
+        canonical_schema_hash=canonical_schema_hash,
+        effective_tool_hash=effective_tool_hash,
+        rendered_prompt_hash=rendered_prompt_hash,
+    )
+
+
+__all__ = [
+    "CANONICAL_CAPABILITY_FIELDS",
+    "CAPABILITY_CORE_NODE_GUIDANCE",
+    "PLANNER_DISCOVERY_TOOL_NAMES",
+    "PLANNER_IMPLEMENTATION_ID",
+    "PLANNER_RECOVERY_TOOL_NAMES",
+    "PLANNER_TERMINAL_TOOL_NAME",
+    "PlannerCapabilityManifest",
+    "build_planner_capability_manifest",
+    "canonical_capability_fields",
+    "documented_capability_fields",
+    "load_pipeline_capability_core",
+    "render_with_pipeline_capabilities",
+    "validate_capability_field_contract",
+]

@@ -1,0 +1,3 @@
+elspeth=/workspace/elspeth/.claude/lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/__init__.py
+elspeth_lints=/workspace/elspeth/.claude/worktrees/composer-remediation-park-identity/elspeth-lints/src/elspeth_lints/__init__.py
+service=/workspace/elspeth/.claude/lanes/composer-remediation-wave1/park-identity-evidence/fix1-refusal-mutant/src/elspeth/web/sessions/service.py

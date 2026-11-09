@@ -1,0 +1,2 @@
+pyproject.toml: note: unused section(s): module = ['claude_agent_sdk.*', 'examples.*', 'pypdfium2_raw', 'pypdfium2_raw.*', 'scripts.*', 'tests.*']
+Success: no issues found in 1120 source files

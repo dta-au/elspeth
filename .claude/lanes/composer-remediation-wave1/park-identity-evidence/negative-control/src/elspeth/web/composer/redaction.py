@@ -1,0 +1,4509 @@
+"""Redaction utilities for composer state serialization.
+
+Functions that strip internal implementation details (storage paths, blob
+locations) from serialized state dicts before they reach external consumers
+(LLM prompts, HTTP responses, MCP tool results).
+
+This module also exposes the shared traversal iterator
+``walk_model_schema`` (spec §4.2.5) consumed by the adequacy guard
+(§4.4) and the runtime walker (§4.2.6). Centralising the traversal
+forecloses the rev-1 BLOCKER 2 pattern where the walker omitted
+container types the spec promised and the guard could not detect.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Set as AbstractSet
+from dataclasses import dataclass, field
+from types import MappingProxyType, UnionType
+from typing import Annotated, Any, Literal, TypeAliasType, Union, get_args, get_origin
+
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    JsonValue,
+    StrictFloat,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+from pydantic.json_schema import SkipJsonSchema
+
+from elspeth.contracts.blobs import BLOB_CREATORS, AllowedMimeType, BlobCreator
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.credential_material import DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
+from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+from elspeth.core.config import RuntimeNodeName, validate_runtime_node_name
+from elspeth.web.composer.authority_hashing import composer_authority_hash
+from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
+from elspeth.web.composer.error_codes import REGISTERED_ERROR_CODES
+from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
+from elspeth.web.composer.state import EdgeType
+from elspeth.web.composer.tool_result_envelope import TOOL_RESULT_OPTIONAL_KEYS, TOOL_RESULT_REQUIRED_KEYS, tool_result_keys
+from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS
+
+REDACTED_BLOB_SOURCE_PATH = "<redacted-blob-source-path>"
+_REDACTED_OPTION_VALUE = "<redacted-option-value>"
+
+
+@trust_boundary(
+    tier=3,
+    source="LLM/composer-authored tool-call timeout_seconds value (pydantic BeforeValidator input)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises ValueError unless value is None or a non-bool int/float; never coerces a numeric string or bool",
+    test_ref="tests/unit/web/composer/test_redaction_trust_boundaries.py::test_reject_coerced_timeout_seconds_rejects_bool",
+    test_fingerprint="df8c4ca47144fd7c4eb24e8253baed9666e1e44b1636afad2bfebaec2a0a0d5b",
+)
+def _reject_coerced_timeout_seconds(value: object) -> object:
+    """Accept only actual JSON numbers at the Tier-3 boundary.
+
+    Pydantic's ordinary float parser coerces booleans and numeric strings.
+    Structural-barrier timeouts are persisted audit facts, so their wire type
+    must be proven before conversion. Integers remain valid JSON numbers and
+    are normalized to float by the annotated field.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("timeout_seconds must be an actual number, not a boolean or string")
+    return value
+
+
+_StrictTimeoutSeconds = Annotated[
+    float,
+    BeforeValidator(_reject_coerced_timeout_seconds),
+    Field(gt=0, allow_inf_nan=False),
+]
+
+# Fixed sentinel for response keys that appear in the input but are not
+# declared in the manifest entry's known_response_keys or
+# sensitive_response_keys sets.  The value is a closed constant — callers
+# MUST compare by ==, not by prefix or regex.  No length disclosure
+# (closes W6 / spec §8.1 RSK-03 weak echo).
+REDACTED_UNKNOWN_RESPONSE_KEY = "<redacted-unknown-response-key>"
+REDACTED_UNKNOWN_RESPONSE_FIELD = "_unknown_response"
+
+# The closed ToolResult dispatch envelope: engine-produced framing present on
+# every serialized tool result.  Implicitly known (never sentinel'd) for
+# declarative manifest entries unless a policy explicitly declares one
+# sensitive; tool payload lives under other keys (``data`` etc.) which remain
+# policy-declared and fail-closed.  Derived from the registry
+# (``tool_result_envelope.TOOL_RESULT_REQUIRED_KEYS``): ``affected_nodes`` is
+# part of it since elspeth-e405ad7cd2 (D1) — while it was missing, every
+# declarative discovery row fired ``unknown_response_key_redacted`` on every
+# call, which made the drift counter permanently non-zero. Node ids go through
+# ``_project_untrusted_response_structure`` exactly as the type-driven path
+# projects them (text sentinels), so no new byte reaches the audit row.
+_TOOL_RESULT_ENVELOPE_KEYS: frozenset[str] = frozenset(TOOL_RESULT_REQUIRED_KEYS)
+
+# Fixed sentinel for arguments that appear in the input but are not declared in
+# a manifest entry's optional known_argument_keys allowlist. Unknown key names
+# are removed too; they are LLM-controlled text and may themselves carry
+# sensitive payload. Every registered declarative tool closes its argument
+# names; redact_unknown_argument_keys=True also closes an empty argument set.
+REDACTED_UNKNOWN_ARGUMENT_KEY = "<redacted-unknown-argument-key>"
+REDACTED_UNKNOWN_ARGUMENTS_FIELD = "_unknown_arguments"
+
+# Sentinel applied to Sensitive[T] fields whose _SensitiveMarker carries no
+# summarizer callable.  A field declared ``Annotated[T, Sensitive()]`` (with
+# no ``summarizer=`` keyword) receives this value instead of the raw payload.
+# It is distinct from REDACTED_UNKNOWN_RESPONSE_KEY so audit consumers can
+# distinguish "known sensitive, no summarizer" from "unknown key, fail-closed".
+REDACTED_SENSITIVE_NO_SUMMARIZER = "<redacted>"
+
+_REDACTED_RESPONSE_TEXT = "<redacted-response-text>"
+_REDACTED_RESPONSE_INTEGER = "<redacted-response-integer>"
+_REDACTED_RESPONSE_NUMBER = "<redacted-response-number>"
+_REDACTED_RESPONSE_VALUE = "<redacted-response-value>"
+_REDACTED_RESPONSE_MAPPING = "<redacted-response-mapping>"
+_REDACTED_RESPONSE_SEQUENCE = "<redacted-response-sequence>"
+_REDACTED_RESPONSE_BOOLEAN = "<redacted-response-boolean>"
+_REDACTED_RESPONSE_NULL = "<redacted-response-null>"
+_REDACTED_ARG_ERROR_CLASS = "<redacted-arg-error-class>"
+_REDACTED_PLUGIN_CRASH_CLASS = "<redacted-plugin-crash-class>"
+_REDACTED_FAILURE_MESSAGE = "<redacted-failure-message>"
+_ARG_ERROR_REDACTION_STATUS = "arg_error"
+_RESPONSE_PROJECTION_LIMIT = MappingProxyType({"_redaction_status": "response_projection_limit"})
+# Per-key twin of the whole-row stub: one top-level response value exceeded the
+# projection budget, so only that key is replaced and the envelope framing
+# (success / validation / version) survives.
+_REDACTED_RESPONSE_PROJECTION_LIMIT = "<redacted-response-projection-limit>"
+
+RESPONSE_PROJECTION_MAX_DEPTH = 32
+RESPONSE_PROJECTION_MAX_CONTAINER_WIDTH = 64
+RESPONSE_PROJECTION_MAX_NODES = 1024
+RESPONSE_PROJECTION_MAX_OUTPUT_BYTES = 65_536
+
+_SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD: Mapping[str, frozenset[str]] = MappingProxyType(
+    {
+        "severity": frozenset({"high", "medium", "low"}),
+        "status": frozenset(
+            {
+                "ok",
+                "healthy",
+                "SUCCESS",
+                "ARG_ERROR",
+                "BUDGET_EXHAUSTED",
+                "COMPOSE_TIMEOUT",
+                "DEADLINE_TOO_CLOSE",
+                "ADVISOR_ERROR",
+            }
+        ),
+        "_kind": frozenset(
+            {
+                "interpretation_review_pending",
+                "interpretation_review_pending_idempotent",
+                "interpretation_review_suppressed_by_opt_out",
+            }
+        ),
+        "kind": frozenset(kind.value for kind in InterpretationKind),
+        "pipeline_content_hash_schema": frozenset({"composer.pipeline-dispatch-result.v1"}),
+        # Blob origin on get_blob_content. Derived from the same closed
+        # vocabularies the DB CHECKs mirror, so the allowlist cannot drift
+        # from the columns it admits.
+        "created_by": BLOB_CREATORS,
+        "creation_modality": frozenset(modality.value for modality in CreationModality),
+        # A rejection's ``validation.errors[].error_code`` is a closed,
+        # server-authored identifier. Only codes in the emitted-code registry
+        # survive; any other value is summarized like free text.
+        "error_code": REGISTERED_ERROR_CODES,
+    }
+)
+_SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS = frozenset(
+    {
+        "version",
+        "count",
+        "size_bytes",
+        "budget_used",
+        "budget_remaining",
+        "prompt_tokens",
+        "completion_tokens",
+        "cached_prompt_tokens",
+        "advisor_latency_ms",
+        "total_chars",
+        "start_char",
+        "end_char",
+        "next_offset_chars",
+    }
+)
+# Exactly the classes the web ARG_ERROR producers raise, pinned by the
+# producer census in tests/unit/web/composer/test_error_class_producer_census.py.
+_SAFE_ARG_ERROR_CLASSES = frozenset(
+    {
+        "IntegerDomainError",
+        "JSONDecodeError",
+        "JsonBoundaryError",
+        "ToolArgumentError",
+        "ValidationError",
+        "ValueError",
+    }
+)
+_SAFE_PLUGIN_CRASH_CLASSES = frozenset(
+    {
+        "AssertionError",
+        "AuditIntegrityError",
+        "KeyError",
+        "MemoryError",
+        "RecursionError",
+        "RuntimeError",
+        "SystemError",
+        "TypeError",
+        "UnicodeError",
+        "ValueError",
+    }
+)
+_SAFE_CANCELLATION_REASONS = frozenset({"cancelled", "coordinator_cancelled", "sibling_failure"})
+_SAFE_UNTRUSTED_RESPONSE_STRUCTURE_KEYS = frozenset(
+    {
+        "additionalProperties",
+        "arguments",
+        "components",
+        "credential_fields",
+        "description",
+        "error",
+        "items",
+        "message",
+        "properties",
+        "repair",
+        "required",
+        "tool",
+        "tool_sequence",
+        "type",
+    }
+)
+
+
+class _TrustedRedactionSummary(str):
+    """Marker for a value produced by a trusted schema summarizer."""
+
+
+_STABLE_RESPONSE_SENTINELS = frozenset(
+    {
+        REDACTED_SENSITIVE_NO_SUMMARIZER,
+        REDACTED_UNKNOWN_RESPONSE_KEY,
+        _REDACTED_RESPONSE_PROJECTION_LIMIT,
+        _REDACTED_RESPONSE_TEXT,
+        _REDACTED_RESPONSE_INTEGER,
+        _REDACTED_RESPONSE_NUMBER,
+        _REDACTED_RESPONSE_VALUE,
+        _REDACTED_RESPONSE_MAPPING,
+        _REDACTED_RESPONSE_SEQUENCE,
+        _REDACTED_RESPONSE_BOOLEAN,
+        _REDACTED_RESPONSE_NULL,
+        "<redacted-blob-content>",
+        "<redacted-interpretation-text>",
+        "<redacted-repair-arguments>",
+    }
+)
+
+
+@observation_boundary(
+    tier=3,
+    source="Raw tool/LLM-provider response payload (redact_tool_call_response's response arg)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns False (never raises) when the response structure's depth, node count, or any "
+        "container width exceeds the fixed projection budget; True otherwise"
+    ),
+)
+def _response_within_projection_budget(value: object, *, depth: int) -> bool:
+    """Iteratively reject response structures that exceed persistence budgets.
+
+    ``depth`` is the depth of ``value`` inside the response: the redactor
+    bounds each top-level value separately and passes ``depth=1`` so the depth
+    limit keeps meaning "levels below the response root".
+    """
+    stack: list[tuple[object, int]] = [(value, depth)]
+    nodes = 0
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > RESPONSE_PROJECTION_MAX_NODES or depth > RESPONSE_PROJECTION_MAX_DEPTH:
+            return False
+        if isinstance(current, Mapping):
+            if len(current) > RESPONSE_PROJECTION_MAX_CONTAINER_WIDTH:
+                return False
+            stack.extend((child, depth + 1) for child in current.values())
+        elif isinstance(current, (list, tuple)):
+            if len(current) > RESPONSE_PROJECTION_MAX_CONTAINER_WIDTH:
+                return False
+            stack.extend((child, depth + 1) for child in current)
+    return True
+
+
+def _bounded_projection_result(
+    result: Mapping[str, object],
+    *,
+    tool_name: str,
+    telemetry: RedactionTelemetry,
+) -> dict[str, object]:
+    projected = dict(result)
+    encoded = json.dumps(projected, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > RESPONSE_PROJECTION_MAX_OUTPUT_BYTES:
+        telemetry.response_projection_limit(tool_name=tool_name, scope="row")
+        return dict(_RESPONSE_PROJECTION_LIMIT)
+    return projected
+
+
+@trust_boundary(
+    tier=3,
+    source="Raw tool/LLM-provider response value (Sensitive() summarizer input, and shared by callers below)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "never raises; returns value unchanged only for a recognized stable sentinel, otherwise returns a "
+        "fixed value-free shape/type sentinel (mapping/sequence/text/boolean/integer/number/null/generic)"
+    ),
+    non_raising=True,
+)
+def _summarize_external_response_value(value: object) -> str:
+    """Return a deterministic, value-free summary for one response value.
+
+    The summary exposes only JSON shape or scalar length. Mapping keys are
+    deliberately omitted because provider/operator-controlled keys can carry
+    the same path, diagnostic, or secret material as values.
+    """
+    if isinstance(value, str) and value in _STABLE_RESPONSE_SENTINELS:
+        return value
+    if isinstance(value, Mapping):
+        return _REDACTED_RESPONSE_MAPPING
+    if isinstance(value, (list, tuple)):
+        return _REDACTED_RESPONSE_SEQUENCE
+    if isinstance(value, str):
+        return _REDACTED_RESPONSE_TEXT
+    if type(value) is bool:
+        return _REDACTED_RESPONSE_BOOLEAN
+    if type(value) is int:
+        return _REDACTED_RESPONSE_INTEGER
+    if type(value) is float:
+        return _REDACTED_RESPONSE_NUMBER
+    if value is None:
+        return _REDACTED_RESPONSE_NULL
+    return _REDACTED_RESPONSE_VALUE
+
+
+def _summarize_arg_error_text(value: str | None, *, label: str) -> str | None:
+    if value is None:
+        return None
+    return f"<redacted-arg-error-{label}>"
+
+
+@trust_boundary(
+    tier=3,
+    source="Raw ARG_ERROR result payload from a failed tool-call argument parse (caller-controlled)",
+    source_param="result",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "never raises; result['error'] and result['validation_errors'] are summarized to bounded counts/"
+        "sentinels and dropped entirely from the projection when not str / list-or-tuple respectively"
+    ),
+    non_raising=True,
+)
+def redact_arg_error_response(
+    *,
+    error_class: str | None,
+    error_category: ToolArgumentErrorCategory | None,
+    error_message: str | None,
+    result: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Return the closed persistence projection for an ARG_ERROR outcome.
+
+    ARG_ERROR payloads are not ToolResult responses and must not validate
+    against a tool's success response model. Preserve only a closed exception
+    class, the closed :class:`ToolArgumentErrorCategory` value, and bounded
+    diagnostic shape; arbitrary messages, result values, and result keys
+    never cross the persistence boundary.
+    """
+    safe_error_class: str | None
+    if error_class is None or error_class in _SAFE_ARG_ERROR_CLASSES:
+        safe_error_class = error_class
+    else:
+        safe_error_class = _REDACTED_ARG_ERROR_CLASS
+
+    projection: dict[str, object] = {
+        "_redaction_status": _ARG_ERROR_REDACTION_STATUS,
+        "error_class": safe_error_class,
+        "error_category": error_category.value if error_category is not None else None,
+        "error_message": _summarize_arg_error_text(error_message, label="message"),
+    }
+    if result is not None:
+        result_projection: dict[str, object] = {"field_count": len(result)}
+        raw_error = result.get("error")
+        if isinstance(raw_error, str):
+            result_projection["error"] = _summarize_arg_error_text(raw_error, label="payload")
+        validation_errors = result.get("validation_errors")
+        if isinstance(validation_errors, (list, tuple)):
+            result_projection["validation_error_count"] = len(validation_errors)
+        projection["result"] = result_projection
+    return projection
+
+
+def redact_failure_response(
+    *,
+    status: str,
+    error_class: str | None,
+    error_message: str | None,
+) -> dict[str, object]:
+    """Return one status-specific, value-free failure persistence projection."""
+    if status == "cancelled":
+        return {
+            "_redaction_status": "cancelled",
+            "error_class": "CancelledError" if error_class == "CancelledError" else "<redacted-cancelled-class>",
+            "error_message": error_message if error_message in _SAFE_CANCELLATION_REASONS else "cancelled",
+        }
+    if status == "plugin_crash":
+        return {
+            "_redaction_status": "plugin_crash",
+            "error_class": error_class if error_class in _SAFE_PLUGIN_CRASH_CLASSES else _REDACTED_PLUGIN_CRASH_CLASS,
+            "error_message": _REDACTED_FAILURE_MESSAGE,
+        }
+    return {
+        "_redaction_status": "failure",
+        "error_class": "<redacted-failure-class>",
+        "error_message": _REDACTED_FAILURE_MESSAGE,
+    }
+
+
+def _coerce_external_response_value_to_summary(value: object) -> str | None:
+    """Pydantic pre-validator for open ToolResult payload carriers."""
+    if value is None:
+        return None
+    return _summarize_external_response_value(value)
+
+
+def _preserve_external_response_summary(value: str | None) -> str:
+    """Sensitive summarizer for an already value-free pre-validation summary."""
+    return _REDACTED_RESPONSE_NULL if value is None else value
+
+
+@trust_boundary(
+    tier=3,
+    source="Provider/operator-supplied scalar values inside a schema-validated ToolResult response model",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "never raises; model validation only proves field NAMES, so every leaf scalar is still summarized "
+        "to a value-free sentinel unless it is a closed public constant, an already-stable sentinel, or a "
+        "declared-safe integer field"
+    ),
+    non_raising=True,
+)
+def _project_validated_response_scalars(
+    value: object,
+    *,
+    path: tuple[str, ...] = (),
+    depth: int = 0,
+) -> object:
+    """Scrub free-form scalars after a response model validates structure.
+
+    Model validation makes mapping keys trusted schema vocabulary. Values
+    still require a separate disposition: a known field name does not make an
+    arbitrary provider/operator value safe. Closed booleans, public counters,
+    and validated status discriminants survive; other scalars are summarized.
+    """
+    if depth > RESPONSE_PROJECTION_MAX_DEPTH or len(path) > RESPONSE_PROJECTION_MAX_DEPTH:
+        return _REDACTED_RESPONSE_VALUE
+    if isinstance(value, Mapping):
+        return {key: _project_validated_response_scalars(child, path=(*path, str(key)), depth=depth + 1) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_project_validated_response_scalars(child, path=path, depth=depth + 1) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_project_validated_response_scalars(child, path=path, depth=depth + 1) for child in value)
+    if value is None or type(value) is bool:
+        return value
+
+    field_name = path[-1] if path else ""
+    if type(value) is int:
+        if field_name in _SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS:
+            return value
+        return _REDACTED_RESPONSE_INTEGER
+    if type(value) is float:
+        return _REDACTED_RESPONSE_NUMBER
+    if isinstance(value, _TrustedRedactionSummary):
+        return value
+    if isinstance(value, str):
+        if value in _STABLE_RESPONSE_SENTINELS:
+            return value
+        if field_name in _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD and value in _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD[field_name]:
+            return value
+        return _summarize_external_response_value(value)
+    return _REDACTED_RESPONSE_VALUE
+
+
+@trust_boundary(
+    tier=3,
+    source="Raw declarative-manifest tool response value with no pydantic model at all (fully unvalidated)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "never raises; unknown mapping keys are renamed to a fixed positional sentinel and every scalar is "
+        "summarized to a value-free sentinel unless it is a declared-safe integer field"
+    ),
+    non_raising=True,
+)
+def _project_untrusted_response_structure(
+    value: object,
+    *,
+    path: tuple[str, ...] = (),
+    depth: int = 0,
+) -> object:
+    """Retain container shape without trusting arbitrary keys or scalars."""
+    if depth > RESPONSE_PROJECTION_MAX_DEPTH or len(path) > RESPONSE_PROJECTION_MAX_DEPTH:
+        return _REDACTED_RESPONSE_VALUE
+    if isinstance(value, Mapping):
+        projected: dict[str, object] = {}
+        hidden_index = 0
+        for raw_key, child in value.items():
+            key = str(raw_key)
+            if key in _SAFE_UNTRUSTED_RESPONSE_STRUCTURE_KEYS:
+                projected_key = key
+            else:
+                hidden_index += 1
+                projected_key = f"_redacted_response_field_{hidden_index}"
+            projected[projected_key] = _project_untrusted_response_structure(
+                child,
+                path=(*path, projected_key),
+                depth=depth + 1,
+            )
+        return projected
+    if isinstance(value, list):
+        return [_project_untrusted_response_structure(child, path=path, depth=depth + 1) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_project_untrusted_response_structure(child, path=path, depth=depth + 1) for child in value)
+    if value is None or type(value) is bool:
+        return value
+    field_name = path[-1] if path else ""
+    if type(value) is int:
+        if field_name in _SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS:
+            return value
+        return _REDACTED_RESPONSE_INTEGER
+    if type(value) is float:
+        return _REDACTED_RESPONSE_NUMBER
+    return _summarize_external_response_value(value)
+
+
+class _SensitiveMarker:
+    """Annotated metadata marker (spec §4.2.2).
+
+    Carried inside ``Annotated[T, Sensitive()]`` field declarations. The
+    runtime walker uses ``summarizer`` to replace sensitive values with a
+    deterministic placeholder before the value reaches an external
+    consumer.
+    """
+
+    __slots__ = ("summarizer",)
+
+    def __init__(self, summarizer: Callable[[Any], str] | None = None) -> None:
+        self.summarizer = summarizer
+
+
+def Sensitive(*, summarizer: Callable[[Any], str] | None = None) -> _SensitiveMarker:
+    """Field-level annotation requesting redaction (§4.2.2)."""
+    return _SensitiveMarker(summarizer=summarizer)
+
+
+_SafeResponseEnvelope = Annotated[
+    str | None,
+    BeforeValidator(_coerce_external_response_value_to_summary),
+    Sensitive(summarizer=_preserve_external_response_summary),
+]
+
+
+@dataclass(frozen=True, slots=True)
+class TraversalNode:
+    """One field encountered while walking a model schema (§4.2.5).
+
+    Freeze-guard elision (rev-3 A2 / W3):
+      `metadata` is typed as `tuple[Any, ...]` to admit `_SensitiveMarker`
+      instances in the metadata position. _SensitiveMarker is a regular
+      (non-frozen) class - it holds a `summarizer` callable that we never
+      mutate after construction. The ``immutability.freeze_guards`` lint
+      rule only flags forbidden patterns in __post_init__; this dataclass
+      intentionally has no __post_init__ and no `freeze_fields()` call. The
+      design assumption is:
+        1. _SensitiveMarker instances are constructed once (at Annotated[...]
+           definition time, module load) and never mutated;
+        2. TraversalNode is produced inside walk_model_schema and discarded
+           after iteration - there is no long-lived reference path that
+           would expose mutation of a marker;
+        3. All other metadata entries are either immutable Pydantic metadata
+           (for example FieldInfo or StringConstraints) or scalar/None.
+      If a future change introduces stateful metadata objects, ADD a
+      freeze_fields() call here AND a deep_freeze() of `metadata` - do not
+      rely on the type signature alone, which `tuple[Any, ...]` does not
+      constrain.
+
+    ``substitute_provider``: when ``with_values=True``, a sibling
+    closure to ``value_provider`` that performs in-place substitution at
+    every reachable leaf for this node's path. Signature:
+    ``(root: dict, transform: Callable[[Any], Any]) -> None``. The closure
+    walks the root dict by the same path steps as ``value_provider`` and
+    replaces each leaf value with ``transform(old_value)``. Raises from
+    ``transform`` propagate; the caller is responsible for atomicity (build
+    on a local; only return on success).
+    """
+
+    path: str
+    field_type: Any
+    metadata: tuple[Any, ...]
+    value_provider: Callable[[dict[str, Any]], Any] | None = None
+    substitute_provider: Callable[[dict[str, Any], Callable[[Any], Any]], None] | None = None
+
+
+def _unwrap_annotated(field_type: Any, metadata: tuple[Any, ...]) -> tuple[Any, tuple[Any, ...]]:
+    """Strip a single Annotated layer; accumulate metadata.
+
+    Returns the inner type plus the combined metadata. ``Annotated`` may
+    nest (``Annotated[Annotated[X, m1], m2]``) so the caller invokes this
+    in a loop until ``get_origin`` no longer reports ``Annotated``.
+    """
+    if get_origin(field_type) is Annotated:
+        args = get_args(field_type)
+        return args[0], metadata + tuple(args[1:])
+    return field_type, metadata
+
+
+def _normalise(field_type: Any, metadata: tuple[Any, ...]) -> tuple[Any, tuple[Any, ...]]:
+    """Expose owned aliases and Annotated metadata without granting scalar trust."""
+    aliases: set[TypeAliasType] = set()
+    while isinstance(field_type, TypeAliasType) or get_origin(field_type) is Annotated:
+        if isinstance(field_type, TypeAliasType):
+            if field_type in aliases:
+                raise ValueError("Recursive redaction type alias cannot be inspected")
+            aliases.add(field_type)
+            field_type = field_type.__value__
+        else:
+            field_type, metadata = _unwrap_annotated(field_type, metadata)
+    return field_type, metadata
+
+
+def _is_union(origin: Any) -> bool:
+    return origin is Union or origin is UnionType
+
+
+def _has_sensitive(metadata: tuple[Any, ...]) -> bool:
+    return any(isinstance(m, _SensitiveMarker) for m in metadata)
+
+
+def _count_sensitive(metadata: tuple[Any, ...]) -> int:
+    count = 0
+    for m in metadata:
+        if isinstance(m, _SensitiveMarker):
+            count += 1
+    return count
+
+
+# A path step describes one descent operation accumulated during the walk.
+# Concrete forms:
+#   ("attr", name)  - dict-attribute access by string name (BaseModel field)
+#   ("list",)        - list/tuple element iteration (yields (index, item))
+#   ("dict",)        - dict element iteration (yields (key, item))
+# At leaf emission, the steps are baked into a value_provider closure.
+_PathStep = tuple[Any, ...]
+
+
+def _build_value_provider(
+    steps: tuple[_PathStep, ...],
+) -> Callable[[dict[str, Any]], Any]:
+    """Compile a path-step list into a value_provider closure.
+
+    Semantics (spec §4.2.5):
+      - Zero container steps: returns the scalar at the path, OR ``None`` if
+        the path descends through an Optional sub-model whose value is
+        ``None`` at runtime.
+      - N container steps (N >= 1): returns a flat list of
+        (key_or_keys, leaf_value) pairs (possibly empty if any intermediate
+        Optional sub-model is ``None`` at runtime).  With one container step
+        the key is a single int/str; with two or more it is a tuple of
+        keys/indices in descent order.
+
+    **Optional-intermediate disposition (rev-4 sibling-API parity).**
+    ``("attr", name)`` steps descend dict-by-name; the walker emits inner
+    paths for fields whose declared type is ``OptionalModel | None`` so the
+    schema-completeness contract holds.  At runtime the value at the
+    intermediate slot may be ``None`` (Pydantic's ``model_dump`` reflects
+    ``Optional[Model] = None`` as ``None``); the inner path is unreachable
+    in that example.  This closure skips such frontier entries — mirroring
+    the sibling ``_build_substitute_provider``'s None-skip pattern (lines
+    250-271). The earlier docstring
+    rule ("KeyError/TypeError on non-conforming root is correct
+    behaviour") predates Optional sub-model coverage and is no
+    longer load-bearing — a None intermediate is conforming-to-schema by
+    Pydantic's definition.
+
+    For the scalar (zero-container) case with an unreachable path the
+    closure returns ``None``: the property test's only-allowed skip rule
+    (``raw_value is None: continue``) treats this as semantically
+    consistent with "no sensitive data at this path for this example."
+    For the container case the closure returns an empty list of pairs:
+    the test's container branch handles this via ``dict([])`` → empty
+    key set → no per-key comparisons.
+
+    Non-Optional non-conforming roots (e.g., a missing required key) still
+    raise KeyError — that remains a bug-in-caller signal.
+    """
+    container_step_count = sum(1 for s in steps if s[0] in ("list", "dict"))
+
+    def provider(root: dict[str, Any]) -> Any:
+        # Stream of (key_path, value) tuples. key_path is a tuple of keys at
+        # container boundaries; for non-container traversal it remains ().
+        frontier: list[tuple[tuple[Any, ...], Any]] = [((), root)]
+        for step in steps:
+            kind = step[0]
+            if kind == "attr":
+                name = step[1]
+                # Optional / union-arm disposition: skip frontier entries
+                # whose ``current`` is None, and mapping entries where the
+                # active runtime arm lacks this field. The walker emits inner
+                # paths through Optional and Union sub-models so schema
+                # completeness holds; at runtime a particular example may
+                # select a different union arm, making the path unreachable.
+                # Sibling parity with _build_substitute_provider.
+                next_frontier: list[tuple[tuple[Any, ...], Any]] = []
+                for keys, current in frontier:
+                    if current is None:
+                        continue
+                    if isinstance(current, Mapping) and name not in current:
+                        continue
+                    next_frontier.append((keys, current[name]))
+                frontier = next_frontier
+            elif kind == "list":
+                # Defensive against a None intermediate (Optional[list[...]]
+                # = None at runtime): treat as empty iteration.
+                frontier = [((*keys, idx), item) for keys, current in frontier if current is not None for idx, item in enumerate(current)]
+            elif kind == "dict":
+                # Defensive against a None intermediate (Optional[dict[...]]
+                # = None at runtime): treat as empty iteration.
+                frontier = [((*keys, key), item) for keys, current in frontier if current is not None for key, item in current.items()]
+            else:
+                raise AssertionError(f"unknown path step kind: {kind!r}")
+
+        if container_step_count == 0:
+            # Scalar case.  If the frontier is empty (path unreachable due
+            # to an Optional intermediate being None), return None — the
+            # property test's only-allowed skip rule treats this as "no
+            # sensitive data at this path for this example".
+            if not frontier:
+                return None
+            ((_, value),) = frontier
+            return value
+        if container_step_count == 1:
+            return [(keys[0], value) for keys, value in frontier]
+        return [(keys, value) for keys, value in frontier]
+
+    return provider
+
+
+def _build_substitute_provider(
+    steps: tuple[_PathStep, ...],
+) -> Callable[[dict[str, Any], Callable[[Any], Any]], None]:
+    """Compile a path-step list into an in-place substitute closure.
+
+    Sibling to ``_build_value_provider``: walks the root dict by the same
+    container-aware path and replaces every reachable leaf with
+    ``transform(old_value)``.  Mutates the input dict in place.
+
+    Path semantics mirror the walker:
+      - ``("attr", name)`` steps descend dict-by-name.
+      - ``("list",)`` and ``("dict",)`` steps iterate every element/value.
+
+    The final step is always ``("attr", name)`` (every TraversalNode lives
+    inside a named field).  At the final attr step, the dict at the current
+    descent point has the leaf assigned at the name slot.
+
+    Caller atomicity: when ``transform`` raises mid-walk, the in-progress
+    dict has been partially mutated.  The walker MUST be invoked on a local
+    variable that is only returned/exposed on full success — the response
+    walker pattern (rev-3 W8b).  The closure does not catch ``transform``
+    exceptions; that is by design.
+
+    No-op for empty input (e.g., empty list/dict containers): the frontier
+    is exhausted before reaching the leaf and ``transform`` is never called.
+    """
+    if not steps:
+        raise AssertionError("substitute_provider requires at least one step (the field-level attr).")
+    if steps[-1][0] != "attr":
+        # walk_model_schema always emits TraversalNodes for a named field
+        # (the last step is always ('attr', field_name)); a non-attr final
+        # step would mean we're trying to substitute INTO an iteration step
+        # itself, which has no destination semantics.
+        raise AssertionError(f"substitute_provider requires final attr step; got steps={steps!r}.")
+    prefix_steps = steps[:-1]
+    leaf_name = steps[-1][1]
+
+    def provider(root: dict[str, Any], transform: Callable[[Any], Any]) -> None:
+        # frontier holds dict references whose ``leaf_name`` slot is the
+        # final substitution target.  Container steps fan the frontier out.
+        #
+        # Optional-container handling: an ``("attr", name)`` step targets a
+        # field that may be ``None`` at runtime when the field's declared
+        # type is ``OptionalModel | None``.  The walker still emits inner-
+        # path TraversalNodes through the BaseModel arm (e.g.,
+        # ``source.inline_blob.content`` when ``inline_blob`` is None at
+        # runtime).  The redactor only invokes ``substitute_provider`` for
+        # Sensitive nodes, so the inner Sensitive leaf's provider receives
+        # an arguments dict whose intermediate Optional is None.  Skipping
+        # any frontier entry whose value at the named field is None (or
+        # absent entirely) is the correct disposition: there is no leaf to
+        # substitute INTO, and the absence is itself the audit fact.
+        frontier: list[Any] = [root]
+        for step in prefix_steps:
+            kind = step[0]
+            if kind == "attr":
+                name = step[1]
+                next_frontier: list[Any] = []
+                for current in frontier:
+                    # Optional-intermediate disposition (sibling parity with
+                    # _build_value_provider lines 211-216): a None intermediate
+                    # or a runtime union arm that lacks this named field has no
+                    # leaf to substitute INTO — skip it. Direct subscript on the
+                    # present-key case; the value may itself be None (declared
+                    # Optional sub-model unset at runtime), which is equally
+                    # unsubstitutable, so skip that too.
+                    if current is None:
+                        continue
+                    if isinstance(current, Mapping) and name not in current:
+                        continue
+                    value = current[name]
+                    if value is None:
+                        continue
+                    next_frontier.append(value)
+                frontier = next_frontier
+            elif kind == "list":
+                frontier = [item for current in frontier for item in current]
+            elif kind == "dict":
+                frontier = [item for current in frontier for item in current.values()]
+            else:
+                raise AssertionError(f"unknown path step kind: {kind!r}")
+        for container in frontier:
+            if container is None:
+                continue
+            if isinstance(container, Mapping) and leaf_name not in container:
+                continue
+            container[leaf_name] = transform(container[leaf_name])
+
+    return provider
+
+
+def walk_model_schema(
+    model: Any,
+    *,
+    with_values: bool = False,
+    _path_prefix: str = "",
+    _steps: tuple[_PathStep, ...] = (),
+) -> Iterator[TraversalNode]:
+    """Yield a TraversalNode per field; descend per §4.2.5.
+
+    Container shapes descended into: ``list[X]``, ``tuple[X, ...]``,
+    ``dict[str, X]``, ``Optional[X]``/``Union[..., X, ...]`` (where ``X``
+    is a ``BaseModel``).
+
+    When ``with_values`` is True, each node receives a ``value_provider``
+    closure that, given a root dict, returns either the value at that path
+    (when no container descent occurred above it) or a list of
+    ``(key_or_index, value)`` pairs (when one or more container descents
+    occurred above it).
+
+    A ``_SensitiveMarker`` on a node short-circuits descent into that
+    node's children (rev-5 A1): the redactor will replace the whole
+    value with the summarizer output, so yielding inner nodes would
+    produce paths with no reachable values in the redacted view.
+
+    Duplicate ``_SensitiveMarker`` in a single field's Annotated tuple
+    raises ``ValueError`` (the spec permits at most one).
+    """
+    if not (isinstance(model, type) and issubclass(model, BaseModel)):
+        raise TypeError(f"walk_model_schema requires a pydantic BaseModel subclass; got {model!r}.")
+
+    for field_name, field_info in model.model_fields.items():
+        # Pydantic stores the field annotation in ``annotation`` (already
+        # post-Annotated for FieldInfo purposes); the surrounding metadata
+        # is exposed via ``metadata``. Reassemble the Annotated view so a
+        # single normalisation path handles all entry forms.
+        raw_type = field_info.annotation
+        raw_metadata: tuple[Any, ...] = tuple(field_info.metadata)
+        field_type, metadata = _normalise(raw_type, raw_metadata)
+
+        sensitive_count = _count_sensitive(metadata)
+        if sensitive_count > 1:
+            raise ValueError(f"Field {field_name!r} has {sensitive_count} Sensitive() markers; spec §4.2.5 permits at most one per field.")
+
+        path = f"{_path_prefix}{field_name}" if _path_prefix == "" else f"{_path_prefix}.{field_name}"
+        field_steps = (*_steps, ("attr", field_name))
+
+        yield from _walk_type(
+            field_type=field_type,
+            metadata=metadata,
+            path=path,
+            with_values=with_values,
+            steps=field_steps,
+        )
+
+
+def _walk_type(
+    *,
+    field_type: Any,
+    metadata: tuple[Any, ...],
+    path: str,
+    with_values: bool,
+    steps: tuple[_PathStep, ...],
+) -> Iterator[TraversalNode]:
+    """Yield TraversalNodes for a single typed slot at ``path``.
+
+    Handles Annotated unwrap (already done by caller for the field-level
+    entry), Union/Optional fan-out, container descent, BaseModel descent,
+    and scalar emission. Sensitive short-circuit applies here: if
+    ``metadata`` contains a marker we yield the current node and stop.
+    """
+    # Re-normalise in case a nested Annotated slipped through (Union arms
+    # commonly carry their own Annotated wrappers).
+    field_type, metadata = _normalise(field_type, metadata)
+
+    origin = get_origin(field_type)
+
+    # Yield-and-return guard: a Sensitive marker on this slot suppresses
+    # descent (rev-5 A1).
+    if _has_sensitive(metadata):
+        yield TraversalNode(
+            path=path,
+            field_type=field_type,
+            metadata=metadata,
+            value_provider=_build_value_provider(steps) if with_values else None,
+            substitute_provider=_build_substitute_provider(steps) if with_values else None,
+        )
+        return
+
+    # Union/Optional: descend into every non-None arm at the SAME path.
+    #
+    # Two emission rules apply (closes rev-3 M1 floor-check):
+    #
+    #   1. A descendable arm (BaseModel, parameterised container, nested Union)
+    #      is always walked — that's the structural-descent contract Tasks 1/7
+    #      established for nested-path redaction.
+    #   2. A non-descendable scalar arm (str, int, bool, ...) is walked iff
+    #      either (a) it carries a Sensitive marker (rev-3 W8a:
+    #      Optional[Annotated[str, Sensitive()]]) OR (b) the Union is
+    #      structurally an Optional — exactly one non-None arm.  Case (b)
+    #      means the Pydantic model still declared a single field; the walker
+    #      must emit a leaf at the field path so the rev-3 M1 floor-check
+    #      (every ``model_fields`` key appears as a walk root) holds.  The
+    #      legacy "skip non-descendable scalar arms" rule existed to prevent
+    #      spurious duplicate yields for genuine multi-arm scalar Unions like
+    #      ``str | _Model | bool`` (test_walk_three_arm_union pins this);
+    #      Optional-of-scalar is single-armed by construction so duplicate-
+    #      yield risk does not apply.
+    #
+    # The Optional-of-scalar carve-out is deliberately narrow: we still skip
+    # scalar arms when ANY other non-None arm is present.  test_walk_three_arm_union
+    # (``field: str | _InnerWithSecret | bool``) MUST continue to walk only via
+    # the BaseModel arm; this fix is purely additive for the Optional[scalar]
+    # case that previously emitted no node at all.
+    if _is_union(origin):
+        # Schema-only metadata can wrap the None arm (SkipJsonSchema[None]);
+        # normalize before counting arms so an optional scalar stays optional.
+        arms = [_normalise(arm, ()) for arm in get_args(field_type)]
+        non_none_arms = [(arm_type, arm_metadata) for arm_type, arm_metadata in arms if arm_type is not type(None)]
+        is_optional_of_scalar = len(non_none_arms) == 1
+        for arm_type, arm_metadata in non_none_arms:
+            if not _is_descendable(arm_type) and not _has_sensitive(arm_metadata) and not is_optional_of_scalar:
+                continue
+            yield from _walk_type(
+                field_type=arm_type,
+                metadata=arm_metadata,
+                path=path,
+                with_values=with_values,
+                steps=steps,
+            )
+        return
+
+    # Container descent.
+    #
+    # NOTE: bare `list` and bare `dict` (unparameterised) have get_origin() == None
+    # in Python's typing machinery, so they do NOT match the `origin in (list, tuple)`
+    # or `origin is dict` branches below. Guard them explicitly here so they raise
+    # ValueError instead of silently falling through to the scalar/leaf path.
+    if field_type is list:
+        raise ValueError(f"Field at path {path!r} uses a bare list; spec §4.2.5 requires a parameterised element type.")
+    if field_type is dict:
+        raise ValueError(f"Field at path {path!r} uses an unparameterised dict; spec §4.2.5 requires dict[str, X].")
+
+    if origin in (list, tuple):
+        args = get_args(field_type)
+        if not args:
+            raise ValueError(f"Field at path {path!r} uses a bare list/tuple; spec §4.2.5 requires a parameterised element type.")
+        # Fixed-length heterogeneous tuples (e.g. tuple[int, str]) are not supported.
+        # The only tuple form that can be descended into is the variable-length
+        # tuple[X, ...] form, identified by exactly two args where the second is
+        # Ellipsis.  Any other multi-arg tuple silently drops all but the first
+        # element type — the exact silent-pass failure the walker was written to
+        # prevent.
+        if origin is tuple and not (len(args) == 2 and args[1] is Ellipsis):
+            raise ValueError(
+                f"Field at path {path!r} uses a fixed-length tuple; spec §4.2.5 supports only the variable-length form tuple[X, ...]."
+            )
+        element_type = args[0]
+        yield from _walk_type(
+            field_type=element_type,
+            metadata=(),
+            path=f"{path}[*]",
+            with_values=with_values,
+            steps=(*steps, ("list",)),
+        )
+        return
+
+    if origin is dict:
+        args = get_args(field_type)
+        if len(args) != 2:
+            raise ValueError(f"Field at path {path!r} uses an unparameterised dict; spec §4.2.5 requires dict[str, X].")
+        key_type, element_type = args
+        if key_type is not str:
+            raise ValueError(f"Field at path {path!r} uses a non-str dict key ({key_type!r}); spec §4.2.5 supports dict[str, X] only.")
+        yield from _walk_type(
+            field_type=element_type,
+            metadata=(),
+            path=f"{path}{{*}}",
+            with_values=with_values,
+            steps=(*steps, ("dict",)),
+        )
+        return
+
+    # BaseModel descent.
+    if isinstance(field_type, type) and issubclass(field_type, BaseModel):
+        yield from walk_model_schema(
+            field_type,
+            with_values=with_values,
+            _path_prefix=path,
+            _steps=steps,
+        )
+        return
+
+    # Scalar/Any/object leaf: yield a node and stop.
+    #
+    # ``substitute_provider`` is meaningful only when the leaf sits at a named
+    # field — that is, when ``steps[-1]`` is ``("attr", name)`` — because
+    # substitution writes a new value INTO a dict at the named slot.  Container-
+    # element leaves (``list[str]``, ``dict[str, str]`` with non-Sensitive scalar
+    # elements) end their step chain with ``("list",)`` or ``("dict",)`` — there
+    # is no named destination to substitute into.  The redactor at
+    # :func:`_redact_via_schema` only consumes ``substitute_provider`` for nodes
+    # carrying a ``_SensitiveMarker``; by spec §4.2.5 Sensitive markers live on
+    # named fields (the walker's "Sensitive yield-and-return" branch above
+    # always sees ``("attr", name)`` as the last step), so producing ``None``
+    # for container-element scalar leaves is correct.  The adequacy guard
+    # (§4.4.2) still gets its closed-list scalar check via
+    # ``node.field_type`` — substitute_provider being None there is harmless.
+    needs_substitute = bool(steps) and steps[-1][0] == "attr"
+    yield TraversalNode(
+        path=path,
+        field_type=field_type,
+        metadata=metadata,
+        value_provider=_build_value_provider(steps) if with_values else None,
+        substitute_provider=_build_substitute_provider(steps) if with_values and needs_substitute else None,
+    )
+
+
+def _is_descendable(t: Any) -> bool:
+    """True iff ``t`` is a BaseModel, parameterised container, or Union.
+
+    Used to decide whether a Union arm warrants descent. Scalar arms
+    (``str``, ``int``, ``bool``) and ``None`` are skipped.
+    """
+    if isinstance(t, type) and issubclass(t, BaseModel):
+        return True
+    origin = get_origin(t)
+    if _is_union(origin):
+        return True
+    return origin in (list, tuple, dict)
+
+
+@dataclass(frozen=True, slots=True)
+class HandlesNoSensitiveDataReason:
+    """Structured justification required for handles_no_sensitive_data=True (spec §4.2.3).
+
+    Replaces rev-3's free-text string. Adequacy-guard validates each field at
+    construction time; the same constraints are checked at manifest-load time
+    by the adequacy guard (§4.4).
+
+    sensitive_data_locations: where sensitive material actually lives if not in
+        this tool's arguments or responses (e.g., 'server-side secret resolver',
+        'request headers stripped before tool dispatch'). Must be non-empty —
+        an empty list provides no signal to auditors.
+
+    why_arguments_safe: prose explanation of why every argument, including any
+        string-typed ones, is safe to persist verbatim. Adequacy-guard checks
+        length >= 32 chars (post-strip) and that the text does not exact-match
+        any other tool's why_arguments_safe (mass-copy uniqueness, §4.4.4).
+
+    why_responses_safe: same as above, for responses.
+    """
+
+    sensitive_data_locations: tuple[str, ...]
+    why_arguments_safe: str
+    why_responses_safe: str
+
+    def __post_init__(self) -> None:
+        # Validators FIRST, then freeze-guard. Order matters: a future change
+        # that mutates a field as part of validation must not run after freeze.
+        if not self.sensitive_data_locations:
+            raise ValueError(
+                "HandlesNoSensitiveDataReason.sensitive_data_locations is empty. "
+                "Every declarative manifest entry must enumerate at least one "
+                "location where sensitive data could plausibly appear but does "
+                "not for this tool (e.g., 'response.body' for a tool that "
+                "returns only structural metadata). If the tool genuinely has "
+                "no plausible sensitive surface, declare so explicitly — e.g., "
+                "('no LLM-supplied inputs',). The list is part of the audit "
+                "trail; an empty list provides no information to auditors. "
+                "Alternatively, migrate the tool's arguments to a Pydantic "
+                "model with Sensitive[T] annotations (the type-driven "
+                "manifest-entry shape, §4.2.1)."
+            )
+        for label, value in (
+            ("why_arguments_safe", self.why_arguments_safe),
+            ("why_responses_safe", self.why_responses_safe),
+        ):
+            if len(value.strip()) < 32:
+                raise ValueError(
+                    f"HandlesNoSensitiveDataReason.{label} must be at least "
+                    "32 characters (excluding leading/trailing whitespace). "
+                    f"The current value strips to {len(value.strip())} characters. "
+                    "Auditors require enough context to understand WHY the "
+                    "tool's argument or response shape cannot carry sensitive "
+                    "data; a short label is insufficient. "
+                    "Spec §4.2.3 example: 'set_pipeline arguments are "
+                    "validated against a Pydantic model with extra=forbid; "
+                    "every field is structural metadata.'"
+                )
+        freeze_fields(self, "sensitive_data_locations")
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRedactionPolicy:
+    """Declarative redaction policy (spec §4.2.3). Used inside the ``policy``
+    field of a manifest entry whose argument surface is purely structural (no
+    Pydantic argument model declared). The type-driven shape (§4.2.1 with
+    ``argument_model`` set) is preferred for any tool that has, or would
+    benefit from, a redaction-bearing Pydantic argument model.
+
+    Five invariants are enforced at construction time:
+
+    1. **No orphan summarizers** — every key in ``argument_summarizers`` must
+       also appear in ``sensitive_argument_keys``. A summarizer for a key that
+       is not declared sensitive is dead code and silently misleads auditors
+       about which keys are redacted.
+
+    2. **``handles_no_sensitive_data=True`` requires a reason struct** — the
+       structured justification is part of the audit trail; an unexplained
+       exemption is forbidden (spec §4.2.3).
+
+    3. **``handles_no_sensitive_data=False`` forbids a reason struct** — the
+       reason struct is meaningful only for an exemption; for a tool with
+       sensitive data the redaction policy is the documentation.
+
+    4. **``handles_no_sensitive_data=False`` requires ``known_response_keys``**
+       — the allowlist defends against response-shape drift; unknown keys at
+       persistence time are fail-closed redacted with a fixed sentinel.
+
+    5. **``known_argument_keys`` covers ``sensitive_argument_keys`` when set or
+       when ``redact_unknown_argument_keys`` is enabled** — the argument
+       allowlist is opt-in for legacy compatibility, but once a policy uses it
+       to fail-close unknown arguments, every sensitive argument key must also
+       be known.
+
+    **Response-walker fail-closed behavior for declarative entries:**
+
+    When ``handles_no_sensitive_data=False``, ``redact_tool_call_response``
+    iterates ``response.items()`` and dispatches each key as follows:
+
+    - Keys in ``sensitive_response_keys`` → substituted with
+      ``REDACTED_SENSITIVE_NO_SUMMARIZER`` (declarative entries have no
+      per-key response summarizers; argument_summarizers covers only
+      argument keys).
+    - Keys in ``known_response_keys`` that are NOT in
+      ``sensitive_response_keys`` → a closed type/value projection. Public
+      framing values survive; externally derived keys and scalars are
+      summarized.
+    - Keys in NEITHER set → substituted with the fixed sentinel
+      ``REDACTED_UNKNOWN_RESPONSE_KEY``. This is the **fail-closed
+      default**: a key the policy author did not declare is sentinel'd,
+      not leaked.
+
+    Therefore ``known_response_keys`` MUST enumerate every key the
+    handler may emit in normal operation (both success and failure
+    branches).  The runtime smoke test
+    (``test_declarative_manifest_runtime_smoke.py``) verifies this by
+    exercising each declarative entry through a real
+    ``redact_tool_call_response`` call.  Adequacy-guard assertion 5
+    and additionally checks that ``sensitive_response_keys ⊆
+    known_response_keys`` at import time so a misspelled sensitive key
+    is caught before any payload reaches the walker.
+
+    NOTE on freeze: ``argument_summarizers`` values are Callables;
+    ``deep_freeze`` passes Callables through unchanged (verified against
+    ``src/elspeth/contracts/freeze.py:78``). Identity-equality of summarizer
+    callables is the policy contract.
+    """
+
+    sensitive_argument_keys: tuple[str, ...] = ()
+    sensitive_response_keys: tuple[str, ...] = ()
+    known_argument_keys: tuple[str, ...] = ()
+    known_response_keys: tuple[str, ...] = ()
+    argument_summarizers: Mapping[str, Callable[[Any], str]] = field(default_factory=dict)
+    handles_no_sensitive_data: bool = False
+    handles_no_sensitive_data_reason_struct: HandlesNoSensitiveDataReason | None = None
+    redact_unknown_argument_keys: bool = False
+
+    def __post_init__(self) -> None:
+        # Validators run BEFORE freeze_fields so they read mutable state.
+        # If any raise, the dataclass __init__ raises and the object is
+        # never returned — atomic construction failure.
+
+        orphan_summarizers = set(self.argument_summarizers) - set(self.sensitive_argument_keys)
+        if orphan_summarizers:
+            raise ValueError(
+                f"argument_summarizers keys {sorted(orphan_summarizers)} are not declared in "
+                f"sensitive_argument_keys; orphan summarizers indicate a policy bug."
+            )
+
+        orphan_sensitive_arguments = set(self.sensitive_argument_keys) - set(self.known_argument_keys)
+        if (self.known_argument_keys or self.redact_unknown_argument_keys) and orphan_sensitive_arguments:
+            raise ValueError(
+                f"sensitive_argument_keys {sorted(orphan_sensitive_arguments)} are not declared in "
+                "known_argument_keys; the opt-in argument allowlist must cover every sensitive argument key."
+            )
+
+        if self.handles_no_sensitive_data and self.handles_no_sensitive_data_reason_struct is None:
+            raise ValueError(
+                "handles_no_sensitive_data=True requires a non-None "
+                "handles_no_sensitive_data_reason_struct. Build a "
+                "HandlesNoSensitiveDataReason instance with concrete fields."
+            )
+
+        if not self.handles_no_sensitive_data and self.handles_no_sensitive_data_reason_struct is not None:
+            raise ValueError("handles_no_sensitive_data_reason_struct is only meaningful when handles_no_sensitive_data=True.")
+
+        if not self.handles_no_sensitive_data and not self.known_response_keys:
+            raise ValueError(
+                "known_response_keys must be declared (non-empty) when "
+                "handles_no_sensitive_data=False. The allowlist defends "
+                "against response-shape drift; unknown keys at persistence "
+                "time are fail-closed redacted with a fixed sentinel."
+            )
+
+        freeze_fields(
+            self,
+            "sensitive_argument_keys",
+            "sensitive_response_keys",
+            "known_argument_keys",
+            "known_response_keys",
+            "argument_summarizers",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRedaction:
+    """One manifest entry. Each entry is keyed by tool name in MANIFEST.
+
+    Exactly one of the two shapes must be populated:
+      • type-driven  — argument_model is not None
+      • declarative  — argument_model is None AND policy is not None
+
+    Both populated → ValueError (precedence is undefined; use one shape).
+    Neither populated → ValueError (every tool must have a redaction
+    declaration; the adequacy guard cannot consult what doesn't exist).
+
+    response_model is only valid alongside argument_model. Declarative
+    entries express response shape via policy.known_response_keys.
+    """
+
+    argument_model: type[BaseModel] | None = None
+    response_model: type[BaseModel] | None = None
+    policy: ToolRedactionPolicy | None = None
+
+    def __post_init__(self) -> None:
+        type_driven = self.argument_model is not None
+        declarative = self.policy is not None
+
+        if type_driven and declarative:
+            raise ValueError(
+                "ToolRedaction declared both argument_model and policy; "
+                "each manifest entry must choose exactly one shape. "
+                "If a tool has a Pydantic argument model with Sensitive[T] "
+                "annotations, the model is the single source of truth — "
+                "remove the policy. If the argument surface is purely "
+                "structural and does not benefit from Sensitive[T], "
+                "remove the argument_model and declare the policy."
+            )
+        if not type_driven and not declarative:
+            raise ValueError(
+                "ToolRedaction declared neither argument_model nor policy; "
+                "every manifest entry must declare its redaction shape. "
+                "If the tool genuinely handles no sensitive material, set "
+                "policy=ToolRedactionPolicy(handles_no_sensitive_data=True, "
+                "handles_no_sensitive_data_reason_struct=...) — the "
+                "structured reason is part of the audit trail."
+            )
+        if self.response_model is not None and not type_driven:
+            raise ValueError(
+                "response_model requires argument_model to also be set "
+                "(declarative entries express response shape via "
+                "policy.known_response_keys)."
+            )
+
+
+_OPTION_SHAPE_CLASSES = ("mapping", "scalar", "sequence", "set")
+
+
+@observation_boundary(
+    tier=3,
+    source="LLM-authored plugin option value (or one immediate child of it) reaching the shape summarizer",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "never raises; classifies the value into the closed _OPTION_SHAPE_CLASSES vocabulary and never returns any part of the value itself"
+    ),
+)
+def _option_shape_class(value: object) -> str:
+    if isinstance(value, Mapping):
+        return "mapping"
+    if isinstance(value, (list, tuple)):
+        return "sequence"
+    if isinstance(value, AbstractSet):
+        return "set"
+    return "scalar"
+
+
+@observation_boundary(
+    tier=3,
+    source="LLM-authored set_source/node/output 'options' mapping (open plugin-defined surface)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "never raises; a non-container collapses to _REDACTED_OPTION_VALUE and a container to its "
+        "shape class, entry count, and closed-vocabulary child-shape counts — no key or value is echoed"
+    ),
+)
+def _summarize_option_shape(value: object) -> object:
+    if not isinstance(value, (Mapping, list, tuple, AbstractSet)):
+        return _REDACTED_OPTION_VALUE
+
+    shape_class = _option_shape_class(value)
+    children = value.values() if isinstance(value, Mapping) else value
+    shape_counts = dict.fromkeys(_OPTION_SHAPE_CLASSES, 0)
+    entry_count = 0
+    for child in children:
+        child_shape = _option_shape_class(child)
+        shape_counts[child_shape] += 1
+        entry_count += 1
+    return {
+        "_option_shape": shape_class,
+        "entry_count": entry_count,
+        "value_shape_counts": shape_counts,
+    }
+
+
+@trust_boundary(
+    tier=3,
+    source="LLM-authored set_source/node/output 'options' tool-call argument (open plugin-defined surface)",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="never raises; returns the canonical-JSON shape summary for a mapping, else the fixed '<invalid-options>' marker",
+    non_raising=True,
+)
+def _summarize_set_source_options(options: object) -> str:
+    """Summarizer for ``set_source.options`` (spec §4.2.6).
+
+    Produces canonical JSON for the option payload's bounded shape: the root
+    container kind, its entry count, and counts drawn from a closed vocabulary
+    of immediate value-shape classes. Raw mapping keys and nested contents are
+    never serialized. Plugin options are an open, plugin-defined surface and
+    routinely carry filesystem paths, source object locators, prompt text, and
+    credential material such as connection strings, SAS tokens, API keys, and
+    client secrets. Therefore the summary must not rely on per-plugin
+    sensitive-key knowledge or on the blob_ref path-only redactor.
+
+    Contract (spec §4.2.6, §9 RSK-03):
+      * MUST NOT raise on any reachable input value.
+      * MUST return ``str``.
+
+    ``default=str`` on :func:`json.dumps` is retained as a final defensive
+    guard. The fixed summary normally contains only trusted strings and
+    integers.
+    """
+    return json.dumps(
+        _summarize_option_shape(options) if isinstance(options, Mapping) else "<invalid-options>",
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+# Earlier provider output sometimes stringified nested objects. Those values
+# violate the advertised object grammar and now reject at admission. The outer
+# tool-call JSON decoder remains bounded; plugin/data keys remain dynamic.
+_LlmJsonObject = Annotated[
+    dict[str, Any],
+    Sensitive(summarizer=_summarize_set_source_options),
+]
+
+
+def _reject_supplied_null(value: Any) -> Any:
+    """Omission may use an internal None default; an authored null may not."""
+    if value is None:
+        raise ValueError("omit this optional field instead of supplying null")
+    return value
+
+
+_OmittableString = Annotated[
+    str | SkipJsonSchema[None],
+    BeforeValidator(_reject_supplied_null),
+]
+
+
+def _reject_coerced_integer(value: Any) -> Any:
+    """JSON Schema integers include integral numbers, but not booleans/text."""
+    if type(value) not in (int, float):
+        raise ValueError("expected a JSON integer")
+    return value
+
+
+_JsonInteger = Annotated[int, BeforeValidator(_reject_coerced_integer)]
+
+
+class SetSourceArgumentsModel(BaseModel):
+    """Redaction-bearing argument model for the ``set_source`` tool.
+
+    Mirrors the JSON schema currently consumed by ``_execute_set_source``
+    (``tools.py``) and the required-paths check at ``service.py``
+    ``_TOOL_REQUIRED_PATHS["set_source"]``.  The ``Annotated`` on
+    ``options`` drives mechanical redaction at the persistence boundary;
+    the model itself is also used at the dispatch boundary by
+    :meth:`Model.model_validate` so the LLM-supplied dict is validated
+    before ``_execute_set_source`` reads any field.
+
+    ``extra="forbid"`` is required (rev-2 M.1): without it the model
+    would silently accept fields the walker has no record of, breaking
+    the manifest/canonical-arguments parity invariant the adequacy
+    guard relies on.
+
+    Field set is exactly the four required keys plus optional
+    ``source_name`` from the JSON schema at ``tools.py``.  Fields belonging to neighbouring tools
+    (``label``, ``blob_id``, ``inline_blob`` — those are on
+    ``set_source_from_blob`` / ``create_blob``) are intentionally absent
+    so ``extra="forbid"`` rejects misrouted argument shapes early.
+    """
+
+    source_name: str = "source"
+    plugin: str
+    on_success: str
+    options: _LlmJsonObject
+    on_validation_failure: str | None = None
+    # One-sentence composer-authored prose for the Spec tab. Free-text scalar
+    # like _PipelineEdgeModel.label — structurally not a leak surface, so no
+    # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
+    description: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+def _summarize_interpretation_term(text: str) -> str:
+    """Summarizer for ``request_interpretation_review.user_term`` and
+    ``request_interpretation_review.llm_draft`` (F-34).
+
+    Returns a stable fixed sentinel with no value-derived length signal. The
+    authoritative text remains in the ``interpretation_events`` row; the
+    audit-side row in ``chat_messages.tool_calls`` carries only the sentinel.
+
+    Naming follows ``_summarize_inline_blob_content`` (American
+    spelling). Contract: MUST NOT raise on any reachable input; MUST
+    return ``str``.
+    """
+    del text
+    return "<redacted-interpretation-text>"
+
+
+def _summarize_inline_blob_content(content: str) -> str:
+    """Summarizer for blob-content fields (``create_blob.content``,
+    ``update_blob.content``) — spec §4.2.6 / rev-2 M.10.
+
+    The blob ``content`` field is the LLM-supplied raw bytes of a session
+    blob: URLs, JSON snippets, CSV seed data, or arbitrary text that may
+    contain operator-sensitive material.  Persisting the raw payload in
+    ``chat_messages.tool_calls`` would mirror that material into the audit
+    trail beyond its intended retention surface (the blob row itself, the
+    canonical record of file content).  The summarizer collapses the
+    payload to a fixed-form scalar ``<inline-blob:N-bytes>`` where ``N``
+    is the byte-length of the UTF-8 encoded content — disclosing size
+    only (a structural fact already inferable from the persisted blob
+    row's ``size_bytes`` column), never content.
+
+    Contract (spec §4.2.6, §9 RSK-03):
+      * MUST NOT raise on any reachable input value.
+      * MUST return ``str``.
+
+    Type-variability discipline (rev-2 M.10): the type-driven argument
+    models for ``create_blob`` and ``update_blob`` declare
+    ``content: Annotated[str, Sensitive(summarizer=...)]`` plus
+    ``model_config = ConfigDict(extra="forbid")``.  Pydantic's ``str``
+    validation rejects ``None``, ``int``, ``bool``, ``list``, ``dict``,
+    and any other non-string before the summarizer is invoked, so this
+    function is reached only with a genuine ``str``.  ``len(b)`` on a
+    Python ``str`` measures code points; we explicitly UTF-8 encode to
+    measure the wire-format byte-length the persistence boundary actually
+    sees, matching the ``size_bytes`` column the handler computes.
+    """
+    return f"<inline-blob:{len(content.encode('utf-8'))}-bytes>"
+
+
+class SetSourceFromBlobArgumentsModel(BaseModel):
+    """Redaction-bearing argument model for the ``set_source_from_blob`` tool.
+
+    Mirrors the JSON schema declared at ``tools.py:1329-1361`` for the
+    ``set_source_from_blob`` definition and its required-paths
+    (``blob_id``, ``on_success``).
+
+    ``options`` is :class:`Sensitive` with the same summarizer
+    (:func:`_summarize_set_source_options`) used by
+    :class:`SetSourceArgumentsModel`.  ``set_source_from_blob`` merges
+    caller-supplied ``options`` with the resolved blob's authoritative
+    ``path`` and ``blob_ref`` at ``_resolve_source_blob`` (``tools.py:
+    1961-1966``); the merged dict carries an internal storage path that
+    must not enter the audit-side ``chat_messages.tool_calls`` row
+    verbatim.  Treating the caller-supplied ``options`` slot as
+    Sensitive at the argument boundary maintains uniformity with
+    ``set_source.options`` so an LLM that happens to include a
+    path-like field receives the same redaction discipline regardless
+    of which source-binding tool it invoked.
+
+    ``blob_id`` is a UUID reference, not content; ``plugin`` and
+    ``on_validation_failure`` are operator-controlled discriminators;
+    ``on_success`` is a connection-name string.  None of these carry
+    LLM-supplied sensitive material, so only ``options`` is marked.
+
+    ``options`` default
+    -------------------
+    The JSON schema for ``set_source_from_blob`` does NOT list
+    ``options`` as required; the handler at
+    :func:`_execute_set_source_from_blob` reads it via
+    ``arguments.get("options", {})``.  We mirror that absent-equals-empty
+    semantics with ``Field(default_factory=dict)`` rather than declaring
+    ``options: dict | None = None``.  Reason: the summarizer needs to
+    handle a real mapping value and should record an absent slot as an
+    empty option shape, not as a separate ``None`` shape.  Defaulting to
+    ``{}`` preserves "absent = no options" at the argument boundary AND
+    records it accurately on the audit side as an empty-options dict.
+
+    ``plugin`` omission triggers MIME-type-based inference. Failure-choice
+    omission is tracked by model_fields_set and preserves only an existing
+    named source's choice. New sources require an explicit non-empty route;
+    null and empty reach the handler's owned semantic rejection, never a
+    fabricated discard policy.
+
+    ``extra="forbid"`` is required (rev-2 M.1).  Fields belonging to
+    neighbouring tools (``filename``, ``mime_type``, ``content``,
+    ``description`` on ``create_blob``/``update_blob``; ``inline_blob``
+    on ``set_pipeline``) are intentionally absent so ``extra="forbid"``
+    rejects misrouted argument shapes early.
+    """
+
+    blob_id: str
+    on_success: str
+    source_name: str = "source"
+    plugin: _OmittableString = None
+    on_validation_failure: str | None = None
+    options: _LlmJsonObject = Field(default_factory=dict)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SetSourceFromBlobsArgumentsModel(BaseModel):
+    """Redaction-bearing argument model for the ``set_source_from_blobs`` tool.
+
+    The PLURAL authoritative binding (elspeth-0c6a343921): the caller
+    supplies only blob IDs; every persisted ``blobs`` entry field is
+    resolved from the session's authoritative records, never copied from
+    LLM assertions. ``options`` is Sensitive for uniformity with the other
+    source-binding tools; the resolver rejects a caller-supplied ``blobs``
+    key outright.
+    """
+
+    blob_ids: list[str] = Field(min_length=1, max_length=1000)
+    on_success: str
+    source_name: str = "source"
+    on_validation_failure: str | None = None
+    options: _LlmJsonObject = Field(default_factory=dict)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class UpdateBlobArgumentsModel(BaseModel):
+    """Redaction-bearing argument model for the ``update_blob`` tool.
+
+    Mirrors the JSON schema declared at ``tools.py:1398-1415`` for the
+    ``update_blob`` definition and its required-paths (``blob_id``,
+    ``content``).  The ``Annotated`` on ``content`` substitutes a
+    length-disclosing scalar at the persistence boundary so the raw blob
+    payload never enters ``chat_messages.tool_calls`` (rev-2 M.10).
+    Identical summarizer to :class:`CreateBlobArgumentsModel.content` —
+    both blob-mutation tools accept the same payload shape and the
+    audit-side redaction must be uniform across them.
+
+    ``extra="forbid"`` is required (rev-2 M.1).  Fields belonging to
+    neighbouring tools (``filename``, ``mime_type``, ``description`` —
+    those are on ``create_blob``; ``plugin``, ``on_success``, ``options``
+    — those are on ``set_source*``) are intentionally absent so
+    ``extra="forbid"`` rejects misrouted argument shapes early.
+    """
+
+    blob_id: str
+    content: Annotated[str, Sensitive(summarizer=_summarize_inline_blob_content)]
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _RequestInterpretationReviewRedactionModel(BaseModel):
+    """Redaction-bearing argument model for ``request_interpretation_review``
+    (F-34).
+
+    The tool is a session-aware async handler; this model is the persistence-
+    boundary redaction declaration registered in :data:`MANIFEST` so the
+    audit-side ``chat_messages.tool_calls`` row carries summarised content
+    rather than the LLM-supplied raw text.
+
+    ``user_term`` is not strictly a secret — it's a word the user typed —
+    but it could carry PII if the user typed something like ``"rate how
+    cool this transaction involving Jane Doe is"``. ``llm_draft`` is the
+    model's draft and may quote or paraphrase user content. Both fields
+    carry :class:`Sensitive` with :func:`_summarize_interpretation_term`
+    so the truncated form lands in the tool-call column (the full value
+    is still in ``interpretation_events_table.user_term`` /
+    ``interpretation_events_table.llm_draft`` — the authoritative row).
+
+    ``affected_node_id`` and ``kind`` are structural metadata and are not
+    marked :class:`Sensitive`. ``extra="forbid"`` ensures a misrouted
+    argument shape fails fast at the persistence boundary rather than
+    silently accepting an unknown key.
+
+    ``llm_draft`` is optional, mirroring the live handler's argument model
+    (elspeth-9d59c33480): an omitted draft resolves server-side from the
+    staged requirement, so the tool-call row legitimately carries no draft.
+    """
+
+    affected_node_id: str
+    kind: InterpretationKind
+    user_term: Annotated[str, Sensitive(summarizer=_summarize_interpretation_term)]
+    llm_draft: Annotated[str | None, Sensitive(summarizer=_summarize_interpretation_term)] = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class CreateBlobArgumentsModel(BaseModel):
+    """Redaction-bearing argument model for the ``create_blob`` tool.
+
+    Mirrors the JSON schema declared at ``tools.py:1362-1397`` for the
+    ``create_blob`` definition and the required-paths the schema enforces
+    (``filename``, ``mime_type``, ``content``; ``description`` optional).
+    The ``Annotated`` on ``content`` substitutes a length-disclosing
+    scalar at the persistence boundary so the raw blob payload never
+    enters ``chat_messages.tool_calls`` (rev-2 M.10).
+
+    ``extra="forbid"`` is required (rev-2 M.1): the walker enumerates the
+    declared field set and the adequacy guard relies on canonical-args/
+    walker parity.  A stray field that Pydantic silently accepted would
+    leak through every gate (manifest dispatch, persistence, adequacy).
+
+    Fields belonging to neighbouring tools (``blob_id`` — that is on
+    ``update_blob`` / ``set_source_from_blob`` / ``delete_blob`` /
+    ``get_blob_content`` / ``inspect_source``) are intentionally absent
+    so ``extra="forbid"`` rejects misrouted argument shapes early.
+    """
+
+    filename: str
+    mime_type: AllowedMimeType
+    content: Annotated[str, Sensitive(summarizer=_summarize_inline_blob_content)]
+    description: _OmittableString = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+# ---------------------------------------------------------------------------
+# set_pipeline argument model.
+#
+# set_pipeline is the atomic full-state mutation, promoted to a type-driven
+# manifest entry here; the handler is the single validation site (rev-3 N7 /
+# rev-4 M1).
+#
+# Field-shape decisions:
+#   * ``source.options`` IS ``Sensitive[dict]`` with the same summarizer
+#     :func:`_summarize_set_source_options` already used by ``set_source`` /
+#     ``set_source_from_blob`` (uniformity-across-source-binding-tools
+#     contract).
+#   * ``source.inline_blob.content`` IS ``Sensitive[str]`` with the same
+#     summarizer :func:`_summarize_inline_blob_content` already used by
+#     ``create_blob`` / ``update_blob`` (uniformity-across-blob-payload-tools
+#     contract).
+#   * ``nodes[*].options`` and ``outputs[*].options`` ARE ``Sensitive[dict]`` with
+#     :func:`_summarize_set_source_options` — the adequacy guard (§4.4.2)
+#     fails closed on inspection-resistant ``dict[str, Any]`` field types
+#     without Sensitive marking, and the LLM-supplied dicts routinely
+#     carry secret-ref markers, filesystem paths, credential material, and
+#     prompt-template payloads.  Reusing the source-side summarizer is
+#     structurally safe because it records option shape while replacing all
+#     scalar values before persistence; future tool-specific summarizers may
+#     preserve more non-sensitive structure.
+#   * ``nodes[*].routes`` and ``nodes[*].trigger`` are structurally typed
+#     models/dicts with closed scalar leaf types, so they are validated and
+#     walked directly rather than collapsed by the option summarizer.
+#
+# Walker coverage at the persistence boundary:
+# ``walk_model_schema`` descends into ``list[NestedModel]`` so the Sensitive markers on the nested option
+# dicts are discoverable from the outer :class:`SetPipelineArgumentsModel`.
+# This produces four Sensitive paths in the model walk:
+# ``source.options``, ``source.inline_blob.content``, ``nodes[*].options``,
+# ``outputs[*].options``.
+# ---------------------------------------------------------------------------
+
+
+class _InlineBlobModel(BaseModel):
+    """Nested model for ``set_pipeline.source.inline_blob``.
+
+    Mirrors the JSON schema's ``inline_blob`` sub-object declared at
+    ``tools.py:986-1009`` (under the ``set_pipeline.source`` properties).
+    Required: ``filename``, ``mime_type``, ``content``.  ``description``
+    is optional and matches :class:`CreateBlobArgumentsModel.description`
+    (the inline-blob path at :func:`_execute_set_pipeline` invokes
+    :func:`_prepare_blob_create`, which reads ``arguments.get("description")``
+    — operator-facing labels are honoured).
+
+    ``content`` carries :class:`Sensitive` with
+    :func:`_summarize_inline_blob_content` — the SAME summarizer used by
+    :class:`CreateBlobArgumentsModel.content` and
+    :class:`UpdateBlobArgumentsModel.content`.  Uniformity discipline:
+    the LLM may funnel the same raw payload through any of the three
+    blob-creating tools (``create_blob``, ``update_blob``,
+    ``set_pipeline``+``inline_blob``); the audit-side redaction must
+    collapse all three to the same fixed-form ``<inline-blob:N-bytes>``
+    scalar.
+    """
+
+    filename: str
+    mime_type: AllowedMimeType
+    # max_length=262_144 (256 KiB) is the inline-blob payload cap (Phase
+    # Inline-blob content policy. The composer is intended for prose-sized inline data
+    # — a single CSV with up to a few thousand rows — not for binary
+    # transfers.  Pydantic rejects oversize content at the boundary so
+    # ``_prepare_blob_create`` and the storage-write layer never see it;
+    # ToolArgumentError surfaces through the compose loop's ARG_ERROR
+    # routing (CEC1).  The siblings ``CreateBlobArgumentsModel.content``
+    # / ``UpdateBlobArgumentsModel.content`` do not yet carry this cap;
+    # alignment is deferred to the same task that introduces a shared
+    content: Annotated[str, Field(max_length=262_144), Sensitive(summarizer=_summarize_inline_blob_content)]
+    description: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _SetPipelineNamedSourceModel(BaseModel):
+    """Typed fields shared by every named ``set_pipeline.sources`` root.
+
+    Named sources deliberately exclude ``blob_id`` and ``inline_blob``:
+    those custody-bearing fields are supported only by the legacy singular
+    ``source`` branch. Keeping a distinct runtime model makes that semantic
+    boundary visible to the advertised-schema compatibility guard.
+    """
+
+    plugin: str
+    on_success: str
+    options: _LlmJsonObject = Field(default_factory=dict)
+    on_validation_failure: str
+    # One-sentence composer-authored prose for the Spec tab. Free-text scalar
+    # like _PipelineEdgeModel.label — structurally not a leak surface, so no
+    # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
+    description: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _SetPipelineSourceModel(_SetPipelineNamedSourceModel):
+    """Nested model for ``set_pipeline.source``.
+
+    Mirrors the JSON schema's ``source`` sub-object declared at
+    ``tools.py:949-1012``.  Required: ``plugin``, ``on_success`` (matching
+    the inner ``required: ["plugin", "on_success"]`` of the JSON schema).
+    All other fields are optional at the boundary; the runtime handler in
+    :func:`_execute_set_pipeline` resolves them (``blob_id`` →
+    :func:`_resolve_source_blob`; ``inline_blob`` →
+    :func:`_prepare_blob_create`; ``options.path`` →
+    :func:`_validate_source_path` allowlist).
+
+    ``options`` carries :class:`Sensitive` with
+    :func:`_summarize_set_source_options` — the SAME summarizer used by
+    :class:`SetSourceArgumentsModel.options` and
+    :class:`SetSourceFromBlobArgumentsModel.options` (uniformity contract).
+    An LLM that includes a path-like field in
+    ``set_pipeline.source.options`` receives the same redaction discipline
+    it would receive via ``set_source`` or ``set_source_from_blob``.
+
+    ``options`` default
+    -------------------
+    Mirrors :class:`SetSourceFromBlobArgumentsModel.options`:
+    ``Field(default_factory=dict)`` — absent equals empty.  Reason
+    documented at length on
+    :class:`SetSourceFromBlobArgumentsModel.options` and applies
+    identically here.
+
+    ``on_validation_failure`` is a required nonnullable field inherited from
+    the named-source model. Full replacement cannot borrow an old choice;
+    empty values are rejected by semantic admission without choosing discard.
+
+    ``blob_id`` / ``inline_blob`` exclusivity
+    ------------------------------------------
+    The JSON schema does NOT encode "exactly one of (blob_id, inline_blob)
+    or neither" (JSON Schema's ``oneOf`` is not used here); the handler at
+    :func:`_execute_set_pipeline` (``tools.py:4039``) rejects the
+    both-supplied case at runtime.  We deliberately do NOT replicate the
+    exclusivity at the Pydantic model layer — the handler's existing check
+    produces a recoverable ``_failure_result`` with a repair hint that the
+    LLM can act on, whereas a Pydantic-level rejection would surface as a
+    bare ARG_ERROR with no repair guidance.  Two channels for two failure
+    shapes (type vs semantic).
+    """
+
+    blob_id: str | None = None
+    inline_blob: _InlineBlobModel | None = None
+
+
+class _NodeTriggerModel(BaseModel):
+    """Typed sub-model for ``nodes[*].trigger`` (aggregation early-batch trigger).
+
+    Mirrors the JSON schema declared at ``tools.py:735-755`` field-for-field:
+    a ``count`` row-threshold (``int | None``), a ``timeout_seconds`` wall-clock
+    threshold (``float | None``), and an optional boolean-expression
+    ``condition`` (``str | None``) evaluated over runtime batch state
+    (``row['batch_count']`` and ``row['batch_age_seconds']``).
+
+    Every field is a closed-list scalar per spec §4.4.2 — no Sensitive marker
+    is required.  The ``condition`` string is a composer-author-supplied
+    boolean expression (matches the composer's grammar discipline) and does
+    NOT carry user-data values.
+
+    ``extra="forbid"`` aligns with the JSON schema's ``additionalProperties:
+    False`` so the LLM cannot smuggle unmodelled keys past the redaction
+    boundary.
+    """
+
+    count: _JsonInteger | None = None
+    timeout_seconds: StrictFloat | None = None
+    condition: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _PipelineNodeModel(BaseModel):
+    """Nested model for ``set_pipeline.nodes[*]``.
+
+    Mirrors the JSON schema's ``nodes`` array-item shape declared at
+    ``tools.py:1013-1060`` and its inner ``required: ["id", "node_type",
+    "input"]``.
+
+    All optional fields preserve operator-omitted-vs-specified semantics
+    (``X | None = None``) because the handler at
+    :func:`_execute_set_pipeline` distinguishes "absent" from "operator-
+    specified empty/default" for several of them (``plugin`` is None for
+    gates and coalesces; ordinary transform/aggregation ``on_error`` is
+    required by conditional semantic admission). ``options`` defaults to ``{}`` via
+    :func:`Field(default_factory=dict)` (matches the handler's
+    ``n.get("options", {})``).
+
+    Sensitive marker on ``options``
+    -------------------------------
+    ``options`` is an LLM-supplied dict that routinely carries secret-ref
+    markers (``api_key: {"secret_ref": ...}``), filesystem paths
+    (``path: "/data/in.csv"``), and prompt templates (``template: "..."``).
+    Without a Sensitive annotation the adequacy guard (§4.4.2) fails
+    closed on the inspection-resistant ``dict[str, Any]`` field type;
+    with the annotation the persistence boundary collapses the field to
+    the canonical-JSON shape summary that
+    :func:`_summarize_set_source_options` already supplies for source-
+    side options.
+
+    The summarizer is reused (NOT a new node-specific one) because it is
+    option-surface agnostic: it emits only bounded container counts and a
+    closed vocabulary of value-shape classes, without mapping keys or nested
+    content. That behaviour is correct for ``nodes[*].options`` too because
+    plugin options may carry credentials, paths, prompts, or future
+    plugin-defined sensitive fields. Future work may introduce a
+    node-shape-aware summarizer that preserves more non-sensitive structure.
+
+    ``routes`` and ``trigger`` typing
+    ---------------------------------
+    ``routes`` is ``dict[str, str]``: route labels (``"true"``, ``"false"``,
+    or custom labels) → sink/connection identifier strings (per the JSON
+    schema at ``tools.py:715-722``).  The closed-list element type makes the
+    field structurally exempt from the §4.4.2 Sensitive requirement: the
+    walker descends to a ``str``-typed leaf, which is in the closed-list
+    scalar set.
+
+    ``trigger`` is a typed sub-model :class:`_NodeTriggerModel`.  Mirroring
+    the JSON schema (``tools.py:735-755``) field-for-field makes every
+    walked node a closed-list scalar, so the Sensitive requirement falls
+    away.
+
+    These two fields previously carried a Sensitive marker that satisfied
+    the adequacy guard MECHANICALLY while losing useful route/trigger
+    structure behind a generic option summary. Replacing the
+    ``dict[str, Any]`` types with structural typings drops the markers and
+    strengthens boundary validation (e.g., ``routes: {"true": 42}`` is now
+    rejected at Pydantic validation instead of silently passing through to
+    become an audit fact).  See F3 in
+    ``docs/composer/evidence/composer-phase-2-followup-prompt-F1-F6.md``.
+    """
+
+    id: str
+    options: _LlmJsonObject = Field(default_factory=dict)
+    on_error: Annotated[str, Field(min_length=1)] | None = None
+    node_type: str
+    input: str
+    plugin: str | None = None
+    on_success: str | None = None
+    condition: str | None = None
+    routes: dict[str, str] | None = None
+    fork_to: list[str] | None = None
+    branches: list[str] | dict[str, str] | None = None
+    policy: str | None = None
+    merge: str | None = None
+    trigger: _NodeTriggerModel | None = None
+    output_mode: str | None = None
+    expected_output_count: _JsonInteger | None = None
+    timeout_seconds: _StrictTimeoutSeconds | None = None
+    # One-sentence composer-authored prose for the Spec tab. Free-text scalar
+    # like _PipelineEdgeModel.label — structurally not a leak surface, so no
+    # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
+    description: str | None = None
+    # Collector scope binding (barrier-scopes spec §3, WS2 Task 12/13): four
+    # structural names — a scope identifier, a transform node id, and two
+    # closed engine vocabularies. Non-Sensitive scalars like the sibling
+    # policy/merge fields; never payload.
+    scope_name: str | None = None
+    scope_opener: str | None = None
+    scope_policy: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _PipelineEdgeModel(BaseModel):
+    """Nested model for ``set_pipeline.edges[*]``.
+
+    Mirrors the JSON schema's ``edges`` array-item shape declared at
+    ``tools.py:1062-1075`` and its inner ``required: ["id", "from_node",
+    "to_node", "edge_type"]``.  ``label`` is optional; the handler reads
+    it via ``e.get("label")``.
+
+    No Sensitive markers on this model: every field is a scalar string
+    naming a node id, edge id, edge type, or human-readable label —
+    structurally not a leak surface.
+    """
+
+    id: str
+    from_node: str
+    to_node: str
+    # The closed EdgeType vocabulary, not free text: Edge.from_dict does not
+    # re-validate, so an open string here would commit vocabulary-invalid
+    # state that the strict web client refuses to decode.
+    edge_type: EdgeType
+    label: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _PipelineOutputModel(BaseModel):
+    """Nested model for ``set_pipeline.outputs[*]``.
+
+    Mirrors the JSON schema's ``outputs`` array-item shape declared at
+    ``tools.py:1077-1115`` and its inner ``required: ["sink_name",
+    "plugin"]``.
+
+    ``options`` carries :class:`Sensitive` with
+    :func:`_summarize_set_source_options` — sink options routinely carry
+    filesystem paths (``path: "outputs/results.json"``), secret-ref
+    markers, and other operator-sensitive payload values.  See the
+    docstring on :class:`_PipelineNodeModel.options` for the rationale
+    behind reusing the source-side summarizer at the node/output
+    boundary.
+
+    ``on_write_failure`` is required: full replacement never borrows an old
+    sink's choice or applies a server default.
+    """
+
+    sink_name: str
+    plugin: str
+    options: _LlmJsonObject = Field(default_factory=dict)
+    on_write_failure: str
+    # One-sentence composer-authored prose for the Spec tab. Free-text scalar
+    # like _PipelineEdgeModel.label — structurally not a leak surface, so no
+    # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
+    description: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+@trust_boundary(
+    tier=3,
+    source="LLM-authored set_pipeline.metadata / set_metadata.patch tool-call argument",
+    source_param="patch",
+    suppresses=("R5",),
+    invariant="never raises; returns the fixed '<metadata-patch:invalid>' marker for a non-mapping, else a closed key-name summary",
+    non_raising=True,
+)
+def _summarize_set_metadata_patch(patch: object) -> str:
+    """Summarize metadata mutations without retaining authored values.
+
+    Shared by ``set_pipeline.metadata`` and ``set_metadata.patch`` so the two
+    equivalent write paths have one persistence-redaction contract. Unknown
+    keys collapse to a fixed marker because key names are LLM-controlled too.
+
+    Contract (spec §4.2.6, §9 RSK-03):
+      * MUST NOT raise on any reachable input value.
+      * MUST return ``str``.
+    """
+    if not isinstance(patch, Mapping):
+        return "<metadata-patch:invalid>"
+    allowed_keys = {"description", "name"}
+    keys = sorted(key for key in patch if isinstance(key, str) and key in allowed_keys)
+    if any(key not in allowed_keys for key in patch):
+        keys.append("unknown")
+    return f"<metadata-patch:{','.join(keys)}>" if keys else "<metadata-patch:empty>"
+
+
+class _PipelineMetadataModel(BaseModel):
+    """Nested model for ``set_pipeline.metadata``.
+
+    Mirrors the JSON schema's ``metadata`` sub-object declared at
+    ``tools.py:1122-1129``.  Both fields are optional; the handler at
+    :func:`_execute_set_pipeline` constructs
+    :class:`elspeth.web.composer.state.PipelineMetadata` only with the
+    explicitly-supplied subset and lets the dataclass defaults fill in the
+    rest. The parent ``SetPipelineArgumentsModel.metadata`` field carries the
+    same object-level Sensitive summarizer as ``set_metadata.patch`` so neither
+    arbitrary name nor description values are mirrored into persistent tool
+    invocation storage.
+    """
+
+    name: str | None = None
+    description: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+def _set_pipeline_source_selection_json_schema(schema: dict[str, JsonValue]) -> None:
+    """Expose the model validator's exactly-one non-null source contract.
+
+    Pydantic cannot infer cross-field JSON Schema from ``model_validator``.
+    Its ordinary schema also advertises ``null`` for these default-``None``
+    fields even though the validator rejects that value. Rewrite only those
+    two generated leaves and add the matching union so model-schema consumers
+    see the same admission contract the runtime enforces.
+    """
+    properties = schema["properties"]
+    if type(properties) is not dict:
+        raise RuntimeError("SetPipelineArgumentsModel.properties must emit a JSON Schema object")
+    for field_name in ("source", "sources"):
+        field_schema = properties[field_name]
+        if type(field_schema) is not dict:
+            raise RuntimeError(f"SetPipelineArgumentsModel.{field_name} must emit a JSON Schema object")
+        branches = field_schema["anyOf"]
+        if type(branches) is not list:
+            raise RuntimeError(f"SetPipelineArgumentsModel.{field_name}.anyOf must emit a JSON Schema array")
+        object_branches: list[dict[str, JsonValue]] = []
+        for branch in branches:
+            if branch == {"type": "null"}:
+                continue
+            if type(branch) is not dict:
+                raise RuntimeError(f"SetPipelineArgumentsModel.{field_name}.anyOf must contain JSON Schema objects")
+            object_branches.append(branch)
+        if len(object_branches) != 1:
+            raise RuntimeError(f"SetPipelineArgumentsModel.{field_name} must emit one non-null JSON Schema branch")
+        properties[field_name] = object_branches[0]
+    schema["oneOf"] = [
+        {"required": ["source"]},
+        {"required": ["sources"]},
+    ]
+
+
+class SetPipelineArgumentsModel(BaseModel):
+    """Redaction-bearing argument model for the ``set_pipeline`` tool.
+
+    Mirrors the JSON schema declared for ``set_pipeline`` and its
+    required-paths. Exactly one of ``source`` or ``sources`` must be supplied
+    as a non-null object; ``nodes``, ``edges``, and ``outputs`` are always
+    required. Nested required fields follow :class:`_SetPipelineSourceModel`,
+    :class:`_PipelineNodeModel`, :class:`_PipelineEdgeModel`, and
+    :class:`_PipelineOutputModel`. ``metadata`` is optional.
+
+    LLM-supplied vs dispatcher-wired arguments
+    ------------------------------------------
+    The dispatcher at :func:`execute_tool` (``tools.py:5530-5540``) calls
+    :func:`_execute_set_pipeline` with additional kwargs (``session_engine``,
+    ``session_id``) that are NOT part of the LLM-supplied ``arguments``
+    dict — they are wired by the composer service from the request context.
+    This Pydantic model validates only the LLM-supplied dict; the kwargs
+    enter through the handler's function signature, not through Pydantic.
+
+    Sensitive marker surface
+    ------------------------
+    Five paths carry :class:`Sensitive` markers (see module-level note above):
+      * ``source.options`` — :func:`_summarize_set_source_options`.
+      * ``source.inline_blob.content`` — :func:`_summarize_inline_blob_content`.
+      * ``nodes[*].options`` — :func:`_summarize_set_source_options`.
+      * ``outputs[*].options`` — :func:`_summarize_set_source_options`.
+      * ``metadata`` — :func:`_summarize_set_metadata_patch`.
+
+    The adequacy guard (§4.4.2) fails closed on any ``dict[str, Any]`` or
+    ``Any``-typed field without a Sensitive marker, which mechanically
+    enforces that every LLM-supplied open option surface is redacted at the
+    persistence boundary. Routes and triggers use structural closed-leaf
+    types instead.
+
+    ``extra="forbid"`` is required (rev-2 M.1) at every level — the
+    outer model AND every nested sub-model.  Misrouted argument shapes
+    (e.g., ``filename`` at the top level — that belongs on
+    ``create_blob``) are rejected before any handler-side logic runs.
+    """
+
+    source: _SetPipelineSourceModel | None = None
+    sources: dict[str, _SetPipelineNamedSourceModel] | None = None
+    nodes: list[_PipelineNodeModel]
+    edges: list[_PipelineEdgeModel]
+    outputs: list[_PipelineOutputModel]
+    metadata: Annotated[_PipelineMetadataModel, Sensitive(summarizer=_summarize_set_metadata_patch)] | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_source_configuration(self) -> SetPipelineArgumentsModel:
+        field_xor = ("source" in self.model_fields_set) != ("sources" in self.model_fields_set)
+        value_xor = (self.source is None) != (self.sources is None)
+        if not field_xor or not value_xor:
+            raise ValueError("set_pipeline requires exactly one non-null source or sources object")
+        return self
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra=_set_pipeline_source_selection_json_schema,
+    )
+
+
+# ---------------------------------------------------------------------------
+# patch_source_options / patch_node_options / patch_output_options
+# argument models.
+#
+# All three tools accept a ``patch`` argument — a merge-patch dict that is
+# applied to the current plugin-options dict via :func:`_apply_merge_patch`.
+# The patch carries the same content surface as the original ``options`` on
+# ``set_source``, ``upsert_node``, and ``set_output`` respectively: plugin
+# option keys including credential-ref markers
+# (``api_key: {"secret_ref": "NAME"}``), filesystem paths
+# (``path: "outputs/results.json"``), and prompt-template payloads.
+#
+# ``patch: dict[str, Any]`` without a Sensitive annotation would fail the
+# adequacy guard (§4.4.2): the value type resolves to ``Any``, which is
+# inspection-resistant — the guard fails closed on that shape.  Wrapping
+# ``patch`` with :class:`Sensitive` and :func:`_summarize_set_source_options`
+# is mandatory, and reusing the source-side summarizer is structurally sound
+# because it records option shape while replacing scalar values. Uniformity
+# with the Waves 2-3 source/node/output options surfaces is an explicit
+# design goal.
+#
+# ``patch_node_options`` adds a ``node_id: str`` selector; the routing-key
+# guard (_node_routing_option_patch_error) is a SEMANTIC check on patch
+# contents (on_success, on_error, input, routes, fork_to), not a shape check.
+# It runs after Pydantic validation and is NOT replicated in the model —
+# same pattern as set_pipeline.source blob_id/inline_blob mutual exclusion
+# which the handler checks post-validation.
+#
+# ``patch_output_options`` adds a ``sink_name: str`` selector.
+# ---------------------------------------------------------------------------
+
+
+class PatchSourceOptionsArgumentsModel(BaseModel):
+    """Redaction-bearing argument model for the ``patch_source_options`` tool.
+
+    Mirrors the JSON schema declared at ``tools.py:883-897`` for the
+    ``patch_source_options`` definition and its ``required: ["patch"]``.
+    ``source_name`` selects the named source root and is not sensitive.
+
+    ``patch`` carries :class:`Sensitive` with
+    :func:`_summarize_set_source_options` — the merge-patch dict has the same
+    content surface as ``set_source.options``: plugin option keys including
+    credential-ref markers, filesystem paths, and prompt-template payloads.
+    Reusing :func:`_summarize_set_source_options` maintains the
+    uniformity-across-source-binding-tools contract from Tasks 4 / 13.
+
+    ``extra="forbid"`` is required (rev-2 M.1).  Fields belonging to
+    ``patch_node_options`` (``node_id``) and ``patch_output_options``
+    (``sink_name``) are intentionally absent so ``extra="forbid"``
+    rejects misrouted argument shapes early.
+    """
+
+    source_name: str = "source"
+    patch: _LlmJsonObject
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class PatchNodeOptionsArgumentsModel(BaseModel):
+    """Redaction-bearing argument model for the ``patch_node_options`` tool.
+
+    Mirrors the JSON schema declared at ``tools.py:899-922`` for the
+    ``patch_node_options`` definition and its ``required: ["node_id", "patch"]``.
+
+    ``node_id`` is a plain string naming the target node — structural
+    identity, no sensitive surface.
+
+    ``patch`` carries :class:`Sensitive` with
+    :func:`_summarize_set_source_options` — node plugin-option dicts carry
+    the same content surface as ``set_pipeline.nodes[*].options``
+    (:class:`_PipelineNodeModel.options` is already marked Sensitive here).
+    Reusing :func:`_summarize_set_source_options` maintains
+    uniformity-across-node-options-tools.
+
+    Post-validation semantic check: the routing-key guard
+    (:func:`_node_routing_option_patch_error`) rejects routing-field keys
+    (``on_error``, ``on_success``, ``input``, ``routes``, ``fork_to``) in
+    ``patch`` and is a value-domain check that Pydantic cannot express.
+    It runs inside ``_execute_patch_node_options`` AFTER this model's
+    validation — the same discipline as ``set_pipeline``'s
+    ``blob_id`` / ``inline_blob`` mutual-exclusion check that lives in
+    ``_execute_set_pipeline`` post-validation.
+
+    ``extra="forbid"`` is required (rev-2 M.1).  Fields belonging to
+    ``patch_source_options`` (no ``node_id``) and ``patch_output_options``
+    (``sink_name``) are intentionally absent.
+    """
+
+    node_id: str
+    patch: _LlmJsonObject
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class PatchOutputOptionsArgumentsModel(BaseModel):
+    """Redaction-bearing argument model for the ``patch_output_options`` tool.
+
+    Mirrors the JSON schema declared at ``tools.py:925-942`` for the
+    ``patch_output_options`` definition and its ``required: ["sink_name", "patch"]``.
+
+    ``sink_name`` is a plain string naming the target output — structural
+    identity, no sensitive surface.
+
+    ``patch`` carries :class:`Sensitive` with
+    :func:`_summarize_set_source_options` — sink option dicts carry the same
+    content surface as ``set_pipeline.outputs[*].options``
+    (:class:`_PipelineOutputModel.options` is already marked Sensitive here).
+    Reusing :func:`_summarize_set_source_options` maintains
+    uniformity-across-output-options-tools.
+
+    ``extra="forbid"`` is required (rev-2 M.1).  Fields belonging to
+    ``patch_source_options`` (no selector) and ``patch_node_options``
+    (``node_id`` vs ``sink_name``) are intentionally absent.
+    """
+
+    sink_name: str
+    patch: _LlmJsonObject
+
+    model_config = ConfigDict(extra="forbid")
+
+
+def _redact_via_schema(
+    tool_name: str,
+    validated: BaseModel,
+    model_cls: type[BaseModel],
+    *,
+    telemetry: RedactionTelemetry,
+    exclude_unset: bool = False,
+) -> dict[str, Any]:
+    """Walk the validated model's schema; substitute Sensitive fields.
+
+    Operates on ``model_dump(exclude_unset=exclude_unset)`` output and substitutes
+    in-place on a deep copy so the input model and any external caller
+    references are not affected.  Returns the dict ready for serialization.
+
+    Sensitive fields with no summarizer receive ``REDACTED_SENSITIVE_NO_SUMMARIZER``.
+    Summarizer failures fire ``telemetry.summarizer_error(tool_name=...)``
+    BEFORE raising ``AuditIntegrityError`` (rev-2 M.8 discipline).
+
+    Path coverage: top-level, nested-BaseModel,
+    list-element, dict-element, and tuple-element paths are all supported
+    via the per-node ``substitute_provider`` closure built alongside
+    ``value_provider`` in ``walk_model_schema(with_values=True)``.
+
+    Walker atomicity (rev-3 W8b / rev-4 W8b): substitutions mutate a local
+    ``dumped`` dict.  When ``transform`` raises mid-walk, the partial dict
+    is discarded by the unwind; only a fully successful walk returns it to
+    the caller.
+    """
+    dumped = copy.deepcopy(validated.model_dump(exclude_unset=exclude_unset))
+    for node in walk_model_schema(model_cls, with_values=True):
+        marker = next((m for m in node.metadata if isinstance(m, _SensitiveMarker)), None)
+        if marker is None:
+            continue
+        if node.substitute_provider is None:
+            # walk_model_schema(with_values=True) guarantees substitute_provider
+            # is populated; a None here is a walker bug, not external input.
+            raise AuditIntegrityError(
+                f"walk_model_schema yielded TraversalNode at {node.path!r} "
+                "with substitute_provider=None despite with_values=True. "
+                "This is an internal walker contract violation."
+            )
+        if marker.summarizer is None:
+            # No summarizer: substitute the no-summarizer sentinel at every
+            # reachable leaf for this path (top-level, nested, or container).
+            # Declarative sensitive keys always use this path; type-driven
+            # Sensitive() fields without a summarizer keyword also land here.
+            node.substitute_provider(dumped, lambda _v: REDACTED_SENSITIVE_NO_SUMMARIZER)
+            continue
+        # Narrow marker.summarizer from `Callable | None` to `Callable` by
+        # rebinding to a local before forming the closure (the early
+        # `continue` on `marker.summarizer is None` above does not propagate
+        # through the loop body's closure-default position).
+        summarizer: Callable[[Any], str] = marker.summarizer
+
+        # Bind summarizer, tool_name, and node.path into the closure via
+        # default-argument captures (B023): the loop reassigns these names
+        # on each iteration, so capturing through the enclosing scope would
+        # have every closure see the LAST iteration's values.
+        def _apply(
+            raw_value: Any,
+            *,
+            _summarizer: Callable[[Any], str] = summarizer,
+            _tool_name: str = tool_name,
+            _path: str = node.path,
+        ) -> Any:
+            try:
+                summary = _summarizer(raw_value)
+            except Exception as exc:
+                telemetry.summarizer_error(tool_name=_tool_name)  # BEFORE raise (rev-2 M.8)
+                raise AuditIntegrityError(f"Summarizer for {_tool_name!r} path {_path!r} raised {type(exc).__name__}: {exc}") from exc
+            if not isinstance(summary, str):
+                # _SensitiveMarker.summarizer is typed as Callable[[Any], str]; mypy
+                # considers this branch unreachable after isinstance narrowing.  We
+                # keep it as an offensive invariant guard: a misconfigured or mocked
+                # summarizer may violate the return-type contract at runtime
+                # (spec §4.2.6 M.8).  type: ignore suppresses the false-positive.
+                telemetry.summarizer_error(tool_name=_tool_name)  # type: ignore[unreachable]  # BEFORE raise (rev-2 M.8)
+                raise AuditIntegrityError(
+                    f"Summarizer for {_tool_name!r} path {_path!r} returned {type(summary).__name__}, expected str (spec §4.2.6)."
+                )
+            return _TrustedRedactionSummary(summary)
+
+        node.substitute_provider(dumped, _apply)
+    return dumped
+
+
+def policy_closes_unknown_arguments(policy: ToolRedactionPolicy) -> bool:
+    """Return whether ``policy`` drops argument keys it does not recognise.
+
+    Declaring ``known_argument_keys`` is enough on its own:
+    ``redact_unknown_argument_keys`` opts a tool into the closed mode without an
+    allowlist, but a tool that supplies an allowlist is already closed. The two
+    conditions are therefore OR-ed, and both spellings reach the same behaviour.
+
+    Exported because a test that restates this rule instead of calling it will
+    drift from it. That is not hypothetical: the first version of
+    ``tests/unit/web/composer/test_tool_argument_wire_parity.py`` filtered on
+    ``redact_unknown_argument_keys`` alone, which silently excluded
+    ``request_advisor_hint`` -- a tool production does close -- and left the gate
+    describing itself as covering more than it iterated. A guard must derive its
+    scope from the authority it guards, not re-derive it alongside.
+    """
+    return bool(policy.known_argument_keys or policy.redact_unknown_argument_keys)
+
+
+def _redact_via_policy(
+    tool_name: str,
+    arguments: dict[str, Any],
+    policy: ToolRedactionPolicy,
+    *,
+    telemetry: RedactionTelemetry,
+) -> dict[str, Any]:
+    """Walk ``arguments`` against a declarative policy.
+
+    Spec §4.2.6 disposition table:
+      * Argument summarizer key declared but argument key absent in input →
+        no-op (key absence is not a fault; Tier-3 input may omit any key).
+      * Argument summarizer key declared AND present in input AND a summarizer
+        is registered for it → summarizer output substitutes the value.
+      * Argument summarizer key declared AND present in input AND no summarizer
+        is registered → REDACTED_SENSITIVE_NO_SUMMARIZER substitutes the value
+        (spec §4.3 line 1073: "Plain sensitive key → value replaced by literal
+        string '<redacted>'.").
+      * Argument key NOT in sensitive_argument_keys → passthrough by default
+        for legacy declarative entries. If ``policy.known_argument_keys`` is
+        declared or ``policy.redact_unknown_argument_keys`` is enabled, keys
+        outside the allowlist are removed and replaced with a generic
+        REDACTED_UNKNOWN_ARGUMENT_KEY marker under
+        REDACTED_UNKNOWN_ARGUMENTS_FIELD. The boolean allows a closed empty
+        argument surface for no-argument tools.
+
+    Walker atomicity (rev-3 W8b / rev-4 W8b): the output dict is built in a
+    local variable and only returned on success.  A mid-walk raise leaves no
+    partial dict observable to the caller.
+    """
+    # Build the output dict by shallow-copying the input, then substituting
+    # values for every sensitive key present.  Atomicity comes from the fact
+    # that any raise during summarization aborts before we hand the dict back.
+    # Non-sensitive keys are passthrough unless the policy opts into a closed
+    # argument allowlist.
+    redacted: dict[str, Any] = dict(arguments)
+    if policy_closes_unknown_arguments(policy):
+        known_argument_keys = set(policy.known_argument_keys)
+        unknown_keys = [key for key in arguments if key not in known_argument_keys]
+        for key in unknown_keys:
+            # ``redacted`` is a fresh copy of ``arguments`` and ``unknown_keys``
+            # derives from the same ``arguments``, so every key is present by
+            # construction; ``del`` crashes on a breach of that first-party
+            # invariant instead of masking it with a pop default.
+            del redacted[key]
+        if unknown_keys:
+            redacted[REDACTED_UNKNOWN_ARGUMENTS_FIELD] = REDACTED_UNKNOWN_ARGUMENT_KEY
+
+    summarizers = policy.argument_summarizers
+    for key in policy.sensitive_argument_keys:
+        if key not in arguments:
+            # Key absence is not a fault (Tier-3 input).
+            continue
+        if key not in summarizers:
+            # Plain sensitive key, no summarizer registered → no-summarizer sentinel.
+            redacted[key] = REDACTED_SENSITIVE_NO_SUMMARIZER
+            continue
+        summarizer = summarizers[key]
+        raw_value = arguments[key]
+        try:
+            summary = summarizer(raw_value)
+        except Exception as exc:
+            telemetry.summarizer_error(tool_name=tool_name)  # BEFORE raise (rev-2 M.8)
+            raise AuditIntegrityError(f"Summarizer for {tool_name!r} argument key {key!r} raised {type(exc).__name__}: {exc}") from exc
+        if not isinstance(summary, str):
+            # ToolRedactionPolicy.argument_summarizers is typed as Mapping[str,
+            # Callable[[Any], str]]; mypy considers this branch unreachable
+            # after the isinstance narrowing.  We keep it as an offensive
+            # invariant guard: a misconfigured or mocked summarizer may
+            # violate the return-type contract at runtime (spec §4.2.6 M.8).
+            telemetry.summarizer_error(tool_name=tool_name)  # type: ignore[unreachable]  # BEFORE raise (rev-2 M.8)
+            raise AuditIntegrityError(
+                f"Summarizer for {tool_name!r} argument key {key!r} returned {type(summary).__name__}, expected str (spec §4.2.6)."
+            )
+        redacted[key] = summary
+    return redacted
+
+
+def normalize_set_pipeline_redacted_arguments(value: Any) -> Any:
+    """Remove only singular source.inline_blob null for semantic binding.
+
+    Pydantic materializes ``source.inline_blob=None`` while proposal custody
+    treats an omitted field as absent. Both spellings mean no inline blob, so
+    their semantic dispatch bindings agree. Displayed arguments retain the
+    authored distinction; this helper does not define display normalization.
+
+    Both mapping tests name ``(dict, MappingProxyType)`` — exactly
+    ``deep_freeze``'s output pair — rather than ``type(x) is dict``. Returning
+    the argument unchanged is this function's "nothing to normalise" answer,
+    so a mapping it fails to recognise is indistinguishable from a mapping
+    that needed no work, and the two spellings of "no inline blob" then
+    persist as DIFFERENT redacted authority projections. The nested test is
+    the load-bearing one: ``ComposerToolInvocation`` (``pipeline_commit``)
+    rejects a non-``dict`` outer value outright, but a plain ``dict`` whose
+    ``source`` is frozen — what a shallow ``dict(mappingproxy)`` produces —
+    passes that gate, leaves ``normalized_arguments is restored_arguments``
+    True, and banks ``semantic_arguments_hash = stored_authority_hash`` over
+    an unnormalised projection. Recognising the frozen form keeps the
+    ``composer_authority_hash`` recomputation on the path that needs it.
+    """
+    if type(value) not in (dict, MappingProxyType):
+        return value
+    if "source" not in value:
+        return value
+    source = value["source"]
+    if type(source) not in (dict, MappingProxyType) or "inline_blob" not in source or source["inline_blob"] is not None:
+        return value
+    normalized_source = dict(source)
+    del normalized_source["inline_blob"]
+    return {**value, "source": normalized_source}
+
+
+def semantic_redacted_pipeline_arguments_hash(arguments: Mapping[str, Any]) -> str:
+    """Bind redacted arguments using only the existing no-inline-blob equivalence."""
+    return composer_authority_hash(normalize_set_pipeline_redacted_arguments(arguments))
+
+
+def redact_tool_call_arguments(
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    telemetry: RedactionTelemetry,
+) -> dict[str, Any]:
+    """Produce the redacted arguments dict that lands in
+    ``chat_messages.tool_calls`` JSON (spec §4.2.6).
+
+    Disposition by manifest-entry shape:
+
+    **Type-driven entry (``argument_model`` set):**
+      Emit the ``manifest_dispatch`` beacon (BEFORE ``model_validate`` so a
+      Tier-3 ``ValidationError`` still records the dispatch); validate the
+      raw arguments against ``argument_model``; walk via
+      :func:`_redact_via_schema`. ``Sensitive[T]`` fields at any path
+      (top-level, nested, list-element, dict-element, tuple-element) are
+      substituted with the summarizer output or
+      ``REDACTED_SENSITIVE_NO_SUMMARIZER`` when no summarizer is declared.
+
+      The handler MUST catch :class:`pydantic.ValidationError` raised here
+      and re-raise as :class:`ToolArgumentError` so the compose loop's
+      ARG_ERROR routing at ``service.py:2480`` receives the right exception
+      class.  A bare ``ValidationError`` escaping the handler hits the
+      catch-all and becomes :class:`ComposerPluginCrashError` → HTTP 500 —
+      the wrong disposition for Tier-3 input.
+
+    **Declarative entry (``policy`` set):**
+      Emit the ``manifest_dispatch`` beacon; walk ``arguments`` by
+      ``policy.sensitive_argument_keys``.  Missing keys are no-ops; present
+      keys are summarized (via ``policy.argument_summarizers[key]``) or
+      sentinel-substituted (``REDACTED_SENSITIVE_NO_SUMMARIZER``).  Keys
+      not in ``sensitive_argument_keys`` are passthrough unless the policy
+      declares ``known_argument_keys`` or enables
+      ``redact_unknown_argument_keys``; in that case unknown argument key names
+      are removed and replaced with a generic ``REDACTED_UNKNOWN_ARGUMENT_KEY``
+      marker under ``REDACTED_UNKNOWN_ARGUMENTS_FIELD``.
+
+    **Failure modes (all raise AuditIntegrityError):**
+      - Manifest entry missing for ``tool_name`` (registry-consistency
+        invariant; distinct from Tier-3 LLM-hallucinated tool name which is
+        caught earlier in the dispatcher).
+      - Summarizer raises → ``telemetry.summarizer_error(tool_name=...)``
+        BEFORE raise; ``AuditIntegrityError`` chained from the underlying
+        exception (M.8).
+      - Summarizer returns non-str → ``telemetry.summarizer_error(...)``
+        BEFORE raise; ``AuditIntegrityError`` with a typed message.
+
+    **Walker atomicity:** the output dict is built in a local variable and
+    only returned on success.  A mid-walk raise leaves no partial dict
+    observable to the caller (rev-3 W8b / rev-4 W8b).
+    """
+    if tool_name not in MANIFEST:
+        raise AuditIntegrityError(
+            f"redact_tool_call_arguments called for unknown tool {tool_name!r}; "
+            "the manifest is the source of truth for the registry/redaction "
+            "set-equality invariant.  Add a manifest entry for this tool or "
+            "verify that the dispatch path passes the correct tool name."
+        )
+    entry = MANIFEST[tool_name]
+    if entry.argument_model is not None:
+        # Emit BEFORE model_validate: dispatch happened regardless of Tier-3
+        # validation outcome.  A ValidationError escapes here and the handler
+        # wraps it as ToolArgumentError; the dispatch beacon must not depend on
+        # validation success.
+        telemetry.manifest_dispatch(tool_name=tool_name, shape="type_driven")
+        validated = entry.argument_model.model_validate(arguments)
+        return _redact_via_schema(tool_name, validated, entry.argument_model, telemetry=telemetry, exclude_unset=True)
+    # Declarative branch (entry.policy is not None — ToolRedaction.__post_init__
+    # guarantees exactly one of {argument_model, policy} is set).
+    telemetry.manifest_dispatch(tool_name=tool_name, shape="declarative")
+    policy = entry.policy
+    assert policy is not None  # offensive: satisfies the type-checker contract
+    return _redact_via_policy(tool_name, arguments, policy, telemetry=telemetry)
+
+
+# ---------------------------------------------------------------------------
+# Declarative manifest entries — _DISCOVERY_TOOLS, 12 tools.
+#
+# Every tool in ``_DISCOVERY_TOOLS`` (tools.py:5500-5513) is read-only over the
+# composer state and returns only cached/derived plugin-registry metadata,
+# validator output, or structural state summaries.  None of these handlers
+# accept LLM-supplied dict-shaped option payloads or return raw blob/secret
+# content.  Each is declared with ``handles_no_sensitive_data=True`` and a
+# distinct ``HandlesNoSensitiveDataReason`` that an auditor can read to
+# understand WHY this specific tool's argument/response surface cannot carry
+# sensitive material — copy-paste justification is rejected at CI by the
+# mass-copy uniqueness assertion (§4.4.4).
+#
+# The §4.4.2 ``dict[str, Any]`` fail-closed rule applies only to type-driven
+# entries (Pydantic models walked via ``walk_model_schema``).  Declarative
+# entries express their argument surface through ``sensitive_argument_keys``;
+# all _DISCOVERY_TOOLS take only scalar string arguments (or no arguments
+# at all), so ``sensitive_argument_keys`` is empty for every entry here —
+# except ``explain_validation_error``: its scalar ``error_text`` carries
+# validator message text, which echoes authored option values, so that one
+# entry declares the argument sensitive (``handles_no_sensitive_data=False``)
+# and summarises it with ``_summarize_explain_validation_error_text``.
+# ---------------------------------------------------------------------------
+
+
+_LIST_SOURCES_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("plugin registry catalogue — cached, read-only metadata served from CatalogService",),
+    why_arguments_safe=(
+        "list_sources accepts no arguments — the JSON schema at tools.py:604 declares "
+        "an empty properties object with empty required, so the LLM cannot place any "
+        "value on this surface; the handler reads zero keys from the arguments dict."
+    ),
+    why_responses_safe=(
+        "Response is {available, prohibited}: available is the cached source-plugin "
+        "descriptor list (name + summary per plugin) produced by CatalogService.list_sources; "
+        "it is registry metadata composed at module import time, carries no user payload, and "
+        "never references credentials. prohibited names any source categorically banned from "
+        "the web authoring surface (PolicyCatalogView.list_prohibited_sources), carrying only "
+        "its name and the same static, non-sensitive policy explanation already shown on a "
+        "rejected set_source attempt (R2-F18)."
+    ),
+)
+
+
+_LIST_TRANSFORMS_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("plugin registry catalogue — cached, read-only metadata served from CatalogService",),
+    why_arguments_safe=(
+        "list_transforms accepts no arguments — the JSON schema at tools.py:609 declares "
+        "an empty properties object with empty required, so no LLM-supplied content can "
+        "reach the dispatch site; the handler reads zero keys from the arguments dict."
+    ),
+    why_responses_safe=(
+        "Response is {available, prohibited}: available is the cached transform-plugin "
+        "descriptor list (name + summary per plugin) produced by CatalogService.list_transforms; "
+        "it is registry metadata composed at module import time, carries no operator data, and "
+        "never references row content. prohibited names any transform categorically banned from "
+        "the web authoring surface (PolicyCatalogView.list_prohibited_transforms), carrying only "
+        "its name and the same static, non-sensitive policy explanation already shown on a "
+        "rejected set_source attempt (R2-F18)."
+    ),
+)
+
+
+_LIST_SINKS_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("plugin registry catalogue — cached, read-only metadata served from CatalogService",),
+    why_arguments_safe=(
+        "list_sinks accepts no arguments — the JSON schema at tools.py:614 declares an "
+        "empty properties object with empty required, so the LLM cannot place any value "
+        "on this surface; the handler reads zero keys from the arguments dict."
+    ),
+    why_responses_safe=(
+        "Response is {available, prohibited}: available is the cached sink-plugin descriptor "
+        "list (name + summary per plugin) produced by CatalogService.list_sinks; it is registry "
+        "metadata composed at module import time, carries no destination credentials, and never "
+        "references payload. prohibited names any sink categorically banned from the web "
+        "authoring surface (PolicyCatalogView.list_prohibited_sinks), carrying only its name and "
+        "the same static, non-sensitive policy explanation already shown on a rejected "
+        "set_source attempt (R2-F18)."
+    ),
+)
+
+
+_GET_PLUGIN_SCHEMA_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("plugin registry catalogue — published JSON schema definitions served from CatalogService",),
+    why_arguments_safe=(
+        "get_plugin_schema arguments are two scalar strings (plugin_type, name) selecting "
+        "a plugin in the catalogue; neither is operator-supplied content and the catalogue "
+        "rejects unknown values with ValueError surfaced as a tool-failure result."
+    ),
+    why_responses_safe=(
+        "Response is the published plugin configuration schema — a Pydantic schema dict that "
+        "names options and types but contains no operator-supplied values, no credentials, "
+        "and no row payloads; it is the same schema available via plugin documentation."
+    ),
+)
+
+
+_GET_EXPRESSION_GRAMMAR_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("gate-expression grammar reference — static reference text returned by get_expression_grammar",),
+    why_arguments_safe=(
+        "get_expression_grammar accepts no arguments — the JSON schema at tools.py:640 "
+        "declares an empty properties object with empty required, so no LLM-supplied "
+        "content can reach the dispatch site; the handler returns a constant grammar."
+    ),
+    why_responses_safe=(
+        "Response is the static gate-expression syntax reference returned by "
+        "get_expression_grammar(); it is a documentation string composed at module load "
+        "time, identical for every invocation, and carries no session or operator data."
+    ),
+)
+
+
+@trust_boundary(
+    tier=3,
+    source="LLM-supplied explain_validation_error.error_text argument (raw; the declarative policy path runs no argument model)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "never raises; returns the value only when it is exactly a closed validation error_code, otherwise a "
+        "length-only sentinel for text or a fixed value-free shape sentinel for any other type"
+    ),
+    non_raising=True,
+)
+def _summarize_explain_validation_error_text(value: object) -> str:
+    """Summarizer for ``explain_validation_error.error_text``.
+
+    The tool description tells the planner to pass a validation entry's
+    ``message``, and validator messages quote authored option values (for
+    example ``Invalid schema mode '<value>'``) — the same text the response
+    side summarises in ``validation.errors[].message``. A string that is
+    exactly a closed ``error_code`` is a public catalogue constant and is kept
+    so the audit row still says which code was looked up; any other string
+    keeps only its length. Exact membership only: a code buried in free text
+    does not make the surrounding bytes safe.
+    """
+    # Function-local import: tools.generation imports this module at load time.
+    from elspeth.web.composer.tools.generation import explain_validation_code
+
+    if isinstance(value, str):
+        if explain_validation_code(value) is not None:
+            return value
+        return f"<redacted-validation-error-text:{len(value)}-chars>"
+    return _summarize_external_response_value(value)
+
+
+_GET_PLUGIN_ASSISTANCE_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=(
+        "plugin-published assistance text — registry-side guidance keyed by issue_code or, for discovery, plugin identity",
+    ),
+    why_arguments_safe=(
+        "get_plugin_assistance arguments are three enum/scalar strings (plugin_type ∈ "
+        "{source, transform, sink}, plugin_name, optional issue_code) selecting "
+        "plugin-published guidance; none carry operator data, and unknown values surface "
+        "as a tool-failure result rather than passing payload to the handler."
+    ),
+    why_responses_safe=(
+        "Response is the plugin's published guidance struct (summary, suggested_fixes, "
+        "examples, composer_hints); it is documentation authored at plugin packaging "
+        "time, carries no session payload, and contains no credentials or row content."
+    ),
+)
+
+
+_LIST_MODELS_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("LLM provider model catalogue — names and counts, no credentials or completions",),
+    why_arguments_safe=(
+        "list_models accepts only an optional provider prefix string and an optional "
+        "integer limit; both are pure filtering parameters and the handler validates "
+        "them against the provider registry without touching session state or secrets."
+    ),
+    why_responses_safe=(
+        "Response is a provider summary or model-id list scoped by the provider filter; "
+        "model identifiers are public catalogue values published by the LLM providers "
+        "themselves, and the handler never includes API keys, completions, or PII."
+    ),
+)
+
+
+_GET_AUDIT_INFO_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=(
+        "Landscape audit-trail metadata — constant strings describing that audit is "
+        "mandatory and operator-managed; the audit URL/DSN/backend type is intentionally "
+        "NOT included (security fix S1, yaml_generator.py:179).",
+    ),
+    why_arguments_safe=(
+        "get_audit_info accepts no arguments — the JSON schema at tools.py:1306 declares "
+        "an empty properties object with empty required, so the LLM cannot place any "
+        "value on this surface; the handler returns a hard-coded literal payload that "
+        "does not depend on the call arguments at all."
+    ),
+    why_responses_safe=(
+        "Response is a constant dict of operator-facing strings explaining that audit is "
+        "always enabled and the backend is not composer-modifiable. The handler "
+        "(_execute_get_audit_info, tools.py:5106) constructs the payload from string "
+        "literals only — no WebSettings access, no DSN, no path, no encryption-key env "
+        "var, no operator-internal config reaches the LLM."
+    ),
+)
+
+
+_GET_PIPELINE_STATE_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("in-memory composition state — structural metadata about the session pipeline",),
+    why_arguments_safe=(
+        "get_pipeline_state accepts only an optional component selector string (a node id, "
+        "an output name, 'source', or a full-state alias); the handler indexes into the "
+        "composer state by this name and never echoes LLM-supplied payload into the result."
+    ),
+    why_responses_safe=(
+        "Response mirrors the operator's own composition — plugin names, node ids, and "
+        "connection wiring — already visible to the operator in the composer UI; the "
+        "redaction policy for the underlying mutation tools (set_source, set_pipeline, "
+        "patch_*_options) governs how option values reach this state in the first place."
+    ),
+)
+
+
+_PREVIEW_PIPELINE_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("validation snapshot — composition-state validator output plus runtime preflight",),
+    why_arguments_safe=(
+        "preview_pipeline accepts no arguments — the JSON schema at tools.py:1296 declares "
+        "an empty properties object with empty required, so the LLM cannot place any "
+        "value on this surface; the handler reads the current composer state directly."
+    ),
+    why_responses_safe=(
+        "Response is the validation summary plus structural source/node/output overview "
+        "and proof diagnostics. The proof step DOES read and parse the bound source blob's "
+        "bytes and evaluate sampled rows (it does not run the full pipeline), but every "
+        "diagnostic that derives from those bytes redacts the observed headers/columns to "
+        "counts and withholds the raw resolver/evaluation error text — mirroring the "
+        "deliberate header redaction in compute_proof_diagnostics — so no raw row payload "
+        "or observed-value PII crosses this surface. Validator entries carry component, "
+        "severity, and a human-readable message in the same class as every other composer "
+        "tool's validation surface (the message may name a declared field or path)."
+    ),
+)
+
+
+_DIFF_PIPELINE_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("pre/post state diff — structural change list versus the session baseline",),
+    why_arguments_safe=(
+        "diff_pipeline accepts no arguments — the JSON schema at tools.py:1323 declares "
+        "an empty properties object with empty required, so the LLM cannot place any "
+        "value on this surface; the handler diffs current state against the baseline."
+    ),
+    why_responses_safe=(
+        "Response is the structural change-set (added/removed/modified nodes/edges/outputs) "
+        "produced by diff_states; both sides of the diff are the operator's own pipeline "
+        "composition and the diff reports field names plus before/after summaries — not "
+        "row payload — so no execution data crosses this surface."
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Declarative manifest entries — _MUTATION_TOOLS remaining,
+# 8 tools).
+#
+# Excluding set_source / set_pipeline / patch_*_options, the
+# remaining ``_MUTATION_TOOLS`` are graph-shape editors that take node-ids,
+# edge-ids, sink names, edge kinds, route slots, and (for upsert_node and
+# set_output) an option dict.  The option-dict-bearing tools declare
+# ``sensitive_argument_keys`` so the option payload is redacted at the
+# argument boundary; the §4.4.2 ``dict[str, Any]`` fail-closed rule applies
+# only to type-driven entries (Pydantic-walked argument models) and the
+# declarative path expresses the same contract through the sensitive-keys
+# tuple.
+#
+# Reuse of :func:`_summarize_set_source_options` is structurally sound: the
+# helper is content-agnostic over option-like dicts because it preserves
+# shape while replacing scalar values, so it applies to upsert_node options,
+# set_output options, and trigger/routes slots without modification.  The
+# same reuse rationale is documented in detail on
+# :class:`_PipelineNodeModel.options` and :class:`_PipelineOutputModel.options`.
+# ---------------------------------------------------------------------------
+
+
+_UPSERT_EDGE_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("graph topology — edge id, endpoints, kind, label — none are payload-bearing",),
+    why_arguments_safe=(
+        "upsert_edge accepts only graph-topology scalars (id, from_node, to_node, edge_type, "
+        "optional label); the manifest argument allowlist preserves those structural fields "
+        "and replaces unexpected LLM-supplied argument keys with the fixed unknown-argument "
+        "sentinel before audit persistence."
+    ),
+    why_responses_safe=(
+        "Response is the structural ToolResult — validation summary plus the edge id list "
+        "after upsert; edges are pure connection-name strings and the response carries no "
+        "plugin option values, no credentials, and no row payload from any execution path."
+    ),
+)
+
+
+_REMOVE_NODE_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("graph topology — single node id selector identifying the deletion target",),
+    why_arguments_safe=(
+        "remove_node accepts only a single scalar id string naming the node to delete; "
+        "the manifest argument allowlist preserves that selector and replaces unexpected "
+        "LLM-supplied argument keys with the fixed unknown-argument sentinel before audit "
+        "persistence."
+    ),
+    why_responses_safe=(
+        "Response is the structural ToolResult — validation summary for the post-removal "
+        "state and the list of affected node ids; the deleted node's options are not "
+        "echoed back, and the validation entries name fields by path without payload."
+    ),
+)
+
+
+_REMOVE_EDGE_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("graph topology — single edge id selector identifying the deletion target",),
+    why_arguments_safe=(
+        "remove_edge accepts only a single scalar id string naming the edge to delete; "
+        "the manifest argument allowlist preserves that selector and replaces unexpected "
+        "LLM-supplied argument keys with the fixed unknown-argument sentinel before audit "
+        "persistence."
+    ),
+    why_responses_safe=(
+        "Response is the structural ToolResult — validation summary for the post-removal "
+        "state and the list of affected node ids; edges carry only connection names so "
+        "the response surface has no payload, no credentials, and no row content."
+    ),
+)
+
+
+_REMOVE_OUTPUT_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("graph topology — single sink_name selector identifying the output to remove",),
+    why_arguments_safe=(
+        "remove_output accepts only a single scalar sink_name string naming the output "
+        "to delete; the manifest argument allowlist preserves that selector and replaces "
+        "unexpected LLM-supplied argument keys with the fixed unknown-argument sentinel "
+        "before audit persistence."
+    ),
+    why_responses_safe=(
+        "Response is the structural ToolResult — validation summary for the post-removal "
+        "state and the affected node id list; the removed sink's option dict is not "
+        "echoed back, so destination paths and credentials do not appear in the response."
+    ),
+)
+
+
+_CLEAR_SOURCE_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("composer state — selected in-memory source root being cleared",),
+    why_arguments_safe=(
+        "clear_source accepts only an optional source_name selector. Source names are "
+        "structural composer identifiers, not plugin options, file paths, source content, "
+        "or credentials; the manifest argument allowlist replaces unexpected LLM-supplied "
+        "argument keys with the fixed unknown-argument sentinel before audit persistence."
+    ),
+    why_responses_safe=(
+        "Response is the structural ToolResult — validation summary describing the "
+        "now-source-less state; the cleared source's option dict is discarded and not "
+        "echoed back, so the response surface has no path, no plugin options, no secrets."
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Declarative manifest entries — _BLOB_DISCOVERY_TOOLS, 5 tools.
+#
+# ``list_blobs``, ``list_composer_blobs``, ``get_blob_metadata``, and
+# ``inspect_source`` return only structural blob facts (id, filename,
+# mime_type, size, observed headers, inferred types) and never return raw blob
+# content.  ``get_blob_content`` IS the content-returning tool and is the
+# singular type-driven entry in this group with a response_model: declarative
+# entries have no response_summarizers field, so the per-key byte-count
+# summary required by the spec §4.7 disposition can only be applied via the
+# schema walker on a response_model with ``Annotated[str,
+# Sensitive(summarizer=...)]``.
+# ---------------------------------------------------------------------------
+
+
+_LIST_BLOBS_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=(
+        "session blob inventory — id/filename/mime_type/size_bytes/created_by/creation_modality per blob, no raw content",
+    ),
+    why_arguments_safe=(
+        "list_blobs accepts no arguments — the JSON schema declares an empty properties "
+        "object with additionalProperties=false, and redaction strips any unknown keys "
+        "before persistence; the handler enumerates the session inventory directly."
+    ),
+    why_responses_safe=(
+        "Response is the blob-inventory list — operator-uploaded filenames, mime_types, "
+        "and structural metadata per blob — but never the raw blob content; payload bytes "
+        "are exposed only via get_blob_content whose policy applies a length-only summary. "
+        "created_by and creation_modality are closed server-recorded vocabularies naming "
+        "who authored each blob's bytes; they carry no model, prompt, or operator identity."
+    ),
+)
+
+
+_LIST_COMPOSER_BLOBS_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("session blob inventory — id/filename/mime_type/size_bytes/content_hash per ready blob, no raw content",),
+    why_arguments_safe=(
+        "list_composer_blobs accepts no arguments — its JSON schema declares an "
+        "empty properties object with additionalProperties=false, and redaction strips "
+        "any unknown keys before persistence; the handler enumerates ready blobs from "
+        "the session-scoped inventory."
+    ),
+    why_responses_safe=(
+        "Response is the ADR-034 H4 visibility shape — blob_id, mime_type, "
+        "size_bytes, content_hash, and filename. It deliberately excludes "
+        "source_description, preview, content bytes, and storage_path so the LLM "
+        "can author a pinned ref without seeing the referenced text."
+    ),
+)
+
+
+_GET_BLOB_METADATA_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("session blob metadata — filename / mime_type / size / status / hash, no content bytes",),
+    why_arguments_safe=(
+        "get_blob_metadata accepts a single blob_id scalar string selecting one inventory "
+        "row; blob_ids are UUIDs assigned by the composer service and contain no operator "
+        "payload; the schema and redaction allowlist reject or strip any other argument keys."
+    ),
+    why_responses_safe=(
+        "Response is the single-blob metadata row — id, filename, mime_type, size_bytes, "
+        "status, content_hash — operator-uploaded labels but never the raw bytes; payload "
+        "exposure is gated to get_blob_content whose policy summarises content by length."
+    ),
+)
+
+
+def _summarize_blob_content(content: str) -> str:
+    """Summarizer for ``get_blob_content.content``.
+
+    Collapses content to a stable fixed sentinel with no value-derived length
+    signal, so projecting an already-redacted response is idempotent.
+
+    Contract (spec §4.2.6, §9 RSK-03):
+      * MUST NOT raise on any reachable input value.
+      * MUST return ``str``.
+    """
+    del content
+    return "<redacted-blob-content>"
+
+
+def _restore_fixed_repair_arguments_for_validation(value: object) -> object:
+    """Admit only our exact fixed sentinel on an idempotent second projection."""
+    return {} if value == "<redacted-repair-arguments>" else value
+
+
+def _summarize_repair_arguments(arguments: Mapping[str, object]) -> str:
+    """Summarizer for ``get_blob_content`` repair-tool-call ``arguments``.
+
+    The validation envelope's ``graph_repair_suggestions[*].tool_sequence[*].
+    arguments`` slot is the one genuinely heterogeneous leaf in the
+    ``get_blob_content`` response surface. It holds the keyword arguments the
+    composer would pass to a repair tool (field paths, node ids, connection
+    selectors) and varies per repair tool, so it cannot be closed-typed the way
+    the surrounding structural fields can. It is NOT source-data lineage — it is
+    derived, advisory repair guidance — so summarizing it to a structural sketch
+    in ``chat_messages.tool_calls`` does not break attributability.
+
+    The mapping is an open carrier: both keys and values may be externally
+    derived. The summary therefore discloses neither names, values, nor count.
+
+    Contract (spec §4.2.6, §9 RSK-03):
+      * MUST NOT raise on any reachable input value.
+      * MUST return ``str``.
+
+    Pydantic validation guarantees a mapping or the stable fixed sentinel
+    before this runs.
+    """
+    del arguments
+    return "<redacted-repair-arguments>"
+
+
+class _RepairToolCallShadowModel(BaseModel):
+    """Redaction shadow for ``_RepairToolCall`` (tools/_common.py).
+
+    Mirrors the serialized ``tool_sequence[*]`` dict: a closed ``tool`` name
+    plus the heterogeneous ``arguments`` mapping. ``arguments`` is the only
+    leaf in the entire ``get_blob_content`` validation envelope that cannot be
+    closed-typed, so it carries a :class:`Sensitive` marker with a structural
+    summarizer (:func:`_summarize_repair_arguments`). It is advisory repair
+    guidance, not source-data lineage, so retaining only its key count is
+    sufficient for audit shape.
+    """
+
+    tool: str
+    arguments: Annotated[
+        Mapping[str, object],
+        BeforeValidator(_restore_fixed_repair_arguments_for_validation),
+        Sensitive(summarizer=_summarize_repair_arguments),
+    ]
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _AffectedConsumerShadowModel(BaseModel):
+    """Redaction shadow for ``_AffectedConsumer`` (tools/_common.py).
+
+    All three fields are pipeline-structural scalar strings (node id and the
+    before/after input descriptors); none carries operator payload.
+    """
+
+    id: str
+    current_input: str
+    new_input: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _GraphRepairSuggestionShadowModel(BaseModel):
+    """Redaction shadow for ``_GraphRepairSuggestion`` (tools/_common.py).
+
+    Mirrors a serialized ``graph_repair_suggestions[*]`` dict. Every scalar
+    field is a structural repair descriptor; the two nested lists descend into
+    :class:`_AffectedConsumerShadowModel` and :class:`_RepairToolCallShadowModel`
+    so the walker reaches the single Sensitive ``arguments`` leaf within.
+    """
+
+    code: str
+    connection: str
+    strategy: str
+    reason: str
+    affected_consumers: list[_AffectedConsumerShadowModel]
+    tool_sequence: list[_RepairToolCallShadowModel]
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _SemanticEdgeContractShadowModel(BaseModel):
+    """Redaction shadow for ``_SemanticEdgeContractPayload`` (tools/_common.py).
+
+    Mirrors a serialized ``semantic_contracts[*]`` dict. All fields are
+    structural edge-contract metadata (node ids, plugin names, field names,
+    outcome / requirement codes). ``producer_plugin`` is ``str | None`` because
+    an unconnected consumer edge has no producer.
+    """
+
+    from_id: str
+    to_id: str
+    consumer_plugin: str
+    producer_plugin: str | None
+    producer_field: str
+    consumer_field: str
+    outcome: str
+    requirement_code: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _SchemaContractDetailShadowModel(BaseModel):
+    """Redaction shadow for ``SchemaContractDetail.to_dict()`` (state.py).
+
+    Producer/consumer are pipeline component identifiers (node ids /
+    ``output:<name>`` / source producer ids); the field lists are schema
+    FIELD NAMES from validated contract config. Pipeline-shape metadata the
+    session owner authored — never user row content — so none of it is
+    Sensitive (same judgment as the enclosing validation envelope).
+    """
+
+    producer: str
+    consumer: str
+    missing_fields: list[str] | None = None
+    extra_fields: list[str] | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _RowUnionFieldSchemaDetailShadowModel(BaseModel):
+    """One declared field in a row-union schema repair fact."""
+
+    name: str
+    field_type: str
+    required: bool
+    nullable: bool
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _RowUnionBranchSchemaDetailShadowModel(BaseModel):
+    """One branch declaration in a row-union schema repair fact."""
+
+    branch: str
+    mode: Literal["fixed", "flexible"]
+    fields: list[_RowUnionFieldSchemaDetailShadowModel]
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _RowUnionSchemaDetailShadowModel(BaseModel):
+    """Typed redaction shadow for safe row-union branch-schema facts."""
+
+    branches: list[_RowUnionBranchSchemaDetailShadowModel]
+    conflicting_fields: list[str]
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _CoalesceUnionTypeDetailShadowModel(BaseModel):
+    """Redaction shadow for ``CoalesceUnionTypeDetail.to_dict()`` (state.py).
+
+    A field name plus two branch names and their declared types, all read from
+    validated schema config — pipeline identifiers and schema field names,
+    never user row content. Same custody class as the row-union shadow above.
+    """
+
+    field: str
+    branch_a: str
+    type_a: str
+    branch_b: str
+    type_b: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _ValidationEntryShadowModel(BaseModel):
+    """Redaction shadow for ``ValidationEntry.to_dict()`` (state.py).
+
+    Mirrors a serialized validation message: ``component`` / ``message`` /
+    ``severity`` are all plain strings (``severity`` serializes from the
+    ``Severity`` literal alias to its string value); ``error_code`` is the
+    closed machine-readable discriminant, emitted only when set, and
+    ``contract`` the structured schema-contract facts, emitted only for the
+    schema-contract family, ``row_union_schema`` the branch declarations
+    emitted only for row-union incompatibility, and ``coalesce_union_type``
+    the conflicting declaration emitted only for a union-coalesce type clash,
+    and ``rejected_component`` the validation-component ref a
+    ``rejected_mutation`` entry is about, emitted only when the set_pipeline
+    component loop stamped it (elspeth-e405ad7cd2). The response scalar
+    projection preserves the closed severity value and summarizes all
+    free-form diagnostic text.
+
+    This model is ``extra="forbid"``, so it must carry EVERY optional key
+    ``ValidationEntry.to_dict()`` can emit: a missing one is not a silent
+    passthrough but a hard validation failure on the response path.
+    ``tests/unit/web/composer/test_redaction.py`` pins the two shapes against
+    each other so a new detail field cannot land on only one side.
+    """
+
+    component: str
+    message: str
+    severity: str
+    error_code: str | None = None
+    contract: _SchemaContractDetailShadowModel | None = None
+    row_union_schema: _RowUnionSchemaDetailShadowModel | None = None
+    coalesce_union_type: _CoalesceUnionTypeDetailShadowModel | None = None
+    rejected_component: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class GetBlobContentValidationModel(BaseModel):
+    """Redaction shadow for the serialized ``ToolResult`` validation envelope.
+
+    Faithfully mirrors the ``"validation"`` dict built in
+    ``ToolResult.to_dict()`` (tools/_common.py ~591-605). This replaces the
+    previous ``validation: dict[str, Any]`` on
+    :class:`GetBlobContentResponseModel`, which was an ``Any``-typed
+    redaction-bypass surface the adequacy guard (§4.4.2) fails closed on.
+
+    The validation envelope is structural pipeline-validation metadata, not
+    blob bytes, so the field as a whole is intentionally NOT marked Sensitive.
+    A post-validation scalar projection preserves closed public framing while
+    summarizing free-form text. The
+    ``graph_repair_suggestions[*].tool_sequence[*].arguments`` mapping also
+    carries its own Sensitive structural summarizer in
+    :class:`_RepairToolCallShadowModel`.
+    """
+
+    is_valid: bool
+    errors: list[_ValidationEntryShadowModel]
+    warnings: list[_ValidationEntryShadowModel]
+    suggestions: list[_ValidationEntryShadowModel]
+    semantic_contracts: list[_SemanticEdgeContractShadowModel]
+    graph_repair_suggestions: list[_GraphRepairSuggestionShadowModel]
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _RequestInterpretationReviewPendingDataModel(BaseModel):
+    """Correlation-only response payload for a pending interpretation review."""
+
+    kind_marker: Literal["interpretation_review_pending", "interpretation_review_pending_idempotent"] = Field(alias="_kind")
+    event_id: str
+    kind: InterpretationKind
+    interpretation_source: str
+    message: str
+
+    model_config = ConfigDict(extra="forbid", serialize_by_alias=True)
+
+
+class _RequestInterpretationReviewPendingTextDataModel(BaseModel):
+    """Legacy/drift response payload that accidentally carries review text.
+
+    The live handler omits ``user_term`` and ``llm_draft`` entirely; this model
+    exists as a persistence-boundary backstop if a future response shape adds
+    them back. Because the raw fields are present, ``message`` is sensitive too:
+    past versions interpolated the term into that string.
+    """
+
+    kind_marker: Literal["interpretation_review_pending", "interpretation_review_pending_idempotent"] = Field(alias="_kind")
+    event_id: str
+    kind: InterpretationKind
+    user_term: Annotated[str, Sensitive(summarizer=_summarize_interpretation_term)]
+    llm_draft: Annotated[str, Sensitive(summarizer=_summarize_interpretation_term)]
+    interpretation_source: str
+    message: Annotated[str, Sensitive(summarizer=_summarize_interpretation_term)]
+
+    model_config = ConfigDict(extra="forbid", serialize_by_alias=True)
+
+
+class _RequestInterpretationReviewSuppressedDataModel(BaseModel):
+    """Correlation-only response payload for session opt-out suppression."""
+
+    kind_marker: Literal["interpretation_review_suppressed_by_opt_out"] = Field(alias="_kind")
+    event_id: str
+    kind: InterpretationKind
+    interpretation_source: str
+    interpretation_review_disabled: bool
+    message: str
+
+    model_config = ConfigDict(extra="forbid", serialize_by_alias=True)
+
+
+class _RequestInterpretationReviewBlockedDataModel(BaseModel):
+    """Closed server-authored refusal; detailed findings stay value-redacted."""
+
+    kind_: Literal["interpretation_review_blocked"] = Field(alias="_kind")
+    message: str
+
+    model_config = ConfigDict(extra="forbid", serialize_by_alias=True)
+
+
+class _RequestInterpretationReviewResponseModel(BaseModel):
+    """Redaction-bearing ``ToolResult`` envelope for interpretation reviews."""
+
+    success: bool
+    validation: GetBlobContentValidationModel
+    affected_nodes: list[str]
+    version: int
+    data: (
+        _RequestInterpretationReviewPendingDataModel
+        | _RequestInterpretationReviewPendingTextDataModel
+        | _RequestInterpretationReviewSuppressedDataModel
+        | _RequestInterpretationReviewBlockedDataModel
+    )
+    runtime_preflight: _SafeResponseEnvelope = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class GetBlobContentArgumentsModel(BaseModel):
+    """Redaction-bearing argument model for the ``get_blob_content`` tool.
+
+    Mirrors the declaration in ``tools/blobs.py``. ``blob_id`` and the
+    character offset are read selectors. The caller's expected hash is
+    Sensitive and masked in argument persistence; only the verified server
+    response may supply publicly retained content identity. At offset zero,
+    omission/null means no expected identity constraint; subsequent offsets
+    require a canonical non-null hash. Every non-null supplied hash is checked.
+
+    ``get_blob_content`` is type-driven (not declarative) because the
+    response surface IS sensitive: ``content`` carries the operator's
+    uploaded blob payload and must be replaced by the fixed content sentinel
+    before reaching ``chat_messages.tool_calls``.  Declarative entries have
+    no ``response_summarizers`` field; the only way
+    to attach a per-key summarizer is via a ``Annotated[T, Sensitive(...)]``
+    on a response model walked by ``walk_model_schema``.
+
+    ``extra="forbid"`` is required (rev-2 M.1).  Fields belonging to
+    neighbouring tools (``filename``, ``mime_type``, ``content`` —
+    those are on ``create_blob`` / ``update_blob``) are intentionally
+    absent so ``extra="forbid"`` rejects misrouted argument shapes early.
+    """
+
+    blob_id: str
+    offset_chars: int = Field(default=0, ge=0)
+    expected_content_hash: Annotated[str | None, Sensitive()] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    @model_validator(mode="after")
+    def require_continuation_identity(self) -> GetBlobContentArgumentsModel:
+        if self.offset_chars > 0 and self.expected_content_hash is None:
+            raise ValueError("Continuation requires expected_content_hash")
+        return self
+
+
+type BlobReadSuggestion = Literal[
+    "This is a partial page of a large attachment. If you need the whole file, use read_attachment "
+    "for complete guarded UTF-8 text in one call; it explicitly refuses if the full response cannot fit.",
+]
+
+
+class GetBlobContentDataModel(BaseModel):
+    """Redaction-bearing success payload for ``get_blob_content``."""
+
+    blob_id: str
+    filename: str
+    mime_type: str
+    content: Annotated[str, Sensitive(summarizer=_summarize_blob_content)]
+    truncated: bool
+    size_bytes: int
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    total_chars: int = Field(ge=0)
+    start_char: int = Field(ge=0)
+    end_char: int = Field(ge=0)
+    next_offset_chars: int | None = Field(ge=0)
+    # Blob origin (elspeth-47eba5cced). Not Sensitive: both are closed
+    # server-recorded vocabularies, and _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD
+    # admits only their declared members, so the persisted audit row keeps
+    # the provenance queryable while any off-vocabulary value is summarized
+    # away. They carry no model, prompt, or operator identity — the five
+    # creating_* columns stay off this wire entirely.
+    created_by: str
+    creation_modality: str
+
+    read_attachment_suggestion: BlobReadSuggestion | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    @model_validator(mode="after")
+    def require_consistent_range(self) -> GetBlobContentDataModel:
+        if not self.start_char <= self.end_char <= self.total_chars or self.end_char - self.start_char > 50_000:
+            raise ValueError("Blob content range is invalid")
+        if self.end_char == self.start_char and self.end_char < self.total_chars:
+            raise ValueError("A nonterminal blob page must advance")
+        if self.truncated != (self.end_char < self.total_chars):
+            raise ValueError("Blob truncation must describe the returned range")
+        if self.next_offset_chars != (self.end_char if self.truncated else None):
+            raise ValueError("Blob continuation offset must match the returned range")
+        return self
+
+
+READ_ATTACHMENT_MAX_UTF8_BYTES = min(JSON_MAX_TOTAL_UTF8_BYTES, DEFAULT_CREDENTIAL_TRAVERSAL_POLICY.max_string_bytes)
+
+
+class ReadAttachmentArgumentsModel(BaseModel):
+    """Selectors for one complete authorized session attachment."""
+
+    blob_id: str
+    expected_content_hash: Annotated[str | None, Sensitive()] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+
+class ReadAttachmentDataModel(BaseModel):
+    """Complete text; never reinterpret a prefix as a full attachment."""
+
+    blob_id: str
+    filename: str
+    mime_type: str
+    content: Annotated[str, Sensitive(summarizer=_summarize_blob_content)]
+    truncated: bool
+    size_bytes: int = Field(ge=0, le=READ_ATTACHMENT_MAX_UTF8_BYTES)
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    total_chars: int = Field(ge=0)
+    start_char: int = Field(ge=0)
+    end_char: int = Field(ge=0)
+    next_offset_chars: int | None = Field(ge=0)
+    created_by: BlobCreator
+    creation_modality: str
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True, revalidate_instances="always")
+
+
+class ReadAttachmentResponseModel(BaseModel):
+    """Sensitive full-file text and recoverable failures share a closed envelope."""
+
+    success: bool
+    validation: GetBlobContentValidationModel
+    affected_nodes: list[str]
+    version: int
+    data: ReadAttachmentDataModel | None = Field(default=None, exclude_if=lambda data: data is None)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def require_success_data(self) -> ReadAttachmentResponseModel:
+        if self.success and self.data is None:
+            raise ValueError("Successful read_attachment response requires complete data")
+        return self
+
+
+class GetBlobContentResponseModel(BaseModel):
+    """Redaction-bearing ``ToolResult`` envelope for ``get_blob_content``.
+
+    The handler returns a normal composer ``ToolResult`` envelope. Its success
+    branch stores sensitive blob bytes under ``data.content``; rejection details
+    reside in ``validation.errors`` and need no data payload. Keep shapes closed so audit persistence
+    redacts content without crashing on recoverable failures.
+    """
+
+    success: bool
+    validation: GetBlobContentValidationModel
+    affected_nodes: list[str]
+    version: int
+    data: GetBlobContentDataModel | None = Field(default=None, exclude_if=lambda data: data is None)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def require_success_data(self) -> GetBlobContentResponseModel:
+        if self.success and self.data is None:
+            raise ValueError("Successful get_blob_content response requires data")
+        return self
+
+
+class _ToolResultResponseModel(BaseModel):
+    """Fail-closed response projection shared by type-driven mutation tools.
+
+    Engine-owned ToolResult framing stays typed and queryable. Open payload
+    carriers are explicitly Sensitive and collapse to value-free shape
+    summaries, so new handler diagnostics cannot become persistence bypasses.
+    """
+
+    success: bool
+    validation: GetBlobContentValidationModel
+    affected_nodes: list[str]
+    version: int
+    data: _SafeResponseEnvelope = None
+    runtime_preflight: _SafeResponseEnvelope = None
+    validation_delta: _SafeResponseEnvelope = None
+    post_call_hints: _SafeResponseEnvelope = None
+    plugin_schemas: _SafeResponseEnvelope = None
+    validation_guidance: _SafeResponseEnvelope = None
+    applied_component: _SafeResponseEnvelope = None
+    pipeline_content_hash_schema: Literal["composer.pipeline-dispatch-result.v1"] | None = None
+    pipeline_content_hash: Annotated[str | None, Sensitive(summarizer=_summarize_external_response_value)] = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+_INSPECT_SOURCE_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("source inspection facts — headers / types / URL candidates, never raw row content",),
+    why_arguments_safe=(
+        "inspect_source accepts a blob_id scalar string selecting one inventory row "
+        "and an optional bounded encoding scalar selecting CSV/TSV decoding. "
+        "The handler reads at most 8 KiB and parses at most 100 rows, returning only "
+        "structural facts; the schema and redaction allowlist reject or strip any other keys."
+    ),
+    why_responses_safe=(
+        "Response is the SourceInspectionFacts struct — observed headers, inferred scalar "
+        "types per column, URL candidate count, and warnings; the inspector explicitly never "
+        "returns raw row content (tools.py:3724 docstring) so payload bytes never appear."
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Declarative manifest entries — _BLOB_MUTATION_TOOLS
+# remaining, 2 tools).
+#
+# Excluding create_blob / update_blob / set_source_from_blob,
+# ``delete_blob`` and ``wire_blob_inline_ref`` remain in
+# ``_BLOB_MUTATION_TOOLS``. They take scalar identifiers / field paths and
+# return structural ToolResult payloads.
+# ---------------------------------------------------------------------------
+
+
+_DELETE_BLOB_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=("session blob inventory — single blob_id selector identifying the deletion target",),
+    why_arguments_safe=(
+        "delete_blob accepts a single blob_id scalar string naming the inventory row to "
+        "delete; the JSON schema at tools.py:1432-1441 has no other properties, so the "
+        "LLM cannot place any blob content or operator payload on this surface."
+    ),
+    why_responses_safe=(
+        "Response is the structural ToolResult after deletion — validation summary plus "
+        "the affected node id list reflecting any pipeline references to the now-removed "
+        "blob; the deleted blob's content and metadata are not echoed back in the response."
+    ),
+)
+
+
+_WIRE_BLOB_INLINE_REF_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=(
+        "session blob inventory — blob_id selector and authoritative content_hash only",
+        "pipeline plugin option dict — the widened blob_ref marker is wired, not the referenced content",
+    ),
+    why_arguments_safe=(
+        "wire_blob_inline_ref arguments are scalar metadata: field_path, blob_id, "
+        "optional encoding. The stored content hash is authoritative. "
+        "The tool never accepts content bytes; it reads the authoritative hash from "
+        "the blobs table and rejects disagreement."
+    ),
+    why_responses_safe=(
+        "Response is the structural ToolResult after the state mutation. Subsequent "
+        "state inspection can show the marker {blob_ref, mode, sha256, encoding}, but "
+        "the referenced blob content remains opaque and is resolved only at runtime."
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Declarative manifest entries — _SECRET_DISCOVERY_TOOLS,
+# 2 tools).
+#
+# Secret values are resolved server-side at execution time by the secret
+# service; they never traverse the composer tool surface.  ``list_secret_refs``
+# and ``validate_secret_ref`` operate on secret NAMES only — discovering which
+# references the operator has wired and whether the current user can resolve
+# them at execution.  The named-vs-valued distinction is the entire reason
+# the secret-ref mechanism exists; surfacing it explicitly in the audit-trail
+# justification is policy-correct.
+# ---------------------------------------------------------------------------
+
+
+_LIST_SECRET_REFS_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=(
+        "server-side secret resolver — secret values resolved at execution time, never echoed",
+        "secret-ref registry — references carry NAMES and SCOPES only, not values",
+    ),
+    why_arguments_safe=(
+        "list_secret_refs accepts no arguments — the JSON schema at tools.py:1519 declares "
+        "an empty properties object with empty required, so the LLM cannot place any "
+        "value on this surface; the handler enumerates the user's accessible references."
+    ),
+    why_responses_safe=(
+        "Response is the user-scoped secret reference inventory — names and scopes per "
+        "ref — but never values; values live behind the secret-service resolver and are "
+        "materialised only at pipeline execution, never in any composer tool response."
+    ),
+)
+
+
+_VALIDATE_SECRET_REF_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=(
+        "server-side secret resolver — secret values resolved at execution time, never echoed",
+        "secret-ref existence check — yes/no flag plus scope, never the value",
+    ),
+    why_arguments_safe=(
+        "validate_secret_ref accepts a single scalar name string identifying the secret "
+        "reference to check; names are operator-chosen labels (e.g., 'OPENROUTER_API_KEY') "
+        "registered via the secret service and never the underlying credential value."
+    ),
+    why_responses_safe=(
+        "Response is the existence/accessibility flag plus the matching scope — boolean "
+        "and scope label only; the secret VALUE is resolved only at pipeline execution "
+        "time by the server-side resolver and never enters the composer tool surface."
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Declarative manifest entries — _SECRET_MUTATION_TOOLS,
+# 1 tool).
+# ---------------------------------------------------------------------------
+
+
+_WIRE_SECRET_REF_REASON = HandlesNoSensitiveDataReason(
+    sensitive_data_locations=(
+        "server-side secret resolver — secret values resolved at execution time, never echoed",
+        "pipeline plugin option dict — the secret REFERENCE marker {secret_ref: NAME} is wired, not the value",
+    ),
+    why_arguments_safe=(
+        "wire_secret_ref arguments are four scalar strings (name, target, target_id, "
+        "option_key); the handler places a {secret_ref: NAME} marker dict into the chosen "
+        "option slot, so only the NAME of the secret is recorded — never any credential."
+    ),
+    why_responses_safe=(
+        "Response is the structural ToolResult after the wire mutation — validation summary "
+        "for the post-mutation state plus the affected node id list; the wired marker "
+        "appears in subsequent state inspections but the secret VALUE is never returned."
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Declarative manifest entry — request_advisor_hint, 1 tool.
+#
+# ``request_advisor_hint`` is the advisor escape hatch intercepted at
+# service.py:2103 BEFORE the dispatcher; the result_payload shapes are
+# enumerated at service.py:2114-2358 (error, budget-exhausted, timeout,
+# advisor-error, success).  ``problem_summary``, ``recent_errors``,
+# ``attempted_actions``, and ``schema_excerpt`` are LLM-supplied free text
+# that may reproduce prompt-injection vectors, plugin option values, or
+# validator-quoted operator content; they ARE summarised at the argument
+# boundary so the audit-side record collapses each to a fixed-form scalar.
+#
+# ``guidance`` in the response is the frontier-model advice text returned
+# by ``_call_advisor_with_audit``; the full text is already preserved in the
+# audit trail by the ComposerLLMCall recorder, which fires in the same
+# request.  For the chat_messages.tool_calls.result_payload row the guidance
+# text is classified as ``sensitive_response_keys`` so it is substituted with
+# REDACTED_SENSITIVE_NO_SUMMARIZER at the persistence boundary, keeping the
+# closed-set status / budget / latency metadata in clear text while preventing
+# double-mirroring of the advice text into the tool-call surface.
+# ---------------------------------------------------------------------------
+
+
+def _summarize_advisor_problem_summary(value: str) -> str:
+    """Summarizer for ``request_advisor_hint.problem_summary``.
+
+    Records only the character length of the LLM's problem statement; the
+    composer's own slog of advisor calls retains the full text under separate
+    retention policy.  Contract (spec §4.2.6, §9 RSK-03):
+
+      * MUST NOT raise on any reachable input value.
+      * MUST return ``str``.
+    """
+    return f"<advisor-problem-summary:{len(value)}-chars>"
+
+
+def _summarize_advisor_recent_errors(value: list[str]) -> str:
+    """Summarizer for ``request_advisor_hint.recent_errors``.
+
+    Records only the number of error strings.  The full error texts are
+    preserved in the separate validator-output audit records; recording them
+    here would double-mirror them into ``chat_messages.tool_calls`` beyond
+    their intended retention surface.
+    """
+    return f"<advisor-recent-errors:{len(value)}-entries>"
+
+
+def _summarize_advisor_attempted_actions(value: list[str]) -> str:
+    """Summarizer for ``request_advisor_hint.attempted_actions``."""
+    return f"<advisor-attempted-actions:{len(value)}-entries>"
+
+
+def _summarize_advisor_schema_excerpt(value: str) -> str:
+    """Summarizer for ``request_advisor_hint.schema_excerpt``."""
+    return f"<advisor-schema-excerpt:{len(value)}-chars>"
+
+
+# Both tables derive from the registry that ``ToolResult.to_dict`` is pinned to;
+# they were hand-maintained copies with no cross-check until elspeth-e405ad7cd2.
+_TOOL_RESULT_REQUIRED_RESPONSE_KEYS: tuple[str, ...] = TOOL_RESULT_REQUIRED_KEYS
+_TOOL_RESULT_OPTIONAL_RESPONSE_KEYS: tuple[str, ...] = tuple(key for key in TOOL_RESULT_OPTIONAL_KEYS if key != "data")
+
+
+def _tool_result_response_keys(*, data: bool) -> tuple[str, ...]:
+    """Return the shared top-level ``ToolResult.to_dict`` response envelope, from the registry."""
+    return tool_result_keys(data=data)
+
+
+# Manifest entries are grouped by tool family. The binding is rebuilt as a
+# new ``MappingProxyType`` per the spec §4.2.1
+# rule "subsequent task waves extend the manifest by building a new
+# dict, then replacing the module-level binding — never by mutating
+# the proxy view".
+MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
+    {
+        # set_source.
+        "set_source": ToolRedaction(
+            argument_model=SetSourceArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        # blob-write tools.
+        "create_blob": ToolRedaction(
+            argument_model=CreateBlobArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        "update_blob": ToolRedaction(
+            argument_model=UpdateBlobArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        "set_source_from_blob": ToolRedaction(
+            argument_model=SetSourceFromBlobArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        "set_source_from_blobs": ToolRedaction(
+            argument_model=SetSourceFromBlobsArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        # full-pipeline mutations.
+        "set_pipeline": ToolRedaction(
+            argument_model=SetPipelineArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        # option-patch tools.
+        "patch_source_options": ToolRedaction(
+            argument_model=PatchSourceOptionsArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        "patch_node_options": ToolRedaction(
+            argument_model=PatchNodeOptionsArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        "patch_output_options": ToolRedaction(
+            argument_model=PatchOutputOptionsArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        # _DISCOVERY_TOOLS, 12 declarative entries.
+        "list_sources": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_LIST_SOURCES_REASON,
+            )
+        ),
+        "list_transforms": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_LIST_TRANSFORMS_REASON,
+            )
+        ),
+        "list_sinks": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_LIST_SINKS_REASON,
+            )
+        ),
+        "get_plugin_schema": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=("plugin_type", "name"),
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_GET_PLUGIN_SCHEMA_REASON,
+            )
+        ),
+        "get_expression_grammar": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_GET_EXPRESSION_GRAMMAR_REASON,
+            )
+        ),
+        "explain_validation_error": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=("error_text",),
+                sensitive_argument_keys=("error_text",),
+                argument_summarizers={"error_text": _summarize_explain_validation_error_text},
+                handles_no_sensitive_data=False,
+                # The dispatch envelope only — the keys that were already
+                # implicitly known. ``data`` (which echoes error_text) and the
+                # optional augmentation keys stay undeclared and fail closed,
+                # so the persisted response is byte-identical to before.
+                known_response_keys=_TOOL_RESULT_REQUIRED_RESPONSE_KEYS,
+            )
+        ),
+        "get_plugin_assistance": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=("plugin_type", "plugin_name", "issue_code"),
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_GET_PLUGIN_ASSISTANCE_REASON,
+            )
+        ),
+        "list_models": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=("provider", "limit"),
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_LIST_MODELS_REASON,
+            )
+        ),
+        "get_audit_info": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_GET_AUDIT_INFO_REASON,
+            )
+        ),
+        "get_pipeline_state": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=("component",),
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_GET_PIPELINE_STATE_REASON,
+            )
+        ),
+        "preview_pipeline": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_PREVIEW_PIPELINE_REASON,
+            )
+        ),
+        "diff_pipeline": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_DIFF_PIPELINE_REASON,
+            )
+        ),
+        # _MUTATION_TOOLS remaining, 8 declarative entries.
+        "upsert_node": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=(
+                    "id",
+                    "node_type",
+                    "input",
+                    "plugin",
+                    "on_success",
+                    "on_error",
+                    "options",
+                    "condition",
+                    "routes",
+                    "fork_to",
+                    "branches",
+                    "policy",
+                    "merge",
+                    "trigger",
+                    "output_mode",
+                    "expected_output_count",
+                    "timeout_seconds",
+                    "scope_name",
+                    "scope_opener",
+                    "scope_policy",
+                    # Advertised since 80fa17fed (2026-08-15) and absent here until
+                    # 2026-09-04: composer-authored prose shown to reviewers on the
+                    # Spec tab. While unlisted, this fail-closed policy replaced the
+                    # key NAME with the unknown-argument sentinel, so the audit row
+                    # could not say which knob the planner had set.
+                    "description",
+                ),
+                sensitive_argument_keys=("options", "routes", "trigger"),
+                argument_summarizers={
+                    "options": _summarize_set_source_options,
+                    "routes": _summarize_set_source_options,
+                    "trigger": _summarize_set_source_options,
+                },
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=False,
+                # Shared ToolResult.to_dict() envelope plus the data key emitted
+                # by failure branches reachable from _execute_upsert_node:
+                # _mutation_result → always emits success/validation/affected_nodes/version;
+                # _failure_result → rejection details in validation.errors;
+                # _credential_wiring_contract_failure → adds data={credential_fields,
+                #   components, repair}.
+                known_response_keys=_tool_result_response_keys(data=True),
+            )
+        ),
+        "upsert_edge": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=(
+                    "id",
+                    "from_node",
+                    "to_node",
+                    "edge_type",
+                    "label",
+                ),
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_UPSERT_EDGE_REASON,
+            )
+        ),
+        "remove_node": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=("id",),
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_REMOVE_NODE_REASON,
+            )
+        ),
+        "remove_edge": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=("id",),
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_REMOVE_EDGE_REASON,
+            )
+        ),
+        "remove_output": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=("sink_name",),
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_REMOVE_OUTPUT_REASON,
+            )
+        ),
+        "clear_source": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=("source_name",),
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_CLEAR_SOURCE_REASON,
+            )
+        ),
+        "set_metadata": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=("patch",),
+                sensitive_argument_keys=("patch",),
+                argument_summarizers={"patch": _summarize_set_metadata_patch},
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=False,
+                # Shared ToolResult.to_dict() envelope. _execute_set_metadata
+                # currently calls _mutation_result without data, so data remains
+                # excluded while optional ToolResult augmentation keys stay
+                # centrally covered.
+                known_response_keys=_tool_result_response_keys(data=False),
+            )
+        ),
+        "set_output": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=(
+                    "sink_name",
+                    "plugin",
+                    "options",
+                    "on_write_failure",
+                    # See the note on upsert_node's "description": same schema
+                    # property, added by the same commit, missing here for the
+                    # same 20 days.
+                    "description",
+                ),
+                sensitive_argument_keys=("options",),
+                argument_summarizers={"options": _summarize_set_source_options},
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=False,
+                # Shared ToolResult.to_dict() envelope plus the data key emitted
+                # by failure branches reachable from _execute_set_output:
+                # _mutation_result → success/validation/affected_nodes/version;
+                # _failure_result → rejection details in validation.errors;
+                # _credential_wiring_contract_failure → adds data={credential_fields,
+                #   components, repair}.
+                known_response_keys=_tool_result_response_keys(data=True),
+            )
+        ),
+        # _BLOB_DISCOVERY_TOOLS, 5 entries (4 declarative + 1 type-driven).
+        "list_blobs": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_LIST_BLOBS_REASON,
+            )
+        ),
+        "list_composer_blobs": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_LIST_COMPOSER_BLOBS_REASON,
+            )
+        ),
+        "get_blob_metadata": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=("blob_id",),
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_GET_BLOB_METADATA_REASON,
+            )
+        ),
+        "get_blob_content": ToolRedaction(
+            argument_model=GetBlobContentArgumentsModel,
+            response_model=GetBlobContentResponseModel,
+        ),
+        "read_attachment": ToolRedaction(
+            argument_model=ReadAttachmentArgumentsModel,
+            response_model=ReadAttachmentResponseModel,
+        ),
+        "inspect_source": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=("blob_id", "encoding"),
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_INSPECT_SOURCE_REASON,
+            )
+        ),
+        # _BLOB_MUTATION_TOOLS remaining, 2 entries.
+        "delete_blob": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=("blob_id",),
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_DELETE_BLOB_REASON,
+            )
+        ),
+        "wire_blob_inline_ref": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=("field_path", "blob_id", "encoding"),
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_WIRE_BLOB_INLINE_REF_REASON,
+            )
+        ),
+        # _SECRET_DISCOVERY_TOOLS, 2 entries.
+        "list_secret_refs": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_LIST_SECRET_REFS_REASON,
+                known_argument_keys=(),
+                redact_unknown_argument_keys=True,
+            )
+        ),
+        "validate_secret_ref": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_VALIDATE_SECRET_REF_REASON,
+                known_argument_keys=("name",),
+                redact_unknown_argument_keys=True,
+            )
+        ),
+        # _SECRET_MUTATION_TOOLS, 1 entry.
+        "wire_secret_ref": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                handles_no_sensitive_data=True,
+                handles_no_sensitive_data_reason_struct=_WIRE_SECRET_REF_REASON,
+                known_argument_keys=("name", "target", "target_id", "option_key"),
+                redact_unknown_argument_keys=True,
+            )
+        ),
+        # request_interpretation_review (session-aware async tool).
+        # Type-driven entry; both argument and response-side review text fields
+        # carry a fixed-form summariser so chat_messages.tool_calls cannot leak
+        # unbounded user/LLM text. The live handler returns correlation-only
+        # response data, while the response_model keeps a redaction backstop for
+        # future drift that accidentally reintroduces user_term / llm_draft.
+        "request_interpretation_review": ToolRedaction(
+            argument_model=_RequestInterpretationReviewRedactionModel,
+            response_model=_RequestInterpretationReviewResponseModel,
+        ),
+        # request_advisor_hint (intercepted at service.py:2103).
+        "request_advisor_hint": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=(
+                    "trigger",
+                    "problem_summary",
+                    "recent_errors",
+                    "attempted_actions",
+                    "schema_excerpt",
+                ),
+                sensitive_argument_keys=(
+                    "problem_summary",
+                    "recent_errors",
+                    "attempted_actions",
+                    "schema_excerpt",
+                ),
+                argument_summarizers={
+                    "problem_summary": _summarize_advisor_problem_summary,
+                    "recent_errors": _summarize_advisor_recent_errors,
+                    "attempted_actions": _summarize_advisor_attempted_actions,
+                    "schema_excerpt": _summarize_advisor_schema_excerpt,
+                },
+                handles_no_sensitive_data=False,
+                # sensitive_response_keys: guidance is the frontier-model advice text,
+                # already preserved by ComposerLLMCall recorder; classifying it sensitive
+                # prevents double-mirroring of the advice text into chat_messages.tool_calls
+                # while keeping the closed-set status/budget/latency metadata in clear text.
+                # Per ToolRedactionPolicy invariant 5 (adequacy guard assertion 5), guidance
+                # must also appear in known_response_keys (sensitive ⊆ known).
+                sensitive_response_keys=("guidance",),
+                # known_response_keys: enumerated from all reachable response shapes at
+                # service.py:2114-2358.  Disabled path → {error}.  Budget-exhausted path →
+                # {status, budget_used, budget_remaining, guidance}.  ARG_ERROR path →
+                # {status, error, error_class}.  Timeout/advisor-error paths →
+                # {status, error, error_class, budget_used, budget_remaining}.  Success path
+                # → {status, guidance, model, prompt_tokens, completion_tokens,
+                # cached_prompt_tokens, advisor_latency_ms, budget_used, budget_remaining,
+                # note}.  Union of all shapes, guidance included per the sensitive⊆known rule.
+                known_response_keys=(
+                    "status",
+                    "error",
+                    "error_class",
+                    "budget_used",
+                    "budget_remaining",
+                    "guidance",
+                    "model",
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "cached_prompt_tokens",
+                    "advisor_latency_ms",
+                    "note",
+                    "abandonment_decision",
+                    "review_binding",
+                ),
+            )
+        ),
+    }
+)
+
+
+@trust_boundary(
+    tier=3,
+    source="Raw declarative-manifest tool response value for a known-but-not-sensitive key (no pydantic model)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "never raises; every disposition falls back to a value-free summary or a nested structural projection "
+        "unless the value matches a closed per-field public constant or a validated nested model"
+    ),
+    non_raising=True,
+)
+def _redact_declarative_known_response_value(
+    value: Any,
+    *,
+    field_name: str,
+    tool_name: str,
+    telemetry: RedactionTelemetry,
+) -> Any:
+    """Apply a type/value disposition after declarative key admission."""
+    if field_name == "success":
+        return value if type(value) is bool else _summarize_external_response_value(value)
+    if field_name in _SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS:
+        return value if type(value) is int else _summarize_external_response_value(value)
+    if field_name == "status":
+        if isinstance(value, str) and value in _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD["status"]:
+            return value
+        return _summarize_external_response_value(value)
+    if field_name == "validation" and isinstance(value, Mapping):
+        try:
+            validated = GetBlobContentValidationModel.model_validate(value)
+        except ValidationError:
+            return _summarize_external_response_value(value)
+        redacted = _redact_via_schema(
+            tool_name,
+            validated,
+            GetBlobContentValidationModel,
+            telemetry=telemetry,
+        )
+        return _project_validated_response_scalars(redacted)
+    return _project_untrusted_response_structure(value, path=(field_name,))
+
+
+def redact_tool_call_response(
+    tool_name: str,
+    response: dict[str, Any],
+    *,
+    telemetry: RedactionTelemetry,
+) -> dict[str, Any]:
+    """Produce the redacted response dict for the persistence boundary (spec §4.2.4, §4.2.6).
+
+    Disposition by manifest-entry shape:
+
+    **Type-driven entry with response_model:**
+      Walk via ``walk_model_schema``; ``Sensitive[T]`` fields are substituted
+      with the summarizer output, or ``REDACTED_SENSITIVE_NO_SUMMARIZER`` when
+      no summarizer is declared. Nested-path substitution delegates to the
+      fail-closed walker path, which raises ``NotImplementedError`` for paths
+      containing ``.``, ``[``, or ``{``.
+
+    **Type-driven entry without response_model:**
+      Raise ``AuditIntegrityError``. A type-driven response without an
+      explicit projection is a manifest integrity defect and must never be
+      persisted.
+
+    **Declarative entry:**
+      Walk ``response.keys()``; each key is one of:
+        - In ``policy.sensitive_response_keys`` → ``REDACTED_SENSITIVE_NO_SUMMARIZER``
+          (declarative entries have no response_summarizers; the argument_summarizers
+          mapping covers only argument keys).
+        - In ``policy.known_response_keys`` but not sensitive → closed
+          type/value projection; public framing survives while externally
+          derived keys and scalars are summarized.
+        - In neither → aggregate under ``REDACTED_UNKNOWN_RESPONSE_FIELD``
+          with ``REDACTED_UNKNOWN_RESPONSE_KEY`` (fail-closed; counter fires).
+
+    **Projection budget (per top-level key):**
+      The depth / width / node budget bounds each top-level value on its own,
+      before any model validation of that value, so one oversized subtree
+      costs only its own key. A known key whose value is over budget becomes
+      ``_REDACTED_RESPONSE_PROJECTION_LIMIT`` and the envelope framing
+      survives. Unknown and sensitive declarative keys are never walked (they
+      become fixed sentinels regardless of size). The whole-row
+      ``_RESPONSE_PROJECTION_LIMIT`` stub remains for: more top-level keys
+      than the container width; a type-driven over-budget value whose field
+      is required or undeclared (a required typed field has no per-key
+      substitute before validation); and a projected row above the output
+      byte budget. Every substitution fires
+      ``telemetry.response_projection_limit(tool_name=..., scope=...)`` with
+      ``scope="key"`` for a per-key sentinel and ``scope="row"`` for the
+      whole-row stub.
+
+    **Failure modes (all raise AuditIntegrityError):**
+      - Manifest entry missing for ``tool_name`` (registry-consistency invariant).
+      - Summarizer raises → ``telemetry.summarizer_error(tool_name=...)`` BEFORE
+        raise; ``AuditIntegrityError`` chained from the underlying exception (M.8).
+      - Summarizer returns non-str → ``telemetry.summarizer_error(tool_name=...)``
+        BEFORE raise; ``AuditIntegrityError`` with a typed message.
+
+    **Walker atomicity:** the output dict is built in a local variable and
+    only returned on success.  A mid-walk raise leaves no partial dict
+    observable to the caller (rev-3 W8b / rev-4 W8b).
+    """
+    if tool_name not in MANIFEST:
+        raise AuditIntegrityError(
+            f"redact_tool_call_response called for unknown tool {tool_name!r}; "
+            "the manifest is the source of truth for the registry/redaction "
+            "set-equality invariant.  Add a manifest entry for this tool or "
+            "verify that the dispatch path passes the correct tool name."
+        )
+    entry = MANIFEST[tool_name]
+    telemetry.manifest_dispatch(
+        tool_name=tool_name,
+        shape="type_driven" if entry.argument_model is not None else "declarative",
+    )
+    if response == _RESPONSE_PROJECTION_LIMIT:
+        return dict(_RESPONSE_PROJECTION_LIMIT)
+    # Only the top-level key COUNT is bounded across the whole row; every
+    # top-level value is bounded separately below, so one wide subtree (the
+    # unfiltered list_models call's 87-entry ``data.providers``) no longer
+    # erases the success / validation / version framing.
+    if len(response) > RESPONSE_PROJECTION_MAX_CONTAINER_WIDTH:
+        telemetry.response_projection_limit(tool_name=tool_name, scope="row")
+        return dict(_RESPONSE_PROJECTION_LIMIT)
+
+    # --- Type-driven path ---
+    if entry.argument_model is not None:
+        # Spec §4.2.4: manifest_dispatch is a per-invocation, walker-wide beacon.
+        # Emit regardless of whether a response_model is declared — the dispatch
+        # happened and the shape is type_driven in both sub-cases.
+        if entry.response_model is None:
+            raise AuditIntegrityError(
+                f"Type-driven redaction entry {tool_name!r} has no response_model; refusing to persist an undeclared response surface."
+            )
+        # Every top-level key reaches model_validate (an undeclared key is
+        # rejected by the model itself), so every value is budget-walked first:
+        # the bound must precede validation to keep pydantic from amplifying
+        # an oversized structure.
+        over_budget = frozenset(key for key, value in response.items() if not _response_within_projection_budget(value, depth=1))
+        response_fields = entry.response_model.model_fields
+        if any(key not in response_fields or response_fields[key].is_required() for key in over_budget):
+            # A required typed field (validation / affected_nodes on the shared
+            # ToolResult shadow) cannot take a string sentinel before
+            # validation, and an undeclared key has no field to degrade.
+            telemetry.response_projection_limit(tool_name=tool_name, scope="row")
+            return dict(_RESPONSE_PROJECTION_LIMIT)
+        # Walk the response via its Pydantic model schema.
+        # model_validate coerces the raw response dict to the declared shape;
+        # unknown keys raise ValidationError if extra="forbid" is set on the
+        # model, but that is a model-design choice, not enforced here.
+        # Over-budget optional values are withheld from validation and replaced
+        # by the per-key sentinel in the projection below.
+        validated = entry.response_model.model_validate({key: value for key, value in response.items() if key not in over_budget})
+        schema_redacted = _redact_via_schema(
+            tool_name,
+            validated,
+            entry.response_model,
+            telemetry=telemetry,
+        )
+        if tool_name == "get_blob_content":
+            if not isinstance(validated, GetBlobContentResponseModel):
+                raise AuditIntegrityError("Blob content redaction requires its declared response model")
+            if validated.data is not None and "data" not in over_budget:
+                # Only this closed model's canonical SHA256 is public identity
+                # metadata. Preserve it without admitting arbitrary strings or
+                # hashes from any other tool's response projection.
+                schema_redacted["data"]["content_hash"] = _TrustedRedactionSummary(validated.data.content_hash)
+        elif tool_name == "read_attachment":
+            if not isinstance(validated, ReadAttachmentResponseModel):
+                raise AuditIntegrityError("Attachment redaction requires its declared response model")
+            if validated.data is not None and "data" not in over_budget:
+                schema_redacted["data"]["content_hash"] = _TrustedRedactionSummary(validated.data.content_hash)
+        projected = _project_validated_response_scalars(schema_redacted)
+        assert type(projected) is dict
+        for key in response:
+            if key in over_budget:
+                telemetry.response_projection_limit(tool_name=tool_name, scope="key")
+        return _bounded_projection_result(
+            {key: _REDACTED_RESPONSE_PROJECTION_LIMIT if key in over_budget else projected[key] for key in response},
+            tool_name=tool_name,
+            telemetry=telemetry,
+        )
+
+    # --- Declarative path ---
+    # entry.policy is not None (ToolRedaction.__post_init__ guarantees exactly
+    # one of {argument_model, policy} is set).
+    # Spec §4.2.4: emit the manifest_dispatch beacon for the declarative branch too.
+    policy = entry.policy
+    assert policy is not None  # offensive: satisfies the type-checker contract
+
+    redacted: dict[str, Any] = {}
+    for key, value in response.items():
+        if key in policy.sensitive_response_keys:
+            # Sensitive key: declarative entries have no response summarizers
+            # (argument_summarizers covers only argument keys).  Substitute
+            # the no-summarizer sentinel.
+            redacted[key] = REDACTED_SENSITIVE_NO_SUMMARIZER
+        elif key in policy.known_response_keys or key in _TOOL_RESULT_ENVELOPE_KEYS:
+            # Known, non-sensitive: preserve the declared ToolResult structure
+            # while applying the closed type/value projection. The closed
+            # dispatch-envelope keys are implicitly known for every
+            # declarative entry — they are engine-produced framing (bool
+            # success, structural validation summary, int state version),
+            # never tool payload, and sentinel-ing them leaves audit rows
+            # blind to every tool outcome.  ``data`` and all other keys stay
+            # policy-declared / fail-closed.
+            if not _response_within_projection_budget(value, depth=1):
+                # Over-budget known value: degrade this key only, never the row.
+                telemetry.response_projection_limit(tool_name=tool_name, scope="key")
+                redacted[key] = _REDACTED_RESPONSE_PROJECTION_LIMIT
+            else:
+                redacted[key] = _redact_declarative_known_response_value(
+                    value,
+                    field_name=key,
+                    tool_name=tool_name,
+                    telemetry=telemetry,
+                )
+        else:
+            # Unknown key: aggregate under a fixed field so externally supplied
+            # key names cannot become a second response-value channel.
+            redacted[REDACTED_UNKNOWN_RESPONSE_FIELD] = REDACTED_UNKNOWN_RESPONSE_KEY
+            telemetry.unknown_response_key_redacted(tool_name=tool_name)
+
+    return _bounded_projection_result(redacted, tool_name=tool_name, telemetry=telemetry)
+
+
+def redact_source_storage_path(state_dict: dict[str, Any]) -> dict[str, Any]:
+    """Redact internal storage paths from a serialized state dict.
+
+    When source options contain a ``blob_ref``, ``path`` (and the equivalent
+    ``file`` carrier) point at an internal storage location that must not be
+    exposed to agents or users. Preserve the key(s) with a sentinel value so
+    external consumers can still tell that the source path contract is satisfied.
+
+    Returns a shallow copy with source options redacted. Does not mutate
+    the input dict.
+
+    ``state_dict`` is one of our own serializer outputs, but its shape is
+    POLYMORPHIC across callers: full-state / ``{"source": ...}`` views always
+    carry a ``"source"`` key, whereas the component-scoped
+    ``_execute_get_pipeline_state`` view emits ``{"node": ...}`` or
+    ``{"output": ...}`` with NO ``"source"`` key at all. The absent key is a
+    legitimate first-party shape ("this view has no source to redact"), not a
+    contract violation — so we gate on explicit membership rather than crash.
+    Likewise a source dict carries ``"options"`` on the to_dict path but the
+    component-scoped ``_serialize_source`` may omit it; gate on membership.
+    The composer/LLM-authored VALUES inside ``options`` are Tier 3, but the
+    only redaction trigger is the structural ``blob_ref`` marker; a ``None``
+    source or blob_ref-less options is the "nothing to redact" outcome,
+    recorded explicitly by returning the input unchanged.
+    """
+
+    def _redact_one(source: Any) -> tuple[Any, bool]:
+        # An absent/None source is the documented "nothing to redact"
+        # first-party shape (see this function's docstring). A PRESENT,
+        # non-None source that is not a Mapping is NOT a producible
+        # first-party shape: every serializer feeding this surface
+        # (CompositionState.to_dict, _serialize_source,
+        # _serialize_full_pipeline_state) emits source/named-source values
+        # as dicts. A non-Mapping here is a corrupted/regressed Tier-1
+        # serializer output; returning it unchanged would silently pass an
+        # un-redacted storage path through this leak-prevention surface, so
+        # fail closed with provenance instead (matches the offensive posture
+        # of _state_response's direct index and the MCP read-back's
+        # PLUGIN_CRASH reclassification).
+        if source is None:
+            return source, False
+        if type(source) is not dict:
+            raise AuditIntegrityError(
+                "redact_source_storage_path received a non-Mapping source value "
+                f"(type {type(source).__name__!r}); serialized state source entries "
+                "must be mappings. Refusing to pass through a malformed first-party "
+                "shape that may carry an un-redacted internal storage path."
+            )
+        if "options" not in source:
+            return source, False
+        options = source["options"]
+        if options is None:
+            return source, False
+        if type(options) is not dict:
+            raise AuditIntegrityError(
+                "redact_source_storage_path received a non-dict source.options value "
+                f"(type {type(options).__name__!r}); serialized source options must be dicts. "
+                "Refusing to pass through a malformed first-party shape that may carry an "
+                "un-redacted internal storage path."
+            )
+        if "blob_ref" not in options:
+            return source, False
+        redacted_source = dict(source)
+        redacted_options = dict(options)
+        # Both "path" and "file" are blob storage-path carriers: blob ownership
+        # detection (web/blobs/service.py) and the fork rewrite
+        # (web/sessions/routes/sessions.py) treat them equivalently. Mask both so a
+        # blob-backed source authored with the "file" option shape cannot leak the
+        # internal storage_path through this redaction surface (elspeth-a7aa07b7ce).
+        # The carrier list is the shared source-path constant rather than a
+        # local literal: a third carrier added there must reach every
+        # masking surface at once, or the surface that kept its own copy leaks.
+        for storage_path_key in SOURCE_LOCAL_PATH_OPTION_KEYS:
+            if storage_path_key in redacted_options:
+                redacted_options[storage_path_key] = REDACTED_BLOB_SOURCE_PATH
+        redacted_source["options"] = redacted_options
+        return redacted_source, True
+
+    source = state_dict["source"] if "source" in state_dict else None
+    redacted_source, source_changed = _redact_one(source)
+    sources = state_dict["sources"] if "sources" in state_dict else None
+    redacted_sources: dict[str, Any] | None = None
+    sources_changed = False
+    if sources is not None:
+        redacted_sources = {}
+        for source_name, named_source in sources.items():
+            redacted_named_source, changed = _redact_one(named_source)
+            redacted_sources[source_name] = redacted_named_source
+            sources_changed = sources_changed or changed
+
+    if not source_changed and not sources_changed:
+        return state_dict
+
+    # Shallow copy the chain to avoid mutating the original
+    redacted = dict(state_dict)
+    if source_changed:
+        redacted["source"] = redacted_source
+    if sources_changed and redacted_sources is not None:
+        redacted["sources"] = redacted_sources
+    return redacted
+
+
+class _AuthoringNodeOptionsModel(BaseModel):
+    """Shared redaction-bearing surface for authored transform options."""
+
+    id: RuntimeNodeName
+    options: _LlmJsonObject = Field(default_factory=dict)
+    on_error: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        return validate_runtime_node_name(value, field_label="Transform name")
+
+
+class _SpliceTransformNodeModel(_AuthoringNodeOptionsModel):
+    """Caller-authored portion of a transform whose routing is server-derived."""
+
+    plugin: str
+    options: _LlmJsonObject
+    # One-sentence composer-authored prose for the Spec tab. Free-text scalar
+    # like _PipelineEdgeModel.label — structurally not a leak surface, so no
+    # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
+    description: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SpliceTransformArgumentsModel(BaseModel):
+    """Redaction-bearing arguments for one direct-path transform insertion."""
+
+    predecessor_id: str
+    successor_id: str
+    node: _SpliceTransformNodeModel
+
+    model_config = ConfigDict(extra="forbid")
+
+
+MANIFEST = MappingProxyType(
+    {
+        **MANIFEST,
+        "splice_transform": ToolRedaction(
+            argument_model=SpliceTransformArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+    }
+)

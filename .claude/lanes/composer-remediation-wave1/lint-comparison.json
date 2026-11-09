@@ -1,0 +1,115 @@
+{
+  "before_count": 5424,
+  "after_count": 5424,
+  "before_exit": 1,
+  "after_exit": 1,
+  "compared_fields": [
+    "rule_id",
+    "file_path",
+    "severity",
+    "message",
+    "suggestion"
+  ],
+  "normalized_only_checkout_prefix": true,
+  "positive_negative_controls": "passed",
+  "semantic_added": 0,
+  "semantic_removed": 0,
+  "line_shifted_findings": [
+    {
+      "rule": "R4",
+      "file": "web/sessions/routes/composer/proposals.py",
+      "before_line": 97,
+      "after_line": 98,
+      "before_fingerprint": "d77eb490f4e5a4ec",
+      "after_fingerprint": "da981ab22569ee2c"
+    },
+    {
+      "rule": "R5",
+      "file": "web/sessions/routes/composer/proposals.py",
+      "before_line": 122,
+      "after_line": 123,
+      "before_fingerprint": "17543b9a98e8f440",
+      "after_fingerprint": "4fe191b1db678774"
+    },
+    {
+      "rule": "R5",
+      "file": "web/sessions/routes/composer/proposals.py",
+      "before_line": 136,
+      "after_line": 137,
+      "before_fingerprint": "c29d7706cde59339",
+      "after_fingerprint": "907e56b5140febcd"
+    },
+    {
+      "rule": "R5",
+      "file": "web/sessions/routes/composer/proposals.py",
+      "before_line": 138,
+      "after_line": 139,
+      "before_fingerprint": "6844e89e664b1885",
+      "after_fingerprint": "4eb4c04d06053043"
+    },
+    {
+      "rule": "R4",
+      "file": "web/sessions/routes/composer/proposals.py",
+      "before_line": 362,
+      "after_line": 363,
+      "before_fingerprint": "b95556f317f9c03a",
+      "after_fingerprint": "8f1c41467777c807"
+    },
+    {
+      "rule": "R6",
+      "file": "web/sessions/routes/composer/proposals.py",
+      "before_line": 616,
+      "after_line": 618,
+      "before_fingerprint": "bdbc7b807017aeec",
+      "after_fingerprint": "b7bf93d7599d3e86"
+    },
+    {
+      "rule": "R4",
+      "file": "web/sessions/routes/composer/proposals.py",
+      "before_line": 828,
+      "after_line": 830,
+      "before_fingerprint": "4020502355b406c5",
+      "after_fingerprint": "c827aa2bd117c76c"
+    },
+    {
+      "rule": "R4",
+      "file": "web/sessions/routes/composer/proposals.py",
+      "before_line": 837,
+      "after_line": 839,
+      "before_fingerprint": "4f3b56d34777eb1f",
+      "after_fingerprint": "61723859ace07d14"
+    },
+    {
+      "rule": "R4",
+      "file": "web/sessions/routes/composer/proposals.py",
+      "before_line": 843,
+      "after_line": 845,
+      "before_fingerprint": "56f633694b35cacb",
+      "after_fingerprint": "1178bedaf443dfef"
+    },
+    {
+      "rule": "R_TB_SUPPRESSED",
+      "file": "web/sessions/routes/composer/proposals.py",
+      "before_line": 164,
+      "after_line": 165,
+      "before_fingerprint": "5c7f3e3e74718110",
+      "after_fingerprint": "d77c40f0b296e747"
+    },
+    {
+      "rule": "R_TB_SUPPRESSED",
+      "file": "web/sessions/routes/composer/proposals.py",
+      "before_line": 167,
+      "after_line": 168,
+      "before_fingerprint": "44cdf01c800f8e74",
+      "after_fingerprint": "2b265fa2b7162b9b"
+    },
+    {
+      "rule": "R_TB_SUPPRESSED",
+      "file": "web/sessions/routes/composer/proposals.py",
+      "before_line": 170,
+      "after_line": 171,
+      "before_fingerprint": "10d15db3cf63db98",
+      "after_fingerprint": "f0d7fa9a426297f1"
+    }
+  ]
+}

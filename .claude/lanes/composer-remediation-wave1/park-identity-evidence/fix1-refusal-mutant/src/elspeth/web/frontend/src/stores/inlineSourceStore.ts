@@ -1,0 +1,176 @@
+// ============================================================================
+// inlineSourceStore — projected per-session view of the inline-blob source
+// attached to the current composition state.
+//
+// This store is a caching/projection layer, NOT a source of truth. The
+// derivation that populates it lives in the ChatPanel wiring (computed from
+// compositionState.sources + blob metadata). The
+// downstream consumers read from here:
+//   - InlineSourceCreatedTurn — confirmation widget after creation.
+//   - Audit-readiness panel surface — readiness row for inline source.
+// ============================================================================
+
+import { create } from "zustand";
+import type {
+  BlobCreationModalityWire,
+  BlobMetadata,
+  InlineSourceProvenance,
+  InlineSourceSummary,
+} from "@/types/api";
+import { parseCsvRows } from "@/utils/contentStructure";
+
+const INLINE_SOURCE_PREVIEW_CHARS = 1024;
+const CONTENT_TYPE_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const SHA256_HEX_RE = /^[a-f0-9]{64}$/;
+const TEXT_DECODER = new TextDecoder("utf-8", { fatal: true });
+
+interface InlineSourceProjectionInput {
+  metadata: BlobMetadata;
+  contentBytes: ArrayBuffer;
+  toProvenance: (
+    wire: BlobCreationModalityWire,
+  ) => InlineSourceProvenance;
+}
+
+function parseContentType(mimeType: string): string | null {
+  const [rawBaseType, ...rawParams] = mimeType.split(";");
+  const baseType = rawBaseType.trim().toLowerCase();
+  const slashIndex = baseType.indexOf("/");
+  if (slashIndex <= 0 || slashIndex !== baseType.lastIndexOf("/")) {
+    return null;
+  }
+  const type = baseType.slice(0, slashIndex);
+  const subtype = baseType.slice(slashIndex + 1);
+  if (
+    !CONTENT_TYPE_TOKEN_RE.test(type) ||
+    !CONTENT_TYPE_TOKEN_RE.test(subtype)
+  ) {
+    return null;
+  }
+
+  for (const rawParam of rawParams) {
+    const param = rawParam.trim();
+    if (param === "") return null;
+    const equalsIndex = param.indexOf("=");
+    if (equalsIndex <= 0 || equalsIndex !== param.lastIndexOf("=")) {
+      return null;
+    }
+    const name = param.slice(0, equalsIndex).trim().toLowerCase();
+    const value = param.slice(equalsIndex + 1).trim();
+    if (!CONTENT_TYPE_TOKEN_RE.test(name) || value === "") return null;
+    if (value.startsWith('"')) {
+      if (value.length < 2 || !value.endsWith('"')) return null;
+      if (/[\r\n]/.test(value.slice(1, -1))) return null;
+      continue;
+    }
+    if (!CONTENT_TYPE_TOKEN_RE.test(value)) return null;
+  }
+
+  return baseType;
+}
+
+async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
+  const digest = await globalThis.crypto.subtle.digest(
+    "SHA-256",
+    bytes,
+  );
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+export function deriveInlineSourceRowCount(
+  mimeType: string,
+  text: string,
+): number | null {
+  const baseMimeType = parseContentType(mimeType);
+  if (baseMimeType !== "text/csv") return null;
+  if (text.trim() === "") return 0;
+  const { rows, endedInQuotes } = parseCsvRows(text);
+  if (endedInQuotes) return null;
+  return Math.max(0, rows.length - 1);
+}
+
+export async function projectInlineSourceSummary({
+  metadata,
+  contentBytes,
+  toProvenance,
+}: InlineSourceProjectionInput): Promise<InlineSourceSummary> {
+  if (metadata.content_hash === null || metadata.content_hash === "") {
+    throw new Error(
+      `inline blob ${metadata.id} has no content_hash — ` +
+        "audit-trail invariant violated (Tier-1)",
+    );
+  }
+  const baseMimeType = parseContentType(metadata.mime_type);
+  if (baseMimeType === null) {
+    throw new Error(
+      `inline blob ${metadata.id} has invalid MIME metadata ` +
+        `${JSON.stringify(metadata.mime_type)} — refusing projection`,
+    );
+  }
+  if (!SHA256_HEX_RE.test(metadata.content_hash)) {
+    throw new Error(
+      `inline blob ${metadata.id} content_hash is not canonical ` +
+        "SHA-256 lowercase hex — refusing projection",
+    );
+  }
+  // The audit hash covers the original bytes, including any UTF-8 BOM.
+  // Decoding first would remove the BOM and falsely report tampering.
+  const actualHash = await sha256Hex(contentBytes);
+  if (actualHash !== metadata.content_hash) {
+    throw new Error(
+      `inline blob ${metadata.id} content_hash mismatch — ` +
+        "metadata does not match preview bytes",
+    );
+  }
+
+  const contentText = TEXT_DECODER.decode(contentBytes);
+  return {
+    blobId: metadata.id,
+    filename: metadata.filename,
+    mimeType: metadata.mime_type,
+    contentPreview: contentText.slice(0, INLINE_SOURCE_PREVIEW_CHARS),
+    rowCount: deriveInlineSourceRowCount(metadata.mime_type, contentText),
+    contentHash: metadata.content_hash,
+    provenance: toProvenance(metadata.creation_modality),
+  };
+}
+
+interface InlineSourceState {
+  // --- Primary projection: per-session inline-source summary ---
+  summariesBySession: Record<string, readonly InlineSourceSummary[]>;
+  setSummary: (sessionId: string, summary: InlineSourceSummary) => void;
+  clearSummary: (sessionId: string) => void;
+  retainSummaries: (sessionId: string, blobIds: readonly string[]) => void;
+  getSummaries: (sessionId: string) => readonly InlineSourceSummary[];
+}
+
+const EMPTY_SUMMARIES: readonly InlineSourceSummary[] = [];
+
+export const useInlineSourceStore = create<InlineSourceState>((set, get) => ({
+  summariesBySession: {},
+  setSummary: (sessionId, summary) =>
+    set((s) => ({
+      summariesBySession: {
+        ...s.summariesBySession,
+        [sessionId]: [
+          ...(s.summariesBySession[sessionId] ?? []).filter((item) => item.blobId !== summary.blobId),
+          summary,
+        ],
+      },
+    })),
+  clearSummary: (sessionId) =>
+    set((s) => {
+      const next = { ...s.summariesBySession };
+      delete next[sessionId];
+      return { summariesBySession: next };
+    }),
+  retainSummaries: (sessionId, blobIds) => set((state) => ({
+    summariesBySession: {
+      ...state.summariesBySession,
+      [sessionId]: (state.summariesBySession[sessionId] ?? []).filter((summary) => blobIds.includes(summary.blobId)),
+    },
+  })),
+  getSummaries: (sessionId) => get().summariesBySession[sessionId] ?? EMPTY_SUMMARIES,
+}));

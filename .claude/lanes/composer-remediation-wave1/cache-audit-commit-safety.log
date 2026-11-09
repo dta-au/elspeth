@@ -1,0 +1,17 @@
+tree   : /workspace/elspeth/.claude/worktrees/composer-remediation-cache-audit  [worktree of /workspace/elspeth]
+HEAD   : f9c23c59c  branch: (detached)  intent: commit
+
+[PASS] in-progress   none  (ls /workspace/elspeth/.git/worktrees/composer-remediation-cache-audit; git ls-files --unmerged)
+[WARN] branch        detached HEAD; a commit here is reachable only by sha  (git branch --show-current)
+[INFO] worktree      staged=3 unstaged=0 untracked=0  (git status --porcelain)
+[PASS] staged-paths  no lane/log/artefact paths in the staged set  (git diff --cached --name-only)
+[PASS] home-paths    no user-home paths in any staged blob  (git show :<staged path> | grep -aE '/(home|Users)/')
+[PASS] secrets       staged set is clean  (scripts/git-hooks/pre-commit-secret-scan.sh)
+[INFO] fetch         not fetched (--fetch to refresh); origin/* is as of the last fetch
+[INFO] upstream      no upstream configured for HEAD  (git rev-parse --abbrev-ref @{u})
+[INFO] base          no base ref (no upstream, no origin/HEAD); pass --base REF
+[PASS] hmac-key      not present in the environment  (env | grep ^ELSPETH_JUDGE)
+[PASS] venv          /workspace/elspeth/.claude/worktrees/composer-remediation-cache-audit/.venv present  (ls -la .venv)
+[PASS] provenance    elspeth and elspeth_lints import from THIS tree  (PYTHONPATH=$ROOT/src:$ROOT/elspeth-lints/src python -c 'import elspeth; print(elspeth.__file__)')
+
+result : FAIL=0 WARN=1  intent=commit  HEAD=f9c23c59c

@@ -1,0 +1,241 @@
+"""Structured logging configuration for ELSPETH.
+
+Uses structlog for structured logging that complements
+OpenTelemetry spans for observability.
+
+Architecture:
+    This module configures BOTH structlog and stdlib logging to emit
+    consistent output (JSON or console). It uses ProcessorFormatter
+    to route stdlib log records through structlog's processor chain,
+    ensuring that modules using logging.getLogger(__name__) produce
+    the same output format as modules using structlog.get_logger().
+"""
+
+import io
+import logging
+import sys
+from typing import Any, Literal, TextIO
+
+import structlog
+from structlog.stdlib import ProcessorFormatter
+
+
+class _LazyStdStream(io.TextIOBase):
+    """Stream wrapper that delegates to the current ``sys.stdout``/``sys.stderr`` at write time.
+
+    ``StreamHandler(sys.stdout)`` captures a reference to the stream at
+    construction. Under pytest, typer's ``CliRunner``, or any tool that swaps
+    the standard streams, the captured reference goes stale after the swap's
+    scope ends. This wrapper resolves the named stream lazily on every write,
+    so it always targets the live one.
+    """
+
+    def __init__(self, name: Literal["stdout", "stderr"]) -> None:
+        super().__init__()
+        self._name = name
+
+    @property
+    def _target(self) -> TextIO:
+        return sys.stdout if self._name == "stdout" else sys.stderr
+
+    def write(self, s: str) -> int:
+        return self._target.write(s)
+
+    def flush(self) -> None:
+        self._target.flush()
+
+    @property
+    def closed(self) -> bool:
+        return self._target.closed
+
+
+# Third-party loggers that are excessively verbose at DEBUG level.
+# These emit HTTP connection details, credential operations, etc. that
+# are noise rather than signal. Silence them to WARNING even when
+# ELSPETH runs in DEBUG mode.
+_NOISY_LOGGERS: tuple[str, ...] = (
+    # Azure SDK - emits HTTP request/response details for every call
+    "azure",
+    "azure.core",
+    "azure.core.pipeline",
+    "azure.core.pipeline.policies",
+    "azure.core.pipeline.policies.http_logging_policy",
+    "azure.identity",
+    "azure.monitor",
+    # urllib3 - connection pool management noise
+    "urllib3",
+    "urllib3.connectionpool",
+    # OpenTelemetry SDK internals - span processing details
+    "opentelemetry",
+    "opentelemetry.sdk",
+    "opentelemetry.exporter",
+    # httpx/httpcore - async HTTP client internals
+    "httpx",
+    "httpcore",
+)
+
+# Track ELSPETH-owned handler ids for selective removal on reconfiguration.
+# Using id-set instead of getattr() to comply with the defensive programming ban.
+_elspeth_handler_ids: set[int] = set()
+
+# The stream handler the most recent configure_logging() installed (exactly
+# one per configuration). Held as the typed object so a stdout-owning CLI mode
+# can re-target its stream without discovering it by type among root.handlers.
+_elspeth_stream_handler: logging.StreamHandler[Any] | None = None
+
+
+def _remove_internal_fields(
+    logger: logging.Logger | None,
+    method_name: str,
+    event_dict: dict[str, Any],
+) -> dict[str, Any]:
+    """Remove internal structlog fields from output.
+
+    ProcessorFormatter ALWAYS adds _record and _from_structlog when processing
+    log records (see structlog.stdlib.ProcessorFormatter.format()). These are
+    internal bookkeeping and should not appear in output.
+
+    Using del instead of .pop(default) because these fields are guaranteed
+    present by ProcessorFormatter's contract. KeyError would indicate a bug
+    in our structlog integration.
+    """
+    del event_dict["_record"]
+    del event_dict["_from_structlog"]
+    return event_dict
+
+
+def configure_logging(
+    *,
+    json_output: bool = False,
+    level: str = "INFO",
+    color_output: bool | None = None,
+) -> None:
+    """Configure structlog and stdlib logging for ELSPETH.
+
+    This configures BOTH structlog and stdlib logging to produce consistent
+    output. Modules using logging.getLogger(__name__) will emit the same
+    format (JSON or console) as modules using structlog.get_logger().
+
+    Args:
+        json_output: If True, output JSON. If False, human-readable.
+        level: Log level (DEBUG, INFO, WARNING, ERROR).
+        color_output: If True, force ANSI colors in console output. If False,
+            disable them. If None, auto-detect from stdout interactivity.
+    """
+    global _elspeth_stream_handler
+    normalized_level = level.upper()
+    if normalized_level == "DEBUG":
+        log_level = logging.DEBUG
+    elif normalized_level == "INFO":
+        log_level = logging.INFO
+    elif normalized_level == "WARNING":
+        log_level = logging.WARNING
+    elif normalized_level == "ERROR":
+        log_level = logging.ERROR
+    else:
+        raise ValueError(f"Unsupported log level {level!r}; expected DEBUG, INFO, WARNING, or ERROR")
+    use_colors = sys.stdout.isatty() if color_output is None else color_output
+
+    # Shared processors applied to ALL log records (structlog and stdlib)
+    shared_processors: list[Any] = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.stdlib.PositionalArgumentsFormatter(),
+        structlog.processors.StackInfoRenderer(),
+    ]
+
+    # Final processors for the formatter (run after shared_processors)
+    if json_output:
+        final_processors: list[Any] = [
+            _remove_internal_fields,
+            structlog.processors.format_exc_info,
+            structlog.processors.JSONRenderer(),
+        ]
+    else:
+        final_processors = [
+            _remove_internal_fields,
+            structlog.dev.ConsoleRenderer(
+                colors=use_colors,
+                exception_formatter=structlog.dev.default_exception_formatter if use_colors else structlog.dev.plain_traceback,
+            ),
+        ]
+
+    # Configure structlog to route through stdlib logging
+    # wrap_for_formatter prepares event_dict for ProcessorFormatter
+    structlog.configure(
+        processors=[*shared_processors, ProcessorFormatter.wrap_for_formatter],
+        wrapper_class=structlog.stdlib.BoundLogger,
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        # IMPORTANT: Disable caching to allow reconfiguration in tests
+        # Without this, tests that reconfigure logging will get stale loggers
+        cache_logger_on_first_use=False,
+    )
+
+    # Configure stdlib logging with ProcessorFormatter
+    # This ensures stdlib loggers go through structlog's processor chain
+    handler = logging.StreamHandler(_LazyStdStream("stdout"))
+    handler.setFormatter(
+        ProcessorFormatter(
+            processors=final_processors,
+            # foreign_pre_chain: processors for stdlib-only records
+            # (structlog records already went through shared_processors)
+            foreign_pre_chain=shared_processors,
+        )
+    )
+
+    # Remove only ELSPETH-owned handlers (preserve others like pytest caplog)
+    root = logging.getLogger()
+    removed_ids = {id(h) for h in root.handlers if id(h) in _elspeth_handler_ids}
+    root.handlers = [h for h in root.handlers if id(h) not in _elspeth_handler_ids]
+    _elspeth_handler_ids.difference_update(removed_ids)
+
+    # Track our handler by id so we can find it later
+    _elspeth_handler_ids.add(id(handler))
+    _elspeth_stream_handler = handler
+    root.addHandler(handler)
+    root.setLevel(log_level)
+
+    # Silence noisy third-party loggers that spam DEBUG output.
+    # Never make noisy loggers less restrictive than the configured root level.
+    # This prevents WARNING output when root is ERROR/CRITICAL.
+    noisy_level = max(log_level, logging.WARNING)
+    for logger_name in _NOISY_LOGGERS:
+        logging.getLogger(logger_name).setLevel(noisy_level)
+
+
+def route_elspeth_logs_to_stderr() -> None:
+    """Move the ELSPETH-owned log handler(s) from stdout to stderr.
+
+    For CLI modes whose stdout IS a machine-readable document (the deployment
+    doctor's ``--json`` report, parsed by the ECS/ACA acceptance drivers and
+    the PostgreSQL doctor proofs — elspeth-4b27604bb7). ``configure_logging``
+    deliberately targets stdout so container logs are captured; a mode that
+    owns stdout must take the log lines off it BEFORE anything that can log
+    runs (``WebSettings`` validation emits a WARNING during settings load).
+
+    Only the handler installed by :func:`configure_logging` is re-targeted —
+    a foreign handler (pytest's caplog, an operator's own sink) keeps its
+    stream. Fails closed when no ELSPETH handler is installed: an ungoverned
+    log channel would fall through to structlog's default stdout printer and
+    corrupt the document again.
+    """
+    handler = _elspeth_stream_handler
+    root = logging.getLogger()
+    if handler is None or id(handler) not in _elspeth_handler_ids or handler not in root.handlers:
+        raise RuntimeError("route_elspeth_logs_to_stderr() requires the handler installed by configure_logging(); none is present")
+    handler.setStream(_LazyStdStream("stderr"))
+
+
+def get_logger(name: str) -> structlog.stdlib.BoundLogger:
+    """Get a bound logger for a module.
+
+    Args:
+        name: Logger name (typically __name__).
+
+    Returns:
+        Bound structlog logger.
+    """
+    logger: structlog.stdlib.BoundLogger = structlog.get_logger(name)
+    return logger

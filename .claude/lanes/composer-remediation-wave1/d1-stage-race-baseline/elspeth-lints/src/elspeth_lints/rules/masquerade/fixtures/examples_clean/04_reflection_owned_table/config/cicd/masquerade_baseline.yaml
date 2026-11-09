@@ -1,0 +1,51 @@
+# masquerade.attribute-probes baseline
+#
+# READ THIS BEFORE TRUSTING A GREEN GATE.
+#
+# This file adjudicates every getattr/hasattr/inspect.getattr_static/
+# __getattr__ site in src/elspeth, tests, scripts, and elspeth-lints/src
+# that is NOT covered by one of the gate's three permanent, structural
+# amnesties (a sentinel getattr on a @trust_boundary/@observation_boundary
+# source_param; assert [not] hasattr(...) in tests; a PEP 562 module
+# __getattr__ gated on a closed literal table). A site listed here is
+# TRACKED, not CLEARED.
+#
+# `classification: unadjudicated` means NOT YET REVIEWED. Most entries in
+# this file were seeded automatically from the corpus measured at gate
+# creation time (elspeth-b9ad1bbee3) and carry no human judgement about
+# whether the site is correct, defective, or should be rewritten. A
+# PASSING GATE MEANS "NOTHING NEW LANDED SINCE THE BASELINE WAS SEEDED" —
+# it does NOT mean "this corpus is clean". Only entries whose
+# classification is one of external-parse / approved-introspection /
+# reflection-owned-table / module-getattr / data-container-api, with a
+# real justification, have been reviewed.
+#
+# Identity is (path, qualname, kind) — no line numbers, so reformatting or
+# moving a site does not require re-adjudication, but renaming or
+# relocating it does (the old entry goes stale, a new one is required).
+# Multiple probe sites of the same kind inside one function share one
+# entry. `occurrences` is a REQUIRED exact count, and `probe_shapes` is a
+# sorted per-occurrence multiset of SHA-256 fingerprints over normalized
+# AST shapes (source positions excluded). Count drift catches additions /
+# removals; shape drift catches one-for-one semantic substitutions at the
+# same key and count. Whitespace-only reformatting keeps the same shape. A
+# legacy entry with no shapes may be loaded for migration, but it always
+# fires shape drift and its old review is not preserved by refresh.
+#
+# A baseline entry whose (path, qualname, kind) no longer exists AT ALL in
+# the tree is itself a gate failure (stale-baseline-entry) so this file
+# tracks reality and cannot silently rot as code moves out from under it.
+#
+# Governing document: docs/architecture/adr/032-validate-by-trust-domain.md
+
+entries:
+- path: src/elspeth/serialization.py
+  qualname: to_dict
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - b870a86da8b84b7d49e0826931e9963fd1c1f3b3cf6892881c3509064634d30e
+  classification: reflection-owned-table
+  justification: Iterates dataclasses.fields(obj), the SAME type being serialized;
+    the class definition IS the table, so no externally controlled name can reach
+    this call.

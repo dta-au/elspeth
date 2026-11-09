@@ -1,0 +1,5 @@
+{
+  "equal_input_negative_control": "passed",
+  "added_distinct_finding_positive_control": "passed",
+  "line_shift_only_negative_control": "passed"
+}

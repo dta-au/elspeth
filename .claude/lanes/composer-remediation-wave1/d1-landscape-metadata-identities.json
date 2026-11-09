@@ -1,0 +1,392 @@
+{
+  "composer-remediation-wave1": {
+    "hashes": {
+      "src/elspeth/core/landscape/database.py": "b8da4ed519bbe887140a0a72f040ce264fc4910724c56ca0f55065c2a89653cf",
+      "src/elspeth/web/schema_probe.py": "c0f27e271e6128ea96a4cb345f32ef4c61bbcdd338aba0a9eaaf1db34447851d"
+    },
+    "sites": [
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "verify_sqlite_tier1_pragmas",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "4e9098161956fab6",
+        "ordinal": 1,
+        "authority": null,
+        "line": 131,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB._create_sqlcipher_engine._creator",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "bc4b6272008ed6ec",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1375,
+        "connection_escape": true
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "_sqlite_epoch_is_incompatible",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "1084a431b73718a3",
+        "ordinal": 1,
+        "authority": null,
+        "line": 879,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "_landscape_identity_issue",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "54f25c9b2650a66b",
+        "ordinal": 1,
+        "authority": null,
+        "line": 904,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "_collect_token_outcomes_shape_errors",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "f95bb339c5816e92",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1010,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB._verify_sqlite_pragmas",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "7b14f45607d6611f",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1230,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB._sync_schema_identity",
+        "table": "<non-session-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "bca7301699f0abd0",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1396,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB._sync_schema_identity",
+        "table": "<non-session-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "dc8b3ee57e650e2d",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1409,
+        "connection_escape": true
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB._get_sqlite_schema_epoch",
+        "table": "<non-session-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "4644a6cc893b4d09",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1436,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB._set_sqlite_schema_epoch",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "145b5590f940eae3",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1448,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB.write_connection",
+        "table": "<non-session-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "222b5f4b0d258dbe",
+        "ordinal": 1,
+        "authority": null,
+        "line": 2225,
+        "connection_escape": true
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB.read_only_connection",
+        "table": "<non-session-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "44c4543542ceeb85",
+        "ordinal": 1,
+        "authority": null,
+        "line": 2243,
+        "connection_escape": true
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "probe_schema_shape",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "701a4d03f32ac0d4",
+        "ordinal": 1,
+        "authority": null,
+        "line": 935,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB._validate_schema",
+        "table": "<non-session-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "2cfb5322571d6d44",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1693,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB.admit_existing_sqlite_store",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "40f92c2195132323",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1959,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/web/schema_probe.py",
+        "symbol": "init_landscape_schema.body",
+        "table": "elspeth_schema_identity",
+        "operation": "stamp_sqlite_sentinel",
+        "fingerprint": "73db976a22a18557",
+        "ordinal": 1,
+        "authority": null,
+        "line": 359,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/web/schema_probe.py",
+        "symbol": "_run_locked",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "6577c8508024422b",
+        "ordinal": 1,
+        "authority": null,
+        "line": 248,
+        "connection_escape": true
+      }
+    ]
+  },
+  "composer-remediation-landscape-metadata": {
+    "hashes": {
+      "src/elspeth/core/landscape/database.py": "099a5bff4fa162b87119cadbd5fc10109938cff4d6c4d2a1e8ac2e5d3f31f1ed",
+      "src/elspeth/web/schema_probe.py": "0e4ba641686cba00c9b459e3cc241ce686847211197c2563a4991f5a5d31c4cd"
+    },
+    "sites": [
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "verify_sqlite_tier1_pragmas",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "4e9098161956fab6",
+        "ordinal": 1,
+        "authority": null,
+        "line": 151,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB._create_sqlcipher_engine._creator",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "bc4b6272008ed6ec",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1395,
+        "connection_escape": true
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "_sqlite_epoch_is_incompatible",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "1084a431b73718a3",
+        "ordinal": 1,
+        "authority": null,
+        "line": 899,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "_landscape_identity_issue",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "54f25c9b2650a66b",
+        "ordinal": 1,
+        "authority": null,
+        "line": 924,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "_collect_token_outcomes_shape_errors",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "f95bb339c5816e92",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1030,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB._verify_sqlite_pragmas",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "7b14f45607d6611f",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1250,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB._sync_schema_identity",
+        "table": "<non-session-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "bca7301699f0abd0",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1416,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB._sync_schema_identity",
+        "table": "<non-session-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "dc8b3ee57e650e2d",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1429,
+        "connection_escape": true
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB._get_sqlite_schema_epoch",
+        "table": "<non-session-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "4644a6cc893b4d09",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1456,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB._set_sqlite_schema_epoch",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "145b5590f940eae3",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1468,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB.write_connection",
+        "table": "<non-session-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "222b5f4b0d258dbe",
+        "ordinal": 1,
+        "authority": null,
+        "line": 2245,
+        "connection_escape": true
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB.read_only_connection",
+        "table": "<non-session-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "44c4543542ceeb85",
+        "ordinal": 1,
+        "authority": null,
+        "line": 2263,
+        "connection_escape": true
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "probe_schema_shape",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "701a4d03f32ac0d4",
+        "ordinal": 1,
+        "authority": null,
+        "line": 955,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB._validate_schema",
+        "table": "<non-session-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "2cfb5322571d6d44",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1713,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/core/landscape/database.py",
+        "symbol": "LandscapeDB.admit_existing_sqlite_store",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "40f92c2195132323",
+        "ordinal": 1,
+        "authority": null,
+        "line": 1979,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/web/schema_probe.py",
+        "symbol": "init_landscape_schema.body",
+        "table": "elspeth_schema_identity",
+        "operation": "stamp_sqlite_sentinel",
+        "fingerprint": "b887ed3ea6657001",
+        "ordinal": 1,
+        "authority": null,
+        "line": 359,
+        "connection_escape": false
+      },
+      {
+        "path": "src/elspeth/web/schema_probe.py",
+        "symbol": "_run_locked",
+        "table": "<sessions-write-connection>",
+        "operation": "write_connection",
+        "fingerprint": "6577c8508024422b",
+        "ordinal": 1,
+        "authority": null,
+        "line": 248,
+        "connection_escape": true
+      }
+    ]
+  }
+}

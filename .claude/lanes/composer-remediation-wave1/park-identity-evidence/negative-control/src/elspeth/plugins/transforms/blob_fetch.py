@@ -1,0 +1,744 @@
+"""Fetch an HTTP(S) document into the run payload store as a blob reference."""
+
+from __future__ import annotations
+
+import ipaddress
+from dataclasses import dataclass
+from ipaddress import IPv4Network, IPv6Network
+from typing import Annotated, Any, Literal, cast
+
+import httpx
+from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
+
+from elspeth.contracts import CallType, Determinism
+from elspeth.contracts.audit import Call
+from elspeth.contracts.call_data import HTTPCallRequest
+from elspeth.contracts.contexts import LifecycleContext, TransformContext
+from elspeth.contracts.contract_propagation import narrow_contract_to_output
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.plugin_capabilities import ContentTrust
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.wire_visible_identity import is_wire_visible_placeholder
+from elspeth.core.security.web import (
+    HTTPOrigin,
+    SSRFBlockedError,
+    SSRFSafeRequest,
+    parse_http_origin,
+    validate_allowed_http_origin,
+    validate_archived_ssrf_request,
+    validate_configured_url_for_ssrf,
+    validate_url_for_ssrf,
+)
+from elspeth.core.security.web import NetworkError as SSRFNetworkError
+from elspeth.plugins.infrastructure.base import BaseTransform
+from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_headers, fingerprint_url
+from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError
+from elspeth.plugins.infrastructure.config_base import TransformDataConfig
+from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+from elspeth.plugins.transforms.web_scrape_errors import (
+    URL_FIELD_MISSING,
+    URL_NOT_A_STRING,
+    BodyTooLargeError,
+    ClientError,
+    ForbiddenError,
+    InvalidURLError,
+    NetworkError,
+    NotFoundError,
+    RateLimitError,
+    ServerError,
+    UnauthorizedError,
+    WebScrapeError,
+    row_url_policy_refusal,
+    row_url_value_refusal,
+)
+
+DEFAULT_ALLOWED_CONTENT_TYPES: tuple[str, ...] = (
+    "text/csv",
+    "application/csv",
+    "application/vnd.ms-excel",
+    "text/plain",
+    "application/json",
+    "application/jsonl",
+    "application/x-jsonlines",
+    "application/x-ndjson",
+    "text/jsonl",
+    "application/xml",
+    "text/xml",
+)
+
+
+def _validate_cidr_entry(entry: str) -> str:
+    try:
+        ipaddress.ip_network(entry, strict=False)
+    except ValueError as exc:
+        raise ValueError(f"Invalid CIDR in allowed_hosts: {entry!r}: {exc}") from exc
+    return entry
+
+
+CidrStr = Annotated[str, AfterValidator(_validate_cidr_entry)]
+
+
+class BlobFetchHTTPConfig(BaseModel):
+    """HTTP policy for fetching remote files into payload-store blobs."""
+
+    model_config = {"extra": "forbid"}
+
+    abuse_contact: str = Field(description="Email for abuse reports, sent as an HTTP header.")
+    fetch_reason: str = Field(description="Why this pipeline is fetching remote files; recorded in audit and sent as an HTTP header.")
+    timeout: int = Field(default=30, gt=0, description="Request timeout in seconds.")
+    max_body_bytes: int = Field(default=10 * 1024 * 1024, gt=0, description="Maximum response body size in bytes.")
+    allowed_hosts: Literal["public_only", "allow_private"] | Annotated[list[CidrStr], Field(min_length=1)] = Field(
+        default="public_only",
+        description="SSRF allowlist: 'public_only', 'allow_private', or explicit CIDR ranges.",
+    )
+    allowed_origins: tuple[str, ...] = Field(default=(), description="Exact HTTP(S) origins permitted for initial requests and redirects.")
+
+    @field_validator("allowed_origins")
+    @classmethod
+    def _validate_allowed_origins(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        parsed = [parse_http_origin(value) for value in values]
+        if len(values) != len(set(parsed)):
+            raise ValueError("allowed_origins entries must be unique")
+        return values
+
+    @field_validator("abuse_contact", "fetch_reason")
+    @classmethod
+    def _validate_wire_visible_header(cls, value: str, info: Any) -> str:
+        if not value.strip():
+            raise ValueError(f"{info.field_name} must not be empty")
+        if is_wire_visible_placeholder(value):
+            raise ValueError(
+                f"{info.field_name} must be supplied by the operator or deployment identity; "
+                "placeholder values are not valid for wire-visible HTTP headers"
+            )
+        if not value.isascii():
+            bad_index = next(i for i, char in enumerate(value) if not char.isascii())
+            bad_char = value[bad_index]
+            raise ValueError(
+                f"{info.field_name} contains a non-ASCII character {bad_char!r} "
+                f"(U+{ord(bad_char):04X}) at position {bad_index}; this value is sent "
+                "verbatim as an HTTP request header and must be ASCII-encodable."
+            )
+        return value
+
+
+class BlobFetchConfig(TransformDataConfig):
+    """Configuration for blob_fetch."""
+
+    url_field: str | None = Field(default=None, description="Input row field containing the absolute HTTP(S) URL to fetch.")
+    url: str | None = Field(default=None, description="Fixed absolute HTTP(S) URL for every row; exclusive with url_field.")
+    blob_ref_field: str = Field(default="blob_ref", description="Output field receiving the payload-store content hash.")
+    content_type_field: str = Field(default="blob_content_type", description="Output field receiving the normalized response Content-Type.")
+    size_bytes_field: str = Field(default="blob_size_bytes", description="Output field receiving the response body size.")
+    sha256_field: str = Field(default="blob_sha256", description="Output field receiving the response body SHA-256 hex digest.")
+    fetch_status_field: str = Field(default="fetch_status", description="Output field receiving the HTTP status code.")
+    fetch_url_final_field: str = Field(
+        default="fetch_url_final", description="Output field receiving the final logical URL after redirects."
+    )
+    fetch_url_final_ip_field: str = Field(default="fetch_url_final_ip", description="Output field receiving the final resolved IP.")
+    allowed_content_types: tuple[str, ...] = Field(
+        default=DEFAULT_ALLOWED_CONTENT_TYPES,
+        min_length=1,
+        description="Exact normalized response Content-Type values accepted for storage.",
+    )
+    http: BlobFetchHTTPConfig = Field(description="HTTP fetching policy, timeout, contact, and host allowlist settings.")
+
+    @field_validator("url_field")
+    @classmethod
+    def _reject_empty_input_field(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.strip():
+            raise ValueError("url_field must not be empty")
+        return value.strip()
+
+    @field_validator(
+        "blob_ref_field",
+        "content_type_field",
+        "size_bytes_field",
+        "sha256_field",
+        "fetch_status_field",
+        "fetch_url_final_field",
+        "fetch_url_final_ip_field",
+    )
+    @classmethod
+    def _validate_output_field(cls, value: str, info: Any) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError(f"{info.field_name} must not be empty")
+        if not stripped.isidentifier():
+            raise ValueError(f"{info.field_name} must be a valid Python identifier, got {value!r}")
+        return stripped
+
+    @field_validator("allowed_content_types")
+    @classmethod
+    def _normalize_allowed_content_types(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(value.split(";", 1)[0].strip().lower() for value in values)
+        if any(not value for value in normalized):
+            raise ValueError("allowed_content_types entries must not be empty")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("allowed_content_types entries must be unique after normalization")
+        return normalized
+
+    @property
+    def declared_input_fields(self) -> frozenset[str]:
+        return super().declared_input_fields | (frozenset({self.url_field}) if self.url_field is not None else frozenset())
+
+    @model_validator(mode="after")
+    def _validate_url_source(self) -> BlobFetchConfig:
+        if (self.url is None) == (self.url_field is None):
+            raise ValueError("exactly one of url or url_field is required")
+        if self.url is not None:
+            allowed_hosts = self.http.allowed_hosts
+            if allowed_hosts == "public_only":
+                allowed_ranges: tuple[IPv4Network | IPv6Network, ...] = ()
+            elif allowed_hosts == "allow_private":
+                allowed_ranges = (ipaddress.ip_network("0.0.0.0/0"), ipaddress.ip_network("::/0"))
+            else:
+                allowed_ranges = _parse_allowed_ranges(allowed_hosts)
+            try:
+                validate_configured_url_for_ssrf(self.url, allowed_ranges=allowed_ranges)
+                validate_allowed_http_origin(self.url, tuple(parse_http_origin(value) for value in self.http.allowed_origins))
+            except SSRFBlockedError as exc:
+                raise ValueError(f"url: {exc}") from exc
+        return self
+
+    @model_validator(mode="after")
+    def _reject_output_collisions(self) -> BlobFetchConfig:
+        output_fields = (
+            self.blob_ref_field,
+            self.content_type_field,
+            self.size_bytes_field,
+            self.sha256_field,
+            self.fetch_status_field,
+            self.fetch_url_final_field,
+            self.fetch_url_final_ip_field,
+        )
+        duplicates = sorted({field for field in output_fields if output_fields.count(field) > 1})
+        if duplicates:
+            raise ValueError(f"Output fields must be unique; duplicates: {duplicates!r}")
+        if self.url_field is not None and self.url_field in output_fields:
+            raise ValueError(f"url_field {self.url_field!r} collides with a blob_fetch output field")
+        return self
+
+
+def _parse_allowed_ranges(entries: list[str]) -> tuple[IPv4Network | IPv6Network, ...]:
+    return tuple(ipaddress.ip_network(entry, strict=False) for entry in entries)
+
+
+def _final_response_ip(response: httpx.Response) -> str:
+    try:
+        final_host = response.request.url.host
+    except RuntimeError as exc:
+        raise FrameworkBugError("SSRF-safe HTTP response has no request; cannot record final resolved IP.") from exc
+
+    if final_host is None:
+        raise FrameworkBugError("SSRF-safe HTTP response request URL has no host; cannot record final resolved IP.")
+    try:
+        ipaddress.ip_address(final_host)
+    except ValueError as exc:
+        raise FrameworkBugError(
+            f"SSRF-safe HTTP response request host {final_host!r} is not an IP address; "
+            "AuditedHTTPClient must return the IP-pinned final request."
+        ) from exc
+    return final_host
+
+
+@dataclass(frozen=True, slots=True)
+class _ContentType:
+    """The response's content-type header, parsed once at the HTTP boundary.
+
+    ``raw`` preserves absence as ``None`` so routed error metadata reports a
+    missing header as missing rather than as an externally supplied empty
+    string; ``normalized`` is the bare media type the allow-list decision uses.
+    """
+
+    raw: str | None
+    normalized: str
+
+
+@trust_boundary(
+    tier=3,
+    source="HTTP response headers returned by an external server via httpx",
+    source_param="response",
+    suppresses=("R1",),
+    invariant=(
+        "parses the content-type header into an owned _ContentType; an absent "
+        "header is preserved as raw=None and normalizes to the empty string, "
+        "which cannot match any configured allowed content type and so surfaces "
+        "as the row's unsupported_content_type error — never raises, never "
+        "fabricates a type"
+    ),
+    non_raising=True,
+)
+def _parse_content_type(response: httpx.Response) -> _ContentType:
+    raw = cast("str | None", response.headers.get("content-type"))
+    return _ContentType(raw=raw, normalized="" if raw is None else raw.split(";", 1)[0].strip().lower())
+
+
+def _blob_fetch_added_output_fields(cfg: BlobFetchConfig) -> tuple[FieldDefinition, ...]:
+    return (
+        FieldDefinition(name=cfg.blob_ref_field, field_type="str", required=True),
+        FieldDefinition(name=cfg.content_type_field, field_type="str", required=True),
+        FieldDefinition(name=cfg.size_bytes_field, field_type="int", required=True),
+        FieldDefinition(name=cfg.sha256_field, field_type="str", required=True),
+        FieldDefinition(name=cfg.fetch_status_field, field_type="int", required=True),
+        FieldDefinition(name=cfg.fetch_url_final_field, field_type="str", required=True),
+        FieldDefinition(name=cfg.fetch_url_final_ip_field, field_type="str", required=True),
+    )
+
+
+def _build_blob_fetch_output_schema_config(schema_config: SchemaConfig, cfg: BlobFetchConfig) -> SchemaConfig:
+    field_by_name: dict[str, FieldDefinition] = {}
+    if schema_config.fields is not None:
+        field_by_name.update((field.name, field) for field in schema_config.fields)
+
+    added_fields = _blob_fetch_added_output_fields(cfg)
+    field_by_name.update((field.name, field) for field in added_fields)
+
+    base_guaranteed = set(schema_config.guaranteed_fields or ())
+    output_guaranteed = base_guaranteed | {field.name for field in added_fields}
+
+    return SchemaConfig(
+        mode=schema_config.mode if schema_config.fields is not None else "flexible",
+        fields=tuple(field_by_name.values()),
+        guaranteed_fields=tuple(sorted(output_guaranteed)),
+        audit_fields=schema_config.audit_fields,
+        required_fields=schema_config.required_fields,
+    )
+
+
+class BlobFetch(BaseTransform):
+    """Fetch an HTTP(S) URL into the run payload store and emit a blob reference."""
+
+    # url_field is the INPUT column (the URL to fetch); every option below is
+    # "Output field receiving ..." per its own config description.
+    output_naming_config_keys = frozenset(
+        {
+            "blob_ref_field",
+            "content_type_field",
+            "size_bytes_field",
+            "sha256_field",
+            "fetch_status_field",
+            "fetch_url_final_field",
+            "fetch_url_final_ip_field",
+        }
+    )
+    name = "blob_fetch"
+    determinism = Determinism.EXTERNAL_CALL
+    plugin_version = "1.0.0"
+    source_file_hash: str | None = "sha256:9c75f8515498a8a4"
+    config_model = BlobFetchConfig
+    passes_through_input = True
+    fetches_http = True
+    content_trust = ContentTrust.UNTRUSTED
+    capability_tags: tuple[str, ...] = ("http", "network", "blob")
+
+    usage_when_to_use = (
+        "Use when each row contains an authorized HTTP(S) file URL and the run must preserve the "
+        "original response bytes in the payload store with MIME type, size, and SHA-256 metadata. "
+        "Fetched bytes and later parser output remain untrusted before LLM consumption."
+    )
+    usage_when_not_to_use = (
+        "Not for semantic extraction or authenticated origins: blob_fetch has no origin-auth option. "
+        "Use web_scrape for public HTML page extraction, then a format-specific parser for stored bytes."
+    )
+    example_use = (
+        "transform:\n"
+        "  plugin: blob_fetch\n"
+        "  options:\n"
+        "    url_field: document_url\n"
+        "    blob_ref_field: document_blob_ref\n"
+        "    allowed_content_types: [text/csv, application/json]\n"
+        "    http:\n"
+        "      abuse_contact: catalogue-ops@example.org\n"
+        "      fetch_reason: Preserve approved public reference files\n"
+        "      allowed_hosts: public_only\n"
+        "    schema: {mode: observed}"
+    )
+
+    @classmethod
+    def probe_config(cls) -> dict[str, Any]:
+        return {
+            "schema": {"mode": "observed"},
+            "url_field": "blob_fetch_probe_url",
+            "http": {
+                "abuse_contact": "invariants@example.com",
+                "fetch_reason": "ADR-009 invariant probe",
+                "allowed_hosts": ["93.184.216.34/32"],
+            },
+        }
+
+    def __init__(self, options: dict[str, Any]) -> None:
+        super().__init__(options)
+        cfg = BlobFetchConfig.from_dict(options, plugin_name=self.name)
+        self._initialize_declared_input_fields(cfg)
+
+        self._url_field = cfg.url_field
+        self._url = cfg.url
+        self._blob_ref_field = cfg.blob_ref_field
+        self._content_type_field = cfg.content_type_field
+        self._size_bytes_field = cfg.size_bytes_field
+        self._sha256_field = cfg.sha256_field
+        self._fetch_status_field = cfg.fetch_status_field
+        self._fetch_url_final_field = cfg.fetch_url_final_field
+        self._fetch_url_final_ip_field = cfg.fetch_url_final_ip_field
+        self._allowed_content_types = frozenset(cfg.allowed_content_types)
+
+        self._abuse_contact = cfg.http.abuse_contact
+        self._fetch_reason = cfg.http.fetch_reason
+        self._timeout = cfg.http.timeout
+        self._max_body_bytes = cfg.http.max_body_bytes
+        self._allowed_origins: tuple[HTTPOrigin, ...] = tuple(parse_http_origin(value) for value in cfg.http.allowed_origins)
+
+        allowed_hosts = cfg.http.allowed_hosts
+        if allowed_hosts == "public_only":
+            self._allowed_ranges: tuple[IPv4Network | IPv6Network, ...] = ()
+        elif allowed_hosts == "allow_private":
+            self._allowed_ranges = (
+                ipaddress.ip_network("0.0.0.0/0"),
+                ipaddress.ip_network("::/0"),
+            )
+        else:
+            self._allowed_ranges = _parse_allowed_ranges(allowed_hosts)
+
+        output_fields = [field.name for field in _blob_fetch_added_output_fields(cfg)]
+        self.declared_output_fields = frozenset(output_fields)
+
+        self.input_schema = create_schema_from_config(cfg.schema_config, "BlobFetchInput", allow_coercion=False)
+        self._output_schema_config = _build_blob_fetch_output_schema_config(cfg.schema_config, cfg)
+        self.output_schema = create_schema_from_config(self._output_schema_config, "BlobFetchOutput", allow_coercion=False)
+
+    @classmethod
+    def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
+        if issue_code is None:
+            return PluginAssistance(
+                plugin_name=cls.name,
+                issue_code=None,
+                summary="Fetch an HTTP(S) URL into the run payload store and emit a blob reference plus fetch metadata.",
+                composer_hints=(
+                    "Use blob_fetch when rows contain document URLs and downstream parser transforms should consume blob_ref, not raw bytes.",
+                    "blob_fetch does not parse content; chain a registered parser after it — blob_csv_expand for CSV, blob_json_expand for JSON or JSONL, blob_text_expand for plain text.",
+                    "allowed_content_types is a strict exact MIME allowlist; add operator-approved types explicitly.",
+                    "http.abuse_contact and http.fetch_reason are mandatory and sent as wire-visible headers.",
+                ),
+            )
+        return None
+
+    def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Inject a deterministic public-IP URL for invariant probing.
+
+        Without this the probe row never carries ``url_field``, ``process()``
+        returns ``validation_failed`` on the ``KeyError``, and ADR-009's forward
+        invariant — which treats a non-success probe as a legitimate processing
+        error and moves on — reports green while asserting nothing
+        (elspeth-6244cb5472). The address matches the ``allowed_hosts`` entry in
+        ``probe_config()``, so SSRF validation resolves without DNS.
+        """
+        if self._url_field is None:
+            return [probe]
+        return [
+            self._augment_invariant_probe_row(
+                probe,
+                field_name=self._url_field,
+                value="https://93.184.216.34/invariant-probe",
+            )
+        ]
+
+    def execute_forward_invariant_probe(
+        self,
+        probe_rows: list[PipelineRow],
+        ctx: TransformContext,
+    ) -> TransformResult:
+        """Drive the real process path with a hermetic no-network fetch seam.
+
+        Both seams must be stubbed for the probe to reach the enrichment path:
+        ``_fetch_url`` would otherwise open a socket, and ``_payload_store`` is
+        bound in ``on_start()``, which the isolated invariant harness never runs.
+        The stub response carries an allowlisted content-type and an IP-pinned
+        request URL because ``process()`` checks both — a probe that skipped
+        either would exercise less of the production path than it appears to.
+        """
+
+        class _InvariantPayloadStore:
+            def store(self, payload: bytes) -> str:
+                return "probe-processed-hash"
+
+        class _InvariantCall:
+            request_ref = "probe-request-hash"
+            response_ref = "probe-response-hash"
+
+        def _fake_fetch_url(
+            safe_request: SSRFSafeRequest,
+            probe_ctx: TransformContext,
+        ) -> tuple[httpx.Response, str, _InvariantCall]:
+            del probe_ctx
+            return (
+                httpx.Response(
+                    200,
+                    content=b"col_a,col_b\n1,2\n",
+                    headers={"content-type": "text/csv"},
+                    request=httpx.Request("GET", safe_request.connection_url),
+                ),
+                safe_request.original_url,
+                _InvariantCall(),
+            )
+
+        had_payload_store = "_payload_store" in self.__dict__
+        original_payload_store: Any = None
+        if had_payload_store:
+            original_payload_store = self.__dict__["_payload_store"]
+        had_fetch_override = "_fetch_url" in self.__dict__
+        original_fetch = self._fetch_url
+        original_url = self._url
+        try:
+            if original_url is not None:
+                self._url = "https://93.184.216.34/invariant-probe"
+            self.__dict__["_payload_store"] = _InvariantPayloadStore()
+            self.__dict__["_fetch_url"] = _fake_fetch_url
+            return super().execute_forward_invariant_probe(probe_rows, ctx)
+        finally:
+            self._url = original_url
+            if had_payload_store:
+                self.__dict__["_payload_store"] = original_payload_store
+            else:
+                delattr(self, "_payload_store")
+            if had_fetch_override:
+                self.__dict__["_fetch_url"] = original_fetch
+            else:
+                delattr(self, "_fetch_url")
+
+    def on_start(self, ctx: LifecycleContext) -> None:
+        super().on_start(ctx)
+        if ctx.landscape is None:
+            raise FrameworkBugError("BlobFetch requires landscape — orchestrator must inject it before on_start().")
+        if ctx.rate_limit_registry is None:
+            raise FrameworkBugError("BlobFetch requires rate_limit_registry — orchestrator must inject it before on_start().")
+        if ctx.payload_store is None:
+            raise FrameworkBugError("BlobFetch requires payload_store — orchestrator must configure it before on_start().")
+        self._recorder = ctx.landscape
+        self._payload_store = ctx.payload_store
+        self._limiter = ctx.rate_limit_registry
+        self._telemetry_emit = ctx.telemetry_emit
+
+    def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
+        try:
+            if self._url is not None:
+                url = self._url
+            elif self._url_field is not None:
+                url = row[self._url_field]
+            else:
+                raise FrameworkBugError("blob_fetch has no configured URL source")
+            if type(url) is not str:
+                raise TypeError("URL field must be a string")
+            validate_allowed_http_origin(url, self._allowed_origins)
+            session = ctx.call_mode_session
+            if session is not None and session.mode is RunMode.REPLAY:
+                archived = session.replay_ssrf_request(
+                    original_url=url,
+                    audited_url=fingerprint_url(url),
+                    call_type=CallType.HTTP,
+                    current_state_id=ctx.state_id,
+                    current_operation_id=None,
+                )
+                safe_request = validate_archived_ssrf_request(url, archived, allowed_ranges=self._allowed_ranges)
+            elif session is not None and session.mode is RunMode.VERIFY:
+                archived = session.replay_ssrf_request(
+                    original_url=url,
+                    audited_url=fingerprint_url(url),
+                    call_type=CallType.HTTP,
+                    current_state_id=ctx.state_id,
+                    current_operation_id=None,
+                )
+                archived_safe = validate_archived_ssrf_request(url, archived, allowed_ranges=self._allowed_ranges)
+                pre_dns_request = HTTPCallRequest(
+                    method="GET",
+                    url=fingerprint_url(url),
+                    headers=fingerprint_headers(
+                        {
+                            "X-Abuse-Contact": self._abuse_contact,
+                            "X-Fetch-Reason": self._fetch_reason,
+                            "Host": archived_safe.host_header,
+                        }
+                    ),
+                    params=None,
+                )
+                session.preflight_verify_http_request(
+                    request_data=pre_dns_request.to_dict(),
+                    current_state_id=ctx.state_id,
+                    current_operation_id=None,
+                )
+                safe_request = validate_url_for_ssrf(url, allowed_ranges=self._allowed_ranges)
+            else:
+                safe_request = validate_url_for_ssrf(url, allowed_ranges=self._allowed_ranges)
+        # Missing row fields, security violations, DNS failures, and invalid
+        # URL value types are row-level validation failures, not retries.
+        except SSRFBlockedError as exc:
+            return TransformResult.error(row_url_policy_refusal(exc))
+        except SSRFNetworkError as exc:
+            return TransformResult.error(row_url_policy_refusal(exc))
+        except TypeError as exc:
+            return TransformResult.error(row_url_value_refusal(URL_NOT_A_STRING, exc))
+        except KeyError as exc:
+            return TransformResult.error(row_url_value_refusal(URL_FIELD_MISSING, exc))
+
+        try:
+            response, final_hostname_url, call = self._fetch_url(safe_request, ctx)
+            final_resolved_ip = _final_response_ip(response)
+        except BodyTooLargeError as exc:
+            return TransformResult.error(
+                {
+                    "reason": "body_too_large",
+                    "error": f"response body {exc.body_size} bytes exceeds max_body_bytes {exc.max_body_bytes}",
+                    "body_size": exc.body_size,
+                    "max_body_bytes": exc.max_body_bytes,
+                }
+            )
+        except HTTPResponseEncodingLimitError as exc:
+            return TransformResult.error(
+                {"reason": "body_too_large", "error": "response encoding limit exceeded", "error_type": exc.reason}
+            )
+        except WebScrapeError as exc:
+            if exc.retryable:
+                raise
+            return TransformResult.error(
+                {
+                    "reason": "api_error",
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                }
+            )
+
+        content_type = _parse_content_type(response)
+        if content_type.normalized not in self._allowed_content_types:
+            return TransformResult.error(
+                {
+                    "reason": "unsupported_content_type",
+                    "error": (
+                        f"content-type {content_type.raw!r} is not allowed; allowed values are {sorted(self._allowed_content_types)!r}"
+                    ),
+                    "content_type": content_type.raw,
+                }
+            )
+
+        body = response.content
+        body_size = len(body)
+        if body_size > self._max_body_bytes:
+            return TransformResult.error(
+                {
+                    "reason": "body_too_large",
+                    "error": f"response body {body_size} bytes exceeds max_body_bytes {self._max_body_bytes}",
+                    "body_size": body_size,
+                    "max_body_bytes": self._max_body_bytes,
+                }
+            )
+
+        blob_ref = self._payload_store.store(body)
+        if call.request_ref is None or call.response_ref is None:
+            raise FrameworkBugError(
+                "AuditedHTTPClient returned a Call with no request_ref/response_ref — "
+                "PayloadStore must be configured for hash-based fetch provenance in BlobFetch."
+            )
+
+        output = row.to_dict()
+        output[self._blob_ref_field] = blob_ref
+        output[self._content_type_field] = content_type.normalized
+        output[self._size_bytes_field] = body_size
+        output[self._sha256_field] = blob_ref
+        output[self._fetch_status_field] = response.status_code
+        output[self._fetch_url_final_field] = fingerprint_url(final_hostname_url)
+        output[self._fetch_url_final_ip_field] = final_resolved_ip
+
+        output_contract = narrow_contract_to_output(input_contract=row.contract, output_row=output)
+        output_contract = self._apply_declared_output_field_contracts(output_contract)
+        output_contract = self._align_output_contract(output_contract)
+
+        return TransformResult.success(
+            PipelineRow(output, output_contract),
+            success_reason={
+                "action": "enriched",
+                "fields_added": sorted(self.declared_output_fields),
+                "metadata": {
+                    "fetch_request_hash": call.request_ref,
+                    "fetch_response_raw_hash": call.response_ref,
+                    "fetch_payload_hash": blob_ref,
+                },
+            },
+        )
+
+    def _fetch_url(self, safe_request: SSRFSafeRequest, ctx: TransformContext) -> tuple[httpx.Response, str, Call]:
+        if ctx.state_id is None:
+            raise FrameworkBugError("ctx.state_id not set by executor — executor must set state_id before calling process().")
+        # No message raised below names the URL (row data; see web_scrape).
+        limiter = self._limiter.get_limiter("blob_fetch")
+        client = AuditedHTTPClient(
+            member_token=ctx.require_member_token(),
+            work_item=ctx.require_work_item(),
+            execution=self._recorder,
+            state_id=ctx.state_id,
+            run_id=ctx.run_id,
+            telemetry_emit=self._telemetry_emit,
+            timeout=self._timeout,
+            limiter=limiter,
+            token_id=ctx.token.token_id if ctx.token is not None else None,
+            max_response_body_bytes=self._max_body_bytes,
+            call_mode_session=ctx.call_mode_session,
+        )
+        headers = {
+            "X-Abuse-Contact": self._abuse_contact,
+            "X-Fetch-Reason": self._fetch_reason,
+        }
+
+        try:
+            response, final_hostname_url, call = client.get_ssrf_safe(
+                safe_request,
+                headers=headers,
+                follow_redirects=True,
+                allowed_ranges=self._allowed_ranges,
+                allowed_origins=self._allowed_origins,
+            )
+            if response.status_code == 404:
+                raise NotFoundError("HTTP 404")
+            if response.status_code == 403:
+                raise ForbiddenError("HTTP 403")
+            if response.status_code == 401:
+                raise UnauthorizedError("HTTP 401")
+            if response.status_code == 429:
+                raise RateLimitError("HTTP 429")
+            if 500 <= response.status_code < 600:
+                raise ServerError(f"HTTP {response.status_code}")
+            if 300 <= response.status_code < 400:
+                raise InvalidURLError(f"Unresolved redirect HTTP {response.status_code} (missing or empty Location header)")
+            if 400 <= response.status_code < 500:
+                raise ClientError(f"HTTP {response.status_code}", retryable=response.status_code == 408)
+            return response, final_hostname_url, call
+        except httpx.TimeoutException as exc:
+            raise NetworkError("Timeout fetching the row's URL") from exc
+        except httpx.ConnectError as exc:
+            raise NetworkError("Connection error fetching the row's URL") from exc
+        except HTTPResponseBodyTooLargeError as exc:
+            raise BodyTooLargeError(
+                f"response body {exc.body_size} bytes exceeds max_body_bytes {exc.max_body_bytes}",
+                body_size=exc.body_size,
+                max_body_bytes=exc.max_body_bytes,
+            ) from exc
+        except SSRFBlockedError as exc:
+            from elspeth.plugins.transforms.web_scrape_errors import SSRFBlockedError as WSSRFBlockedError
+
+            raise WSSRFBlockedError("SSRF blocked during a redirect") from exc
+        except SSRFNetworkError as exc:
+            raise NetworkError("DNS resolution failed during a redirect") from exc
+        except httpx.TooManyRedirects as exc:
+            raise InvalidURLError("Too many redirects") from exc
+        except httpx.RequestError as exc:
+            raise NetworkError(f"HTTP request error fetching the row's URL ({type(exc).__name__})") from exc
+        finally:
+            client.close()
+
+    def close(self) -> None:
+        pass

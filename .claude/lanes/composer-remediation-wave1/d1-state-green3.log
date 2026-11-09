@@ -1,0 +1,187 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 58 items
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py . [  1%]
+................................F.........F...........F.                 [ 98%]
+tests/unit/web/composer/test_proposal_cap_turn_counts.py .               [100%]
+
+=================================== FAILURES ===================================
+_ test_identical_canonical_candidate_returns_unchanged_without_proposal[named-source] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-44/test_identical_canonical_candi1')
+named_sources = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("named_sources", (False, True), ids=("singleton-source", "named-source"))
+    async def test_identical_canonical_candidate_returns_unchanged_without_proposal(tmp_path: Path, named_sources: bool) -> None:
+        harness = _harness(tmp_path)
+        arguments = _valid_pipeline_args(tmp_path)
+        state = CompositionState.from_dict({
+            **arguments, "version": 7, "metadata": {"description": "", **arguments["metadata"]},
+            "outputs": [{"name": output["sink_name"], **output} for output in arguments["outputs"]],
+        })
+        if named_sources:
+            arguments = deep_thaw(owned_composition_state_review_arguments(owned_composition_state_authority(state)))
+        llm = _ScriptedLLM(
+            _tool_turn("call_identical", "set_pipeline", arguments),
+            _fake_llm_response(content="The pipeline is unchanged."),
+        )
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Keep the current pipeline.", [], state, session_id=harness.session_id,
+                user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+            )
+        assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
+        assert result.state is state
+        assert len(result.tool_invocations) == 1
+        outcome = batches[0][0]
+>       assert outcome.response.success is True
+E       assert False is True
+E        +  where False = ToolResult(success=False, updated_state=CompositionState(nodes=(), edges=(), outputs=(OutputSpec(name='main', plugin='...sts must exist; the llm profile must be one of the enum aliases from get_plugin_schema."})})}), applied_component=None).success
+E        +    where ToolResult(success=False, updated_state=CompositionState(nodes=(), edges=(), outputs=(OutputSpec(name='main', plugin='...sts must exist; the llm profile must be one of the enum aliases from get_plugin_schema."})})}), applied_component=None) = _ToolOutcome(call=_AdmittedToolCall(id='call_identical', function=_AdmittedToolFunction(name='set_pipeline', arguments...s=None, error_category=None, error_message=None, pre_version=7, post_version=7, strict_sent=None, wire_conformant=True).response
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1686: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:20:45 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:20:45 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:20:45 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:20:45 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_semantic_admission_across_incremental_mutation_families[changed-output] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-44/test_semantic_admission_across9')
+family = 'output', changed = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("family", ("metadata", "source", "node", "output", "edge", "replacement"))
+    @pytest.mark.parametrize("changed", (False, True), ids=("no-change", "changed"))
+    async def test_semantic_admission_across_incremental_mutation_families(tmp_path: Path, family: str, changed: bool) -> None:
+        harness = _harness(tmp_path)
+        pipeline = _valid_pipeline_args(tmp_path)
+        pipeline["source"]["on_success"] = "rows"
+        pipeline["nodes"] = [{
+            "id": "map", "node_type": "transform", "plugin": "field_mapper", "input": "rows",
+            "on_success": "main", "on_error": "discard", "options": {"schema": {"mode": "observed"}, "mapping": {}},
+        }]
+        pipeline["edges"] = [{"id": "incoming", "from_node": "source", "to_node": "map", "edge_type": "on_success", "label": None}]
+        state = CompositionState.from_dict({
+            **pipeline, "version": 7, "metadata": {"description": "", **pipeline["metadata"]},
+            "outputs": [{"name": output["sink_name"], **output} for output in pipeline["outputs"]],
+        })
+        cases = {
+            "metadata": ("set_metadata", {"patch": {"name": "changed" if changed else "proposal-valid"}}),
+            "source": ("patch_source_options", {"patch": {"delimiter": ";"} if changed else {}}),
+            "node": ("patch_node_options", {"node_id": "map", "patch": {"select_only": True} if changed else {}}),
+            "output": ("patch_output_options", {"sink_name": "main", "patch": {"mode": "append"} if changed else {}}),
+            "edge": ("upsert_edge", {**pipeline["edges"][0], "label": "changed" if changed else None}),
+            "replacement": ("set_pipeline", {**pipeline, "metadata": {"name": "changed" if changed else "proposal-valid"}}),
+        }
+        tool_name, arguments = cases[family]
+        llm = _ScriptedLLM(_tool_turn("call_family", tool_name, arguments), _fake_llm_response(content="Done."))
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Review this pipeline edit.", [], state, session_id=harness.session_id,
+                user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+            )
+        proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+>       assert len(proposals) == int(changed)
+E       assert 0 == 1
+E        +  where 0 = len([])
+E        +  and   1 = int(True)
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1729: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:20:52 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:20:52 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:20:52 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:20:52 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+______ test_blob_marker_admission_checks_real_metadata_and_modality[llm] _______
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-44/test_blob_marker_admission_che2')
+blob_kind = 'llm'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("blob_kind", ("user", "missing", "llm"))
+    async def test_blob_marker_admission_checks_real_metadata_and_modality(tmp_path: Path, blob_kind: str) -> None:
+        from elspeth.web.composer.tools import blobs
+        from tests.helpers.session_fences import fenced_operation_context
+        from tests.unit.web.composer.test_blob_inline_tools import _inline_ref_state
+    
+        harness = _harness(tmp_path)
+        state = _inline_ref_state()
+        blob_id = uuid4()
+        if blob_kind != "missing":
+            with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as operation:
+>               blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+                    UUID(harness.session_id), "prompt.txt", b"A user supplied prompt", "text/plain",
+                    created_by="user" if blob_kind == "user" else "llm", session_operation_context=operation,
+                )
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1854: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <elspeth.web.blobs.service.BlobServiceImpl object at 0x7f2658460bc0>
+session_id = UUID('00000000-0000-4000-8000-000000000001')
+filename = 'prompt.txt', content = b'A user supplied prompt'
+mime_type = 'text/plain', created_by = 'llm', source_description = None
+
+    async def create_blob(
+        self,
+        session_id: UUID,
+        filename: str,
+        content: bytes,
+        mime_type: StorageMimeType,
+        created_by: BlobCreator = "user",
+        source_description: str | None = None,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> BlobRecord:
+        """Create a blob from content bytes under the caller's CREATE/COMPOSE fence.
+    
+        Accepts the STORAGE union: which subset applies (text/data vs
+        binary document) is decided by the authenticated boundary that
+        received the bytes — the upload route enforces the binary
+        signature agreement before this method runs (elspeth-0c6a343921).
+    
+        Reservation and ready publication are exact-context authority
+        mutations. The intervening filesystem write re-proves that authority
+        before and after publication while the separate blob-custody lock
+        serialises same-session filesystem effects.
+        """
+        _require_blob_operation_context(session_operation_context, allowed_kinds=_CREATE_BLOB_OPERATION_KINDS)
+        if type(session_id) is not UUID:
+            raise TypeError(f"session_id must be UUID, got {type(session_id).__name__}")
+        if str(session_id) != session_operation_context.fence.session_id:
+            raise ValueError("session operation context does not own the blob session")
+        if type(filename) is not str:
+            raise TypeError(f"filename must be str, got {type(filename).__name__}")
+        if type(content) is not bytes:
+            raise TypeError(f"Blob content must be bytes, got {type(content).__name__}")
+        untrusted_created_by: object = created_by
+        if type(untrusted_created_by) is not str:
+            raise TypeError(f"created_by must be str, got {type(untrusted_created_by).__name__}")
+        if untrusted_created_by not in BLOB_CREATORS:
+>           raise RuntimeError(f"Invalid created_by {untrusted_created_by!r} — must be one of {sorted(BLOB_CREATORS)}")
+E           RuntimeError: Invalid created_by 'llm' — must be one of ['assistant', 'pipeline', 'user']
+
+src/elspeth/web/blobs/service.py:2658: RuntimeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:21:01 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:21:01 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:21:01 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+=========================== short test summary info ============================
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_identical_canonical_candidate_returns_unchanged_without_proposal[named-source]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_semantic_admission_across_incremental_mutation_families[changed-output]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_blob_marker_admission_checks_real_metadata_and_modality[llm]
+======================== 3 failed, 55 passed in 43.48s =========================

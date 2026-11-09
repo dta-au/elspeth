@@ -1,0 +1,2 @@
+2026-11-09 19:33:49 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=300.0 configured_turns=25 fundable_turns_estimate=20 planning_seconds_per_turn=15.0
+2026-11-09 19:33:52 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred

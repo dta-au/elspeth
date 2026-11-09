@@ -1,0 +1,26 @@
+{
+  "head": "f9c23c59c63bbd3099029e995a778bade594f6c8",
+  "frozen": true,
+  "scope": "all tracked files plus untracked/ignored source and test inputs excluding caches; symlinks hashed without following",
+  "inputs": 6205,
+  "symlinks": 12,
+  "positive_control_detected": true,
+  "non_input_additions": [
+    ".claude/lifecycle-foundations-final-pytest/sink-effect-spoolcurrent",
+    ".claude/lifecycle-foundations-final-pytest/test_fatal_worker_exits_uvicor0/fail",
+    ".claude/lifecycle-foundations-final-pytest/test_fatal_worker_exits_uvicor0/host.log",
+    ".claude/lifecycle-foundations-final-pytest/test_fatal_worker_exits_uvicor0/shutdown",
+    ".claude/lifecycle-foundations-final-pytest/test_fatal_worker_exits_uvicor1/fail",
+    ".claude/lifecycle-foundations-final-pytest/test_fatal_worker_exits_uvicor1/host.log",
+    ".claude/lifecycle-foundations-final-pytest/test_fatal_worker_exits_uvicor1/shutdown",
+    ".claude/lifecycle-foundations-final-pytest/test_fatal_worker_exits_uvicorcurrent",
+    ".claude/lifecycle-foundations-final-pytest/test_real_watchdog_armed_chann0/owned_hung_child.py",
+    ".claude/lifecycle-foundations-final-pytest/test_real_watchdog_armed_channcurrent",
+    ".claude/lifecycle-foundations-final-pytest/test_real_watchdog_normal_disa0/owned_child.py",
+    ".claude/lifecycle-foundations-final-pytest/test_real_watchdog_normal_disacurrent",
+    ".claude/lifecycle-foundations-final-pytest/test_seal_joins_real_worker_in0/worker-child.exit",
+    ".claude/lifecycle-foundations-final-pytest/test_seal_joins_real_worker_in0/worker-child.log",
+    ".claude/lifecycle-foundations-final-pytest/test_seal_joins_real_worker_incurrent",
+    ".claude/lifecycle-foundations-final-pytest/test_simultaneous_membership_acurrent"
+  ]
+}

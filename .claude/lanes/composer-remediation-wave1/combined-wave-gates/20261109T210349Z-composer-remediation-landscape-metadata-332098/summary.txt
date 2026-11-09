@@ -1,0 +1,13 @@
+run_dir=/workspace/elspeth/.claude/lanes/composer-remediation-wave1/combined-wave-gates/20261109T210349Z-composer-remediation-landscape-metadata-332098
+tree=/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata head=dd3b3524ccd2a1910db98f77eb35f9d7ce69a249 before=dd3b3524ccd2a1910db98f77eb35f9d7ce69a249 01ba4719c80b6fe9
+stage=ruff exit=0 seconds=3 fatal=1
+freeze_monitor stage=ruff status=healthy watcher_exit=0
+stage=mypy exit=0 seconds=33 fatal=1
+freeze_monitor stage=mypy status=healthy watcher_exit=0
+stage=contracts exit=0 seconds=36 fatal=1
+freeze_monitor stage=contracts status=healthy watcher_exit=0
+stage=lints exit=1 seconds=252 fatal=0 findings=5454
+freeze_monitor stage=lints status=healthy watcher_exit=0
+after=dd3b3524ccd2a1910db98f77eb35f9d7ce69a249 01ba4719c80b6fe9 frozen=yes
+RESULT=PASS
+driver_exit=0 reason=completed phase=complete stage=none stage_exit=UNKNOWN freeze_monitor=healthy

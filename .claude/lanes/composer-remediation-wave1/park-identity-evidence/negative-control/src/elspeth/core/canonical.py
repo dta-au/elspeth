@@ -1,0 +1,376 @@
+"""
+Canonical JSON serialization for deterministic hashing.
+
+Two-phase approach:
+1. Normalize: Convert pandas/numpy types to JSON-safe primitives (our code)
+2. Serialize: Delegate primitive canonical JSON/hash policy to contracts.hashing
+
+IMPORTANT: NaN and Infinity are strictly REJECTED, not silently converted.
+This is defense-in-depth for audit integrity.
+
+NOTE: For non-canonical data that cannot be serialized (malformed external
+data at Tier-3 trust boundary), use ``elspeth.contracts.hashing.repr_hash()``
+as a fallback.  This is NOT deterministic across Python versions but is
+appropriate for quarantined data where the content is already flagged as
+problematic.
+"""
+
+from __future__ import annotations
+
+import base64
+import math
+from collections.abc import Mapping
+from datetime import UTC, date, datetime, time
+from decimal import Decimal
+from typing import TYPE_CHECKING, Any
+from uuid import UUID
+
+import networkx as nx
+import numpy as np
+import pandas as pd
+
+from elspeth.contracts.hashing import CANONICAL_VERSION as CANONICAL_VERSION
+from elspeth.contracts.hashing import canonical_json as _primitive_canonical_json
+from elspeth.contracts.hashing import stable_hash as _primitive_stable_hash
+from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.contracts.trust_boundary import trust_boundary
+
+if TYPE_CHECKING:
+    from elspeth.core.dag import ExecutionGraph
+
+
+_CANONICAL_TYPE_KEY = "__elspeth_canonical_type__"
+_CANONICAL_BYTES_TAG = "bytes"
+_CANONICAL_MAPPING_TAG = "mapping"
+
+
+def _normalize_value(obj: Any) -> Any:
+    """Convert a single value to JSON-safe primitive.
+
+    Handles pandas and numpy types that appear in real pipeline data.
+
+    NaN Policy: STRICT REJECTION
+    - NaN and Infinity are invalid input states for float AND Decimal
+    - Use None/pd.NA/NaT for intentional missing values
+    - This prevents silent data corruption in audit records
+
+    Args:
+        obj: Any Python value
+
+    Returns:
+        JSON-serializable primitive
+
+    Raises:
+        ValueError: If value contains NaN or Infinity
+    """
+    # Check for NaN/Infinity FIRST (before type coercion)
+    if isinstance(obj, np.floating):
+        # Use NumPy-native finiteness check — math.isnan/isinf implicitly
+        # downcast through float(), which overflows for np.longdouble values
+        # outside IEEE 754 double range (falsely treating finite values as inf).
+        if not np.isfinite(obj):
+            raise ValueError(f"Cannot canonicalize non-finite float: {obj}. Use None for missing values, not NaN.")
+        converted = float(obj)
+        if not math.isfinite(converted):
+            raise ValueError(
+                f"Cannot canonicalize {type(obj).__name__} value: exceeds IEEE 754 double range. "
+                f"Value is finite in native representation but overflows JSON number format."
+            )
+        return converted
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            raise ValueError(f"Cannot canonicalize non-finite float: {obj}. Use None for missing values, not NaN.")
+        return obj
+
+    # Primitives pass through unchanged
+    if obj is None or isinstance(obj, str | int | bool):
+        return obj
+
+    # NumPy scalar types
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        # Numeric arrays can be checked vectorially; object/string arrays are
+        # normalized element-by-element below so embedded Python floats still
+        # use the scalar non-finite checks.
+        if obj.size > 0 and np.issubdtype(obj.dtype, np.number) and not np.all(np.isfinite(obj)):
+            raise ValueError(
+                "NaN/Infinity found in NumPy array. Audit trail requires finite values only. Use None for missing values, not NaN."
+            )
+        # 0-D arrays convert to scalars via tolist()/item(); normalize that scalar directly.
+        if obj.ndim == 0:
+            return _normalize_value(obj.item())
+        return [_normalize_value(x) for x in obj.tolist()]
+
+    # NumPy datetime64
+    if isinstance(obj, np.datetime64):
+        if np.isnat(obj):
+            return None
+        # Convert to pd.Timestamp for consistent UTC ISO 8601 output
+        ts = pd.Timestamp(obj)
+        if ts.tz is None:
+            return ts.tz_localize("UTC").isoformat()
+        return ts.tz_convert("UTC").isoformat()
+
+    # Pandas types
+    if isinstance(obj, pd.Timestamp):
+        # Naive timestamps assumed UTC (explicit policy)
+        if obj.tz is None:
+            return obj.tz_localize("UTC").isoformat()
+        return obj.tz_convert("UTC").isoformat()
+
+    # Intentional missing values (NOT NaN - that's rejected above).
+    # Both are singletons, so identity IS the type check: ``obj is pd.NaT``
+    # already implies ``isinstance(obj, type(pd.NaT))``.
+    if obj is pd.NA or obj is pd.NaT:
+        return None
+
+    # Standard library types
+    if isinstance(obj, datetime):
+        if obj.tzinfo is None:
+            obj = obj.replace(tzinfo=UTC)
+        return obj.astimezone(UTC).isoformat()
+
+    if isinstance(obj, date):
+        return obj.isoformat()
+
+    if isinstance(obj, time):
+        return obj.isoformat()
+
+    if isinstance(obj, UUID):
+        return str(obj)
+
+    if isinstance(obj, bytes):
+        return {
+            _CANONICAL_TYPE_KEY: _CANONICAL_BYTES_TAG,
+            "base64": base64.b64encode(obj).decode("ascii"),
+        }
+
+    if isinstance(obj, Decimal):
+        if not obj.is_finite():  # Rejects NaN, sNaN, Infinity, -Infinity
+            raise ValueError(f"Cannot canonicalize non-finite Decimal: {obj}. Use None for missing values, not NaN/Infinity.")
+        return str(obj)
+
+    return obj
+
+
+def _normalize_for_canonical(data: Any) -> Any:
+    """Recursively normalize a data structure for canonical JSON.
+
+    Converts pandas/numpy types to JSON-safe primitives.
+    Handles PipelineRow by converting to dict.
+
+    Args:
+        data: Any data structure (dict, list, primitive, PipelineRow)
+
+    Returns:
+        Normalized data structure with only JSON-safe types
+
+    Raises:
+        ValueError: If data contains NaN, Infinity, or other non-serializable values
+    """
+    # Handle PipelineRow - convert to dict before processing
+    if isinstance(data, PipelineRow):
+        data = data.to_dict()
+
+    if isinstance(data, Mapping):
+        if _CANONICAL_TYPE_KEY in data:
+            entries = [
+                {
+                    "key": _normalize_for_canonical(key),
+                    "value": _normalize_for_canonical(value),
+                }
+                for key, value in data.items()
+            ]
+            return {
+                _CANONICAL_TYPE_KEY: _CANONICAL_MAPPING_TAG,
+                "entries": sorted(entries, key=lambda entry: _primitive_canonical_json(entry["key"])),
+            }
+        return {k: _normalize_for_canonical(v) for k, v in data.items()}
+    if isinstance(data, list | tuple):
+        return [_normalize_for_canonical(v) for v in data]
+    return _normalize_value(data)
+
+
+def canonical_json(obj: Any) -> str:
+    """Produce canonical JSON for hashing.
+
+    Two-phase approach:
+    1. Normalize pandas/numpy types to JSON-safe primitives (our code)
+    2. Serialize via the shared contracts.hashing primitive policy
+
+    Args:
+        obj: Data structure to serialize
+
+    Returns:
+        Canonical JSON string (no whitespace, sorted keys)
+
+    Raises:
+        ValueError: If data contains NaN, Infinity, or other non-finite values
+        TypeError: If data contains types that cannot be serialized
+    """
+    normalized = _normalize_for_canonical(obj)
+    return _primitive_canonical_json(normalized)
+
+
+def stable_hash(obj: Any) -> str:
+    """Compute stable hash of object.
+
+    Args:
+        obj: Data structure to hash
+
+    Returns:
+        SHA-256 hex digest of canonical JSON
+    """
+    normalized = _normalize_for_canonical(obj)
+    return _primitive_stable_hash(normalized)
+
+
+def compute_full_topology_hash(graph: ExecutionGraph) -> str:
+    """Compute hash of complete DAG topology for checkpoint validation.
+
+    Unlike upstream-only hashing, this ensures ANY topology change
+    (including sibling branches in multi-sink DAGs) invalidates checkpoint resume.
+
+    This enforces the audit integrity invariant: one run_id = one configuration.
+    A single run cannot contain outputs produced under different pipeline configs.
+
+    Args:
+        graph: Execution graph to hash
+
+    Returns:
+        SHA-256 hash of canonical full topology representation.
+    """
+    nx_graph = graph.get_nx_graph()
+
+    topology_data = {
+        "nodes": sorted(
+            [
+                {
+                    "node_id": n,
+                    "plugin_name": graph.get_node_info(n).plugin_name,
+                    "node_type": graph.get_node_info(n).node_type.value,
+                    "config_hash": stable_hash(graph.get_node_info(n).config),
+                }
+                for n in nx_graph.nodes()
+            ],
+            key=lambda x: x["node_id"],
+        ),
+        "edges": sorted(
+            [_edge_to_canonical_dict(nx_graph, u, v, k) for u, v, k in nx_graph.edges(keys=True)],
+            key=lambda x: (x["from"], x["to"], x["key"]),
+        ),
+    }
+
+    return stable_hash(topology_data)
+
+
+def _edge_to_canonical_dict(
+    graph: nx.MultiDiGraph[Any],
+    u: str,
+    v: str,
+    k: str,
+) -> dict[str, Any]:
+    """Convert edge to canonical dict for hashing.
+
+    Uses explicit defaults for missing attributes to ensure
+    hash stability across graphs with inconsistent edge data.
+
+    Args:
+        graph: NetworkX graph containing the edge
+        u: Source node ID
+        v: Target node ID
+        k: Edge key
+
+    Returns:
+        Canonical dict representation of edge attributes.
+    """
+    edge_data = graph.edges[u, v, k]
+    # Edge data is Tier 1 (Our Data) - crash on missing/wrong attributes
+    # If label or mode are missing/wrong, that's a bug in ExecutionGraph.add_edge()
+    return {
+        "from": u,
+        "to": v,
+        "key": k,
+        "label": edge_data["label"],
+        "mode": edge_data["mode"].value,
+    }
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "a value from external row data whose Python type is not yet known — a source row at the source-boundary "
+        "schema, or a quarantined row being made hashable"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns True only for a number canonical_json refuses by value and False for every other value, "
+        "including every non-number; never raises on malformed input"
+    ),
+    non_raising=True,
+)
+def is_non_canonical_number(value: object) -> bool:
+    """Return whether ``value`` is a number canonical JSON refuses by its VALUE.
+
+    The one authority for the canonical-number rule at the Tier-3 boundaries
+    (the source schema's admission check and the quarantine sanitizer): a
+    number is non-canonical exactly when this module's canonicalizer refuses
+    it with ``ValueError`` — an integer outside the JSON safe range
+    ±(2**53-1) (``rfc8785.IntegerDomainError``), a NaN or infinite float or
+    Decimal, or a NumPy floating value beyond the IEEE 754 double range. The
+    canonicalizer decides; this function only asks it.
+
+    ``bool`` is not a number here (it serializes as ``true``/``false``), and
+    non-numeric values are never "non-canonical numbers": a value canonical
+    JSON cannot represent because of its TYPE is a different defect (the
+    producer emitted a type it must not) and is not this function's concern.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float | Decimal | np.integer | np.floating):
+        return False
+    try:
+        canonical_json(value)
+    except ValueError:
+        return True
+    return False
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "external row data on the quarantine path — already-malformed values being normalized so they "
+        "can pass through canonical_json/stable_hash for the quarantine record"
+    ),
+    source_param="obj",
+    suppresses=("R5",),
+    invariant=(
+        "replaces numbers canonical JSON refuses by value (NaN, Infinity, integers outside the JSON safe "
+        "range) with None inside recognized dict/ndarray/list/tuple shapes and returns every other value "
+        "unchanged; never raises on malformed input"
+    ),
+    non_raising=True,
+)
+def sanitize_for_canonical(obj: Any) -> Any:
+    """Recursively replace non-canonical numbers (``is_non_canonical_number``) with None.
+
+    Used at Tier-3 trust boundaries (quarantine path) to normalize external
+    data so it can safely pass through canonical_json and stable_hash: NaN,
+    Infinity, and integers outside the JSON safe range ±(2**53-1).
+    Per docs/guides/data-trust-and-error-handling.md §Coercion Rules by Plugin
+    Type, sources MAY coerce to normalize external data at ingestion.
+
+    The quarantine error message records what was originally wrong with the data,
+    so replacing such a number with None preserves auditability.
+    """
+    if isinstance(obj, dict):
+        return {k: sanitize_for_canonical(v) for k, v in obj.items()}
+    if isinstance(obj, np.ndarray):
+        return sanitize_for_canonical(obj.tolist())
+    if isinstance(obj, (list, tuple)):
+        return [sanitize_for_canonical(v) for v in obj]
+    if is_non_canonical_number(obj):
+        return None
+    return obj

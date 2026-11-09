@@ -1,0 +1,192 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-d2
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 923 items
+
+tests/unit/composer_mcp/test_audit.py ............                       [  1%]
+tests/unit/composer_mcp/test_call_tool_audit.py ........................ [  3%]
+......                                                                   [  4%]
+tests/unit/composer_mcp/test_checkout_diagnostics.py ....                [  4%]
+tests/unit/composer_mcp/test_configured_root_admission.py .............. [  6%]
+........................................................................ [ 14%]
+....................................................                     [ 19%]
+tests/unit/composer_mcp/test_server.py ....................F............ [ 23%]
+................                                                         [ 25%]
+tests/unit/composer_mcp/test_session.py ................................ [ 28%]
+.................................                                        [ 32%]
+tests/unit/web/test_paths.py ........................................... [ 36%]
+...............                                                          [ 38%]
+tests/unit/web/composer/test_set_pipeline_candidate.py ................. [ 40%]
+........................................................................ [ 48%]
+........................................................................ [ 56%]
+                                                                         [ 56%]
+tests/unit/web/execution/test_validation_authoring.py .................. [ 57%]
+......................................                                   [ 62%]
+tests/unit/web/execution/test_validation_materialization.py ............ [ 63%]
+......F................................................................  [ 71%]
+tests/unit/web/execution/test_validation_identity_document.py ...        [ 71%]
+tests/unit/web/execution/test_validation.py ...................F........ [ 74%]
+........................................................................ [ 82%]
+........................................................................ [ 90%]
+..............................................................           [ 96%]
+tests/unit/web/execution/test_preflight_side_effects.py ................ [ 98%]
+..............                                                           [100%]
+
+=================================== FAILURES ===================================
+______ TestDispatchTool.test_set_output_accepts_explicit_collision_policy ______
+
+self = <tests.unit.composer_mcp.test_server.TestDispatchTool object at 0x7efcd56d6600>
+scratch_dir = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/regression-tmp/test_set_output_accepts_explic0/scratch')
+
+    def test_set_output_accepts_explicit_collision_policy(self, scratch_dir: Path) -> None:
+        result = _dispatch_tool(
+            "set_output",
+            {
+                "sink_name": "main",
+                "plugin": "csv",
+                "options": {
+                    "path": "outputs/out.csv",
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                "on_write_failure": "discard",
+            },
+            _empty_state(),
+            _mock_catalog(),
+            scratch_dir,
+        )
+    
+>       assert result["success"] is True
+E       assert False is True
+
+tests/unit/composer_mcp/test_server.py:622: AssertionError
+_ test_materialization_does_not_catch_yaml_path_or_bounded_yaml_exceptions[path] _
+
+stage = 'path'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7efcb9ed84a0>
+
+    @pytest.mark.parametrize("stage", ["generate", "path", "load_yaml"])
+    def test_materialization_does_not_catch_yaml_path_or_bounded_yaml_exceptions(
+        stage: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class ExpectedError(RuntimeError):
+            pass
+    
+        generator = _YamlGenerator("blob_ref: inline_content\n" if stage == "load_yaml" else "sources: {}\n")
+        if stage == "generate":
+            monkeypatch.setattr(generator, "generate_yaml", lambda state: (_ for _ in ()).throw(ExpectedError("generate")))
+        if stage == "path":
+            monkeypatch.setattr(
+                "elspeth.web.execution._validation_materialization.resolve_runtime_yaml_paths",
+                lambda pipeline_yaml, data_dir, *, session_id: (_ for _ in ()).throw(ExpectedError("path")),
+            )
+    
+        with pytest.raises(ExpectedError, match=stage):
+>           materialize_validation_yaml(
+                _interpretation(_state()),
+                yaml_generator=generator,
+                data_dir=Path("/tmp/test_data"),
+                session_id="test-session",
+                blob_get_metadata=lambda _blob_id: None,
+                load_yaml=lambda pipeline_yaml: (_ for _ in ()).throw(ExpectedError("load_yaml")),
+            )
+
+tests/unit/web/execution/test_validation_materialization.py:428: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+interpretation = InterpretationValidatedState(authored=AuthoredValidatedState(policy=PolicyLoweredState(authored_state=CompositionState...ec(plugin='csv', on_success='node_in', options=mappingproxy({}), on_validation_failure='discard', description=None)})))
+
+    def materialize_validation_yaml(
+        interpretation: InterpretationValidatedState,
+        *,
+        yaml_generator: YamlGenerator,
+        data_dir: Path,
+        session_id: str | None,
+        mcp_root_authority: McpConfiguredRootAuthority | None = None,
+        blob_get_metadata: Callable[[UUID], BlobRecord | None] | None,
+        load_yaml: Callable[[str], object],
+        blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
+    ) -> PhaseReport[MaterializedYaml] | PhaseFailure:
+        """Generate the exact runtime YAML and validate inline-blob metadata.
+    
+        A state shape the generator refuses to lower (``PipelineLoweringError``) is an
+        authoring defect reachable from any rehydrated session, so it becomes a red
+        verdict here rather than a 500. Note the failure lands on
+        ``CHECK_BLOB_INLINE_REFS``: the ledger requires a failure to occupy the next
+        canonical core check, and materialization's canonical slot is that one — so
+        the check NAME is positional, and ``error_code`` is what distinguishes a
+        state-shape refusal from an actual blob problem.
+    
+        Only that typed error converts. ``resolve_runtime_yaml_paths`` and the
+        non-dict check below stay outside the guard, and anything else the generator
+        raises is a bug in code ELSPETH owns, which must keep escaping.
+        """
+        try:
+            pipeline_yaml = yaml_generator.generate_yaml(interpretation.materialized_state)
+        except PipelineLoweringError as exc:
+            detail = f"Pipeline state cannot be materialized to runtime YAML: {exc}"
+            return PhaseFailure(
+                passed_checks=(),
+                failed_check=ValidationCheck(
+                    name=CHECK_BLOB_INLINE_REFS,
+                    passed=False,
+                    detail=detail,
+                    affected_nodes=(),
+                    outcome_code=None,
+                ),
+                errors=(
+                    ValidationError(
+                        component_id=None,
+                        component_type=None,
+                        message=detail,
+                        suggestion="Repair the named node so the field is set — patch it with upsert_node/patch_node_options, or remove the node if it is no longer part of the pipeline.",
+                        error_code="state_shape_materialization",
+                    ),
+                ),
+                readiness=_blocked_readiness(code="state_shape_materialization", detail=detail),
+                semantic_contracts=interpretation.authored.semantic_contracts,
+            )
+>       pipeline_yaml = resolve_runtime_yaml_paths(pipeline_yaml, str(data_dir), session_id=session_id, mcp_root_authority=mcp_root_authority)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: test_materialization_does_not_catch_yaml_path_or_bounded_yaml_exceptions.<locals>.<lambda>() got an unexpected keyword argument 'mcp_root_authority'
+
+src/elspeth/web/execution/_validation_materialization.py:318: TypeError
+_ test_validate_pipeline_public_signature_is_stable_through_boundary_decorator _
+
+    def test_validate_pipeline_public_signature_is_stable_through_boundary_decorator() -> None:
+        expected = (
+            "(state: 'CompositionState', settings: 'ValidationSettings', yaml_generator: 'YamlGenerator', *, "
+            "plugin_snapshot: 'PluginAvailabilitySnapshot', profile_registry: 'OperatorProfileRegistry | None', "
+            "catalog: 'CatalogService', secret_service: 'WebSecretResolver | None' = None, "
+            "secret_wiring_policy: 'SecretWiringPolicy | None' = None, user_id: 'str | None' = None, "
+            "blob_get_metadata: 'Callable[[UUID], BlobRecord | None] | None' = None, "
+            "blob_get_content: 'Callable[[UUID], tuple[BlobRecord, bytes]] | None' = None, "
+            "allow_pending_interpretation_placeholders: 'bool' = False, session_id: 'str | None' = None) -> 'ValidationResult'"
+        )
+    
+        # The single literal comparison IS the whole guarantee: inspect.signature
+        # follows __wrapped__, so if the boundary decorator ever broke
+        # introspection (lost __wrapped__, interposed an unannotated shim) this
+        # resolves to (*args, **kwargs) and fails. A second
+        # signature(f) == signature(f.__wrapped__) comparison was removed as a
+        # tautology — signature() already resolves through __wrapped__ on both
+        # sides, so it could never fail for any functools.wraps decorator.
+>       assert str(inspect.signature(validation_module.validate_pipeline)) == expected
+E       assert "(state: 'Com...dationResult'" == "(state: 'Com...dationResult'"
+E         
+E         Skipping 591 identical leading characters in diff, use -v to show
+E         - ne' = None) -> 'ValidationResult'
+E         + ne' = None, mcp_root_authority: 'McpConfiguredRootAuthority | None' = None) -> 'ValidationResult'
+
+tests/unit/web/execution/test_validation.py:1102: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/composer_mcp/test_server.py::TestDispatchTool::test_set_output_accepts_explicit_collision_policy
+FAILED tests/unit/web/execution/test_validation_materialization.py::test_materialization_does_not_catch_yaml_path_or_bounded_yaml_exceptions[path]
+FAILED tests/unit/web/execution/test_validation.py::test_validate_pipeline_public_signature_is_stable_through_boundary_decorator
+================== 3 failed, 920 passed in 200.22s (0:03:20) ===================

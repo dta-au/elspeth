@@ -1,0 +1,48 @@
+2026-11-09 18:57:01 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 18:57:04 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 18:57:05 [info     ] openrouter_catalog_boot_prime_skipped action='serving bundled litellm catalog; no boot-time egress to openrouter.ai' configured_llm_providers=() reason='openrouter is not a configured LLM provider for this deployment'
+2026-11-09 18:57:06 [error    ] composer_operation.worker_loop_lost exc_class=NoneType
+ERROR:    Traceback (most recent call last):
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.venv/lib/python3.12/site-packages/starlette/routing.py", line 638, in lifespan
+    async with self.lifespan_context(app) as maybe_state:
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/tests/unit/web/test_process_recovery.py", line 106, in observed_lifespan
+    async with lifespan(application):
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/src/elspeth/web/app.py", line 641, in lifespan
+    async with _service_lifespan(app):
+               ^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/src/elspeth/web/app.py", line 1238, in _service_lifespan
+    raise failures[0]
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/src/elspeth/web/app.py", line 1202, in observe_shutdown
+    await action()
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/tests/unit/web/test_process_recovery.py", line 94, in membership_stop
+    return await original_membership_stop(membership)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/src/elspeth/web/coordination/membership_lifecycle.py", line 242, in stop
+    raise heartbeat_failure
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/src/elspeth/web/coordination/membership_lifecycle.py", line 176, in _heartbeat_loop
+    await run_sync_in_worker(self._authority.heartbeat, self._identity.instance_id, lease_seconds=self._lease_seconds)
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/src/elspeth/web/async_workers.py", line 650, in run_sync_in_worker
+    return await _await_worker_future(concurrent_future, cancel_queued=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/src/elspeth/web/async_workers.py", line 720, in _await_worker_future
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/thread.py", line 59, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/src/elspeth/web/required_executor.py", line 119, in invoke
+    return callable_()
+           ^^^^^^^^^^^
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/tests/unit/web/test_process_recovery.py", line 66, in heartbeat
+    raise WebInstanceMembershipLost()
+elspeth.web.coordination.membership_authority.WebInstanceMembershipLost: web instance membership row is not in a renewable state
+
+ERROR:    Application shutdown failed. Exiting.

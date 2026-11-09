@@ -1,0 +1,213 @@
+{
+  "new": {
+    "success": true,
+    "data": {
+      "session_id": "d08f94d054ac",
+      "name": "Untitled Pipeline"
+    },
+    "state": {
+      "version": 1,
+      "metadata": {
+        "name": "Untitled Pipeline",
+        "description": ""
+      },
+      "sources": {},
+      "nodes": [],
+      "edges": [],
+      "outputs": []
+    }
+  },
+  "source": {
+    "success": true,
+    "validation": {
+      "is_valid": false,
+      "errors": [
+        {
+          "component": "pipeline",
+          "message": "No sinks configured.",
+          "severity": "high",
+          "error_code": "no_sinks_configured"
+        },
+        {
+          "component": "source",
+          "message": "Source on_success 'result' is neither a sink nor a known connection.",
+          "severity": "high",
+          "error_code": "source_on_success_dangling"
+        }
+      ],
+      "warnings": [
+        {
+          "component": "source",
+          "message": "Source on_success 'result' does not match any node input or output \u2014 data may not flow.",
+          "severity": "medium"
+        }
+      ],
+      "suggestions": [],
+      "semantic_contracts": [],
+      "graph_repair_suggestions": []
+    },
+    "affected_nodes": [
+      "source"
+    ],
+    "version": 2,
+    "validation_delta": {
+      "new_errors": [
+        {
+          "component": "source",
+          "message": "Source on_success 'result' is neither a sink nor a known connection.",
+          "severity": "high",
+          "error_code": "source_on_success_dangling"
+        }
+      ],
+      "resolved_errors": [
+        {
+          "component": "source",
+          "message": "No source configured.",
+          "severity": "high",
+          "error_code": "no_source_configured"
+        }
+      ],
+      "new_warnings": [
+        {
+          "component": "source",
+          "message": "Source on_success 'result' does not match any node input or output \u2014 data may not flow.",
+          "severity": "medium"
+        }
+      ],
+      "resolved_warnings": []
+    },
+    "applied_component": {
+      "source": {
+        "plugin": "null",
+        "on_success": "result",
+        "options": {
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_validation_failure": "discard",
+        "description": null
+      }
+    },
+    "state": {
+      "version": 2,
+      "metadata": {
+        "name": "Untitled Pipeline",
+        "description": ""
+      },
+      "sources": {
+        "source": {
+          "plugin": "null",
+          "on_success": "result",
+          "options": {
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [],
+      "edges": [],
+      "outputs": []
+    }
+  },
+  "output": {
+    "success": true,
+    "validation": {
+      "is_valid": true,
+      "errors": [],
+      "warnings": [],
+      "suggestions": [],
+      "semantic_contracts": [],
+      "graph_repair_suggestions": []
+    },
+    "affected_nodes": [
+      "result"
+    ],
+    "version": 3,
+    "validation_delta": {
+      "new_errors": [],
+      "resolved_errors": [
+        {
+          "component": "pipeline",
+          "message": "No sinks configured.",
+          "severity": "high",
+          "error_code": "no_sinks_configured"
+        },
+        {
+          "component": "source",
+          "message": "Source on_success 'result' is neither a sink nor a known connection.",
+          "severity": "high",
+          "error_code": "source_on_success_dangling"
+        }
+      ],
+      "new_warnings": [],
+      "resolved_warnings": [
+        {
+          "component": "source",
+          "message": "Source on_success 'result' does not match any node input or output \u2014 data may not flow.",
+          "severity": "medium"
+        }
+      ]
+    },
+    "applied_component": {
+      "outputs": [
+        {
+          "sink_name": "result",
+          "plugin": "csv",
+          "options": {
+            "path": "output.csv",
+            "schema": {
+              "mode": "observed"
+            },
+            "mode": "write",
+            "collision_policy": "auto_increment"
+          },
+          "on_write_failure": "discard",
+          "description": null
+        }
+      ]
+    },
+    "state": {
+      "version": 3,
+      "metadata": {
+        "name": "Untitled Pipeline",
+        "description": ""
+      },
+      "sources": {
+        "source": {
+          "plugin": "null",
+          "on_success": "result",
+          "options": {
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "result",
+          "plugin": "csv",
+          "options": {
+            "path": "output.csv",
+            "schema": {
+              "mode": "observed"
+            },
+            "mode": "write",
+            "collision_policy": "auto_increment"
+          },
+          "on_write_failure": "discard"
+        }
+      ]
+    }
+  },
+  "preview": {
+    "transport_error": "Tool error: AuditIntegrityError"
+  },
+  "returncode": 0
+}

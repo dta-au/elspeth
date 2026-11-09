@@ -1,0 +1,354 @@
+"""Pipeline configuration validation functions.
+
+These functions validate route configurations at pipeline initialization,
+BEFORE any rows are processed. This catches config errors early instead
+of failing mid-run with cryptic errors.
+
+Validations performed:
+- Gate route destinations reference existing sinks
+- Transform on_error destinations reference existing sinks
+- Source quarantine destinations reference existing sinks
+
+IMPORTANT: Import Cycle Prevention
+----------------------------------
+This module imports RouteValidationError from types.py (a leaf module).
+It imports protocols at runtime because isinstance() checks require them.
+Other imports use TYPE_CHECKING to avoid cycles.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
+
+# Import GateName at runtime - used in function body, not just type hints
+from elspeth.contracts import RouteDestination, RouteDestinationKind
+from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.sink import FAILSINK_ELIGIBLE_SINK_PLUGINS, format_sink_plugin_names
+from elspeth.contracts.types import GateName
+from elspeth.engine.orchestrator.types import RouteValidationError
+
+if TYPE_CHECKING:
+    from elspeth.contracts import SourceProtocol
+    from elspeth.contracts.types import NodeID
+    from elspeth.core.config import AggregationSettings, GateSettings
+    from elspeth.engine.orchestrator.plugin_types import RowPlugin
+    from elspeth.engine.orchestrator.types import PipelineConfig
+
+
+def validate_route_destinations(
+    route_resolution_map: Mapping[tuple[NodeID, str], RouteDestination],
+    available_sinks: set[str],
+    config_gate_id_map: Mapping[GateName, NodeID] | None = None,
+    config_gates: Sequence[GateSettings] | None = None,
+) -> None:
+    """Validate all route destinations reference existing sinks.
+
+    Called at pipeline initialization, BEFORE any rows are processed.
+    This catches config errors early instead of failing mid-run.
+
+    Args:
+        route_resolution_map: Maps (gate_node_id, route_label) -> resolved destination
+        available_sinks: Set of sink names from PipelineConfig
+        config_gate_id_map: Maps config gate name -> node_id
+        config_gates: List of config gate settings
+
+    Raises:
+        RouteValidationError: If any route references a non-existent sink
+    """
+    # Build reverse lookup: node_id -> gate name
+    # All gates in config_gates MUST have entries in their ID maps
+    # (graph construction bug if missing)
+    node_id_to_gate_name: dict[str, str] = {}
+
+    # Add config gates to the lookup
+    if config_gate_id_map and config_gates:
+        for gate_config in config_gates:
+            # Graph must have ID for every config gate - crash if missing
+            node_id = config_gate_id_map[GateName(gate_config.name)]
+            node_id_to_gate_name[node_id] = gate_config.name
+
+    # Check each route destination
+    for (gate_node_id, route_label), destination in route_resolution_map.items():
+        if destination.kind in (
+            RouteDestinationKind.CONTINUE,
+            RouteDestinationKind.FORK,
+            RouteDestinationKind.PROCESSING_NODE,
+            RouteDestinationKind.DISCARD,
+        ):
+            continue
+
+        if destination.sink_name is None:
+            raise OrchestrationInvariantError(
+                f"Route destination for gate_node_id={gate_node_id!r}, route_label={route_label!r} has kind='sink' but sink_name is None"
+            )
+
+        # destination should be a sink name
+        if destination.sink_name not in available_sinks:
+            # Every gate in route_resolution_map MUST have a name mapping
+            gate_name = node_id_to_gate_name[gate_node_id]
+            raise RouteValidationError(
+                f"Gate '{gate_name}' can route to '{destination.sink_name}' "
+                f"(via route label '{route_label}') but no sink named "
+                f"'{destination.sink_name}' exists. Available sinks: {sorted(available_sinks)}"
+            )
+
+
+def validate_pipeline_route_targets(
+    *,
+    config: PipelineConfig,
+    route_resolution_map: Mapping[tuple[NodeID, str], RouteDestination],
+    config_gate_id_map: Mapping[GateName, NodeID],
+    closer_names: frozenset[str] = frozenset(),
+) -> None:
+    """Run the full route-target preflight bundle for a pipeline config.
+
+    ``closer_names`` (spec §7 rule 9, WS3 Task 9b): legal ``on_error``
+    targets beyond a sink name — the error-routable closer names (coalesce,
+    row_union and, since the integration item-18 parity sweep, collector)
+    the graph's own builder already accepted (``ExecutionGraph.
+    get_error_routable_closer_names()``). The BUILDER is the
+    in-region/out-of-region validity authority (``core/dag/builder.py``'s
+    rule-9 resolution runs at graph construction, before this ever sees the
+    config): a closer name reaching this validator implies the builder
+    already accepted it, so this only needs to widen the "is this a legal
+    non-sink destination" membership test — it must NEVER re-derive region
+    membership.
+    """
+
+    available_sinks = set(config.sinks.keys())
+    validate_route_destinations(
+        route_resolution_map=route_resolution_map,
+        available_sinks=available_sinks,
+        config_gate_id_map=config_gate_id_map,
+        config_gates=config.gates,
+    )
+    validate_transform_error_sinks(
+        transforms=config.transforms,
+        available_sinks=available_sinks,
+        closer_names=closer_names,
+    )
+    validate_gate_error_sinks(
+        gates=config.gates,
+        available_sinks=available_sinks,
+        closer_names=closer_names,
+    )
+    validate_aggregation_error_sinks(
+        aggregation_settings=config.aggregation_settings,
+        available_sinks=available_sinks,
+    )
+    for source in config.sources.values():
+        validate_source_quarantine_destination(
+            source=source,
+            available_sinks=available_sinks,
+        )
+    sink_validation_stubs = {name: SimpleNamespace(on_write_failure=sink._on_write_failure) for name, sink in config.sinks.items()}
+    sink_plugins = {name: sink.name for name, sink in config.sinks.items()}
+    validate_sink_failsink_destinations(
+        sink_configs=sink_validation_stubs,
+        available_sinks=available_sinks,
+        sink_plugins=sink_plugins,
+    )
+
+
+def validate_transform_error_sinks(
+    transforms: Sequence[RowPlugin],
+    available_sinks: set[str],
+    closer_names: frozenset[str] = frozenset(),
+) -> None:
+    """Validate all transform on_error destinations reference an existing
+    sink OR a legal rule-9 closer.
+
+    Called at pipeline initialization, BEFORE any rows are processed.
+    This catches config errors early instead of failing mid-run with KeyError.
+
+    Args:
+        transforms: List of transform plugins
+        available_sinks: Set of sink names from PipelineConfig
+        closer_names: Error-routable closer names (coalesce, row_union,
+            collector) the builder already accepted as this transform's own
+            enclosing-region target (spec
+            §7 rule 9, WS3 Task 9b) — see
+            ``validate_pipeline_route_targets``'s docstring for why this
+            widens membership only, never re-derives region validity.
+
+    Raises:
+        RouteValidationError: If any transform on_error references neither
+            an existing sink nor a known closer.
+    """
+    for transform in transforms:
+        on_error = transform.on_error
+        # on_error is always set (required by TransformSettings) — Tier 1 invariant
+        if on_error is None:
+            raise OrchestrationInvariantError(
+                f"Transform '{transform.name}' has on_error=None — this should be impossible since TransformSettings requires on_error"
+            )
+
+        if on_error == "discard":
+            # "discard" is a special value, not a sink name
+            continue
+
+        if on_error in closer_names:
+            continue
+
+        # on_error should reference an existing sink
+        if on_error not in available_sinks:
+            raise RouteValidationError(
+                f"Transform '{transform.name}' has on_error='{on_error}' "
+                f"but no sink named '{on_error}' exists. "
+                f"Available sinks: {sorted(available_sinks)}. "
+                f"Use 'discard' to drop error rows without routing."
+            )
+
+
+def validate_gate_error_sinks(
+    gates: Sequence[GateSettings],
+    available_sinks: set[str],
+    closer_names: frozenset[str] = frozenset(),
+) -> None:
+    """Validate optional config-gate row-error destinations reference an
+    existing sink OR a legal rule-9 closer (see ``validate_transform_error_sinks``)."""
+    for gate in gates:
+        on_error = gate.on_error
+        if on_error is None or on_error == "discard":
+            continue
+        if on_error in closer_names:
+            continue
+        if on_error not in available_sinks:
+            raise RouteValidationError(
+                f"Gate '{gate.name}' has on_error='{on_error}' "
+                f"but no sink named '{on_error}' exists. "
+                f"Available sinks: {sorted(available_sinks)}. "
+                "Use 'discard' to drop gate-error rows or omit on_error to fail fast."
+            )
+
+
+def validate_aggregation_error_sinks(
+    aggregation_settings: Mapping[str, AggregationSettings],
+    available_sinks: set[str],
+) -> None:
+    """Validate aggregation on_error destinations reference existing sinks.
+
+    The DAG builder is the first wall: it refuses an unknown aggregation
+    on_error sink while it wires the ``__error_<name>__`` DIVERT edge
+    (elspeth-d2e3f29d10). This is the second wall at pipeline initialization,
+    for a PipelineConfig whose aggregation settings reach the orchestrator
+    without that graph — mirroring the transform/gate checks
+    (elspeth-eb4127fb49).
+    """
+    for settings in aggregation_settings.values():
+        on_error = settings.on_error
+        if on_error == "discard":
+            continue
+        if on_error not in available_sinks:
+            raise RouteValidationError(
+                f"Aggregation '{settings.name}' has on_error='{on_error}' "
+                f"but no sink named '{on_error}' exists. "
+                f"Available sinks: {sorted(available_sinks)}. "
+                f"Use 'discard' to drop failed batches without routing."
+            )
+
+
+def validate_source_quarantine_destination(
+    source: SourceProtocol,
+    available_sinks: set[str],
+) -> None:
+    """Validate source quarantine destination references an existing sink.
+
+    Called at pipeline initialization, BEFORE any rows are processed.
+    This catches config errors early instead of silently dropping quarantined
+    rows at runtime.
+
+    Args:
+        source: Source plugin instance
+        available_sinks: Set of sink names from PipelineConfig
+
+    Raises:
+        RouteValidationError: If source on_validation_failure references
+            a non-existent sink
+    """
+    # _on_validation_failure is required by SourceProtocol
+    on_validation_failure = source._on_validation_failure
+
+    if on_validation_failure == "discard":
+        # "discard" is a special value, not a sink name
+        return
+
+    # on_validation_failure should reference an existing sink
+    if on_validation_failure not in available_sinks:
+        raise RouteValidationError(
+            f"Source '{source.name}' has on_validation_failure='{on_validation_failure}' "
+            f"but no sink named '{on_validation_failure}' exists. "
+            f"Available sinks: {sorted(available_sinks)}. "
+            f"Use 'discard' to drop invalid rows without routing."
+        )
+
+
+def validate_sink_failsink_destinations(
+    sink_configs: Mapping[str, Any],
+    available_sinks: set[str],
+    sink_plugins: Mapping[str, str],
+    allowed_failsink_plugins: frozenset[str] = FAILSINK_ELIGIBLE_SINK_PLUGINS,
+) -> None:
+    """Validate all sink on_write_failure destinations.
+
+    Called at pipeline initialization, before any rows are processed.
+    Parallel to validate_transform_error_sinks() for transform on_error.
+
+    Rules:
+    1. 'discard' is always valid
+    2. Sink name must exist in available_sinks
+    3. Sink cannot reference itself
+    4. Target sink must use a failsink-capable plugin type
+    5. Target sink must have on_write_failure='discard' (no chains)
+
+    Args:
+        sink_configs: Dict of sink_name -> config object with on_write_failure attr.
+        available_sinks: Set of all sink names in the pipeline.
+        sink_plugins: Dict of sink_name -> plugin type name (e.g., "csv", "chroma_sink").
+        allowed_failsink_plugins: Set of plugin types allowed as failsinks.
+
+    Raises:
+        RouteValidationError: If any sink's on_write_failure is invalid.
+    """
+    for sink_name, config in sink_configs.items():
+        dest = config.on_write_failure
+        if dest is None:
+            raise OrchestrationInvariantError(
+                f"Sink '{sink_name}' has _on_write_failure=None — injection was skipped. This is a framework bug."
+            )
+        if dest == "discard":
+            continue
+
+        # Rule 2: must exist
+        if dest not in available_sinks:
+            raise RouteValidationError(
+                f"Sink '{sink_name}' on_write_failure references unknown sink '{dest}'. Available sinks: {sorted(available_sinks)}."
+            )
+
+        # Rule 3: no self-reference
+        if dest == sink_name:
+            raise RouteValidationError(f"Sink '{sink_name}' on_write_failure references itself. A sink cannot be its own failsink.")
+
+        # Rule 4: must use a failsink-capable plugin.
+        # Direct access — Rule 2 guarantees dest exists in available_sinks,
+        # so it must also exist in sink_plugins. If the maps are inconsistent,
+        # the KeyError crashes through as a framework bug.
+        plugin_type = sink_plugins[dest]
+        if plugin_type not in allowed_failsink_plugins:
+            allowed_text = format_sink_plugin_names(allowed_failsink_plugins)
+            raise RouteValidationError(
+                f"Sink '{sink_name}' on_write_failure references '{dest}' "
+                f"(plugin='{plugin_type}'), but failsinks must use {allowed_text} plugins."
+            )
+
+        # Rule 5: no chains — target must use 'discard'
+        if dest in sink_configs:
+            target_dest = sink_configs[dest].on_write_failure
+            if target_dest != "discard":
+                raise RouteValidationError(
+                    f"Sink '{sink_name}' on_write_failure references '{dest}', "
+                    f"but '{dest}' has on_write_failure='{target_dest}'. "
+                    f"Failsink targets must have on_write_failure='discard' (no chains)."
+                )

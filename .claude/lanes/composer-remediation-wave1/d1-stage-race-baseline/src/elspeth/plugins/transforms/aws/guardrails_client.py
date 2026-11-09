@@ -1,0 +1,826 @@
+"""Strict, audited wrapper for Bedrock Runtime ApplyGuardrail."""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import re
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Literal, Protocol, cast
+
+import structlog
+
+import elspeth.contracts.errors as contract_errors
+from elspeth.contracts import CallStatus, CallType, RunMode
+from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.call_mode import CallModeSession, ReplayCallEvidence
+from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.events import ExternalCallCompleted
+from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.core.canonical import stable_hash
+from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
+from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient, require_replay_fields
+
+if TYPE_CHECKING:
+    from elspeth.contracts.audit_protocols import CallRecorder
+
+logger = structlog.get_logger(__name__)
+
+GuardrailSource = Literal["INPUT", "OUTPUT"]
+
+PROMPT_ATTACK_FILTERS: tuple[str, ...] = ("PROMPT_ATTACK",)
+HARMFUL_CONTENT_FILTERS: tuple[str, ...] = ("INSULTS", "HATE", "SEXUAL", "VIOLENCE", "MISCONDUCT")
+ALLOWED_FILTERS = frozenset((*PROMPT_ATTACK_FILTERS, *HARMFUL_CONTENT_FILTERS))
+
+ALL_USAGE_KEYS: frozenset[str] = frozenset(
+    {
+        "automatedReasoningPolicies",
+        "automatedReasoningPolicyUnits",
+        "contentPolicyImageUnits",
+        "contentPolicyUnits",
+        "contextualGroundingPolicyUnits",
+        "sensitiveInformationPolicyFreeUnits",
+        "sensitiveInformationPolicyUnits",
+        "topicPolicyUnits",
+        "wordPolicyUnits",
+    }
+)
+_REQUIRED_USAGE_KEYS = frozenset(
+    {
+        "contentPolicyUnits",
+        "contextualGroundingPolicyUnits",
+        "sensitiveInformationPolicyFreeUnits",
+        "sensitiveInformationPolicyUnits",
+        "topicPolicyUnits",
+        "wordPolicyUnits",
+    }
+)
+_FILTER_ACTIONS = frozenset({"NONE", "BLOCKED"})
+_FILTER_CONFIDENCE = frozenset({"NONE", "LOW", "MEDIUM", "HIGH"})
+_MAX_USAGE_UNITS = 2**31 - 1
+_MAX_OUTPUTS = 8
+_MAX_OUTPUT_TEXT = 4096
+_MAX_REQUEST_TEXT = 1_000_000
+_MAX_ACTION_REASON = 4096
+_MAX_LONG = 2**63 - 1
+_APPLIED_GUARDRAIL_ID = re.compile(r"[a-z0-9]+\Z")
+_APPLIED_GUARDRAIL_VERSION = re.compile(r"(?:[1-9][0-9]{0,7}|DRAFT)\Z")
+_APPLIED_GUARDRAIL_ARN = re.compile(r"arn:aws(?:-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:guardrail/[a-z0-9]+\Z")
+_GUARDRAIL_ORIGINS = frozenset({"REQUEST", "ACCOUNT_ENFORCED", "ORGANIZATION_ENFORCED"})
+_GUARDRAIL_OWNERSHIP = frozenset({"SELF", "CROSS_ACCOUNT"})
+
+
+class GuardrailResponseError(ValueError):
+    """Raised when provider data cannot prove a safe or blocked decision."""
+
+    def __init__(self, message: str = "malformed Bedrock Guardrail response") -> None:
+        super().__init__(message)
+
+
+class GuardrailPartialCoverageError(GuardrailResponseError):
+    """Raised when the guardrail scanned only part of the input (guarded != total).
+
+    Fail-closed but distinctly classified (operator decision 2026-07-17):
+    oversized inputs exceed the guardrail's per-request text-unit capacity
+    and must be recognizable as the coverage gate, not a malformed response.
+    Carried values are ELSPETH-validated integers and the closed coverage-key
+    vocabulary — never provider text.
+    """
+
+    def __init__(self, *, coverage_key: str, guarded: int, total: int) -> None:
+        super().__init__(f"partial Bedrock Guardrail coverage: {guarded}/{total} {coverage_key} units scanned")
+        self.coverage_key = coverage_key
+        self.guarded = guarded
+        self.total = total
+
+
+class GuardrailServiceError(RuntimeError):
+    """Sanitized terminal SDK failure."""
+
+    def __init__(self, *, retryable: bool) -> None:
+        super().__init__("Bedrock Guardrail request failed")
+        self.retryable = retryable
+
+
+@dataclass(frozen=True, slots=True)
+class GuardrailUsage:
+    units: tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class GuardrailDecision:
+    detected: bool
+    intervened: bool
+    matched_filters: tuple[str, ...]
+    usage: GuardrailUsage
+    request_id: str | None
+
+
+class BedrockRuntimeClient(Protocol):
+    """SDK operations ELSPETH owns at the Bedrock Runtime boundary."""
+
+    def apply_guardrail(
+        self,
+        *,
+        guardrailIdentifier: str,
+        guardrailVersion: str,
+        source: GuardrailSource,
+        outputScope: str,
+        content: list[dict[str, object]],
+    ) -> object: ...
+
+    def close(self) -> None: ...
+
+
+@trust_boundary(
+    tier=3,
+    source="botocore Bedrock Runtime ApplyGuardrail response envelope (externally derived)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises GuardrailResponseError unless value is a Mapping whose every key is a str; never coerces or defaults",
+    test_ref="tests/unit/plugins/transforms/aws/test_guardrails_client.py::test_mapping_boundary_rejects_non_mapping_and_non_string_keys",
+    test_fingerprint="2ae82b3a6c1d85014449420bc9fbe40c2e624cf2775e1c44daa45c6258a8c01b",
+)
+def _mapping(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or not all(type(key) is str for key in value):
+        raise GuardrailResponseError
+    return value
+
+
+def _list(value: object, *, exact: int | None = None, minimum: int = 0, maximum: int) -> Sequence[object]:
+    if type(value) is not list:
+        raise GuardrailResponseError
+    if exact is not None and len(value) != exact:
+        raise GuardrailResponseError
+    if not minimum <= len(value) <= maximum:
+        raise GuardrailResponseError
+    return value
+
+
+def _parse_usage(value: object) -> GuardrailUsage:
+    usage = _mapping(value)
+    keys = frozenset(usage)
+    if not keys >= _REQUIRED_USAGE_KEYS or not keys <= ALL_USAGE_KEYS:
+        raise GuardrailResponseError
+    units: list[tuple[str, int]] = []
+    for key, item in usage.items():
+        if type(item) is not int or not 0 <= item <= _MAX_USAGE_UNITS:
+            raise GuardrailResponseError
+        units.append((key, item))
+    return GuardrailUsage(tuple(sorted(units)))
+
+
+def _parse_retry_attempts(value: object) -> int:
+    if value is None:
+        return 1
+    metadata = _mapping(value)
+    retry_count: object = 0
+    if "RetryAttempts" in metadata:
+        retry_count = metadata["RetryAttempts"]
+    if type(retry_count) is not int or not 0 <= retry_count <= 10:
+        raise GuardrailResponseError
+    return retry_count + 1
+
+
+def _parse_request_metadata(value: object) -> tuple[str | None, int]:
+    attempts = _parse_retry_attempts(value)
+    if value is None:
+        return None, attempts
+    metadata = _mapping(value)
+    request_id: object = None
+    if "RequestId" in metadata:
+        request_id = metadata["RequestId"]
+    if request_id is not None and (type(request_id) is not str or not 1 <= len(request_id) <= 256):
+        raise GuardrailResponseError
+    return request_id, attempts
+
+
+def _validate_coverage(value: object) -> None:
+    coverage = _mapping(value)
+    if not set(coverage) <= {"textCharacters", "images"}:
+        raise GuardrailResponseError
+    for coverage_key, raw_counts in coverage.items():
+        counts = _mapping(raw_counts)
+        if set(counts) != {"guarded", "total"}:
+            raise GuardrailResponseError
+        guarded = counts["guarded"]
+        total = counts["total"]
+        if type(guarded) is not int or not 0 <= guarded <= _MAX_USAGE_UNITS:
+            raise GuardrailResponseError
+        if type(total) is not int or not 0 <= total <= _MAX_USAGE_UNITS:
+            raise GuardrailResponseError
+        if guarded != total:
+            raise GuardrailPartialCoverageError(coverage_key=coverage_key, guarded=guarded, total=total)
+
+
+def _validate_invocation_metrics(value: object) -> None:
+    metrics = _mapping(value)
+    if not set(metrics) <= {"guardrailProcessingLatency", "usage", "guardrailCoverage"}:
+        raise GuardrailResponseError
+    if "guardrailProcessingLatency" in metrics:
+        latency = metrics["guardrailProcessingLatency"]
+        if type(latency) is not int or not 0 <= latency <= _MAX_LONG:
+            raise GuardrailResponseError
+    if "usage" in metrics:
+        _parse_usage(metrics["usage"])
+    if "guardrailCoverage" in metrics:
+        _validate_coverage(metrics["guardrailCoverage"])
+
+
+def _validate_applied_guardrail_details(value: object) -> None:
+    details = _mapping(value)
+    allowed = {"guardrailId", "guardrailVersion", "guardrailArn", "guardrailOrigin", "guardrailOwnership"}
+    if not set(details) <= allowed:
+        raise GuardrailResponseError
+
+    guardrail_id: object = None
+    if "guardrailId" in details:
+        guardrail_id = details["guardrailId"]
+    if guardrail_id is not None and (
+        type(guardrail_id) is not str
+        or len(guardrail_id) > 2048
+        or (guardrail_id != "" and _APPLIED_GUARDRAIL_ID.fullmatch(guardrail_id) is None)
+    ):
+        raise GuardrailResponseError
+    version: object = None
+    if "guardrailVersion" in details:
+        version = details["guardrailVersion"]
+    if version is not None and (type(version) is not str or (version != "" and _APPLIED_GUARDRAIL_VERSION.fullmatch(version) is None)):
+        raise GuardrailResponseError
+    arn: object = None
+    if "guardrailArn" in details:
+        arn = details["guardrailArn"]
+    if arn is not None and (type(arn) is not str or len(arn) > 2048 or _APPLIED_GUARDRAIL_ARN.fullmatch(arn) is None):
+        raise GuardrailResponseError
+    origins: object = None
+    if "guardrailOrigin" in details:
+        origins = details["guardrailOrigin"]
+    if origins is not None:
+        raw_origins = _list(origins, minimum=0, maximum=len(_GUARDRAIL_ORIGINS))
+        if any(type(origin) is not str or origin not in _GUARDRAIL_ORIGINS for origin in raw_origins):
+            raise GuardrailResponseError
+        if len(set(raw_origins)) != len(raw_origins):
+            raise GuardrailResponseError
+    ownership: object = None
+    if "guardrailOwnership" in details:
+        ownership = details["guardrailOwnership"]
+    if ownership is not None and (type(ownership) is not str or ownership not in _GUARDRAIL_OWNERSHIP):
+        raise GuardrailResponseError
+
+
+def _validate_outputs(value: object, *, intervened: bool) -> None:
+    outputs = _list(value, minimum=1 if intervened else 0, maximum=_MAX_OUTPUTS if intervened else 0)
+    for raw_output in outputs:
+        output = _mapping(raw_output)
+        if set(output) != {"text"}:
+            raise GuardrailResponseError
+        text = output["text"]
+        if type(text) is not str or len(text) > _MAX_OUTPUT_TEXT:
+            raise GuardrailResponseError
+        # Validate and discard immediately. Provider-authored canned text is
+        # intentionally never copied into a decision, audit, telemetry, or row.
+
+
+def parse_guardrail_response(
+    response: object,
+    *,
+    required_filters: tuple[str, ...],
+) -> tuple[GuardrailDecision, int]:
+    """Validate one FULL ApplyGuardrail response without retaining provider text."""
+    if required_filters not in (PROMPT_ATTACK_FILTERS, HARMFUL_CONTENT_FILTERS):
+        raise ValueError("required_filters must name a supported closed policy")
+    root = _mapping(response)
+    allowed_root = {
+        "usage",
+        "action",
+        "actionReason",
+        "outputs",
+        "assessments",
+        "guardrailCoverage",
+        "ResponseMetadata",
+    }
+    if not {"usage", "action", "outputs", "assessments"} <= set(root) or set(root) - allowed_root:
+        raise GuardrailResponseError
+
+    action = root["action"]
+    if action not in ("NONE", "GUARDRAIL_INTERVENED"):
+        raise GuardrailResponseError
+    action_reason: object = None
+    if "actionReason" in root:
+        action_reason = root["actionReason"]
+    if action_reason is not None and (type(action_reason) is not str or len(action_reason) > _MAX_ACTION_REASON):
+        raise GuardrailResponseError
+    if "guardrailCoverage" in root:
+        _validate_coverage(root["guardrailCoverage"])
+    assessments = _list(root["assessments"], exact=1, maximum=1)
+    assessment = _mapping(assessments[0])
+    if "contentPolicy" not in assessment or set(assessment) - {"contentPolicy", "invocationMetrics", "appliedGuardrailDetails"}:
+        raise GuardrailResponseError
+    if "invocationMetrics" in assessment:
+        _validate_invocation_metrics(assessment["invocationMetrics"])
+    if "appliedGuardrailDetails" in assessment:
+        _validate_applied_guardrail_details(assessment["appliedGuardrailDetails"])
+    content_policy = _mapping(assessment["contentPolicy"])
+    if set(content_policy) != {"filters"}:
+        raise GuardrailResponseError
+    filters = _list(content_policy["filters"], minimum=1, maximum=len(ALLOWED_FILTERS))
+
+    seen: set[str] = set()
+    matched: list[str] = []
+    blocked: set[str] = set()
+    for raw_filter in filters:
+        item = _mapping(raw_filter)
+        if not {"type", "confidence", "action", "detected"} <= set(item):
+            raise GuardrailResponseError
+        if set(item) - {"type", "confidence", "filterStrength", "action", "detected"}:
+            raise GuardrailResponseError
+        filter_type = item["type"]
+        confidence = item["confidence"]
+        filter_action = item["action"]
+        detected = item["detected"]
+        if type(filter_type) is not str or filter_type not in ALLOWED_FILTERS or filter_type in seen:
+            raise GuardrailResponseError
+        if confidence not in _FILTER_CONFIDENCE or filter_action not in _FILTER_ACTIONS or type(detected) is not bool:
+            raise GuardrailResponseError
+        strength: object = None
+        if "filterStrength" in item:
+            strength = item["filterStrength"]
+        if strength is not None and strength not in _FILTER_CONFIDENCE:
+            raise GuardrailResponseError
+        if filter_action == "BLOCKED" and not detected:
+            raise GuardrailResponseError
+        seen.add(filter_type)
+        if detected:
+            matched.append(filter_type)
+        if filter_action == "BLOCKED":
+            blocked.add(filter_type)
+
+    if seen != set(required_filters):
+        raise GuardrailResponseError
+    intervened = action == "GUARDRAIL_INTERVENED"
+    detected_any = bool(matched)
+    if intervened:
+        if not detected_any or not blocked or not blocked <= set(matched):
+            raise GuardrailResponseError
+    elif blocked:
+        raise GuardrailResponseError
+    _validate_outputs(root["outputs"], intervened=intervened)
+    usage = _parse_usage(root["usage"])
+    response_metadata: object = None
+    if "ResponseMetadata" in root:
+        response_metadata = root["ResponseMetadata"]
+    request_id, attempts = _parse_request_metadata(response_metadata)
+    return (
+        GuardrailDecision(
+            detected=detected_any,
+            intervened=intervened,
+            matched_filters=tuple(sorted(matched)),
+            usage=usage,
+            request_id=request_id,
+        ),
+        attempts,
+    )
+
+
+@trust_boundary(
+    tier=3,
+    source="botocore exception raised by a Bedrock Runtime ApplyGuardrail call (externally derived)",
+    source_param="error",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns a (retryable, attempts) pair for every botocore exception; an unrecognised exception class or a "
+        "malformed error envelope classifies as non-retryable with the observed attempt count and never raises"
+    ),
+    non_raising=True,
+)
+def _provider_error(error: Exception) -> tuple[bool, int]:
+    """Classify one botocore exception into (retryable, attempts).
+
+    The exception's ``response`` envelope is vendor data: every member is read
+    once, bounded, and re-asserted before it becomes part of the audit record.
+    """
+    from botocore.exceptions import ClientError, ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError
+
+    if isinstance(error, (ConnectTimeoutError, ConnectionClosedError, EndpointConnectionError, ReadTimeoutError)):
+        return True, 1
+    if not isinstance(error, ClientError):
+        return False, 1
+    attempts = 1
+    response_metadata = error.response.get("ResponseMetadata")
+    if isinstance(response_metadata, Mapping):
+        raw_retries = response_metadata.get("RetryAttempts", 0)
+        if type(raw_retries) is int and 0 <= raw_retries <= 10:
+            attempts = raw_retries + 1
+    error_data = error.response.get("Error")
+    if not isinstance(error_data, Mapping):
+        return False, attempts
+    code = error_data.get("Code")
+    if type(code) is not str:
+        return False, attempts
+    retryable = code in {
+        "InternalServerException",
+        "ServiceUnavailableException",
+        "ThrottlingException",
+        "TooManyRequestsException",
+    }
+    return retryable, attempts
+
+
+class BedrockGuardrailsClient(AuditedClientBase):
+    """Single-retry-owner ApplyGuardrail client with audit-first telemetry."""
+
+    def __init__(
+        self,
+        execution: CallRecorder,
+        state_id: str,
+        run_id: str,
+        telemetry_emit: TelemetryEmitCallback,
+        *,
+        guardrail_identifier: str,
+        guardrail_version: str,
+        region: str,
+        audit_salt: bytes,
+        source_audit_salt: bytes | None = None,
+        sdk_client: BedrockRuntimeClient | None = None,
+        token_id: str | None = None,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
+        call_mode_session: CallModeSession | None = None,
+    ) -> None:
+        super().__init__(execution, state_id, run_id, telemetry_emit, token_id=token_id, member_token=member_token, work_item=work_item)
+        if len(audit_salt) < 16:
+            raise ValueError("audit_salt must contain at least 16 bytes")
+        self._guardrail_identifier = guardrail_identifier
+        self._guardrail_version = guardrail_version
+        self._region = region
+        self._target_fingerprint = hmac.new(
+            audit_salt,
+            f"{guardrail_identifier}\0{guardrail_version}\0{region}".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        self._source_target_fingerprint = (
+            None
+            if source_audit_salt is None
+            else hmac.new(
+                source_audit_salt,
+                f"{guardrail_identifier}\0{guardrail_version}\0{region}".encode(),
+                hashlib.sha256,
+            ).hexdigest()
+        )
+        self._call_mode_session = call_mode_session
+        if call_mode_session is not None and self._source_target_fingerprint is None:
+            raise ValueError("source_audit_salt is required for Guardrail replay/verify matching")
+        if call_mode_session is not None and call_mode_session.mode is RunMode.REPLAY and sdk_client is None:
+            raise AuditIntegrityError("Guardrail replay requires the fail-closed SDK stand-in")
+        if sdk_client is not None:
+            self._sdk_client = sdk_client
+        elif call_mode_session is not None and call_mode_session.mode is RunMode.VERIFY:
+            self._sdk_client = DeferredAWSClient(self._build_sdk_client)
+        else:
+            self._sdk_client = self._build_sdk_client()
+
+    def _record_mode_outcome(
+        self,
+        *,
+        call_index: int,
+        request_payload: RawCallPayload,
+        lookup_request: RawCallPayload,
+        response_payload: RawCallPayload,
+        error_payload: RawCallPayload | None,
+        status: CallStatus,
+        latency_ms: float,
+        replay_evidence: ReplayCallEvidence | None = None,
+    ) -> None:
+        call = self._record_call(
+            call_index=call_index,
+            call_type=CallType.HTTP,
+            status=status,
+            request_data=request_payload,
+            response_data=response_payload,
+            error=error_payload,
+            latency_ms=latency_ms,
+            source_call_id=None if replay_evidence is None else replay_evidence.source_call_id,
+        )
+        session = self._call_mode_session
+        if session is not None and session.mode is RunMode.VERIFY:
+            session.verify_call(
+                call_type=CallType.HTTP,
+                request_data=lookup_request.to_dict(),
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+                current_call_id=call.call_id,
+                live_status=status,
+                live_response_data=response_payload.to_dict(),
+                live_error_data=None if error_payload is None else error_payload.to_dict(),
+            )
+
+    @property
+    def sdk_client(self) -> BedrockRuntimeClient:
+        return self._sdk_client
+
+    def _build_sdk_client(self) -> BedrockRuntimeClient:
+        return build_bedrock_runtime_client(self._region)
+
+    def _emit_after_audit(
+        self,
+        *,
+        status: CallStatus,
+        latency_ms: float,
+        request_payload: RawCallPayload,
+        response_payload: RawCallPayload,
+    ) -> None:
+        try:
+            self._telemetry_emit(
+                ExternalCallCompleted(
+                    timestamp=datetime.now(UTC),
+                    run_id=self._run_id,
+                    call_type=CallType.HTTP,
+                    provider="aws-bedrock-guardrails",
+                    status=status,
+                    latency_ms=latency_ms,
+                    state_id=self._telemetry_state_id(),
+                    token_id=self._telemetry_token_id(),
+                    request_hash=stable_hash(request_payload.to_dict()),
+                    response_hash=stable_hash(response_payload.to_dict()),
+                    request_payload=request_payload,
+                    response_payload=response_payload,
+                    token_usage=None,
+                )
+            )
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except (TypeError, AttributeError, KeyError, NameError):
+            raise
+        except Exception as error:
+            logger.warning(
+                "telemetry_emit_failed",
+                error_type=type(error).__name__,
+                run_id=self._run_id,
+                state_id=self._telemetry_state_id(),
+                call_type="bedrock_guardrail",
+                exc_info=True,
+            )
+
+    def apply_guardrail(
+        self,
+        *,
+        text: str,
+        source: GuardrailSource,
+        required_filters: tuple[str, ...],
+    ) -> GuardrailDecision:
+        if type(text) is not str or not 1 <= len(text) <= _MAX_REQUEST_TEXT:
+            raise ValueError("guardrail text must be a bounded non-empty string")
+        if source not in ("INPUT", "OUTPUT"):
+            raise ValueError("guardrail source must be INPUT or OUTPUT")
+        if required_filters not in (PROMPT_ATTACK_FILTERS, HARMFUL_CONTENT_FILTERS):
+            raise ValueError("required_filters must name a supported closed policy")
+
+        call_index = self._next_call_index()
+        request_payload = RawCallPayload(
+            {
+                "operation": "apply_guardrail",
+                "target_fingerprint": self._target_fingerprint,
+                "source": source,
+                "required_filters": required_filters,
+            }
+        )
+        # Guardrail text is deliberately absent from the call payload. Source
+        # input compatibility and parent-local call order bind it during
+        # replay/verify. The target HMAC is keyed by the run, so lookup uses
+        # the source run's fingerprint while the new audit uses its own.
+        source_request = request_payload.to_dict()
+        if self._source_target_fingerprint is not None:
+            source_request["target_fingerprint"] = self._source_target_fingerprint
+        lookup_request = RawCallPayload(source_request)
+        session = self._call_mode_session
+        if session is not None and session.mode is RunMode.REPLAY:
+            evidence = session.replay_call(
+                call_type=CallType.HTTP,
+                request_data=lookup_request.to_dict(),
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+            )
+            payload = require_replay_fields(
+                evidence.response_data,
+                fields=("operation", "attempts", "status"),
+                source_call_id=evidence.source_call_id,
+            ).data
+            if payload["operation"] != "apply_guardrail":
+                raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has no complete response")
+            attempts = payload["attempts"]
+            if type(attempts) is not int or not 1 <= attempts <= 11:
+                raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has invalid attempts")
+            replay_error: Exception | None = None
+            decision: GuardrailDecision | None = None
+            if evidence.status is CallStatus.SUCCESS:
+                payload = require_replay_fields(
+                    payload,
+                    fields=("detected", "intervened", "matched_filters", "request_id", "request_id_present", "usage"),
+                    source_call_id=evidence.source_call_id,
+                ).data
+                detected = payload["detected"]
+                intervened = payload["intervened"]
+                filters = payload["matched_filters"]
+                request_id = payload["request_id"]
+                if (
+                    payload["status"] not in ("safe", "blocked")
+                    or type(detected) is not bool
+                    or type(intervened) is not bool
+                    or type(filters) is not tuple
+                    or any(type(item) is not str for item in filters)
+                    or not set(filters) <= set(required_filters)
+                    or len(set(filters)) != len(filters)
+                    or bool(filters) is not detected
+                    or (intervened and not detected)
+                    or (request_id is not None and (type(request_id) is not str or not 1 <= len(request_id) <= 256))
+                    or payload["request_id_present"] is not (request_id is not None)
+                    or payload["status"] != ("blocked" if detected else "safe")
+                    or evidence.error_data is not None
+                ):
+                    raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has incomplete decision")
+                try:
+                    usage = _parse_usage(payload["usage"])
+                except GuardrailResponseError as error:
+                    raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has invalid usage") from error
+                decision = GuardrailDecision(
+                    detected=detected,
+                    intervened=intervened,
+                    matched_filters=tuple(filters),
+                    usage=usage,
+                    request_id=request_id,
+                )
+            elif evidence.status is CallStatus.ERROR:
+                error_data = require_replay_fields(
+                    evidence.error_data,
+                    fields=("type", "retryable"),
+                    source_call_id=evidence.source_call_id,
+                ).data
+                status = payload["status"]
+                if error_data["type"] != status or type(error_data["retryable"]) is not bool:
+                    raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has contradictory error")
+                if status == "partial_coverage" and error_data["retryable"] is False:
+                    payload = require_replay_fields(
+                        payload,
+                        fields=("coverage_key", "guarded_units", "total_units"),
+                        source_call_id=evidence.source_call_id,
+                    ).data
+                    key = payload["coverage_key"]
+                    guarded = payload["guarded_units"]
+                    total = payload["total_units"]
+                    if key in ("textCharacters", "images") and type(guarded) is int and type(total) is int and 0 <= guarded < total:
+                        replay_error = GuardrailPartialCoverageError(coverage_key=key, guarded=guarded, total=total)
+                elif status == "malformed_response" and error_data["retryable"] is False:
+                    replay_error = GuardrailResponseError()
+                elif status == "service_error" and type(error_data["retryable"]) is bool:
+                    replay_error = GuardrailServiceError(retryable=error_data["retryable"])
+                if replay_error is None:
+                    raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has incomplete error")
+            else:
+                raise AuditIntegrityError(f"Guardrail replay call {evidence.source_call_id} has invalid status")
+            response_payload = RawCallPayload(payload)
+            error_payload = None if evidence.error_data is None else RawCallPayload(evidence.error_data)
+            latency_ms = evidence.latency_ms if evidence.latency_ms is not None else 0.0
+            self._record_mode_outcome(
+                call_index=call_index,
+                request_payload=request_payload,
+                lookup_request=lookup_request,
+                response_payload=response_payload,
+                error_payload=error_payload,
+                status=evidence.status,
+                latency_ms=latency_ms,
+                replay_evidence=evidence,
+            )
+            self._emit_after_audit(
+                status=evidence.status,
+                latency_ms=latency_ms,
+                request_payload=request_payload,
+                response_payload=response_payload,
+            )
+            if replay_error is not None:
+                raise replay_error
+            assert decision is not None
+            return decision
+        if session is not None and session.mode is RunMode.VERIFY:
+            session.admit_verify_call(
+                call_type=CallType.HTTP,
+                request_data=lookup_request.to_dict(),
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+            )
+        start = time.perf_counter()
+        terminal_error: Exception | None = None
+        attempts = 1
+        try:
+            response = self._sdk_client.apply_guardrail(
+                guardrailIdentifier=self._guardrail_identifier,
+                guardrailVersion=self._guardrail_version,
+                source=source,
+                outputScope="FULL",
+                content=[{"text": {"text": text, "qualifiers": ["guard_content"]}}],
+            )
+            response_root = _mapping(response)
+            response_metadata: object = None
+            if "ResponseMetadata" in response_root:
+                response_metadata = response_root["ResponseMetadata"]
+            attempts = _parse_retry_attempts(response_metadata)
+            decision, parsed_attempts = parse_guardrail_response(response_root, required_filters=required_filters)
+            if parsed_attempts != attempts:
+                raise GuardrailResponseError
+            response_payload = RawCallPayload(
+                {
+                    "operation": "apply_guardrail",
+                    "status": "blocked" if decision.detected else "safe",
+                    "attempts": attempts,
+                    "detected": decision.detected,
+                    "intervened": decision.intervened,
+                    "matched_filters": decision.matched_filters,
+                    "usage": dict(decision.usage.units),
+                    "request_id": decision.request_id,
+                    "request_id_present": decision.request_id is not None,
+                }
+            )
+            call_status = CallStatus.SUCCESS
+            error_payload = None
+        except GuardrailPartialCoverageError as error:
+            terminal_error = error
+            response_payload = RawCallPayload(
+                {
+                    "operation": "apply_guardrail",
+                    "status": "partial_coverage",
+                    "attempts": attempts,
+                    "coverage_key": error.coverage_key,
+                    "guarded_units": error.guarded,
+                    "total_units": error.total,
+                }
+            )
+            call_status = CallStatus.ERROR
+            error_payload = RawCallPayload({"type": "partial_coverage", "retryable": False})
+            decision = None
+        except GuardrailResponseError as error:
+            terminal_error = error
+            response_payload = RawCallPayload({"operation": "apply_guardrail", "status": "malformed_response", "attempts": attempts})
+            call_status = CallStatus.ERROR
+            error_payload = RawCallPayload({"type": "malformed_response", "retryable": False})
+            decision = None
+        except _bedrock_provider_exception_types() as error:
+            retryable, attempts = _provider_error(error)
+            terminal_error = GuardrailServiceError(retryable=retryable)
+            response_payload = RawCallPayload({"operation": "apply_guardrail", "status": "service_error", "attempts": attempts})
+            call_status = CallStatus.ERROR
+            error_payload = RawCallPayload({"type": "service_error", "retryable": retryable})
+            decision = None
+
+        latency_ms = (time.perf_counter() - start) * 1000
+        self._record_mode_outcome(
+            call_index=call_index,
+            request_payload=request_payload,
+            lookup_request=lookup_request,
+            response_payload=response_payload,
+            error_payload=error_payload,
+            status=call_status,
+            latency_ms=latency_ms,
+        )
+        self._emit_after_audit(
+            status=call_status,
+            latency_ms=latency_ms,
+            request_payload=request_payload,
+            response_payload=response_payload,
+        )
+        if terminal_error is not None:
+            raise terminal_error
+        assert decision is not None
+        return decision
+
+
+def _bedrock_provider_exception_types() -> tuple[type[Exception], ...]:
+    """Declared botocore failures raised by Bedrock Runtime operations."""
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    return (BotoCoreError, ClientError)
+
+
+def build_bedrock_runtime_client(region: str) -> BedrockRuntimeClient:
+    """Build the SDK client with botocore as the sole retry owner."""
+    import boto3
+    from botocore.config import Config
+
+    return cast(
+        "BedrockRuntimeClient",
+        boto3.client(
+            "bedrock-runtime",
+            region_name=region,
+            config=Config(
+                retries={"mode": "standard", "total_max_attempts": 3},
+                connect_timeout=5,
+                read_timeout=15,
+            ),
+        ),
+    )

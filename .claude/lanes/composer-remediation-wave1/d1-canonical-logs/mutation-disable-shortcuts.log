@@ -1,0 +1,406 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 14 items
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py FF.. [ 28%]
+                                                                         [ 28%]
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py FFF.     [ 57%]
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py . [ 64%]
+.FF..                                                                    [100%]
+
+=================================== FAILURES ===================================
+______ test_equal_candidate_only_rejects_after_recovery_integrity[fresh] _______
+
+proposal = _Proposal(service=<elspeth.web.sessions.service.SessionServiceImpl object at 0x7fb45a967a70>, engine=Engine(sqlite:///...1ad29834575f5d94b228c0a4eb88468b4'), root=PosixPath('/tmp/pytest-of-agent/pytest-146/test_equal_candidate_only_reje0'))
+recovery = 'fresh'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("recovery", ["fresh", "matching", "mismatch", "missing_pair"])
+    async def test_equal_candidate_only_rejects_after_recovery_integrity(proposal: _Proposal, recovery: str) -> None:
+        operations = proposal.service.session_operation_authority
+        context = operations.acquire(
+            session_id=proposal.authority.row.session_id,
+            operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=proposal.service.session_operation_owner_instance_id,
+            lease_seconds=300,
+        )
+        try:
+            prepared = await _prepare(proposal, context)
+            current = replace(prepared.result.updated_state, version=19)
+            recorder = BufferingRecorder()
+            binding = prepared.dispatch if recovery != "fresh" else None
+            executor_hash = prepared.executor_content_hash if recovery == "matching" else "0" * 64 if recovery == "mismatch" else None
+            expected_error = AuditIntegrityError if recovery == "missing_pair" else PipelineCommitError
+>           with pytest.raises(expected_error) as caught:
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           Failed: DID NOT RAISE <class 'elspeth.web.composer.pipeline_commit.PipelineCommitError'>
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:230: Failed
+_____ test_equal_candidate_only_rejects_after_recovery_integrity[matching] _____
+
+proposal = _Proposal(service=<elspeth.web.sessions.service.SessionServiceImpl object at 0x7fb459948f50>, engine=Engine(sqlite:///...1ad29834575f5d94b228c0a4eb88468b4'), root=PosixPath('/tmp/pytest-of-agent/pytest-146/test_equal_candidate_only_reje1'))
+recovery = 'matching'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("recovery", ["fresh", "matching", "mismatch", "missing_pair"])
+    async def test_equal_candidate_only_rejects_after_recovery_integrity(proposal: _Proposal, recovery: str) -> None:
+        operations = proposal.service.session_operation_authority
+        context = operations.acquire(
+            session_id=proposal.authority.row.session_id,
+            operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=proposal.service.session_operation_owner_instance_id,
+            lease_seconds=300,
+        )
+        try:
+            prepared = await _prepare(proposal, context)
+            current = replace(prepared.result.updated_state, version=19)
+            recorder = BufferingRecorder()
+            binding = prepared.dispatch if recovery != "fresh" else None
+            executor_hash = prepared.executor_content_hash if recovery == "matching" else "0" * 64 if recovery == "mismatch" else None
+            expected_error = AuditIntegrityError if recovery == "missing_pair" else PipelineCommitError
+            with pytest.raises(expected_error) as caught:
+>               await _prepare(
+                    proposal,
+                    context,
+                    recorder=recorder,
+                    current_state=current,
+                    recovery_dispatch=binding,
+                    recovery_executor_content_hash=executor_hash,
+                )
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:231: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+proposal = _Proposal(service=<elspeth.web.sessions.service.SessionServiceImpl object at 0x7fb459948f50>, engine=Engine(sqlite:///...1ad29834575f5d94b228c0a4eb88468b4'), root=PosixPath('/tmp/pytest-of-agent/pytest-146/test_equal_candidate_only_reje1'))
+context = SessionOperationContext(fence=SessionOperationFence(session_id='7a3f8897-3522-4a91-b25e-0a39370f72ce', operation_id='7...T5Yt0P78RvousUM80BnitjPGOhy1F___rqUMs', operation_epoch=4), operation_kind=<SessionOperationKind.PROPOSAL: 'proposal'>)
+
+    async def _prepare(
+        proposal: _Proposal,
+        context: SessionOperationContext,
+        *,
+        recorder: BufferingRecorder | None = None,
+        current_state: CompositionState | None = None,
+        recovery_dispatch: pipeline_commit.PipelineDispatchAuditBinding | None = None,
+        recovery_executor_content_hash: str | None = None,
+    ) -> PreparedPipelineCommit:
+        result = await prepare_pipeline_proposal_commit(
+            authority=proposal.authority,
+            current_state=current_state
+            if current_state is not None
+            else CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+            current_state_id=None,
+            policy_catalog=proposal.policy,
+            plugin_snapshot=proposal.snapshot,
+            config=PipelineCommitConfig(
+                data_dir=str(proposal.root),
+                session_engine=proposal.engine,
+                session_operation_context=context,
+                session_operation_authority=proposal.service.session_operation_authority,
+                secret_service=None,
+                user_id="alice",
+                user_message_content=None,
+                max_blob_storage_per_session_bytes=1_000_000,
+                runtime_preflight=None,
+                timeout_seconds=5.0,
+            ),
+            recorder=recorder if recorder is not None else BufferingRecorder(),
+            actor="user:alice",
+            recovery_dispatch=recovery_dispatch,
+            recovery_executor_content_hash=recovery_executor_content_hash,
+        )
+>       assert isinstance(result, PreparedPipelineCommit)
+E       AssertionError: assert False
+E        +  where False = isinstance(RecoveredPipelineCommit(result=ToolResult(success=True, updated_state=CompositionState(nodes=(), edges=(), outputs=(Ou...6c0b2a1ec0beb2e47c2f3098a4249028b123', result_hash='6a713e85c94353edc514c9a1523de376ff1b74dfbc19bd76c1642a96f23d2110')), PreparedPipelineCommit)
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:209: AssertionError
+_ test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-explicit_approve-explicit_approve] _
+
+snapshot = 'explicit_approve', live = 'explicit_approve'
+
+    @pytest.mark.parametrize(
+        "snapshot,live", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve")]
+    )
+    async def test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged(snapshot: str, live: str) -> None:
+        state = replace(_empty_state(), version=7)
+>       result, sessions = await _stage(
+            trust_mode=snapshot,
+            live_trust_mode=live,
+            preflight=AssertionError("no new runtime claim"),
+            candidate_state=replace(state, version=8),
+            state=state,
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:265: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:232: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:707: in _stage_pipeline_plan
+    runtime_result = await self._preflight.cached_runtime_preflight(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <AsyncMock spec='method' id='140412488745904'>
+args = (CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(name='Untitled Pipeline', description=''), version=8, sources=mappingproxy({})),)
+kwargs = {'cache': {}, 'initial_version': 7, 'llm_calls': (), 'plugin_snapshot': None, ...}
+_call = call(CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(name='Untitled Pipeline', description=...oken='8b24fad74a33411290f8c202b50a989b', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>))
+effect = AssertionError('no new runtime claim')
+
+    async def _execute_mock_call(self, /, *args, **kwargs):
+        # This is nearly just like super(), except for special handling
+        # of coroutines
+    
+        _call = _Call((args, kwargs), two=True)
+        self.await_count += 1
+        self.await_args = _call
+        self.await_args_list.append(_call)
+    
+        effect = self.side_effect
+        if effect is not None:
+            if _is_exception(effect):
+>               raise effect
+E               AssertionError: no new runtime claim
+
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/mock.py:2291: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 14:09:15 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 14:09:17 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 14:09:17 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-auto_commit-auto_commit] _
+
+snapshot = 'auto_commit', live = 'auto_commit'
+
+    @pytest.mark.parametrize(
+        "snapshot,live", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve")]
+    )
+    async def test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged(snapshot: str, live: str) -> None:
+        state = replace(_empty_state(), version=7)
+>       result, sessions = await _stage(
+            trust_mode=snapshot,
+            live_trust_mode=live,
+            preflight=AssertionError("no new runtime claim"),
+            candidate_state=replace(state, version=8),
+            state=state,
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:265: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:232: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:707: in _stage_pipeline_plan
+    runtime_result = await self._preflight.cached_runtime_preflight(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <AsyncMock spec='method' id='140412484191152'>
+args = (CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(name='Untitled Pipeline', description=''), version=8, sources=mappingproxy({})),)
+kwargs = {'cache': {}, 'initial_version': 7, 'llm_calls': (), 'plugin_snapshot': None, ...}
+_call = call(CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(name='Untitled Pipeline', description=...oken='6adcccb8fabc44d8afffb8e53cef4c8d', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>))
+effect = AssertionError('no new runtime claim')
+
+    async def _execute_mock_call(self, /, *args, **kwargs):
+        # This is nearly just like super(), except for special handling
+        # of coroutines
+    
+        _call = _Call((args, kwargs), two=True)
+        self.await_count += 1
+        self.await_args = _call
+        self.await_args_list.append(_call)
+    
+        effect = self.side_effect
+        if effect is not None:
+            if _is_exception(effect):
+>               raise effect
+E               AssertionError: no new runtime claim
+
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/mock.py:2291: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 14:09:17 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 14:09:17 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 14:09:17 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-auto_commit-explicit_approve] _
+
+snapshot = 'auto_commit', live = 'explicit_approve'
+
+    @pytest.mark.parametrize(
+        "snapshot,live", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve")]
+    )
+    async def test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged(snapshot: str, live: str) -> None:
+        state = replace(_empty_state(), version=7)
+>       result, sessions = await _stage(
+            trust_mode=snapshot,
+            live_trust_mode=live,
+            preflight=AssertionError("no new runtime claim"),
+            candidate_state=replace(state, version=8),
+            state=state,
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:265: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:232: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:707: in _stage_pipeline_plan
+    runtime_result = await self._preflight.cached_runtime_preflight(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <AsyncMock spec='method' id='140412484390256'>
+args = (CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(name='Untitled Pipeline', description=''), version=8, sources=mappingproxy({})),)
+kwargs = {'cache': {}, 'initial_version': 7, 'llm_calls': (), 'plugin_snapshot': None, ...}
+_call = call(CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(name='Untitled Pipeline', description=...oken='38cbe6c26f784c7e9d4cc5db9305a712', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>))
+effect = AssertionError('no new runtime claim')
+
+    async def _execute_mock_call(self, /, *args, **kwargs):
+        # This is nearly just like super(), except for special handling
+        # of coroutines
+    
+        _call = _Call((args, kwargs), two=True)
+        self.await_count += 1
+        self.await_args = _call
+        self.await_args_list.append(_call)
+    
+        effect = self.side_effect
+        if effect is not None:
+            if _is_exception(effect):
+>               raise effect
+E               AssertionError: no new runtime claim
+
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/mock.py:2291: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 14:09:17 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 14:09:17 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 14:09:17 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_identical_canonical_candidate_returns_unchanged_without_proposal[auto_commit-singleton-source] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-146/test_identical_canonical_candi2')
+named_sources = False, trust_mode = 'auto_commit'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("named_sources", (False, True), ids=("singleton-source", "named-source"))
+    @pytest.mark.parametrize("trust_mode", ("explicit_approve", "auto_commit"))
+    async def test_identical_canonical_candidate_returns_unchanged_without_proposal(
+        tmp_path: Path, named_sources: bool, trust_mode: str
+    ) -> None:
+        harness = _harness(tmp_path)
+        await harness.sessions.update_composer_preferences(
+            UUID(harness.session_id), trust_mode=trust_mode, density_default="high", actor="user:proposal-prevalidation-user"
+        )
+        arguments = _valid_pipeline_args(tmp_path)
+        if named_sources:
+            arguments["sources"] = {"orders": arguments.pop("source")}
+        state = CompositionState.from_dict(
+            {
+                **arguments,
+                "version": 7,
+                "metadata": {"description": "", **arguments["metadata"]},
+                "outputs": [{"name": output["sink_name"], **output} for output in arguments["outputs"]],
+            }
+        )
+        llm = _ScriptedLLM(
+            _tool_turn("call_identical", "set_pipeline", arguments),
+            _fake_llm_response(content="The pipeline is unchanged."),
+        )
+        progress_events = []
+    
+        async def record_progress(event: Any) -> None:
+            progress_events.append(event)
+    
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as executor,
+            patch.object(AntiAnchorTracker, "record_failure", autospec=True) as record_failure,
+            patch.object(AntiAnchorTracker, "record_success", autospec=True) as record_success,
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Keep the current pipeline.",
+                [],
+                state,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                user_message_id=harness.user_message_id,
+                progress=record_progress,
+            )
+        assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
+>       assert result.state is state
+E       AssertionError: assert CompositionState(nodes=(), edges=(), outputs=(OutputSpec(name='main', plugin='json', options=mappingproxy({'path': '/t...00001/input.csv', 'schema': mappingproxy({'mode': 'observed'})}), on_validation_failure='discard', description=None)})) is CompositionState(nodes=(), edges=(), outputs=(OutputSpec(name='main', plugin='json', options=mappingproxy({'path': '/t...00001/input.csv', 'schema': mappingproxy({'mode': 'observed'})}), on_validation_failure='discard', description=None)}))
+E        +  where CompositionState(nodes=(), edges=(), outputs=(OutputSpec(name='main', plugin='json', options=mappingproxy({'path': '/t...00001/input.csv', 'schema': mappingproxy({'mode': 'observed'})}), on_validation_failure='discard', description=None)})) = ComposerResult(message='The pipeline is unchanged.\n\n---\n\n[ELSPETH-SYSTEM] Checkpoint save status: Verified checkpo...tches_terminal_model_turn=False, advisor_terminal_publication=None, final_persisted_state_id=None, repair_turns_used=0).state
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1733: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 14:09:18 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 14:09:18 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 14:09:18 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 14:09:18 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_identical_canonical_candidate_returns_unchanged_without_proposal[auto_commit-named-source] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-146/test_identical_canonical_candi3')
+named_sources = True, trust_mode = 'auto_commit'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("named_sources", (False, True), ids=("singleton-source", "named-source"))
+    @pytest.mark.parametrize("trust_mode", ("explicit_approve", "auto_commit"))
+    async def test_identical_canonical_candidate_returns_unchanged_without_proposal(
+        tmp_path: Path, named_sources: bool, trust_mode: str
+    ) -> None:
+        harness = _harness(tmp_path)
+        await harness.sessions.update_composer_preferences(
+            UUID(harness.session_id), trust_mode=trust_mode, density_default="high", actor="user:proposal-prevalidation-user"
+        )
+        arguments = _valid_pipeline_args(tmp_path)
+        if named_sources:
+            arguments["sources"] = {"orders": arguments.pop("source")}
+        state = CompositionState.from_dict(
+            {
+                **arguments,
+                "version": 7,
+                "metadata": {"description": "", **arguments["metadata"]},
+                "outputs": [{"name": output["sink_name"], **output} for output in arguments["outputs"]],
+            }
+        )
+        llm = _ScriptedLLM(
+            _tool_turn("call_identical", "set_pipeline", arguments),
+            _fake_llm_response(content="The pipeline is unchanged."),
+        )
+        progress_events = []
+    
+        async def record_progress(event: Any) -> None:
+            progress_events.append(event)
+    
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as executor,
+            patch.object(AntiAnchorTracker, "record_failure", autospec=True) as record_failure,
+            patch.object(AntiAnchorTracker, "record_success", autospec=True) as record_success,
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Keep the current pipeline.",
+                [],
+                state,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                user_message_id=harness.user_message_id,
+                progress=record_progress,
+            )
+        assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
+>       assert result.state is state
+E       AssertionError: assert CompositionState(nodes=(), edges=(), outputs=(OutputSpec(name='main', plugin='json', options=mappingproxy({'path': '/t...00001/input.csv', 'schema': mappingproxy({'mode': 'observed'})}), on_validation_failure='discard', description=None)})) is CompositionState(nodes=(), edges=(), outputs=(OutputSpec(name='main', plugin='json', options=mappingproxy({'path': '/t...00001/input.csv', 'schema': mappingproxy({'mode': 'observed'})}), on_validation_failure='discard', description=None)}))
+E        +  where CompositionState(nodes=(), edges=(), outputs=(OutputSpec(name='main', plugin='json', options=mappingproxy({'path': '/t...00001/input.csv', 'schema': mappingproxy({'mode': 'observed'})}), on_validation_failure='discard', description=None)})) = ComposerResult(message='The pipeline is unchanged.\n\n---\n\n[ELSPETH-SYSTEM] Checkpoint save status: Verified checkpo...tches_terminal_model_turn=False, advisor_terminal_publication=None, final_persisted_state_id=None, repair_turns_used=0).state
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1733: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 14:09:19 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 14:09:19 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 14:09:19 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 14:09:19 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_pipeline_commit_operation_authority.py::test_equal_candidate_only_rejects_after_recovery_integrity[fresh]
+FAILED tests/unit/web/composer/test_pipeline_commit_operation_authority.py::test_equal_candidate_only_rejects_after_recovery_integrity[matching]
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-explicit_approve-explicit_approve]
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-auto_commit-auto_commit]
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-auto_commit-explicit_approve]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_identical_canonical_candidate_returns_unchanged_without_proposal[auto_commit-singleton-source]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_identical_canonical_candidate_returns_unchanged_without_proposal[auto_commit-named-source]
+========================= 7 failed, 7 passed in 9.67s ==========================

@@ -1,0 +1,1060 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 603 items
+
+tests/unit/web/test_sessions_composer_attribute_contracts.py .....       [  0%]
+tests/unit/web/composer/test_tool_result_envelope.py .....               [  1%]
+tests/unit/web/composer/test_tool_result_envelope_gate.py .............. [  3%]
+.............................F.FFFFFF.............FFF..F..FF............ [ 15%]
+..........................FFFF........F................................. [ 27%]
+.....................................................                    [ 36%]
+tests/unit/web/composer/test_blob_response_contracts.py ................ [ 39%]
+...................................................................      [ 50%]
+tests/unit/web/composer/test_dispatch_arms_characterization.py ......... [ 51%]
+..........                                                               [ 53%]
+tests/unit/web/composer/test_proposal_cap_turn_counts.py .               [ 53%]
+tests/unit/web/composer/test_progress.py ............................... [ 58%]
+.                                                                        [ 59%]
+tests/unit/elspeth_lints/test_masquerade_gate.py ....................... [ 62%]
+........................................................................ [ 74%]
+........................................................................ [ 86%]
+........sss............................................................. [ 98%]
+.....                                                                    [ 99%]
+tests/unit/test_mock_discipline_baseline.py ...                          [100%]
+
+=================================== FAILURES ===================================
+_____________ test_every_shipped_envelope_key_is_taught_or_fenced ______________
+
+    def test_every_shipped_envelope_key_is_taught_or_fenced() -> None:
+        fenced = {(e.surface, e.tool, e.key) for e in load_fence()}
+>       unexplained = {k: v for k, v in untaught_keys().items() if k not in fenced}
+                                        ^^^^^^^^^^^^^^^
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2520: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2477: in untaught_keys
+    blocks = _teaching_blocks()
+             ^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2457: in _teaching_blocks
+    validate_teaching_scopes(blocks, frozenset((row.surface, row.tool, row.key) for row in shipped_keys()))
+                                                                                           ^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2396: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+_ test_real_diagnostic_conditional_splat_rejects_planted_keys[unexplained_diagnostic_splat_probe-body] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5db778c950>
+arm = 'body', key = 'unexplained_diagnostic_splat_probe'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize("key", ["unexplained_diagnostic_splat_probe", "success"])
+    def test_real_diagnostic_conditional_splat_rejects_planted_keys(monkeypatch: pytest.MonkeyPatch, arm: str, key: str) -> None:
+        """Skipping either actual branch must not hide an untaught key or nested envelope homonym."""
+        test_real_diagnostic_conditional_splat_is_censused_at_its_constructor()
+        gate = test_no_nested_key_is_a_homonym_of_an_envelope_key if key == "success" else test_every_shipped_envelope_key_is_taught_or_fenced
+>       gate()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2566: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2520: in test_every_shipped_envelope_key_is_taught_or_fenced
+    unexplained = {k: v for k, v in untaught_keys().items() if k not in fenced}
+                                    ^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2477: in untaught_keys
+    blocks = _teaching_blocks()
+             ^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2457: in _teaching_blocks
+    validate_teaching_scopes(blocks, frozenset((row.surface, row.tool, row.key) for row in shipped_keys()))
+                                                                                           ^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2396: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+_ test_real_diagnostic_conditional_splat_rejects_planted_keys[unexplained_diagnostic_splat_probe-orelse] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5db778f800>
+arm = 'orelse', key = 'unexplained_diagnostic_splat_probe'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize("key", ["unexplained_diagnostic_splat_probe", "success"])
+    def test_real_diagnostic_conditional_splat_rejects_planted_keys(monkeypatch: pytest.MonkeyPatch, arm: str, key: str) -> None:
+        """Skipping either actual branch must not hide an untaught key or nested envelope homonym."""
+        test_real_diagnostic_conditional_splat_is_censused_at_its_constructor()
+        gate = test_no_nested_key_is_a_homonym_of_an_envelope_key if key == "success" else test_every_shipped_envelope_key_is_taught_or_fenced
+>       gate()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2566: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2520: in test_every_shipped_envelope_key_is_taught_or_fenced
+    unexplained = {k: v for k, v in untaught_keys().items() if k not in fenced}
+                                    ^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2477: in untaught_keys
+    blocks = _teaching_blocks()
+             ^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2457: in _teaching_blocks
+    validate_teaching_scopes(blocks, frozenset((row.surface, row.tool, row.key) for row in shipped_keys()))
+                                                                                           ^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2396: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+__ test_real_diagnostic_conditional_splat_rejects_planted_keys[success-body] ___
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5db7987b60>
+arm = 'body', key = 'success'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize("key", ["unexplained_diagnostic_splat_probe", "success"])
+    def test_real_diagnostic_conditional_splat_rejects_planted_keys(monkeypatch: pytest.MonkeyPatch, arm: str, key: str) -> None:
+        """Skipping either actual branch must not hide an untaught key or nested envelope homonym."""
+        test_real_diagnostic_conditional_splat_is_censused_at_its_constructor()
+        gate = test_no_nested_key_is_a_homonym_of_an_envelope_key if key == "success" else test_every_shipped_envelope_key_is_taught_or_fenced
+>       gate()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2566: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2641: in test_no_nested_key_is_a_homonym_of_an_envelope_key
+    {(shipped.key, shipped.site) for shipped in shipped_keys() if "." in shipped.key and leaf_of(shipped.key) in envelope}
+                                                ^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2396: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+_ test_real_diagnostic_conditional_splat_rejects_planted_keys[success-orelse] __
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5db778fd40>
+arm = 'orelse', key = 'success'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize("key", ["unexplained_diagnostic_splat_probe", "success"])
+    def test_real_diagnostic_conditional_splat_rejects_planted_keys(monkeypatch: pytest.MonkeyPatch, arm: str, key: str) -> None:
+        """Skipping either actual branch must not hide an untaught key or nested envelope homonym."""
+        test_real_diagnostic_conditional_splat_is_censused_at_its_constructor()
+        gate = test_no_nested_key_is_a_homonym_of_an_envelope_key if key == "success" else test_every_shipped_envelope_key_is_taught_or_fenced
+>       gate()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2566: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2641: in test_no_nested_key_is_a_homonym_of_an_envelope_key
+    {(shipped.key, shipped.site) for shipped in shipped_keys() if "." in shipped.key and leaf_of(shipped.key) in envelope}
+                                                ^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2396: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+______________ test_no_nested_key_is_a_homonym_of_an_envelope_key ______________
+
+    def test_no_nested_key_is_a_homonym_of_an_envelope_key() -> None:
+        """No key nested under an envelope field may have one of the ENVELOPE's own key names as its leaf.
+    
+        Before the ownership reader, ``is_taught`` matched a quoted leaf ANYWHERE
+        in the taught corpus, which quotes every envelope key, so a payload key named
+        after one is "taught" by the sentence describing a different field. Not
+        hypothetical: ``data["success"] = "false"`` added to
+        ``_common._failure_result`` — the shared recoverable-rejection builder, 261
+        producers behind it — was ENUMERATED by the census (342 rows, the new row
+        named at its site) and then admitted, with the whole gate file green
+        (red-team RED2-2, mutant A3). The two payloads that already carry exact-key
+        pins refuse ``success`` by hand (F1); this refuses the class, on every
+        payload, for every envelope key, and takes the forbidden names from the
+        registry rather than from a list of the four that happen to be quoted today.
+    
+        This structural backstop remains depth-blind, not scoped to ``data.``:
+        the historical mechanism cared neither how deep the key sat
+        nor which surface carries it. The dotted test is what separates a nested
+        key from the envelope's own eleven rows, which are the only dotless ones
+        (measured). Measured before landing, so the rule costs no churn — zero of
+        the shipped rows collide (341 when the rule landed, 344 once the subscript
+        walker started reporting nested values). A future collision is an
+        adjudication (rename
+        the nested key, or split the envelope's), not something to route around
+        here: the reader cannot tell the two apart, whatever the gate does. A
+        depth-blind rule is worth only the walk beneath it: this stayed green
+        against a ``version`` planted inside ``data.sources`` until
+        ``_nested_value_keys`` stopped declining comprehension-valued payloads.
+        RE-MEASURED at that new size rather than assumed to still be free: 401
+        rows, 390 of them dotted, against the registry's 11 envelope keys — zero
+        collide. The set is derived live from every dotted row below, so no count
+        of the newly-walked rows is carried here: one more figure to keep true
+        across every census move, and the derivation already covers them all.
+    
+        NOT closed by this: a leaf admitted because some OTHER tool's description
+        quotes it. That is the same ``is_taught`` mechanism one step out, it needs
+        either a data-payload-scoped corpus match or a per-tool ruling, and it is
+        recorded on elspeth-e405ad7cd2 rather than fenced here.
+    
+        The DERIVATION is asserted, not only its consequence. Coming from the
+        registry rather than from the four names that happen to be quoted today is
+        one of the three ways this rule was generalised, and it was free to lose:
+        narrowing ``envelope`` back to ``{success, validation, version,
+        affected_nodes}`` left the whole gate file green, because no shipped row
+        collides with any of the other seven either (measured, red-team RED5-4).
+        So the set is re-derived here from the two registry constants
+        ``tool_result_keys`` is built out of — a different expression from the one
+        under test, which is the point: a hand-list substituted for either reds.
+        """
+        envelope = set(env.tool_result_keys(data=True))
+        assert envelope == set(env.TOOL_RESULT_REQUIRED_KEYS) | set(env.TOOL_RESULT_OPTIONAL_KEYS), (
+            "the forbidden names must be the registry's whole envelope, not a hand-list of the ones a shipped row happens to collide with today"
+        )
+        collisions = sorted(
+>           {(shipped.key, shipped.site) for shipped in shipped_keys() if "." in shipped.key and leaf_of(shipped.key) in envelope}
+                                                        ^^^^^^^^^^^^^^
+        )
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2641: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2396: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+__________________ test_fence_entries_are_live_untaught_keys ___________________
+
+    def test_fence_entries_are_live_untaught_keys() -> None:
+        """A fence must not outlive what it fences: a taught or no-longer-shipped key leaves the fixture."""
+>       untaught = untaught_keys()
+                   ^^^^^^^^^^^^^^^
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2652: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2477: in untaught_keys
+    blocks = _teaching_blocks()
+             ^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2457: in _teaching_blocks
+    validate_teaching_scopes(blocks, frozenset((row.surface, row.tool, row.key) for row in shipped_keys()))
+                                                                                           ^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2396: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+____________ test_review_blocked_payload_and_preflight_are_censused ____________
+
+    def test_review_blocked_payload_and_preflight_are_censused() -> None:
+>       rows = [row for row in shipped_keys() if row.site.startswith(f"{_display(SESSION_TOOL)}:")]
+                               ^^^^^^^^^^^^^^
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2762: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2396: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+__________ test_review_blocked_census_rejects_an_untaught_payload_key __________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5db7525dc0>
+
+    def test_review_blocked_census_rejects_an_untaught_payload_key(monkeypatch: pytest.MonkeyPatch) -> None:
+>       test_review_blocked_payload_and_preflight_are_censused()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2772: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2762: in test_review_blocked_payload_and_preflight_are_censused
+    rows = [row for row in shipped_keys() if row.site.startswith(f"{_display(SESSION_TOOL)}:")]
+                           ^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2396: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+___________ test_review_blocked_census_rejects_unadmitted_preflight ____________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5db798d610>
+
+    def test_review_blocked_census_rejects_unadmitted_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+>       test_review_blocked_payload_and_preflight_are_censused()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2797: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2762: in test_review_blocked_payload_and_preflight_are_censused
+    rows = [row for row in shipped_keys() if row.site.startswith(f"{_display(SESSION_TOOL)}:")]
+                           ^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2396: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+________ test_credential_builder_census_rejects_an_untaught_payload_key ________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5db7768050>
+
+    def test_credential_builder_census_rejects_an_untaught_payload_key(monkeypatch: pytest.MonkeyPatch) -> None:
+        test_credential_builder_payload_is_censused_at_its_actual_owner()
+        original = _parse
+    
+        def with_extra_key(path: Path) -> ast.Module:
+            tree = original(path)
+            if path == COMMON:
+                payload = _credential_builder_payload(tree)
+                payload.keys.append(ast.Constant(value="unexplained_credential_probe"))
+                payload.values.append(ast.Constant(value=True))
+            return tree
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "_parse", with_extra_key)
+        assert any(row.key == "data.unexplained_credential_probe" for row in _failure_data_sites())
+        with pytest.raises(AssertionError, match="unexplained_credential_probe"):
+>           test_every_shipped_envelope_key_is_taught_or_fenced()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2858: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2520: in test_every_shipped_envelope_key_is_taught_or_fenced
+    unexplained = {k: v for k, v in untaught_keys().items() if k not in fenced}
+                                    ^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2477: in untaught_keys
+    blocks = _teaching_blocks()
+             ^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2457: in _teaching_blocks
+    validate_teaching_scopes(blocks, frozenset((row.surface, row.tool, row.key) for row in shipped_keys()))
+                                                                                           ^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2396: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5db7768050>
+
+    def test_credential_builder_census_rejects_an_untaught_payload_key(monkeypatch: pytest.MonkeyPatch) -> None:
+        test_credential_builder_payload_is_censused_at_its_actual_owner()
+        original = _parse
+    
+        def with_extra_key(path: Path) -> ast.Module:
+            tree = original(path)
+            if path == COMMON:
+                payload = _credential_builder_payload(tree)
+                payload.keys.append(ast.Constant(value="unexplained_credential_probe"))
+                payload.values.append(ast.Constant(value=True))
+            return tree
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "_parse", with_extra_key)
+        assert any(row.key == "data.unexplained_credential_probe" for row in _failure_data_sites())
+>       with pytest.raises(AssertionError, match="unexplained_credential_probe"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'unexplained_credential_probe'
+E         Actual message: "src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES\nassert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})\n +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2857: AssertionError
+___________ test_credential_builder_owner_classification_is_required ___________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5db7769dc0>
+
+    def test_credential_builder_owner_classification_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
+>       test_every_result_constructor_site_is_attributed()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2885: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3328: in test_every_result_constructor_site_is_attributed
+    list(_tool_data_sites())
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+_______ test_every_registered_container_path_has_one_witnessed_producer ________
+
+    def test_every_registered_container_path_has_one_witnessed_producer() -> None:
+>       _assert_unique_container_producers()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2925: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2919: in _assert_unique_container_producers
+    shipped_keys()
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2396: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+_ test_second_container_producer_refuses_even_with_existing_coverage[data.edge_contracts] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5db78a03b0>
+path = 'data.edge_contracts'
+
+    @pytest.mark.parametrize("path", sorted(_CONTAINER_ELEMENT_PAYLOADS))
+    def test_second_container_producer_refuses_even_with_existing_coverage(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+        census = shipped_keys
+    
+        def with_second_producer() -> list[ShippedKey]:
+            rows = census()
+            list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "second-producer", {}, element_of=path))
+            return rows
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", with_second_producer)
+        test_every_deferred_container_element_is_censused_by_its_named_derivation()
+        with pytest.raises(AssertionError, match="multiple producers"):
+>           _assert_unique_container_producers()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3243: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2919: in _assert_unique_container_producers
+    shipped_keys()
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3236: in with_second_producer
+    rows = census()
+           ^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2396: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5db78a03b0>
+path = 'data.edge_contracts'
+
+    @pytest.mark.parametrize("path", sorted(_CONTAINER_ELEMENT_PAYLOADS))
+    def test_second_container_producer_refuses_even_with_existing_coverage(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+        census = shipped_keys
+    
+        def with_second_producer() -> list[ShippedKey]:
+            rows = census()
+            list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "second-producer", {}, element_of=path))
+            return rows
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", with_second_producer)
+        test_every_deferred_container_element_is_censused_by_its_named_derivation()
+>       with pytest.raises(AssertionError, match="multiple producers"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'multiple producers'
+E         Actual message: "src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES\nassert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})\n +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3242: AssertionError
+_ test_second_container_producer_refuses_even_with_existing_coverage[validation.errors] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5db78a0bc0>
+path = 'validation.errors'
+
+    @pytest.mark.parametrize("path", sorted(_CONTAINER_ELEMENT_PAYLOADS))
+    def test_second_container_producer_refuses_even_with_existing_coverage(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+        census = shipped_keys
+    
+        def with_second_producer() -> list[ShippedKey]:
+            rows = census()
+            list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "second-producer", {}, element_of=path))
+            return rows
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", with_second_producer)
+        test_every_deferred_container_element_is_censused_by_its_named_derivation()
+        with pytest.raises(AssertionError, match="multiple producers"):
+>           _assert_unique_container_producers()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3243: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2919: in _assert_unique_container_producers
+    shipped_keys()
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3236: in with_second_producer
+    rows = census()
+           ^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2396: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5db78a0bc0>
+path = 'validation.errors'
+
+    @pytest.mark.parametrize("path", sorted(_CONTAINER_ELEMENT_PAYLOADS))
+    def test_second_container_producer_refuses_even_with_existing_coverage(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+        census = shipped_keys
+    
+        def with_second_producer() -> list[ShippedKey]:
+            rows = census()
+            list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "second-producer", {}, element_of=path))
+            return rows
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", with_second_producer)
+        test_every_deferred_container_element_is_censused_by_its_named_derivation()
+>       with pytest.raises(AssertionError, match="multiple producers"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'multiple producers'
+E         Actual message: "src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES\nassert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})\n +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3242: AssertionError
+_ test_second_container_producer_refuses_even_with_existing_coverage[validation.suggestions] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5db78a16a0>
+path = 'validation.suggestions'
+
+    @pytest.mark.parametrize("path", sorted(_CONTAINER_ELEMENT_PAYLOADS))
+    def test_second_container_producer_refuses_even_with_existing_coverage(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+        census = shipped_keys
+    
+        def with_second_producer() -> list[ShippedKey]:
+            rows = census()
+            list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "second-producer", {}, element_of=path))
+            return rows
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", with_second_producer)
+        test_every_deferred_container_element_is_censused_by_its_named_derivation()
+        with pytest.raises(AssertionError, match="multiple producers"):
+>           _assert_unique_container_producers()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3243: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2919: in _assert_unique_container_producers
+    shipped_keys()
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3236: in with_second_producer
+    rows = census()
+           ^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2396: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5db78a16a0>
+path = 'validation.suggestions'
+
+    @pytest.mark.parametrize("path", sorted(_CONTAINER_ELEMENT_PAYLOADS))
+    def test_second_container_producer_refuses_even_with_existing_coverage(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+        census = shipped_keys
+    
+        def with_second_producer() -> list[ShippedKey]:
+            rows = census()
+            list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "second-producer", {}, element_of=path))
+            return rows
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", with_second_producer)
+        test_every_deferred_container_element_is_censused_by_its_named_derivation()
+>       with pytest.raises(AssertionError, match="multiple producers"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'multiple producers'
+E         Actual message: "src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES\nassert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})\n +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3242: AssertionError
+_ test_second_container_producer_refuses_even_with_existing_coverage[validation.warnings] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5db778c560>
+path = 'validation.warnings'
+
+    @pytest.mark.parametrize("path", sorted(_CONTAINER_ELEMENT_PAYLOADS))
+    def test_second_container_producer_refuses_even_with_existing_coverage(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+        census = shipped_keys
+    
+        def with_second_producer() -> list[ShippedKey]:
+            rows = census()
+            list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "second-producer", {}, element_of=path))
+            return rows
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", with_second_producer)
+        test_every_deferred_container_element_is_censused_by_its_named_derivation()
+        with pytest.raises(AssertionError, match="multiple producers"):
+>           _assert_unique_container_producers()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3243: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2919: in _assert_unique_container_producers
+    shipped_keys()
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3236: in with_second_producer
+    rows = census()
+           ^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2396: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5db778c560>
+path = 'validation.warnings'
+
+    @pytest.mark.parametrize("path", sorted(_CONTAINER_ELEMENT_PAYLOADS))
+    def test_second_container_producer_refuses_even_with_existing_coverage(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+        census = shipped_keys
+    
+        def with_second_producer() -> list[ShippedKey]:
+            rows = census()
+            list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "second-producer", {}, element_of=path))
+            return rows
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", with_second_producer)
+        test_every_deferred_container_element_is_censused_by_its_named_derivation()
+>       with pytest.raises(AssertionError, match="multiple producers"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'multiple producers'
+E         Actual message: "src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES\nassert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})\n +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3242: AssertionError
+_______________ test_every_result_constructor_site_is_attributed _______________
+
+    def test_every_result_constructor_site_is_attributed() -> None:
+        """Every ``data=`` result-constructor site in web/composer is walked or classified, and nothing is skipped.
+    
+        Two claims, and before this the test made only half of the first: it ran
+        the tool-data walker, which raises on an unattributed site — but only over
+        a HAND-LIST of seven files, so a producer outside them was invisible rather
+        than refused, and three real ones were (systems seat SYS-R3-2). The site set
+        is now derived from the package, and a site that is neither walked as tool
+        data nor named in one of the two classification registries fails here.
+    
+        The registries are checked in both directions: a stale row (its site gone or
+        renamed) fails too, so a classification cannot outlive what it classifies.
+    
+        ``_all_data_sites`` walks the package recursively while ``_TOOL_DATA_FILES``
+        names files under ``tools/``, so a base name does NOT identify a module. Two
+        distinct escapes can come from keying on one:
+    
+        * another ``sources.py`` shipping a ``data=`` payload can count itself as
+          walked while ``_tool_data_sites`` parses only ``tools/sources.py``;
+        * another ``outputs.py`` can do the same with no collision to notice if
+          ``tools/outputs.py`` ships no ``data=`` site.
+    
+        Hence ``walked`` is keyed on the MODULE,
+        which is what the tool-data walker actually parses, plus an injectivity
+        refusal for each bare name this file still attributes by, each with its own
+        killing mutant:
+    
+        * the FILE name, because the two classification registries key on it and a
+          row cannot say which of two modules it classifies;
+        * the FUNCTION name, because ``_attribute_tool`` keys on it alone — a second
+          ``_execute_delete_blob_locked`` in another walked file had its keys
+          censused, taught and manifest-checked against ``delete_blob``, silently,
+          34 passed exit 0, whenever the keys it ships are ones that tool already
+          teaches.
+        """
+>       list(_tool_data_sites())
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3328: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2340: in _tool_data_sites
+    tool = _tool_name_for(fn_name, site)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+fn_name = 'admit_blob_mutation'
+site = 'src/elspeth/web/composer/tools/blobs.py:1830'
+
+    def _tool_name_for(fn_name: str | None, site: str) -> str:
+        assert fn_name is not None, f"{site}: result constructed outside any function"
+        if fn_name == "page" and site.startswith("src/elspeth/web/composer/tools/blobs.py:"):
+            return "get_blob_content"
+        if fn_name in _FUNCTION_TOOL_OVERRIDES:
+            return _FUNCTION_TOOL_OVERRIDES[fn_name]
+        name = fn_name
+        for prefix in ("_handle_", "_execute_"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+>       assert name in _registered_tool_names(), f"{site}: cannot attribute function {fn_name!r} to a tool — add it to _FUNCTION_TOOL_OVERRIDES"
+E       AssertionError: src/elspeth/web/composer/tools/blobs.py:1830: cannot attribute function 'admit_blob_mutation' to a tool — add it to _FUNCTION_TOOL_OVERRIDES
+E       assert 'admit_blob_mutation' in frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...})
+E        +  where frozenset({'clear_source', 'create_blob', 'delete_blob', 'diff_pipeline', 'explain_validation_error', 'get_audit_info', ...}) = _registered_tool_names()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2118: AssertionError
+=========================== short test summary info ============================
+SKIPPED [3] tests/unit/elspeth_lints/test_masquerade_gate.py:1521: PEP 696 defaults need Python 3.13
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_every_shipped_envelope_key_is_taught_or_fenced
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_real_diagnostic_conditional_splat_rejects_planted_keys[unexplained_diagnostic_splat_probe-body]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_real_diagnostic_conditional_splat_rejects_planted_keys[unexplained_diagnostic_splat_probe-orelse]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_real_diagnostic_conditional_splat_rejects_planted_keys[success-body]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_real_diagnostic_conditional_splat_rejects_planted_keys[success-orelse]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_no_nested_key_is_a_homonym_of_an_envelope_key
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_fence_entries_are_live_untaught_keys
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_review_blocked_payload_and_preflight_are_censused
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_review_blocked_census_rejects_an_untaught_payload_key
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_review_blocked_census_rejects_unadmitted_preflight
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_credential_builder_census_rejects_an_untaught_payload_key
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_credential_builder_owner_classification_is_required
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_every_registered_container_path_has_one_witnessed_producer
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_second_container_producer_refuses_even_with_existing_coverage[data.edge_contracts]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_second_container_producer_refuses_even_with_existing_coverage[validation.errors]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_second_container_producer_refuses_even_with_existing_coverage[validation.suggestions]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_second_container_producer_refuses_even_with_existing_coverage[validation.warnings]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_every_result_constructor_site_is_attributed
+============ 18 failed, 582 passed, 3 skipped in 506.38s (0:08:26) =============

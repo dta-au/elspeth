@@ -1,0 +1,718 @@
+// stores/subscriptions.ts
+//
+// Cross-store subscriptions extracted to break circular imports between
+// sessionStore, executionStore, and auditReadinessStore. Call
+// initStoreSubscriptions() once at app startup (e.g. in App.tsx).
+
+import { useSessionStore } from "./sessionStore";
+import { useExecutionStore } from "./executionStore";
+import { useAuditReadinessStore } from "./auditReadinessStore";
+import { useAuthStore } from "./authStore";
+import type { CompositionState, ValidationResult } from "@/types/index";
+import { hasCompositionContent } from "@/utils/compositionState";
+import { compositionContentEqual } from "@/lib/compositionContent";
+import {
+  humaniseExecutionError,
+  humaniseValidationWarning,
+  type HumanisedFinding,
+  makePhraseFor,
+  stepPrefixPhrase,
+} from "@/lib/validationHumaniser";
+import {
+  characterisePendingControls,
+  pendingControlsInstruction,
+} from "@/components/chat/acknowledgementLabels";
+import { useInterpretationEventsStore } from "./interpretationEventsStore";
+import {
+  registerResolveValidateRequester,
+  type ResolveValidateRequest,
+} from "./validationRequests";
+
+let previousVersion: number | null = null;
+let previousSessionIds: Set<string> = new Set();
+let initialized = false;
+let unsubscribe: (() => void) | null = null;
+
+interface CompositionSnapshot {
+  sessionId: string | null;
+  version: number;
+  state: CompositionState;
+}
+let previousClearSnapshot: CompositionSnapshot | null = null;
+let previousValidatedSnapshot: CompositionSnapshot | null = null;
+
+/**
+ * True when `snapshot` describes the SAME session's composition and its
+ * authored content matches `state` — i.e. the version bump between them is a
+ * bookkeeping write, not an edit. Fails closed on a null snapshot or a
+ * session change (see compositionContent.ts's safe-direction rule).
+ */
+function isContentOnlyVersionBump(
+  snapshot: CompositionSnapshot | null,
+  sessionId: string | null,
+  state: CompositionState | null,
+): boolean {
+  if (snapshot === null || state === null) return false;
+  if (snapshot.sessionId !== sessionId) return false;
+  return compositionContentEqual(snapshot.state, state);
+}
+
+// Tracks the last-seen activeSessionId so the run-rehydration subscriber
+// fires once per session activation, not on every sessionStore write.
+let previousActiveSessionId: string | null = null;
+let unsubscribeRunRehydration: (() => void) | null = null;
+
+// Module-level state for the executionStore subscriber.
+// Must be reset in _resetSubscriptionsForTesting().
+let previousValidationFingerprint: string | null = null;
+// Tracks whether the last surfaced validation outcome was a pending
+// interpretation review. When the next outcome is clean-valid we use this to
+// replace the "needs your okay" message with a "ready to run" nudge (and so
+// clear the otherwise-stale pending message), without firing that nudge on
+// ordinary mid-compose valid results.
+let previousWasPendingReview = false;
+let unsubscribeExecution: (() => void) | null = null;
+
+const lastValidatedVersionBySession = new Map<string, number>();
+// Versions whose verdict came from a /validate POST that LANDED (applied, not
+// superseded). Narrower than lastValidatedVersionBySession, which also holds
+// versions whose verdict was carried forward from content-equal predecessors
+// without a POST. Only this map proves a POST observed the server state as it
+// stands after a mutation that minted the version.
+const lastPostedValidateVersionBySession = new Map<string, number>();
+interface ValidateTarget {
+  sessionId: string;
+  version: number;
+  force: boolean;
+}
+
+let pendingValidateTarget: ValidateTarget | null = null;
+let validateInflight = false;
+let unsubscribeAutoValidate: (() => void) | null = null;
+let inflightValidateTarget: ValidateTarget | null = null;
+let unsubscribeAuth: (() => void) | null = null;
+
+/**
+ * Detects the backend's structured ``empty_pipeline`` validation outcome.
+ *
+ * Returned by ``web/execution/validation.py::validate_pipeline`` when the
+ * composition has no source, no transforms, and no outputs. The frontend
+ * uses this to suppress chat-injected error banners. The historical
+ * feedback-to-LLM path also used this guard to avoid POSTing the failure to
+ * ``/messages`` and prompting a confabulated placeholder ``set_pipeline``
+ * fix; validation failures are now local-only, but the empty-state silence
+ * remains intentional.
+ */
+function isEmptyPipelineResult(result: ValidationResult): boolean {
+  return (
+    !result.is_valid &&
+    result.errors.length === 1 &&
+    result.errors[0].error_code === "empty_pipeline"
+  );
+}
+
+/**
+ * Detects the "partial composition" outcomes — a lone source, a lone output,
+ * or a transform with neither (error codes ``missing_source`` / ``missing_sink``
+ * from the settings-load reframe, elspeth-901a404926). Like ``empty_pipeline``,
+ * these are the tutorial's normal mid-build steady state: the rail strip
+ * already carries the plain "Add an output step…" guidance, so injecting an
+ * alarmist "Validation failed" chat line on every intermediate build step would
+ * be noise. Keep them silent in chat.
+ */
+const INCOMPLETE_PIPELINE_CODES = new Set(["missing_source", "missing_sink"]);
+function isIncompletePipelineResult(result: ValidationResult): boolean {
+  return (
+    !result.is_valid &&
+    result.errors.length > 0 &&
+    result.errors.every(
+      (err) => err.error_code != null && INCOMPLETE_PIPELINE_CODES.has(err.error_code),
+    )
+  );
+}
+
+function isPendingInterpretationReviewResult(result: ValidationResult): boolean {
+  const readiness = result.readiness;
+  if (!readiness) return false;
+  return (
+    !result.is_valid &&
+    readiness.authoring_valid &&
+    !readiness.execution_ready &&
+    readiness.completion_ready &&
+    readiness.blockers.some((blocker) => blocker.code === "interpretation_review_pending")
+  );
+}
+
+function validationFingerprint(result: ValidationResult | null): string | null {
+  if (!result) return null;
+  return JSON.stringify({
+    is_valid: result.is_valid,
+    readiness: result.readiness,
+    errors: result.errors.map((err) => ({
+      component_type: err.component_type ?? null,
+      component_id: err.component_id ?? null,
+      message: err.message,
+      error_code: err.error_code ?? null,
+      suggestion: err.suggestion ?? null,
+    })),
+    warnings: (result.warnings ?? []).map((warn) => ({
+      component_type: warn.component_type ?? null,
+      component_id: warn.component_id ?? null,
+      message: warn.message,
+      suggestion: warn.suggestion ?? null,
+    })),
+  });
+}
+
+/**
+ * Format one validation finding as a novice-register chat bullet
+ * (elspeth-d9e5d157cb). Routes the raw backend message through the SHARED
+ * humaniser and drops the engineer-grade "[type] id:" internal-id prefix the
+ * old injection leaked verbatim. Prefixes the plain step name exactly when
+ * the SHARED stepPrefixPhrase (the same decision formatFindingBody renders
+ * from — elspeth-901a404926 / elspeth-9f21f3c57d) says the prefix adds a
+ * name the headline lacks. Interpretation-review-pending findings never
+ * reach here (handled by isPendingInterpretationReviewResult above), so no
+ * stepLabelFor is needed.
+ *
+ * `componentType` is the SAME finding's structured `component_type` —
+ * required (not optional) so this can't silently drop the hint that lets
+ * `phraseFor` resolve a role-less generated id in the right direction
+ * (elspeth-ede84df6b3). Pass `null` when the caller has none.
+ */
+function humanisedValidationBullet(
+  finding: HumanisedFinding,
+  componentId: string | null,
+  componentType: string | null,
+  phraseFor: (componentId: string | null, componentType?: string | null) => string,
+): string {
+  const prefix = stepPrefixPhrase(finding, componentId, componentType, phraseFor);
+  return prefix !== null
+    ? `- **${prefix}:** ${finding.headline}`
+    : `- ${finding.headline}`;
+}
+
+/**
+ * Returns a string that changes when the authenticated identity changes.
+ * "anon" when no token is present; the user_id string otherwise.
+ * Used by the auth subscription to detect user switches (logout / re-login
+ * as a different user in the same tab) so per-user caches can be cleared.
+ *
+ * NOTE: UserProfile uses `user_id` (not `id`) — confirmed from types/index.ts.
+ */
+function authIdentityFingerprint(state: { token: string | null; user: { user_id: string } | null }): string {
+  return state.token == null ? "anon" : `${state.user?.user_id ?? "unknown"}`;
+}
+
+/**
+ * Clears all per-user module-level state without tearing down subscription
+ * wiring. Called when the authenticated identity transitions (logout or
+ * user switch). Does NOT touch validateInflight, initialized, or any
+ * unsubscribe handle — those belong to the subscription wiring lifetime,
+ * not the user session lifetime.
+ *
+ * inflightValidateTarget is deliberately preserved. The executionStore
+ * subscriber uses `inflightValidateTarget.sessionId !== activeSessionId`
+ * to drop a stale validationResult that resolves after the user has
+ * already switched sessions or identities. Nulling it here would short-
+ * circuit that guard and let a previous user's validation side-effect
+ * system message fire on the new user's session. fireValidateLoop's own
+ * try/finally clears the field once the in-flight validate() promise settles.
+ */
+function resetPerUserState(): void {
+  previousVersion = null;
+  previousClearSnapshot = null;
+  previousValidatedSnapshot = null;
+  previousValidationFingerprint = null;
+  previousWasPendingReview = false;
+  previousSessionIds = new Set();
+  lastValidatedVersionBySession.clear();
+  lastPostedValidateVersionBySession.clear();
+  pendingValidateTarget = null;
+  // Pre-run disclosure opt-outs are per user: the ack map survives
+  // executionStore.reset() (session switches) by design, so the identity
+  // transition is the one place it must be flushed.
+  useExecutionStore.getState().clearRunDisclosureAcks();
+}
+
+/**
+ * Wire up cross-store subscriptions. Must be called exactly once at
+ * application startup, after all stores have been created.
+ *
+ * Current subscriptions:
+ * - Auto-clear validation when compositionState.version changes.
+ * - Auto-clear audit-readiness cache for any session that disappears from
+ *   sessionStore.sessions (archive, 404 self-eviction, future removal paths).
+ *   Uses a previous-id set tracked across firings to detect removals
+ *   uniformly — no need to instrument each removal call site.
+ * - Fire injectSystemMessage when useExecutionStore.validationResult
+ *   transitions to a failing or warnings-only result. Phase 2C centralized
+ *   the side-effect orchestration so keyboard and CommandPalette callers of
+ *   validate() share the same local UI path.
+ * - Auto-validate when compositionState.version increments, with a correctness
+ *   loop that re-fires after in-flight validation settles if a newer version
+ *   arrived in the meantime.
+ * - Rehydrate a live run on session activation (elspeth-90db33baac): when
+ *   activeSessionId changes, executionStore.rehydrateActiveRun re-attaches
+ *   activeRunId + the progress WebSocket if the backend reports a pending or
+ *   running run, so a page reload during execution keeps its Cancel control.
+ *   Lives here rather than in sessionStore because sessionStore must not
+ *   depend on execution wiring (same circular-import break as the rest of
+ *   this module).
+ */
+export function initStoreSubscriptions(): void {
+  if (initialized) return;
+  initialized = true;
+  registerResolveValidateRequester(requestValidateAfterResolve);
+
+  // Seed previousSessionIds from the current store state. Otherwise the first
+  // removal of any session that was already in sessionStore before
+  // initStoreSubscriptions() was called would silently no-op (the empty
+  // previousSessionIds set has no ids to detect as "removed"). Production
+  // startup order makes this unreachable today (sessions starts empty and
+  // init runs synchronously before loadSessions), but adding persist
+  // middleware, SSR hydration, or a test that seeds sessions before init
+  // would expose the gap. The seed costs one set construction.
+  previousSessionIds = new Set(useSessionStore.getState().sessions.map((s) => s.id));
+
+  unsubscribe = useSessionStore.subscribe((state) => {
+    const composition = state.compositionState;
+    const currentVersion = composition?.version ?? null;
+    if (previousVersion !== null && currentVersion !== previousVersion) {
+      const contentOnlyBump = isContentOnlyVersionBump(
+        previousClearSnapshot,
+        state.activeSessionId,
+        composition,
+      );
+      if (!contentOnlyBump) {
+        useExecutionStore.getState().clearValidation();
+      } else if (
+        previousClearSnapshot !== null &&
+        state.activeSessionId !== null &&
+        currentVersion !== null
+      ) {
+        // Same authored content ⇒ the readiness the server computed for the
+        // previous version is exact for this one. Carry it forward rather
+        // than let `useAuditReadinessSync`'s version-keyed effect refetch:
+        // that fetch is the SAME defect on a third surface (Checks badge to
+        // "Checking", ExecuteButton's advisory snapshot to undefined, one
+        // extra server-side validation + audit projection per question).
+        // The store re-checks that the cached snapshot is the predecessor's
+        // before it moves — this side owns only the content proof.
+        useAuditReadinessStore
+          .getState()
+          .carrySnapshotForward(
+            state.activeSessionId,
+            previousClearSnapshot.version,
+            currentVersion,
+          );
+      }
+    }
+    previousVersion = currentVersion;
+    previousClearSnapshot =
+      composition === null || currentVersion === null
+        ? null
+        : {
+            sessionId: state.activeSessionId,
+            version: currentVersion,
+            state: composition,
+          };
+
+    // Session removal clears audit-readiness cache.
+    const currentIds = new Set(state.sessions.map((s) => s.id));
+    for (const prevId of previousSessionIds) {
+      if (!currentIds.has(prevId)) {
+        useAuditReadinessStore.getState().clearSession(prevId);
+        lastValidatedVersionBySession.delete(prevId);
+        lastPostedValidateVersionBySession.delete(prevId);
+      }
+    }
+    previousSessionIds = currentIds;
+  });
+
+  // Run/WebSocket rehydration on session activation. Seeded from current
+  // state (like previousSessionIds above) so init itself does not fire a
+  // rehydrate for a session that was already active before wiring.
+  previousActiveSessionId = useSessionStore.getState().activeSessionId;
+  unsubscribeRunRehydration = useSessionStore.subscribe((state) => {
+    const sessionId = state.activeSessionId;
+    if (sessionId === previousActiveSessionId) return;
+    previousActiveSessionId = sessionId;
+    if (!sessionId) return;
+    // Fire-and-forget: rehydrateActiveRun guards internally against the
+    // session changing again while its fetch is in flight.
+    void useExecutionStore.getState().rehydrateActiveRun(sessionId);
+  });
+
+  const VALIDATION_MSG_ID = "system-validation-current";
+
+  unsubscribeExecution = useExecutionStore.subscribe((state) => {
+    const result = state.validationResult;
+    if (!result) {
+      previousValidationFingerprint = null;
+      return;
+    }
+
+    if (
+      inflightValidateTarget !== null &&
+      inflightValidateTarget.sessionId !== useSessionStore.getState().activeSessionId
+    ) {
+      return;
+    }
+
+    const fingerprint = validationFingerprint(result);
+    // Content guard: fire only when the validation outcome changes, not when
+    // the same result is re-created as a fresh object during hydration or
+    // auto-validation refreshes.
+    if (fingerprint === previousValidationFingerprint) return;
+    previousValidationFingerprint = fingerprint;
+
+    // Structural-incompleteness guard: when the backend reports the
+    // ``empty_pipeline`` outcome (nothing built yet, e.g. immediately after
+    // exit_to_freeform) or a partial ``missing_source`` / ``missing_sink``
+    // outcome (a normal mid-build step), keep that state silent instead of
+    // injecting a local "fix these errors" message — the rail strip carries
+    // the plain-language guidance. The fingerprint update above stays so a
+    // later, genuinely-actionable failure with a different fingerprint still
+    // surfaces.
+    if (isEmptyPipelineResult(result) || isIncompletePipelineResult(result)) return;
+
+    const sessionStore = useSessionStore.getState();
+
+    if (isPendingInterpretationReviewResult(result)) {
+      previousWasPendingReview = true;
+      // Human-centric, not a dump of the raw validation blockers: the review
+      // cards above already describe each item in plain language, so this
+      // message just orients the user toward them. The per-blocker detail
+      // strings (validation.py) are machine-facing and would read as error
+      // extracts here.
+      const count = result.readiness.blockers.filter(
+        (blocker) => blocker.code === "interpretation_review_pending",
+      ).length;
+      const pendingMap =
+        useInterpretationEventsStore.getState().pendingBySession[
+          sessionStore.activeSessionId ?? ""
+        ];
+      const pendingKinds =
+        pendingMap === undefined
+          ? []
+          : Object.values(pendingMap).map((event) => event.kind);
+      const instruction = pendingControlsInstruction(
+        characterisePendingControls(pendingKinds),
+        (label) => `**${label}**`,
+      );
+      // One vocabulary for one action (ux-review 2026-08-13): the click
+      // records an attestation, so the prose says "sign-off"/"acknowledged"
+      // throughout rather than mixing "okay", "Acknowledge" and "approved".
+      // "approved" in particular was the lowercase form of a DIFFERENT
+      // control's name (Approve), which all-vague_term sets never render.
+      const pickSingular =
+        instruction ?? "use the buttons on the card to resolve it";
+      const pickPlural =
+        instruction === null
+          ? "use the buttons on each card to resolve them"
+          : `${instruction} for each`;
+      const message =
+        count === 1
+          ? "I made one choice while building this that needs your sign-off. " +
+            `Check the card above and ${pickSingular} — then your pipeline's ` +
+            "ready to run."
+          : `I made ${count} choices while building this that need your sign-off. ` +
+            `Check the cards above and ${pickPlural} — once every card is ` +
+            "acknowledged, your pipeline's ready to run.";
+      sessionStore.injectSystemMessage(message, VALIDATION_MSG_ID);
+      return;
+    }
+
+    if (!result.is_valid && result.errors.length > 0) {
+      previousWasPendingReview = false;
+      const phraseFor = makePhraseFor(sessionStore.compositionState);
+      const lines = ["**Validation failed** — fix the following errors before running:"];
+      for (const err of result.errors) {
+        lines.push(
+          humanisedValidationBullet(humaniseExecutionError(err, phraseFor), err.component_id ?? null, err.component_type ?? null, phraseFor),
+        );
+      }
+      sessionStore.injectSystemMessage(lines.join("\n"), VALIDATION_MSG_ID);
+    } else if (result.is_valid && result.warnings && result.warnings.length > 0) {
+      previousWasPendingReview = false;
+      const phraseFor = makePhraseFor(sessionStore.compositionState);
+      const lines = ["**Validation passed with warnings:**"];
+      for (const warn of result.warnings) {
+        lines.push(
+          humanisedValidationBullet(humaniseValidationWarning(warn), warn.component_id ?? null, warn.component_type ?? null, phraseFor),
+        );
+      }
+      sessionStore.injectSystemMessage(lines.join("\n"), VALIDATION_MSG_ID);
+    } else if (result.is_valid && previousWasPendingReview) {
+      // The user just resolved the last pending interpretation review and the
+      // pipeline is otherwise clean. Replace the now-stale "needs your
+      // sign-off" message (same VALIDATION_MSG_ID) with a clear next step —
+      // the Run control lives away from the chat where the user's attention
+      // is, so NAME THE CONTROL. Deliberately no locative (was "in the side
+      // panel"): a place word is a second thing that can contradict the
+      // layout, which is the elspeth-eba8820005 defect class, and the control
+      // name "Run pipeline" is unique and searchable on its own. Gated on
+      // previousWasPendingReview so ordinary mid-compose valid results stay
+      // quiet.
+      previousWasPendingReview = false;
+      sessionStore.injectSystemMessage(
+        "Every card acknowledged — your pipeline's ready. Select " +
+          "**Run pipeline** to start it.",
+        VALIDATION_MSG_ID,
+      );
+    }
+  });
+
+  unsubscribeAutoValidate = useSessionStore.subscribe((state) => {
+    const sessionId = state.activeSessionId;
+    const version = state.compositionState?.version ?? null;
+    if (!sessionId || version === null) return;
+    if (!hasCompositionContent(state.compositionState)) return;
+    if (lastValidatedVersionBySession.get(sessionId) === version) return;
+    const exec = useExecutionStore.getState();
+    if (exec.isExecuting || exec.progress?.status === "running") return;
+
+    // Content-equal carry-forward: a verdict that LANDED for this exact
+    // content is carried to the new version instead of re-POSTing /validate.
+    //
+    // "Landed" is the load-bearing half — `lastValidatedVersionBySession`
+    // holding the snapshot's own version. Without it this would swallow the
+    // deliberate retry of a version whose validate FAILED or was suppressed:
+    // that path leaves the cache empty precisely so a re-fire validates
+    // again, and there is no verdict to carry forward from it.
+    //
+    // Advancing the cache is what makes the skip safe to repeat — a LATER
+    // version with genuinely different content still misses it and validates.
+    // This subscriber owns that map, so the advance lives here and nowhere
+    // else.
+    const carriedVerdict =
+      previousValidatedSnapshot !== null &&
+      lastValidatedVersionBySession.get(sessionId) ===
+        previousValidatedSnapshot.version &&
+      isContentOnlyVersionBump(
+        previousValidatedSnapshot,
+        sessionId,
+        state.compositionState,
+      );
+    previousValidatedSnapshot = {
+      sessionId,
+      version,
+      state: state.compositionState,
+    };
+    if (carriedVerdict) {
+      lastValidatedVersionBySession.set(sessionId, version);
+      return;
+    }
+
+    pendingValidateTarget = { sessionId, version, force: false };
+    if (validateInflight) return;
+    void fireValidateLoop();
+  });
+
+  // Auth identity subscription — clears per-user caches on logout or user
+  // switch (same tab, different user). The subscription wiring itself is not
+  // torn down; only the per-user state is cleared so the next user starts
+  // fresh. `previousAuthFingerprint` is function-scoped so it is re-captured
+  // fresh on every `initStoreSubscriptions()` call, which is what the test
+  // seam in `_resetSubscriptionsForTesting` requires.
+  let previousAuthFingerprint = authIdentityFingerprint(useAuthStore.getState());
+  unsubscribeAuth = useAuthStore.subscribe((state) => {
+    const fingerprint = authIdentityFingerprint(state);
+    if (fingerprint === previousAuthFingerprint) return;
+    previousAuthFingerprint = fingerprint;
+    resetPerUserState();
+  });
+}
+
+async function fireValidateLoop(): Promise<void> {
+  validateInflight = true;
+  try {
+    while (pendingValidateTarget !== null) {
+      const target = pendingValidateTarget;
+      const execState = useExecutionStore.getState();
+      if (execState.isExecuting || execState.progress?.status === "running") {
+        pendingValidateTarget = null;
+        break;
+      }
+      if (target.sessionId !== useSessionStore.getState().activeSessionId) {
+        pendingValidateTarget = null;
+        break;
+      }
+      if (
+        !target.force &&
+        lastValidatedVersionBySession.get(target.sessionId) === target.version
+      ) {
+        pendingValidateTarget = null;
+        break;
+      }
+
+      // FRAGILE: clear pending before awaiting validate() so any newer
+      // compositionState.version that arrives during the await is re-queued
+      // by the subscription and picked up by the next loop iteration.
+      pendingValidateTarget = null;
+      inflightValidateTarget = target;
+      try {
+        const validationApplied = await useExecutionStore
+          .getState()
+          .validate(target.sessionId, { expectedVersion: target.version });
+        if (validationApplied !== false) {
+          lastValidatedVersionBySession.set(target.sessionId, target.version);
+          lastPostedValidateVersionBySession.set(
+            target.sessionId,
+            target.version,
+          );
+        }
+      } finally {
+        inflightValidateTarget = null;
+      }
+    }
+  } finally {
+    validateInflight = false;
+  }
+}
+
+/**
+ * Manual validate request. Reuses the auto-validation queue and live-run
+ * guards, but deliberately bypasses the same-version cache: a visible user
+ * action must perform validation rather than silently no-op. Use this from
+ * buttons, keyboard shortcuts, and command-palette actions instead of calling
+ * useExecutionStore.validate() directly.
+ *
+ * Skips validate when the active composition has no source, transforms,
+ * or outputs. This mirrors the auto-validate subscription guard so that
+ * keyboard / command-palette triggers cannot land the structured
+ * ``empty_pipeline`` failure on a session immediately after
+ * ``exit_to_freeform`` (where the composition_state version increments
+ * but content is empty).
+ */
+export function requestValidate(sessionId: string, version: number): void {
+  if (!forcedValidateAllowed()) return;
+  enqueueForcedValidate(sessionId, version);
+}
+
+/** Guards shared by every forced entry: content present, no live run. */
+function forcedValidateAllowed(): boolean {
+  if (!hasCompositionContent(useSessionStore.getState().compositionState)) {
+    return false;
+  }
+  const exec = useExecutionStore.getState();
+  return !(exec.isExecuting || exec.progress?.status === "running");
+}
+
+function enqueueForcedValidate(sessionId: string, version: number): void {
+  pendingValidateTarget = { sessionId, version, force: true };
+  if (validateInflight) return;
+  void fireValidateLoop();
+}
+
+/**
+ * Post-resolve validate request, registered with validationRequests.ts so
+ * sessionStore.applyResolvedInterpretation can reach the queue without
+ * importing this module. Same guards as requestValidate (an empty
+ * composition has nothing to gate; a resolve during a live run does not
+ * re-validate mid-run, matching the auto-validate subscriber).
+ *
+ * Accept/amend (`mintedVersion`): the backend always mints `version += 1`,
+ * and publishing it already fired the auto-validate subscriber above, which
+ * has that version in flight. A request for a version the resolve itself
+ * minted can only have been issued after the resolve committed, so its
+ * verdict already reflects the resolved review — forcing a repeat is the
+ * duplicate POST this path exists to avoid (likewise once such a POST has
+ * landed; see mintedVersionAlreadyValidated). When it is NOT in flight (the
+ * subscriber carried a content-equal verdict forward, or it is merely
+ * pending behind another version) the forced entry still queues it, so the
+ * Run gate is re-checked against the post-resolve server state.
+ *
+ * Opt-out (`!mintedVersion`): no state is minted and the version is
+ * unchanged, so the same-version cache would skip; `force` overrides it.
+ * An in-flight request for this version may predate the opt-out, so it is
+ * never treated as covering it.
+ */
+function requestValidateAfterResolve({
+  sessionId,
+  version,
+  mintedVersion,
+}: ResolveValidateRequest): void {
+  if (!forcedValidateAllowed()) return;
+  if (mintedVersion && mintedVersionAlreadyValidated(sessionId, version)) {
+    return;
+  }
+  enqueueForcedValidate(sessionId, version);
+}
+
+/**
+ * True when a /validate POST for a version minted by a committed server
+ * mutation (resolve accept/amend, YAML import) is in flight or has landed.
+ * Such a POST can only have been issued after the mutation committed, so its
+ * verdict already reflects it; forcing another is a duplicate. A verdict that
+ * was merely CARRIED to this version (content-equal predecessor, no POST) is
+ * not covered — it predates the mutation.
+ */
+function mintedVersionAlreadyValidated(
+  sessionId: string,
+  version: number,
+): boolean {
+  if (
+    inflightValidateTarget !== null &&
+    inflightValidateTarget.sessionId === sessionId &&
+    inflightValidateTarget.version === version
+  ) {
+    return true;
+  }
+  return lastPostedValidateVersionBySession.get(sessionId) === version;
+}
+
+/**
+ * Post-import validate request (ImportYamlModal). Call once the import's
+ * session refetch (selectSession) has published the imported head. The
+ * import minted that version server-side, so this is the minted-version
+ * entry: a POST the auto-validate subscriber already has in flight (or has
+ * landed) for it covers the import; otherwise — the import's content equals
+ * the previous head's and the subscriber carried that verdict forward — it
+ * is queued forced so the post-import banner reflects the server's verdict.
+ * Same guards as requestValidate. A no-op when the user has moved to another
+ * session or the refetch published no composition.
+ */
+export function requestValidateAfterImport(sessionId: string): void {
+  const sessionState = useSessionStore.getState();
+  if (sessionState.activeSessionId !== sessionId) return;
+  const version = sessionState.compositionState?.version ?? null;
+  if (version === null) return;
+  if (!forcedValidateAllowed()) return;
+  if (mintedVersionAlreadyValidated(sessionId, version)) return;
+  enqueueForcedValidate(sessionId, version);
+}
+
+/**
+ * Test-only helper. Resets the module-level state so each test starts from
+ * a clean slate. Unsubscribes the active zustand subscriber so stale
+ * callbacks do not accumulate across beforeEach resets. Not exported from
+ * any index barrel.
+ */
+export function _resetSubscriptionsForTesting(): void {
+  unsubscribe?.();
+  unsubscribe = null;
+  unsubscribeExecution?.();
+  unsubscribeExecution = null;
+  unsubscribeAutoValidate?.();
+  unsubscribeAutoValidate = null;
+  unsubscribeAuth?.();
+  unsubscribeAuth = null;
+  unsubscribeRunRehydration?.();
+  unsubscribeRunRehydration = null;
+  previousActiveSessionId = null;
+  previousVersion = null;
+  previousClearSnapshot = null;
+  previousValidatedSnapshot = null;
+  previousValidationFingerprint = null;
+  previousWasPendingReview = false;
+  previousSessionIds = new Set();
+  lastValidatedVersionBySession.clear();
+  lastPostedValidateVersionBySession.clear();
+  pendingValidateTarget = null;
+  validateInflight = false;
+  inflightValidateTarget = null;
+  registerResolveValidateRequester(null);
+  initialized = false;
+}

@@ -1,0 +1,87 @@
+mode=container_reservation; repository=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src/elspeth/web/coordination/repository.py; no checkout edits
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 1 item
+
+tests/unit/web/blobs/test_mutation_admission_quota.py F                  [100%]
+
+=================================== FAILURES ===================================
+_ test_output_reservation_excess_is_charged_once_by_every_admission_bound[container-partial] _
+
+db_engine = Engine(sqlite:///:memory:)
+session_id = UUID('380cf3ba-5280-4aed-a8cf-dd5523cccabf')
+compose_context = SessionOperationContext(fence=SessionOperationFence(session_id='380cf3ba-5280-4aed-a8cf-dd5523cccabf', operation_id='0...token='673999dfde3e47c68c026008ad18cbdc', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>)
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-105/test_output_reservation_excess0')
+coverage = 'partial', binding = 'container'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("coverage", ["unmatched", "partial", "full"])
+    @pytest.mark.parametrize("binding", ["session", "identity", "container"])
+    async def test_output_reservation_excess_is_charged_once_by_every_admission_bound(
+        db_engine, session_id, compose_context, tmp_path, coverage, binding
+    ):
+        recorder, url = _durable_recorder(tmp_path)
+        authority = SQLiteLocalSessionOperationAuthority(db_engine, quota_exceeded_recorder=recorder.record_quota_exceeded)
+        service = BlobServiceImpl(db_engine, tmp_path, session_operation_authority=authority)
+        run_id = await service_fixtures._seed_active_run(
+            db_engine, session_id, session_operation_context=compose_context, source=service_fixtures._RUN_SOURCE, status="completed"
+        )
+        execute = seed_live_operation_context(db_engine, session_id, operation_kind=SessionOperationKind.EXECUTE)
+        record = service_fixtures._pending_output_record(service, session_id, "quota.csv")
+    
+        def reserve_output(transaction):
+            transaction.blobs.reserve_pending_output_blob(record=record)
+            transaction.blobs.insert_blob_run_link(blob_id=record.id, run_id=UUID(run_id), direction="output")
+    
+        authority.mutate(execute, reserve_output)
+        reservation_size = {"unmatched": 5, "partial": 5, "full": 3}[coverage]
+        authority.mutate(
+            execute,
+            lambda transaction: transaction.blobs.reserve_run_output_storage(
+                run_id=UUID(run_id),
+                target_path=str(tmp_path / "unmatched.csv") if coverage == "unmatched" else record.storage_path,
+                size_bytes=reservation_size,
+                max_storage_per_session=1000,
+            ),
+        )
+        _atomic_write_blob(Path(record.storage_path), b"old", write_guard=lambda: authority.compare_and_swap(execute))
+        record = authority.mutate(
+            execute,
+            lambda transaction: transaction.blobs.mark_run_output_blob_ready(
+                run_id=UUID(run_id),
+                blob_id=record.id,
+                size_bytes=3,
+                content_hash=content_hash(b"old"),
+                max_storage_per_session=1000,
+            ),
+        )
+        operation = seed_live_compose_context(db_engine, session_id)
+        _policies(db_engine, cap=6 if binding == "identity" else 1000, ceiling=6 if binding == "container" else 1000)
+        context = replace(
+            admission._context(service, db_engine, operation, tmp_path),
+            user_message_content="larger",
+            max_blob_storage_per_session_bytes=6 if binding == "session" else 1000,
+        )
+        before = admission._resources(db_engine, tmp_path / "blobs")
+        result = admit_blob_mutation("update_blob", {"blob_id": str(record.id), "content": "larger"}, admission._empty_state(), context)
+>       assert (result is None) is (coverage == "full")
+E       AssertionError: assert (None is None) is ('partial' == 'full'
+E         
+E         - full
+E         + partial)
+
+tests/unit/web/blobs/test_mutation_admission_quota.py:177: AssertionError
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/_pytest/config/__init__.py:1309
+  /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/lib/python3.12/site-packages/_pytest/config/__init__.py:1309: PytestAssertRewriteWarning: Module already imported so cannot be rewritten; anyio
+    self._mark_plugins_for_rewrite(hook, disable_autoload)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/unit/web/blobs/test_mutation_admission_quota.py::test_output_reservation_excess_is_charged_once_by_every_admission_bound[container-partial]
+========================= 1 failed, 1 warning in 0.48s =========================

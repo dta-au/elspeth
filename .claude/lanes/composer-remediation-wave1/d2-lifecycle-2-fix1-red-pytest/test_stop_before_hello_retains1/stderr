@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/tests/helpers/portable_supervisor_probe.py", line 340, in <module>
+    raise SystemExit(child(directory, mode))
+                     ^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/tests/helpers/portable_supervisor_probe.py", line 191, in child
+    connection = connect_supervisor()
+                 ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/src/elspeth/composer_mcp/portable_bootstrap.py", line 98, in connect_supervisor
+    reply = exchange_sync(channel, hello)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/src/elspeth/composer_mcp/portable_bootstrap.py", line 67, in exchange_sync
+    raise WatchdogProtocolError("Unexpected Composer bootstrap frame")
+elspeth.contracts.process_watchdog_wire.WatchdogProtocolError: Unexpected Composer bootstrap frame

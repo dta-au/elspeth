@@ -1,0 +1,17 @@
+16	5	src/elspeth/composer_mcp/__init__.py
+39	6	src/elspeth/composer_mcp/portable_supervisor.py
+29	96	src/elspeth/composer_mcp/server.py
+62	0	src/elspeth/web/async_workers.py
+15	0	src/elspeth/web/required_executor.py
+5	0	tests/conftest.py
+4	0	tests/fixtures/required_executor.py
+4	2	tests/unit/composer_mcp/test_server.py
+40	0	docs/guides/composer-mcp-lifecycle.md
+62	0	src/elspeth/composer_mcp/runner.py
+78	0	src/elspeth/composer_mcp/standalone.py
+239	0	tests/helpers/composer_lifecycle_probe.py
+143	0	tests/helpers/composer_parent_death_probe.py
+128	0	tests/helpers/composer_stdio_ownership_probe.py
+187	0	tests/helpers/composer_stdio_probe.py
+373	0	tests/unit/composer_mcp/test_standalone_lifecycle.py
+71	0	tests/unit/web/test_async_worker_settlement.py

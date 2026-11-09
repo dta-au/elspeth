@@ -1,0 +1,866 @@
+"""TypedDict definitions for MCP server return types.
+
+These TypedDicts give static structure to the dicts returned by
+LandscapeAnalyzer methods. At runtime they are plain dicts and
+serialize identically via json.dumps() -- the MCP wire format is
+unchanged. mypy uses them to verify that return structures match.
+
+Follows the naming convention from tui/types.py:
+  - {Noun}Record   -- items in a list (SQL row projections)
+  - {Noun}Detail   -- dataclass_to_dict conversions (audit entities)
+  - {Noun}Report   -- aggregate / analysis single-dict returns
+
+Design decisions:
+  - ``total=False`` + ``Required[]`` when some keys are conditionally present
+  - ``dict[str, Any]`` for genuinely dynamic sub-structures
+    (outcome distributions, per-plugin stats, dataclass-converted nested objects)
+  - Functional TypedDict form for ``DAGEdge`` (``"from"`` is a Python keyword)
+"""
+
+from typing import Any, Literal, Required, TypedDict
+
+from elspeth.contracts import OPERATION_TYPE_VALUES as OPERATION_TYPE_VALUES
+from elspeth.contracts import OperationType
+from elspeth.contracts.export_records import (
+    SinkEffectAttemptExportRecord,
+    SinkEffectExportRecord,
+    SinkEffectMemberExportRecord,
+)
+
+RunStatusValue = Literal["running", "completed", "completed_with_failures", "failed", "empty", "interrupted"]
+ExportStatusValue = Literal["pending", "completed", "failed"]
+OperationTypeValue = OperationType
+OperationStatusValue = Literal["open", "completed", "failed", "pending"]
+OPERATION_STATUS_VALUES: tuple[OperationStatusValue, ...] = ("open", "completed", "failed", "pending")
+CallTypeValue = Literal["llm", "http", "http_redirect", "sql", "vector", "filesystem"]
+CallStatusValue = Literal["success", "error"]
+NodeStateStatusValue = Literal["open", "pending", "completed", "failed"]
+NodeTypeValue = Literal["source", "transform", "gate", "aggregation", "coalesce", "row_union", "collector", "queue", "sink"]
+RoutingModeValue = Literal["move", "copy", "divert"]
+DAGFlowTypeValue = Literal["normal", "divert"]
+SchemaModeValue = Literal["fixed", "flexible", "observed", "parse"]
+ContractModeValue = Literal["FIXED", "FLEXIBLE", "OBSERVED"]
+ContractViolationTypeValue = Literal["type_mismatch", "missing_field", "extra_field"]
+DiagnosticSeverityValue = Literal["CRITICAL", "WARNING", "INFO"]
+DiagnosticStatusValue = Literal["OK", "WARNING", "CRITICAL"]
+DivertTypeValue = Literal["quarantine", "error"]
+
+
+class RunRecord(TypedDict):
+    """A run record as returned by ``list_runs``."""
+
+    run_id: str
+    status: RunStatusValue
+    started_at: str | None
+    completed_at: str | None
+    config_hash: str
+    export_status: ExportStatusValue | None
+
+
+class RowRecord(TypedDict):
+    """A source row record as returned by ``list_rows``."""
+
+    row_id: str
+    run_id: str
+    source_node_id: str
+    row_index: int
+    source_row_index: int
+    ingest_sequence: int
+    source_data_hash: str
+    source_data_ref: str | None
+    created_at: str | None
+
+
+class LineageFrameEntry(TypedDict):
+    """One lineage-path frame (spec §4.1) as projected on an MCP read surface.
+
+    ``depth`` is the frame's position on the path, outermost first (0-indexed).
+    """
+
+    depth: int
+    kind: str
+    group_id: str
+    member_key: str
+
+
+class TokenRecord(TypedDict):
+    """A token record as returned by ``list_tokens``.
+
+    ``branch_name``/``fork_group_id``/``expand_group_id`` are DERIVED from
+    ``lineage_path`` (ruling 21, ratified 2026-08-22) — never a stored-column
+    read. They stay on the wire for backward compatibility.
+    """
+
+    token_id: str
+    row_id: str
+    branch_name: str | None
+    fork_group_id: str | None
+    join_group_id: str | None
+    step_in_pipeline: int | None
+    expand_group_id: str | None
+    lineage_path: list[LineageFrameEntry]
+    created_at: str | None
+
+
+class GroupRecordEntry(TypedDict):
+    """A group roster record as returned by ``list_group_records``.
+
+    Minted at the opening operation for EVERY expansion, empty ones
+    included (spec §4.3); deliberately binding-blind — boundness is a
+    config fact, never a durable column.
+    """
+
+    group_id: str
+    kind: str
+    opener_token_id: str
+    member_count: int
+    created_at: str | None
+
+
+class GroupLossEntry(TypedDict):
+    """A group-loss ledger row as returned by ``list_group_losses``.
+
+    The ledger is append-only; ``adopted_epoch`` is a leader replay
+    cursor, never a truth filter (spec §6.2) — the projection surfaces
+    adopted and unadopted rows alike.
+    """
+
+    loss_id: str
+    closer_name: str
+    group_id: str
+    member_key: str
+    token_id: str
+    reason: str
+    recorded_by: str
+    recorded_at: str | None
+    adopted_epoch: int | None
+
+
+class TokenChildRecord(TypedDict):
+    """Forward lineage record: what child tokens were created from a parent.
+
+    Used by ``get_token_children`` to trace what a COALESCED parent merged into.
+    The child_token_id is the merged token; ordinal is this parent's position
+    in the merge (0-indexed).
+    """
+
+    child_token_id: str
+    """The token created from this parent (e.g., the coalesced result)."""
+
+    parent_token_id: str
+    """The parent token being queried."""
+
+    ordinal: int
+    """This parent's position in the child's parent list (0-indexed)."""
+
+
+class OperationRecord(TypedDict):
+    """A source/sink operation record as returned by ``list_operations``."""
+
+    operation_id: str
+    run_id: str
+    node_id: str
+    plugin_name: str
+    operation_type: OperationTypeValue
+    sink_effect_id: str | None
+    status: OperationStatusValue
+    started_at: str | None
+    completed_at: str | None
+    duration_ms: float | None
+    error_message: str | None
+
+
+class ArtifactRecord(TypedDict):
+    """A sink artifact record as returned by ``list_artifacts``."""
+
+    artifact_id: str
+    run_id: str
+    sink_node_id: str
+    producer_kind: Literal["node_state", "sink_effect"]
+    produced_by_state_id: str | None
+    sink_effect_id: str | None
+    artifact_type: str
+    path_or_uri: str
+    content_hash: str
+    size_bytes: int
+    idempotency_key: str | None
+    publication_performed: bool
+    publication_evidence_kind: Literal["returned", "reconciled", "inherited", "virtual", "legacy_returned"]
+    created_at: str
+
+
+class SinkEffectHistoryReport(TypedDict):
+    """Operator-safe lifecycle, member progress, and call history."""
+
+    effect: SinkEffectExportRecord
+    members: list[SinkEffectMemberExportRecord]
+    attempts: list[SinkEffectAttemptExportRecord]
+    member_progress: dict[str, int]
+    response_lost_attempts: int
+    operator_guidance: str
+
+
+class OperationCallRecord(TypedDict):
+    """A call made during a source/sink operation (``get_operation_calls``)."""
+
+    call_id: str
+    operation_id: str
+    call_index: int
+    call_type: CallTypeValue
+    status: CallStatusValue
+    latency_ms: float | None
+    request_hash: str
+    response_hash: str | None
+    approved_prompt_artifact_hash: str | None
+    created_at: str | None
+
+
+class NodeStateRecord(TypedDict, total=False):
+    """A node state record as returned by ``get_node_states``.
+
+    Core fields are always present. Context fields (context_after, error,
+    success_reason) are included only when ``include_context=True``.
+    """
+
+    # Always present
+    state_id: Required[str]
+    token_id: Required[str]
+    node_id: Required[str]
+    step_index: Required[int]
+    attempt: Required[int]
+    status: Required[NodeStateStatusValue]
+    input_hash: Required[str]
+    output_hash: str | None
+    duration_ms: float | None
+    started_at: str | None
+    completed_at: str | None
+
+    # Optional context fields (when include_context=True)
+    context_after: dict[str, Any] | None
+    error: dict[str, Any] | None
+    success_reason: dict[str, Any] | None
+
+
+class CollisionValueFingerprint(TypedDict):
+    """Historical summary of a branch value involved in a coalesce collision."""
+
+    value_hash: str
+    value_type: str
+
+
+class CollisionFieldRecord(TypedDict):
+    """Details of a single field collision during coalesce.
+
+    When the coalesce node status is FAILED (e.g., union_collision_policy='fail'),
+    ``winner_branch`` and ``winner_value_fingerprint`` are None because no winner
+    was selected.
+    """
+
+    field: str
+    """Field name where collision occurred."""
+
+    contributing_branches: list[str]
+    """Branches that supplied the field, in configured merge order."""
+
+    winner_branch: str | None
+    """Branch whose value was kept (last_wins or first_wins), or None if merge failed."""
+
+    winner_value_fingerprint: CollisionValueFingerprint | None
+    """Historical fingerprint of the winning value; None for current records or failed merges."""
+
+    competing_value_fingerprints: list[tuple[str, CollisionValueFingerprint]]
+    """Historical fingerprints in merge order; empty for current branch-only records."""
+
+
+class CollisionRecord(TypedDict):
+    """A collision event from a coalesce merge operation.
+
+    Returned by ``list_collisions`` for quick identification of merge conflicts.
+    When ``status`` is FAILED, the merge aborted and no winner was selected.
+    """
+
+    run_id: str
+    token_id: str
+    node_id: str
+    plugin_name: str
+    status: NodeStateStatusValue
+    """Node state status: COMPLETED if merge succeeded, FAILED if it aborted."""
+    completed_at: str | None
+    collision_fields: list[CollisionFieldRecord]
+    union_field_origins: dict[str, str]
+    """Field name → originating branch for all union-merged fields."""
+
+
+# Dataclass mirror types: dict[str, Any] aliases for dataclass_to_dict() projections.
+#
+# These are NOT TypedDicts. Each is `dict[str, Any]` wearing a descriptive name, so an
+# annotation like `-> RunDetail | None` reads as typed while carrying no field contract
+# at all. Say so plainly rather than letting the name do the talking.
+#
+# Each alias projects exactly ONE owned dataclass — not a variant family (measured
+# 2026-09-04: run_lifecycle.get_run -> `Run | None`, data_flow.get_nodes -> `list[Node]`,
+# query.get_calls -> `list[Call]`; all three defined in contracts/audit.py). They stay
+# soft because `dataclass_to_dict` (core/landscape/serialization.py:56) builds a recursive
+# JSON projection, and a hand-written TypedDict would duplicate the dataclass's field list
+# with nothing pinning the copies equal. The fix is a DERIVED mirror or serializing at the
+# MCP boundary, not a second hand-maintained declaration.
+#
+# config/cicd/contracts-whitelist.yaml carries the six affected returns and this rationale.
+
+RunDetail = dict[str, Any]
+"""Run detail dict from ``dataclass_to_dict(Run)``."""
+
+NodeDetail = dict[str, Any]
+"""Node detail dict from ``dataclass_to_dict(Node)``."""
+
+CallDetail = dict[str, Any]
+"""Call detail dict from ``dataclass_to_dict(Call)``."""
+
+
+class RunSummaryCounts(TypedDict):
+    """Count sub-dict inside ``RunSummaryReport``."""
+
+    rows: int
+    tokens: int
+    nodes: int
+    node_states: int
+    operations: int
+    source_loads: int
+    sink_writes: int
+    runtime_preflights: int
+    collector_groups_failed: int
+
+
+class RunSummaryErrors(TypedDict):
+    """Error count sub-dict inside ``RunSummaryReport``.
+
+    ``validation`` counts ``validation_errors`` rows (a source row that failed
+    validation has no token). ``transform`` counts tokens whose terminal
+    outcome is a failure decided by a transform error. It does not count
+    ``transform_errors`` rows, which record attempts: a resumed attempt can
+    fail again (a second row) or succeed and deliver the row (a row for a
+    token that did not fail).
+
+    ``collector_group`` counts tokens whose collector group FAILED as a whole,
+    each once (M in ``core/landscape/terminal_transform_failures.py``). It is
+    disjoint from ``transform`` by terminal path, so ``total`` is the sum of
+    all three. Failed GROUPS are ``counts.collector_groups_failed`` (G), a
+    different unit that no error total includes.
+    """
+
+    validation: int
+    transform: int
+    collector_group: int
+    total: int
+
+
+class OutcomeDistributionEntry(TypedDict):
+    """Single entry in outcome distribution (ADR-019 two-axis terminal model)."""
+
+    outcome: str | None
+    path: str
+    completed: bool
+    count: int
+
+
+class RunSummaryReport(TypedDict):
+    """Return type for ``get_run_summary``."""
+
+    run_id: str
+    status: RunStatusValue
+    started_at: str | None
+    completed_at: str | None
+    run_duration_seconds: float | None
+    counts: RunSummaryCounts
+    errors: RunSummaryErrors
+    outcome_distribution: list[OutcomeDistributionEntry]
+    avg_state_duration_ms: float | None
+
+
+class DAGNode(TypedDict):
+    """A node in the DAG structure."""
+
+    node_id: str
+    plugin_name: str
+    node_type: NodeTypeValue
+    sequence: int | None
+
+
+# Functional form because "from" is a Python keyword
+DAGEdge = TypedDict(
+    "DAGEdge",
+    {
+        "from": str,
+        "to": str,
+        "label": str,
+        "mode": RoutingModeValue,
+        "flow_type": DAGFlowTypeValue,
+    },
+)
+
+
+class DAGStructureReport(TypedDict):
+    """Return type for ``get_dag_structure``."""
+
+    run_id: str
+    nodes: list[DAGNode]
+    edges: list[DAGEdge]
+    node_count: int
+    edge_count: int
+    terminal_sink_map: dict[str, str]
+    mermaid: str
+
+
+class NodePerformance(TypedDict):
+    """Per-node performance statistics."""
+
+    node_id: str
+    plugin: str
+    type: NodeTypeValue
+    executions: int
+    avg_ms: float | None
+    min_ms: float | None
+    max_ms: float | None
+    total_ms: float | None
+    pct_of_total: float
+    failures: int
+
+
+class PerformanceReport(TypedDict):
+    """Return type for ``get_performance_report``."""
+
+    run_id: str
+    total_processing_time_ms: float
+    node_count: int
+    bottlenecks: list[NodePerformance]
+    high_variance_nodes: list[NodePerformance]
+    node_performance: list[NodePerformance]
+
+
+class ValidationErrorGroup(TypedDict):
+    """Validation error group by source plugin."""
+
+    source_plugin: str
+    schema_mode: SchemaModeValue
+    count: int
+
+
+class TransformErrorGroup(TypedDict):
+    """Transform error group by transform plugin.
+
+    ``count`` is the number of tokens whose terminal outcome is a failure a
+    transform error at this plugin decided. It never counts ``transform_errors``
+    rows, which record attempts.
+    """
+
+    transform_plugin: str
+    count: int
+
+
+class ValidationErrorSummary(TypedDict):
+    """Validation errors sub-dict in ``ErrorAnalysisReport``."""
+
+    total: int
+    by_source: list[ValidationErrorGroup]
+    sample_data: list[dict[str, Any] | None]
+
+
+class TransformErrorSummary(TypedDict):
+    """Transform errors sub-dict in ``ErrorAnalysisReport``.
+
+    ``total`` and ``by_transform`` count terminally failed tokens, each at the
+    node whose transform error decided it. ``sample_details`` is ATTEMPT
+    evidence: up to five raw ``transform_errors`` rows. These may include an
+    attempt whose resumed retry succeeded, or an earlier attempt of a token
+    that failed again, so they are never a failure count.
+    """
+
+    total: int
+    by_transform: list[TransformErrorGroup]
+    sample_details: list[dict[str, Any] | None]
+
+
+class CollectorGroupFailureGroup(TypedDict):
+    """Failed collector groups at one collector node, under one recorded reason.
+
+    ``failure_reason`` is a ``CollectorGroupFailureReason`` code. ``groups``
+    counts group verdicts; ``member_tokens`` counts the tokens those groups
+    failed, and is 0 for a group no member reached.
+    """
+
+    collector_plugin: str
+    node_id: str
+    failure_reason: str
+    groups: int
+    member_tokens: int
+
+
+class CollectorGroupFailureSummary(TypedDict):
+    """Collector group failures sub-dict in ``ErrorAnalysisReport``.
+
+    ``groups_total`` is G (failed groups) and ``member_tokens_total`` is M
+    (the tokens they failed). There are no free-text samples: the flush
+    state's text is attempt evidence, and only the recorded reason code is
+    reported.
+    """
+
+    groups_total: int
+    member_tokens_total: int
+    by_collector: list[CollectorGroupFailureGroup]
+
+
+class ErrorAnalysisReport(TypedDict):
+    """Return type for ``get_error_analysis``."""
+
+    run_id: str
+    validation_errors: ValidationErrorSummary
+    transform_errors: TransformErrorSummary
+    collector_group_failures: CollectorGroupFailureSummary
+
+
+class LLMSummary(TypedDict):
+    """LLM call summary totals."""
+
+    total_calls: int
+    total_latency_ms: float
+    avg_latency_ms: float | None
+
+
+class LLMPluginStats(TypedDict):
+    """Per-plugin LLM statistics."""
+
+    total_calls: int
+    successful: int
+    failed: int
+    avg_latency_ms: float
+    total_latency_ms: float
+
+
+class LLMUsageReport(TypedDict, total=False):
+    """Return type for ``get_llm_usage_report``.
+
+    Uses ``total=False`` because the empty-case returns ``message``
+    instead of ``llm_summary`` / ``by_plugin``.
+    """
+
+    run_id: Required[str]
+    # Present when there are LLM calls
+    call_types: dict[str, int]  # dynamic call type names
+    llm_summary: LLMSummary
+    by_plugin: dict[str, LLMPluginStats]  # dynamic plugin names
+    # Present when there are NO LLM calls
+    message: str
+
+
+class OutcomeSummary(TypedDict):
+    """Outcome summary counts."""
+
+    terminal_tokens: int
+    non_terminal_tokens: int
+    fork_operations: int
+    join_operations: int
+    expand_operations: int
+
+
+class OutcomeAnalysisReport(TypedDict):
+    """Return type for ``get_outcome_analysis``."""
+
+    run_id: str
+    summary: OutcomeSummary
+    outcome_distribution: list[OutcomeDistributionEntry]
+    sink_distribution: dict[str, int]  # dynamic sink names
+
+
+class ColumnInfo(TypedDict):
+    """Column metadata from SQLAlchemy inspector."""
+
+    name: str
+    type: str
+    nullable: bool
+
+
+class ForeignKeyInfo(TypedDict):
+    """Foreign key metadata."""
+
+    columns: list[str]
+    references: str
+
+
+class TableInfo(TypedDict):
+    """Table metadata from SQLAlchemy inspector."""
+
+    columns: list[ColumnInfo]
+    primary_key: list[str]
+    foreign_keys: list[ForeignKeyInfo]
+
+
+class SchemaDescription(TypedDict):
+    """Return type for ``describe_schema``."""
+
+    tables: dict[str, TableInfo]  # dynamic table names
+    table_count: int
+    hint: str
+
+
+class ValidationErrorDetail(TypedDict):
+    """A single validation error in ``get_errors``."""
+
+    error_id: str
+    node_id: str | None
+    row_hash: str
+    row_data: dict[str, Any] | None
+    schema_mode: SchemaModeValue
+    created_at: str | None
+
+
+class TransformErrorDetail(TypedDict):
+    """A single transform error in ``get_errors``."""
+
+    error_id: str
+    token_id: str
+    transform_id: str
+    row_data: dict[str, Any] | None
+    error_details: dict[str, Any] | None
+    created_at: str | None
+
+
+class ErrorsReport(TypedDict, total=False):
+    """Return type for ``get_errors``.
+
+    Uses ``total=False`` because validation_errors and transform_errors
+    are conditionally present depending on the ``error_type`` parameter.
+    """
+
+    run_id: Required[str]
+    validation_errors: list[ValidationErrorDetail]
+    transform_errors: list[TransformErrorDetail]
+
+
+class DiagnosticProblem(TypedDict, total=False):
+    """A single problem in ``diagnose``.
+
+    Uses ``total=False`` because different problem types include
+    different fields (``run_ids``, ``runs``, ``operations``, ``count``).
+    """
+
+    severity: Required[DiagnosticSeverityValue]
+    type: Required[str]
+    message: Required[str]
+    count: int
+    run_ids: list[str]
+    runs: list[dict[str, Any]]
+    operations: list[dict[str, Any]]
+
+
+class RecentRunSummary(TypedDict):
+    """A recent run in the diagnose summary."""
+
+    run_id: str
+    status: RunStatusValue
+    started: str | None
+
+
+class DiagnosticReport(TypedDict):
+    """Return type for ``diagnose``."""
+
+    status: DiagnosticStatusValue
+    problems: list[DiagnosticProblem]
+    recent_runs: list[RecentRunSummary]
+    recommendations: list[str]
+    next_steps: list[str]
+
+
+class FailedNodeState(TypedDict):
+    """A failed node state in failure context."""
+
+    state_id: str
+    token_id: str
+    plugin: str
+    type: NodeTypeValue
+    step: int
+    attempt: int
+    started: str | None
+
+
+class FailureTransformError(TypedDict):
+    """A transform error in failure context."""
+
+    token_id: str
+    plugin: str
+    details: dict[str, Any] | None
+
+
+class FailureValidationError(TypedDict):
+    """A validation error in failure context."""
+
+    plugin: str | None
+    row_hash: str | None
+    sample_data: dict[str, Any] | None
+
+
+class FailurePatterns(TypedDict):
+    """Patterns identified in failure analysis.
+
+    ``failure_count``, ``transform_error_count`` and
+    ``validation_error_count`` are the lengths of the ``limit``-bounded record
+    listings beside them. Each counts sampled records, not failed tokens.
+    ``transform_errors`` in particular lists ATTEMPT evidence, which can
+    include an attempt whose resumed retry succeeded.
+    """
+
+    plugins_failing: list[str]
+    has_retries: bool
+    failure_count: int
+    transform_error_count: int
+    validation_error_count: int
+
+
+class FailureContextReport(TypedDict):
+    """Return type for ``get_failure_context``."""
+
+    run_id: str
+    run_status: RunStatusValue
+    failed_node_states: list[FailedNodeState]
+    transform_errors: list[FailureTransformError]
+    validation_errors: list[FailureValidationError]
+    patterns: FailurePatterns
+    next_steps: list[str]
+
+
+class RecentRunDetail(TypedDict):
+    """A run in the recent activity timeline."""
+
+    run_id: str
+    full_run_id: str
+    status: RunStatusValue
+    started: str | None
+    duration_seconds: float | None
+    rows_processed: int
+    node_executions: int
+
+
+class RecentActivityReport(TypedDict):
+    """Return type for ``get_recent_activity``."""
+
+    time_window_minutes: int
+    total_runs: int
+    status_summary: dict[str, int]  # dynamic status names
+    runs: list[RecentRunDetail]
+
+
+class ContractField(TypedDict):
+    """A field in the schema contract."""
+
+    normalized_name: str
+    original_name: str
+    python_type: str
+    required: bool
+    nullable: bool
+    source: str
+
+
+class RunContractReport(TypedDict):
+    """Return type for ``get_run_contract``."""
+
+    run_id: str
+    mode: ContractModeValue
+    locked: bool
+    fields: list[ContractField]
+    field_count: int
+    version_hash: str
+
+
+class FieldExplanation(TypedDict):
+    """Return type for ``explain_field``."""
+
+    run_id: str
+    normalized_name: str
+    original_name: str
+    python_type: str
+    required: bool
+    nullable: bool
+    source: str
+    contract_mode: ContractModeValue
+
+
+class ContractViolationRecord(TypedDict):
+    """A single contract violation."""
+
+    error_id: str
+    violation_type: ContractViolationTypeValue
+    normalized_field_name: str | None
+    original_field_name: str | None
+    expected_type: str | None
+    actual_type: str | None
+    error: str
+    schema_mode: SchemaModeValue
+    destination: str
+    created_at: str
+
+
+class ContractViolationsReport(TypedDict):
+    """Return type for ``list_contract_violations``."""
+
+    run_id: str
+    total_violations: int
+    violations: list[ContractViolationRecord]
+    limit: int
+
+
+class DivertSummary(TypedDict):
+    """Summary of a divert (quarantine/error routing)."""
+
+    diverted: bool
+    divert_type: DivertTypeValue
+    from_node: str
+    to_sink: str
+    edge_label: str
+    reason_hash: str | None
+
+
+class VerificationDecisionRecord(TypedDict):
+    """Persisted comparison evidence for one current-run external call."""
+
+    current_call_id: str
+    current_run_id: str
+    source_run_id: str
+    source_call_id: str | None
+    is_match: bool | None
+    differences_json: str
+    recorded_at: str
+
+
+class ExplainTokenResult(TypedDict):
+    """Return type for ``explain_token``.
+
+    Top-level keys are typed but deeply nested sub-structures
+    (routing_events items, node_states items) use ``dict[str, Any]``
+    because they come from ``dataclass_to_dict()`` on complex nested
+    dataclasses -- typing them fully would duplicate the entire audit
+    dataclass hierarchy.
+    """
+
+    token: dict[str, Any]
+    source_row: dict[str, Any]
+    node_states: list[dict[str, Any]]
+    routing_events: list[dict[str, Any]]
+    calls: list[dict[str, Any]]
+    parent_tokens: list[dict[str, Any]]
+    validation_errors: list[dict[str, Any]]
+    transform_errors: list[dict[str, Any]]
+    outcome: dict[str, Any] | None
+    divert_summary: DivertSummary | None
+    verification_decisions: list[VerificationDecisionRecord]
+
+
+class ErrorResult(TypedDict):
+    """Returned for early-exit ``{"error": "..."}`` paths."""
+
+    error: str
+
+
+class FieldNotFoundError(TypedDict):
+    """Returned when a field is not found in ``explain_field``."""
+
+    error: str
+    available_fields: list[str]

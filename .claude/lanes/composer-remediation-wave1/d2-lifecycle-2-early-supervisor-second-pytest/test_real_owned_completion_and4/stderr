@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/tests/helpers/portable_supervisor_probe.py", line 265, in <module>
+    raise SystemExit(child(directory, mode))
+                     ^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/tests/helpers/portable_supervisor_probe.py", line 144, in child
+    return raw_child(directory, mode)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/tests/helpers/portable_supervisor_probe.py", line 102, in raw_child
+    assert extra.recv(1) == b""
+           ^^^^^^^^^^^^^
+ConnectionResetError: [Errno 104] Connection reset by peer

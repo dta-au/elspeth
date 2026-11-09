@@ -1,0 +1,276 @@
+"""Type definitions for TUI data contracts.
+
+These TypedDicts define the exact shape of data passed between
+TUI components. Using direct field access (data["field"]) instead
+of .get() ensures missing fields fail loudly.
+
+Error and artifact display types follow the Tier 1 trust model:
+- After JSON parsing, data is validated and converted to typed structures
+- Display code accesses fields directly (crash on missing = bug)
+"""
+
+from typing import Any, Literal, Required, TypedDict
+
+from elspeth.contracts.audit import CallVerification
+
+
+class NodeInfo(TypedDict):
+    """Information about a single pipeline node."""
+
+    name: str
+    node_id: str | None
+    node_type: str
+
+
+class SourceInfo(TypedDict):
+    """Information about the pipeline source."""
+
+    name: str | None
+    node_id: str | None
+
+
+class TuiArtifactInfo(TypedDict):
+    """Artifact evidence attached to a focused token outcome."""
+
+    artifact_id: str
+    artifact_type: str
+    path_or_uri: str
+    content_hash: str
+    size_bytes: int
+    sink_node_id: str
+    producer_kind: Literal["node_state", "sink_effect"]
+    produced_by_state_id: str | None
+    sink_effect_id: str | None
+    publication_performed: bool
+    publication_evidence_kind: Literal["returned", "reconciled", "inherited", "virtual", "legacy_returned"]
+
+
+class TokenOutcomeDisplayInfo(TypedDict, total=False):
+    """Terminal outcome evidence attached to a focused token."""
+
+    outcome: Required[str]
+    path: Required[str]
+    completed: Required[bool]
+    sink: str
+    error_hash: str
+    artifact: TuiArtifactInfo
+
+
+class TokenParentDisplayInfo(TypedDict):
+    """Parent token evidence attached to a focused token."""
+
+    token_id: str
+    row_id: str
+
+
+class TokenDisplayInfo(TypedDict, total=False):
+    """Token information formatted for TUI display.
+
+    Note: This is a DISPLAY type, not the canonical TokenInfo from contracts.
+    It contains presentation-specific fields like 'path' for breadcrumb display.
+    """
+
+    token_id: Required[str]
+    row_id: Required[str]
+    path: Required[list[str]]
+    outcome: TokenOutcomeDisplayInfo
+    parent_tokens: list[TokenParentDisplayInfo]
+
+
+class LineageData(TypedDict):
+    """Data contract for lineage tree display.
+
+    All fields are required. If data is unavailable, the caller
+    must handle that BEFORE constructing LineageData - not inside
+    the widget via .get() defaults.
+    """
+
+    run_id: str
+    source: SourceInfo
+    transforms: list[NodeInfo]
+    sinks: list[NodeInfo]
+    tokens: list[TokenDisplayInfo]
+
+
+class TreeNodeDict(TypedDict):
+    """Flattened tree node for rendering.
+
+    Output of LineageTree.get_tree_nodes(). All fields are required
+    since they're generated internally by _flatten_tree().
+    """
+
+    label: str
+    node_id: str | None
+    node_type: str
+    selection: "TreeSelection | None"
+    depth: int
+    has_children: bool
+    expanded: bool
+
+
+class TreeSelection(TypedDict, total=False):
+    """Selection payload for lineage tree rows.
+
+    The ``kind`` discriminator prevents token, edge, outcome, and run rows from
+    being mistaken for pipeline nodes just because they have an identifier.
+    """
+
+    kind: Required[Literal["run", "node", "token", "edge", "outcome", "status"]]
+    run_id: Required[str]
+    node_id: str
+    node_type: str
+    token_id: str
+    row_id: str
+    sink: str
+    state_id: str
+    sink_effect_id: str
+    edge_id: str
+    from_node_id: str
+    to_node_id: str
+    edge_label: str
+    outcome: str
+    outcome_path: str
+    completed: bool
+    error_hash: str
+    artifact_id: str
+    artifact_type: str
+    artifact_path_or_uri: str
+    artifact_hash: str
+    artifact_size_bytes: int
+    artifact_producer_kind: Literal["node_state", "sink_effect"]
+    artifact_publication_performed: bool
+    artifact_publication_evidence_kind: Literal["returned", "reconciled", "inherited", "virtual", "legacy_returned"]
+    message: str
+
+
+class NodeStateInfo(TypedDict, total=False):
+    """Node state information for detail panel display.
+
+    This TypedDict uses total=False to indicate that fields are
+    conditionally present based on context:
+
+    Required fields (always present from _load_node_state):
+    - node_id: Unique identifier for the node
+    - plugin_name: Name of the plugin (e.g., "csv_source", "filter")
+    - node_type: Type of node ("source", "transform", "sink", etc.)
+
+    Optional fields (present only after execution has occurred):
+    - state_id: Unique identifier for this execution state
+    - token_id: Token that visited this node
+    - status: Execution status ("open", "completed", "failed")
+    - started_at: When execution began (ISO timestamp string)
+    - completed_at: When execution finished (ISO timestamp string)
+    - duration_ms: Execution duration in milliseconds
+    - input_hash: Hash of input data
+    - output_hash: Hash of output data (if completed)
+    - error_json: JSON string of error details (if failed)
+    - success_reason_json: JSON string of success provenance (if completed)
+    - context_after_json: JSON string of post-execution context (if available)
+    - artifact: Artifact info dict (for sink nodes)
+    """
+
+    # Required - always present from node registration
+    node_id: Required[str]
+    plugin_name: Required[str]
+    node_type: Required[str]
+
+    # Optional - present after execution
+    state_id: str
+    sink_effect_id: str
+    token_id: str
+    status: str
+    started_at: str
+    completed_at: str
+    duration_ms: float
+    input_hash: str
+    output_hash: str
+    error_json: str
+    success_reason_json: str
+    context_after_json: str
+    artifact: dict[str, Any]
+
+
+class SelectionDetailInfo(TypedDict, total=False):
+    """Non-node tree selection detail for the TUI detail panel."""
+
+    detail_kind: Required[Literal["run", "token", "edge", "outcome", "status"]]
+    title: Required[str]
+    run_id: str
+    verification_decisions: tuple[CallVerification, ...]
+    token_id: str
+    row_id: str
+    sink: str
+    edge_id: str
+    from_node_id: str
+    to_node_id: str
+    edge_label: str
+    state_id: str
+    sink_effect_id: str
+    outcome: str
+    outcome_path: str
+    completed: bool
+    error_hash: str
+    artifact_id: str
+    artifact_type: str
+    artifact_path_or_uri: str
+    artifact_hash: str
+    artifact_size_bytes: int
+    artifact_producer_kind: Literal["node_state", "sink_effect"]
+    artifact_publication_performed: bool
+    artifact_publication_evidence_kind: Literal["returned", "reconciled", "inherited", "virtual", "legacy_returned"]
+    message: str
+
+
+class ExecutionErrorDisplay(TypedDict, total=False):
+    """Parsed ExecutionError for display.
+
+    From contracts.errors.ExecutionError - used by executors for exceptions.
+    exception and type fields are REQUIRED after validation.
+    """
+
+    exception: Required[str]  # Exception message (REQUIRED)
+    type: Required[str]  # Exception class name (e.g., "ValueError") (REQUIRED)
+    traceback: str  # Optional full traceback
+    phase: str  # Optional phase (e.g., "flush")
+
+
+class TransformErrorDisplay(TypedDict, total=False):
+    """Parsed TransformErrorReason for display.
+
+    From contracts.errors.TransformErrorReason - used by transforms.
+    The 'reason' field is REQUIRED and identifies the error category.
+    """
+
+    reason: Required[str]  # Error category (e.g., "api_error", "missing_field") (REQUIRED)
+    error: str  # Exception message or description
+    message: str  # Human-readable error message
+    error_type: str  # Sub-category
+    field: str  # Field name for field-related errors
+
+
+class CoalesceErrorDisplay(TypedDict, total=False):
+    """Parsed CoalesceFailureReason for display.
+
+    From contracts.errors.CoalesceFailureReason - used by CoalesceExecutor.
+    The 'failure_reason' field is REQUIRED and identifies the failure type.
+    """
+
+    failure_reason: Required[str]  # Why coalesce failed (REQUIRED)
+    expected_branches: Required[list[str]]  # Branches expected (REQUIRED)
+    branches_arrived: Required[list[str]]  # Branches that arrived (REQUIRED)
+    merge_policy: Required[str]  # Merge policy in effect (REQUIRED)
+    timeout_ms: int  # Timeout in ms (if timeout failure)
+    select_branch: str  # Target branch for select policy
+
+
+class ArtifactDisplay(TypedDict, total=False):
+    """Parsed Artifact for display.
+
+    From contracts.audit.Artifact - produced by sinks.
+    All fields are required and match the dataclass contract.
+    """
+
+    artifact_id: Required[str]
+    path_or_uri: Required[str]
+    content_hash: Required[str]
+    size_bytes: Required[int]

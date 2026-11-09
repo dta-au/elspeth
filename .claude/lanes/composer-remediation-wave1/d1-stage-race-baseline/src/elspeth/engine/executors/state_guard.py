@@ -1,0 +1,576 @@
+"""NodeStateGuard — structural control over node-state terminal status.
+
+The invariant "every token reaches exactly one terminal state" is central to
+ELSPETH's audit integrity.  Before this guard, the invariant was enforced by
+manually-scoped try/except blocks in each executor.  The problem: post-processing
+code (output hashing, contract evolution) lived OUTSIDE those blocks, so failures
+there left node_states permanently OPEN — violating the audit trail.
+
+NodeStateGuard encodes the invariant structurally: an unhandled exception within
+the ``with`` block automatically completes the state as FAILED before propagating,
+except for explicit scheduler ownership loss. That narrow crash-image path leaves
+the stale attempt OPEN because a replacement generation owns terminal audit writes.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import logging
+import time
+from collections.abc import Mapping
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, Literal
+
+from elspeth.contracts import ExecutionError, NodeStateOpen
+from elspeth.contracts.audit_evidence import AuditEvidenceBase
+from elspeth.contracts.enums import CollectorGroupFailureReason, NodeStateStatus, OutputMode, TriggerType
+from elspeth.contracts.errors import (
+    AuditIntegrityError,
+    OrchestrationInvariantError,
+    RunLeadershipLostError,
+    RunMembershipLostError,
+    RunWorkerEvictedError,
+    SchedulerLeaseLostError,
+)
+from elspeth.contracts.secret_scrub import scrub_payload_for_audit
+from elspeth.core.canonical import canonical_json
+from elspeth.core.landscape.errors import LandscapePostCommitError, LandscapeRecordError
+from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.core.operations import _render_exception
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from elspeth.contracts import AggregationResultMember, PipelineRow
+    from elspeth.contracts.audit import TokenRef
+    from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+    from elspeth.contracts.errors import CoalesceFailureReason, TransformErrorReason, TransformSuccessReason
+    from elspeth.contracts.node_state_context import NodeStateContext
+
+logger = logging.getLogger(__name__)
+
+type NodeStateAutoFailPhase = Literal[
+    "aggregation_flush",
+    "collector_flush",
+    "gate_evaluation_routing",
+    "retry_pre_attempt_shutdown",
+    "transform_execution",
+]
+
+_NODE_STATE_AUTO_FAIL_PHASES: frozenset[NodeStateAutoFailPhase] = frozenset(
+    {
+        "aggregation_flush",
+        "collector_flush",
+        "gate_evaluation_routing",
+        "retry_pre_attempt_shutdown",
+        "transform_execution",
+    }
+)
+_GUARD_TERMINAL_NODE_STATE_STATUSES = frozenset({NodeStateStatus.COMPLETED, NodeStateStatus.FAILED})
+
+
+def _validate_auto_fail_phase(value: object) -> NodeStateAutoFailPhase:
+    """Validate runtime callers without weakening the constructor's static contract."""
+    if type(value) is not str or value not in _NODE_STATE_AUTO_FAIL_PHASES:
+        raise OrchestrationInvariantError(
+            f"NodeStateGuard auto_fail_phase must be one of {sorted(_NODE_STATE_AUTO_FAIL_PHASES)}; got {value!r}."
+        )
+    return value
+
+
+# Attribute name for the node-state id stamped onto exceptions that cross a
+# NodeStateGuard. Executors scope ctx.state_id per operation (it is restored
+# on exceptional exit), so the exception itself is the only channel that can
+# carry the failed state's id to callers that convert the exception into
+# row-scoped audit records (e.g. the DIVERT routing_event for on_error sinks).
+_EXCEPTION_NODE_STATE_ID_ATTR = "_elspeth_node_state_id"
+
+
+def stamp_node_state_id(exc: BaseException, state_id: str) -> None:
+    """Stamp ``state_id`` onto ``exc`` as the node state it escaped.
+
+    Called by ``NodeStateGuard.__exit__`` for every exception crossing the
+    guard. When an exception crosses nested guards, the outermost stamp wins —
+    that is the state closest to the caller reading the stamp. Best-effort:
+    an exception type that rejects attribute assignment (``__slots__``) is
+    left unstamped; the consumer's state_id-required invariant then fails
+    loudly rather than mis-attributing the audit record.
+    """
+    with contextlib.suppress(AttributeError, TypeError):
+        setattr(exc, _EXCEPTION_NODE_STATE_ID_ATTR, state_id)
+
+
+def stamped_node_state_id(exc: BaseException) -> str | None:
+    """Return the node-state id stamped on ``exc``, or None if unstamped."""
+    try:
+        attributes = vars(exc)
+    except TypeError:
+        return None
+    if _EXCEPTION_NODE_STATE_ID_ATTR not in attributes:
+        return None
+    stamped = attributes[_EXCEPTION_NODE_STATE_ID_ATTR]
+    return stamped if type(stamped) is str else None
+
+
+def _render_exception_message(exc_type: type[BaseException], exc_val: BaseException | None) -> str:
+    """Render a guaranteed non-empty message for the auto-fail audit record.
+
+    ``ExecutionError`` rejects empty exception strings, and a hostile
+    ``__str__`` can raise — either would abort the terminal FAILED write and
+    leave the node state permanently OPEN (elspeth-d67453c22f). Audit
+    terminality outranks message fidelity: fall back to the exception type
+    name (guaranteed non-empty) when the message is empty/whitespace or
+    unrenderable. ``ExecutionError.exception`` and guard-raised
+    ``AuditIntegrityError`` messages reuse this rendered string, so it is
+    rendered by the one audit exception renderer (secret scrub, raising
+    ``__str__`` and database-error text handled there).
+    """
+    if exc_val is None:
+        return exc_type.__name__
+    message = _render_exception(exc_val)
+    if not message.strip():
+        return exc_type.__name__
+    return message
+
+
+class NodeStateGuard:
+    """Context manager that controls a node state's terminal status.
+
+    Opens a node state in ``__enter__`` and, if the caller has not explicitly
+    completed it before an exception triggers ``__exit__``, auto-completes the
+    state as FAILED with the exception details and the caller-supplied guarded
+    scope. The sole exception is an explicitly abandoned stale attempt
+    accompanied by ``SchedulerLeaseLostError`` or ``RunWorkerEvictedError``;
+    that attempt remains OPEN as crash evidence.
+
+    Usage::
+
+        with NodeStateGuard(
+            recorder,
+            token_id=...,
+            node_id=...,
+            member_token=ctx.require_member_token(),
+            step_index=...,
+            input_data=...,
+            auto_fail_phase="transform_execution",
+        ) as guard:
+            ctx.state_id = guard.state_id
+            # ... processing ...
+            guard.complete(NodeStateStatus.COMPLETED, output_data=..., ...)
+
+    If an exception is raised before ``guard.complete()`` is called, the state
+    is automatically completed as FAILED unless the scheduler ownership-loss
+    carve-out applies. If ``guard.complete()`` was already called, ``__exit__``
+    is a no-op (the state is already terminal).
+    """
+
+    __slots__ = (
+        "_abandoned",
+        "_attempt",
+        "_auto_fail_phase",
+        "_completed",
+        "_enter_time",
+        "_execution",
+        "_input_data",
+        "_member_token",
+        "_node_id",
+        "_resume_checkpoint_id",
+        "_run_id",
+        "_state",
+        "_step_index",
+        "_terminal_persisted",
+        "_token_id",
+    )
+
+    def __init__(
+        self,
+        execution: ExecutionRepository,
+        *,
+        token_id: str,
+        node_id: str,
+        member_token: WorkerMembershipToken,
+        step_index: int,
+        input_data: dict[str, Any],  # Row data (Tier 2 pipeline data)
+        attempt: int = 0,
+        resume_checkpoint_id: str | None = None,
+        auto_fail_phase: NodeStateAutoFailPhase,
+    ) -> None:
+        validated_auto_fail_phase = _validate_auto_fail_phase(auto_fail_phase)
+        self._execution = execution
+        self._token_id = token_id
+        self._node_id = node_id
+        self._run_id = member_token.run_id
+        self._member_token = member_token
+        self._step_index = step_index
+        self._input_data = input_data
+        self._attempt = attempt
+        self._resume_checkpoint_id = resume_checkpoint_id
+        self._auto_fail_phase = validated_auto_fail_phase
+        self._enter_time: float = 0.0
+        self._state: NodeStateOpen | None = None
+        self._abandoned = False
+        self._completed = False
+        self._terminal_persisted = False
+
+    # -- context manager protocol ------------------------------------------
+
+    def __enter__(self) -> NodeStateGuard:
+        self._enter_time = time.perf_counter()
+        self._state = self._execution.begin_node_state(
+            token_id=self._token_id,
+            node_id=self._node_id,
+            member_token=self._member_token,
+            step_index=self._step_index,
+            input_data=self._input_data,
+            attempt=self._attempt,
+            resume_checkpoint_id=self._resume_checkpoint_id,
+        )
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        if exc_val is not None:
+            # Stamp before the terminal-state early returns: the explicit
+            # complete(FAILED)-then-reraise path must stamp too, since the
+            # caller's ctx.state_id is scope-restored during unwind.
+            stamp_node_state_id(exc_val, self.state_id)
+
+        if isinstance(exc_val, (RunLeadershipLostError, RunMembershipLostError)):
+            # The repository refused before mutation. Preserve that verdict;
+            # a second write would use lost authority or mask the first refusal.
+            return
+
+        if self._abandoned:
+            if not isinstance(exc_val, (SchedulerLeaseLostError, RunWorkerEvictedError)):
+                raise OrchestrationInvariantError(
+                    f"NodeStateGuard for state {self.state_id} was abandoned without a nominal ownership-loss exception."
+                )
+            return
+
+        if self._completed:
+            return
+
+        if self._terminal_persisted:
+            # complete() or auto-fail already wrote a terminal state (or the
+            # repository explicitly told us the terminal write happened before
+            # raising). Writing FAILED on top would corrupt the audit trail.
+            return
+
+        duration_ms = (time.perf_counter() - self._enter_time) * 1000
+
+        if exc_type is None:
+            # Clean exit without calling complete() — programming error.
+            # Record FAILED first (preserve audit invariant), then crash.
+            error = ExecutionError(
+                exception="NodeStateGuard exited normally without complete()",
+                exception_type="OrchestrationInvariantError",
+                phase="executor_guard_missing_complete",
+            )
+            try:
+                self._execution.complete_node_state(
+                    member_token=self._member_token,
+                    state_id=self.state_id,
+                    status=NodeStateStatus.FAILED,
+                    duration_ms=duration_ms,
+                    error=error,
+                )
+                self._terminal_persisted = True
+            except LandscapePostCommitError as db_err:
+                self._terminal_persisted = True
+                raise AuditIntegrityError(
+                    f"FAILED state for {self.state_id} was persisted after missing complete(), "
+                    f"but it became unreadable immediately after completion (Tier 1 violation). "
+                    f"Recorder error: {type(db_err).__name__}: {db_err}"
+                ) from db_err
+            except LandscapeRecordError as db_err:
+                raise AuditIntegrityError(
+                    f"Cannot record FAILED for state {self.state_id} after missing complete() — "
+                    f"audit trail has permanent OPEN state (Tier 1 violation). "
+                    f"DB error: {type(db_err).__name__}: {db_err}"
+                ) from db_err
+            raise OrchestrationInvariantError(
+                f"NodeStateGuard for state {self.state_id} exited without complete(). "
+                f"This is a bug in the calling executor — every code path must call "
+                f"guard.complete() before the with-block exits normally."
+            )
+
+        # An exception occurred and the state was never completed.
+        # Auto-complete as FAILED so the audit trail has a terminal record.
+        #
+        # ADR-010 §Decision 1: nominal AuditEvidenceBase check. Classes must
+        # explicitly inherit to contribute structured context; see ADR-010
+        # §Alternative 3 for the security rationale (accidental-match spoofing
+        # was the reason we did not use a structural Protocol here).
+        context, evidence_failure = self._extract_audit_evidence_context(exc_val)
+
+        exc_message = _render_exception_message(exc_type, exc_val)
+        exc_error = ExecutionError(
+            exception=exc_message,
+            exception_type=exc_type.__name__,
+            phase=self._auto_fail_phase,
+            context=context,
+        )
+        try:
+            self._execution.complete_node_state(
+                member_token=self._member_token,
+                state_id=self.state_id,
+                status=NodeStateStatus.FAILED,
+                duration_ms=duration_ms,
+                error=exc_error,
+            )
+            self._terminal_persisted = True
+        except LandscapePostCommitError as db_err:
+            self._terminal_persisted = True
+            raise AuditIntegrityError(
+                f"FAILED state for {self.state_id} was persisted while handling "
+                f"{exc_type.__name__}: {exc_message}, but it became unreadable immediately "
+                f"after completion (Tier 1 violation). Recorder error: "
+                f"{type(db_err).__name__}: {db_err}"
+            ) from db_err
+        except LandscapeRecordError as db_err:
+            # A verdict verb (complete_aggregation_failure,
+            # complete_collector_failure) may have committed this state
+            # terminal and then raised before returning — a lost
+            # acknowledgement. The state is then durably terminal, not OPEN:
+            # read it back and let the original exception stand rather than
+            # report a corruption that does not exist.
+            durable = self._execution.get_node_state(self.state_id)
+            if durable is not None and durable.status in _GUARD_TERMINAL_NODE_STATE_STATUSES:
+                self._terminal_persisted = True
+                return
+            # Audit trail corruption (permanent OPEN state) is MORE critical than
+            # the original exception. Raise AuditIntegrityError with both contexts.
+            raise AuditIntegrityError(
+                f"Cannot record FAILED for state {self.state_id} while handling "
+                f"{exc_type.__name__}: {exc_message} — audit trail has permanent OPEN state "
+                f"(Tier 1 violation). DB error: {type(db_err).__name__}: {db_err}"
+            ) from db_err
+
+        if evidence_failure is not None:
+            raise AuditIntegrityError(
+                f"Recorded FAILED for state {self.state_id} while handling "
+                f"{exc_type.__name__}: {exc_message}, but audit evidence serialization failed "
+                f"and structured context was dropped to preserve terminality."
+            ) from evidence_failure
+
+    # -- public API --------------------------------------------------------
+
+    @property
+    def state(self) -> NodeStateOpen:
+        """The opened node state.  Only valid after ``__enter__``."""
+        if self._state is None:
+            raise OrchestrationInvariantError("NodeStateGuard.state accessed before __enter__")
+        return self._state
+
+    @property
+    def state_id(self) -> str:
+        """Shorthand for ``guard.state.state_id``."""
+        return self.state.state_id
+
+    @property
+    def completed(self) -> bool:
+        """Whether the caller has explicitly completed this state."""
+        return self._completed
+
+    def abandon_open_state(self) -> None:
+        """Leave this attempt OPEN after an external ownership-loss verdict.
+
+        A recovered scheduler claim has moved to a new work-item generation.
+        Its old in-flight process must not forge COMPLETED or FAILED evidence
+        after that point; the OPEN attempt is the honest crash/abandonment
+        image. The caller must immediately propagate the ownership-loss
+        exception, which ``__exit__`` enforces.
+        """
+        if self._state is None:
+            raise OrchestrationInvariantError("Cannot abandon a NodeStateGuard before __enter__.")
+        if self._completed or self._terminal_persisted:
+            raise OrchestrationInvariantError(f"Cannot abandon terminal node state {self.state_id}.")
+        self._abandoned = True
+
+    def complete(
+        self,
+        status: Literal[NodeStateStatus.COMPLETED, NodeStateStatus.FAILED],
+        *,
+        output_data: dict[str, Any] | list[dict[str, Any]] | None = None,
+        duration_ms: float | None = None,
+        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | None = None,
+        success_reason: TransformSuccessReason | None = None,
+        context_after: NodeStateContext | None = None,
+    ) -> None:
+        """Complete the node state.  Guard will not intervene after this.
+
+        ``__exit__`` only stands down once terminal persistence is known.
+        Pre-persistence failures must still flow through the auto-fail path,
+        but post-commit materialization failures must not trigger a second
+        terminal write on top of an already-persisted state.
+        """
+        if status not in _GUARD_TERMINAL_NODE_STATE_STATUSES:
+            valid = ", ".join(member.name for member in sorted(_GUARD_TERMINAL_NODE_STATE_STATUSES, key=lambda item: item.value))
+            status_name = status.name if type(status) is NodeStateStatus else repr(status)
+            raise OrchestrationInvariantError(
+                f"NodeStateGuard.complete() only accepts terminal node states ({valid}); got {status_name}. "
+                "Use ExecutionRepository.complete_node_state() directly for non-terminal state transitions."
+            )
+
+        # The repository signature takes Mapping-typed rows; rebuilding the
+        # list widens the invariant element type (dict[str, Any] stays the
+        # runtime type either way). isinstance, not an exact-type test: only
+        # isinstance narrows list OUT of the non-list arm, which is what makes
+        # the mapping arm assignable without a cast.
+        normalized_output: Mapping[str, object] | list[Mapping[str, object]] | None = (
+            list(output_data) if isinstance(output_data, list) else output_data
+        )
+
+        try:
+            if status is NodeStateStatus.COMPLETED:
+                self._execution.complete_node_state(
+                    member_token=self._member_token,
+                    state_id=self.state_id,
+                    status=NodeStateStatus.COMPLETED,
+                    output_data=normalized_output,
+                    duration_ms=duration_ms,
+                    error=error,
+                    success_reason=success_reason,
+                    context_after=context_after,
+                )
+            else:
+                # The FAILED completion contract has no success_reason;
+                # reject rather than silently drop a caller's value.
+                if success_reason is not None:
+                    raise OrchestrationInvariantError("NodeStateGuard.complete(FAILED) does not accept success_reason.")
+                self._execution.complete_node_state(
+                    member_token=self._member_token,
+                    state_id=self.state_id,
+                    status=NodeStateStatus.FAILED,
+                    output_data=normalized_output,
+                    duration_ms=duration_ms,
+                    error=error,
+                    context_after=context_after,
+                )
+        except LandscapePostCommitError:
+            self._terminal_persisted = True
+            raise
+
+        self._terminal_persisted = True
+        self._completed = True
+
+    def complete_aggregation_result(
+        self,
+        *,
+        batch_id: str,
+        coordination_token: CoordinationToken,
+        aggregation_node_id: str,
+        trigger_type: TriggerType,
+        output_mode: OutputMode,
+        output_rows: Sequence[PipelineRow],
+        output_shape: str,
+        output_hash: str,
+        members: Sequence[AggregationResultMember],
+        expansion_parent_token_id: str | None,
+        duration_ms: float,
+        success_reason: TransformSuccessReason | None,
+        context_after: NodeStateContext,
+    ) -> None:
+        """Complete node, batch, and transform output receipt atomically."""
+        try:
+            self._execution.complete_aggregation_result(
+                batch_id=batch_id,
+                coordination_token=coordination_token,
+                aggregation_node_id=aggregation_node_id,
+                state_id=self.state_id,
+                trigger_type=trigger_type,
+                output_mode=output_mode,
+                output_rows=output_rows,
+                output_shape=output_shape,
+                output_hash=output_hash,
+                members=members,
+                expansion_parent_token_id=expansion_parent_token_id,
+                duration_ms=duration_ms,
+                success_reason=success_reason,
+                context_after=context_after,
+            )
+        except LandscapePostCommitError:
+            self._terminal_persisted = True
+            raise
+        self._terminal_persisted = True
+        self._completed = True
+
+    def complete_aggregation_failure(
+        self,
+        *,
+        batch_id: str,
+        coordination_token: CoordinationToken,
+        aggregation_node_id: str,
+        trigger_type: TriggerType,
+        members: Sequence[tuple[TokenRef, PipelineRow]],
+        reason: TransformErrorReason,
+        destination: str,
+        divert_edge_id: str | None,
+        duration_ms: float,
+    ) -> None:
+        """Record the batch's FAILED verdict — node, batch, transform_errors and DIVERT — atomically."""
+        self._execution.complete_aggregation_failure(
+            batch_id=batch_id,
+            coordination_token=coordination_token,
+            aggregation_node_id=aggregation_node_id,
+            state_id=self.state_id,
+            trigger_type=trigger_type,
+            members=members,
+            reason=reason,
+            destination=destination,
+            divert_edge_id=divert_edge_id,
+            duration_ms=duration_ms,
+        )
+        self._terminal_persisted = True
+        self._completed = True
+
+    def complete_collector_failure(
+        self,
+        *,
+        coordination_token: CoordinationToken,
+        group_id: str,
+        collector_node_id: str,
+        failure_reason: CollectorGroupFailureReason,
+        flush_error: ExecutionError,
+        duration_ms: float,
+        member_holds: Sequence[tuple[TokenRef, str, float]],
+        hold_error: ExecutionError,
+    ) -> None:
+        """Record the collector group's FAILED verdict — this flush state and every member hold — atomically."""
+        self._execution.complete_collector_failure(
+            coordination_token=coordination_token,
+            group_id=group_id,
+            collector_node_id=collector_node_id,
+            failure_reason=failure_reason,
+            flush_state_id=self.state_id,
+            flush_error=flush_error,
+            flush_duration_ms=duration_ms,
+            member_holds=member_holds,
+            hold_error=hold_error,
+        )
+        self._terminal_persisted = True
+        self._completed = True
+
+    def _extract_audit_evidence_context(
+        self,
+        exc_val: object | None,
+    ) -> tuple[Mapping[str, Any] | None, BaseException | None]:
+        """Extract structured exception context without letting it strand the state OPEN."""
+        if not isinstance(exc_val, AuditEvidenceBase):
+            return None, None
+
+        try:
+            context = exc_val.to_audit_dict()
+            if not isinstance(context, Mapping):
+                raise TypeError(f"Audit evidence must be a mapping, got {type(context).__name__}")
+            if any(type(key) is not str for key in context):
+                raise TypeError("Audit evidence keys must be strings")
+            context = scrub_payload_for_audit(context)
+            canonical_json(context)
+            return context, None
+        except Exception as exc:
+            return None, exc

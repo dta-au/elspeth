@@ -1,0 +1,268 @@
+"""Plugin-facing audit writer adapter for Landscape repositories."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
+
+from elspeth.contracts import (
+    Call,
+    CallStatus,
+    CallType,
+    NodeState,
+    RoutingEvent,
+    RoutingMode,
+    RoutingReason,
+    RoutingSpec,
+)
+from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.call_data import CallPayload
+from elspeth.contracts.errors import ContractViolation, TransformErrorReason
+from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
+from elspeth.core.landscape.data_flow_repository import DataFlowRepository
+from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository
+
+if TYPE_CHECKING:
+    from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+    from elspeth.contracts.scheduler import TokenWorkItem
+    from elspeth.contracts.schema_contract import PipelineRow
+
+
+class PluginAuditWriterAdapter:
+    """Composes three repositories into the PluginAuditWriter interface.
+
+    Each method delegates to the correct repository. This is a thin adapter
+    with no logic of its own.
+
+    Method-count ratchet: the public method count is pinned exactly by the
+    ``contract_invariants.adapter_method_budget`` elspeth-lints rule — growth
+    fails CI, and removals must lower the ratchet there to lock them in.
+    """
+
+    def __init__(
+        self,
+        execution: ExecutionRepository,
+        data_flow: DataFlowRepository,
+        run_lifecycle: RunLifecycleRepository,
+    ) -> None:
+        self._execution = execution
+        self._data_flow = data_flow
+        self._run_lifecycle = run_lifecycle
+
+    # ── ExecutionRepository delegation ───────────────────────────────────
+
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
+        return self._execution.allocate_call_index(state_id, member_token=member_token, work_item=work_item)
+
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
+        return self._execution.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
+
+    def record_call(
+        self,
+        state_id: str,
+        call_index: int,
+        call_type: CallType,
+        status: CallStatus,
+        request_data: CallPayload,
+        response_data: CallPayload | None = None,
+        error: CallPayload | None = None,
+        latency_ms: float | None = None,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
+        request_ref: str | None = None,
+        response_ref: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
+    ) -> Call:
+        return self._execution.record_call(
+            state_id,
+            call_index,
+            call_type,
+            status,
+            request_data,
+            response_data,
+            error,
+            latency_ms,
+            member_token=member_token,
+            work_item=work_item,
+            request_ref=request_ref,
+            response_ref=response_ref,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
+            token_usage=token_usage,
+            source_call_id=source_call_id,
+            call_id=call_id,
+            created_at=created_at,
+        )
+
+    def record_operation_call(
+        self,
+        operation_id: str,
+        call_type: CallType,
+        status: CallStatus,
+        request_data: CallPayload,
+        response_data: CallPayload | None = None,
+        error: CallPayload | None = None,
+        latency_ms: float | None = None,
+        *,
+        coordination_token: CoordinationToken,
+        call_index: int | None = None,
+        request_ref: str | None = None,
+        response_ref: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
+    ) -> Call:
+        return self._execution.record_operation_call(
+            operation_id,
+            call_type,
+            status,
+            request_data,
+            response_data,
+            error,
+            latency_ms,
+            coordination_token=coordination_token,
+            call_index=call_index,
+            request_ref=request_ref,
+            response_ref=response_ref,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
+            token_usage=token_usage,
+            source_call_id=source_call_id,
+            call_id=call_id,
+            created_at=created_at,
+        )
+
+    def get_node_state(self, state_id: str) -> NodeState | None:
+        return self._execution.get_node_state(state_id)
+
+    def record_routing_event(
+        self,
+        state_id: str,
+        edge_id: str,
+        mode: RoutingMode,
+        reason: RoutingReason | None = None,
+        *,
+        member_token: WorkerMembershipToken,
+        event_id: str | None = None,
+        routing_group_id: str | None = None,
+        ordinal: int = 0,
+        reason_ref: str | None = None,
+    ) -> RoutingEvent:
+        """Record a complete one-route decision; use the plural API for forks."""
+        return self._execution.record_routing_event(
+            state_id,
+            edge_id,
+            mode,
+            reason,
+            member_token=member_token,
+            event_id=event_id,
+            routing_group_id=routing_group_id,
+            ordinal=ordinal,
+            reason_ref=reason_ref,
+        )
+
+    def record_routing_events(
+        self,
+        state_id: str,
+        routes: list[RoutingSpec],
+        reason: RoutingReason | None = None,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
+    ) -> list[RoutingEvent]:
+        """Atomically record every route in one complete fork decision."""
+        return self._execution.record_routing_events(state_id, routes, reason, member_token=member_token, work_item=work_item)
+
+    # ── DataFlowRepository delegation ────────────────────────────────────
+
+    def record_validation_error(
+        self,
+        node_id: str | None,
+        row_data: Any,
+        error: str,
+        schema_mode: str,
+        destination: str,
+        *,
+        coordination_token: CoordinationToken,
+        contract_violation: ContractViolation | None = None,
+    ) -> str:
+        return self._data_flow.record_validation_error(
+            node_id,
+            row_data,
+            error,
+            schema_mode,
+            destination,
+            coordination_token=coordination_token,
+            contract_violation=contract_violation,
+        )
+
+    def record_transform_error(
+        self,
+        ref: TokenRef,
+        transform_id: str,
+        row_data: Mapping[str, object] | PipelineRow,
+        error_details: TransformErrorReason,
+        destination: str,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
+    ) -> str:
+        return self._data_flow.record_transform_error(
+            ref,
+            transform_id,
+            row_data,
+            error_details,
+            destination,
+            member_token=member_token,
+            work_item=work_item,
+        )
+
+    def update_node_output_contract(
+        self,
+        node_id: str,
+        contract: SchemaContract,
+        *,
+        member_token: WorkerMembershipToken,
+    ) -> None:
+        self._data_flow.update_node_output_contract(node_id, contract, member_token=member_token)
+
+    def get_node_contracts(
+        self,
+        run_id: str,
+        node_id: str,
+        *,
+        allow_missing: bool = False,
+    ) -> tuple[SchemaContract | None, SchemaContract | None]:
+        return self._data_flow.get_node_contracts(run_id, node_id, allow_missing=allow_missing)
+
+    # ── RunLifecycleRepository delegation ────────────────────────────────
+
+    def get_source_field_resolution(self, run_id: str) -> dict[str, str] | None:
+        return self._run_lifecycle.get_source_field_resolution(run_id)
+
+    def record_readiness_check(
+        self,
+        *,
+        name: str,
+        collection: str,
+        reachable: bool,
+        count: int | None,
+        message: str,
+        member_token: WorkerMembershipToken,
+    ) -> None:
+        self._run_lifecycle.record_readiness_check(
+            name=name,
+            collection=collection,
+            reachable=reachable,
+            count=count,
+            message=message,
+            member_token=member_token,
+        )

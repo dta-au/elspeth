@@ -1,0 +1,384 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="48" skipped="0" tests="56" time="43.066" timestamp="2026-11-09T20:37:33.697103+00:00" hostname="af0377a21211"><testcase classname="tests.unit.web.composer.test_graph_recovery" name="test_restore_intent_and_parser_canonicalize_only_external_park_selector[canonical]" time="0.004" /><testcase classname="tests.unit.web.composer.test_graph_recovery" name="test_restore_intent_and_parser_canonicalize_only_external_park_selector[uppercase]" time="0.001"><failure message="AssertionError: assert 'ABCDEFAB-CDE...-ABCDEFABCDEF' == 'abcdefab-cde...-abcdefabcdef'&#10;  &#10;  - abcdefab-cdef-4abc-8def-abcdefabcdef&#10;  + ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF">tests/unit/web/composer/test_graph_recovery.py:180: in test_restore_intent_and_parser_canonicalize_only_external_park_selector
+    assert direct.park_id == BLOB_UUID
+E   AssertionError: assert 'ABCDEFAB-CDE...-ABCDEFABCDEF' == 'abcdefab-cde...-abcdefabcdef'
+E     
+E     - abcdefab-cdef-4abc-8def-abcdefabcdef
+E     + ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF</failure></testcase><testcase classname="tests.unit.web.composer.test_graph_recovery" name="test_restore_intent_and_parser_canonicalize_only_external_park_selector[mixed]" time="0.001"><failure message="AssertionError: assert 'Abcdefab-cde...-abcdefabcdef' == 'abcdefab-cde...-abcdefabcdef'&#10;  &#10;  - abcdefab-cdef-4abc-8def-abcdefabcdef&#10;  ? ^&#10;  + Abcdefab-cdef-4abc-8def-abcdefabcdef&#10;  ? ^">tests/unit/web/composer/test_graph_recovery.py:180: in test_restore_intent_and_parser_canonicalize_only_external_park_selector
+    assert direct.park_id == BLOB_UUID
+E   AssertionError: assert 'Abcdefab-cde...-abcdefabcdef' == 'abcdefab-cde...-abcdefabcdef'
+E     
+E     - abcdefab-cdef-4abc-8def-abcdefabcdef
+E     ? ^
+E     + Abcdefab-cdef-4abc-8def-abcdefabcdef
+E     ? ^</failure></testcase><testcase classname="tests.unit.web.composer.test_graph_recovery" name="test_restore_intent_and_parser_canonicalize_only_external_park_selector[braced]" time="0.001"><failure message="AssertionError: assert '{abcdefab-cd...abcdefabcdef}' == 'abcdefab-cde...-abcdefabcdef'&#10;  &#10;  - abcdefab-cdef-4abc-8def-abcdefabcdef&#10;  + {abcdefab-cdef-4abc-8def-abcdefabcdef}&#10;  ? +                                    +">tests/unit/web/composer/test_graph_recovery.py:180: in test_restore_intent_and_parser_canonicalize_only_external_park_selector
+    assert direct.park_id == BLOB_UUID
+E   AssertionError: assert '{abcdefab-cd...abcdefabcdef}' == 'abcdefab-cde...-abcdefabcdef'
+E     
+E     - abcdefab-cdef-4abc-8def-abcdefabcdef
+E     + {abcdefab-cdef-4abc-8def-abcdefabcdef}
+E     ? +                                    +</failure></testcase><testcase classname="tests.unit.web.composer.test_graph_recovery" name="test_restore_intent_and_parser_canonicalize_only_external_park_selector[hyphenless]" time="0.001"><failure message="AssertionError: assert 'abcdefabcdef...fabcdefabcdef' == 'abcdefab-cde...-abcdefabcdef'&#10;  &#10;  - abcdefab-cdef-4abc-8def-abcdefabcdef&#10;  + abcdefabcdef4abc8defabcdefabcdef">tests/unit/web/composer/test_graph_recovery.py:180: in test_restore_intent_and_parser_canonicalize_only_external_park_selector
+    assert direct.park_id == BLOB_UUID
+E   AssertionError: assert 'abcdefabcdef...fabcdefabcdef' == 'abcdefab-cde...-abcdefabcdef'
+E     
+E     - abcdefab-cdef-4abc-8def-abcdefabcdef
+E     + abcdefabcdef4abc8defabcdefabcdef</failure></testcase><testcase classname="tests.unit.web.composer.test_graph_recovery" name="test_restore_intent_and_parser_canonicalize_only_external_park_selector[urn]" time="0.002"><failure message="AssertionError: assert 'urn:uuid:abc...-abcdefabcdef' == 'abcdefab-cde...-abcdefabcdef'&#10;  &#10;  - abcdefab-cdef-4abc-8def-abcdefabcdef&#10;  + urn:uuid:abcdefab-cdef-4abc-8def-abcdefabcdef&#10;  ? +++++++++">tests/unit/web/composer/test_graph_recovery.py:180: in test_restore_intent_and_parser_canonicalize_only_external_park_selector
+    assert direct.park_id == BLOB_UUID
+E   AssertionError: assert 'urn:uuid:abc...-abcdefabcdef' == 'abcdefab-cde...-abcdefabcdef'
+E     
+E     - abcdefab-cdef-4abc-8def-abcdefabcdef
+E     + urn:uuid:abcdefab-cdef-4abc-8def-abcdefabcdef
+E     ? +++++++++</failure></testcase><testcase classname="tests.unit.web.composer.test_graph_recovery" name="test_restore_intent_and_parser_canonicalize_only_external_park_selector[padded]" time="0.001"><failure message="AssertionError: assert ' \tabcdefab-...bcdefabcdef\n' == 'abcdefab-cde...-abcdefabcdef'&#10;  &#10;  - abcdefab-cdef-4abc-8def-abcdefabcdef&#10;  +  &#09;abcdefab-cdef-4abc-8def-abcdefabcdef&#10;  ? ++                                    +">tests/unit/web/composer/test_graph_recovery.py:180: in test_restore_intent_and_parser_canonicalize_only_external_park_selector
+    assert direct.park_id == BLOB_UUID
+E   AssertionError: assert ' \tabcdefab-...bcdefabcdef\n' == 'abcdefab-cde...-abcdefabcdef'
+E     
+E     - abcdefab-cdef-4abc-8def-abcdefabcdef
+E     +  	abcdefab-cdef-4abc-8def-abcdefabcdef
+E     ? ++                                    +</failure></testcase><testcase classname="tests.unit.web.coordination.test_graph_recovery_persistence" name="test_explicit_restore_uses_parked_identity_across_turns[canonical]" time="0.324" /><testcase classname="tests.unit.web.coordination.test_graph_recovery_persistence" name="test_explicit_restore_uses_parked_identity_across_turns[uppercase]" time="0.275"><failure message="AssertionError: assert (None == UUID('a11e1dc2-507e-4196-9693-50976eae5513'))&#10; +  where None = GraphRecoverySettlement(session_id=UUID('a38d86f8-9fda-4a9e-882d-157ebf3a52d0'), operation_id='d565181f-6176-44d1-9b66...se, failure_reason='target_unavailable', receipt_id=UUID('6821baf1-8b5c-4839-a7e5-475d7483eda3'), malformed_head=False).target_state_id&#10; +  and   UUID('a11e1dc2-507e-4196-9693-50976eae5513') = GraphRecoverySettlement(session_id=UUID('a38d86f8-9fda-4a9e-882d-157ebf3a52d0'), operation_id='8e5d87d2-f696-43d4-84aa...pty_fallback=False, failure_reason=None, receipt_id=UUID('a4ca655a-e762-4058-8c95-2c322afb583c'), malformed_head=False).state_id">tests/unit/web/coordination/test_graph_recovery_persistence.py:374: in test_explicit_restore_uses_parked_identity_across_turns
+    assert restore.target_state_id == park.state_id and not restore.empty_fallback
+E   AssertionError: assert (None == UUID('a11e1dc2-507e-4196-9693-50976eae5513'))
+E    +  where None = GraphRecoverySettlement(session_id=UUID('a38d86f8-9fda-4a9e-882d-157ebf3a52d0'), operation_id='d565181f-6176-44d1-9b66...se, failure_reason='target_unavailable', receipt_id=UUID('6821baf1-8b5c-4839-a7e5-475d7483eda3'), malformed_head=False).target_state_id
+E    +  and   UUID('a11e1dc2-507e-4196-9693-50976eae5513') = GraphRecoverySettlement(session_id=UUID('a38d86f8-9fda-4a9e-882d-157ebf3a52d0'), operation_id='8e5d87d2-f696-43d4-84aa...pty_fallback=False, failure_reason=None, receipt_id=UUID('a4ca655a-e762-4058-8c95-2c322afb583c'), malformed_head=False).state_id</failure></testcase><testcase classname="tests.unit.web.coordination.test_graph_recovery_persistence" name="test_explicit_restore_uses_parked_identity_across_turns[mixed]" time="0.293"><failure message="AssertionError: assert (None == UUID('a38106ed-7f79-4ab9-8ced-f6ac1b651f92'))&#10; +  where None = GraphRecoverySettlement(session_id=UUID('dfbf8c45-216d-4482-a05f-a830989c0bdd'), operation_id='4fe1804a-3f36-49d4-97aa...se, failure_reason='target_unavailable', receipt_id=UUID('3d962f9e-5f36-4476-8746-92a7e5532e0d'), malformed_head=False).target_state_id&#10; +  and   UUID('a38106ed-7f79-4ab9-8ced-f6ac1b651f92') = GraphRecoverySettlement(session_id=UUID('dfbf8c45-216d-4482-a05f-a830989c0bdd'), operation_id='dcc40c44-c91c-4329-a79d...pty_fallback=False, failure_reason=None, receipt_id=UUID('ad4a2951-bb60-4c7d-b779-f754c00ff85a'), malformed_head=False).state_id">tests/unit/web/coordination/test_graph_recovery_persistence.py:374: in test_explicit_restore_uses_parked_identity_across_turns
+    assert restore.target_state_id == park.state_id and not restore.empty_fallback
+E   AssertionError: assert (None == UUID('a38106ed-7f79-4ab9-8ced-f6ac1b651f92'))
+E    +  where None = GraphRecoverySettlement(session_id=UUID('dfbf8c45-216d-4482-a05f-a830989c0bdd'), operation_id='4fe1804a-3f36-49d4-97aa...se, failure_reason='target_unavailable', receipt_id=UUID('3d962f9e-5f36-4476-8746-92a7e5532e0d'), malformed_head=False).target_state_id
+E    +  and   UUID('a38106ed-7f79-4ab9-8ced-f6ac1b651f92') = GraphRecoverySettlement(session_id=UUID('dfbf8c45-216d-4482-a05f-a830989c0bdd'), operation_id='dcc40c44-c91c-4329-a79d...pty_fallback=False, failure_reason=None, receipt_id=UUID('ad4a2951-bb60-4c7d-b779-f754c00ff85a'), malformed_head=False).state_id</failure></testcase><testcase classname="tests.unit.web.coordination.test_graph_recovery_persistence" name="test_explicit_restore_uses_parked_identity_across_turns[braced]" time="0.325"><failure message="AssertionError: assert (None == UUID('adfa8b85-9f17-4162-b6a1-ca9b08078629'))&#10; +  where None = GraphRecoverySettlement(session_id=UUID('8a42da07-151f-4c17-a9ad-849beca90d14'), operation_id='b243acdf-6bdf-4a52-a4dc...se, failure_reason='target_unavailable', receipt_id=UUID('602f888d-0276-46c6-a409-6de362f770ad'), malformed_head=False).target_state_id&#10; +  and   UUID('adfa8b85-9f17-4162-b6a1-ca9b08078629') = GraphRecoverySettlement(session_id=UUID('8a42da07-151f-4c17-a9ad-849beca90d14'), operation_id='ff1fca6c-e9dd-4ce7-8b33...pty_fallback=False, failure_reason=None, receipt_id=UUID('acc881ee-af7a-4cf8-a2a2-98683a842b55'), malformed_head=False).state_id">tests/unit/web/coordination/test_graph_recovery_persistence.py:374: in test_explicit_restore_uses_parked_identity_across_turns
+    assert restore.target_state_id == park.state_id and not restore.empty_fallback
+E   AssertionError: assert (None == UUID('adfa8b85-9f17-4162-b6a1-ca9b08078629'))
+E    +  where None = GraphRecoverySettlement(session_id=UUID('8a42da07-151f-4c17-a9ad-849beca90d14'), operation_id='b243acdf-6bdf-4a52-a4dc...se, failure_reason='target_unavailable', receipt_id=UUID('602f888d-0276-46c6-a409-6de362f770ad'), malformed_head=False).target_state_id
+E    +  and   UUID('adfa8b85-9f17-4162-b6a1-ca9b08078629') = GraphRecoverySettlement(session_id=UUID('8a42da07-151f-4c17-a9ad-849beca90d14'), operation_id='ff1fca6c-e9dd-4ce7-8b33...pty_fallback=False, failure_reason=None, receipt_id=UUID('acc881ee-af7a-4cf8-a2a2-98683a842b55'), malformed_head=False).state_id</failure></testcase><testcase classname="tests.unit.web.coordination.test_graph_recovery_persistence" name="test_explicit_restore_uses_parked_identity_across_turns[hyphenless]" time="0.697"><failure message="AssertionError: assert (None == UUID('a5b1626c-c49a-4046-9d6f-50c0ce57da86'))&#10; +  where None = GraphRecoverySettlement(session_id=UUID('ef95a790-97a4-4896-8313-54bafe2a9714'), operation_id='9a5755b7-8e92-42f2-9253...se, failure_reason='target_unavailable', receipt_id=UUID('2c0bfe97-533c-4020-a3f8-4492212267cc'), malformed_head=False).target_state_id&#10; +  and   UUID('a5b1626c-c49a-4046-9d6f-50c0ce57da86') = GraphRecoverySettlement(session_id=UUID('ef95a790-97a4-4896-8313-54bafe2a9714'), operation_id='004682ed-1a3a-494d-b348...pty_fallback=False, failure_reason=None, receipt_id=UUID('ac96eab5-a022-4bc9-a117-3398054d325c'), malformed_head=False).state_id">tests/unit/web/coordination/test_graph_recovery_persistence.py:374: in test_explicit_restore_uses_parked_identity_across_turns
+    assert restore.target_state_id == park.state_id and not restore.empty_fallback
+E   AssertionError: assert (None == UUID('a5b1626c-c49a-4046-9d6f-50c0ce57da86'))
+E    +  where None = GraphRecoverySettlement(session_id=UUID('ef95a790-97a4-4896-8313-54bafe2a9714'), operation_id='9a5755b7-8e92-42f2-9253...se, failure_reason='target_unavailable', receipt_id=UUID('2c0bfe97-533c-4020-a3f8-4492212267cc'), malformed_head=False).target_state_id
+E    +  and   UUID('a5b1626c-c49a-4046-9d6f-50c0ce57da86') = GraphRecoverySettlement(session_id=UUID('ef95a790-97a4-4896-8313-54bafe2a9714'), operation_id='004682ed-1a3a-494d-b348...pty_fallback=False, failure_reason=None, receipt_id=UUID('ac96eab5-a022-4bc9-a117-3398054d325c'), malformed_head=False).state_id</failure></testcase><testcase classname="tests.unit.web.coordination.test_graph_recovery_persistence" name="test_explicit_restore_uses_parked_identity_across_turns[urn]" time="0.288"><failure message="AssertionError: assert (None == UUID('aef51487-b538-4b35-b7c4-d3a8e49ab3b0'))&#10; +  where None = GraphRecoverySettlement(session_id=UUID('637bfcdd-2e53-4068-aabe-4dbc81fe86b9'), operation_id='bbdfef3e-af21-40ab-b1a8...se, failure_reason='target_unavailable', receipt_id=UUID('dc12996d-a011-41c2-aab5-94dfc29bdfc6'), malformed_head=False).target_state_id&#10; +  and   UUID('aef51487-b538-4b35-b7c4-d3a8e49ab3b0') = GraphRecoverySettlement(session_id=UUID('637bfcdd-2e53-4068-aabe-4dbc81fe86b9'), operation_id='80c16db4-5709-4285-8264...pty_fallback=False, failure_reason=None, receipt_id=UUID('a7345b24-ea6b-439b-8787-718d4efc7450'), malformed_head=False).state_id">tests/unit/web/coordination/test_graph_recovery_persistence.py:374: in test_explicit_restore_uses_parked_identity_across_turns
+    assert restore.target_state_id == park.state_id and not restore.empty_fallback
+E   AssertionError: assert (None == UUID('aef51487-b538-4b35-b7c4-d3a8e49ab3b0'))
+E    +  where None = GraphRecoverySettlement(session_id=UUID('637bfcdd-2e53-4068-aabe-4dbc81fe86b9'), operation_id='bbdfef3e-af21-40ab-b1a8...se, failure_reason='target_unavailable', receipt_id=UUID('dc12996d-a011-41c2-aab5-94dfc29bdfc6'), malformed_head=False).target_state_id
+E    +  and   UUID('aef51487-b538-4b35-b7c4-d3a8e49ab3b0') = GraphRecoverySettlement(session_id=UUID('637bfcdd-2e53-4068-aabe-4dbc81fe86b9'), operation_id='80c16db4-5709-4285-8264...pty_fallback=False, failure_reason=None, receipt_id=UUID('a7345b24-ea6b-439b-8787-718d4efc7450'), malformed_head=False).state_id</failure></testcase><testcase classname="tests.unit.web.coordination.test_graph_recovery_persistence" name="test_explicit_restore_uses_parked_identity_across_turns[padded]" time="0.301"><failure message="AssertionError: assert (None == UUID('a1366238-8f08-4c83-9372-57b4ca010eb0'))&#10; +  where None = GraphRecoverySettlement(session_id=UUID('cdb9b7b6-d593-4c2f-b61a-a34bce9cecae'), operation_id='35ecee68-4ace-4b2e-94a3...se, failure_reason='target_unavailable', receipt_id=UUID('c041d1ed-490f-41a3-ad47-7e7e709676fd'), malformed_head=False).target_state_id&#10; +  and   UUID('a1366238-8f08-4c83-9372-57b4ca010eb0') = GraphRecoverySettlement(session_id=UUID('cdb9b7b6-d593-4c2f-b61a-a34bce9cecae'), operation_id='2b4d5d5e-83fc-40c6-9971...pty_fallback=False, failure_reason=None, receipt_id=UUID('aca6aaf7-fc38-449e-810b-661af4474f0b'), malformed_head=False).state_id">tests/unit/web/coordination/test_graph_recovery_persistence.py:374: in test_explicit_restore_uses_parked_identity_across_turns
+    assert restore.target_state_id == park.state_id and not restore.empty_fallback
+E   AssertionError: assert (None == UUID('a1366238-8f08-4c83-9372-57b4ca010eb0'))
+E    +  where None = GraphRecoverySettlement(session_id=UUID('cdb9b7b6-d593-4c2f-b61a-a34bce9cecae'), operation_id='35ecee68-4ace-4b2e-94a3...se, failure_reason='target_unavailable', receipt_id=UUID('c041d1ed-490f-41a3-ad47-7e7e709676fd'), malformed_head=False).target_state_id
+E    +  and   UUID('a1366238-8f08-4c83-9372-57b4ca010eb0') = GraphRecoverySettlement(session_id=UUID('cdb9b7b6-d593-4c2f-b61a-a34bce9cecae'), operation_id='2b4d5d5e-83fc-40c6-9971...pty_fallback=False, failure_reason=None, receipt_id=UUID('aca6aaf7-fc38-449e-810b-661af4474f0b'), malformed_head=False).state_id</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[canonical-none-freeform]" time="1.434" /><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[canonical-none-planner]" time="1.381" /><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[canonical-none-malformed-head]" time="0.738" /><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[canonical-openai_strict-freeform]" time="0.927" /><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[canonical-openai_strict-planner]" time="0.853" /><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[canonical-openai_strict-malformed-head]" time="0.631" /><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-none-freeform]" time="1.412"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-none-planner]" time="0.855"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-none-malformed-head]" time="0.594"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-openai_strict-freeform]" time="0.865"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-openai_strict-planner]" time="1.397"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-openai_strict-malformed-head]" time="0.625"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-none-freeform]" time="0.841"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-none-planner]" time="0.909"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-none-malformed-head]" time="0.644"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-openai_strict-freeform]" time="0.891"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-openai_strict-planner]" time="1.579"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[mixed-openai_strict-malformed-head]" time="0.625"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-none-freeform]" time="0.892"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-none-planner]" time="0.807"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-none-malformed-head]" time="0.583"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-openai_strict-freeform]" time="1.405"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-openai_strict-planner]" time="0.875"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[braced-openai_strict-malformed-head]" time="0.649"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-none-freeform]" time="0.891"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-none-planner]" time="0.816"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-none-malformed-head]" time="0.638"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-openai_strict-freeform]" time="0.846"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-openai_strict-planner]" time="1.554"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[hyphenless-openai_strict-malformed-head]" time="0.630"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-none-freeform]" time="0.862"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-none-planner]" time="0.838"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-none-malformed-head]" time="0.624"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-openai_strict-freeform]" time="0.839"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-openai_strict-planner]" time="0.844"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[urn-openai_strict-malformed-head]" time="1.558"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-none-freeform]" time="0.833"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-none-planner]" time="0.837"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-none-malformed-head]" time="0.609"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-openai_strict-freeform]" time="0.862"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-openai_strict-planner]" time="0.796"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase><testcase classname="tests.unit.web.sessions.test_graph_recovery_turn" name="test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[padded-openai_strict-malformed-head]" time="0.577"><failure message="assert '\n\n---\n\n[... to continue.' == &quot; \tLet's edit that draft.\n&quot;&#10;  &#10;  -  &#09;Let's edit that draft.&#10;  + &#10;  + &#10;  + ---&#10;  + &#10;  + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.">tests/unit/web/sessions/test_graph_recovery_turn.py:227: in test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence
+    assert response.message.content == arguments["message"]
+E   assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E     
+E     -  	Let's edit that draft.
+E     + 
+E     + 
+E     + ---
+E     + 
+E     + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.</failure></testcase></testsuite></testsuites>

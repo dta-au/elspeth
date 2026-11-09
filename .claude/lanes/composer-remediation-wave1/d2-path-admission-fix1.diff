@@ -1,0 +1,362 @@
+diff --git a/src/elspeth/web/execution/_validation_authoring.py b/src/elspeth/web/execution/_validation_authoring.py
+--- a/src/elspeth/web/execution/_validation_authoring.py
++++ b/src/elspeth/web/execution/_validation_authoring.py
+@@ -293,9 +293,9 @@
+         source_options = dict(source.options)
+         source_component = _source_policy_component_id(source_name)
+         for key in SOURCE_LOCAL_PATH_OPTION_KEYS:
+-            value = source_options.get(key)
+-            if value is None:
++            if key not in source_options:
+                 continue
++            value = source_options[key]
+             if not is_local_path_value(value):
+                 return _path_value_failure(
+                     component_id=source_component,
+@@ -346,9 +346,9 @@
+ 
+     for output in state.outputs:
+         for key in SINK_LOCAL_PATH_OPTION_KEYS:
+-            value = output.options[key] if key in output.options else None
+-            if value is None:
++            if key not in output.options:
+                 continue
++            value = output.options[key]
+             if not is_local_path_value(value):
+                 return _path_value_failure(
+                     component_id=output.name,
+diff --git a/src/elspeth/web/execution/preflight.py b/src/elspeth/web/execution/preflight.py
+--- a/src/elspeth/web/execution/preflight.py
++++ b/src/elspeth/web/execution/preflight.py
+@@ -42,6 +42,7 @@
+     NESTED_LOCAL_PATH_OPTION_KEYS,
+     SINK_LOCAL_PATH_OPTION_KEYS,
+     SOURCE_LOCAL_PATH_OPTION_KEYS,
++    is_local_path_value,
+     require_mcp_root_context,
+     resolve_data_path,
+     resolve_sink_data_path,
+@@ -133,11 +134,16 @@
+             raise TypeError(f"YAML generator produced non-dict '{component_path}.options' value (got {type(opts).__name__})")
+         path_options = cast(dict[str, Any], opts)
+         for key in path_option_keys:
+-            if key in path_options and not Path(str(path_options[key])).is_absolute():
++            if key not in path_options:
++                continue
++            value = path_options[key]
++            if not is_local_path_value(value):
++                raise ValueError(f"{component_path}.options.{key} must be a nonempty string path without NUL")
++            if not Path(value).is_absolute():
+                 if sink_paths and mcp_root_authority is None:
+-                    path_options[key] = str(resolve_sink_data_path(str(path_options[key]), data_dir, session_id=session_id))
++                    path_options[key] = str(resolve_sink_data_path(value, data_dir, session_id=session_id))
+                 else:
+-                    path_options[key] = str(resolve_data_path(str(path_options[key]), data_dir))
++                    path_options[key] = str(resolve_data_path(value, data_dir))
+ 
+     if "source" in config:
+         source = config["source"]
+@@ -236,11 +242,18 @@
+             if not isinstance(provider_config, dict):
+                 continue
+             for key in NESTED_LOCAL_PATH_OPTION_KEYS:
+-                if key in provider_config and provider_config[key] is not None and not Path(str(provider_config[key])).is_absolute():
++                if key not in provider_config:
++                    continue
++                value = provider_config[key]
++                if value is None:
++                    continue
++                if not is_local_path_value(value):
++                    raise ValueError(f"transform.options.provider_config.{key} must be a nonempty string path without NUL")
++                if not Path(value).is_absolute():
+                     provider_config[key] = str(
+-                        resolve_data_path(str(provider_config[key]), data_dir)
++                        resolve_data_path(value, data_dir)
+                         if mcp_root_authority is not None
+-                        else resolve_sink_data_path(str(provider_config[key]), data_dir, session_id=session_id)
++                        else resolve_sink_data_path(value, data_dir, session_id=session_id)
+                     )
+ 
+     return yaml.dump(config, default_flow_style=False)
+diff --git a/tests/unit/composer_mcp/test_configured_root_admission.py b/tests/unit/composer_mcp/test_configured_root_admission.py
+--- a/tests/unit/composer_mcp/test_configured_root_admission.py
++++ b/tests/unit/composer_mcp/test_configured_root_admission.py
+@@ -29,6 +29,7 @@
+ from elspeth.web.composer.state import CompositionState
+ from elspeth.web.composer.tools._common import ToolContext
+ from elspeth.web.dependencies import create_catalog_service
++from elspeth.web.execution import validation as execution_validation
+ from elspeth.web.execution._validation_materialization import materialize_validation_yaml
+ from elspeth.web.execution._validation_model import PhaseReport
+ from elspeth.web.execution.runtime_preflight import RuntimePreflightCoordinator
+@@ -453,6 +454,143 @@
+     assert live.saved_bytes == saved
+ 
+ 
++_SOURCE_SINK_PATH_KEYS = [
++    pytest.param("source", "path", id="source-path"),
++    pytest.param("source", "file", id="source-file"),
++    pytest.param("output", "path", id="sink-path"),
++    pytest.param("output", "file", id="sink-file"),
++    pytest.param("output", "persist_directory", id="sink-persist-directory"),
++]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(("component", "key"), _SOURCE_SINK_PATH_KEYS)
++@pytest.mark.parametrize("escape_link", [False, True])
++async def test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup(
++    tmp_path: Path, component: str, key: str, escape_link: bool, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A present null must fail the path gate before any scalar-to-path rewrite."""
++    root = tmp_path / "data"
++    root.mkdir()
++    (root / "input.csv").write_text("text\ninside\n")
++    outside = tmp_path / "outside.csv"
++    outside.write_text("text\noutside\n")
++    if escape_link:
++        (root / "None").symlink_to(outside)
++    payload = _preview_state().to_dict()
++    options = payload["sources"]["source"]["options"] if component == "source" else payload["outputs"][0]["options"]
++    options[key] = None
++    live = await _live_mcp(tmp_path, root, state=CompositionState.from_dict(payload))
++    before, saved = live.private_state, live.saved_bytes
++    before_public = await live.call("get_pipeline_state", {})
++    outside_bytes = outside.read_bytes()
++    reached: list[dict[str, Any]] = []
++    materialize = execution_validation.materialize_validation_yaml
++    instantiate = execution_validation.instantiate_runtime_plugins
++
++    def observe_materialization(*args: Any, **kwargs: Any) -> Any:
++        result = materialize(*args, **kwargs)
++        reached.append({"phase": "materialization", "yaml": result.artifact.pipeline_yaml if isinstance(result, PhaseReport) else None})
++        return result
++
++    def observe_plugin_setup(*args: Any, **kwargs: Any) -> Any:
++        reached.append({"phase": "plugin_setup"})
++        return instantiate(*args, **kwargs)
++
++    monkeypatch.setattr(execution_validation, "materialize_validation_yaml", observe_materialization)
++    monkeypatch.setattr(execution_validation, "instantiate_runtime_plugins", observe_plugin_setup)
++    preview = await live.call("preview_pipeline", {})
++    preflight = preview["runtime_preflight"]
++    (tmp_path / "observed-null-preview.json").write_text(
++        json.dumps(
++            {
++                "component": component,
++                "key": key,
++                "escape_link": escape_link,
++                "root": str(root),
++                "outside": str(outside),
++                "reached": reached,
++                "preflight": preflight,
++                "outside_bytes_unchanged": outside.read_bytes() == outside_bytes,
++            },
++            indent=2,
++        )
++    )
++    path_checks = [check for check in preflight["checks"] if check["name"] == "path_allowlist"]
++    assert len(path_checks) == 1
++    assert path_checks[0]["passed"] is False, {"preflight": preflight, "reached": reached}
++    assert preflight["is_valid"] is False
++    assert preview["data"]["preview_is_valid"] is False
++    assert reached == []
++    assert outside.read_bytes() == outside_bytes
++    assert live.saved_bytes == saved
++    after_public = await live.call("get_pipeline_state", {})
++    assert after_public["state"] == before_public["state"]
++    assert (await live.call("save_session", {"session_id": live.session_id}))["success"] is True
++    after = live.private_state
++    assert after.to_dict() == before.to_dict()
++    assert after.version == before.version
++    assert composition_content_hash(after) == composition_content_hash(before)
++    assert live.saved_bytes == saved
++
++
++@pytest.mark.parametrize(("component", "key"), _SOURCE_SINK_PATH_KEYS)
++def test_null_path_cannot_be_materialized_into_execution_or_identity_yaml(tmp_path: Path, component: str, key: str) -> None:
++    """Calling either materializer directly must not invent a pathname from null."""
++    root = tmp_path / "data"
++    root.mkdir()
++    (root / "None").symlink_to(tmp_path / "outside.csv")
++    payload = _preview_state().to_dict()
++    options = payload["sources"]["source"]["options"] if component == "source" else payload["outputs"][0]["options"]
++    options[key] = None
++    state = CompositionState.from_dict(payload)
++    authority = McpConfiguredRootAuthority(root)
++    with pytest.raises(ValueError, match="nonempty string path"):
++        materialize_validation_yaml(
++            _interpretation(state),
++            yaml_generator=yaml_generator,
++            data_dir=root,
++            session_id=None,
++            blob_get_metadata=None,
++            load_yaml=yaml.safe_load,
++            mcp_root_authority=authority,
++        )
++    with pytest.raises(ValueError, match="nonempty string path"):
++        _compiled_identity_settings(state, yaml_generator=yaml_generator, data_dir=root, session_id=None, mcp_root_authority=authority)
++
++
++def test_missing_source_sink_keys_and_nullable_provider_survive_both_materializers(tmp_path: Path) -> None:
++    """Absent optional keys stay absent; only nested provider null is retained."""
++    payload = _seed_state().to_dict()
++    payload["sources"]["source"]["options"].pop("path")
++    payload["outputs"][0]["options"].pop("path")
++    payload["nodes"][1]["options"]["provider_config"]["persist_directory"] = None
++    state = CompositionState.from_dict(payload)
++    authority = McpConfiguredRootAuthority(tmp_path)
++    materialized = materialize_validation_yaml(
++        _interpretation(state),
++        yaml_generator=yaml_generator,
++        data_dir=tmp_path,
++        session_id=None,
++        blob_get_metadata=None,
++        load_yaml=yaml.safe_load,
++        mcp_root_authority=authority,
++    )
++    assert isinstance(materialized, PhaseReport)
++    execution = yaml.safe_load(materialized.artifact.pipeline_yaml)
++    identity = _compiled_identity_settings(
++        state,
++        yaml_generator=yaml_generator,
++        data_dir=tmp_path,
++        session_id=None,
++        mcp_root_authority=authority,
++    ).audit_safe_settings()
++    for document in (execution, identity):
++        assert not {"path", "file"}.intersection(document["sources"]["source"]["options"])
++        assert not {"path", "file", "persist_directory"}.intersection(document["sinks"]["result"]["options"])
++        assert document["transforms"][1]["options"]["provider_config"]["persist_directory"] is None
++
++
+ @pytest.mark.asyncio
+ async def test_canonical_root_and_contained_leaf_symlinks_allow_authoring(tmp_path: Path) -> None:
+     actual = tmp_path / "actual-data"
+diff --git a/tests/unit/web/execution/test_preflight_side_effects.py b/tests/unit/web/execution/test_preflight_side_effects.py
+--- a/tests/unit/web/execution/test_preflight_side_effects.py
++++ b/tests/unit/web/execution/test_preflight_side_effects.py
+@@ -12,9 +12,11 @@
+ from unittest.mock import patch
+ 
+ import pytest
++import yaml
+ from pydantic import SecretBytes
+ 
+ from elspeth.config_loading import load_settings_from_yaml_string
++from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
+ from elspeth.contracts.enums import RunMode
+ from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml, resolve_config
+ from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode, plugin_preflight_mode_enabled
+@@ -50,6 +52,63 @@
+     monkeypatch.setattr(socket, "socket", fail)
+     monkeypatch.setattr(socket, "create_connection", fail)
+     monkeypatch.setattr(socket, "getaddrinfo", fail)
++
++
++_REWRITTEN_PATH_SITES = [
++    ("source", "path"),
++    ("source", "file"),
++    ("sources", "path"),
++    ("sources", "file"),
++    ("sinks", "path"),
++    ("sinks", "file"),
++    ("sinks", "persist_directory"),
++    ("provider", "persist_directory"),
++]
++
++
++@pytest.mark.parametrize(
++    ("component", "key", "value"),
++    [
++        (component, key, value)
++        for component, key in _REWRITTEN_PATH_SITES
++        for value in (None, 42, False, [], {}, "", "bad\x00path")
++        if not (component == "provider" and value is None)
++    ],
++)
++@pytest.mark.parametrize("mode", ["web", "mcp"])
++def test_runtime_yaml_refuses_invalid_values_before_path_coercion(
++    tmp_path: Path, component: str, key: str, value: object, mode: str
++) -> None:
++    """Resolver entry points cannot turn an invalid scalar/container into a filename."""
++    configured: dict[str, Any]
++    if component == "provider":
++        configured = {"transforms": [{"name": "lookup", "plugin": "rag_retrieval", "options": {"provider_config": {key: value}}}]}
++    else:
++        item = {"plugin": "csv", "options": {key: value}}
++        configured = {component: item if component == "source" else {"main": item}}
++    with pytest.raises(ValueError, match="nonempty string path"):
++        execution_preflight.resolve_runtime_yaml_paths(
++            yaml.safe_dump(configured),
++            str(tmp_path),
++            session_id="test-session" if mode == "web" else None,
++            mcp_root_authority=McpConfiguredRootAuthority(tmp_path) if mode == "mcp" else None,
++        )
++
++
++@pytest.mark.parametrize("mode", ["web", "mcp"])
++def test_runtime_yaml_keeps_absent_path_options_and_nullable_provider(tmp_path: Path, mode: str) -> None:
++    document = {
++        "sources": {"main": {"plugin": "null", "options": {}}},
++        "sinks": {"main": {"plugin": "csv", "options": {}}},
++        "transforms": [{"name": "lookup", "plugin": "rag_retrieval", "options": {"provider_config": {"persist_directory": None}}}],
++    }
++    result = execution_preflight.resolve_runtime_yaml_paths(
++        yaml.safe_dump(document),
++        str(tmp_path),
++        session_id="test-session" if mode == "web" else None,
++        mcp_root_authority=McpConfiguredRootAuthority(tmp_path) if mode == "mcp" else None,
++    )
++    assert yaml.safe_load(result) == document
+ 
+ 
+ def _web_settings(tmp_path: Path) -> WebSettings:
+diff --git a/tests/unit/web/execution/test_validation_authoring.py b/tests/unit/web/execution/test_validation_authoring.py
+--- a/tests/unit/web/execution/test_validation_authoring.py
++++ b/tests/unit/web/execution/test_validation_authoring.py
+@@ -9,6 +9,7 @@
+ import pytest
+ 
+ from elspeth.contracts import Determinism
++from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
+ from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem, SecretScope
+ from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+ from elspeth.plugins.transforms.blob_fetch import BlobFetch
+@@ -236,6 +237,36 @@
+ 
+ 
+ @pytest.mark.parametrize(
++    ("component", "key"), [("source", "path"), ("source", "file"), ("sink", "path"), ("sink", "file"), ("sink", "persist_directory")]
++)
++@pytest.mark.parametrize("mode", ["web", "mcp"])
++def test_path_phase_refuses_present_null_for_each_source_sink_alias(tmp_path: Path, component: str, key: str, mode: str) -> None:
++    state = _state(source=_source({key: None})) if component == "source" else _state(outputs=(_output({key: None}),))
++    result = validate_path_policy(
++        _policy(state),
++        data_dir=tmp_path,
++        session_id="test-session" if mode == "web" else None,
++        mcp_root_authority=McpConfiguredRootAuthority(tmp_path) if mode == "mcp" else None,
++    )
++    assert isinstance(result, PhaseFailure)
++    assert result.failed_check.name == "path_allowlist"
++    assert result.errors[0].component_type == component
++
++
++@pytest.mark.parametrize("mode", ["web", "mcp"])
++def test_path_phase_keeps_missing_keys_and_nullable_provider_distinct_from_null_source_sink(tmp_path: Path, mode: str) -> None:
++    state = _state(nodes=(_node(options={"provider_config": {"persist_directory": None}}),), outputs=(_output(),))
++    result = validate_path_policy(
++        _policy(state),
++        data_dir=tmp_path,
++        session_id="test-session" if mode == "web" else None,
++        mcp_root_authority=McpConfiguredRootAuthority(tmp_path) if mode == "mcp" else None,
++    )
++    assert isinstance(result, PhaseReport)
++    assert result.artifact.state.to_dict() == state.to_dict()
++
++
++@pytest.mark.parametrize(
+     ("source_name", "component_id"),
+     [("source", "source"), ("orders", "source:orders"), ("7", "source:7"), (7, "source:<invalid>"), (None, "source:<invalid>")],
+ )

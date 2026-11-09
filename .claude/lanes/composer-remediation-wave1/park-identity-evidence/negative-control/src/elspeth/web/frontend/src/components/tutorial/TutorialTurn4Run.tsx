@@ -1,0 +1,509 @@
+import { type JSX, useEffect, useRef, useState } from "react";
+import { cancelTutorialRun, fetchPluginPolicy, runTutorialPipeline } from "@/api/client";
+import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
+import { AlertBanner, Button } from "@/components/ui";
+import { useSessionOperationInFlight } from "@/hooks/useSessionOperationInFlight";
+import type { TutorialRunResponse } from "@/types/api";
+import {
+  TUTORIAL_RUN_PREAMBLE,
+  TUTORIAL_SHIELD_OVERRIDE_CAVEAT,
+  TUTORIAL_SHIELD_WIRED_NOTE,
+  TURN_4_PRIMARY_BUTTON,
+  TURN_4_READY_BODY,
+  TURN_4_RUN_BUTTON,
+  TURN_4_SETTLING_BODY,
+} from "./copy";
+import type { RunResultRow, TutorialRunResult } from "./tutorialMachine";
+import { TutorialWorkspaceFrame } from "./TutorialWorkspaceFrame";
+
+interface TutorialTurn4RunProps {
+  sessionId: string;
+  /**
+   * Fired as soon as the run's result arrives (rendered on this turn,
+   * before the user clicks Continue). The parent persists the run identity
+   * so a reload resumes at the audit step instead of re-executing the
+   * pipeline (elspeth-918f4434b3). Optional — standalone mounts (tests)
+   * may omit it.
+   */
+  onResult?: (result: TutorialRunResult) => void;
+  onCompleted: (result: TutorialRunResult) => void;
+  onCancelled: () => void;
+  /**
+   * Back affordance. The tutorial supplies it only before a run has started,
+   * returning to the same freeform Build session. Once a run has an identity,
+   * Back is omitted so a reload cannot accidentally re-execute it.
+   */
+  onBack?: () => void;
+}
+
+/**
+ * Three-phase narration timing for the run status text. Tied to fixed
+ * timers (not streamed progress events — the backend run is an opaque
+ * POST). Tuned so AT users hear progress at a rate that matches the
+ * typical 8–12s tutorial run on a warm cache.
+ */
+const PHASE_MODEL_DELAY_MS = 2_000;
+const PHASE_WRITE_DELAY_MS = 6_000;
+const SHOW_CANCEL_DELAY_MS = 5_000;
+
+type RunPhase = "fetch" | "model" | "write";
+
+interface CachedRun {
+  promise: Promise<TutorialRunResponse>;
+  controller: AbortController;
+}
+
+/**
+ * Cached by `sessionId` so React StrictMode's double-invoke of the run
+ * effect coalesces to a single backend call. The cache entry stores both
+ * the promise and the AbortController owning the fetch's signal — the
+ * user-cancel path aborts via the cached controller and removes the entry
+ * so a subsequent re-mount triggers a fresh run.
+ *
+ * TutorialRunRequest carries only session_id; the backend rechecks and runs
+ * that session's approved state. Build is no longer revisited once Run starts,
+ * so the session ID identifies the in-page request for StrictMode dedupe.
+ */
+const tutorialRunCache = new Map<string, CachedRun>();
+
+function getTutorialRun(sessionId: string): CachedRun {
+  const existing = tutorialRunCache.get(sessionId);
+  if (existing !== undefined) {
+    return existing;
+  }
+  const controller = new AbortController();
+  const promise = runTutorialPipeline(
+    { session_id: sessionId },
+    controller.signal,
+  ).catch((err: unknown) => {
+    // Drop the cache entry on failure so the user can retry without
+    // hitting a stale rejected promise.
+    tutorialRunCache.delete(sessionId);
+    throw err;
+  });
+  const entry: CachedRun = { promise, controller };
+  tutorialRunCache.set(sessionId, entry);
+  return entry;
+}
+
+function clearTutorialRunCache(sessionId: string): void {
+  tutorialRunCache.delete(sessionId);
+}
+
+/**
+ * Abort the cached in-flight run fetch (if any) and fire the best-effort
+ * server-side cancel. Shared by the run turn's Cancel button and the
+ * tutorial chrome's "Exit tutorial" control: the effect cleanup above
+ * deliberately never aborts (StrictMode), so without an explicit call here
+ * an exit mid-run leaves the backend run executing (LLM spend, sink
+ * writes) after the learner has left the tutorial.
+ */
+export function abandonTutorialRun(sessionId: string): void {
+  const cached = tutorialRunCache.get(sessionId);
+  if (cached !== undefined) {
+    cached.controller.abort();
+    tutorialRunCache.delete(sessionId);
+  }
+  // Not awaited, so the caller's UI moves on immediately rather than
+  // blocking on network latency. Aborting only the browser fetch left the
+  // backend run executing; this call is what makes cancel/exit honest.
+  void cancelTutorialRun(sessionId).catch(() => {
+    // Nothing to surface: the caller has already moved on, and the
+    // endpoint is itself idempotent/best-effort.
+  });
+}
+
+function isAbortError(err: unknown): boolean {
+  return err instanceof DOMException && err.name === "AbortError";
+}
+
+function hasErrorType(err: unknown, type: string): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "error_type" in err &&
+    (err as { error_type?: unknown }).error_type === type
+  );
+}
+
+// Friendly copy for the ``run_already_active`` 409 (a quick retry lands while
+// the previous run is still finishing server-side). Deliberately does NOT
+// echo the backend's raw detail string ("run already active for session
+// ...") — that string names an internal invariant, not user-facing copy.
+const TUTORIAL_RUN_STILL_FINISHING_MESSAGE =
+  "Your previous tutorial run is still finishing. Give it a moment, then try again.";
+
+export function TutorialTurn4Run({
+  sessionId,
+  onResult,
+  onCompleted,
+  onCancelled,
+  onBack,
+}: TutorialTurn4RunProps): JSX.Element {
+  // The run never auto-fires (I-1). `armed` flips true on the learner's Run
+  // click and gates the run effect below. It initialises TRUE only when this
+  // session already has a cached run — the in-page audit → Back → run
+  // remount, where the completed result is re-viewable and offering Run
+  // again would be a second execution. A fresh mount (first arrival, or a
+  // resume after reload — the cache is module-level and dies with the page)
+  // starts disarmed on the pre-run card.
+  const [armed, setArmed] = useState(() => tutorialRunCache.has(sessionId));
+  const [result, setResult] = useState<TutorialRunResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [phase, setPhase] = useState<RunPhase>("fetch");
+  const [showCancel, setShowCancel] = useState(false);
+  const [retryNonce, setRetryNonce] = useState(0);
+  const headingRef = useRef<HTMLHeadingElement | null>(null);
+  // #352: the Run card can mount while the build's last request (a review
+  // resolve, or the /validate it triggers) still holds the session's fence;
+  // a run dispatched then is refused with a bare 409. Run waits for it.
+  const operationInFlight = useSessionOperationInFlight(sessionId);
+
+  // Move focus to the turn's heading on mount so screen-reader users
+  // hear the new step. `tabIndex={-1}` on the h2 makes it
+  // programmatically focusable without entering the tab order.
+  useEffect(() => {
+    headingRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    if (!armed) {
+      // Pre-run card: no request, no phase timers. The learner has not
+      // clicked Run yet.
+      return;
+    }
+    let active = true;
+    setResult(null);
+    setError(null);
+    setPhase("fetch");
+    setShowCancel(false);
+
+    const cached = getTutorialRun(sessionId);
+    cached.promise
+      .then((response) => {
+        if (!active) return;
+        const arrived: TutorialRunResult = {
+          runId: response.run_id,
+          sourceDataHash: response.output.source_data_hash,
+          rows: response.output.rows,
+          discardedRowCount: response.output.discarded_row_count,
+        };
+        setResult(arrived);
+        // Notify the parent the run identity exists, so it can be
+        // persisted for resume BEFORE the user clicks Continue. Uses the
+        // same latest-effect-run closure convention as onCancelled below.
+        onResult?.(arrived);
+      })
+      .catch((err: unknown) => {
+        if (!active) return;
+        // AbortError on the cached promise means another consumer (the
+        // user-cancel path below) aborted the run. The cancel handler
+        // already dispatched onCancelled; nothing more to render here.
+        if (isAbortError(err)) return;
+        // Server-side cancellation (another tab's Cancel click, or the run
+        // landing on "cancelled" after this fetch was already in flight)
+        // surfaces as a 409 with this machine-readable error_type, distinct
+        // from the generic live-run-failed error below. Route it to the
+        // same cancelled state the local Cancel button drives, rather than
+        // rendering it as a raw error.
+        if (hasErrorType(err, "tutorial_run_cancelled")) {
+          onCancelled();
+          return;
+        }
+        setError(formatError(err));
+      });
+
+    const phaseModelTimer = window.setTimeout(() => {
+      if (active) setPhase("model");
+    }, PHASE_MODEL_DELAY_MS);
+    const phaseWriteTimer = window.setTimeout(() => {
+      if (active) setPhase("write");
+    }, PHASE_WRITE_DELAY_MS);
+    const cancelTimer = window.setTimeout(() => {
+      if (active) setShowCancel(true);
+    }, SHOW_CANCEL_DELAY_MS);
+
+    return () => {
+      active = false;
+      window.clearTimeout(phaseModelTimer);
+      window.clearTimeout(phaseWriteTimer);
+      window.clearTimeout(cancelTimer);
+      // Do NOT abort the cached controller on effect cleanup — that path
+      // fires under React StrictMode's developer double-invoke as well as
+      // on real unmount. The cached promise should survive the
+      // double-invoke (that's the whole point of the cache); the
+      // user-cancel button is the only legitimate abort trigger.
+    };
+    // Intentional: `onCancelled` is deliberately NOT a dep. HelloWorldTutorial
+    // passes an inline arrow function, so a naive dep list would re-run this
+    // effect (resetting phase/showCancel and restarting the cancel timers) on
+    // every parent re-render — the effect should only re-run for a real
+    // session/retry change. The closure below always calls the version
+    // captured at the most recent effect run, which is fine here: onCancelled
+    // is a stable "dispatch a fixed action" callback, not state-dependent.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, retryNonce, armed]);
+
+  const onRunClick = (): void => {
+    if (operationInFlight) return;
+    setArmed(true);
+    // The Run button the learner just pressed leaves the DOM; put focus on
+    // the heading (now "Running your pipeline.") so keyboard and AT users
+    // are not dropped at the document root.
+    headingRef.current?.focus();
+  };
+
+  const onCancelClick = (): void => {
+    abandonTutorialRun(sessionId);
+    onCancelled();
+  };
+
+  const onRetryClick = (): void => {
+    if (operationInFlight) return;
+    clearTutorialRunCache(sessionId);
+    setRetryNonce((n) => n + 1);
+  };
+
+  /**
+   * Which prompt-shield teaching moment is true for THIS deployment.
+   *
+   * Both strings state a checkable fact about the pipeline the user is watching
+   * run, so neither may be rendered on a guess. Three states, not two:
+   *
+   * - `"wired"` — a shield is selected AND the control mode is `required`. Only
+   *   then is every clause true: coverage validation would have refused the
+   *   pipeline otherwise, so a shield is certainly in it.
+   * - `"absent"` — no shield selected, so the deployment cannot have wired one.
+   * - `null` — selected but merely `recommend`, or the policy is unreadable.
+   *   Under `recommend` the aid asks for a shield and nothing enforces it, so
+   *   whether this pipeline has one is unknowable from policy alone; claiming
+   *   either way would be the same falsehood this conditional exists to remove.
+   */
+  const [shieldNote, setShieldNote] = useState<"wired" | "absent" | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchPluginPolicy()
+      .then((snapshot) => {
+        if (cancelled) {
+          return;
+        }
+        const selected = snapshot.data.selections.some(
+          (selection) =>
+            selection.capability === "prompt_shield" && selection.plugin_id !== null,
+        );
+        if (!selected) {
+          setShieldNote("absent");
+          return;
+        }
+        const required = snapshot.data.control_modes.some(
+          (control) =>
+            control.capability === "prompt_shield" && control.mode === "required",
+        );
+        setShieldNote(required ? "wired" : null);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setShieldNote(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const running = armed && result === null && error === null;
+  const back = (label?: string): JSX.Element | null =>
+    onBack === undefined ? null : (
+      <Button variant="bare" className="tutorial-link-button" onClick={onBack} aria-label={label}>
+        Back
+      </Button>
+    );
+
+  let title: string;
+  let actions: JSX.Element | undefined;
+  if (!armed) {
+    // Pre-run (I-1): the committed graph sits in the pipeline pane beside
+    // this step; the run waits for the learner's explicit click.
+    title = "Ready to run.";
+    actions = (
+      <>
+        <Button variant="primary" onClick={onRunClick} disabled={operationInFlight}>
+          {TURN_4_RUN_BUTTON}
+        </Button>
+        {back()}
+      </>
+    );
+  } else if (result !== null) {
+    title = "Your pipeline ran.";
+    actions = (
+      <>
+        <Button variant="primary" onClick={() => onCompleted(result)}>{TURN_4_PRIMARY_BUTTON}</Button>
+        {back("Back to the pipeline build")}
+      </>
+    );
+  } else if (error !== null) {
+    title = "The run did not complete.";
+    actions = (
+      <>
+        <Button variant="primary" onClick={onRetryClick} disabled={operationInFlight}>Retry</Button>
+        {back()}
+      </>
+    );
+  } else {
+    title = "Running your pipeline.";
+    actions = showCancel ? <Button onClick={onCancelClick}>Cancel run</Button> : undefined;
+  }
+
+  return (
+    <TutorialWorkspaceFrame
+      ariaLabel="Tutorial run"
+      header={{
+        title,
+        headingRef,
+        instruction: (
+          // ONE element across the run's phases, so it is already a live
+          // region when the phase text and then the result land in it. Busy
+          // while the run executes; nothing is in progress before Run.
+          <div
+            className="tutorial-step-instruction"
+            role={armed ? "status" : undefined}
+            aria-busy={running || undefined}
+          >
+            {!armed && (operationInFlight ? TURN_4_SETTLING_BODY : TURN_4_READY_BODY)}
+            {running && (
+              <span className="tutorial-running">
+                <span className="tutorial-progress-bar" aria-hidden="true" />
+                <span>{describePhase(phase)}</span>
+              </span>
+            )}
+            {result !== null && (
+              <>
+                <span className="tutorial-run-summary">Done. {result.rows.length} rows returned.</span>{" "}
+                Continue to see what the audit trail recorded about this run.
+              </>
+            )}
+            {error !== null && (onBack === undefined ? "Retry the run." : "Retry the run, or go back to Build.")}
+          </div>
+        ),
+        notice: error !== null ? <p role="alert" className="tutorial-error">{error}</p> : undefined,
+        actions,
+      }}
+    >
+      <div className="tutorial-workspace-authoring tutorial-run-authoring">
+        <AlertBanner tone="info" className="tutorial-disclosure">
+          {TUTORIAL_RUN_PREAMBLE}
+        </AlertBanner>
+        {shieldNote !== null && (
+          <p className="tutorial-callout">
+            {shieldNote === "wired" ? TUTORIAL_SHIELD_WIRED_NOTE : TUTORIAL_SHIELD_OVERRIDE_CAVEAT}
+          </p>
+        )}
+        {result !== null && result.discardedRowCount > 0 && (
+          <p className="tutorial-run-discarded" role="status">
+            {result.discardedRowCount}{" "}
+            {result.discardedRowCount === 1 ? "row was" : "rows were"} discarded at the source
+            because the data could not be parsed. They were recorded in the audit trail but are
+            not shown in the results table.
+          </p>
+        )}
+        {result !== null && <TutorialResultTable rows={result.rows} />}
+        {result === null && error === null && (
+          <p className="tutorial-muted">Results appear here when the run finishes.</p>
+        )}
+      </div>
+    </TutorialWorkspaceFrame>
+  );
+}
+
+function describePhase(phase: RunPhase): string {
+  switch (phase) {
+    case "fetch":
+      return "Fetching pages…";
+    case "model":
+      return "Calling the model…";
+    case "write":
+      return "Writing the output…";
+  }
+}
+
+function TutorialResultTable({ rows }: { rows: RunResultRow[] }): JSX.Element {
+  const columns = preferredColumns(rows);
+  return (
+    <div className="tutorial-result-table-wrap">
+      <table className="tutorial-result-table">
+        <caption className="sr-only">Pipeline run results</caption>
+        <thead>
+          <tr>
+            {columns.map((column) => (
+              <th key={column}>{titleCaseLabel(column)}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, index) => (
+            <tr key={index}>
+              {columns.map((column) => (
+                <td key={column}>
+                  {stringifyCell(row[column])}
+                  {column === "error" && row[column] ? (
+                    <span className="tutorial-cell-note">Recorded in audit</span>
+                  ) : null}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function preferredColumns(rows: RunResultRow[]): string[] {
+  const keys = new Set<string>();
+  rows.forEach((row) => Object.keys(row).forEach((key) => keys.add(key)));
+  const preferred = ["url", "summary", "error"];
+  const ordered = preferred.filter((key) => keys.has(key));
+  for (const key of keys) {
+    if (!ordered.includes(key)) {
+      ordered.push(key);
+    }
+  }
+  return ordered.slice(0, 6);
+}
+
+function stringifyCell(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return JSON.stringify(value);
+}
+
+function formatError(err: unknown): string {
+  // run_already_active is an internal one-active-run-per-session invariant
+  // (RunAlreadyActiveError, sessions/protocol.py) tripping on a too-quick
+  // retry — its raw detail ("run already active for session <uuid>") is
+  // implementation detail, not user-facing copy. Fixed friendly language
+  // instead of widening what the client echoes.
+  if (hasErrorType(err, "run_already_active")) {
+    return TUTORIAL_RUN_STILL_FINISHING_MESSAGE;
+  }
+  if (
+    typeof err === "object" &&
+    err !== null &&
+    "detail" in err &&
+    typeof (err as { detail?: unknown }).detail === "string"
+  ) {
+    return (err as { detail: string }).detail;
+  }
+  if (err instanceof Error && err.message !== "") {
+    // An ApiError can carry an empty message (structured detail withheld from
+    // the client) — falling through to the fixed copy beats rendering an
+    // empty alert strip with a bare Retry button.
+    return err.message;
+  }
+  return "The tutorial run failed.";
+}

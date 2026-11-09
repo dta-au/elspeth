@@ -1,0 +1,1708 @@
+"""Web application configuration."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import types
+import typing
+from collections.abc import Mapping
+from decimal import Decimal
+from ipaddress import ip_address, ip_network
+from pathlib import Path
+from typing import Any, Literal
+from urllib.parse import urlparse
+
+import structlog
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretBytes,
+    SecretStr,
+    TypeAdapter,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
+
+from elspeth.contracts.auth import AuthProviderType
+from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+from elspeth.contracts.prompt_guard import PromptGuardMode
+from elspeth.core.config import PayloadStoreSettings, RateLimitSettings
+from elspeth.core.llm_profiles import LLMProfileSettings, validate_profile_alias
+from elspeth.core.url_validation import validate_credential_safe_https_url
+from elspeth.plugins.infrastructure.power_automate import normalize_allowed_origin
+from elspeth.plugins.transforms.aws.guardrail_profiles import (
+    BEDROCK_GUARDRAIL_PLUGIN_IDS,
+    BedrockGuardrailProfileSettings,
+)
+from elspeth.plugins.transforms.aws.textract_regions import is_well_formed_aws_region
+from elspeth.telemetry.resource_identity import is_aws_ecs_name, is_aws_resource_label, is_aws_task_revision, is_release_identity
+from elspeth.web.auth.providers import IdPProfile, get_profile
+from elspeth.web.auth.urls import (
+    DiscoveredEndpoints,
+    validate_discovered_endpoints,
+)
+from elspeth.web.compartments import COMPARTMENT_ID_PATTERN, is_compartment_id
+from elspeth.web.composer.reasoning import ReasoningEffort
+from elspeth.web.composer.strict_transport import StrictToolsSetting
+from elspeth.web.plugin_policy.profiles import (
+    AWSS3SourceProfileSettings,
+    AWSTextractProfileSettings,
+    AzureSearchProfileSettings,
+)
+from elspeth.web.prompt_guard_config import PromptGuardSettings
+from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
+from elspeth.web.validation import (
+    SERVER_SECRET_RESERVED_PREFIX,
+    is_reserved_server_secret_name,
+    validate_secret_name,
+)
+
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_MIN_NON_LOCAL_JWT_SECRET_KEY_BYTES = 32
+# The transport idle ceiling is the SMALLEST idle/read timeout of EVERY hop in
+# front of this process, not just the reverse proxy the deployment configures.
+# It is a DECLARED value — nothing here can measure it — so a declaration that
+# names one hop and misses another silently makes the wall-clock guard below
+# vacuous, which is the failure it exists to prevent.
+#
+# Derive it, do not type it. The ECS path does this correctly:
+# `deploy/aws-ecs/terraform/modules/scenario/locals.tf` wires
+# ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS to
+# `var.alb_idle_timeout_seconds` — the ALB's own configured idle timeout — with a
+# plan-time cap and a test pinning the mirror. A deployment that cannot bind the
+# value to real proxy config must enumerate the hops by hand and take the MINIMUM.
+#
+# Measured failure (2026-08-17, elspeth-ad5628ecda): the bare-metal deployment
+# declared 660.0 on the reasoning that Caddy configures no response timeout —
+# true, and irrelevant, because that host also sits behind Cloudflare, which cut
+# composer requests at 125s. The guard passed against a ceiling 5x higher than
+# reality and the proxy abort it exists to stay ahead of happened anyway: the
+# origin's structured terminal was never reached, the client got a bare gateway
+# error, and an in-flight run with ~475s of its budget left was destroyed.
+# A CDN in front of the reverse proxy is the hop most likely to be missed.
+_DEFAULT_COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS = 300.0
+_DEFAULT_COMPOSER_TRANSPORT_HEADROOM_SECONDS = 30.0
+# Conservative planning floor for one authoring turn (LLM call + tool work).
+# Measured ~20s/turn mean on the 2026-08-02 acceptance burst (11 provider
+# calls / 99.4s); 15s sits below that mean so the underfunded-budget warning
+# (elspeth-f159d2394b) fires only when the configured turn budget is not
+# realistically reachable, not on ordinary variance.
+_COMPOSER_PLANNING_SECONDS_PER_TURN = 15.0
+
+_slog = structlog.get_logger(__name__)
+# Mechanical link to core retention default: if
+# core/config.py:PayloadStoreSettings.retention_days changes, this value
+# tracks it automatically. Prevents the silent divergence called out in
+# docs/composer/ux-redesign-2026-05/14a-phase-2a-backend.md
+# §"Retention default divergence guard".
+_DEFAULT_PAYLOAD_STORE_RETENTION_DAYS: int = PayloadStoreSettings.model_fields["retention_days"].default
+
+DeploymentTarget = Literal[
+    "default",
+    "docker-compose",
+    "linux-systemd",
+    "aws-ecs",
+    "azure-container-apps",
+    "kubernetes",
+]
+DeploymentStateMode = Literal["auto", "sqlite-single", "external-postgresql"]
+
+
+def validate_trusted_proxy_hosts(hosts: tuple[str, ...]) -> tuple[str, ...]:
+    """Admit explicit numeric forwarding peers without Uvicorn's wildcard form."""
+    normalized: list[str] = []
+    for host in hosts:
+        if host != host.strip() or "%" in host:
+            raise ValueError("trusted_proxy_hosts entries must be numeric IP addresses or strict CIDR networks")
+        try:
+            network = ip_network(host, strict=True)
+        except ValueError:
+            raise ValueError("trusted_proxy_hosts entries must be numeric IP addresses or strict CIDR networks") from None
+        if network.prefixlen == 0 or network.network_address.is_multicast or network.network_address.is_unspecified:
+            raise ValueError("trusted_proxy_hosts must not include wildcard, unspecified, or multicast peers")
+        normalized.append(str(network) if "/" in host else str(network.network_address))
+    return tuple(normalized)
+
+
+def trusted_proxy_hosts_from_env() -> tuple[str, ...]:
+    """Read the server transport setting before the application factory runs.
+
+    The CLI must configure Uvicorn itself; loading all application settings here
+    would duplicate the factory's startup validation and secret loading.
+    """
+    raw = os.environ.get("ELSPETH_WEB__TRUSTED_PROXY_HOSTS", "[]")
+    hosts = TypeAdapter(tuple[str, ...]).validate_json(raw)
+    return validate_trusted_proxy_hosts(hosts)
+
+
+def _allow_insecure_test_keys(host: str) -> bool:
+    return host in _LOCAL_HOSTS and ("pytest" in sys.modules or os.environ.get("ELSPETH_ENV") == "test")
+
+
+def is_default_secret_key_placeholder(secret_key: str) -> bool:
+    return secret_key == "change-me-in-production"
+
+
+def is_undersized_secret_key(secret_key: str) -> bool:
+    return len(secret_key.encode("utf-8")) < _MIN_NON_LOCAL_JWT_SECRET_KEY_BYTES
+
+
+def is_uniform_byte_key(key_bytes: bytes) -> bool:
+    return len(set(key_bytes)) == 1
+
+
+def _is_loopback_or_private_origin(value: str) -> bool:
+    parsed = urlparse(value)
+    hostname = parsed.hostname
+    if hostname is None:
+        return True
+    if hostname.casefold() == "localhost":
+        return True
+    try:
+        address = ip_address(hostname)
+    except ValueError:
+        return False
+    return not address.is_global
+
+
+def _is_loopback_origin(value: str) -> bool:
+    parsed = urlparse(value)
+    hostname = parsed.hostname
+    if hostname is None:
+        return False
+    if hostname.casefold() == "localhost":
+        return True
+    try:
+        address = ip_address(hostname)
+    except ValueError:
+        return False
+    return address.is_loopback
+
+
+def _validate_composer_endpoint_base_url(value: str, *, field_name: str) -> str:
+    """Validate an operator-set OpenAI-compatible endpoint base URL.
+
+    Same credential-safety discipline as every other credential-bearing URL
+    in this codebase (``validate_credential_safe_https_url``: HTTPS required,
+    HTTP permitted only for loopback, no embedded userinfo) plus an explicit
+    query/fragment rejection — a path IS allowed (``/v1`` is the normal
+    OpenAI-compatible mount point), unlike ``public_base_url`` which must be
+    a bare origin.
+
+    Field-scoped tightening on top of the shared helper: the shared
+    ``_is_loopback_host`` treats the literal name ``localhost`` as loopback,
+    which is fine for the other (non-credential, or lower-stakes) callers of
+    that helper but not for this one. ``localhost`` is resolver-dependent —
+    ``/etc/hosts``, NSS, container DNS can all point it somewhere other than
+    the local box — so a name-based loopback URL is not proof of on-box
+    egress the way a literal ``127.0.0.0/8`` or ``::1`` address is. This
+    field carries an operator bearer credential over that connection, so we
+    reject the name form here and require the numeric loopback address.
+    """
+    safe_url = validate_credential_safe_https_url(value, field_name=field_name, allow_http_loopback=True)
+    parsed = urlparse(safe_url)
+    if parsed.query or parsed.fragment:
+        raise ValueError(f"{field_name} must not include a query string or fragment")
+    if parsed.scheme == "http" and parsed.hostname is not None and parsed.hostname.casefold() == "localhost":
+        raise ValueError(
+            f"{field_name} must use a numeric loopback address (127.0.0.1 or [::1]), not the name 'localhost': "
+            "name resolution is resolver-dependent (/etc/hosts, NSS, container DNS) and is not proof of on-box "
+            "egress for this credential-bearing URL"
+        )
+    return safe_url
+
+
+class WebSettings(BaseModel):
+    """Configuration for the ELSPETH web application.
+
+    All fields have sensible defaults for local development.
+    auth_provider uses a Literal type so Pydantic rejects invalid
+    values automatically -- no manual @field_validator needed.
+
+    Frozen to prevent accidental mutation in async request handlers —
+    settings are constructed once and shared via app.state.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
+
+    host: str = "127.0.0.1"
+    port: int = Field(default=8451, ge=1, le=65535)
+    # No forwarding headers are trusted until the operator names the actual
+    # connecting proxy peers. This also overrides Uvicorn's ambient defaults.
+    trusted_proxy_hosts: tuple[str, ...] = ()
+    auth_provider: AuthProviderType = "local"
+    # ``default`` preserves current behavior; deployment-specific state rules
+    # are resolved by web/deployment_contract.py.
+    deployment_target: DeploymentTarget = "default"
+    deployment_state_mode: DeploymentStateMode = "auto"
+    # The identity this process presents on every response (X-Elspeth-Instance),
+    # in /api/system/status, and as the owner of the session-operation fences it
+    # acquires. None (the production setting) mints a fresh ``web-<uuid4>`` at
+    # startup, which is what keeps two replicas distinguishable; an explicit
+    # value pins it for a single-process harness.
+    instance_id: str | None = None
+    deployment_aws_region: str | None = None
+    # Operator telemetry is deployment policy, not pipeline-authored routing.
+    # The AWS destination and headers are intentionally absent from this model:
+    # web/operator_telemetry.py fixes them to the task-local collector and the
+    # ECS task role owns AWS authentication.
+    operator_telemetry: Literal["prometheus", "aws-otlp"] = "prometheus"
+    operator_telemetry_service_name: str = "elspeth-web"
+    operator_telemetry_environment: str | None = None
+    operator_telemetry_release: str | None = None
+    operator_telemetry_ecs_cluster: str | None = None
+    operator_telemetry_ecs_service: str | None = None
+    operator_telemetry_task_definition_family: str | None = None
+    operator_telemetry_task_definition_revision: str | None = None
+    operator_telemetry_export_interval_seconds: int = Field(default=60, strict=True, ge=1, le=3600)
+    operator_pipeline_telemetry_granularity: Literal["lifecycle", "rows"] = "lifecycle"
+    # Dedicated operator credential for the process-global Prometheus scrape
+    # surface. Tenant access tokens are intentionally not accepted. When
+    # unset, /metrics is disabled (404) rather than falling back to tenant
+    # authentication. Generate with ``openssl rand -base64 32``.
+    operator_metrics_bearer_token: SecretStr | None = None
+    registration_mode: Literal["open", "email_verified", "closed"] = "open"
+    # Optional credential-management grant for one local development account,
+    # independent of identity roles. Local-auth administrators also have this
+    # capability through their live admin role. IdP deployments leave it unset.
+    dev_admin_user: str | None = None
+    cors_origins: tuple[str, ...] = ("http://localhost:5173",)
+    data_dir: Path = Field(default=Path("data"), validate_default=True)
+    # Trusted externally visible origin used for generated user-facing links.
+    # Required for email-verified registration when binding to a non-local host;
+    # never derive emailed links from request Host headers.
+    public_base_url: str | None = Field(default=None)
+    # Phase p4: override for the public base URL the tutorial synthetic-scrape
+    # pages are reachable at. When None (the default), the canonical public
+    # GitHub Pages copy (TUTORIAL_SAMPLE_PAGES_BASE_URL) is used. Used ONLY to
+    # build {base}/tutorial-site/project-N.html for the tutorial's web_scrape
+    # node; that node uses the plugin default allowed_hosts="public_only" and the
+    # server injects no allowlist. Set this only to host your own copy (a fork).
+    tutorial_sample_base_url: str | None = Field(default=None)
+    # Operator-declared protective marking for the deployment, rendered by the
+    # SPA as a full-width banner in the reserved overlay band above the header.
+    # Closed vocabulary: the PSPF markings up to PROTECTED, plus the CABINET
+    # caveat ("official_sensitive" covers every OFFICIAL: Sensitive IMM
+    # variant — the banner carries the classification, not the IMM). Colours
+    # follow the traditional PSPF colour code (UNOFFICIAL green, OFFICIAL
+    # grey, OFFICIAL: Sensitive yellow, PROTECTED and its CABINET caveat
+    # blue), not themed — see --color-classification-* in the frontend token
+    # sheet. None (the default) renders no banner. SECRET and above are
+    # deliberately absent: declaring a marking this deployment model cannot
+    # honour would be a lie, not a label.
+    classification_banner: Literal["unofficial", "official", "official_sensitive", "protected", "protected_cabinet"] | None = Field(
+        default=None
+    )
+    composer_model: str = "gpt-5.5"
+    composer_prompt_guard: PromptGuardSettings | None = Field(default=None, repr=False)
+    composer_prompt_guard_mode: PromptGuardMode = "required"
+    composer_pricing_model: str | None = Field(
+        default=None, min_length=1, description="LiteLLM catalog identity for missing-cost calculation; defaults to the routing model."
+    )
+    # Reasoning-effort hints for the composer plane (elspeth-dc459d438e).
+    # All composer roles run reasoning-capable models; these knobs bound the
+    # thinking budget per call class instead of letting the model pick an
+    # unhinted budget that grows with the transcript (measured 120s tails on
+    # the tutorial planner, journal 2026-07-27..08-05). Composer and advisor
+    # must be reasoning models: there is no "none" opt-out, and a value
+    # outside low/medium/high is refused at settings load. openrouter/
+    # models are hinted via OpenRouter's native reasoning object, everything
+    # else via LiteLLM's reasoning_effort (Bedrock -> Anthropic thinking
+    # budgets, Azure -> native effort, OpenAI-compatible gateways -> the
+    # chat-completions field); see elspeth.web.composer.reasoning.
+    composer_discovery_reasoning_effort: ReasoningEffort = "low"
+    composer_candidate_reasoning_effort: ReasoningEffort = "high"
+    composer_advisor_reasoning_effort: ReasoningEffort = "medium"
+    # Operator affordance: point the PRIMARY composer role at any
+    # OpenAI-compatible endpoint (a self-hosted gateway, a local dev proxy,
+    # an agency-run translation layer) instead of the provider LiteLLM would
+    # otherwise route to from the model prefix. None (the default) omits
+    # ``api_base``/``api_key`` from every LiteLLM call entirely, so an
+    # unconfigured deployment is byte-identical to pre-endpoint-affordance
+    # behaviour. Configuration surface only — see
+    # docs/reference/environment-variables.md ("Custom LLM Endpoints"); the
+    # 2026-07-31 gateway phase-3 plan that introduced it is in git history.
+    # Setting this does NOT rewrite ``composer_model``: LiteLLM shapes the
+    # request off the model prefix, not off ``api_base``, so a custom
+    # endpoint generally wants an ``openai/``-prefixed (or bare OpenAI-name)
+    # model — that remains the operator's lever, deliberately not automated.
+    composer_endpoint_base_url: str | None = Field(default=None)
+    # Operator-held bearer credential for composer_endpoint_base_url. Same
+    # shape as operator_metrics_bearer_token: a directly env-set secret, not
+    # a per-user secret-store reference (the boot probe and the planner have
+    # no authenticated user_id to resolve one against). The affordance as a
+    # whole is optional (both fields None is the default, unconfigured
+    # state) but once composer_endpoint_base_url is set this field is
+    # REQUIRED — an unauthenticated loopback dev gateway is NOT a supported
+    # configuration; see _validate_composer_endpoint_credential_pairing,
+    # which fails closed rather than letting LiteLLM fall back to an
+    # ambient provider credential.
+    composer_endpoint_api_key: SecretStr | None = Field(default=None)
+    # Operator-set LLM sampling. Default None means omitted from the
+    # provider request, which is the coherent default for reasoning-model
+    # defaults like gpt-5.5 that reject non-default temperature values.
+    # Sent verbatim when set; provider rejection is the operator's config
+    # error and is validated at boot. See
+    # docs/specs/2026-06-03-composer-operator-set-sampling-config-design.md.
+    composer_temperature: float | None = Field(default=None, ge=0, le=2)
+    composer_seed: int | None = None
+    # Tests/offline development can disable the real provider boot probe.
+    composer_boot_probe_enabled: bool = True
+    composer_strict_tools: StrictToolsSetting = Field(
+        default="preferred",
+        description=(
+            "Which composer routes send OpenAI strict tool contracts. 'preferred' sends them only on OpenRouter "
+            "hosts; 'forward_to_endpoint' also sends them to custom endpoints, hosted OpenAI and Azure; 'off' "
+            "restores the pre-strict tool bytes on every route."
+        ),
+    )
+    # JSON log rendering (elspeth-cd98ea9d82 Tier 3): CloudWatch Logs
+    # Insights auto-parses JSON, so `filter request_id = "..."` becomes a
+    # working field query. Off by default — local journald stays the
+    # human-readable console format.
+    log_json: bool = False
+    composer_max_composition_turns: int = Field(..., ge=1)
+    composer_max_discovery_turns: int = Field(..., ge=1)
+    composer_max_tool_calls_per_turn: int = Field(default=16, ge=1)
+    composer_timeout_seconds: float = Field(..., gt=0)
+    # Canonical full-pipeline planner budgets. These are independent of the
+    # ordinary incremental compose loop because the planner accounts for exact
+    # request bytes, physical provider attempts, requested completion tokens,
+    # and post-call provider cost.
+    composer_planner_max_provider_calls: int = Field(default=75, strict=True, ge=1)
+    composer_planner_max_request_bytes: int = Field(default=2 * 1024 * 1024, strict=True, ge=1)
+    composer_planner_max_completion_tokens: int = Field(default=16_384, strict=True, ge=1)
+    composer_planner_max_cumulative_provider_cost: Decimal = Field(default=Decimal("5.00"), ge=0)
+    composer_planner_repair_budget: int = Field(default=2, strict=True, ge=0)
+    composer_transport_idle_ceiling_seconds: float = Field(
+        default=_DEFAULT_COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS,
+        gt=0,
+        description=(
+            "Smallest idle/read timeout of EVERY hop in front of this process — "
+            "CDN, load balancer, and reverse proxy — not just the one this "
+            "deployment configures. Bind it to real proxy config where you can "
+            "(the ECS module wires it to the ALB idle timeout); otherwise "
+            "enumerate every hop and take the minimum. Declaring a ceiling "
+            "higher than reality does not raise it: it only makes the "
+            "wall-clock guard vacuous, so the proxy aborts the request before "
+            "the composer can return its structured terminal."
+        ),
+    )
+    composer_transport_headroom_seconds: float = Field(
+        default=_DEFAULT_COMPOSER_TRANSPORT_HEADROOM_SECONDS,
+        gt=0,
+    )
+    # Durable jobs share the bounded 16-thread synchronous worker pool.
+    composer_async_max_queued_operations: int = Field(default=64, ge=1, le=10_000)
+    composer_async_worker_concurrency: int = Field(default=4, ge=1, le=16)
+    composer_async_claim_lease_seconds: int = Field(default=30, ge=5, le=600)
+    composer_async_scan_interval_seconds: float = Field(default=1.0, gt=0, le=60)
+    composer_async_poll_after_ms: int = Field(default=1000, ge=100, le=60_000)
+    composer_async_drain_seconds: float = Field(default=10.0, gt=0, le=120)
+
+    @property
+    def composer_sync_timeout_seconds(self) -> float:
+        """Budget for composer work performed inside a held HTTP request."""
+        return min(
+            self.composer_timeout_seconds,
+            self.composer_transport_idle_ceiling_seconds - self.composer_transport_headroom_seconds,
+        )
+
+    composer_runtime_preflight_timeout_seconds: float = Field(default=5.0, gt=0)
+    composer_rate_limit_per_minute: int = Field(..., ge=1)
+    audit_readiness_rate_limit_per_minute: int = Field(
+        default=60,
+        ge=1,
+        description=(
+            "Per-user per-minute budget for audit-readiness snapshots. "
+            "Snapshots run canonical pipeline validation, so this separate "
+            "bucket protects shared worker capacity without consuming the "
+            "LLM-backed composer-call budget."
+        ),
+    )
+    write_rate_limit_per_minute: int = Field(
+        default=60,
+        ge=1,
+        description=(
+            "Per-user per-minute budget for cheap authenticated DB-write "
+            "endpoints (composer-preferences PATCH, shareable-review "
+            "mark-ready/link). Deliberately a SEPARATE bucket from "
+            "composer_rate_limit_per_minute, which is sized for LLM-backed "
+            "calls: the tutorial legitimately writes preference resume "
+            "state in bursts, and sharing one bucket let those bursts "
+            "starve the tutorial-completion write into a 429."
+        ),
+    )
+    composer_expose_provider_errors: bool = False
+    e2e_state_seed_enabled: bool = False
+    composer_advisor_model: str = "anthropic/claude-sonnet-4-6"
+    composer_advisor_prompt_guard: PromptGuardSettings | None = Field(default=None, repr=False)
+    composer_advisor_pricing_model: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Advisor LiteLLM catalog identity for missing-cost calculation; defaults to its routing model.",
+    )
+    composer_allow_same_advisor_model: bool = Field(
+        default=False,
+        description="Allow Composer and Advisor to use the same model, accepting correlated review blind spots.",
+    )
+    # Independent endpoint affordance for the ADVISOR role — see
+    # composer_endpoint_base_url. Deliberately separate settings: the
+    # default two-model rule (_validate_advisor_distinct_from_primary)
+    # promotes independence from the primary composer's failure modes,
+    # and an operator may legitimately run the advisor direct against its
+    # provider while the primary composer goes through a gateway (or vice
+    # versa). Neither role defaults to the other's endpoint.
+    composer_advisor_endpoint_base_url: str | None = Field(default=None)
+    composer_advisor_endpoint_api_key: SecretStr | None = Field(default=None)
+    composer_advisor_max_calls_per_compose: int = Field(
+        default=4,
+        ge=0,
+        description=(
+            "Maximum advisor calls per compose request (NOT per session-across-time). "
+            "Each new user prompt starts with a fresh budget. The default of 4 is "
+            "sized to accommodate one proactive intro call (security/red-list trigger) "
+            "plus three reactive recovery calls — the proactive call should not crowd "
+            "out reactive recovery. A user prompting 10 times in one session may make "
+            "up to 40 advisor calls total over the session lifetime; session-lifetime "
+            "cost is bounded by composer_rate_limit_per_minute, not this setting. "
+            "Raise this for heavyweight workloads (e.g. business-analysis pipelines "
+            "with many plugins where the LLM benefits from multiple intro consultations)."
+        ),
+    )
+    composer_advisor_checkpoint_max_passes: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "Max END advisor-checkpoint passes per compose request (the initial "
+            "end sign-off plus its re-reviews), counted SEPARATELY from "
+            "_MAX_REPAIR_TURNS. The EARLY advisory pass is separate and does NOT "
+            "consume this counter (spec §13). On the last budgeted pass a "
+            "still-flagged end gate fails closed (no repair — it cannot "
+            "re-review). Checkpoint calls are bounded SOLELY by this knob and are "
+            "NOT counted against composer_advisor_max_calls_per_compose (which "
+            "bounds LLM-initiated hints + proactive-security). "
+            "(Spec §7 envisioned composer_advisor_max_calls_per_compose as a "
+            "unified backstop across all advisor calls including checkpoints; "
+            "that unification is not implemented — checkpoints are bounded "
+            "separately. Operator decision pending.)"
+        ),
+    )
+    composer_advisor_max_prompt_tokens: int = Field(
+        default=4000,
+        ge=1,
+        description=(
+            "Rough input-cost allowance converted to characters at four characters per configured unit. "
+            "Public hints count the complete variable message; backend EARLY/END checkpoints count only "
+            "optional prose added above the complete required graph. Mandatory graph and checkpoint evidence "
+            "is always retained and is not capped by this allowance. "
+            "This is not a measured provider-token or context-window limit."
+        ),
+    )
+    # 8192 (was 1500): with advisor reasoning enabled the thinking budget
+    # shares max_tokens, and Anthropic thinking has a 1024-token floor that
+    # must fit inside it — 1500 left medium effort illegal or starved.
+    composer_advisor_max_completion_tokens: int = Field(default=8192, ge=1)
+    composer_advisor_timeout_seconds: float = Field(default=60.0, gt=0)
+    # Phase 5b Task 5 — interpretation-event rate limits (F-30/F-31).
+    #
+    # Both limits are read at compose-loop initialisation and passed to
+    # ``_check_interpretation_rate_limits`` as keyword arguments; changing
+    # them requires a service restart (not a per-request reload). The
+    # per-day window is UTC midnight, not a sliding 24-hour window —
+    # simpler for operators to reason about and produces predictable
+    # reset behaviour. See ``web/composer/tools.py`` for the helper that
+    # consumes these values.
+    composer_interpretation_rate_limit_per_term: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Max times the composer LLM may surface the same (session, user_term, "
+            "composition_state_id) tuple for user review. Applies to vague_term "
+            "reviews only — every other kind is a server-shaped obligation with "
+            "no bake fallback, so capping it wedges the session "
+            "(elspeth-558fa5a321). Exceeding this cap raises ToolArgumentError; "
+            "the compose loop falls back to AUTO_INTERPRETED_NO_SURFACES."
+        ),
+    )
+    composer_interpretation_rate_limit_per_session_day: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            "Max vague_term request_interpretation_review invocations per session "
+            "per UTC day (LLM-authored rows only; backend-surfaced rows and other "
+            "kinds neither consume nor are blocked by this budget). Window resets "
+            "at UTC midnight (not a sliding 24-hour window). Exceeding this cap "
+            "raises ToolArgumentError; the compose loop falls back to "
+            "AUTO_INTERPRETED_NO_SURFACES."
+        ),
+    )
+    auth_rate_limit_per_minute: int = Field(default=20, ge=1)
+    secret_key: str = (
+        "change-me-in-production"  # Security rule S3 (seam-contracts.md): Sub-2 startup guard enforces non-default in production
+    )
+    max_upload_bytes: int = Field(default=100 * 1024 * 1024, ge=1)
+    max_blob_storage_per_session_bytes: int = Field(default=500 * 1024 * 1024, ge=1)
+    server_secret_allowlist: tuple[str, ...] = (
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "AZURE_API_KEY",
+        # Bedrock: the Amazon Bedrock API key (bearer token), then the static
+        # IAM credential triple. All optional — the AWS default credential
+        # chain (task role) needs none of them.
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+    )
+    # Locked-down server-only mode: when False, user-scoped secrets are
+    # disabled end to end — the API refuses create/delete, stored user rows
+    # are neither listed nor resolved, and only ``server_secret_allowlist``
+    # names can be wired. Fail-closed for deployments where every credential
+    # must be operator-provisioned.
+    user_secrets_enabled: bool = True
+    # Server-authored secret→destination allowlist (elspeth-f3c1aafd25).
+    # Secret WIRING is deny-by-default: with no rules, wire_secret_ref and
+    # every other marker entry path is refused at validation. Each rule
+    # authorizes one exact (secret, component_type, plugin, option_key)
+    # destination. This is deliberately distinct from server_secret_allowlist,
+    # which only exposes a server secret's NAME to users.
+    secret_wiring_allowlist: tuple[SecretWiringRuleSettings, ...] = ()
+    # Universal web plugin policy.  These user-facing Pydantic values are
+    # converted immediately to RuntimeWebPluginConfig before consumption.
+    plugin_allowlist: tuple[str, ...] = ()
+    power_automate_allowed_origins: tuple[str, ...] = ()
+    plugin_preferences: Mapping[PluginCapability, tuple[str, ...]] = Field(default_factory=dict)
+    plugin_control_modes: Mapping[PluginCapability, ControlMode] = Field(
+        default_factory=lambda: {
+            PluginCapability.PROMPT_SHIELD: ControlMode.RECOMMEND,
+            PluginCapability.CONTENT_SAFETY: ControlMode.RECOMMEND,
+        }
+    )
+    llm_profiles: Mapping[str, LLMProfileSettings] = Field(default_factory=dict)
+    default_llm_profile: str | None = None
+    bedrock_guardrail_profiles: tuple[BedrockGuardrailProfileSettings, ...] = ()
+    bedrock_guardrail_default_profiles: Mapping[str, str] = Field(default_factory=dict)
+    aws_s3_source_profiles: tuple[AWSS3SourceProfileSettings, ...] = ()
+    aws_textract_profiles: tuple[AWSTextractProfileSettings, ...] = ()
+    azure_search_profiles: tuple[AzureSearchProfileSettings, ...] = ()
+    orphan_run_max_age_seconds: int = Field(default=3600, ge=60)
+    orphan_run_check_interval_seconds: int = Field(default=300, ge=30)
+    # External-call rate limits for web-executed runs: the same block a CLI
+    # pipeline sets as ``rate_limit:`` in settings.yaml. A composition cannot
+    # carry run-execution settings, so without this every web run was pinned to
+    # the engine default (60 calls/minute per service) with no operator
+    # override. Operator-owned, never author-settable. Limiters are keyed by
+    # provider type (``openrouter``, ``azure_openai``, ``bedrock``,
+    # ``gateway``), so one ``services`` entry covers every LLM profile that
+    # shares that provider.
+    execution_rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
+
+    # Execution infrastructure — defaults derive from data_dir when not explicitly set
+    landscape_url: str | None = None
+    landscape_passphrase: str | None = None
+    payload_store_path: Path | None = None
+    payload_store_retention_days: int = Field(
+        default=_DEFAULT_PAYLOAD_STORE_RETENTION_DAYS,
+        ge=1,
+        description=(
+            "Payload retention in days surfaced by the audit-readiness "
+            "panel. Mirrors the core default sourced from "
+            "src/elspeth/core/config.py:PayloadStoreSettings.retention_days "
+            "via _DEFAULT_PAYLOAD_STORE_RETENTION_DAYS (mechanical link, "
+            "not a hand-copied literal). The panel row is informational "
+            "only in Phase 2A — there is no user-stated requirement to "
+            "compare against yet."
+        ),
+    )
+
+    # Entra-specific: the profile derives its issuer from the tenant.
+    entra_tenant_id: str | None = None
+
+    # --- Pluggable SSO (elspeth-07cd19ba73, spec §Settings) ---------------
+    #
+    # The backend redeems the authorization code as a CONFIDENTIAL client;
+    # the browser never holds a client secret and never performs the token
+    # exchange. ``auth_provider`` selects one registered profile and every
+    # field here is that profile's configuration for THIS container: the
+    # build carries no credentials, the profile carries no deployment facts,
+    # and switching IdP is a config change plus a restart, never a build.
+    #
+    # Which of these are required, optional, or forbidden is decided by the
+    # profile registry, not by branches here — see
+    # ``web/auth/providers``. Adding an IdP must not mean editing a
+    # validator.
+    sso_client_id: str | None = None
+    sso_client_secret: SecretStr | None = None
+    sso_issuer: str | None = None
+    # Exact HTTPS origins the discovered endpoints may use BEYOND the issuer
+    # origin. Generic OIDC only: a Cognito hosted domain differs from the
+    # pool issuer, so same-origin alone would refuse a correct deployment.
+    sso_endpoint_origins: tuple[str, ...] = ()
+    # Break-glass overrides for discovery, all-or-none. The origin policy
+    # still applies to whatever is set here — these skip DISCOVERY, not
+    # validation.
+    sso_authorization_endpoint: str | None = None
+    sso_token_endpoint: str | None = None
+    sso_userinfo_endpoint: str | None = None
+    sso_jwks_uri: str | None = None
+    # Seals the login transaction cookie carrying PKCE verifier, state and
+    # nonce. Independent of ``secret_key`` so rotating one does not
+    # invalidate the other.
+    sso_transaction_secret: SecretStr | None = None
+    # Google only, and required there: without a hosted domain any Google
+    # account in the world is a valid login, so the profile refuses to start
+    # rather than defaulting to open.
+    google_hosted_domain: str | None = None
+    # Bootstrap only. Seeds the first ``admin`` role row at first login, and
+    # ONLY while the container has zero active human admins — after that the
+    # list is inert, so it never becomes a standing grant.
+    sso_admin_subjects: tuple[str, ...] = ()
+    # Every activation writes a quota_policies row from these, so an
+    # activated identity can never hold unbounded spend on the container's
+    # shared LLM credential. Required for an IdP deployment; None is only
+    # coherent for local auth, and only with the WHOLE quota system off:
+    # see ``quotas_enabled`` and its validator.
+    quota_default_tokens_per_day: int | None = Field(default=None, gt=0, le=2**63 - 1)
+    quota_default_storage_bytes: int | None = Field(default=None, gt=0, le=2**63 - 1)
+    # Optional container ceiling rows, distinct from the per-identity level.
+    quota_container_tokens_per_day: int | None = Field(default=None, gt=0, le=2**63 - 1)
+    quota_container_storage_bytes: int | None = Field(default=None, gt=0, le=2**63 - 1)
+    # The marking stamped into exports, library rows and audit metadata, so
+    # the same artifact appearing in two containers is detectable later.
+    compartment_id: str | None = None
+    # R9 dormancy window, and how long a never-activated pending row is kept
+    # before a lazy purge drops it. Both have defaults because both are
+    # policy, not deployment facts.
+    #
+    # ``identity_dormancy_days`` IS READ AT EVERY LOGIN: the app factory and
+    # the SSO wiring hand it to ``ensure_identity``, which re-pends an active
+    # identity whose previous login is older than the window (R9), exempting
+    # the last active human administrator (D34). Lower it and the next login
+    # by anyone past the new window re-pends them; raise it and nothing
+    # already re-pended comes back on its own.
+    identity_dormancy_days: int = Field(default=90, gt=0)
+    identity_pending_retention_days: int = Field(default=90, gt=0)
+    # Workflow-governance mode for the later approval, review, and library
+    # authorities. Readiness already checks the unsafe local-registration
+    # combination and missing compartment, so an operator receives a named
+    # /api/ready failure instead of a load error.
+    workflow_governance: Literal["off", "on"] = "off"
+
+    # JWKS cache tuning (OIDC / Entra). Defaults match the provider
+    # defaults; operators may lower or raise them. Raising the failure
+    # retry makes stale-serve windows longer (safer during brief IdP
+    # outages); lowering it shrinks the partial-DoS blast radius during
+    # a sustained outage — see elspeth-32982f17cf.
+    #
+    # ``jwks_failure_retry_seconds`` floor is 10, not 1: the whole point
+    # of the throttle is that during an IdP outage the FIRST caller pays
+    # the httpx timeout (≈15s worst case) and the REST short-circuit.
+    # A configured 1-second retry window means concurrent auth requests
+    # re-hit the dead IdP almost immediately, collapsing the shield
+    # back toward the per-request timeout and reinstating the cold-start
+    # DoS the throttle exists to close.  Ten seconds is tight enough for
+    # test fixtures to advance the window deliberately and loose enough
+    # that production operators cannot configure the throttle away.
+    jwks_cache_ttl_seconds: int = Field(default=3600, ge=1)
+    jwks_failure_retry_seconds: int = Field(default=300, ge=10)
+    # Absolute cache authority is measured from the most recent successful,
+    # fully validated JWKS fetch. Failure retry windows never renew it.
+    jwks_max_stale_seconds: int = Field(default=86_400, ge=1)
+
+    # Session database (sessions, messages, composition states, runs)
+    # Separate from landscape_url (audit DB)
+    session_db_url: str | None = None
+
+    # Phase 6A — shareable-review token signing.
+    #
+    # The HMAC key backs the ``ShareTokenSigner`` primitive at
+    # ``web/shareable_reviews/signer.py``. Required (Field(...)): the web
+    # service refuses to start without it — there is no test-friendly
+    # default because rotation/recovery is "re-issue all links," and a
+    # silent dev-mode default would let a misconfigured staging deploy
+    # ship outstanding links signed with the well-known dev key. Pair the
+    # operator-action runbook entry at
+    # ``docs/guides/sharing-pipelines.md`` (Task 12 of plan 19a) with the
+    # generation step ``openssl rand -base64 32``.
+    #
+    # 32-byte minimum matches HMAC-SHA256's digest (output) size — the
+    # natural entropy floor for a tag of this hash, and the byte count
+    # produced by the documented operator recipe ``openssl rand -base64 32``
+    # after base64 decode. (HMAC-SHA256's *block* size is 64 bytes; the
+    # floor here is the digest size, not the block size.) Longer keys
+    # are accepted as opaque key material.
+    #
+    # Rotating this key invalidates EVERY outstanding shareable link.
+    # There is no dual-key acceptance window in v1 — key rotation tooling
+    # is out of scope.
+    #
+    # ``SecretBytes`` masks the value in ``repr()`` so tracebacks, debug
+    # logs, and REPL inspection do not exfiltrate the HMAC key. Pydantic v2's
+    # default repr otherwise prints every field value in plaintext.
+    #
+    # ``strict=True`` forbids the lax ``str → bytes`` utf-8 coercion. Without
+    # this, a 31-character string containing a 2-byte codepoint
+    # (``'a' * 30 + 'ñ'``) silently passes the 32-byte floor with only 31
+    # characters of entropy. Strict mode rejects non-bytes inputs at the
+    # boundary.
+    #
+    # Consumer site (web/app.py:276) unwraps with ``.get_secret_value()``
+    # when constructing the ``ShareTokenSigner`` primitive — the signer's
+    # constructor signature is unchanged (still ``bytes``).
+    shareable_link_signing_key: SecretBytes = Field(
+        ...,
+        strict=True,
+        description=(
+            "HMAC-SHA256 key for shareable-review tokens. Required — the "
+            "service refuses to start without it. Rotating invalidates "
+            "ALL outstanding shareable links. Generate with "
+            "``openssl rand -base64 32`` and store as utf-8 bytes. "
+            "Wrapped in ``SecretBytes``: ``repr()`` shows a mask; call "
+            "``.get_secret_value()`` to obtain the raw bytes."
+        ),
+    )
+
+    # Phase 6A — shareable-review token lifetime.
+    #
+    # Stamps ``expires_at = now() + this delta`` on every newly minted
+    # signed token. The signer verifies expiry on resolve (see
+    # ``ShareTokenSigner.verify``). Default is 30 days; operators may
+    # lower or raise as appropriate to their review cadence.
+    shareable_link_lifetime_seconds: int = Field(
+        default=30 * 24 * 3600,
+        gt=0,
+        description=(
+            "Lifetime (in seconds) for shareable-review tokens. Default: "
+            "30 days. The service stamps expires_at = now() + this delta "
+            "when creating a token."
+        ),
+    )
+
+    @field_validator(
+        "entra_tenant_id",
+        # Pluggable SSO. A blank here is worse than an omission: it satisfies
+        # every ``is not None`` check on the way to a deployment that cannot
+        # complete a login, which is precisely the shape an empty environment
+        # variable in a task definition produces.
+        "sso_client_id",
+        "sso_issuer",
+        "sso_authorization_endpoint",
+        "sso_token_endpoint",
+        "sso_userinfo_endpoint",
+        "sso_jwks_uri",
+        "google_hosted_domain",
+        "compartment_id",
+    )
+    @classmethod
+    def _reject_blank_auth_fields(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if not v.strip():
+            raise ValueError("must not be blank (omit the field or set to a non-empty value)")
+        return v
+
+    @field_validator("trusted_proxy_hosts")
+    @classmethod
+    def _validate_trusted_proxy_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return validate_trusted_proxy_hosts(value)
+
+    @field_validator("compartment_id")
+    @classmethod
+    def _validate_compartment_id(cls, value: str | None) -> str | None:
+        if value is not None and not is_compartment_id(value):
+            raise ValueError(f"compartment_id must match {COMPARTMENT_ID_PATTERN}")
+        return value
+
+    @field_validator("deployment_aws_region")
+    @classmethod
+    def _validate_deployment_aws_region(cls, value: str | None) -> str | None:
+        if value is not None and not is_well_formed_aws_region(value):
+            raise ValueError("deployment_aws_region must be a non-blank well-formed AWS region identifier")
+        return value
+
+    @field_validator("landscape_url", "session_db_url")
+    @classmethod
+    def _validate_db_url(cls, v: str | None) -> str | None:
+        """Reject blank and malformed database URLs at config time."""
+        if v is None:
+            return None
+        from elspeth.contracts.database_url import validate_database_url_format
+
+        return validate_database_url_format(v)
+
+    @field_validator("landscape_passphrase")
+    @classmethod
+    def _reject_blank_passphrase(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if not v.strip():
+            raise ValueError("must not be blank (omit the field to disable encryption)")
+        return v
+
+    @field_validator("tutorial_sample_base_url")
+    @classmethod
+    def _reject_blank_tutorial_sample_base_url(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if not v.strip():
+            raise ValueError("must not be blank (omit the field or set to a non-empty base URL)")
+        return v
+
+    @field_validator("public_base_url")
+    @classmethod
+    def _validate_public_base_url(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        safe_url = validate_credential_safe_https_url(
+            v,
+            field_name="public_base_url",
+            allow_http_loopback=True,
+        ).rstrip("/")
+        parsed = urlparse(safe_url)
+        if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
+            raise ValueError("public_base_url must be an origin without path, query, or fragment")
+        if _is_loopback_or_private_origin(safe_url) and not (parsed.scheme == "http" and _is_loopback_origin(safe_url)):
+            raise ValueError("public_base_url must target a public origin unless using HTTP loopback for local development")
+        return safe_url
+
+    @field_validator("composer_pricing_model", "composer_advisor_pricing_model")
+    @classmethod
+    def _validate_pricing_model(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("pricing model must be nonblank")
+        return value
+
+    @field_validator("composer_endpoint_base_url")
+    @classmethod
+    def _validate_composer_endpoint_base_url_field(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return _validate_composer_endpoint_base_url(v, field_name="composer_endpoint_base_url")
+
+    @field_validator("composer_advisor_endpoint_base_url")
+    @classmethod
+    def _validate_composer_advisor_endpoint_base_url_field(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return _validate_composer_endpoint_base_url(v, field_name="composer_advisor_endpoint_base_url")
+
+    @field_validator("secret_key")
+    @classmethod
+    def _reject_blank_secret_key(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must not be blank")
+        return v
+
+    @field_validator("instance_id")
+    @classmethod
+    def _validate_instance_id(cls, v: str | None) -> str | None:
+        # The value is placed verbatim on every response header and in every
+        # fence row, so it is held to a header-safe shape: a leading
+        # alphanumeric, then at most 127 of [A-Za-z0-9._-]; nothing that could
+        # smuggle a header continuation or a control character.
+        if v is None:
+            return None
+        if not v.strip():
+            raise ValueError("instance_id must not be blank (omit the field to mint one at startup)")
+        header_safe = all(char.isascii() and (char.isalnum() or char in "._-") for char in v)
+        if len(v) > 128 or not header_safe or not v[0].isalnum():
+            raise ValueError("instance_id must be 1-128 characters of [A-Za-z0-9._-] with a leading alphanumeric")
+        return v
+
+    @field_validator("operator_metrics_bearer_token")
+    @classmethod
+    def _validate_operator_metrics_bearer_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        raw = value.get_secret_value()
+        if not 32 <= len(raw) <= 512:
+            raise ValueError("operator_metrics_bearer_token must be between 32 and 512 characters")
+        if not raw.isascii() or any(character.isspace() or not character.isprintable() for character in raw):
+            raise ValueError("operator_metrics_bearer_token must contain only visible ASCII characters without whitespace")
+        return value
+
+    @field_validator("shareable_link_signing_key", mode="before")
+    @classmethod
+    def _decode_signing_key_from_string(cls, v: object) -> object:
+        """Explicit base64 decoding for str inputs.
+
+        Env-var ingestion (``ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY``)
+        delivers the key as a ``str``. With ``strict=True`` on the field,
+        Pydantic would reject the str outright; without it, Pydantic would
+        silently utf-8-encode the str — and that is the bug: a 31-character
+        string containing a 2-byte codepoint
+        (``'a' * 30 + 'ñ'``) encodes to 32 utf-8 bytes and slips past the
+        byte-length floor with only 31 characters of entropy.
+
+        The documented operator recipe is ``openssl rand -base64 32`` (44-char
+        base64 string, 32 raw bytes of entropy). We decode str as base64
+        explicitly here — same encoding the operator used to generate the
+        key. Invalid base64 raises ``ValueError`` (no fall-back to utf-8
+        coercion). Bytes pass through unchanged; strict mode then rejects any
+        remaining non-bytes types.
+
+        Multibyte-utf-8 ambiguity is foreclosed at the boundary by requiring
+        base64 — the only way to express N raw bytes through a string medium
+        without character-vs-byte conflation.
+        """
+        if isinstance(v, str):
+            import base64
+            import binascii
+
+            try:
+                return base64.b64decode(v, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError(
+                    "shareable_link_signing_key string inputs must be base64-encoded (e.g. ``openssl rand -base64 32``). Decoding failed."
+                ) from exc
+        return v
+
+    @field_validator("shareable_link_signing_key")
+    @classmethod
+    def _signing_key_min_length(cls, v: SecretBytes) -> SecretBytes:
+        """Phase 6A — reject signing keys shorter than HMAC-SHA256's digest size.
+
+        32 bytes is the minimum — the digest (output) size of HMAC-SHA256
+        and the natural entropy floor for a tag produced by this hash.
+        ``openssl rand -base64 32`` produces 44 utf-8 characters that
+        base64-decode to exactly 32 raw bytes — the floor.
+        Shorter keys reduce the effective entropy of the HMAC tag and make
+        brute-force token forgery easier; pre-release ELSPETH refuses to start
+        a service with such a key.
+
+        The floor is on raw byte length. The ``mode="before"`` companion
+        validator above performs explicit base64 decoding for str inputs, so
+        this byte count equals the operator-supplied raw byte count —
+        multibyte-utf-8 ambiguity is foreclosed at the boundary, not papered
+        over here.
+        """
+        if len(v.get_secret_value()) < 32:
+            raise ValueError("shareable_link_signing_key must be at least 32 bytes")
+        return v
+
+    @field_validator("data_dir", "payload_store_path", mode="before")
+    @classmethod
+    def _reject_blank_path_strings(cls, v: object) -> object:
+        if isinstance(v, str) and not v.strip():
+            raise ValueError("must not be blank")
+        return v
+
+    @field_validator("data_dir", "payload_store_path")
+    @classmethod
+    def _normalize_paths(cls, v: Path | None, info: ValidationInfo) -> Path | None:
+        if v is None:
+            return None
+        if not str(v).strip():
+            raise ValueError("must not be blank")
+        expanded = v.expanduser()
+        if info.field_name == "payload_store_path":
+            # Preserve the configured lexical path so the payload-store
+            # boundary can detect and reject a pre-existing symlink. resolve()
+            # would follow the link here and erase the evidence before either
+            # AWS startup validation or FilesystemPayloadStore sees it.
+            # absolute() still pins relative configuration to the construction
+            # CWD, preserving the process-lifetime stability promised below.
+            return expanded.absolute()
+        # Resolve to an absolute path at validation time so downstream
+        # consumers do not depend on the running process CWD. Without
+        # this, a relative `data_dir` (e.g. the default Path("data"))
+        # is interpreted against whatever CWD the systemd unit happens
+        # to have when the audit DB is opened vs. when the
+        # sink-allowlist is checked — same code, different answers.
+        # `.resolve()` makes the answer immutable for the process
+        # lifetime regardless of later os.chdir calls.
+        return expanded.resolve()
+
+    @field_validator("server_secret_allowlist")
+    @classmethod
+    def _validate_server_secret_allowlist(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        validated = tuple(validate_secret_name(name, field_name="server_secret_allowlist entry") for name in v)
+        reserved = tuple(name for name in validated if is_reserved_server_secret_name(name))
+        if reserved:
+            raise ValueError(f"server_secret_allowlist entries must not start with {SERVER_SECRET_RESERVED_PREFIX}: {sorted(reserved)}")
+        return validated
+
+    @field_validator("power_automate_allowed_origins")
+    @classmethod
+    def _validate_power_automate_allowed_origins(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(normalize_allowed_origin(value) for value in values)
+        if any(_is_loopback_or_private_origin(value) for value in normalized):
+            raise ValueError("power_automate_allowed_origins requires public HTTPS443 origins")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("power_automate_allowed_origins contains duplicate origins")
+        return tuple(sorted(normalized))
+
+    @field_validator("llm_profiles")
+    @classmethod
+    def _validate_llm_profile_aliases(cls, value: Mapping[str, LLMProfileSettings]) -> Mapping[str, LLMProfileSettings]:
+        for alias in value:
+            validate_profile_alias(alias)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_default_llm_profile_alias(self) -> WebSettings:
+        """Validate a designated default without turning its absence into boot failure.
+
+        A missing default is a supported degraded-readiness state: ordinary
+        pipelines and explicit profile authoring remain available, while the
+        first-run tutorial reports that no standard profile is configured.
+        """
+        if self.default_llm_profile is not None:
+            validate_profile_alias(self.default_llm_profile)
+            if self.default_llm_profile not in self.llm_profiles:
+                raise ValueError("default_llm_profile must name a configured LLM profile")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_bedrock_guardrail_profiles(self) -> WebSettings:
+        by_alias: dict[str, BedrockGuardrailProfileSettings] = {}
+        by_plugin: dict[str, list[BedrockGuardrailProfileSettings]] = {plugin: [] for plugin in BEDROCK_GUARDRAIL_PLUGIN_IDS}
+        for profile in self.bedrock_guardrail_profiles:
+            if profile.alias in by_alias:
+                raise ValueError("Bedrock Guardrail profile aliases must be unique")
+            by_alias[profile.alias] = profile
+            by_plugin[profile.plugin].append(profile)
+
+        unknown_defaults = set(self.bedrock_guardrail_default_profiles) - set(BEDROCK_GUARDRAIL_PLUGIN_IDS)
+        if unknown_defaults:
+            raise ValueError("Bedrock Guardrail default profile names an unknown plugin")
+        for plugin, profiles in by_plugin.items():
+            default_alias = self.bedrock_guardrail_default_profiles.get(plugin)
+            aliases = {profile.alias for profile in profiles}
+            if len(profiles) > 1 and default_alias is None:
+                raise ValueError("multiple Bedrock Guardrail profiles require an explicit plugin default")
+            if default_alias is not None and default_alias not in aliases:
+                raise ValueError("Bedrock Guardrail default profile must name a profile for the same plugin")
+        return self
+
+    @field_validator("aws_s3_source_profiles")
+    @classmethod
+    def _validate_aws_s3_source_profiles(
+        cls,
+        profiles: tuple[AWSS3SourceProfileSettings, ...],
+    ) -> tuple[AWSS3SourceProfileSettings, ...]:
+        aliases = [profile.alias for profile in profiles]
+        if len(aliases) != len(set(aliases)):
+            raise ValueError("AWS S3 source profile aliases must be unique")
+        return profiles
+
+    @field_validator("aws_textract_profiles")
+    @classmethod
+    def _validate_aws_textract_profiles(
+        cls,
+        profiles: tuple[AWSTextractProfileSettings, ...],
+    ) -> tuple[AWSTextractProfileSettings, ...]:
+        aliases = [profile.alias for profile in profiles]
+        if len(aliases) != len(set(aliases)):
+            raise ValueError("AWS Textract profile aliases must be unique")
+        return profiles
+
+    @field_validator("azure_search_profiles")
+    @classmethod
+    def _validate_azure_search_profiles(
+        cls,
+        profiles: tuple[AzureSearchProfileSettings, ...],
+    ) -> tuple[AzureSearchProfileSettings, ...]:
+        aliases = [profile.alias for profile in profiles]
+        if len(aliases) != len(set(aliases)):
+            raise ValueError("Azure Search profile aliases must be unique")
+        return profiles
+
+    @field_validator("operator_telemetry_service_name")
+    @classmethod
+    def _validate_operator_telemetry_service_name(cls, value: str) -> str:
+        return cls._validate_operator_resource_identity("operator_telemetry_service_name", value)
+
+    @field_validator("operator_telemetry_environment")
+    @classmethod
+    def _validate_operator_telemetry_environment(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return cls._validate_operator_resource_identity("operator_telemetry_environment", value)
+
+    @field_validator(
+        "operator_telemetry_release",
+        "operator_telemetry_ecs_cluster",
+        "operator_telemetry_ecs_service",
+        "operator_telemetry_task_definition_family",
+        "operator_telemetry_task_definition_revision",
+    )
+    @classmethod
+    def _validate_operator_deployment_identity(cls, value: str | None, info: ValidationInfo) -> str | None:
+        if value is None:
+            return None
+        field_name = info.field_name
+        assert field_name is not None
+        value = cls._validate_operator_resource_identity(field_name, value)
+        if field_name == "operator_telemetry_release":
+            valid = is_release_identity(value)
+        elif field_name == "operator_telemetry_task_definition_revision":
+            valid = is_aws_task_revision(value)
+        else:
+            valid = is_aws_ecs_name(value)
+        if not valid:
+            raise ValueError(f"{field_name} must be a bounded AWS deployment identity without ARN or account identity")
+        return value
+
+    @field_validator("operator_telemetry_export_interval_seconds", mode="before")
+    @classmethod
+    def _parse_operator_export_interval_from_env(cls, value: object) -> object:
+        # Environment variables arrive as strings; direct Python booleans must
+        # not pass through int coercion as 0/1.
+        if isinstance(value, str):
+            try:
+                return int(value, 10)
+            except ValueError:
+                raise ValueError("operator_telemetry_export_interval_seconds must be an integer") from None
+        return value
+
+    @staticmethod
+    def _validate_operator_resource_identity(field_name: str, value: str) -> str:
+        if not value.strip() or value != value.strip() or len(value) > 128 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError(f"{field_name} must be a non-blank bounded string without control characters")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_aws_operator_resource_labels(self) -> WebSettings:
+        if self.operator_telemetry != "aws-otlp" and self.deployment_target != "aws-ecs":
+            return self
+        for field_name, value in (
+            ("operator_telemetry_service_name", self.operator_telemetry_service_name),
+            ("operator_telemetry_environment", self.operator_telemetry_environment),
+        ):
+            if value is not None and not is_aws_resource_label(value):
+                raise ValueError(f"{field_name} must be a bounded AWS-safe resource label without ARN or account identity")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_auth_fields(self) -> WebSettings:
+        """Enforce that OIDC/Entra providers have their required fields."""
+        if self.registration_mode == "email_verified" and self.host not in _LOCAL_HOSTS:
+            if self.public_base_url is None:
+                raise ValueError("email_verified registration on a non-local host requires public_base_url")
+            if _is_loopback_or_private_origin(self.public_base_url):
+                raise ValueError("public_base_url for a non-local email_verified host must be publicly reachable")
+
+        if self.dev_admin_user is not None:
+            if self.auth_provider != "local":
+                raise ValueError("dev_admin_user requires auth_provider=local; IdP deployments must not carry it")
+            if not self.dev_admin_user.strip():
+                raise ValueError("dev_admin_user must name a local-auth user, not be blank")
+
+        # Registry-driven SSO validation: the forbidden-setting rule and the
+        # required-setting rule for EVERY registered provider come from the
+        # profile registry, so there is no per-provider arm here to fall out
+        # of step with readiness (which reads the same matrix). The legacy
+        # browser path's hand-written ``oidc``/``entra`` arms and their
+        # ``oidc_*`` fields were deleted with that path (identity sprint
+        # step E).
+        if self.auth_provider == "local":
+            if self.entra_tenant_id is not None:
+                raise ValueError("Local auth does not use entra_tenant_id")
+        else:
+            profile = get_profile(self.auth_provider)
+            configured_settings = configured_auth_settings(self)
+            configured_but_meaningless = sorted(name for name in profile.forbidden_settings if configured_settings[name])
+            if configured_but_meaningless:
+                raise ValueError(
+                    f"auth_provider={self.auth_provider!r} does not use: "
+                    f"{', '.join(configured_but_meaningless)} "
+                    f"(configuring a setting for a different IdP is silently ignored otherwise)"
+                )
+            missing = [name for name in profile.required_settings if not configured_settings[name]]
+            if missing:
+                raise ValueError(f"auth_provider={self.auth_provider!r} requires: {', '.join(missing)}")
+            self._validate_sso_endpoint_overrides(profile)
+        return self
+
+    def _validate_sso_endpoint_overrides(self, profile: IdPProfile) -> None:
+        """Hold the break-glass endpoint overrides to the same origin policy.
+
+        The four ``sso_*`` endpoint settings exist so an operator can bypass
+        discovery when an IdP's document is wrong or unreachable. Until now
+        they were accepted unvalidated beyond a blank check, which made the
+        break-glass path the weakest way into the deployment: an operator
+        typo, or an environment variable set by something other than the
+        operator, could point the token endpoint anywhere.
+
+        ALL OR NONE. A partial override silently mixes operator-supplied and
+        discovered endpoints, so which origin policy applied to which URL
+        would depend on which variables happened to be set. Refusing the
+        mixture is the only reading that keeps the answer knowable.
+
+        The origin policy is the profile's, exactly as it is for discovery.
+        An override is a way to name a DIFFERENT URL on an origin the IdP is
+        expected to serve from — not a way to leave the expected origins.
+        """
+        overrides = {
+            "sso_authorization_endpoint": self.sso_authorization_endpoint,
+            "sso_token_endpoint": self.sso_token_endpoint,
+            "sso_jwks_uri": self.sso_jwks_uri,
+        }
+        supplied = sorted(name for name, value in overrides.items() if value is not None)
+        if not supplied:
+            # userinfo alone is not an override: with no endpoints to pair it
+            # with there is nothing for discovery to be bypassed FOR.
+            if self.sso_userinfo_endpoint is not None:
+                raise ValueError("sso_userinfo_endpoint requires the other sso endpoint overrides: " + ", ".join(overrides))
+            return
+        if len(supplied) != len(overrides):
+            missing = sorted(set(overrides) - set(supplied))
+            raise ValueError(f"sso endpoint overrides are all-or-none; missing: {', '.join(missing)}")
+
+        # Only the three ENDPOINT settings are narrowed here, because only
+        # they are what the all-or-none check above just established. The
+        # issuer is NOT: ``sso_issuer`` is in the derived forbidden set for
+        # entra and google, so asserting it here refused a correct
+        # break-glass configuration on half the profiles -- and, being an
+        # assert, did so only when Python was not run with -O. Each profile's
+        # resolve_issuer states its own precondition: issuer_from_settings
+        # asserts sso_issuer with a message, issuer_from_entra_tenant reads
+        # the tenant instead, and google_issuer returns a constant.
+        assert self.sso_authorization_endpoint is not None
+        assert self.sso_token_endpoint is not None
+        assert self.sso_jwks_uri is not None
+        validated = validate_discovered_endpoints(
+            DiscoveredEndpoints(
+                authorization_endpoint=self.sso_authorization_endpoint,
+                token_endpoint=self.sso_token_endpoint,
+                jwks_uri=self.sso_jwks_uri,
+                userinfo_endpoint=self.sso_userinfo_endpoint,
+            ),
+            expected_origins=profile.expected_origins(self, profile.resolve_issuer(self)),
+        )
+        object.__setattr__(self, "sso_authorization_endpoint", validated.authorization_endpoint)
+        object.__setattr__(self, "sso_token_endpoint", validated.token_endpoint)
+        object.__setattr__(self, "sso_jwks_uri", validated.jwks_uri)
+        object.__setattr__(self, "sso_userinfo_endpoint", validated.userinfo_endpoint)
+
+    @model_validator(mode="after")
+    def _validate_composer_timeout_transport_headroom(self) -> WebSettings:
+        """Keep a positive transport-safe budget for synchronous consumers.
+
+        Durable composer jobs use their admission deadline. Subscription
+        lifetime and socket send deadlines are independently bounded.
+        """
+        max_backend_timeout_seconds = self.composer_transport_idle_ceiling_seconds - self.composer_transport_headroom_seconds
+        if max_backend_timeout_seconds <= 0:
+            raise ValueError("composer_transport_headroom_seconds must be less than composer_transport_idle_ceiling_seconds")
+        return self
+
+    @model_validator(mode="after")
+    def _warn_composer_turn_budget_underfunded(self) -> WebSettings:
+        """Disclose a turn budget the wall clock cannot fund (elspeth-f159d2394b).
+
+        The 2026-08-02 acceptance run authorised 12+8 turns on a 120s clock
+        that funded ~6 at the measured per-turn cost — the configured budget
+        was never reachable, presenting a capability that did not exist.
+        Disclosure rather than rejection: per-turn cost is workload- and
+        model-dependent (measured ~20s/turn on the acceptance burst;
+        thinking-heavy single calls have exceeded 120s), so a hard gate here
+        would couple config validity to a drifting measurement. The planning
+        floor below is deliberately below the measured mean.
+        """
+        configured_turns = self.composer_max_composition_turns + self.composer_max_discovery_turns
+        fundable_turns = int(self.composer_timeout_seconds // _COMPOSER_PLANNING_SECONDS_PER_TURN)
+        if fundable_turns < configured_turns:
+            _slog.warning(
+                "composer_turn_budget_underfunded",
+                composer_timeout_seconds=self.composer_timeout_seconds,
+                configured_turns=configured_turns,
+                fundable_turns_estimate=fundable_turns,
+                planning_seconds_per_turn=_COMPOSER_PLANNING_SECONDS_PER_TURN,
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_advisor_distinct_from_primary(self) -> WebSettings:
+        """Require different models unless the operator explicitly allows sharing.
+
+        Independence of failure modes: a model checking its own work shares
+        its blind spots. Exact-string distinctness on the canonical model id
+        (final path segment, so provider prefixes like ``openrouter/openai/``
+        do not mask a same-model pairing). The advisor is mandatory — there is
+        no enable flag — so this runs for every boot.
+        """
+        if self.composer_allow_same_advisor_model:
+            return self
+
+        def _canonical(model_id: str) -> str:
+            return model_id.rsplit("/", 1)[-1].strip()
+
+        if _canonical(self.composer_advisor_model) == _canonical(self.composer_model):
+            raise ValueError(
+                "composer_advisor_model must differ from composer_model "
+                f"(both resolve to {_canonical(self.composer_model)!r}); the advisor "
+                "is the independent reviewer. Set composer_allow_same_advisor_model=true "
+                "to explicitly accept a same-model pairing"
+            )
+        return self
+
+    @property
+    def quotas_enabled(self) -> bool:
+        """Whether this deployment runs the quota system at all.
+
+        There is no separate switch: configuring ANY quota setting turns it
+        on. ``_validate_quota_defaults_when_enabled`` then guarantees both
+        per-identity defaults exist, so "on" always means a person's first
+        cap can be written.
+        """
+        return any(
+            value is not None
+            for value in (
+                self.quota_default_tokens_per_day,
+                self.quota_default_storage_bytes,
+                self.quota_container_tokens_per_day,
+                self.quota_container_storage_bytes,
+            )
+        )
+
+    @model_validator(mode="after")
+    def _validate_quota_defaults_when_enabled(self) -> WebSettings:
+        """Quotas on means BOTH per-identity defaults are configured.
+
+        A ``quota_policies`` row stores a value for tokens AND storage. An
+        administrator sets one dimension at a time, so the other value of a
+        person's first cap comes from these defaults. With one default, or
+        with only a container ceiling, the system looks enabled and every
+        first cap is refused for a reason no administrator can fix from the
+        panel. Refuse to start instead.
+        """
+        if self.quotas_enabled and (self.quota_default_tokens_per_day is None or self.quota_default_storage_bytes is None):
+            raise ValueError(
+                "the quota system is enabled (a quota_* setting is configured), so both quota_default_tokens_per_day "
+                "and quota_default_storage_bytes must be set: a person's first cap stores a value for both, and the "
+                "one an administrator does not type comes from these defaults"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_composer_endpoint_credential_pairing(self) -> WebSettings:
+        """Endpoint + credential must be configured together, per role.
+
+        An endpoint with no key is a credential-egress trap, not a valid
+        "unauthenticated gateway" configuration: LiteLLM does not require an
+        explicit ``api_key`` argument, so an unpaired ``*_endpoint_base_url``
+        would silently fall back to whatever ambient provider credential the
+        process environment happens to expose (``OPENAI_API_KEY`` and
+        friends) and send it to the operator-configured endpoint — exactly
+        the scenario this affordance exists to let an operator route through
+        a third-party gateway. Fail closed at config time rather than warn in
+        prose (this project's posture everywhere else). A key with no
+        endpoint is symmetric nonsense: it is inert (never read without a
+        base URL to pair it with) and signals a misconfiguration the
+        operator should fix, not silently ignore.
+
+        Each role is independent — see the two-model independence rule above.
+        """
+        if (self.composer_endpoint_base_url is None) != (self.composer_endpoint_api_key is None):
+            raise ValueError(
+                "composer_endpoint_base_url and composer_endpoint_api_key must be configured together: "
+                "an endpoint with no key would let LiteLLM silently fall back to an ambient provider "
+                "credential (e.g. OPENAI_API_KEY) and send it to the configured endpoint; a key with no "
+                "endpoint is inert and never used"
+            )
+        if (self.composer_advisor_endpoint_base_url is None) != (self.composer_advisor_endpoint_api_key is None):
+            raise ValueError(
+                "composer_advisor_endpoint_base_url and composer_advisor_endpoint_api_key must be "
+                "configured together: an endpoint with no key would let LiteLLM silently fall back to an "
+                "ambient provider credential (e.g. OPENAI_API_KEY) and send it to the configured endpoint; "
+                "a key with no endpoint is inert and never used"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_passphrase_requires_sqlite(self) -> WebSettings:
+        """Reject landscape_passphrase with non-SQLite URLs at config time."""
+        if self.landscape_passphrase is not None and self.landscape_url is not None:
+            from sqlalchemy.engine.url import make_url
+
+            driver = make_url(self.landscape_url).drivername.split("+")[0]
+            if driver != "sqlite":
+                raise ValueError(
+                    f"landscape_passphrase requires a SQLite landscape_url, "
+                    f"got driver '{driver}'. Either remove the passphrase "
+                    f"or change landscape_url to sqlite:///path/to/audit.db"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _enforce_secret_key_in_production(self) -> WebSettings:
+        """Reject default, undersized, or uniform-byte JWT HMAC keys outside explicit test contexts."""
+        if _allow_insecure_test_keys(self.host):
+            return self
+        if is_default_secret_key_placeholder(self.secret_key):
+            raise ValueError(
+                "secret_key must be set to a secure value outside explicit test contexts. "
+                "Set ELSPETH_WEB__SECRET_KEY or pass secret_key explicitly."
+            )
+        if is_undersized_secret_key(self.secret_key):
+            raise ValueError(
+                f"secret_key must be at least {_MIN_NON_LOCAL_JWT_SECRET_KEY_BYTES} bytes outside explicit test contexts. "
+                "Generate a high-entropy key for ELSPETH_WEB__SECRET_KEY."
+            )
+        if is_uniform_byte_key(self.secret_key.encode("utf-8")):
+            raise ValueError(
+                "secret_key is a known-weak uniform-byte placeholder outside explicit test contexts. "
+                "Generate a high-entropy key for ELSPETH_WEB__SECRET_KEY."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_known_weak_signing_key(self) -> WebSettings:
+        """Refuse uniform-byte placeholder signing keys outside explicit test contexts.
+
+        Test fixtures across the suite use ``b'\\x00' * 32`` and ``b'0' * 32``
+        as convenient 32-byte placeholders. Those values are operationally
+        indistinguishable from "the operator forgot to generate a real key" —
+        outside an explicit test context that is a security incident waiting to
+        happen. Mirrors the shape of ``_enforce_secret_key_in_production`` above.
+
+        A real key from ``openssl rand -base64 32`` is uniformly distributed;
+        a single repeated byte (any value) is the signature of a placeholder.
+        The check is intentionally simple — "all bytes identical" — to avoid
+        false positives on legitimate (if unusual) high-entropy keys.
+        """
+        if _allow_insecure_test_keys(self.host):
+            return self
+        raw_key = self.shareable_link_signing_key.get_secret_value()
+        if is_uniform_byte_key(raw_key):
+            raise ValueError(
+                "shareable_link_signing_key is a known-weak placeholder "
+                "(uniform-byte pattern detected); generate a real key with "
+                "``openssl rand -base64 32`` outside explicit test contexts."
+            )
+        return self
+
+    def get_landscape_url(self) -> str:
+        """Resolve landscape DB URL, defaulting to data_dir-relative path."""
+        return resolve_landscape_url(data_dir=self.data_dir, landscape_url=self.landscape_url)
+
+    def get_payload_store_path(self) -> Path:
+        """Resolve payload store path, defaulting to data_dir-relative path."""
+        if self.payload_store_path is not None:
+            return self.payload_store_path
+        return self.data_dir / "payloads"
+
+    def get_session_db_url(self) -> str:
+        """Resolve session DB URL, defaulting to data_dir-relative path."""
+        return resolve_session_db_url(data_dir=self.data_dir, session_db_url=self.session_db_url)
+
+
+def resolve_landscape_url(*, data_dir: Path, landscape_url: str | None) -> str:
+    """Where the Landscape lives: the configured URL, else ``data_dir/runs/audit.db``.
+
+    Module-level for the same reason as :func:`resolve_session_db_url`: the
+    ``composer users`` CLI writes the identity-retirement audit row to the
+    same Landscape the web app would, resolved by the same rule.
+    """
+    if landscape_url is not None:
+        return landscape_url
+    return f"sqlite:///{data_dir / 'runs' / 'audit.db'}"
+
+
+def resolve_session_db_url(*, data_dir: Path, session_db_url: str | None) -> str:
+    """Where the sessions store lives: the configured URL, else ``data_dir/sessions.db``.
+
+    Module-level so the ``composer users`` CLI -- which takes ``--data-dir``
+    rather than a full :class:`WebSettings` -- resolves the store by the same
+    rule the web app does, instead of by a copy of it.
+    """
+    if session_db_url is not None:
+        return session_db_url
+    return f"sqlite:///{data_dir / 'sessions.db'}"
+
+
+# Fields that accept JSON-encoded collection values from environment variables.
+# Add new tuple-typed WebSettings fields here so settings_from_env() decodes
+# them. Scalar fields are handled by Pydantic.
+_JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
+    {
+        "cors_origins",
+        "trusted_proxy_hosts",
+        "server_secret_allowlist",
+        # Both arrive from the ECS task definition as JSON, so they decode the
+        # same way every other collection setting does.
+        "sso_endpoint_origins",
+        "sso_admin_subjects",
+        "plugin_allowlist",
+        "power_automate_allowed_origins",
+        "bedrock_guardrail_profiles",
+        "aws_s3_source_profiles",
+        "aws_textract_profiles",
+        "azure_search_profiles",
+        "secret_wiring_allowlist",
+    }
+)
+_JSON_OBJECT_FIELDS: frozenset[str] = frozenset(
+    {"plugin_preferences", "plugin_control_modes", "llm_profiles", "bedrock_guardrail_default_profiles", "execution_rate_limit"}
+)
+_OPTIONAL_JSON_OBJECT_FIELDS: frozenset[str] = frozenset({"composer_prompt_guard", "composer_advisor_prompt_guard"})
+
+
+def _text_configured(value: str | None) -> bool:
+    """True when an operator actually supplied text.
+
+    A blank string is not a value: ``ELSPETH_WEB__SSO_ISSUER=`` in a task
+    definition satisfies every ``is not None`` check on the way to a
+    deployment that cannot complete a login. The field validators reject
+    blanks at parse time; this stays honest for state readiness did not
+    parse, because readiness must be total.
+    """
+    return value is not None and bool(value.strip())
+
+
+def _secret_configured(value: SecretStr | None) -> bool:
+    return value is not None and bool(value.get_secret_value().strip())
+
+
+def configured_auth_settings(settings: WebSettings) -> Mapping[str, bool]:
+    """Which settings the profile registry may name are actually configured.
+
+    Returns a verdict per setting rather than the values themselves, so no
+    caller has to ask "what type is this, and what counts as empty for it?"
+    -- each answer is computed here, where the field's type is known
+    statically. That is also why this is written out rather than reflected:
+    ``getattr(settings, name)`` on a type ELSPETH owns is the defect the
+    masquerade gate exists for, and a comprehension over field names would
+    let a typo in a profile's ``specific_required`` resolve to "missing"
+    forever -- readiness would report a correctly configured deployment as
+    not ready, naming a field nobody can find.
+
+    A ``KeyError`` from a caller is the honest failure: it means a profile
+    names a setting that does not exist. ``test_provider_type_contract``
+    pins the two sets equal so that cannot reach a deployment.
+    """
+    return {
+        "sso_client_id": _text_configured(settings.sso_client_id),
+        "sso_client_secret": _secret_configured(settings.sso_client_secret),
+        "sso_transaction_secret": _secret_configured(settings.sso_transaction_secret),
+        "sso_issuer": _text_configured(settings.sso_issuer),
+        "sso_endpoint_origins": bool(settings.sso_endpoint_origins),
+        "entra_tenant_id": _text_configured(settings.entra_tenant_id),
+        "google_hosted_domain": _text_configured(settings.google_hosted_domain),
+        "public_base_url": _text_configured(settings.public_base_url),
+        "compartment_id": _text_configured(settings.compartment_id),
+        "quota_default_tokens_per_day": settings.quota_default_tokens_per_day is not None,
+        "quota_default_storage_bytes": settings.quota_default_storage_bytes is not None,
+    }
+
+
+def _annotation_scalar_types(annotation: Any) -> set[type]:
+    """Flatten an annotation (including ``X | None`` unions) to its scalar types."""
+    origin = typing.get_origin(annotation)
+    if origin in (typing.Union, types.UnionType):
+        return {member for arg in typing.get_args(annotation) for member in _annotation_scalar_types(arg)}
+    return {annotation} if isinstance(annotation, type) else set()
+
+
+def _coerce_env_scalar(value: str, annotation: Any) -> object:
+    """Coerce a numeric environment string when the target field is int/float.
+
+    Environment values are always strings, but several fields are declared
+    ``strict=True`` and reject string input outright — without coercion those
+    fields are silently un-settable from the environment (the misconfiguration
+    only detonates as a startup crash-loop). Non-numeric targets, unparseable
+    values, and bool-typed fields pass through unchanged so Pydantic reports
+    them against the original input.
+    """
+    scalar_types = _annotation_scalar_types(annotation)
+    if bool in scalar_types:
+        return value
+    try:
+        if int in scalar_types and float not in scalar_types:
+            return int(value)
+        if float in scalar_types:
+            return float(value)
+    except ValueError:
+        return value
+    return value
+
+
+def settings_from_env() -> WebSettings:
+    """Construct :class:`WebSettings` from ``ELSPETH_WEB__*`` variables.
+
+    Collection fields use JSON arrays/objects, the literal ``null`` clears an
+    optional scalar, numeric strings are coerced for strict int/float fields,
+    unknown fields fail with their original environment name, and
+    policy-validation failures never echo raw operator input.
+    """
+    kwargs: dict[str, object] = {}
+    prefix = "ELSPETH_WEB__"
+    for key, value in os.environ.items():
+        if not key.startswith(prefix):
+            continue
+        field_name = key[len(prefix) :].lower()
+        if field_name == "deployment_aws_region":
+            raise RuntimeError("ELSPETH_WEB__DEPLOYMENT_AWS_REGION is reserved; deployment region comes from ambient AWS_REGION")
+        if field_name not in WebSettings.model_fields:
+            raise RuntimeError(f"Unknown ELSPETH_WEB__ setting: {key}")
+        if field_name in _JSON_COLLECTION_FIELDS | _JSON_OBJECT_FIELDS | _OPTIONAL_JSON_OBJECT_FIELDS:
+            try:
+                parsed = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                expected = "array" if field_name in _JSON_COLLECTION_FIELDS else "object"
+                raise RuntimeError(f"ELSPETH_WEB__{field_name.upper()} must be valid JSON {expected}.") from None
+            if field_name in _JSON_COLLECTION_FIELDS:
+                if not isinstance(parsed, list):
+                    raise RuntimeError(f"ELSPETH_WEB__{field_name.upper()} must be valid JSON array.")
+                kwargs[field_name] = tuple(parsed)
+            else:
+                if parsed is None and field_name in _OPTIONAL_JSON_OBJECT_FIELDS:
+                    kwargs[field_name] = None
+                    continue
+                if not isinstance(parsed, dict):
+                    raise RuntimeError(f"ELSPETH_WEB__{field_name.upper()} must be valid JSON object.")
+                kwargs[field_name] = parsed
+        elif value == "null":
+            kwargs[field_name] = None
+        else:
+            kwargs[field_name] = _coerce_env_scalar(value, WebSettings.model_fields[field_name].annotation)
+
+    aws_region = os.environ.get("AWS_REGION")
+    aws_default_region = os.environ.get("AWS_DEFAULT_REGION")
+    if aws_region is not None and (not aws_region.strip() or not is_well_formed_aws_region(aws_region)):
+        raise RuntimeError("AWS_REGION must be a non-blank well-formed AWS region identifier")
+    if aws_default_region is not None and (not aws_default_region.strip() or not is_well_formed_aws_region(aws_default_region)):
+        raise RuntimeError("AWS_DEFAULT_REGION must be a non-blank well-formed AWS region identifier")
+    if aws_region is not None and aws_default_region is not None and aws_region != aws_default_region:
+        raise RuntimeError("AWS_REGION and AWS_DEFAULT_REGION must agree when both are set")
+    kwargs["deployment_aws_region"] = aws_region if aws_region is not None else aws_default_region
+
+    try:
+        return WebSettings(**kwargs)  # type: ignore[arg-type]
+    except ValidationError as error:
+        policy_fields = {
+            "plugin_allowlist",
+            "power_automate_allowed_origins",
+            "plugin_preferences",
+            "plugin_control_modes",
+            "llm_profiles",
+            "default_llm_profile",
+            "bedrock_guardrail_profiles",
+            "bedrock_guardrail_default_profiles",
+            "aws_s3_source_profiles",
+            "aws_textract_profiles",
+            "azure_search_profiles",
+            "composer_prompt_guard",
+            "composer_advisor_prompt_guard",
+            "composer_prompt_guard_mode",
+        }
+        safe_paths = {
+            str(item) for detail in error.errors(include_input=False) for item in detail.get("loc", ()) if isinstance(item, (str, int))
+        }
+        guard_paths = (_OPTIONAL_JSON_OBJECT_FIELDS | {"composer_prompt_guard_mode"}) & safe_paths
+        if guard_paths:
+            rendered_paths = ", ".join(sorted(guard_paths))
+            raise RuntimeError(f"Invalid ELSPETH_WEB__ prompt guard setting at: {rendered_paths}") from None
+        if policy_fields & safe_paths:
+            rendered_paths = ", ".join(sorted(safe_paths))
+            raise RuntimeError(f"Invalid ELSPETH_WEB__ plugin policy setting at: {rendered_paths}") from None
+        raise

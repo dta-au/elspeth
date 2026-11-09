@@ -1,0 +1,1424 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { RunOutputsPanel } from "./RunOutputsPanel";
+import {
+  downloadRunOutputContent,
+  fetchRunOutputPreview,
+  fetchRunOutputs,
+} from "@/api/client";
+import type {
+  ApiError,
+  RunOutputArtifact,
+  RunOutputArtifactPreview,
+  RunOutputsResponse,
+} from "@/types/index";
+
+vi.mock("@/api/client", async () => {
+  const actual = await vi.importActual<typeof import("@/api/client")>("@/api/client");
+  return {
+    ...actual,
+    fetchRunOutputs: vi.fn(),
+    fetchRunOutputPreview: vi.fn(),
+    downloadRunOutputContent: vi.fn(),
+  };
+});
+
+const RUN_ID = "run-abc";
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function fileArtifact(overrides: Partial<RunOutputArtifact> = {}): RunOutputArtifact {
+  return {
+    artifact_id: "art-1",
+    sink_node_id: "results",
+    producer_kind: "sink_effect",
+    produced_by_state_id: null,
+    sink_effect_id: "effect-1",
+    artifact_type: "file",
+    path_or_uri: "file:///data/outputs/results.csv",
+    content_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+    size_bytes: 1024,
+    publication_performed: true,
+    publication_evidence_kind: "returned",
+    created_at: "2026-05-10T00:00:00Z",
+    exists_now: true,
+    downloadable: true,
+    storage_kind: "sink_file",
+    ...overrides,
+  };
+}
+
+function manifest(artifacts: RunOutputArtifact[]): RunOutputsResponse {
+  return {
+    run_id: RUN_ID,
+    landscape_run_id: RUN_ID,
+    artifacts,
+  };
+}
+
+function csvPreview(overrides: Partial<RunOutputArtifactPreview> = {}): RunOutputArtifactPreview {
+  return {
+    artifact_id: "art-1",
+    content_type: "csv",
+    preview_text: "col1,col2\n1,2\n3,4\n",
+    truncated: false,
+    total_size_bytes: 18,
+    row_count_preview: 3,
+    ...overrides,
+  };
+}
+
+describe("RunOutputsPanel", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("loads the manifest on mount and renders artifact rows", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByText("results.csv")).toBeInTheDocument());
+    expect(screen.getByText("file")).toBeInTheDocument();
+    expect(screen.getByText("1.0 KiB")).toBeInTheDocument();
+    expect(screen.getByText("abcdef012345…")).toBeInTheDocument();
+    expect(screen.getByText("Download")).toBeInTheDocument();
+    // Run timestamp: rendered as a compact local YYYY-MM-DD HH:MM:SS
+    // alongside the file size. The exact text varies by host timezone
+    // (the fixture is "2026-05-10T00:00:00Z"), so assert the *shape*
+    // and verify the unmodified ISO survives in the tooltip.
+    expect(screen.getByText(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/)).toBeInTheDocument();
+    expect(
+      screen.getByTitle("2026-05-10T00:00:00Z"),
+    ).toBeInTheDocument();
+  });
+
+  it("shows an empty state when the run produced no outputs", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(manifest([]));
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/produced no outputs/i)).toBeInTheDocument(),
+    );
+  });
+
+  it("renders the 'no longer available on disk' state for purged artifacts", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact({ exists_now: false, downloadable: false })]),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/no longer available on disk/i)).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("Download")).not.toBeInTheDocument();
+    expect(screen.queryByText("Preview")).not.toBeInTheDocument();
+  });
+
+  it("does not leak raw internal storage paths in unavailable-row tooltips", async () => {
+    // Regression for elspeth-52af16f9ae: the frontend previously guessed
+    // "internal storage" from a path-shape regex that no repo code
+    // actually produces. The backend now classifies storage_kind
+    // structurally; a purged blob-store artifact (exists_now=false)
+    // must still mask its raw path in the tooltip.
+    const rawPath = "/var/lib/elspeth/data/blobs/session-1/blob-abc_report.json";
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([
+        fileArtifact({
+          sink_node_id: "final_report",
+          path_or_uri: rawPath,
+          exists_now: false,
+          downloadable: false,
+          storage_kind: "blob",
+        }),
+      ]),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const unavailable = await screen.findByText(/no longer available on disk/i);
+    expect(unavailable).toHaveAttribute(
+      "title",
+      "Recorded artifact for final_report",
+    );
+    expect(unavailable.getAttribute("title")).not.toContain(rawPath);
+  });
+
+  it("shows the 'outside allowed sink directories' tooltip when not downloadable", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact({ exists_now: true, downloadable: false })]),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/outside allowed sink directories/i),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("Download")).not.toBeInTheDocument();
+  });
+
+  it("renders non-file artifacts as metadata-only with no action buttons", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([
+        fileArtifact({
+          artifact_id: "art-db",
+          artifact_type: "database",
+          path_or_uri: "postgres://prod/results.outputs",
+          exists_now: false,
+          downloadable: false,
+        }),
+      ]),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("postgres://prod/results.outputs"),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.getByText("database")).toBeInTheDocument();
+    expect(screen.queryByText("Download")).not.toBeInTheDocument();
+    expect(screen.queryByText("Preview")).not.toBeInTheDocument();
+    // Non-file artifacts also do NOT show the "no longer available" message
+    // (that's a file-only concept).
+    expect(screen.queryByText(/no longer available on disk/i)).not.toBeInTheDocument();
+  });
+
+  // Auto-expansion (elspeth-3a7b7c7b37): the single-previewable-artifact
+  // common case expands and fetches its preview through the SAME
+  // togglePreview path a manual click uses — exactly once — while
+  // multi-artifact manifests keep the original opt-in behaviour.
+
+  // row_count_preview === 1 is reachable and is the only count that exposes a
+  // hardcoded plural: the backend reports complete logical records (including
+  // a CSV header), so a byte-capped CSV may return only its complete header.
+  // A dropped final record must SAY it was dropped. Both tests below feed a
+  // preview whose text stops inside a quoted field — the parser reports
+  // endedInQuotes and the fragment is discarded — and assert the operator is
+  // told which of the two reasons applies. Before this, the record vanished
+  // in silence: buildTabularPreviewModel justified the drop by citing the
+  // "Preview truncated" footer, a footer it was never given the flag to see,
+  // and which does not render at all on the malformed-artifact path.
+
+  it("says the final record was cut off when a TRUNCATED preview ends mid-quote", async () => {
+    // Defensive wire handling: the current backend withholds byte-cut record
+    // fragments, but a stale server or captured response may still carry one.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        truncated: true,
+        row_count_preview: 3,
+        preview_text: 'id,answer\n1,ok\n2,"a half-written ans',
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    expect(
+      await screen.findByText(/cut off by the preview limit/i),
+    ).toBeInTheDocument();
+    // The complete record still renders; only the fragment is withheld.
+    expect(screen.getByText("ok")).toBeInTheDocument();
+    expect(screen.queryByText(/a half-written ans/)).not.toBeInTheDocument();
+  });
+
+  it("reports an unterminated quoted field when an UNtruncated preview ends mid-quote", async () => {
+    // A partially-written or malformed artifact that did not hit either cap,
+    // so the backend reports truncated=false and NO footer renders.
+    // Without a caveat here the record disappears with nothing on screen.
+    // summarizeCsv (utils/contentStructure.ts) has always reported exactly
+    // this condition; this is the same rule reaching the second consumer.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        truncated: false,
+        row_count_preview: 3,
+        preview_text: 'id,answer\n1,ok\n2,"a half-written ans',
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    expect(
+      await screen.findByText(/unterminated quoted field/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/preview truncated/i)).not.toBeInTheDocument();
+  });
+
+  it("shows the malformed CSV caveat even when no complete row can render", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        truncated: false,
+        row_count_preview: null,
+        preview_text: '"unfinished header',
+      }),
+    );
+
+    const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
+
+    expect(
+      await screen.findByText(/unterminated quoted field/i),
+    ).toBeInTheDocument();
+    expect(container.querySelector(".structured-preview-table")).toBeNull();
+  });
+
+  it("says a singular row count and discloses that CSV counts include the header", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({ truncated: true, row_count_preview: 1 }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const footer = await screen.findByText(/preview truncated/i);
+    expect(footer.textContent).toContain("to 1 row including header");
+    expect(footer.textContent).not.toContain("to 1 rows");
+  });
+
+  it("does not claim a header was included when the byte cap captured zero CSV rows", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        truncated: true,
+        row_count_preview: 0,
+        preview_text: "",
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const footer = await screen.findByText(/preview truncated/i);
+    expect(footer.textContent).toContain("to 0 rows");
+    expect(footer.textContent).not.toContain("including header");
+  });
+
+  it("auto-expands the single previewable artifact, fetching its preview once, and shows the truncation footer", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({ truncated: true, total_size_bytes: 5_000_000 }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    // No click: the sole previewable artifact expands itself.
+    await waitFor(() =>
+      expect(fetchRunOutputPreview).toHaveBeenCalledWith(RUN_ID, "art-1"),
+    );
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(1);
+    expect(
+      await screen.findByRole("button", { name: /Hide preview/ }),
+    ).toBeInTheDocument();
+    // CSV renders as a table — assert on cell content.
+    await waitFor(() => expect(screen.getByText("col1")).toBeInTheDocument());
+    expect(screen.getByText("col2")).toBeInTheDocument();
+    // Truncation footer is present when truncated=true.
+    expect(screen.getByText(/preview truncated/i)).toBeInTheDocument();
+    // The "download for full file" element MUST be a button, not an
+    // anchor. A plain `<a href download>` would 401 because Bearer
+    // auth doesn't ride on top-level navigation. Same regression
+    // guard as the row-level Download button — see the dedicated
+    // download-via-button test below.
+    const fullFileLink = screen.getByText(/download for full file/i);
+    expect(fullFileLink.tagName).toBe("BUTTON");
+    expect(fullFileLink.hasAttribute("href")).toBe(false);
+  });
+
+  it("keeps a multi-artifact manifest collapsed until Preview is clicked", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([
+        fileArtifact(),
+        fileArtifact({
+          artifact_id: "art-2",
+          path_or_uri: "file:///data/outputs/errors.csv",
+        }),
+      ]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview(),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const previewButtons = await screen.findAllByRole("button", {
+      name: /^Preview$/,
+    });
+    expect(previewButtons).toHaveLength(2);
+    expect(fetchRunOutputPreview).not.toHaveBeenCalled();
+
+    fireEvent.click(previewButtons[0]);
+    await waitFor(() =>
+      expect(fetchRunOutputPreview).toHaveBeenCalledWith(RUN_ID, "art-1"),
+    );
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not re-expand after a manual collapse, even across Refresh of the same run", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview(),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Hide preview/ }));
+
+    fireEvent.click(screen.getByRole("button", { name: /Refresh/ }));
+
+    // The refreshed manifest must not override the operator's collapse:
+    // auto-expansion is once per run.
+    await waitFor(() => expect(fetchRunOutputs).toHaveBeenCalledTimes(2));
+    expect(
+      await screen.findByRole("button", { name: /^Preview$/ }),
+    ).toBeInTheDocument();
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not refetch preview when the row is collapsed and re-expanded", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(csvPreview());
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    // Auto-expansion performs the first (and only) fetch.
+    await waitFor(() => expect(fetchRunOutputPreview).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(await screen.findByRole("button", { name: /Hide preview/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Preview$/ }));
+
+    // Cached — no second fetch.
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders the binary 'no inline preview' message for binary content", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact({ path_or_uri: "file:///data/outputs/blob.bin" })]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        content_type: "binary",
+        preview_text: "",
+        row_count_preview: null,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    // Sole previewable artifact — auto-expanded, no click needed.
+    await waitFor(() =>
+      expect(screen.getByText(/no inline preview available/i)).toBeInTheDocument(),
+    );
+  });
+
+  it("renders jsonl preview with each line in a single cell (no comma fragmentation)", async () => {
+    // Regression for Codex P2 finding: TabularPreview previously called
+    // `line.split(",")` for both csv and jsonl. For jsonl, that fragments
+    // each JSON object across cells (e.g. `{"a":1,"b":2}` splits into
+    // `{"a":1` / `"b":2}`). Each line must remain intact in a single cell.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact({ path_or_uri: "file:///data/outputs/results.jsonl" })]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        content_type: "jsonl",
+        preview_text: '{"a":1,"b":2}\n{"a":3,"b":4}\n',
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    // The full JSON object is present in the rendered output rather than
+    // any of its fragments. If the comma-split bug had survived,
+    // {"a":1 and "b":2} would appear as separate cell text and
+    // {"a":1,"b":2} (the whole object) would not be queryable as a unit.
+    await waitFor(() =>
+      expect(screen.getByText('{"a":1,"b":2}')).toBeInTheDocument(),
+    );
+    expect(screen.getByText('{"a":3,"b":4}')).toBeInTheDocument();
+
+    // jsonl has no column structure of its own, but it still gets a real
+    // th scope="col" header cell through the shared PreviewTable rather
+    // than rendering headerless (or with the old fake bold-td header).
+    const header = screen.getByRole("columnheader");
+    expect(header.tagName).toBe("TH");
+    expect(header.getAttribute("scope")).toBe("col");
+  });
+
+  it("does not render CRLF blank JSONL frames that the backend does not count", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact({ path_or_uri: "file:///data/outputs/results.jsonl" })]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        content_type: "jsonl",
+        preview_text: '{"a":1}\r\n\r\n{"a":2}\r\n',
+        row_count_preview: 2,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByText('{"a":1}')).toBeInTheDocument());
+    expect(screen.getByText('{"a":2}')).toBeInTheDocument();
+    expect(screen.getAllByRole("row")).toHaveLength(3); // header plus two JSONL records
+  });
+
+  it("renders nothing for an empty csv/jsonl preview body instead of an empty table shell", async () => {
+    // buildTabularPreviewModel returns null for zero data lines; TabularPreview
+    // must render nothing rather than an empty PreviewTable — this empty
+    // state must keep working across the TabularPreview rewrite.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({ preview_text: "", row_count_preview: null }),
+    );
+
+    const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /Hide preview/ })).toBeInTheDocument(),
+    );
+    expect(container.querySelector(".structured-preview-table")).toBeNull();
+    expect(screen.queryByRole("columnheader")).not.toBeInTheDocument();
+  });
+
+  it("renders csv preview headers as real th[scope=col], not a fake bold-td header", async () => {
+    // Regression for elspeth-611a05668e: csv/jsonl previously rendered
+    // through a bespoke inline-styled table that faked its header row
+    // with a bold <td>. Both the csv/jsonl and JSON table renderers now
+    // share one PreviewTable component with a real thead/th scope="col".
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(csvPreview());
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const headerCells = await screen.findAllByRole("columnheader");
+    expect(headerCells.map((el) => el.textContent)).toEqual(["col1", "col2"]);
+    headerCells.forEach((cell) => {
+      expect(cell.tagName).toBe("TH");
+      expect(cell.getAttribute("scope")).toBe("col");
+    });
+  });
+
+  it("renders TSV preview (content_type=csv, tab-separated) with tab delimiter sniffing", async () => {
+    // Regression for Codex P2 finding: backend tags both `.csv` and
+    // `.tsv` files as content_type "csv" (web/execution/preview.py
+    // _CSV_EXTENSIONS), so a tab-separated blob arrives at TabularPreview
+    // with content_type="csv". A literal `split(",")` collapses the
+    // entire row into one cell. The renderer must sniff the first line
+    // for tab vs comma and use whichever is more frequent.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact({ path_or_uri: "file:///data/outputs/results.tsv" })]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        content_type: "csv",
+        preview_text: "id\tname\tvalue\n1\tAlice\t9.99\n2\tBob\t19.95\n",
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    // Each header and data cell is its own queryable element. Before the
+    // fix, "id\tname\tvalue" rendered as a single cell.
+    await waitFor(() => expect(screen.getByText("id")).toBeInTheDocument());
+    expect(screen.getByText("name")).toBeInTheDocument();
+    expect(screen.getByText("value")).toBeInTheDocument();
+    expect(screen.getByText("Alice")).toBeInTheDocument();
+    expect(screen.getByText("19.95")).toBeInTheDocument();
+  });
+
+  it("keeps a quoted comma-bearing value in one cell and leaves no blank column headers", async () => {
+    // Regression for elspeth-7f1e148ed6. Every transform:llm emits
+    // `<response_field>_usage` as a dict repr full of commas, so the sink
+    // quotes it and `line.split(delimiter)` shredded it into five cells.
+    // Body rows then parsed wider than the header, `columnCount` grew to
+    // the body width, and the header was right-padded with empty strings —
+    // so the operator read real values under nameless columns. Live shape:
+    // session 75cec2b2, run 6f32968e.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text:
+          'colour,pairing,pairing_usage\n'
+          + 'Crimson,Teal,"{\'completion_tokens\': 6, \'total_tokens\': 51}"\n',
+        row_count_preview: 2,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const headerCells = await screen.findAllByRole("columnheader");
+    // Exactly the three declared columns — no padding.
+    expect(headerCells.map((el) => el.textContent)).toEqual([
+      "colour",
+      "pairing",
+      "pairing_usage",
+    ]);
+    // The quoted field survives whole, in its own cell.
+    expect(
+      screen.getByText("{'completion_tokens': 6, 'total_tokens': 51}"),
+    ).toBeInTheDocument();
+    // And the value after it did not slide under the wrong heading.
+    const bodyCells = screen.getAllByRole("cell").map((el) => el.textContent);
+    expect(bodyCells).toEqual([
+      "Crimson",
+      "Teal",
+      "{'completion_tokens': 6, 'total_tokens': 51}",
+    ]);
+  });
+
+  it("labels genuinely over-wide CSV rows and explains the header mismatch", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: "id,name\n1,Alice,unexpected\n",
+        row_count_preview: 2,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const headerCells = await screen.findAllByRole("columnheader");
+    expect(headerCells.map((cell) => cell.textContent)).toEqual([
+      "id",
+      "name",
+      "Unnamed column 3",
+    ]);
+    expect(
+      screen.getByText(/some rows contain more fields than the header/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText("unexpected")).toBeInTheDocument();
+  });
+
+  it("keeps a quoted multi-line value in one cell instead of starting a new row", async () => {
+    // The shape elspeth-7f1e148ed6 was originally filed on: an
+    // llm_response holding formatted JSON. `text.split("\n")` turned each
+    // embedded newline into a table row.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: 'id,llm_response\n1,"line one\nline two"\n2,plain\n',
+        row_count_preview: 3,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByText("id")).toBeInTheDocument());
+    const rows = screen.getAllByRole("row");
+    // header + exactly two data rows
+    expect(rows).toHaveLength(3);
+    expect(screen.getByText("line one line two")).toBeInTheDocument();
+  });
+
+  it("renders a final quoted empty CSV record without a terminal newline", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: 'value\n""',
+        row_count_preview: 2,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByText("value")).toBeInTheDocument());
+    expect(screen.getAllByRole("row")).toHaveLength(2); // header plus empty record
+  });
+
+  it("renders five complete 120-line records from a record-bounded backend preview", async () => {
+    const answers = Array.from({ length: 5 }, (_, recordIndex) =>
+      Array.from(
+        { length: 120 },
+        (_, lineIndex) => `record ${recordIndex} line ${lineIndex}`,
+      ).join("\n"),
+    );
+    const previewText =
+      "id,answer\n" +
+      answers
+        .map((answer, recordIndex) => `${recordIndex},"${answer}"\n`)
+        .join("");
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: previewText,
+        row_count_preview: 6,
+        truncated: false,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByText("id")).toBeInTheDocument());
+    const renderedRows = screen.getAllByRole("row");
+    expect(renderedRows).toHaveLength(6); // one header plus five body records
+    expect(renderedRows[1]?.querySelectorAll("td")[1]?.textContent).toContain(
+      "record 0 line 0\nrecord 0 line 1",
+    );
+    expect(renderedRows[5]?.querySelectorAll("td")[1]?.textContent).toContain(
+      "record 4 line 118\nrecord 4 line 119",
+    );
+  });
+
+  it("escaped double quotes inside a quoted field collapse to one quote", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: 'id,quote\n1,"she said ""hi"", then left"\n',
+        row_count_preview: 2,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() =>
+      expect(screen.getByText('she said "hi", then left')).toBeInTheDocument(),
+    );
+  });
+
+  it("drops the trailing row of a preview cut off inside a quoted field", async () => {
+    // A truncated preview can end mid-quote. Rendering the partial field as
+    // a row would show the operator a record that does not exist; the
+    // "Preview truncated" notice already explains the omission.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: 'id,note\n1,complete\n2,"cut off mid fie',
+        truncated: true,
+        row_count_preview: 3,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByText("complete")).toBeInTheDocument());
+    const rows = screen.getAllByRole("row");
+    // header + the one complete data row
+    expect(rows).toHaveLength(2);
+    expect(screen.queryByText(/cut off mid fie/)).not.toBeInTheDocument();
+  });
+
+  it("pretty-prints JSON previews and offers a table view for record arrays", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact({ path_or_uri: "file:///data/outputs/results.json" })]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        content_type: "json",
+        preview_text: '[{"id":1,"status":"ok"},{"id":2,"status":"error"}]',
+        row_count_preview: null,
+      }),
+    );
+
+    const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() =>
+      expect(container.querySelector('[data-codeblock-format="json"]')?.textContent).toContain(
+        '"id": 1,',
+      ),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Table view" }));
+
+    expect(screen.getByText("id")).toBeInTheDocument();
+    expect(screen.getByText("status")).toBeInTheDocument();
+    expect(screen.getByText("error")).toBeInTheDocument();
+  });
+
+  it("derives a friendly artifact label instead of showing opaque blob-store paths", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([
+        fileArtifact({
+          sink_node_id: "final_report",
+          path_or_uri:
+            "/var/lib/elspeth/data/blobs/session-1/blob-abc_report.json",
+          storage_kind: "blob",
+        }),
+      ]),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() =>
+      expect(screen.getByText("final_report")).toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByText(
+        "/var/lib/elspeth/data/blobs/session-1/blob-abc_report.json",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("derives a friendly artifact label for payload-store paths too", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([
+        fileArtifact({
+          sink_node_id: "final_report",
+          path_or_uri:
+            "/var/lib/elspeth/data/payloads/ab/abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+          storage_kind: "payload",
+        }),
+      ]),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() =>
+      expect(screen.getByText("final_report")).toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByText(
+        "/var/lib/elspeth/data/payloads/ab/abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("preserves legitimate hash-like filenames when storage_kind is not internal storage", async () => {
+    // Regression for elspeth-52af16f9ae: this filename would have matched
+    // the old sha256-basename regex heuristic, but only blob/payload
+    // storage_kind values mask — a user-configured sink directory outside
+    // the recognised layouts classifies "unknown", so the raw name must
+    // render as-is.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([
+        fileArtifact({
+          sink_node_id: "final_report",
+          path_or_uri:
+            "file:///srv/exports/sha256-abcdef0123456789abcdef0123456789.json",
+          storage_kind: "unknown",
+        }),
+      ]),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("sha256-abcdef0123456789abcdef0123456789.json"),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("final_report")).not.toBeInTheDocument();
+  });
+
+  it("preserves user output filenames that include a blob-storage-looking directory name without exposing the raw path", async () => {
+    // Regression for elspeth-52af16f9ae: a user-configured sink path that
+    // happens to contain a "blob-storage" segment is classified
+    // storage_kind="sink_file" by the backend (it's not under the real
+    // blob-store layout), so the basename must render as-is — the old
+    // regex heuristic would have masked this incorrectly. The full local
+    // file URI is still server-private and must not leak through the title.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([
+        fileArtifact({
+          sink_node_id: "final_report",
+          path_or_uri: "file:///data/outputs/blob-storage/report.json",
+          storage_kind: "sink_file",
+        }),
+      ]),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByText("report.json")).toBeInTheDocument());
+    expect(screen.getByTitle("report.json")).toBeInTheDocument();
+    expect(screen.queryByTitle("file:///data/outputs/blob-storage/report.json")).not.toBeInTheDocument();
+    expect(screen.queryByText("final_report")).not.toBeInTheDocument();
+  });
+
+  it("transitions to 'no longer available on disk' on artifact_purged_or_moved race", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    // parseResponse throws an ApiError-shaped object, NOT an Error
+    // instance. The race detection matches on the structured
+    // error_type field, not on a substring of detail.
+    const apiError: ApiError = {
+      status: 410,
+      detail: "Resource gone",
+      error_type: "artifact_purged_or_moved",
+    };
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockRejectedValue(apiError);
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    // The auto-expanded preview fetch hits the purge race directly.
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          /file is no longer available on disk \(purged or moved/i,
+        ),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("renders a generic error using ApiError.detail for non-purged preview failures", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    const apiError: ApiError = { status: 500, detail: "server boom" };
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockRejectedValue(apiError);
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.getByText(/server boom/)).toBeInTheDocument();
+  });
+
+  it("surfaces a manifest-load error and offers Refresh", async () => {
+    const apiError: ApiError = { status: 503, detail: "Manifest unavailable" };
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockRejectedValue(apiError);
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.getByText(/Manifest unavailable/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Refresh/ })).toBeInTheDocument();
+  });
+
+  it("clears prior manifest and preview state as soon as runId changes", async () => {
+    const runBLoad = deferred<RunOutputsResponse>();
+    (fetchRunOutputs as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(manifest([fileArtifact()]))
+      .mockReturnValueOnce(runBLoad.promise);
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({ preview_text: "old-run-preview\n" }),
+    );
+
+    const { rerender } = render(<RunOutputsPanel runId="run-a" />);
+    // Sole previewable artifact — auto-expanded, no click needed.
+    await waitFor(() =>
+      expect(screen.getByText("old-run-preview")).toBeInTheDocument(),
+    );
+
+    rerender(<RunOutputsPanel runId="run-b" />);
+
+    expect(screen.queryByText("results.csv")).not.toBeInTheDocument();
+    expect(screen.queryByText("old-run-preview")).not.toBeInTheDocument();
+    expect(screen.getByText(/loading outputs/i)).toBeInTheDocument();
+
+    const apiError: ApiError = { status: 503, detail: "run B manifest failed" };
+    runBLoad.reject(apiError);
+
+    await waitFor(() =>
+      expect(screen.getByText(/run B manifest failed/i)).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("results.csv")).not.toBeInTheDocument();
+    expect(screen.queryByText("old-run-preview")).not.toBeInTheDocument();
+  });
+
+  it("ignores a late manifest response for a previous runId", async () => {
+    const runALoad = deferred<RunOutputsResponse>();
+    (fetchRunOutputs as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce(runALoad.promise)
+      .mockResolvedValueOnce(
+        manifest([
+          fileArtifact({
+            artifact_id: "run-b-artifact",
+            path_or_uri: "file:///data/outputs/run-b.csv",
+          }),
+        ]),
+      );
+
+    const { rerender } = render(<RunOutputsPanel runId="run-a" />);
+    rerender(<RunOutputsPanel runId="run-b" />);
+
+    await waitFor(() => expect(screen.getByText("run-b.csv")).toBeInTheDocument());
+
+    runALoad.resolve(
+      manifest([
+        fileArtifact({
+          artifact_id: "run-a-artifact",
+          path_or_uri: "file:///data/outputs/run-a.csv",
+        }),
+      ]),
+    );
+
+    await waitFor(() =>
+      expect(fetchRunOutputs).toHaveBeenCalledWith("run-a"),
+    );
+    expect(screen.queryByText("run-a.csv")).not.toBeInTheDocument();
+    expect(screen.getByText("run-b.csv")).toBeInTheDocument();
+  });
+
+  it("ignores a late preview response for a previous runId", async () => {
+    const oldPreview = deferred<RunOutputArtifactPreview>();
+    (fetchRunOutputs as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(manifest([fileArtifact()]))
+      .mockResolvedValueOnce(
+        manifest([
+          fileArtifact({
+            path_or_uri: "file:///data/outputs/run-b-results.csv",
+          }),
+        ]),
+      );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      oldPreview.promise,
+    );
+
+    const { rerender } = render(<RunOutputsPanel runId="run-a" />);
+    // Auto-expansion fires the run-a preview fetch.
+    await waitFor(() =>
+      expect(fetchRunOutputPreview).toHaveBeenCalledWith("run-a", "art-1"),
+    );
+
+    rerender(<RunOutputsPanel runId="run-b" />);
+    await waitFor(() =>
+      expect(screen.getByText("run-b-results.csv")).toBeInTheDocument(),
+    );
+
+    oldPreview.resolve(
+      csvPreview({ preview_text: "stale-run-a-preview\n", artifact_id: "art-1" }),
+    );
+
+    await waitFor(() =>
+      expect(fetchRunOutputs).toHaveBeenCalledWith("run-b"),
+    );
+    expect(screen.queryByText("stale-run-a-preview")).not.toBeInTheDocument();
+  });
+
+  // The auto-expand effect fires in the SAME commit as the runId prop change,
+  // while `manifest` state is still the previous run's. Acting on that pair
+  // would fetch run A's artifact ids against run B's /preview endpoint AND
+  // burn run B's once-per-run auto-expand budget, leaving B's real output
+  // collapsed. The manifest-ownership guard must make both impossible.
+  it("never auto-expands run B using run A's manifest", async () => {
+    const runBLoad = deferred<RunOutputsResponse>();
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockImplementation(
+      (targetRunId: string) =>
+        targetRunId === "run-a"
+          ? Promise.resolve(
+              manifest([
+                fileArtifact({
+                  artifact_id: "art-a",
+                  path_or_uri: "file:///data/outputs/run-a.csv",
+                }),
+              ]),
+            )
+          : runBLoad.promise,
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview(),
+    );
+
+    const { rerender } = render(<RunOutputsPanel runId="run-a" />);
+    await waitFor(() =>
+      expect(fetchRunOutputPreview).toHaveBeenCalledWith("run-a", "art-a"),
+    );
+
+    rerender(<RunOutputsPanel runId="run-b" />);
+    await waitFor(() =>
+      expect(fetchRunOutputs).toHaveBeenCalledWith("run-b"),
+    );
+    // No cross-run preview fetch while run B's own manifest is still in
+    // flight — run A's artifact id does not exist under run B.
+    expect(fetchRunOutputPreview).not.toHaveBeenCalledWith("run-b", "art-a");
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(1);
+
+    runBLoad.resolve(
+      manifest([
+        fileArtifact({
+          artifact_id: "art-b",
+          path_or_uri: "file:///data/outputs/run-b.csv",
+        }),
+      ]),
+    );
+
+    // Run B's budget was never spent on run A's artifact, so B's own sole
+    // output still auto-expands.
+    await waitFor(() =>
+      expect(fetchRunOutputPreview).toHaveBeenCalledWith("run-b", "art-b"),
+    );
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not re-expand a manually collapsed artifact when navigating run A → B → A", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockImplementation(
+      (targetRunId: string) =>
+        Promise.resolve(
+          manifest([
+            targetRunId === "run-a"
+              ? fileArtifact({
+                  artifact_id: "art-a",
+                  path_or_uri: "file:///data/outputs/run-a.csv",
+                })
+              : fileArtifact({
+                  artifact_id: "art-b",
+                  path_or_uri: "file:///data/outputs/run-b.csv",
+                }),
+          ]),
+        ),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview(),
+    );
+
+    const { rerender } = render(<RunOutputsPanel runId="run-a" />);
+    // Run A auto-expands, then the operator deliberately collapses it.
+    fireEvent.click(await screen.findByRole("button", { name: /Hide preview/ }));
+    expect(screen.getByRole("button", { name: /^Preview$/ })).toBeInTheDocument();
+
+    rerender(<RunOutputsPanel runId="run-b" />);
+    await waitFor(() =>
+      expect(fetchRunOutputPreview).toHaveBeenCalledWith("run-b", "art-b"),
+    );
+
+    rerender(<RunOutputsPanel runId="run-a" />);
+    await waitFor(() => expect(screen.getByText("run-a.csv")).toBeInTheDocument());
+
+    // Returning to run A must honour the collapse: auto-expansion is
+    // remembered per run in a SET, so run B's visit cannot re-arm run A.
+    expect(
+      await screen.findByRole("button", { name: /^Preview$/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Hide preview/ }),
+    ).not.toBeInTheDocument();
+    // Exactly the two intentional expansions: run A's original auto-expand
+    // and run B's. Returning to A adds no third fetch.
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(2);
+  });
+
+  it("download button calls downloadRunOutputContent with auth (not a plain anchor)", async () => {
+    // The /content endpoint requires Authorization headers — a plain
+    // `<a download>` would 401 on top-level navigation. Verify the
+    // Download UI element is a button that calls the auth-attached
+    // downloader, not an anchor with an href.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact({ artifact_id: "art with spaces/and slash" })]),
+    );
+    const blob = new Blob(["downloaded bytes"], { type: "text/csv" });
+    (downloadRunOutputContent as ReturnType<typeof vi.fn>).mockResolvedValue({
+      data: blob,
+      filename: "results.csv",
+    });
+    // Stub objectURL primitives so triggerBrowserDownload doesn't break.
+    const createSpy = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:mock");
+    const revokeSpy = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const dlBtn = await screen.findByRole("button", { name: /Download/ });
+    expect(dlBtn.tagName).toBe("BUTTON");
+    expect(dlBtn.hasAttribute("href")).toBe(false);
+    fireEvent.click(dlBtn);
+
+    await waitFor(() =>
+      expect(downloadRunOutputContent).toHaveBeenCalledWith(
+        RUN_ID,
+        "art with spaces/and slash",
+      ),
+    );
+    expect(createSpy).toHaveBeenCalledWith(blob);
+    expect(revokeSpy).toHaveBeenCalledWith("blob:mock");
+
+    createSpy.mockRestore();
+    revokeSpy.mockRestore();
+  });
+
+  // Every other loading state in the app spins (LoginPage, AuthGuard,
+  // ExecuteButton, PluginCard); static text cannot tell an operator whether the
+  // panel is working or stalled. The spacing around the preview block was also
+  // a raw `6` at five sites, invisible to the token system even though
+  // --space-1-5 IS exactly 6px (elspeth-cda90fbb49).
+  describe("loading affordance and spacing tokens (elspeth-cda90fbb49)", () => {
+    it("spins the shared .spinner while the manifest is loading", async () => {
+      const pending = deferred<RunOutputsResponse>();
+      (fetchRunOutputs as ReturnType<typeof vi.fn>).mockReturnValue(
+        pending.promise,
+      );
+
+      const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
+
+      const loading = await screen.findByText(/Loading outputs/);
+      expect(container.querySelector(".spinner")).not.toBeNull();
+      // The spinner is decoration; the text is the announcement.
+      expect(container.querySelector(".spinner")).toHaveAttribute(
+        "aria-hidden",
+        "true",
+      );
+      expect(loading).toBeInTheDocument();
+
+      pending.resolve(manifest([]));
+      await waitFor(() =>
+        expect(container.querySelector(".spinner")).toBeNull(),
+      );
+    });
+
+    it("spins the shared .spinner while a preview is in flight", async () => {
+      (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+        manifest([fileArtifact()]),
+      );
+      const pending = deferred<RunOutputArtifactPreview>();
+      (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockReturnValue(
+        pending.promise,
+      );
+
+      const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
+
+      await screen.findByText(/Loading preview/);
+      expect(container.querySelector(".spinner")).not.toBeNull();
+
+      pending.resolve(csvPreview());
+      await waitFor(() =>
+        expect(screen.queryByText(/Loading preview/)).toBeNull(),
+      );
+      expect(container.querySelector(".spinner")).toBeNull();
+    });
+
+    // purged / error / binary are TERMINAL outcomes, not work in progress. A
+    // spinner on one of them would claim activity that is not happening — the
+    // filed remediation counted them among "four loading states"; they are not.
+    it("shows no spinner on the terminal purged / error / binary states", async () => {
+      (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+        manifest([fileArtifact()]),
+      );
+      (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+        csvPreview({ content_type: "binary", preview_text: "" }),
+      );
+
+      const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
+
+      await screen.findByText(/Binary file/);
+      expect(container.querySelector(".spinner")).toBeNull();
+    });
+
+    it("spaces the preview block with --space-1-5, never a raw 6", async () => {
+      (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+        manifest([fileArtifact()]),
+      );
+      (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+        csvPreview({ truncated: true, row_count_preview: 1 }),
+      );
+
+      render(<RunOutputsPanel runId={RUN_ID} />);
+
+      const footer = await screen.findByText(/download for full file/i);
+      // The preview container and the truncation footer both read from the
+      // spacing scale.
+      const previewBlock = footer.closest("div")?.parentElement as HTMLElement;
+      expect(previewBlock.style.marginTop).toBe("var(--space-1-5)");
+      expect((footer.closest("div") as HTMLElement).style.marginTop).toBe(
+        "var(--space-xs)",
+      );
+    });
+  });
+
+  // R11 (elspeth-fa96173e32) filed RunOutputsPanel.tsx:502 as an ASCII "..."
+  // against BlobRow's U+2026. It is not: this panel is already all-U+2026, and
+  // the only "..." in the file are JS spread operators. Pinned so a later edit
+  // cannot reintroduce the split this panel does not currently have.
+  it("terminates every user-visible loading string with U+2026, never '...'", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    const pending = deferred<RunOutputArtifactPreview>();
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockReturnValue(
+      pending.promise,
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    // Scoped to the copy, not to the whole rendered subtree: artifact names,
+    // hashes and server error strings are DATA and may legitimately contain
+    // three dots.
+    const loading = await screen.findByText(/Loading preview/);
+    expect(loading.textContent).toContain("Loading preview…");
+    expect(loading.textContent).not.toContain("...");
+
+    pending.resolve(csvPreview());
+  });
+
+  // (#43) The run-outputs routes (execution/routes.py) raise these with a
+  // dict `detail` carrying only `error_type` — no human string — so
+  // `parseResponse` falls back to `response.statusText`. Model that real
+  // wire shape (a bare HTTP reason phrase in `detail`, the discriminator in
+  // `error_type`) rather than a fixture with a human `detail` the backend
+  // never sends.
+  it.each([
+    [
+      "run_outputs_audit_unavailable",
+      503,
+      "Service Unavailable",
+      /audit trail is unavailable/i,
+    ],
+    [
+      "output_path_outside_allowlist",
+      403,
+      "Forbidden",
+      /outside the deployment's allowed output directories/i,
+    ],
+    [
+      "artifact_not_found",
+      404,
+      "Not Found",
+      /no longer listed in the run's output manifest/i,
+    ],
+    [
+      "artifact_path_resolution_failed",
+      500,
+      "Internal Server Error",
+      /could not resolve this artifact's file path/i,
+    ],
+  ] as const)(
+    "maps manifest error_type %s to operator copy, not the bare '%s' reason phrase",
+    async (errorType, status, statusText, expectedCopy) => {
+      const apiError: ApiError = { status, detail: statusText, error_type: errorType };
+      (fetchRunOutputs as ReturnType<typeof vi.fn>).mockRejectedValue(apiError);
+
+      render(<RunOutputsPanel runId={RUN_ID} />);
+
+      await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+      expect(screen.getByText(expectedCopy)).toBeInTheDocument();
+      expect(screen.queryByText(statusText)).not.toBeInTheDocument();
+    },
+  );
+
+  it("maps the object-store 415 to operator copy for a non-file download attempt", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    const apiError: ApiError = {
+      status: 415,
+      detail: "Unsupported Media Type",
+      error_type: "object_store_artifact_not_streamable",
+    };
+    (downloadRunOutputContent as ReturnType<typeof vi.fn>).mockRejectedValue(apiError);
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+    await waitFor(() => expect(screen.getByText("results.csv")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: /Download/i }));
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(
+      screen.getByText(/object store with no filesystem mirror and cannot be downloaded/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Unsupported Media Type")).not.toBeInTheDocument();
+  });
+
+  // (#43 follow-up) Three run-outputs /content error types the download
+  // path did not map: the 409 content-drift guard, the 410 purge/move race
+  // (a distinct copy from the preview row's per-artifact "purged" state —
+  // formatError is shared with the manifest-load and non-purge preview
+  // paths, so it must never echo the bare HTTP reason phrase either), and
+  // the 416 range-not-satisfiable guard on ranged downloads.
+  it.each([
+    [
+      "artifact_content_drift",
+      409,
+      "Conflict",
+      /no longer matches what the run recorded and cannot be downloaded/i,
+    ],
+    [
+      "artifact_purged_or_moved",
+      410,
+      "Gone",
+      /no longer exists at its recorded location.*cannot be downloaded/i,
+    ],
+    [
+      "range_not_satisfiable",
+      416,
+      "Range Not Satisfiable",
+      /requested portion of this artifact could not be read/i,
+    ],
+  ] as const)(
+    "maps download error_type %s to operator copy, not the bare '%s' reason phrase",
+    async (errorType, status, statusText, expectedCopy) => {
+      (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+        manifest([fileArtifact()]),
+      );
+      const apiError: ApiError = { status, detail: statusText, error_type: errorType };
+      (downloadRunOutputContent as ReturnType<typeof vi.fn>).mockRejectedValue(apiError);
+
+      render(<RunOutputsPanel runId={RUN_ID} />);
+      await waitFor(() => expect(screen.getByText("results.csv")).toBeInTheDocument());
+      fireEvent.click(screen.getByRole("button", { name: /Download/i }));
+
+      const alert = await screen.findByRole("alert");
+      expect(alert).toHaveTextContent(expectedCopy);
+      expect(alert).not.toHaveTextContent(statusText);
+    },
+  );
+
+  // (#43 open item, low-severity attack) Pin the existing
+  // object_store_artifact_not_previewable mapping's KEY, not just its
+  // rendered copy: a typo in the allowlist key (e.g. a dropped letter)
+  // makes `RUN_OUTPUTS_ERROR_COPY[value.error_type]` miss and formatError
+  // silently falls through to the bare reason phrase this whole mapping
+  // exists to hide. The backend raises this exact error_type from the
+  // PREVIEW endpoint's object-store check (`_resolved_allowed_artifact_paths`
+  // called with `object_store_error_type="object_store_artifact_not_previewable"`
+  // from `_verified_artifact_preview_head_from_candidates`), reached here via
+  // the single-artifact auto-expand preview fetch — the same mechanism the
+  // artifact_purged_or_moved race test above uses.
+  it("maps object_store_artifact_not_previewable on the auto-expanded preview fetch", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    const apiError: ApiError = {
+      status: 415,
+      detail: "Unsupported Media Type",
+      error_type: "object_store_artifact_not_previewable",
+    };
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockRejectedValue(apiError);
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(
+      screen.getByText(/object store with no filesystem mirror and cannot be previewed/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Unsupported Media Type")).not.toBeInTheDocument();
+  });
+});

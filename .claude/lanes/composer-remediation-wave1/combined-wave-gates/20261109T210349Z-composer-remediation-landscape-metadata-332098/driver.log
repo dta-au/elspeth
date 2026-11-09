@@ -1,0 +1,31 @@
+tree        : /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata
+HEAD        : dd3b3524ccd2a1910db98f77eb35f9d7ce69a249  ()
+stages      : ruff,mypy,contracts,lints
+log dir     : /workspace/elspeth/.claude/lanes/composer-remediation-wave1/combined-wave-gates
+provenance  : elspeth -> /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/src/elspeth/__init__.py
+              elspeth_lints -> /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/elspeth-lints/src/elspeth_lints/__init__.py
+siblings    : 0 pytest process(es) already on this box -> workers=4
+tree state  : dd3b3524ccd2a1910db98f77eb35f9d7ce69a249 01ba4719c80b6fe9  (HEAD + sha256 of status+diff; must match after the run)
+
+commands (PYTHONPATH=/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/src:/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/elspeth-lints/src exported for every stage):
+  [ruff] /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv/bin/ruff check src/ tests/ scripts/ examples/ elspeth-lints/src/ && /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv/bin/ruff format --check src/ tests/ scripts/ examples/ elspeth-lints/src/
+  [mypy] /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv/bin/mypy src/ elspeth-lints/src/
+  [contracts] /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv/bin/python scripts/check_contracts.py && /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv/bin/python scripts/cicd/generate_skill_inventory.py --check
+  [lints] ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv/bin/python -m elspeth_lints.core.cli check --rules all --root src/elspeth
+
+run_dir=/workspace/elspeth/.claude/lanes/composer-remediation-wave1/combined-wave-gates/20261109T210349Z-composer-remediation-landscape-metadata-332098
+tree=/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata head=dd3b3524ccd2a1910db98f77eb35f9d7ce69a249 before=dd3b3524ccd2a1910db98f77eb35f9d7ce69a249 01ba4719c80b6fe9
+>>> [ruff] 21:03:52Z  log: /workspace/elspeth/.claude/lanes/composer-remediation-wave1/combined-wave-gates/20261109T210349Z-composer-remediation-landscape-metadata-332098/ruff.log
+stage=ruff exit=0 seconds=3 fatal=1
+freeze_monitor stage=ruff status=healthy watcher_exit=0
+>>> [mypy] 21:03:57Z  log: /workspace/elspeth/.claude/lanes/composer-remediation-wave1/combined-wave-gates/20261109T210349Z-composer-remediation-landscape-metadata-332098/mypy.log
+stage=mypy exit=0 seconds=33 fatal=1
+freeze_monitor stage=mypy status=healthy watcher_exit=0
+>>> [contracts] 21:04:33Z  log: /workspace/elspeth/.claude/lanes/composer-remediation-wave1/combined-wave-gates/20261109T210349Z-composer-remediation-landscape-metadata-332098/contracts.log
+stage=contracts exit=0 seconds=36 fatal=1
+freeze_monitor stage=contracts status=healthy watcher_exit=0
+>>> [lints] 21:05:13Z  log: /workspace/elspeth/.claude/lanes/composer-remediation-wave1/combined-wave-gates/20261109T210349Z-composer-remediation-landscape-metadata-332098/lints.log
+stage=lints exit=1 seconds=252 fatal=0 findings=5454
+freeze_monitor stage=lints status=healthy watcher_exit=0
+after=dd3b3524ccd2a1910db98f77eb35f9d7ce69a249 01ba4719c80b6fe9 frozen=yes
+RESULT=PASS

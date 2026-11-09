@@ -1,0 +1,305 @@
+"""Runtime-backed rule for plugin options metadata completeness."""
+
+from __future__ import annotations
+
+import ast
+import inspect
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol, cast
+
+import yaml
+
+from elspeth_lints.core.protocols import Finding, RuleContext, RuleMetadata, RuleScope
+from elspeth_lints.rules.plugin_contract.options_metadata.metadata import ALLOWLIST_PATH, RULE_ID, RULE_METADATA
+
+
+class PluginCatalog(Protocol):
+    """Plugin-manager surface needed by this rule."""
+
+    def get_sources(self) -> Iterable[object]:
+        """Return source plugin classes."""
+
+    def get_transforms(self) -> Iterable[object]:
+        """Return transform plugin classes."""
+
+    def get_sinks(self) -> Iterable[object]:
+        """Return sink plugin classes."""
+
+
+PluginManagerFactory = Callable[[], PluginCatalog]
+
+
+def _default_plugin_manager() -> PluginCatalog:
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    return cast(PluginCatalog, get_shared_plugin_manager())
+
+
+@dataclass(frozen=True, slots=True)
+class FieldLocation:
+    """Best-effort source location for one Pydantic model field."""
+
+    file_path: str
+    line: int
+    column: int
+
+
+@dataclass(frozen=True, slots=True)
+class OptionsMetadataRule:
+    """Fail when plugin configuration fields lack title or description metadata."""
+
+    plugin_manager_factory: PluginManagerFactory = _default_plugin_manager
+    allowlist_path: Path = ALLOWLIST_PATH
+    id: str = RULE_ID
+    scope: RuleScope = RuleScope.WHOLE_REPO
+    metadata: RuleMetadata = RULE_METADATA
+
+    def analyze(self, tree: ast.AST, file_path: Path, context: RuleContext) -> list[Finding]:
+        """Run the repository-scoped metadata rule."""
+        del tree, file_path
+        try:
+            plugin_manager = self.plugin_manager_factory()
+        except ModuleNotFoundError as exc:
+            return [_missing_runtime_dependency_finding(exc)]
+        allowlist = load_options_metadata_allowlist(_repository_root(context.root, context.repo_root) / self.allowlist_path)
+        try:
+            return collect_metadata_findings(
+                plugin_manager=plugin_manager,
+                allowlist=allowlist,
+                root=context.root,
+            )
+        except ModuleNotFoundError as exc:
+            return [_missing_runtime_dependency_finding(exc)]
+
+
+def iter_metadata_models(kind: str, plugin_cls: object) -> Iterator[tuple[str, type[Any]]]:
+    """Yield the metadata-bearing config models for one plugin class."""
+    from elspeth.contracts.discriminated import DiscriminatedPlugin
+    from elspeth.plugins.infrastructure.base import (
+        BaseSink,
+        BaseSource,
+        BaseTransform,
+        declares_discriminated_config_variants,
+    )
+
+    base_model = _pydantic_base_model()
+    expected_base_by_kind = {
+        "source": BaseSource,
+        "transform": BaseTransform,
+        "sink": BaseSink,
+    }
+    try:
+        expected_base = expected_base_by_kind[kind]
+    except KeyError as exc:
+        raise ValueError(f"unknown plugin kind {kind!r}") from exc
+    if not isinstance(plugin_cls, type) or not issubclass(plugin_cls, expected_base):
+        raise TypeError(f"{kind} plugin {plugin_cls!r} must inherit {expected_base.__name__}")
+    plugin_type = cast(type[BaseSource] | type[BaseTransform] | type[BaseSink], plugin_cls)
+    plugin_name = plugin_type.name
+    if not isinstance(plugin_name, str):
+        raise TypeError(f"{kind} plugin {plugin_cls!r} has no string name")
+    if declares_discriminated_config_variants(plugin_type):
+        # The owned helper admits the nominal Base* category and derives the
+        # public protocol declaration across the complete MRO. The Protocol
+        # cast is typing-only; it is not the runtime identity control.
+        variants_raw = cast(type[DiscriminatedPlugin], plugin_type).discriminated_variants()
+        if not isinstance(variants_raw, tuple) or len(variants_raw) != 2:
+            raise TypeError(f"{kind}/{plugin_name}: discriminated_variants() returned an invalid shape")
+        variants = variants_raw[1]
+        if not isinstance(variants, Mapping):
+            raise TypeError(f"{kind}/{plugin_name}: discriminated variants must be a mapping")
+        for variant_name, model in variants.items():
+            if not isinstance(variant_name, str):
+                raise TypeError(f"{kind}/{plugin_name}: discriminated variant names must be strings")
+            if not isinstance(model, type) or not issubclass(model, base_model):
+                raise TypeError(f"{kind}/{plugin_name}[{variant_name}]: variant config model must inherit BaseModel")
+            yield f"{kind}/{plugin_name}[{variant_name}]", model
+        return
+
+    options_model = plugin_type.config_model
+    if isinstance(options_model, type) and issubclass(options_model, base_model):
+        yield f"{kind}/{plugin_name}", options_model
+
+
+def collect_metadata_findings(*, plugin_manager: PluginCatalog, allowlist: set[str], root: Path | None) -> list[Finding]:
+    """Return metadata findings for every plugin config field not allowlisted."""
+    findings: list[Finding] = []
+    catalogs = (
+        ("source", plugin_manager.get_sources()),
+        ("transform", plugin_manager.get_transforms()),
+        ("sink", plugin_manager.get_sinks()),
+    )
+    for kind, plugins in catalogs:
+        for plugin_cls in plugins:
+            for model_id, options_model in iter_metadata_models(kind, plugin_cls):
+                for field_name, field_info in options_model.model_fields.items():
+                    identifier = f"{model_id}:{field_name}"
+                    if identifier in allowlist:
+                        continue
+                    location = _field_location(options_model, field_name, root=root)
+                    if not field_info.title:
+                        findings.append(_finding(identifier, "missing title", "missing-title", location))
+                    if not field_info.description:
+                        findings.append(_finding(identifier, "missing description", "missing-description", location))
+    return findings
+
+
+def _repository_root(root: Path, explicit_repo_root: Path | None) -> Path:
+    """Return the repository root for a scan root.
+
+    Mirrors ``trust_boundary.shared.repository_root``: an explicit
+    ``RuleContext.repo_root`` wins; the canonical ``<repo>/src/elspeth`` scan
+    root resolves to ``<repo>``; any other scan root is its own repository
+    root (fixture case directories rely on this). Allowlist governance lives
+    under ``<repo>/config/cicd``, so joining the relative allowlist path onto
+    the scan root itself cannot resolve under the canonical invocation.
+    """
+    if explicit_repo_root is not None:
+        return explicit_repo_root
+    if root.name == "elspeth" and root.parent.name == "src":
+        return root.parent.parent
+    return root
+
+
+def load_options_metadata_allowlist(path: Path) -> set[str]:
+    """Load legacy options-metadata allowlist identifiers and require reasons."""
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: allowlist YAML must be a mapping")
+    entries = data.get("entries", [])
+    if not isinstance(entries, list):
+        raise ValueError(f"{path}: 'entries' must be a list")
+
+    allowlist: set[str] = set()
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{path}: entries[{index}] must be a mapping")
+        identifier = _required_non_empty_string(entry, "id", path=path, index=index)
+        _required_non_empty_string(entry, "reason", path=path, index=index)
+        allowlist.add(identifier)
+    return allowlist
+
+
+def _finding(identifier: str, message_suffix: str, fingerprint_suffix: str, location: FieldLocation) -> Finding:
+    return Finding(
+        rule_id=RULE_ID,
+        file_path=location.file_path,
+        line=location.line,
+        column=location.column,
+        message=f"{identifier}: {message_suffix}",
+        fingerprint=f"{identifier}:{fingerprint_suffix}",
+        severity=RULE_METADATA.severity,
+    )
+
+
+def _field_location(model: type[Any], field_name: str, *, root: Path | None) -> FieldLocation:
+    base_model = _pydantic_base_model()
+    for cls in model.__mro__:
+        if not isinstance(cls, type) or not issubclass(cls, base_model):
+            continue
+        location = _field_location_in_class(cls, field_name, root=root)
+        if location is not None:
+            return location
+    return FieldLocation(file_path=f"plugin-config:{model.__name__}", line=1, column=0)
+
+
+def _field_location_in_class(cls: type[Any], field_name: str, *, root: Path | None) -> FieldLocation | None:
+    source_file = inspect.getsourcefile(cls)
+    if source_file is None:
+        return None
+    source_path = Path(source_file)
+    try:
+        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    except (OSError, SyntaxError):
+        return FieldLocation(file_path=_display_path(source_path, root=root), line=1, column=0)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == cls.__name__:
+            location = _field_location_in_class_node(node, field_name, source_path, root=root)
+            if location is not None:
+                return location
+    return None
+
+
+def _field_location_in_class_node(node: ast.ClassDef, field_name: str, source_path: Path, *, root: Path | None) -> FieldLocation | None:
+    for statement in node.body:
+        if isinstance(statement, ast.AnnAssign) and _target_name(statement.target) == field_name:
+            return FieldLocation(
+                file_path=_display_path(source_path, root=root),
+                line=statement.lineno,
+                column=statement.col_offset,
+            )
+        if isinstance(statement, ast.Assign) and any(_target_name(target) == field_name for target in statement.targets):
+            return FieldLocation(
+                file_path=_display_path(source_path, root=root),
+                line=statement.lineno,
+                column=statement.col_offset,
+            )
+    return None
+
+
+def _target_name(target: ast.expr) -> str | None:
+    if isinstance(target, ast.Name):
+        return target.id
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    return None
+
+
+def _display_path(source_path: Path, *, root: Path | None) -> str:
+    if root is None:
+        return str(source_path)
+    try:
+        return source_path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return str(source_path)
+
+
+def _required_non_empty_string(entry: Mapping[str, object], key: str, *, path: Path, index: int) -> str:
+    value = entry.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{path}: entries[{index}] must include non-empty {key!r}")
+    return value
+
+
+def _pydantic_base_model() -> type[Any]:
+    from pydantic import BaseModel
+
+    return BaseModel
+
+
+def _missing_runtime_dependency_finding(exc: ModuleNotFoundError) -> Finding:
+    missing = exc.name or _missing_module_name_from_message(str(exc))
+    if missing == "elspeth" or missing.startswith("elspeth."):
+        dependency = "elspeth package"
+        detail = "install or run from the main elspeth project environment so the plugin manager is importable"
+    elif missing == "pydantic" or missing.startswith("pydantic."):
+        dependency = "pydantic package"
+        detail = "install pydantic or run from the main elspeth project environment"
+    else:
+        dependency = missing
+        detail = "install the missing runtime dependency or run from the full project environment"
+    return Finding(
+        rule_id=RULE_ID,
+        file_path=".",
+        line=1,
+        column=0,
+        message=f"{RULE_ID} requires the {dependency}; {detail}.",
+        fingerprint=f"runtime-dependency:{missing}",
+        severity=RULE_METADATA.severity,
+    )
+
+
+def _missing_module_name_from_message(message: str) -> str:
+    prefix = "No module named "
+    if prefix not in message:
+        return "unknown"
+    raw = message.split(prefix, 1)[1].strip()
+    if (raw.startswith("'") and raw.endswith("'")) or (raw.startswith('"') and raw.endswith('"')):
+        return raw[1:-1]
+    return raw
+
+
+RULE = OptionsMetadataRule()

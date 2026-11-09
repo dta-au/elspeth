@@ -1,0 +1,4 @@
+Frozen candidate: HEAD, complete binary patch digest, and untracked inventory unchanged before/after final affected verification.
+HEAD=05bcab93955b2070ffdc90e72eddd7368502d2c1
+patch_sha256=1a9999a08b9983d0cfb7a88cc508f1f9fab3518226d5c8e1487f55579c7a8616
+Untracked implementation inventory empty.

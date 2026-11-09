@@ -1,0 +1,2091 @@
+import { installComposeTurnDouble } from "@/test/composeTurnDouble";
+import recoveryProducerFixtures from "@/test/composerRecoveryProducerFixtures.json";
+import { authenticateComposerCustody, purgeComposerCustody } from "@/stores/composerOperationCustody";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import App from "./App";
+import * as api from "./api/client";
+import { resetStore } from "@/test/store-helpers";
+import { useSessionStore } from "./stores/sessionStore";
+import { useExecutionStore } from "./stores/executionStore";
+import { useAuthStore } from "./stores/authStore";
+import { useMailboxStore } from "./stores/mailboxStore";
+import { usePreferencesStore } from "./stores/preferencesStore";
+import {
+  OPEN_GRAPH_MODAL_EVENT,
+  FOCUS_AUTHORING_EVENT,
+  REQUEST_ARTIFACT_VIEW_EVENT,
+  REQUEST_RUN_EVENT,
+  type RequestArtifactViewDetail,
+} from "./lib/composer-events";
+import type {
+  ChatMessage,
+  CompositionState,
+  Session,
+  SystemStatus,
+  UserProfile,
+  ValidationResult,
+} from "./types/index";
+import {
+  compositionStateAuthorityFields,
+  EXECUTION_BLOCKED_VALIDATION_READINESS,
+  makeValidationResult,
+  READY_VALIDATION_READINESS,
+} from "@/test/composerFixtures";
+
+// ── Sub-component stubs ──────────────────────────────────────────────────────
+// App renders many heavy children (ComposerWorkspace, ChatPanel, …).
+// Stub them out so the test focuses solely on App's own banner DOM.
+
+const tutorialMountSpy = vi.hoisted(() => vi.fn());
+const tutorialPropsSpy = vi.hoisted(() => vi.fn());
+const workspaceMountSpy = vi.hoisted(() => vi.fn());
+const workspaceCapabilitiesSpy = vi.hoisted(() => vi.fn());
+const artifactWorkspacePropsSpy = vi.hoisted(() => vi.fn());
+
+vi.mock("./components/workspace/ComposerWorkspace", () => ({
+  ComposerWorkspace: (props: {
+    authoring: React.ReactNode;
+    artifact: React.ReactNode;
+    inspector: React.ReactNode;
+    actionBar: React.ReactNode;
+    collapsedStatus?: React.ReactNode | { text: string; tone: string };
+  }) => {
+    workspaceMountSpy(props);
+    return (
+      <div data-testid="composer-workspace-stub">
+        {props.authoring}
+        {props.artifact}
+        {props.inspector}
+        {props.actionBar}
+        <output data-testid="collapsed-authoring-status">
+          {typeof props.collapsedStatus === "object" &&
+          props.collapsedStatus !== null &&
+          "text" in props.collapsedStatus
+            ? props.collapsedStatus.text
+            : props.collapsedStatus}
+        </output>
+      </div>
+    );
+  },
+}));
+
+vi.mock("./components/workspace/WorkspacePaneContext", () => ({
+  useWorkspacePaneController: () => ({
+    state: { authoringCollapsed: false },
+  }),
+}));
+
+vi.mock("./components/workspace/ArtifactWorkspace", () => ({
+  ArtifactWorkspace: (props: {
+    runAvailable?: boolean;
+    catalogAvailable?: boolean;
+  }) => {
+    artifactWorkspacePropsSpy(props);
+    return (
+      <div data-testid="artifact-workspace-stub">
+        {/* The Plugin-catalog trigger lives in the artifact toolbar since
+            the More-actions popover retired (2026-08-15). */}
+        {props.catalogAvailable === true ? (
+          <button type="button">Plugin catalog</button>
+        ) : null}
+      </div>
+    );
+  },
+}));
+
+vi.mock("./components/workspace/WorkspaceActionBar", () => ({
+  WorkspaceActionBar: ({
+    capabilities,
+  }: {
+    capabilities: { completion: boolean };
+  }) => {
+    workspaceCapabilitiesSpy(capabilities);
+    return (
+      <div data-testid="workspace-action-bar-stub">
+        <button type="button">Validation Not checked</button>
+        <button type="button">Audit Checking</button>
+        {capabilities.completion ? (
+          <div data-testid="completion-bar">
+            <button type="button">Import YAML</button>
+          </div>
+        ) : null}
+      </div>
+    );
+  },
+}));
+
+vi.mock("./components/chat/ChatPanel", () => ({
+  ChatPanel: () => {
+    const sendMessage = useSessionStore((state) => state.sendMessage);
+    const error = useSessionStore((state) => state.error);
+    return (
+      <div data-testid="chat-panel-stub">
+        <button type="button" onClick={() => void sendMessage("compose")}>
+          Send compose
+        </button>
+        {error ? <div role="alert">{error}</div> : null}
+      </div>
+    );
+  },
+}));
+
+vi.mock("./components/settings/SecretsPanel", () => ({
+  SecretsPanel: () => <div data-testid="secrets-panel-stub" />,
+}));
+
+vi.mock("./components/tutorial", async () => {
+  const React = await import("react");
+  return {
+    HelloWorldTutorial: (props: {
+      composerAvailable?: boolean;
+      tutorialReady?: boolean;
+    }) => {
+      tutorialPropsSpy({
+        composerAvailable: props.composerAvailable,
+        tutorialReady: props.tutorialReady,
+      });
+      React.useEffect(() => {
+        tutorialMountSpy();
+      }, []);
+      return <div data-testid="tutorial-stub" />;
+    },
+  };
+});
+
+vi.mock("./components/audit/AuditReadinessPanel", () => ({
+  AuditReadinessPanel: () => <div data-testid="audit-readiness-stub" />,
+}));
+
+// GraphMiniView and GraphView render @xyflow flow graphs whenever the
+// composition has content; xyflow needs ResizeObserver, which jsdom lacks.
+// Stubbed — their behaviour is covered in their own test files.
+vi.mock("./components/sidebar/GraphMiniView", () => ({
+  GraphMiniView: () => <div data-testid="graph-mini-view-stub" />,
+}));
+
+vi.mock("./components/inspector/GraphView", () => ({
+  GraphView: () => <div data-testid="graph-view-stub" />,
+}));
+
+vi.mock("./components/sidebar/SideRailValidationBanner", () => ({
+  SideRailValidationBanner: () => (
+    <div data-testid="side-rail-validation-banner-stub" />
+  ),
+}));
+
+vi.mock("./components/common/CommandPalette", () => ({
+  CommandPalette: () => <div data-testid="command-palette-stub" />,
+}));
+
+vi.mock("./components/common/ShortcutsHelp", () => ({
+  ShortcutsHelp: () => <div data-testid="shortcuts-help-stub" />,
+}));
+
+vi.mock("./components/common/ConfirmDialog", () => ({
+  // Exposes onConfirm so the App-level guard confirm paths (fanout and
+  // secret-approval ConfirmDialogs — never mounted simultaneously) can be
+  // exercised without the real dialog chrome; renders title, message, and
+  // children so the secret guard's wirings disclosure is assertable.
+  ConfirmDialog: ({
+    title,
+    message,
+    onConfirm,
+    children,
+  }: {
+    title?: string;
+    message?: string;
+    onConfirm?: () => void;
+    children?: React.ReactNode;
+  }) => (
+    <div data-testid="confirm-dialog-stub">
+      <div>{title}</div>
+      <div>{message}</div>
+      {children}
+      <button type="button" onClick={() => onConfirm?.()}>
+        Stub confirm
+      </button>
+    </div>
+  ),
+}));
+
+// ── Auth stub ────────────────────────────────────────────────────────────────
+// Mock useAuth so AuthGuard passes and renders children immediately.
+
+vi.mock("./hooks/useAuth", () => ({
+  useAuth: () => ({
+    isAuthenticated: true,
+    isLoading: false,
+    user: {
+      user_id: "test-001",
+      username: "test-operator",
+      display_name: null,
+      email: null,
+      groups: [],
+      dev_admin: false,
+    } satisfies UserProfile,
+    loginError: null,
+    login: vi.fn(),
+    loginWithToken: vi.fn(),
+    logout: vi.fn(),
+  }),
+}));
+
+// ── API client stub ──────────────────────────────────────────────────────────
+// fetchSystemStatus is called by App's health-check effect; provide a
+// default resolved value (backend up, composer available) so the no-banner
+// state is the default.  Individual tests override with vi.spyOn.
+
+vi.mock("./api/client", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/api/client")>(),
+  submitComposerOperation: vi.fn(), fetchComposerOperation: vi.fn(),
+  fetchComposerOperationStream: vi.fn(), cancelComposerOperation: vi.fn(),
+  fetchSystemStatus: vi.fn().mockResolvedValue({
+    composer_available: true,
+    composer_model: "gpt-4o",
+    composer_advisor_model: "anthropic/claude-sonnet-4-6",
+    composer_provider: "openai",
+    composer_reason: null,
+    composer_missing_keys: [],
+  } satisfies SystemStatus),
+  fetchSessions: vi.fn().mockResolvedValue([]),
+  fetchRuns: vi.fn().mockResolvedValue([]),
+  fetchComposerProgress: vi.fn().mockResolvedValue({ phase: "idle" }),
+  fetchRecoveryTranscript: vi.fn().mockResolvedValue([]),
+  listSources: vi.fn().mockResolvedValue([]),
+  listTransforms: vi.fn().mockResolvedValue([]),
+  listSinks: vi.fn().mockResolvedValue([]),
+  sendMessage: vi.fn(),
+  recompose: vi.fn(),
+  fetchMessages: vi.fn(),
+  // YamlView fetches the rendered YAML when its persistent artifact tab opens.
+  fetchYaml: vi.fn().mockResolvedValue({ yaml: "sources: {}" }),
+  // refreshAll fans out to refreshInterpretationEventsForSession on session
+  // select, so this is called incidentally during App render. Without the mock
+  // entry the call throws "no export defined on the mock" as an unhandled error
+  // and fails the run even though every assertion passes.
+  listInterpretationEvents: vi.fn().mockResolvedValue([]),
+  // Phase 1B: account-level composer preferences. The real preferencesStore
+  // module imports these from @/api/client and would receive `undefined`
+  // (throwing at first call) without the mock entries.
+  fetchUserComposerPreferences: vi.fn().mockResolvedValue({
+    freeform_intro_dismissed_at: null,
+    tutorial_completed_at: "2026-05-19T00:00:00Z",
+    tutorial_stage: null,
+    tutorial_session_id: null,
+    tutorial_run_id: null,
+    tutorial_source_data_hash: null,
+    updated_at: "2026-05-15T00:00:00Z",
+  }),
+  updateUserComposerPreferences: vi.fn(),
+}));
+
+// ── Shareable-reviews API stub ───────────────────────────────────────────────
+// SharedInspectView (Phase 6B Task 8) calls fetchSharedInspect on mount. The
+// shared-route test below never resolves the promise — that leaves the view
+// in its "loading" state, which is enough to assert (a) SharedInspectView is
+// mounted, (b) the composer Layout is suppressed.
+
+vi.mock("./api/shareableReviews", () => ({
+  fetchSharedInspect: vi.fn().mockReturnValue(new Promise(() => {})),
+  markReadyForReview: vi.fn(),
+  fetchShareableLink: vi.fn(),
+}));
+
+// ── People directory API stub ────────────────────────────────────────────────
+// App asks the server's capability projection whether to offer People &
+// access. Default: the signed-in test operator holds neither capability, so
+// no other test grows an account-menu entry. The mount test below grants one.
+
+const peopleCapabilities = vi.hoisted(() => ({
+  current: { identity_admin: false, local_accounts: false, auth_provider: "local", self_identity_id: "test-001", self_username: "test-operator" },
+}));
+
+vi.mock("./api/people", async () => ({
+  ...(await vi.importActual<typeof import("./api/people")>("./api/people")),
+  fetchPeopleCapabilities: vi.fn(() => Promise.resolve(peopleCapabilities.current)),
+  listPeople: vi.fn(() => Promise.resolve({ people: [], limit: 25, offset: 0, has_more: false, capabilities: peopleCapabilities.current, active_human_admin_count: 2 })),
+}));
+
+// ── Store subscriptions ──────────────────────────────────────────────────────
+// initStoreSubscriptions() runs at module load when App is imported and is
+// idempotent (guarded by `initialized` flag), so it is benign here.
+
+describe("App banner roles", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetStore(useSessionStore);
+    resetStore(usePreferencesStore);
+    useExecutionStore.getState().reset();
+    // Seed authStore as authenticated. useSessionLifecycle now reads
+    // useAuthStore(selectIsAuthenticated) directly and skips loadSessions
+    // when not authenticated — without this seed, the post-AuthGuard
+    // integration tests below would never trigger session load. The
+    // useAuth() mock above only covers consumers of that hook; the
+    // lifecycle reads the store directly.
+    useAuthStore.setState({
+      token: "test-token",
+      user: {
+        user_id: "test-001",
+        username: "test-operator",
+        display_name: null,
+        email: null,
+        groups: [],
+        dev_admin: false,
+      } as never,
+    } as never);
+    useMailboxStore.getState().reset();
+    peopleCapabilities.current = { ...peopleCapabilities.current, identity_admin: false, local_accounts: false };
+    localStorage.clear();
+    window.history.replaceState(null, "", "/");
+    // Restore the default (backend up, composer available) after any
+    // per-test override.
+    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
+      composer_available: true,
+      composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
+      composer_provider: "openai",
+      composer_reason: null,
+      composer_missing_keys: [],
+    } satisfies SystemStatus);
+    vi.spyOn(api, "fetchSessions").mockResolvedValue([]);
+    vi.spyOn(api, "fetchRuns").mockResolvedValue([]);
+    tutorialMountSpy.mockClear();
+    workspaceMountSpy.mockClear();
+    workspaceCapabilitiesSpy.mockClear();
+    artifactWorkspacePropsSpy.mockClear();
+  });
+
+  it("mounts mailbox, library and People & access from the account menu", async () => {
+    // The mailbox reports NO admin role: the entry comes from the server's
+    // capability projection, not from whatever the mailbox happened to load.
+    useMailboxStore.setState({ summary: {
+      governance: "on", roles: [], approvals_to_decide: 0, reviews_to_attest: 0, decisions_unseen: 0,
+    } });
+    peopleCapabilities.current = { ...peopleCapabilities.current, identity_admin: true };
+    render(<App />);
+    await userEvent.click(screen.getByRole("button", { name: "account menu" }));
+    await userEvent.click(screen.getByRole("button", { name: "Mailbox" }));
+    expect(screen.getByRole("dialog", { name: "Mailbox" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Close mailbox" }));
+    await userEvent.click(screen.getByRole("button", { name: "account menu" }));
+    await userEvent.click(screen.getByRole("button", { name: "Shared library" }));
+    expect(screen.getByRole("dialog", { name: "Shared library" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Close shared library" }));
+    await userEvent.click(screen.getByRole("button", { name: "account menu" }));
+    await userEvent.click(await screen.findByRole("button", { name: "People & access" }));
+    expect(screen.getByRole("dialog", { name: "People & access" })).toBeInTheDocument();
+    // Sign-out unmounts the panel, and with it every piece of administrative state.
+    act(() => useAuthStore.setState({ token: null, user: null } as never));
+    expect(screen.queryByRole("dialog", { name: "People & access" })).not.toBeInTheDocument();
+  });
+
+  it("offers no People & access entry to a user who holds neither capability", async () => {
+    render(<App />);
+    await userEvent.click(screen.getByRole("button", { name: "account menu" }));
+    expect(screen.getByRole("button", { name: "Mailbox" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "People & access" })).not.toBeInTheDocument();
+  });
+
+  it("uses role=alert for the backend-unavailable banner (hard outage)", async () => {
+    vi.spyOn(api, "fetchSystemStatus").mockRejectedValue(new Error("down"));
+    // Silence the intentional diagnostic log so test stderr stays clean,
+    // AND positively VER that the diagnostic actually fired.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    render(<App />);
+
+    const banner = await screen.findByText(/Backend unavailable/i);
+    const root = banner.closest(".alert-banner") as HTMLElement | null;
+    expect(root).not.toBeNull();
+    expect(root!.getAttribute("role")).toBe("alert");
+
+    // Diagnostic must have fired — the role=alert banner is the user-visible
+    // signal; console.error is the operator-visible signal in DevTools.
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[health-check]"),
+      expect.any(Error),
+    );
+    errorSpy.mockRestore();
+  });
+
+  it("renders the operator-declared classification banner from the status payload", async () => {
+    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
+      composer_available: true,
+      composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
+      composer_provider: "openai",
+      composer_reason: null,
+      composer_missing_keys: [],
+      classification_banner: "unofficial",
+    } satisfies SystemStatus);
+
+    render(<App />);
+
+    const banner = await screen.findByTestId("classification-banner");
+    expect(banner).toHaveTextContent("UNOFFICIAL");
+    expect(banner).toHaveClass("classification-banner--unofficial");
+  });
+
+  it("publishes the advisor model from the status payload into the session store", async () => {
+    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
+      composer_available: true,
+      composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-opus-4-7",
+      composer_provider: "openai",
+      composer_reason: null,
+      composer_missing_keys: [],
+    } satisfies SystemStatus);
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(useSessionStore.getState().composerAdvisorModel).toBe(
+        "anthropic/claude-opus-4-7",
+      ),
+    );
+    expect(useSessionStore.getState().composerModel).toBe("gpt-4o");
+  });
+
+  it("renders no classification banner when the deployment declares none", async () => {
+    // The default beforeEach status payload omits the field entirely (the
+    // pre-feature wire shape); the band stays empty rather than rendering an
+    // unmarked strip.
+    render(<App />);
+    await screen.findByText(/pipeline composer/i);
+    expect(screen.queryByTestId("classification-banner")).toBeNull();
+  });
+
+  it("uses role=status, not role=alert, for the composer-unavailable banner", async () => {
+    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
+      composer_available: false,
+      composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
+      composer_provider: "openai",
+      composer_reason: "No API key configured",
+      composer_missing_keys: ["OPENAI_API_KEY"],
+    } satisfies SystemStatus);
+
+    render(<App />);
+
+    const banner = await screen.findByText(/Service unavailable/i);
+    const root = banner.closest(".alert-banner") as HTMLElement | null;
+    expect(root).not.toBeNull();
+    expect(root!.getAttribute("role")).toBe("status");
+  });
+
+  // ── One name per destination (elspeth-bafd220871) ────────────────────────
+  //
+  // This control carried four names for one destination: visible "⚙ API Keys",
+  // title "Configure API keys", aria-label "Open secrets settings", and the
+  // panel heading it opens. A screen-reader user, a hovering mouse user and a
+  // sighted user each learned a different name, so no two could describe it
+  // the same way.
+  it("gives the secrets shortcut one name, carried by its visible text", async () => {
+    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
+      composer_available: false,
+      composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
+      composer_provider: "openai",
+      composer_reason: "No API key configured",
+      composer_missing_keys: ["OPENAI_API_KEY"],
+    } satisfies SystemStatus);
+
+    render(<App />);
+    await screen.findByText(/Service unavailable/i);
+
+    const shortcut = screen.getByRole("button", { name: "API keys & secrets" });
+    // The accessible name IS the visible text — no aria-label carrying a
+    // second wording, no title carrying a third.
+    expect(shortcut).toHaveTextContent("API keys & secrets");
+    expect(shortcut).not.toHaveAttribute("aria-label");
+    expect(shortcut).not.toHaveAttribute("title");
+  });
+
+  // ── One prefix treatment (elspeth-e5c446fab0) ────────────────────────────
+  //
+  // Notices sharing a slot and a frame introduced themselves four different
+  // ways (bold + em dash + capitalised continuation / bold + colon / plain +
+  // colon / none), so the prefix could not be skimmed for category.
+  it.each([
+    ["backend-unavailable", /Backend unavailable/i],
+    ["composer-unavailable", /Service unavailable/i],
+  ])("introduces the %s notice with a bold label and a colon", async (
+    _kind,
+    pattern,
+  ) => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    if (pattern.source.includes("Backend")) {
+      vi.spyOn(api, "fetchSystemStatus").mockRejectedValue(new Error("down"));
+    } else {
+      vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
+        composer_available: false,
+        composer_model: "gpt-4o",
+        composer_advisor_model: "anthropic/claude-sonnet-4-6",
+        composer_provider: "openai",
+        composer_reason: "No API key configured",
+        composer_missing_keys: ["OPENAI_API_KEY"],
+      } satisfies SystemStatus);
+    }
+
+    render(<App />);
+    const label = await screen.findByText(pattern);
+
+    expect(label.tagName).toBe("STRONG");
+    expect(label.textContent?.endsWith(":")).toBe(true);
+    expect(label.closest(".alert-banner")).not.toBeNull();
+    // The continuation is ordinary sentence text, not an em-dash join.
+    // Scoped to what follows the LABEL, not the whole banner: the trailing
+    // copy is partly server-supplied and may legitimately contain a dash.
+    expect(label.nextSibling?.textContent ?? "").not.toMatch(/^\s*[—–-]/);
+    errorSpy.mockRestore();
+  });
+
+  // The run-lifecycle fix rests entirely on RunOutcomeNotice being mounted at
+  // App level: it is the ONLY completion surface outside the Run panel, whose
+  // body unmounts whenever another artifact tab is active. Its own suite and
+  // the a11y audit both render the component directly, so they prove it works
+  // while proving nothing about it being wired in — deleting the <App/> mount
+  // left the whole suite green. This pins the wiring.
+  it("mounts the run-outcome notice's persistent polite region and surfaces a terminal outcome", async () => {
+    render(<App />);
+
+    // Present with NO outcome: the live region must pre-exist its content
+    // (a polite region inserted carrying its own text does not announce).
+    const region = await screen.findByTestId("run-outcome-status-region");
+    expect(region).toHaveAttribute("role", "status");
+    expect(region).toHaveTextContent("");
+    expect(document.querySelector(".run-outcome-notice")).toBeNull();
+
+    act(() => {
+      useExecutionStore.setState({
+        lastRunOutcome: {
+          runId: "run-app-1",
+          status: "failed",
+          sessionId: "11111111-1111-4111-8111-111111111111",
+        },
+      });
+    });
+
+    expect(region).toHaveTextContent("Pipeline failed.");
+    const banner = document.querySelector(".run-outcome-notice");
+    expect(banner).not.toBeNull();
+    expect(banner).toHaveTextContent("Pipeline failed.");
+    // App-level assertive-region hygiene: the notice announces every terminal
+    // outcome POLITELY and contributes no role="alert" node. A permanently
+    // mounted empty alert region made singular getByRole("alert") ambiguous
+    // for every other App surface (it broke the chat convergence-error test).
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+  });
+
+  it("consolidates simultaneous notices into one priority-ordered banner row", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(api, "fetchSystemStatus").mockRejectedValue(new Error("down"));
+    usePreferencesStore.setState({
+      loaded: true,
+      writeError: "Preferences could not be loaded.",
+    });
+    vi.spyOn(usePreferencesStore.getState(), "bootstrap").mockResolvedValueOnce(
+      undefined,
+    );
+
+    render(<App />);
+
+    const primary = await screen.findByTestId("app-notice-primary");
+    expect(within(primary).getByText(/Backend unavailable/i)).toBeVisible();
+    expect(screen.getAllByTestId("app-notice-primary")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "1 more notice" })).toBeVisible();
+    expect(screen.queryByText("Preferences could not be loaded.")).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "1 more notice" }));
+    const popover = screen.getByRole("region", { name: "All notices" });
+    expect(within(popover).getByText("Preferences could not be loaded.")).toBeVisible();
+    expect(within(primary).getByRole("button", { name: "Retry connection" }))
+      .toBeVisible();
+    errorSpy.mockRestore();
+  });
+
+  it("silently canonicalizes stale Runs hashes", async () => {
+    useSessionStore.setState({ activeSessionId: "11111111-1111-4111-8111-111111111111" });
+    window.history.replaceState(null, "", "#/11111111-1111-4111-8111-111111111111/runs");
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(window.location.hash).toBe("#/11111111-1111-4111-8111-111111111111");
+    });
+  });
+
+  it("silently canonicalizes stale Spec hashes", async () => {
+    useSessionStore.setState({ activeSessionId: "11111111-1111-4111-8111-111111111111" });
+    window.history.replaceState(null, "", "#/11111111-1111-4111-8111-111111111111/spec");
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(window.location.hash).toBe("#/11111111-1111-4111-8111-111111111111");
+    });
+  });
+
+  it("does not mount the retired sessions sidebar", async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(api.fetchSystemStatus).toHaveBeenCalled();
+    });
+    expect(screen.queryByLabelText(/sessions sidebar/i)).not.toBeInTheDocument();
+  });
+
+  it("mounts one common workspace with authoring, artifact, and actions", async () => {
+    // An active session keeps the composer shell mounted — with no sessions
+    // at all App now renders the empty landing instead (elspeth-e69642fede).
+    useSessionStore.setState({ activeSessionId: "11111111-1111-4111-8111-111111111111" });
+    render(<App />);
+
+    await waitFor(() => {
+      expect(api.fetchSystemStatus).toHaveBeenCalled();
+    });
+    expect(screen.getByTestId("chat-panel-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("artifact-workspace-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("workspace-action-bar-stub")).toBeInTheDocument();
+    expect(screen.getAllByTestId("composer-workspace-stub")).toHaveLength(1);
+    expect(workspaceMountSpy).toHaveBeenCalled();
+    expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
+      completion: true,
+    });
+    expect(artifactWorkspacePropsSpy).toHaveBeenLastCalledWith(
+      expect.objectContaining({ catalogAvailable: true }),
+    );
+  });
+
+  it("moves skip-link focus to the stable main workspace without changing session routing", async () => {
+    const user = userEvent.setup();
+    useSessionStore.setState({ activeSessionId: "11111111-1111-4111-8111-111111111111" });
+    render(<App />);
+    await waitFor(() => expect(window.location.hash).toBe("#/11111111-1111-4111-8111-111111111111"));
+
+    const main = screen.getByRole("main");
+    expect(main).toHaveAttribute("id", "composer-main");
+    expect(main).toHaveAttribute("tabindex", "-1");
+
+    const skipLink = screen.getByRole("link", { name: "Skip to main content" });
+    expect(skipLink).toHaveAttribute("href", "#composer-main");
+    await user.click(skipLink);
+
+    expect(main).toHaveFocus();
+    expect(window.location.hash).toBe("#/11111111-1111-4111-8111-111111111111");
+    expect(useSessionStore.getState().activeSessionId).toBe("11111111-1111-4111-8111-111111111111");
+  });
+
+  it.each([
+    ["busy", { isComposing: true, error: null }],
+    ["error", { isComposing: false, error: "authoring failed" }],
+  ] as const)(
+    "renders the real App-owned collapsed status projection with %s tone",
+    async (tone, state) => {
+      useSessionStore.setState({
+        activeSessionId: "11111111-1111-4111-8111-111111111111",
+        ...state,
+      });
+      render(<App />);
+      await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+
+      const projection = within(
+        screen.getByTestId("collapsed-authoring-status"),
+      ).getByText(tone === "busy" ? "Authoring in progress" : /Authoring error:/);
+      expect(projection).toHaveAttribute("data-tone", tone);
+      expect(projection).toHaveClass("workspace-collapsed-status");
+    },
+  );
+
+  it("loads sessions on startup after SessionSidebar removal", async () => {
+    const session: Session = {
+      id: "session-loaded",
+      title: "Loaded session",
+      created_at: "2026-05-17T00:00:00Z",
+      updated_at: "2026-05-17T00:00:00Z",
+    };
+    vi.spyOn(api, "fetchSessions").mockResolvedValue([session]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(api.fetchSessions).toHaveBeenCalledTimes(1);
+    });
+    expect(useSessionStore.getState().sessions).toEqual([session]);
+  });
+
+  it("resets execution state and loads runs for the active session on startup", async () => {
+    useSessionStore.setState({ activeSessionId: "11111111-1111-4111-8111-111111111111" });
+    useExecutionStore.setState({
+      activeRunId: "stale-run",
+      runs: [{ id: "stale-run", status: "running" } as never],
+      progress: { status: "running" } as never,
+    } as never);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(api.fetchRuns).toHaveBeenCalledWith("11111111-1111-4111-8111-111111111111");
+    });
+    expect(useExecutionStore.getState().activeRunId).toBeNull();
+  });
+
+  it("dispatches an open-catalog event on Ctrl+Shift+P", async () => {
+    const onOpenCatalog = vi.fn();
+    window.addEventListener("open-catalog", onOpenCatalog);
+
+    render(<App />);
+    await waitFor(() => {
+      expect(api.fetchSystemStatus).toHaveBeenCalled();
+    });
+
+    fireEvent.keyDown(document, {
+      key: "P",
+      code: "KeyP",
+      ctrlKey: true,
+      shiftKey: true,
+    });
+
+    expect(onOpenCatalog).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("dialog", { name: "Plugin catalog" })).toBeInTheDocument();
+    window.removeEventListener("open-catalog", onOpenCatalog);
+  });
+
+  it("routes Graph and YAML shortcuts to the active session's persistent artifact tabs", async () => {
+    const artifactRequests: RequestArtifactViewDetail[] = [];
+    const onArtifactRequest = (event: Event) => {
+      artifactRequests.push(
+        (event as CustomEvent<RequestArtifactViewDetail>).detail,
+      );
+    };
+    const onOpenGraph = vi.fn();
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+    window.addEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
+    // Ctrl+Shift+Y is content-gated (elspeth-bff8043d33 residual): seed a
+    // non-empty composition so the YAML dispatch fires.
+    useSessionStore.setState({
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+      compositionState: {
+        ...makeState(1),
+        sources: { source: { plugin: "csv", options: {} } },
+      },
+    });
+
+    render(<App />);
+    await waitFor(() => {
+      expect(api.fetchSystemStatus).toHaveBeenCalled();
+    });
+
+    fireEvent.keyDown(document, {
+      key: "G",
+      code: "KeyG",
+      ctrlKey: true,
+      shiftKey: true,
+    });
+    fireEvent.keyDown(document, {
+      key: "Y",
+      code: "KeyY",
+      metaKey: true,
+      shiftKey: true,
+    });
+
+    expect(artifactRequests).toEqual([
+      { tab: "graph", focusMode: false, sessionId: "11111111-1111-4111-8111-111111111111" },
+      { tab: "yaml", focusMode: false, sessionId: "11111111-1111-4111-8111-111111111111" },
+    ]);
+    expect(onOpenGraph).not.toHaveBeenCalled();
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+    window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
+  });
+
+  it("lets Ctrl+/ supersede a real deferred Spec hash through the shared workspace clock", async () => {
+    const onFocusAuthoring = vi.fn();
+    const artifactRequests: RequestArtifactViewDetail[] = [];
+    const onArtifactRequest = (event: Event) => {
+      artifactRequests.push(
+        (event as CustomEvent<RequestArtifactViewDetail>).detail,
+      );
+    };
+    window.addEventListener(FOCUS_AUTHORING_EVENT, onFocusAuthoring);
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+    useSessionStore.setState({
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+      sessions: [{ id: "11111111-1111-4111-8111-111111111111", title: "Session 1" } as never],
+      compositionStateLoaded: false,
+      compositionState: makeState(1),
+    } as never);
+    window.history.replaceState(null, "", "#/11111111-1111-4111-8111-111111111111/spec");
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+
+    fireEvent.keyDown(document, { key: "/", ctrlKey: true });
+    act(() => {
+      useSessionStore.setState({ compositionStateLoaded: true });
+    });
+    await act(async () => Promise.resolve());
+
+    expect(onFocusAuthoring).toHaveBeenCalledTimes(1);
+    expect(artifactRequests).toEqual([]);
+    window.removeEventListener(FOCUS_AUTHORING_EVENT, onFocusAuthoring);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+  });
+
+  it("does not dispatch Ctrl+E when backend execution readiness is false", async () => {
+    const execute = vi.fn();
+    const onRequestRun = vi.fn();
+    window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
+    useSessionStore.setState({
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+      compositionState: makeState(1),
+    });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    useExecutionStore.setState({
+      validationResult: makeValidationResult({
+        readiness: EXECUTION_BLOCKED_VALIDATION_READINESS,
+      }),
+      isExecuting: false,
+      progress: null,
+      execute,
+    });
+    fireEvent.keyDown(document, { key: "e", ctrlKey: true });
+
+    expect(onRequestRun).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
+  });
+
+  it("does not dispatch Ctrl+E when a malformed validation response omits readiness", async () => {
+    const onRequestRun = vi.fn();
+    window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
+    useSessionStore.setState({
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+      compositionState: makeState(1),
+    });
+
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    useExecutionStore.setState({
+      // Deliberately model untrusted wire data that violates the mandatory
+      // TypeScript contract. Ordinary fixtures use makeValidationResult.
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+      } as unknown as ValidationResult,
+      isExecuting: false,
+      progress: null,
+    });
+    fireEvent.keyDown(document, { key: "e", ctrlKey: true });
+
+    expect(onRequestRun).not.toHaveBeenCalled();
+    window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
+  });
+
+  it("routes a ready Ctrl+E through run intent instead of calling the execution store directly", async () => {
+    const execute = vi.fn();
+    const onRequestRun = vi.fn();
+    window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
+    useSessionStore.setState({
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+      compositionState: makeState(1),
+    });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    useExecutionStore.setState({
+      validationResult: makeValidationResult({
+        readiness: READY_VALIDATION_READINESS,
+      }),
+      isExecuting: false,
+      progress: null,
+      execute,
+      runDisclosureAckBySession: {},
+    });
+    fireEvent.keyDown(document, { key: "e", metaKey: true });
+
+    expect(onRequestRun).toHaveBeenCalledTimes(1);
+    expect(execute).not.toHaveBeenCalled();
+    window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
+  });
+
+  // Third run-launch path (elspeth-3a7b7c7b37): the fanout-guard
+  // ConfirmDialog's confirm re-enters execute() via confirmFanoutExecution,
+  // which ExecuteButton's own post-launch switch never observes — App must
+  // dispatch the Run-artifact intent itself, keyed on a real run_id.
+  it("switches to the Run artifact after a confirmed fanout execution", async () => {
+    const artifactRequests: RequestArtifactViewDetail[] = [];
+    const onArtifactRequest = (event: Event) => {
+      artifactRequests.push(
+        (event as CustomEvent<RequestArtifactViewDetail>).detail,
+      );
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+    useSessionStore.setState({
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+      compositionState: makeState(1),
+    });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    const confirmFanoutExecution = vi.fn().mockResolvedValue("run-99");
+    act(() => {
+      useExecutionStore.setState({
+        pendingFanoutGuard: {
+          ack_token: "ack-1",
+          risk_level: "high",
+          summary: "LLM fanout needs confirmation.",
+          risks: [],
+        },
+        pendingFanoutSessionId: "11111111-1111-4111-8111-111111111111",
+        confirmFanoutExecution,
+      } as never);
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub confirm" }));
+
+    await waitFor(() =>
+      expect(artifactRequests).toEqual([
+        { tab: "run", focusMode: false, sessionId: "11111111-1111-4111-8111-111111111111" },
+      ]),
+    );
+    expect(confirmFanoutExecution).toHaveBeenCalledTimes(1);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+  });
+
+  it("does not switch artifacts when the confirmed fanout dispatch fails", async () => {
+    const artifactRequests: RequestArtifactViewDetail[] = [];
+    const onArtifactRequest = (event: Event) => {
+      artifactRequests.push(
+        (event as CustomEvent<RequestArtifactViewDetail>).detail,
+      );
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+    useSessionStore.setState({
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+      compositionState: makeState(1),
+    });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    // Stale readiness / re-armed 428 both resolve null from the store.
+    const confirmFanoutExecution = vi.fn().mockResolvedValue(null);
+    act(() => {
+      useExecutionStore.setState({
+        pendingFanoutGuard: {
+          ack_token: "ack-1",
+          risk_level: "high",
+          summary: "LLM fanout needs confirmation.",
+          risks: [],
+        },
+        pendingFanoutSessionId: "11111111-1111-4111-8111-111111111111",
+        confirmFanoutExecution,
+      } as never);
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub confirm" }));
+
+    await act(async () => Promise.resolve());
+    expect(confirmFanoutExecution).toHaveBeenCalledTimes(1);
+    expect(artifactRequests).toEqual([]);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+  });
+
+  it("renders the secret guard's summary and disclosed wirings", async () => {
+    useSessionStore.setState({
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+      compositionState: makeState(1),
+    });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    act(() => {
+      useExecutionStore.setState({
+        pendingSecretGuard: {
+          ack_token: "secret-ack-1",
+          summary: "This run uses 2 stored secrets.",
+          wirings: [
+            {
+              secret_name: "OPENROUTER_API_KEY",
+              component_id: "classify_line",
+              component_type: "transform",
+              plugin: "llm_transform",
+              option_key: "api_key",
+            },
+            {
+              secret_name: "PG_PASSWORD",
+              component_id: "load_rows",
+              component_type: "source",
+              plugin: "postgres",
+              option_key: "password",
+            },
+          ],
+        },
+        pendingSecretSessionId: "11111111-1111-4111-8111-111111111111",
+      } as never);
+    });
+
+    expect(screen.getByText("Approve secret use")).toBeInTheDocument();
+    expect(
+      screen.getByText("This run uses 2 stored secrets."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("OPENROUTER_API_KEY → classify_line (llm_transform) api_key"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("PG_PASSWORD → load_rows (postgres) password"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Approving allows this exact pipeline to use the named secrets.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("switches to the Run artifact after a confirmed secret approval", async () => {
+    const artifactRequests: RequestArtifactViewDetail[] = [];
+    const onArtifactRequest = (event: Event) => {
+      artifactRequests.push(
+        (event as CustomEvent<RequestArtifactViewDetail>).detail,
+      );
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+    useSessionStore.setState({
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+      compositionState: makeState(1),
+    });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    const confirmSecretExecution = vi.fn().mockResolvedValue("run-77");
+    act(() => {
+      useExecutionStore.setState({
+        pendingSecretGuard: {
+          ack_token: "secret-ack-1",
+          summary: "This run uses 1 stored secret.",
+          wirings: [],
+        },
+        pendingSecretSessionId: "11111111-1111-4111-8111-111111111111",
+        confirmSecretExecution,
+      } as never);
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub confirm" }));
+
+    await waitFor(() =>
+      expect(artifactRequests).toEqual([
+        { tab: "run", focusMode: false, sessionId: "11111111-1111-4111-8111-111111111111" },
+      ]),
+    );
+    expect(confirmSecretExecution).toHaveBeenCalledTimes(1);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+  });
+
+  it("does not switch artifacts when the confirmed secret dispatch fails", async () => {
+    const artifactRequests: RequestArtifactViewDetail[] = [];
+    const onArtifactRequest = (event: Event) => {
+      artifactRequests.push(
+        (event as CustomEvent<RequestArtifactViewDetail>).detail,
+      );
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+    useSessionStore.setState({
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+      compositionState: makeState(1),
+    });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    // Follow-on fanout 428, stale readiness, and re-keyed secret guards all
+    // resolve null from the store.
+    const confirmSecretExecution = vi.fn().mockResolvedValue(null);
+    act(() => {
+      useExecutionStore.setState({
+        pendingSecretGuard: {
+          ack_token: "secret-ack-1",
+          summary: "This run uses 1 stored secret.",
+          wirings: [],
+        },
+        pendingSecretSessionId: "11111111-1111-4111-8111-111111111111",
+        confirmSecretExecution,
+      } as never);
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub confirm" }));
+
+    await act(async () => Promise.resolve());
+    expect(confirmSecretExecution).toHaveBeenCalledTimes(1);
+    expect(artifactRequests).toEqual([]);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+  });
+
+  it("does not dispatch retired inspector tab shortcuts on Alt+digit", async () => {
+    const onSwitchTab = vi.fn();
+    window.addEventListener("elspeth-switch-tab", onSwitchTab);
+
+    render(<App />);
+    await waitFor(() => {
+      expect(api.fetchSystemStatus).toHaveBeenCalled();
+    });
+
+    fireEvent.keyDown(document, {
+      key: "1",
+      code: "Digit1",
+      altKey: true,
+    });
+
+    expect(onSwitchTab).not.toHaveBeenCalled();
+    window.removeEventListener("elspeth-switch-tab", onSwitchTab);
+  });
+});
+
+function makeState(version: number): CompositionState {
+  return {
+    id: `22222222-2222-4222-8222-${String(version).padStart(12, "0")}`,
+    ...compositionStateAuthorityFields,
+    session_id: "11111111-1111-4111-8111-111111111111",
+    version,
+    sources: {},
+    nodes: [],
+    edges: [],
+    outputs: [],
+    metadata: { name: null, description: null },
+  };
+}
+
+function makeAssistantMessage(): ChatMessage {
+  return {
+    id: "assistant-1",
+    session_id: "11111111-1111-4111-8111-111111111111",
+    role: "assistant",
+    content: "done",
+    tool_calls: null,
+    created_at: "2026-05-14T00:00:00Z",
+  };
+}
+
+describe("App informational health and authoring readiness", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetStore(useSessionStore);
+    useExecutionStore.getState().reset();
+    useAuthStore.setState({
+      token: "test-token",
+      user: {
+        user_id: "test-001",
+        username: "test-operator",
+        display_name: null,
+        email: null,
+        groups: [],
+        dev_admin: false,
+      } as never,
+    } as never);
+    localStorage.clear();
+    window.history.replaceState(null, "", "/");
+    vi.spyOn(api, "fetchSessions").mockResolvedValue([]);
+    vi.spyOn(api, "fetchRuns").mockResolvedValue([]);
+  });
+
+  it("does not open authoring readiness when informational system status lands", async () => { vi.spyOn(api, "fetchSystemStatus").mockResolvedValue(GOOD_STATUS); render(<App />); await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled()); expect(useSessionStore.getState().compositionStateLoaded).toBe(false); });
+
+  it("keeps the backend unavailable banner independent of selected-session readiness", async () => { vi.spyOn(api, "fetchSystemStatus").mockRejectedValue(new Error("down")); const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {}); render(<App />); await screen.findByText(/Backend unavailable/i); expect(useSessionStore.getState().compositionStateLoaded).toBe(false); errorSpy.mockRestore(); });
+
+  it("does not invent composer unavailability when informational timeout is absent", async () => { vi.spyOn(api, "fetchSystemStatus").mockResolvedValue(PARTIAL_STATUS); const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {}); render(<App />); await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled()); expect(useSessionStore.getState().compositionStateLoaded).toBe(false); expect(errorSpy.mock.calls.filter((call) => String(call[0]).includes("no usable"))).toHaveLength(0); errorSpy.mockRestore(); });
+
+  it("preserves loaded session readiness across a partial health poll", async () => { vi.useFakeTimers(); useSessionStore.setState({ compositionStateLoaded: true }); const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {}); vi.spyOn(api, "fetchSystemStatus").mockResolvedValueOnce(GOOD_STATUS).mockResolvedValue(PARTIAL_STATUS); render(<App />); await vi.waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalledTimes(1)); await vi.advanceTimersByTimeAsync(30000); expect(api.fetchSystemStatus).toHaveBeenCalledTimes(2); expect(useSessionStore.getState().compositionStateLoaded).toBe(true); expect(errorSpy.mock.calls.filter((call) => String(call[0]).includes("no usable"))).toHaveLength(0); vi.useRealTimers(); errorSpy.mockRestore(); });
+
+  const GOOD_STATUS = {
+    composer_available: true,
+    composer_model: "gpt-4o",
+    composer_advisor_model: "anthropic/claude-sonnet-4-6",
+    composer_provider: "openai",
+    composer_reason: null,
+    composer_missing_keys: [],
+    composer_timeout_seconds: 300,
+  } satisfies SystemStatus;
+  const PARTIAL_STATUS = {
+    composer_available: true,
+    composer_model: "gpt-4o",
+    composer_advisor_model: "anthropic/claude-sonnet-4-6",
+    composer_provider: "openai",
+    composer_reason: null,
+    composer_missing_keys: [],
+  } satisfies SystemStatus;
+
+  it("does not bypass session loading when a later health poll supplies a timeout", async () => { vi.useFakeTimers(); vi.spyOn(api, "fetchSystemStatus").mockResolvedValueOnce(PARTIAL_STATUS).mockResolvedValue(GOOD_STATUS); render(<App />); await vi.waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalledTimes(1)); await vi.advanceTimersByTimeAsync(30000); expect(api.fetchSystemStatus).toHaveBeenCalledTimes(2); expect(useSessionStore.getState().compositionStateLoaded).toBe(false); vi.useRealTimers(); });
+
+  it("does not log a stale timeout diagnostic across repeated informational polls", async () => { vi.useFakeTimers(); const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {}); vi.spyOn(api, "fetchSystemStatus").mockResolvedValue(PARTIAL_STATUS); render(<App />); await vi.waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalledTimes(1)); await vi.advanceTimersByTimeAsync(30000); expect(api.fetchSystemStatus).toHaveBeenCalledTimes(2); expect(errorSpy.mock.calls.filter((call) => String(call[0]).includes("no usable"))).toHaveLength(0); vi.useRealTimers(); errorSpy.mockRestore(); });
+
+  it("shows backend loss without replacing loaded-session authority with timeout state", async () => { vi.useFakeTimers(); useSessionStore.setState({ compositionStateLoaded: true }); const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {}); vi.spyOn(api, "fetchSystemStatus").mockResolvedValueOnce(PARTIAL_STATUS).mockRejectedValue(new Error("down")); render(<App />); await vi.waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalledTimes(1)); await vi.advanceTimersByTimeAsync(30000); expect(screen.getByText(/Backend unavailable/i)).toBeInTheDocument(); expect(useSessionStore.getState().compositionStateLoaded).toBe(true); vi.useRealTimers(); errorSpy.mockRestore(); });
+});
+
+describe("App composer recovery panel", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetStore(useSessionStore);
+    purgeComposerCustody();
+    authenticateComposerCustody({ principalId: "test-001", authProvider: "local" });
+    installComposeTurnDouble({
+      sendMessage: vi.spyOn(api, "sendMessage"), recompose: vi.spyOn(api, "recompose"),
+      submitComposerOperation: vi.spyOn(api, "submitComposerOperation"),
+      fetchComposerOperation: vi.spyOn(api, "fetchComposerOperation"),
+      fetchComposerOperationStream: vi.spyOn(api, "fetchComposerOperationStream"),
+      cancelComposerOperation: vi.spyOn(api, "cancelComposerOperation"),
+    });
+    vi.spyOn(api, "fetchMessages").mockRejectedValue(new Error("Reload unavailable"));
+    vi.spyOn(api, "fetchCompositionState").mockRejectedValue(new Error("Reload unavailable"));
+    vi.spyOn(api, "fetchCompositionProposals").mockRejectedValue(new Error("Reload unavailable"));
+    useSessionStore.setState({ compositionStateLoaded: true });
+    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
+      composer_available: true,
+      composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
+      composer_provider: "openai",
+      composer_reason: null,
+      composer_missing_keys: [],
+    } satisfies SystemStatus);
+    const recoveryAssistantId = recoveryProducerFixtures.recovery[1].assistant_message_id;
+    if (recoveryAssistantId === null) throw new Error("Expected the persisted-assistant producer fixture");
+    vi.spyOn(api, "fetchRecoveryTranscript").mockResolvedValue([
+      {
+        id: recoveryAssistantId,
+        session_id: "11111111-1111-4111-8111-111111111111",
+        role: "assistant",
+        content: "calling tools",
+        raw_content: null,
+        tool_calls: null,
+        created_at: "2026-05-14T00:00:00Z",
+        composition_state_id: null,
+        tool_call_id: null,
+        parent_assistant_id: null,
+        sequence_no: 1,
+      },
+    ]);
+  });
+
+  it("opens the recovery panel for recovery-shaped send failures", async () => {
+    const recovered = makeState(2);
+    vi.spyOn(api, "sendMessage").mockRejectedValue({
+      status: 500,
+      detail: "compose failed",
+      error_type: "composer_plugin_crash",
+      partial_state: recovered,
+      failed_turn: {
+        ...recoveryProducerFixtures.recovery[1],
+        tool_calls_attempted: 1,
+        tool_responses_persisted: 1,
+        transcript_url: null,
+      },
+    });
+    useSessionStore.setState({
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+      compositionState: makeState(1),
+    });
+
+    render(<App />);
+    await userEvent.click(screen.getByRole("button", { name: "Send compose" }));
+
+    expect(
+      await screen.findByRole("dialog", { name: "Recover partial composer draft" }),
+    ).toBeInTheDocument();
+  });
+
+  it("applies and discards recovery locally without compose retries", async () => {
+    const user = userEvent.setup();
+    const recovered = makeState(3);
+    const original = makeState(1);
+    vi.mocked(api.fetchMessages).mockResolvedValue([]);
+    vi.mocked(api.fetchCompositionState).mockResolvedValue(recovered);
+    vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
+    vi.spyOn(api, "sendMessage").mockRejectedValue({
+      status: 500,
+      detail: "compose failed",
+      error_type: "composer_plugin_crash",
+      partial_state: recovered,
+      failed_turn: {
+        ...recoveryProducerFixtures.recovery[1],
+        tool_calls_attempted: 1,
+        tool_responses_persisted: 1,
+        transcript_url: null,
+      },
+    });
+    useSessionStore.setState({
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+      compositionState: original,
+    });
+
+    render(<App />);
+    await user.click(screen.getByRole("button", { name: "Send compose" }));
+    await screen.findByRole("dialog", { name: "Recover partial composer draft" });
+    await user.click(screen.getByRole("button", { name: "Apply partial draft" }));
+
+    expect(useSessionStore.getState().compositionState).toEqual(recovered);
+    expect(api.sendMessage).toHaveBeenCalledTimes(1);
+    expect(api.recompose).not.toHaveBeenCalled();
+    expect(api.fetchMessages).toHaveBeenCalled();
+
+    vi.mocked(api.sendMessage).mockRejectedValueOnce({
+      status: 500,
+      detail: "compose failed again",
+      error_type: "composer_plugin_crash",
+      partial_state: makeState(4),
+      failed_turn: {
+        ...recoveryProducerFixtures.recovery[1],
+        tool_calls_attempted: 1,
+        tool_responses_persisted: 1,
+        transcript_url: null,
+      },
+    });
+    await user.click(screen.getByRole("button", { name: "Send compose" }));
+    await screen.findByRole("dialog", { name: "Recover partial composer draft" });
+    await user.click(screen.getByRole("button", { name: "Discard recovery" }));
+
+    expect(useSessionStore.getState().compositionState).toEqual(makeState(4));
+    expect(api.sendMessage).toHaveBeenCalledTimes(2);
+    expect(api.recompose).not.toHaveBeenCalled();
+    expect(api.fetchMessages).toHaveBeenCalled();
+  });
+
+  it("keeps non-recovery convergence errors on the existing chat error path", async () => {
+    vi.spyOn(api, "sendMessage").mockRejectedValue({
+      status: 422,
+      error_type: "convergence",
+      detail: "ignored",
+    });
+    useSessionStore.setState({
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+      compositionState: makeState(1),
+    });
+
+    render(<App />);
+    await userEvent.click(screen.getByRole("button", { name: "Send compose" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /couldn't complete the composition/,
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("does not open recovery for successful sends", async () => {
+    vi.spyOn(api, "sendMessage").mockResolvedValue({
+      message: makeAssistantMessage(),
+      state: makeState(2),
+      proposals: [],
+    });
+    useSessionStore.setState({
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+      compositionState: makeState(1),
+    });
+
+    render(<App />);
+    await userEvent.click(screen.getByRole("button", { name: "Send compose" }));
+
+    await waitFor(() => expect(api.sendMessage).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await waitFor(() => expect(useSessionStore.getState().compositionState?.version).toBe(2));
+  });
+});
+
+// ── Phase 1B: preferences bootstrap on auth-success ──────────────────────
+describe("App preferences bootstrap (Phase 1B)", () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    // Reset the preferences store so the bootstrap spy fires on a clean
+    // module-singleton state — without this, an earlier test in the same
+    // worker that touched usePreferencesStore would leak `loaded: true`
+    // and the new bootstrap call would still fire (we assert it does)
+    // but the test intent is fragile to ordering. Mirrors the Phase 1A
+    // finding-7 pattern noted in the plan.
+    const { usePreferencesStore } = await import("@/stores/preferencesStore");
+    resetStore(usePreferencesStore);
+    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
+      composer_available: true,
+      composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
+      composer_provider: "openai",
+      composer_reason: null,
+      composer_missing_keys: [],
+    });
+  });
+
+  it("calls preferencesStore.bootstrap once authenticated", async () => {
+    const { usePreferencesStore } = await import("@/stores/preferencesStore");
+    const bootstrap = vi
+      .spyOn(usePreferencesStore.getState(), "bootstrap")
+      .mockResolvedValueOnce(undefined);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(bootstrap).toHaveBeenCalled();
+    });
+  });
+
+  it("App still renders when preferences bootstrap fails (Panel test #1)", async () => {
+    // Resilience claim: a failing prefs bootstrap MUST NOT block app
+    // render. The earlier test spied on bootstrap-rejection and asserted
+    // the App.tsx caller's .catch(console.error) was hit — but that
+    // silent-swallow was the I5 bug (CorruptPreferencesError got
+    // logged-and-forgotten, leaving the user with no signal). Bootstrap
+    // is now contracted to NEVER reject; failures are surfaced via the
+    // store's bootstrapError so the role="alert" region (Phase 1B-round-2)
+    // shows the user something is wrong.
+    //
+    // We exercise the failure path through the lower API mock rather
+    // than spying on bootstrap directly, so the test runs through the
+    // real bootstrap() implementation including the catch/bootstrapError
+    // branch — the part that was previously uncovered.
+    const apiClient = await import("@/api/client");
+    const { usePreferencesStore } = await import("@/stores/preferencesStore");
+    (
+      apiClient.fetchUserComposerPreferences as ReturnType<typeof vi.fn>
+    ).mockRejectedValueOnce(new Error("network down"));
+
+    render(<App />);
+
+    // Wait for bootstrap to settle into the failure-path state.
+    await waitFor(() => {
+      const state = usePreferencesStore.getState();
+      expect(state.loaded).toBe(true);
+      expect(state.bootstrapError).not.toBeNull();
+      expect(state.writeError).toBeNull();
+    });
+    // App chrome remains rendered. The Layout/ChatPanel stubs are still
+    // present — proves the bootstrap failure didn't unmount the tree.
+    expect(screen.getByTestId("chat-panel-stub")).toBeInTheDocument();
+    // I5: the failure MUST be surfaced to the user via the always-mounted
+    // alert region in App.tsx. Without this assertion the test would
+    // pass even if bootstrapError were set in the store but never rendered
+    // to the DOM — the silent-failure-one-layer-up regression I5
+    // exists to prevent. The role="alert" region carries the
+    // bootstrapError text from the store.
+    await waitFor(() => {
+      const alerts = screen.getAllByRole("alert");
+      const surfaced = alerts.some(
+        (el) => el.textContent !== null && el.textContent.includes("network down"),
+      );
+      expect(surfaced).toBe(true);
+    });
+  });
+
+  it("does not offer a tutorial or a false preferences save to an admin without the user role", async () => {
+    vi.mocked(api.fetchUserComposerPreferences).mockRejectedValueOnce({
+      status: 403,
+      error_type: "user_role_required",
+      detail: "A live user role is required",
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(usePreferencesStore.getState().unavailableForRole).toBe(true));
+    expect(usePreferencesStore.getState().loaded).toBe(false);
+    expect(screen.queryByTestId("tutorial-stub")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Couldn't load your preferences/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /account/i }));
+    expect(screen.queryByRole("button", { name: /composer preferences/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /switch to light theme/i })).toBeInTheDocument();
+    expect(api.updateUserComposerPreferences).not.toHaveBeenCalled();
+  });
+
+  it("unmounts an already-open Composer preferences panel when the owned role refusal arrives", async () => {
+    let rejectFetch!: (reason: unknown) => void;
+    vi.mocked(api.fetchUserComposerPreferences).mockImplementationOnce(
+      () => new Promise<Awaited<ReturnType<typeof api.fetchUserComposerPreferences>>>((_, reject) => { rejectFetch = reject; }),
+    );
+    render(<App />);
+    await userEvent.click(screen.getByRole("button", { name: /account/i }));
+    await userEvent.click(screen.getByRole("button", { name: /composer preferences/i }));
+    expect(screen.getByRole("dialog", { name: /composer preferences/i })).toBeInTheDocument();
+
+    rejectFetch({ status: 403, error_type: "user_role_required", detail: "User role required" });
+    await waitFor(() => expect(usePreferencesStore.getState().unavailableForRole).toBe(true));
+    expect(screen.queryByRole("dialog", { name: /composer preferences/i })).not.toBeInTheDocument();
+    expect(api.updateUserComposerPreferences).not.toHaveBeenCalled();
+  });
+
+  it("renders the tutorial instead of the composer layout before completion", async () => {
+    const { usePreferencesStore } = await import("@/stores/preferencesStore");
+    usePreferencesStore.setState({
+      loaded: true,
+      tutorialCompletedAt: null,
+      tutorialCompleted: false,
+    });
+    vi.spyOn(usePreferencesStore.getState(), "bootstrap").mockResolvedValueOnce(
+      undefined,
+    );
+
+    render(<App />);
+
+    expect(screen.getByTestId("tutorial-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-workspace-stub")).not.toBeInTheDocument();
+  });
+
+  it("keeps tutorial readiness fail-closed while system status is still loading", async () => {
+    const { usePreferencesStore } = await import("@/stores/preferencesStore");
+    usePreferencesStore.setState({
+      loaded: true,
+      tutorialCompletedAt: null,
+      tutorialCompleted: false,
+    });
+    vi.spyOn(usePreferencesStore.getState(), "bootstrap").mockResolvedValueOnce(
+      undefined,
+    );
+    vi.spyOn(api, "fetchSystemStatus").mockReturnValue(new Promise(() => {}));
+    tutorialPropsSpy.mockClear();
+
+    render(<App />);
+
+    await waitFor(() => expect(tutorialPropsSpy).toHaveBeenCalled());
+    expect(tutorialPropsSpy).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        composerAvailable: false,
+        tutorialReady: false,
+      }),
+    );
+  });
+
+  it("keeps the tutorial visible when saving a preference fails", async () => {
+    const { usePreferencesStore } = await import("@/stores/preferencesStore");
+    usePreferencesStore.setState({
+      loaded: true,
+      tutorialCompletedAt: null,
+      tutorialCompleted: false,
+      bootstrapError: null,
+      writeError: "Couldn't save your preference: network down",
+    });
+    vi.spyOn(usePreferencesStore.getState(), "bootstrap").mockResolvedValueOnce(
+      undefined,
+    );
+
+    render(<App />);
+
+    expect(screen.getByTestId("tutorial-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-workspace-stub")).not.toBeInTheDocument();
+    expect(screen.getByText(/Couldn't save your preference: network down/)).toBeInTheDocument();
+  });
+
+  it("blocks the tutorial when preferences could not be loaded", async () => {
+    const { usePreferencesStore } = await import("@/stores/preferencesStore");
+    usePreferencesStore.setState({
+      loaded: true,
+      tutorialCompletedAt: null,
+      tutorialCompleted: false,
+      bootstrapError: "Preferences could not be loaded: network down",
+      writeError: null,
+    });
+    vi.spyOn(usePreferencesStore.getState(), "bootstrap").mockResolvedValueOnce(
+      undefined,
+    );
+
+    render(<App />);
+
+    expect(screen.queryByTestId("tutorial-stub")).not.toBeInTheDocument();
+    expect(screen.getByText(/Preferences could not be loaded: network down/)).toBeInTheDocument();
+  });
+
+  it("remounts the tutorial shell after Reset tutorial succeeds", async () => {
+    const { usePreferencesStore } = await import("@/stores/preferencesStore");
+    usePreferencesStore.setState({
+      loaded: true,
+      tutorialCompletedAt: null,
+      tutorialCompleted: false,
+      tutorialStage: "build",
+      tutorialSessionId: "sess-in-progress",
+      tutorialRunId: null,
+      tutorialSourceDataHash: null,
+      writeError: null,
+    });
+    vi.spyOn(usePreferencesStore.getState(), "bootstrap").mockResolvedValueOnce(
+      undefined,
+    );
+    vi.spyOn(api, "updateUserComposerPreferences").mockResolvedValueOnce({
+      freeform_intro_dismissed_at: null,
+      tutorial_completed_at: null,
+      tutorial_stage: null,
+      tutorial_session_id: null,
+      tutorial_run_id: null,
+      tutorial_source_data_hash: null,
+      show_advanced: false,
+      updated_at: "2026-07-10T07:30:00Z",
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(tutorialMountSpy).toHaveBeenCalledTimes(1);
+    });
+    await userEvent.click(screen.getByRole("button", { name: /account menu/i }));
+    await userEvent.click(screen.getByRole("button", { name: /composer preferences/i }));
+    await userEvent.click(screen.getByRole("button", { name: /reset tutorial/i }));
+
+    await waitFor(() => {
+      expect(api.updateUserComposerPreferences).toHaveBeenCalledWith({
+        tutorial_completed_at: null,
+        tutorial_stage: null,
+        tutorial_session_id: null,
+        tutorial_run_id: null,
+        tutorial_source_data_hash: null,
+      });
+    });
+    await waitFor(() => {
+      expect(tutorialMountSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+});
+
+// ── Phase 6B Task 8: shared-route Layout suppression ─────────────────────
+//
+// Plan §Task 8 test case 9 (`docs/composer/ux-redesign-2026-05/19b-phase-6b-frontend.md`):
+// when the URL hash is `#/shared/{token}`, the composer Layout (chat +
+// side rail) MUST NOT be rendered. The SharedInspectView mounts in its
+// place. A future refactor that accidentally drops the App.tsx
+// short-circuit and renders Layout under a shared route would convert
+// every shared link into a full composer session for the reviewer — this
+// test pins the suppression so that regression is caught.
+describe("App shared-route Layout suppression (Phase 6B Task 8)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetStore(useSessionStore);
+    useExecutionStore.getState().reset();
+    useAuthStore.setState({
+      token: "test-token",
+      user: {
+        user_id: "test-001",
+        username: "test-operator",
+        display_name: null,
+        email: null,
+        groups: [],
+        dev_admin: false,
+      } as never,
+    } as never);
+    localStorage.clear();
+    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
+      composer_available: true,
+      composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
+      composer_provider: "openai",
+      composer_reason: null,
+      composer_missing_keys: [],
+    } satisfies SystemStatus);
+  });
+
+  it("renders SharedInspectView and does NOT mount the composer Layout for #/shared/{token}", async () => {
+    // Set the hash BEFORE render — App reads it via useSharedRoute on first
+    // render. Setting after render would defeat the short-circuit branch
+    // this test exists to pin.
+    window.history.replaceState(null, "", "#/shared/tok-abc");
+
+    render(<App />);
+
+    // SharedInspectView is mounted. fetchSharedInspect is stubbed with a
+    // never-resolving promise (see top-level vi.mock), so the view stays
+    // in the loading state — which is exactly what we want to assert
+    // against. We do NOT depend on the eventual resolution.
+    expect(
+      await screen.findByTestId("shared-inspect-loading"),
+    ).toBeInTheDocument();
+
+    // The composer Layout (mocked above as data-testid="layout-stub") is
+    // NOT rendered under a shared route. If a refactor drops the
+    // short-circuit in App.tsx, this assertion fails and the regression
+    // is caught.
+    expect(screen.queryByTestId("composer-workspace-stub")).toBeNull();
+    // The chat panel is part of Layout; pin its absence too, because the
+    // layout-stub testid is one indirection away from the actual chrome.
+    expect(screen.queryByTestId("chat-panel-stub")).toBeNull();
+  });
+
+  it.each(["#/shared", "#/shared/", "#/shared/abc%ZZ"])(
+    "refuses malformed share route %s without displaying the recipient's workspace",
+    async (hash) => {
+      useSessionStore.setState({
+        activeSessionId: "22222222-2222-4222-8222-222222222222",
+        compositionStateLoaded: true,
+        compositionState: {
+          ...makeState(1),
+          metadata: { name: "Bob private graph", description: "" },
+        },
+      });
+      window.history.replaceState(null, "", hash);
+      render(<App />);
+      expect(await screen.findByTestId("shared-inspect-error")).toHaveTextContent(
+        "This share link is malformed",
+      );
+      expect(screen.queryByTestId("composer-workspace-stub")).toBeNull();
+      expect(screen.queryByTestId("chat-panel-stub")).toBeNull();
+      expect(window.location.hash).toBe(hash);
+    },
+  );
+
+  it("renders the composer Layout when the hash is NOT a shared route", async () => {
+    // Counterpoint: with no hash, the regular composer flow runs. This
+    // protects the test above from a false-positive caused by the
+    // Layout mock simply never rendering. An active session keeps the
+    // shell mounted (no sessions at all → empty landing instead,
+    // elspeth-e69642fede).
+    window.history.replaceState(null, "", "/");
+    useSessionStore.setState({ activeSessionId: "11111111-1111-4111-8111-111111111111" });
+
+    render(<App />);
+
+    expect(await screen.findByTestId("composer-workspace-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("shared-inspect-loading")).toBeNull();
+  });
+});
+
+// ── elspeth-e69642fede: returning-user landing ────────────────────────────
+describe("App empty landing and auto-resume", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetStore(useSessionStore);
+    useExecutionStore.getState().reset();
+    useAuthStore.setState({
+      token: "test-token",
+      user: {
+        user_id: "test-001",
+        username: "test-operator",
+        display_name: null,
+        email: null,
+        groups: [],
+        dev_admin: false,
+      } as never,
+    } as never);
+    localStorage.clear();
+    window.history.replaceState(null, "", "/");
+    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
+      composer_available: true,
+      composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
+      composer_provider: "openai",
+      composer_reason: null,
+      composer_missing_keys: [],
+    } satisfies SystemStatus);
+    vi.spyOn(api, "fetchRuns").mockResolvedValue([]);
+  });
+
+  it("renders a real empty state with primary actions when no sessions exist", async () => {
+    vi.spyOn(api, "fetchSessions").mockResolvedValue([]);
+
+    render(<App />);
+
+    expect(await screen.findByText(/no sessions yet/i)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /new session/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /browse the catalog/i }),
+    ).toBeInTheDocument();
+    // The composer shell is replaced, not layered under.
+    expect(screen.queryByTestId("composer-workspace-stub")).toBeNull();
+  });
+
+  it("auto-resumes the most recently active session for a returning user", async () => {
+    const older: Session = {
+      id: "older",
+      title: "Older",
+      created_at: "2026-06-01T00:00:00Z",
+      updated_at: "2026-06-01T00:00:00Z",
+    };
+    const newest: Session = {
+      id: "newest",
+      title: "Newest",
+      created_at: "2026-07-01T00:00:00Z",
+      updated_at: "2026-07-01T00:00:00Z",
+    };
+    vi.spyOn(api, "fetchSessions").mockResolvedValue([older, newest]);
+    vi.spyOn(api, "fetchMessages").mockResolvedValue([]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(useSessionStore.getState().activeSessionId).toBe("newest");
+    });
+    // With a session active, the composer shell renders — not the landing.
+    expect(await screen.findByTestId("composer-workspace-stub")).toBeInTheDocument();
+    expect(screen.queryByText(/no sessions yet/i)).toBeNull();
+  });
+
+  it("does not request the YAML artifact on Ctrl+Shift+Y when the pipeline is empty", async () => {
+    const onArtifactRequest = vi.fn();
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+    vi.spyOn(api, "fetchSessions").mockResolvedValue([]);
+    useSessionStore.setState({
+      activeSessionId: "11111111-1111-4111-8111-111111111111",
+      compositionState: makeState(1), // no sources/nodes/outputs
+    });
+
+    render(<App />);
+    await waitFor(() => {
+      expect(api.fetchSystemStatus).toHaveBeenCalled();
+    });
+
+    fireEvent.keyDown(document, {
+      key: "Y",
+      code: "KeyY",
+      ctrlKey: true,
+      shiftKey: true,
+    });
+
+    expect(onArtifactRequest).not.toHaveBeenCalled();
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+  });
+});
+
+describe("App shared-route keyboard isolation", () => {
+  const recipient: Session = {
+    id: "11111111-1111-4111-8111-111111111111",
+    title: "Recipient workspace",
+    created_at: "2026-07-01T00:00:00Z",
+    updated_at: "2026-07-01T00:00:00Z",
+  };
+  const created: Session = {
+    ...recipient,
+    id: "33333333-3333-4333-8333-333333333333",
+    title: "New workspace",
+  };
+  const sharedHashes = [
+    "#/shared/tok-abc",
+    "#/shared",
+    "#/shared/",
+    "#/shared/abc%ZZ",
+  ];
+  const modifiers = ["ctrlKey", "metaKey"] as const;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetStore(useSessionStore);
+    resetStore(usePreferencesStore);
+    useExecutionStore.getState().reset();
+    useMailboxStore.getState().reset();
+    useAuthStore.setState({
+      token: "test-token",
+      user: {
+        user_id: "test-001",
+        username: "test-operator",
+        display_name: null,
+        email: null,
+        groups: [],
+        dev_admin: false,
+      },
+    });
+    localStorage.clear();
+    window.history.replaceState(null, "", "/");
+    usePreferencesStore.setState({
+      loaded: true,
+      tutorialCompleted: true,
+      tutorialCompletedAt: "2026-07-01T00:00:00Z",
+    });
+    vi.spyOn(usePreferencesStore.getState(), "bootstrap").mockResolvedValue(undefined);
+    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
+      composer_available: true,
+      composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
+      composer_provider: "openai",
+      composer_reason: null,
+      composer_missing_keys: [],
+    } satisfies SystemStatus);
+    vi.spyOn(api, "fetchSessions").mockResolvedValue([]);
+    vi.spyOn(api, "fetchRuns").mockResolvedValue([]);
+    vi.spyOn(api, "createSession").mockResolvedValue(created);
+    vi.spyOn(useExecutionStore.getState(), "validate").mockResolvedValue(true);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  async function press(
+    key: string,
+    modifier: (typeof modifiers)[number] = "ctrlKey",
+    shiftKey = false,
+  ): Promise<KeyboardEvent> {
+    const event = new KeyboardEvent("keydown", {
+      key,
+      [modifier]: true,
+      shiftKey,
+      bubbles: true,
+      cancelable: true,
+    });
+    await act(async () => {
+      document.dispatchEvent(event);
+    });
+    return event;
+  }
+
+  async function mountSurface(hash: string, surface = "workspace") {
+    if (surface === "workspace") {
+      vi.mocked(api.fetchSessions).mockResolvedValue([recipient]);
+      useSessionStore.setState({
+        sessions: [recipient],
+        sessionsLoaded: true,
+        activeSessionId: recipient.id,
+        compositionStateLoaded: true,
+        compositionState: {
+          ...makeState(7),
+          sources: { source: { plugin: "csv", options: {} } },
+        },
+        messages: [makeAssistantMessage()],
+      });
+    } else {
+      useSessionStore.setState({ sessionsLoaded: true });
+      if (surface === "tutorial") {
+        usePreferencesStore.setState({
+          tutorialCompleted: false,
+          tutorialCompletedAt: null,
+        });
+      }
+    }
+    window.history.replaceState(null, "", hash);
+    const mounted = render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    if (hash.startsWith("#/shared")) {
+      await screen.findByTestId(
+        hash === "#/shared/tok-abc" ? "shared-inspect-loading" : "shared-inspect-error",
+      );
+      expect(screen.queryByTestId("composer-workspace-stub")).toBeNull();
+    } else if (surface === "workspace") {
+      await screen.findByTestId("composer-workspace-stub");
+    } else if (surface === "tutorial") {
+      await screen.findByTestId("tutorial-stub");
+    } else {
+      await screen.findByText("No sessions yet");
+    }
+    await act(async () => { await Promise.resolve(); });
+    act(() => {
+      useExecutionStore.setState({
+        validationResult: makeValidationResult({ readiness: READY_VALIDATION_READINESS }),
+        isExecuting: false,
+        progress: null,
+      });
+    });
+    vi.mocked(useExecutionStore.getState().validate).mockClear();
+    vi.mocked(api.createSession).mockClear();
+    return mounted;
+  }
+
+  for (const hash of sharedHashes) {
+    it.each(modifiers)(`blocks real New Session via %s on ${hash}`, async (modifier) => {
+      await mountSurface(hash);
+      const before = useSessionStore.getState();
+      const validationBefore = useExecutionStore.getState().validationResult;
+      const event = await press("n", modifier);
+      expect({
+        calls: vi.mocked(api.createSession).mock.calls,
+        session: useSessionStore.getState().activeSessionId,
+        composition: useSessionStore.getState().compositionState,
+        messages: useSessionStore.getState().messages,
+        validation: useExecutionStore.getState().validationResult,
+      }).toEqual({
+        calls: [],
+        session: before.activeSessionId,
+        composition: before.compositionState,
+        messages: before.messages,
+        validation: validationBefore,
+      });
+      expect(event.defaultPrevented).toBe(false);
+      expect(window.location.hash).toBe(hash);
+    });
+
+    it.each(modifiers)(`blocks real validation queue via %s on ${hash}`, async (modifier) => {
+      await mountSurface(hash);
+      const before = useSessionStore.getState();
+      const event = await press("V", modifier, true);
+      expect(useExecutionStore.getState().validate).not.toHaveBeenCalled();
+      expect(useSessionStore.getState().activeSessionId).toBe(before.activeSessionId);
+      expect(useSessionStore.getState().compositionState).toBe(before.compositionState);
+      expect(event.defaultPrevented).toBe(false);
+      expect(window.location.hash).toBe(hash);
+    });
+
+    it.each(modifiers)(`leaves workspace intent chords dormant via %s on ${hash}`, async (modifier) => {
+      await mountSurface(hash);
+      const events = vi.fn();
+      const names = ["open-catalog", REQUEST_ARTIFACT_VIEW_EVENT, FOCUS_AUTHORING_EVENT, REQUEST_RUN_EVENT];
+      for (const name of names) window.addEventListener(name, events);
+      try {
+        for (const [key, shift] of [["k", false], ["P", true], ["G", true], ["Y", true], ["/", false], ["e", false]] as const) {
+          expect((await press(key, modifier, shift)).defaultPrevented).toBe(false);
+        }
+        const help = new KeyboardEvent("keydown", { key: "?", bubbles: true, cancelable: true });
+        act(() => { document.dispatchEvent(help); });
+        expect(help.defaultPrevented).toBe(false);
+        expect(screen.queryByTestId("shortcuts-help-stub")).toBeNull();
+        expect(events).not.toHaveBeenCalled();
+        expect(window.location.hash).toBe(hash);
+      } finally {
+        for (const name of names) window.removeEventListener(name, events);
+      }
+    });
+  }
+
+  for (const surface of ["workspace", "empty", "tutorial"]) {
+    it.each(modifiers)(`retains real New Session via %s on ordinary ${surface}`, async (modifier) => {
+      await mountSurface("/", surface);
+      expect((await press("n", modifier)).defaultPrevented).toBe(true);
+      expect(api.createSession).toHaveBeenCalledTimes(1);
+      expect(useSessionStore.getState().activeSessionId).toBe(created.id);
+      expect(useSessionStore.getState().compositionState).toBeNull();
+      expect(useExecutionStore.getState().validationResult).toBeNull();
+    });
+  }
+
+  it.each(modifiers)("retains real forced validation via %s on ordinary workspace", async (modifier) => {
+    await mountSurface("/");
+    expect((await press("V", modifier, true)).defaultPrevented).toBe(true);
+    expect(useExecutionStore.getState().validate).toHaveBeenCalledExactlyOnceWith(
+      recipient.id, { expectedVersion: 7 },
+    );
+  });
+
+  it.each(["empty", "tutorial"])("cleans up route transitions with stable %s shortcut inputs", async (surface) => {
+    const mounted = await mountSurface("/", surface);
+    const createSession = useSessionStore.getState().createSession;
+    const catalog = vi.fn();
+    window.addEventListener("open-catalog", catalog);
+    const assertStableInputs = () => {
+      expect(useSessionStore.getState().activeSessionId).toBeNull();
+      expect(useSessionStore.getState().compositionState).toBeNull();
+      expect(useSessionStore.getState().createSession).toBe(createSession);
+    };
+    try {
+      for (let round = 0; round < 2; round += 1) {
+        assertStableInputs();
+        catalog.mockClear();
+        expect((await press("P", "ctrlKey", true)).defaultPrevented).toBe(true);
+        expect(catalog).toHaveBeenCalledTimes(1);
+        for (const [hash, signal] of [["#/shared/tok-abc", "hashchange"], ["#/shared/abc%ZZ", "popstate"]] as const) {
+          act(() => {
+            window.history.replaceState(null, "", hash);
+            window.dispatchEvent(new Event(signal));
+          });
+          await screen.findByTestId(hash === "#/shared/tok-abc" ? "shared-inspect-loading" : "shared-inspect-error");
+          assertStableInputs();
+          catalog.mockClear();
+          expect((await press("P", "ctrlKey", true)).defaultPrevented).toBe(false);
+          expect(catalog).not.toHaveBeenCalled();
+          expect(window.location.hash).toBe(hash);
+        }
+        act(() => {
+          window.history.replaceState(null, "", "/");
+          window.dispatchEvent(new Event("hashchange"));
+        });
+        if (surface === "tutorial") await screen.findByTestId("tutorial-stub");
+        else await screen.findByText("No sessions yet");
+        assertStableInputs();
+      }
+      catalog.mockClear();
+      expect((await press("P", "ctrlKey", true)).defaultPrevented).toBe(true);
+      expect(catalog).toHaveBeenCalledTimes(1);
+      mounted.unmount();
+      catalog.mockClear();
+      expect((await press("P", "ctrlKey", true)).defaultPrevented).toBe(false);
+      expect(catalog).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("open-catalog", catalog);
+    }
+  });
+});

@@ -1,0 +1,1340 @@
+"""Azure Blob Storage source plugin for ELSPETH.
+
+Loads rows from Azure Blob containers. Supports CSV, JSON array, and JSONL formats.
+
+IMPORTANT: Sources use allow_coercion=True to normalize external data.
+This is the ONLY place in the pipeline where coercion is allowed.
+"""
+
+from __future__ import annotations
+
+import csv
+import enum
+import hashlib
+import io
+import itertools
+import json
+import time
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
+
+import structlog
+from pydantic import BaseModel, Field, JsonValue, ValidationError, field_validator, model_validator
+
+from elspeth.contracts import CallStatus, CallType, Determinism, PluginSchema, SourceRow
+from elspeth.contracts.contexts import SourceContext
+from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLimitExceeded
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identifiers import validate_field_names
+from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
+from elspeth.contracts.schema_contract_factory import create_contract_from_config
+from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
+from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig, AzureAuthMethod
+from elspeth.plugins.infrastructure.base import BaseSource
+from elspeth.plugins.infrastructure.config_base import (
+    DataPluginConfig,
+    NormalizedColumnsOption,
+    NormalizedFieldMappingOption,
+    declared_source_schema_field_names,
+)
+from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+from elspeth.plugins.sources.field_normalization import (
+    ExternalHeaderError,
+    FieldMappingCollisionError,
+    FieldResolution,
+    check_declared_fields_reachable,
+    extend_field_resolution,
+    normalize_field_name,
+    resolve_field_names,
+)
+from elspeth.plugins.sources.json_source import (
+    _contains_surrogateescape_chars,
+    _reject_nonfinite_constant,
+    _surrogateescape_line_to_bytes,
+)
+
+if TYPE_CHECKING:
+    from azure.storage.blob import BlobClient
+
+logger = structlog.get_logger(__name__)
+
+_DOWNLOAD_CHUNK_BYTES = 64 * 1024
+
+
+def _azure_provider_exception_types() -> tuple[type[Exception], ...]:
+    """Declared Azure SDK and transport failures at the external seam."""
+    from azure.core.exceptions import AzureError
+
+    return (AzureError, ConnectionError, TimeoutError)
+
+
+@dataclass(frozen=True, slots=True)
+class _AzureBlobDownloadFailure:
+    provider_error_type: str
+
+
+# Sentinel distinguishing "iterator exhausted" from a real CSV row when peeking
+# with next(it, _ROW_EXHAUSTED). Lets us treat end-of-file as ordinary control
+# flow instead of catching StopIteration, while csv.Error still propagates. An
+# Enum member (not a bare object()) so mypy narrows the union on `is` checks.
+class _RowSentinel(enum.Enum):
+    EXHAUSTED = enum.auto()
+
+
+_ROW_EXHAUSTED = _RowSentinel.EXHAUSTED
+
+
+class CSVOptions(BaseModel):
+    """CSV parsing options."""
+
+    model_config = {"extra": "forbid"}
+
+    delimiter: str = ","
+    has_header: bool = True
+    encoding: str = "utf-8"
+
+    @field_validator("delimiter")
+    @classmethod
+    def _validate_delimiter(cls, v: str) -> str:
+        if len(v) != 1:
+            raise ValueError(f"delimiter must be a single character, got {v!r}")
+        return v
+
+    @field_validator("encoding")
+    @classmethod
+    def _validate_encoding(cls, v: str) -> str:
+        import codecs
+
+        try:
+            codecs.lookup(v)
+        except LookupError as exc:
+            raise ValueError(f"unknown encoding: {v!r}") from exc
+        return v
+
+
+class JSONOptions(BaseModel):
+    """JSON parsing options."""
+
+    model_config = {"extra": "forbid"}
+
+    encoding: str = "utf-8"
+    data_key: str | None = None
+
+    @field_validator("encoding")
+    @classmethod
+    def _validate_encoding(cls, v: str) -> str:
+        import codecs
+
+        try:
+            codecs.lookup(v)
+        except LookupError as exc:
+            raise ValueError(f"unknown encoding: {v!r}") from exc
+        return v
+
+
+class AzureBlobSourceConfig(DataPluginConfig):
+    """Configuration for Azure Blob source plugin.
+
+    Extends DataPluginConfig which requires schema configuration.
+    Unlike file-based sources, does not extend PathConfig (no local file path).
+
+    Supports four authentication methods (mutually exclusive):
+    1. connection_string - Simple connection string auth (default)
+    2. sas_token + account_url - Shared Access Signature token
+    3. use_managed_identity + account_url - Azure Managed Identity
+    4. tenant_id + client_id + client_secret + account_url - Service Principal
+
+    _plugin_component_type overrides DataPluginConfig (None) because this
+    config extends DataPluginConfig directly, bypassing SourceDataConfig.
+
+    Example configurations:
+
+        # Option 1: Connection string (simplest)
+        connection_string: "${AZURE_STORAGE_CONNECTION_STRING}"
+        container: "my-container"
+        blob_path: "data/input.csv"
+
+        # Option 2: SAS token
+        sas_token: "${AZURE_STORAGE_SAS_TOKEN}"
+        account_url: "https://mystorageaccount.blob.core.windows.net"
+        container: "my-container"
+        blob_path: "data/input.csv"
+
+        # Option 3: Managed Identity (for Azure-hosted workloads)
+        use_managed_identity: true
+        account_url: "https://mystorageaccount.blob.core.windows.net"
+        container: "my-container"
+        blob_path: "data/input.csv"
+
+        # Option 4: Service Principal
+        tenant_id: "${AZURE_TENANT_ID}"
+        client_id: "${AZURE_CLIENT_ID}"
+        client_secret: "${AZURE_CLIENT_SECRET}"
+        account_url: "https://mystorageaccount.blob.core.windows.net"
+        container: "my-container"
+        blob_path: "data/input.csv"
+    """
+
+    _plugin_component_type: ClassVar[str | None] = "source"
+
+    auth_mode: AzureAuthMethod | None = Field(
+        default=None,
+        description="Explicit Azure authentication mode; inferred from legacy credential fields when omitted.",
+    )
+
+    # Auth Option 1: Connection string
+    connection_string: str | None = Field(
+        default=None,
+        description="Azure Storage connection string",
+    )
+
+    # Auth Option 2: SAS token
+    sas_token: str | None = Field(
+        default=None,
+        description="Azure Storage SAS token (with or without leading '?')",
+    )
+
+    # Auth Option 3: Managed Identity
+    use_managed_identity: bool = Field(
+        default=False,
+        description="Use Azure Managed Identity for authentication",
+    )
+    account_url: str | None = Field(
+        default=None,
+        description="Azure Storage account URL (e.g., https://mystorageaccount.blob.core.windows.net)",
+    )
+
+    # Auth Option 4: Service Principal
+    tenant_id: str | None = Field(
+        default=None,
+        description="Azure AD tenant ID for Service Principal auth",
+    )
+    client_id: str | None = Field(
+        default=None,
+        description="Azure AD client ID for Service Principal auth",
+    )
+    client_secret: str | None = Field(
+        default=None,
+        description="Azure AD client secret for Service Principal auth",
+    )
+
+    # Blob location (required for all auth methods)
+    container: str = Field(
+        ...,
+        description="Azure Blob container name",
+    )
+    blob_path: str = Field(
+        ...,
+        description="Path to blob within container",
+    )
+    format: Literal["csv", "json", "jsonl"] = Field(
+        default="csv",
+        description="Data format: csv, json (array), or jsonl (newline-delimited)",
+    )
+    max_object_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        gt=0,
+        le=1024 * 1024 * 1024,
+        strict=True,
+        description="Maximum Azure blob bytes accepted",
+    )
+    csv_options: CSVOptions = Field(
+        default_factory=CSVOptions,
+        description="CSV parsing options (delimiter, has_header, encoding)",
+    )
+    json_options: JSONOptions = Field(
+        default_factory=JSONOptions,
+        description="JSON parsing options (encoding, data_key)",
+    )
+    columns: NormalizedColumnsOption = Field(
+        default=None,
+        description="Explicit column names for headerless CSV blobs",
+    )
+    field_mapping: NormalizedFieldMappingOption = Field(
+        default=None,
+        description="Override specific normalized field names",
+    )
+    on_validation_failure: str = Field(
+        ...,
+        description="Sink name for non-conformant rows, or 'discard' for explicit drop",
+    )
+
+    @model_validator(mode="after")
+    def validate_auth_config(self) -> Self:
+        """Validate authentication configuration via AzureAuthConfig.
+
+        Delegates to AzureAuthConfig for comprehensive auth validation,
+        ensuring exactly one auth method is configured.
+        """
+        # Create AzureAuthConfig to validate auth fields
+        # This will raise ValueError with descriptive messages if invalid
+        auth = AzureAuthConfig(
+            auth_mode=self.auth_mode,
+            connection_string=self.connection_string,
+            sas_token=self.sas_token,
+            use_managed_identity=self.use_managed_identity,
+            account_url=self.account_url,
+            tenant_id=self.tenant_id,
+            client_id=self.client_id,
+            client_secret=self.client_secret,
+        )
+        object.__setattr__(self, "auth_mode", auth.auth_method)
+        return self
+
+    @model_validator(mode="after")
+    def validate_field_normalization_options(self) -> Self:
+        """Validate source-boundary field normalization options."""
+        if self.format != "csv":
+            if self.columns is not None:
+                raise ValueError("columns is only supported for CSV format")
+        else:
+            if self.csv_options.has_header and self.columns is not None:
+                raise ValueError("columns requires csv_options.has_header: false for headerless CSV blobs.")
+
+            # B4.4: headerless CSV with no columns and no schema-declared fields
+            # would fall back to inventing numeric field names ("0","1","2") which
+            # are not valid Python identifiers -- violating the source-boundary
+            # invariant and silently dropping the field-resolution audit record.
+            # Fail fast at config time (Option B, mirrors csv_source which has NO
+            # numeric fallback at all: headerless mode REQUIRES explicit columns).
+            if (
+                not self.csv_options.has_header
+                and self.columns is None
+                and self.schema_config is not None
+                and (self.schema_config.is_observed or not self.schema_config.fields)
+            ):
+                raise ValueError(
+                    "headerless CSV (csv_options.has_header: false) with no columns and no schema-declared "
+                    "fields cannot generate valid field names. Provide explicit columns (e.g. columns: [id, name, value]) "
+                    "or declare schema fields so field names can be inferred."
+                )
+
+        if self.format == "csv" and self.columns is not None:
+            validate_field_names(self.columns, "columns")
+
+        if self.field_mapping is not None and self.field_mapping:
+            validate_field_names(list(self.field_mapping.values()), "field_mapping values")
+
+        # Reject declared schema names the resolution can never produce
+        # (elspeth-3664e213c4). Headered CSV and JSON object keys are
+        # normalized to lowercase identifiers; headerless CSV resolves the
+        # explicit columns — or, absent columns, the declared schema names
+        # themselves (guaranteed non-empty by the B4.4 check above) — verbatim.
+        declared = declared_source_schema_field_names(self.schema_config)
+        if declared:
+            if self.format == "csv" and not self.csv_options.has_header:
+                schema_fields = self.schema_config.fields
+                effective_columns = self.columns if self.columns is not None else [fd.name for fd in schema_fields or ()]
+                check_declared_fields_reachable(
+                    declared,
+                    columns=effective_columns,
+                    field_mapping=self.field_mapping,
+                    header_kind="CSV headers",
+                )
+            else:
+                check_declared_fields_reachable(
+                    declared,
+                    columns=None,
+                    field_mapping=self.field_mapping,
+                    header_kind="CSV headers" if self.format == "csv" else "JSON object keys",
+                )
+
+        return self
+
+    def get_auth_config(self) -> AzureAuthConfig:
+        """Get the AzureAuthConfig for this source configuration.
+
+        Returns:
+            AzureAuthConfig instance with the auth fields from this config.
+        """
+        return AzureAuthConfig(
+            auth_mode=self.auth_mode,
+            connection_string=self.connection_string,
+            sas_token=self.sas_token,
+            use_managed_identity=self.use_managed_identity,
+            account_url=self.account_url,
+            tenant_id=self.tenant_id,
+            client_id=self.client_id,
+            client_secret=self.client_secret,
+        )
+
+    @field_validator("container")
+    @classmethod
+    def validate_container_not_empty(cls, v: str) -> str:
+        """Validate that container is not empty or whitespace-only."""
+        if not v or not v.strip():
+            raise ValueError("container cannot be empty")
+        return reject_operator_required_placeholder_value(v, field_name="container")
+
+    @field_validator("blob_path")
+    @classmethod
+    def validate_blob_path_not_empty(cls, v: str) -> str:
+        """Validate that blob_path is not empty or whitespace-only."""
+        if not v or not v.strip():
+            raise ValueError("blob_path cannot be empty")
+        return reject_operator_required_placeholder_value(v, field_name="blob_path")
+
+    @field_validator("on_validation_failure")
+    @classmethod
+    def validate_on_validation_failure(cls, v: str) -> str:
+        """Ensure on_validation_failure is not empty."""
+        if not v or not v.strip():
+            raise ValueError("on_validation_failure must be a sink name or 'discard'")
+        return v.strip()
+
+
+# Rebuild model to resolve forward references for dynamic module loading
+AzureBlobSourceConfig.model_rebuild()
+
+
+class AzureBlobSource(BaseSource):
+    """Load rows from Azure Blob Storage.
+
+    Config options:
+        Authentication (exactly one required):
+        - connection_string: Azure Storage connection string
+        - use_managed_identity + account_url: Azure Managed Identity
+        - tenant_id + client_id + client_secret + account_url: Service Principal
+
+        Blob location:
+        - container: Blob container name (required)
+        - blob_path: Path to blob within container (required)
+        - format: "csv", "json" (array), or "jsonl" (lines). Default: "csv"
+
+        Parsing options:
+        - csv_options: CSV parsing options (delimiter, has_header, encoding)
+        - json_options: JSON parsing options (encoding, data_key)
+        - schema: Schema configuration (required, via DataPluginConfig)
+        - on_validation_failure: Sink name or "discard" (required)
+
+    The schema can be:
+        - Observed: {"mode": "observed"} - accept any fields
+        - Fixed: {"mode": "fixed", "fields": ["id: int", "name: str"]}
+        - Flexible: {"mode": "flexible", "fields": ["id: int"]} - at least these fields
+
+    Three-tier trust model:
+        - Azure Blob SDK calls = EXTERNAL SYSTEM -> wrap with try/except
+        - Row data parsing/validation = THEIR DATA -> wrap, quarantine failures
+        - Our internal state = OUR CODE -> let it crash
+    """
+
+    name = "azure_blob"
+    determinism = Determinism.IO_READ
+    plugin_version = "1.0.0"
+    source_file_hash: str | None = "sha256:9b3702740122b8f8"
+    config_model = AzureBlobSourceConfig
+
+    usage_when_to_use: str = (
+        "Use for one real, operator-approved Azure blob containing CSV, JSON-array, or JSONL data with an approved "
+        "authentication method. The source preserves container and blob audit identity while normalizing and validating rows."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use for Composer uploads, prefix or whole-container reads, event streams, or objects larger than max_object_bytes."
+    )
+    example_use: str = """sources:
+  azure_input:
+    plugin: azure_blob
+    on_success: output
+    options:
+      use_managed_identity: true
+      account_url: https://records.blob.core.windows.net
+      container: inbound
+      blob_path: data/customers.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+      on_validation_failure: discard
+"""
+    capability_tags: tuple[str, ...] = ("azure", "blob-storage", "object-storage", "batch")
+
+    @classmethod
+    def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
+        if issue_code is None:
+            return PluginAssistance(
+                plugin_name=cls.name,
+                issue_code=None,
+                summary="Loads CSV, JSON, or JSONL rows from Azure Blob Storage.",
+                composer_hints=(
+                    "Configure exactly one auth path: connection_string, sas_token+account_url, managed identity+account_url, or service principal+account_url.",
+                    "Choose format explicitly; csv uses csv_options, while json/jsonl use json_options and optional data_key.",
+                    "Set max_object_bytes to the largest approved input blob; downloads beyond that limit fail before parsing.",
+                    "For headerless CSV set csv_options.has_header=false and provide columns; columns is invalid for headered CSV or non-CSV blobs.",
+                    "If you have been asked to generate source rows yourself, do not pick `azure_blob` — this source reads pre-existing storage blobs, not LLM-authored content. Switch to a local-blob source (`csv`, `json`, or `text`) via `create_blob` plus `set_source_from_blob`.",
+                    "Never synthesise an Azure container name, blob path, account URL, or credential for content you authored — the audit trail must reference a real, addressable blob.",
+                    "Use field_mapping only to override normalized field names at the source boundary.",
+                    "Set on_validation_failure to a quarantine sink unless deliberate discard is acceptable.",
+                ),
+            )
+        return None
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__(config)
+        cfg = AzureBlobSourceConfig.from_dict(config, plugin_name=self.name)
+
+        # Store auth config for creating clients
+        self._auth_config = cfg.get_auth_config()
+        self._container = cfg.container
+        self._blob_path = cfg.blob_path
+        self._format = cfg.format
+        self._max_object_bytes = cfg.max_object_bytes
+        self._csv_options = cfg.csv_options
+        self._json_options = cfg.json_options
+        self._columns = cfg.columns
+        self._field_mapping = cfg.field_mapping
+        # Headerless CSV (columns, or the schema's field names): field_mapping keys are matched as written.
+        self._field_mapping_keys = "as_written" if cfg.format == "csv" and not cfg.csv_options.has_header else "normalized"
+        self._normalizes_external_names = self._field_mapping_keys == "normalized"
+        self._field_resolution: FieldResolution | None = None
+        self._contract_builder: ContractBuilder | None = None
+
+        # Store schema config for audit trail
+        # DataPluginConfig ensures schema_config is not None
+        self._schema_config = cfg.schema_config
+        self._initialize_declared_guaranteed_fields(self._schema_config)
+
+        # Store quarantine routing destination
+        self._on_validation_failure = cfg.on_validation_failure
+
+        # CRITICAL: allow_coercion=True for sources (external data boundary)
+        # Sources are the ONLY place where type coercion is allowed
+        self._schema_class: type[PluginSchema] = create_schema_from_config(
+            self._schema_config,
+            "AzureBlobRowSchema",
+            allow_coercion=True,
+        )
+
+        # Set output_schema for protocol compliance
+        self.output_schema = self._schema_class
+
+        # Create schema contract for PipelineRow support.
+        # CSV and JSON/JSONL need source-boundary field_resolution before
+        # unlocked contracts can infer fields, so those builders are created
+        # during load() once the first valid row establishes the mapping.
+        if self._format == "csv":
+            # CSV needs field_resolution from headers - defer contract creation to load()
+            pass
+        else:
+            # JSON/JSONL normalize row keys when the first row is processed.
+            # FIXED schemas can be locked immediately; FLEXIBLE/OBSERVED defer
+            # builder creation until field_resolution is known.
+            initial_contract = create_contract_from_config(self._schema_config)
+            if initial_contract.locked:
+                self.set_schema_contract(initial_contract)
+
+        # Lazy-loaded blob client
+        self._blob_client: BlobClient | None = None
+
+    def _get_blob_client(self) -> BlobClient:
+        """Get or create the Azure Blob client.
+
+        Uses the configured authentication method (connection string,
+        managed identity, or service principal) to create the client.
+
+        Returns:
+            BlobClient for the configured blob.
+
+        Raises:
+            ImportError: If azure-storage-blob (or azure-identity for
+                managed identity/service principal) is not installed.
+        """
+        if self._blob_client is None:
+            # Use shared auth config to create the service client
+            service_client = self._auth_config.create_blob_service_client()
+            container_client = service_client.get_container_client(self._container)
+            self._blob_client = container_client.get_blob_client(self._blob_path)
+
+        return self._blob_client
+
+    def _download_blob_payload(self) -> object | _AzureBlobDownloadFailure:
+        """Return the provider payload or a sanitized, explicit failure."""
+        try:
+            downloader = self._get_blob_client().download_blob()
+            payload = bytearray()
+            while True:
+                remaining = self._max_object_bytes - len(payload)
+                chunk = downloader.read(min(_DOWNLOAD_CHUNK_BYTES, remaining + 1))
+                if type(chunk) is not bytes:
+                    raise TypeError("Azure blob downloader.read() must return exact bytes")
+                if not chunk:
+                    return bytes(payload)
+                if len(chunk) > remaining:
+                    return _AzureBlobDownloadFailure(provider_error_type="AzureBlobSizeLimitExceeded")
+                payload.extend(chunk)
+        except ImportError:
+            raise
+        except _azure_provider_exception_types() as error:
+            return _AzureBlobDownloadFailure(provider_error_type=type(error).__name__)
+
+    def load(self, ctx: SourceContext) -> Iterator[SourceRow]:
+        """Load rows from Azure Blob Storage.
+
+        Each row is validated against the configured schema:
+        - Valid rows are yielded as SourceRow.valid()
+        - Invalid rows are yielded as SourceRow.quarantined()
+
+        For FLEXIBLE/OBSERVED schemas, the first valid row locks the contract with
+        inferred types. Subsequent rows validate against the locked contract.
+
+        Yields:
+            SourceRow for each row (valid or quarantined).
+
+        Raises:
+            ImportError: If azure-storage-blob is not installed.
+            azure.core.exceptions.ResourceNotFoundError: If blob does not exist.
+            azure.core.exceptions.ClientAuthenticationError: If connection fails.
+        """
+        # Track first valid row for FLEXIBLE/OBSERVED type inference
+        self._first_valid_row_processed = False
+        request_data = {
+            "operation": "download_blob",
+            "container": self._container,
+            "blob_path": self._blob_path,
+        }
+        verify_session = ctx.call_mode_session
+        if verify_session is not None and verify_session.mode is RunMode.VERIFY:
+            source_call_id = verify_session.preflight_verify_request(
+                call_type=CallType.HTTP,
+                request_data=request_data,
+                current_state_id=None,
+                current_operation_id=ctx.operation_id,
+            )
+            admitted_call_id = verify_session.admit_verify_call(
+                call_type=CallType.HTTP,
+                request_data=request_data,
+                current_state_id=None,
+                current_operation_id=ctx.operation_id,
+                current_call_index=None,
+            )
+            if admitted_call_id != source_call_id:
+                raise AuditIntegrityError("Azure blob source call changed after pre-dispatch admission")
+
+        # EXTERNAL SYSTEM: Azure Blob SDK calls - wrap with try/except
+        # Record call for audit trail (ctx.operation_id is set by orchestrator)
+        start_time = time.perf_counter()
+        download_result = self._download_blob_payload()
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        if isinstance(download_result, _AzureBlobDownloadFailure):
+            error_data = {"type": download_result.provider_error_type}
+            recorded_call = ctx.record_call(
+                call_type=CallType.HTTP,
+                status=CallStatus.ERROR,
+                request_data=request_data,
+                error=error_data,
+                latency_ms=latency_ms,
+                provider="azure_blob_storage",
+            )
+            if verify_session is not None and verify_session.mode is RunMode.VERIFY:
+                if recorded_call is None:
+                    raise AuditIntegrityError("Azure blob verify call was not recorded")
+                verify_session.verify_call(
+                    call_type=CallType.HTTP,
+                    request_data=request_data,
+                    current_state_id=None,
+                    current_operation_id=ctx.operation_id,
+                    current_call_index=recorded_call.call_index,
+                    current_call_id=recorded_call.call_id,
+                    live_status=CallStatus.ERROR,
+                    live_response_data=None,
+                    live_error_data=error_data,
+                )
+            raise RuntimeError(f"Failed to download blob {self._blob_path!r} from container {self._container!r}.") from None
+
+        blob_data = download_result
+        if type(blob_data) is not bytes:
+            raise TypeError("Azure BlobClient.download_blob().readall() must return exact bytes")
+
+        response_data = {"size_bytes": len(blob_data), "content_hash": hashlib.sha256(blob_data).hexdigest()}
+        recorded_call = ctx.record_call(
+            call_type=CallType.HTTP,
+            status=CallStatus.SUCCESS,
+            request_data=request_data,
+            response_data=response_data,
+            latency_ms=latency_ms,
+            provider="azure_blob_storage",
+        )
+        if verify_session is not None and verify_session.mode is RunMode.VERIFY:
+            if recorded_call is None:
+                raise AuditIntegrityError("Azure blob verify call was not recorded")
+            verify_session.verify_call(
+                call_type=CallType.HTTP,
+                request_data=request_data,
+                current_state_id=None,
+                current_operation_id=ctx.operation_id,
+                current_call_index=recorded_call.call_index,
+                current_call_id=recorded_call.call_id,
+                live_status=CallStatus.SUCCESS,
+                live_response_data=response_data,
+                live_error_data=None,
+            )
+
+        # Parse blob content based on format
+        if self._format == "csv":
+            yield from self._load_csv(blob_data, ctx)
+        elif self._format == "json":
+            yield from self._load_json_array(blob_data, ctx)
+        elif self._format == "jsonl":
+            yield from self._load_jsonl(blob_data, ctx)
+
+        # CRITICAL: keep contract state consistent when no valid rows were seen.
+        # Mirrors CSVSource behavior for all-invalid/empty inputs.
+        if not self._first_valid_row_processed:
+            if self._contract_builder is not None:
+                self.set_schema_contract(self._contract_builder.contract.with_locked())
+            elif self.get_schema_contract() is None:
+                self.set_schema_contract(create_contract_from_config(self._schema_config).with_locked())
+
+    def _load_csv(self, blob_data: bytes, ctx: SourceContext) -> Iterator[SourceRow]:
+        """Load rows from CSV blob data.
+
+        Args:
+            blob_data: Raw bytes from blob download.
+            ctx: Plugin context for recording validation errors.
+
+        Yields:
+            SourceRow for each row (valid or quarantined).
+        """
+        # Access typed config fields directly - they have defaults from CSVOptions
+        delimiter = self._csv_options.delimiter
+        has_header = self._csv_options.has_header
+        encoding = self._csv_options.encoding
+
+        # THEIR DATA: Parsing blob content - wrap operations
+        try:
+            text_data = blob_data.decode(encoding)
+        except UnicodeDecodeError as e:
+            error_msg = f"Failed to decode CSV blob as {encoding}: {e}"
+            raw_row = {
+                "container": self._container,
+                "blob_path": self._blob_path,
+                "error": error_msg,
+            }
+            ctx.record_validation_error(
+                row=raw_row,
+                error=error_msg,
+                schema_mode="parse",
+                destination=self._on_validation_failure,
+            )
+            if self._on_validation_failure != "discard":
+                yield SourceRow.quarantined(
+                    row=raw_row,
+                    error=error_msg,
+                    destination=self._on_validation_failure,
+                    source_row_index=0,
+                )
+            return
+
+        # Parse CSV row-by-row using csv.reader for per-row error handling.
+        # This allows quarantining individual bad rows instead of the entire file.
+        # strict=True is required (matching CSVSource) so malformed quoting fails at
+        # the source boundary with a csv.Error — without it, data after a closing
+        # quote is silently merged into adjacent fields and a field-count-preserving
+        # corrupt row passes through with no quarantine and no audit record.
+        reader = csv.reader(io.StringIO(text_data), delimiter=delimiter, strict=True)
+
+        # Track a peeked first data row (used for headerless CSV with no schema)
+        first_data_row: list[str] | None = None
+
+        # Determine headers
+        if has_header:
+            try:
+                # next(..., sentinel) turns end-of-file into ordinary control
+                # flow (no StopIteration handler); csv.Error still propagates.
+                raw_headers = next(reader, _ROW_EXHAUSTED)
+            except csv.Error as e:
+                # Header parse failure at source boundary (Tier 3)
+                raw_row = {
+                    "__raw_blob_preview__": text_data[:200],
+                    "__encoding__": encoding,
+                }
+                error_msg = f"CSV parse error in blob header: {e}"
+                ctx.record_validation_error(
+                    row=raw_row,
+                    error=error_msg,
+                    schema_mode="parse",
+                    destination=self._on_validation_failure,
+                )
+                if self._on_validation_failure != "discard":
+                    yield SourceRow.quarantined(
+                        row=raw_row,
+                        error=error_msg,
+                        destination=self._on_validation_failure,
+                        source_row_index=0,
+                    )
+                return
+
+            if raw_headers is _ROW_EXHAUSTED:
+                # Empty file — quarantine as structural failure (Tier 3)
+                raw_row = {
+                    "__raw_blob_preview__": text_data[:200],
+                    "__encoding__": encoding,
+                }
+                error_msg = "CSV parse error: empty file contains no header row"
+                ctx.record_validation_error(
+                    row=raw_row,
+                    error=error_msg,
+                    schema_mode="parse",
+                    destination=self._on_validation_failure,
+                )
+                if self._on_validation_failure != "discard":
+                    yield SourceRow.quarantined(
+                        row=raw_row,
+                        error=error_msg,
+                        destination=self._on_validation_failure,
+                        source_row_index=0,
+                    )
+                return
+
+            # External-header faults (normalization collision, empty/duplicate headers)
+            # are Tier 3 (the blob's own header bytes are bad): record + quarantine/
+            # discard like the sibling csv.Error header path above. Config faults (a bad
+            # field_mapping) raise plain ValueError and crash — they are ours.
+            try:
+                self._field_resolution = resolve_field_names(
+                    raw_headers=raw_headers,
+                    field_mapping=self._field_mapping,
+                    columns=None,
+                )
+            except ExternalHeaderError as e:
+                raw_row = {
+                    "__raw_blob_preview__": text_data[:200],
+                    "__encoding__": encoding,
+                }
+                error_msg = f"CSV header could not be resolved: {e}"
+                ctx.record_validation_error(
+                    row=raw_row,
+                    error=error_msg,
+                    schema_mode="parse",
+                    destination=self._on_validation_failure,
+                )
+                if self._on_validation_failure != "discard":
+                    yield SourceRow.quarantined(
+                        row=raw_row,
+                        error=error_msg,
+                        destination=self._on_validation_failure,
+                        source_row_index=0,
+                    )
+                return
+            headers = self._field_resolution.final_headers
+        elif self._columns is not None:
+            self._field_resolution = resolve_field_names(
+                raw_headers=None,
+                field_mapping=self._field_mapping,
+                columns=self._columns,
+            )
+            headers = self._field_resolution.final_headers
+        else:
+            # Headerless CSV with schema-defined field names.
+            # The config validator (validate_field_normalization_options) rejects
+            # headerless+no-columns+no-schema at init time (B4.4), so by the time
+            # we reach here, schema fields must be present.
+            if not self._schema_config.is_observed and self._schema_config.fields:
+                schema_names = [field_def.name for field_def in self._schema_config.fields]
+                self._field_resolution = resolve_field_names(
+                    raw_headers=None,
+                    field_mapping=self._field_mapping,
+                    columns=schema_names,
+                )
+                headers = self._field_resolution.final_headers
+            else:
+                # Defensive guard: config validator rejects headerless+no-columns+
+                # no-schema at init time (B4.4). Reaching here would mean inventing
+                # non-identifier numeric column names ("0","1","2") which violates
+                # the source-boundary invariant. Raise rather than produce bad data.
+                raise AssertionError(
+                    "headerless CSV with no columns and no schema fields: "
+                    "this config should have been rejected by validate_field_normalization_options"
+                )
+
+        expected_count = len(headers)
+
+        # Create contract now that field_resolution is known (CSV path)
+        if self._contract_builder is None and self._format == "csv":
+            initial_contract = create_contract_from_config(
+                self._schema_config,
+                field_resolution=self._field_resolution.resolution_mapping if self._field_resolution else None,
+            )
+            if initial_contract.locked:
+                self.set_schema_contract(initial_contract)
+            else:
+                self._contract_builder = ContractBuilder(initial_contract)
+
+        # Process data rows with per-row error handling.
+        # csv.Error can corrupt parser state, so we stop on csv.Error (matching CSVSource).
+        # Column count mismatches quarantine the individual row and continue.
+        # If first_data_row was peeked (headerless, no schema), process it first.
+        row_source: Iterator[list[str]] = itertools.chain([first_data_row], reader) if first_data_row is not None else reader
+        row_count = 0
+        while True:
+            try:
+                # next(..., sentinel) makes end-of-file ordinary control flow;
+                # the csv.Error boundary handler below still fires on bad CSV.
+                values = next(row_source, _ROW_EXHAUSTED)
+            except csv.Error as e:
+                # csv.Error can leave parser in corrupted state — stop processing
+                row_count += 1
+                physical_line = reader.line_num
+                raw_row = {
+                    "__raw_line__": "(unparseable due to csv.Error)",
+                    "__line_number__": str(physical_line),
+                    "__row_number__": str(row_count),
+                }
+                error_msg = (
+                    f"CSV parse error at line {physical_line}: {e}. "
+                    f"Stopping blob processing — csv.Error can corrupt parser state, "
+                    f"making subsequent rows untrustworthy."
+                )
+                ctx.record_validation_error(
+                    row=raw_row,
+                    error=error_msg,
+                    schema_mode="parse",
+                    destination=self._on_validation_failure,
+                )
+                if self._on_validation_failure != "discard":
+                    yield SourceRow.quarantined(
+                        row=raw_row,
+                        error=error_msg,
+                        destination=self._on_validation_failure,
+                        source_row_index=row_count - 1,
+                    )
+                break
+
+            if values is _ROW_EXHAUSTED:
+                break
+
+            # Skip blank lines
+            if not values:
+                continue
+
+            row_count += 1
+            physical_line = reader.line_num
+
+            # Column count validation — quarantine malformed rows individually
+            if len(values) != expected_count:
+                raw_row = {
+                    "__raw_line__": delimiter.join(values),
+                    "__line_number__": str(physical_line),
+                    "__row_number__": str(row_count),
+                }
+                error_msg = f"CSV parse error at line {physical_line}: expected {expected_count} fields, got {len(values)}"
+                ctx.record_validation_error(
+                    row=raw_row,
+                    error=error_msg,
+                    schema_mode="parse",
+                    destination=self._on_validation_failure,
+                )
+                if self._on_validation_failure != "discard":
+                    yield SourceRow.quarantined(
+                        row=raw_row,
+                        error=error_msg,
+                        destination=self._on_validation_failure,
+                        source_row_index=row_count - 1,
+                    )
+                continue
+
+            # Build row dict — csv.reader returns strings, matching dtype=str behavior
+            row = dict(zip(headers, values, strict=True))
+            yield from self._validate_and_yield(row, ctx, source_row_index=row_count - 1)
+
+    def _load_json_array(self, blob_data: bytes, ctx: SourceContext) -> Iterator[SourceRow]:
+        """Load rows from JSON array blob data.
+
+        Args:
+            blob_data: Raw bytes from blob download.
+            ctx: Plugin context for recording validation errors.
+
+        Yields:
+            SourceRow for each row (valid or quarantined).
+
+        """
+        # Access typed config fields directly - they have defaults from JSONOptions
+        encoding = self._json_options.encoding
+        data_key = self._json_options.data_key
+
+        def _record_file_level_error(error_msg: str, schema_mode: str) -> Iterator[SourceRow]:
+            raw_row = {
+                "container": self._container,
+                "blob_path": self._blob_path,
+                "error": error_msg,
+            }
+            ctx.record_validation_error(
+                row=raw_row,
+                error=error_msg,
+                schema_mode=schema_mode,
+                destination=self._on_validation_failure,
+            )
+            if self._on_validation_failure != "discard":
+                yield SourceRow.quarantined(
+                    row=raw_row,
+                    error=error_msg,
+                    destination=self._on_validation_failure,
+                    source_row_index=0,
+                )
+
+        # THEIR DATA: JSON parsing - quarantine failures at boundary
+        try:
+            text_data = blob_data.decode(encoding)
+        except UnicodeDecodeError as e:
+            error_msg = f"Failed to decode blob as {encoding}: {e}"
+            yield from _record_file_level_error(error_msg, "parse")
+            return
+
+        try:
+            data = json.loads(text_data, parse_constant=_reject_nonfinite_constant)
+        except (json.JSONDecodeError, ValueError) as e:
+            error_msg = f"Invalid JSON in blob: {e}"
+            yield from _record_file_level_error(error_msg, "parse")
+            return
+
+        # Extract from nested key if specified
+        if data_key:
+            if not isinstance(data, dict):
+                error_msg = f"Cannot extract data_key '{data_key}': expected JSON object, got {type(data).__name__}"
+                yield from _record_file_level_error(error_msg, "parse")
+                return
+            if data_key not in data:
+                error_msg = f"data_key '{data_key}' not found in JSON object"
+                yield from _record_file_level_error(error_msg, "parse")
+                return
+            data = data[data_key]
+
+        if not isinstance(data, list):
+            error_msg = f"Expected JSON array, got {type(data).__name__}"
+            yield from _record_file_level_error(error_msg, "parse")
+            return
+
+        for source_row_index, row in enumerate(data):
+            yield from self._validate_and_yield(row, ctx, source_row_index=source_row_index)
+
+    def _load_jsonl(self, blob_data: bytes, ctx: SourceContext) -> Iterator[SourceRow]:
+        """Load rows from JSONL (newline-delimited JSON) blob data.
+
+        Args:
+            blob_data: Raw bytes from blob download.
+            ctx: Plugin context for recording validation errors.
+
+        Yields:
+            SourceRow for each row (valid or quarantined).
+        """
+        # Access typed config field directly - it has a default from JSONOptions
+        encoding = self._json_options.encoding
+
+        non_empty_count = 0
+        line_num = 0
+        try:
+            text_stream = io.TextIOWrapper(
+                io.BytesIO(blob_data),
+                encoding=encoding,
+                errors="surrogateescape",
+                newline="",
+            )
+            for line_num, raw_line in enumerate(text_stream, start=1):
+                line = raw_line.strip()
+                if not line:  # Skip empty lines
+                    continue
+
+                non_empty_count += 1
+
+                if _contains_surrogateescape_chars(raw_line):
+                    raw_bytes = _surrogateescape_line_to_bytes(raw_line.rstrip("\r\n"), encoding)
+                    raw_row = {
+                        "__raw_bytes_hex__": raw_bytes.hex(),
+                        "__line_number__": line_num,
+                    }
+                    error_msg = f"JSON parse error at line {line_num}: invalid {encoding} encoding"
+                    ctx.record_validation_error(
+                        row=raw_row,
+                        error=error_msg,
+                        schema_mode="parse",
+                        destination=self._on_validation_failure,
+                    )
+                    if self._on_validation_failure != "discard":
+                        yield SourceRow.quarantined(
+                            row=raw_row,
+                            error=error_msg,
+                            destination=self._on_validation_failure,
+                            source_row_index=line_num - 1,
+                        )
+                    continue
+
+                # Catch JSON parse errors at the trust boundary
+                try:
+                    row = json.loads(line, parse_constant=_reject_nonfinite_constant)
+                except (json.JSONDecodeError, ValueError) as e:
+                    # External data parse failure - quarantine, don't crash
+                    # Store raw line + metadata for audit traceability
+                    raw_row = {"__raw_line__": line, "__line_number__": str(line_num)}
+                    error_msg = f"JSON parse error at line {line_num}: {e}"
+
+                    ctx.record_validation_error(
+                        row=raw_row,
+                        error=error_msg,
+                        schema_mode="parse",  # Distinct from schema validation
+                        destination=self._on_validation_failure,
+                    )
+
+                    if self._on_validation_failure != "discard":
+                        yield SourceRow.quarantined(
+                            row=raw_row,
+                            error=error_msg,
+                            destination=self._on_validation_failure,
+                            source_row_index=line_num - 1,
+                        )
+                    continue
+
+                yield from self._validate_and_yield(row, ctx, source_row_index=line_num - 1)
+        except UnicodeDecodeError as e:
+            # Some codecs can still raise on truncated byte sequences while
+            # reading. Treat that as a line-level external parse failure.
+            error_line = line_num + 1
+            error_msg = f"JSON parse error at line {error_line}: invalid {encoding} encoding ({e})"
+            raw_row = {
+                "container": self._container,
+                "blob_path": self._blob_path,
+                "__line_number__": error_line,
+            }
+            ctx.record_validation_error(
+                row=raw_row,
+                error=error_msg,
+                schema_mode="parse",
+                destination=self._on_validation_failure,
+            )
+            if self._on_validation_failure != "discard":
+                yield SourceRow.quarantined(
+                    row=raw_row,
+                    error=error_msg,
+                    destination=self._on_validation_failure,
+                    source_row_index=error_line - 1,
+                )
+            return
+
+    def _prepare_normalized_row_keys(self, row: Any) -> tuple[Mapping[str, JsonValue], FieldResolution]:
+        """Normalize JSON/JSONL object keys at the source boundary."""
+        try:
+            row_items = list(row.items())
+        except AttributeError:
+            # A JSON/JSONL element that is not an object (e.g. a bare primitive
+            # in an array) is Tier-3 bad source data, not an our-code fault.
+            # Raise the external-field-boundary marker (ExternalHeaderError, a
+            # ValueError subclass) so _validate_and_yield can discriminate this
+            # quarantine-worthy data fault from the plain ValueErrors that
+            # resolve_field_names raises for config/our-code faults, which must
+            # crash. Mirrors the CSV header path's ExternalHeaderError vs plain
+            # ValueError split (see _load_csv and field_normalization.py).
+            raise ExternalHeaderError(f"Expected JSON object, got {type(row).__name__}") from None
+
+        raw_keys = [key for key, _ in row_items]
+
+        if self._field_resolution is None:
+            prospective_resolution = self._resolve_json_field_names(raw_keys)
+
+            if self._contract_builder is None and self.get_schema_contract() is None:
+                initial_contract = create_contract_from_config(
+                    self._schema_config,
+                    field_resolution=prospective_resolution.resolution_mapping,
+                )
+                self._contract_builder = ContractBuilder(initial_contract)
+        else:
+            prospective_resolution = self._field_resolution
+
+        mapping = prospective_resolution.resolution_mapping
+        normalized: dict[str, JsonValue] = {}
+        new_raw_keys: list[str] = []
+        for key, value in row_items:
+            if key in mapping:
+                normalized[mapping[key]] = value
+            else:
+                # New key not in the cached resolution — normalize it, then apply
+                # field_mapping by normalized name so a mapped key that first appears
+                # in a LATER row still maps to its target. (Relaxing the strict resolve
+                # check for sparse records unmasks this path — elspeth-bdcdce6f58.)
+                nk = normalize_field_name(key)
+                final_name = self._field_mapping[nk] if self._field_mapping and nk in self._field_mapping else nk
+                normalized[final_name] = value
+                new_raw_keys.append(key)
+
+        if new_raw_keys:
+            # Extend with just the new raw keys while preserving B4.3 union
+            # semantics. Rebuilding the full historical key set on every sparse
+            # row is quadratic in attacker-controlled fields.
+            try:
+                prospective_resolution = extend_field_resolution(
+                    prospective_resolution,
+                    raw_headers=new_raw_keys,
+                    field_mapping=self._field_mapping,
+                )
+            except FieldMappingCollisionError as exc:
+                raise ExternalHeaderError(str(exc)) from exc
+
+        return normalized, prospective_resolution
+
+    def _normalize_row_keys(self, row: Any) -> Mapping[str, Any]:
+        """Normalize and commit field resolution for direct trusted callers."""
+        normalized, prospective_resolution = self._prepare_normalized_row_keys(row)
+        self._field_resolution = prospective_resolution
+        return normalized
+
+    def _resolve_json_field_names(self, raw_keys: list[str]) -> FieldResolution:
+        """Resolve sparse JSON keys, classifying row-created collisions as data faults."""
+        try:
+            return resolve_field_names(
+                raw_headers=raw_keys,
+                field_mapping=self._field_mapping,
+                columns=None,
+                require_all_mapping_keys=False,  # sparse JSON records may omit optional mapped keys
+            )
+        except FieldMappingCollisionError as exc:
+            raise ExternalHeaderError(str(exc)) from exc
+
+    def _validate_and_yield(self, row: Any, ctx: SourceContext, *, source_row_index: int) -> Iterator[SourceRow]:
+        """Validate a row and yield if valid, otherwise quarantine.
+
+        For FLEXIBLE/OBSERVED schemas, the first valid row triggers type inference and
+        locks the contract. Subsequent rows validate against the locked contract.
+
+        Args:
+            row: Row data to validate. May be non-dict for malformed external
+                 data (e.g., JSON arrays containing primitives).
+            ctx: Plugin context for recording validation errors.
+
+        Yields:
+            SourceRow.valid() if valid, SourceRow.quarantined() if invalid.
+        """
+        prospective_resolution: FieldResolution | None
+        try:
+            if self._format in ("json", "jsonl"):
+                row_to_validate, prospective_resolution = self._prepare_normalized_row_keys(row)
+            else:
+                row_to_validate = row
+                prospective_resolution = self._field_resolution
+        except ExternalHeaderError as e:
+            # Tier-3 data faults only: a non-object row, external-key
+            # normalization failure, or a row-created mapping collision reclassified
+            # by _resolve_json_field_names. Config/our-code faults — bad
+            # field_mapping keys/values or a normalization-algorithm bug — remain
+            # plain ValueError and must crash, so they are NOT caught here. This
+            # mirrors the CSV header path's ExternalHeaderError/ValueError split.
+            error_msg = f"Field normalization failed: {e}"
+            ctx.record_validation_error(
+                row=row,
+                error=error_msg,
+                schema_mode="field_normalization",
+                destination=self._on_validation_failure,
+            )
+            if self._on_validation_failure != "discard":
+                yield SourceRow.quarantined(
+                    row=row,
+                    error=error_msg,
+                    destination=self._on_validation_failure,
+                    source_row_index=source_row_index,
+                )
+            return
+
+        try:
+            # Validate and potentially coerce row data
+            validated = self._schema_class.model_validate(row_to_validate)
+            validated_row = validated.to_row()
+
+            # For FLEXIBLE/OBSERVED schemas, process first valid row to lock contract
+            if self._contract_builder is not None and not self._first_valid_row_processed:
+                if prospective_resolution is None:
+                    field_resolution_map: Mapping[str, str] = {k: k for k in validated_row}
+                else:
+                    field_resolution_map = prospective_resolution.resolution_mapping
+
+                self._contract_builder.process_first_row(validated_row, field_resolution_map)
+                self.set_schema_contract(self._contract_builder.contract)
+                self._first_valid_row_processed = True
+
+            # Validate against locked contract to catch type drift on inferred
+            # fields. Pydantic extra="allow" accepts any type for extras — the
+            # contract knows inferred types from the first row and enforces here.
+            contract = self.require_schema_contract()
+            if self._format in ("json", "jsonl") and self._contract_builder is not None and contract.mode in ("OBSERVED", "FLEXIBLE"):
+                # JSON/JSONL blobs can be sparse. If a later row emits a new
+                # normalized key, the row contract must own its original-name
+                # and type metadata before validation and yield.
+                if prospective_resolution is None:
+                    raise ValueError("field_resolution must be established before sparse-field contract inference")
+                contract = self._contract_builder.process_sparse_fields(
+                    validated_row,
+                    prospective_resolution.resolution_mapping,
+                )
+                self.set_schema_contract(contract)
+
+            self._field_resolution = prospective_resolution
+            if contract.locked:
+                violations = contract.validate(validated_row)
+                if violations:
+                    error_msg = "; ".join(str(v) for v in violations)
+                    ctx.record_validation_error(
+                        row=validated_row,
+                        error=error_msg,
+                        schema_mode=self._schema_config.mode,
+                        destination=self._on_validation_failure,
+                    )
+                    if self._on_validation_failure != "discard":
+                        yield SourceRow.quarantined(
+                            row=validated_row,
+                            error=error_msg,
+                            destination=self._on_validation_failure,
+                            source_row_index=source_row_index,
+                        )
+                    return
+
+            yield SourceRow.valid(validated_row, contract=contract, source_row_index=source_row_index)
+        except ContractFieldLimitExceeded as e:
+            ctx.record_validation_error(
+                row=row_to_validate,
+                error=str(e),
+                schema_mode=self._schema_config.mode,
+                destination=self._on_validation_failure,
+            )
+            if self._on_validation_failure != "discard":
+                yield SourceRow.quarantined(
+                    row=row_to_validate,
+                    error=str(e),
+                    destination=self._on_validation_failure,
+                    source_row_index=source_row_index,
+                )
+        except ValidationError as e:
+            # Record validation failure in audit trail
+            # This is a trust boundary: external data may be invalid.
+            # Input-free text: str(e) echoes the offending Tier-3 value
+            # into audit surfaces (elspeth-a300402c58).
+            error_text = safe_validation_error_text(e, self._schema_class)
+            ctx.record_validation_error(
+                row=row_to_validate,
+                error=error_text,
+                schema_mode=self._schema_config.mode,
+                destination=self._on_validation_failure,
+            )
+
+            # Yield quarantined row for routing to configured sink
+            # If "discard", don't yield - row is intentionally dropped
+            if self._on_validation_failure != "discard":
+                yield SourceRow.quarantined(
+                    row=row_to_validate,
+                    error=error_text,
+                    destination=self._on_validation_failure,
+                    source_row_index=source_row_index,
+                )
+
+    def close(self) -> None:
+        """Release the owned Azure blob client exactly once."""
+        blob_client = self._blob_client
+        self._blob_client = None
+        if blob_client is not None:
+            blob_client.close()
+
+    def get_field_resolution(self) -> tuple[Mapping[str, str], str | None] | None:
+        """Return field resolution mapping for audit trail."""
+        if self._field_resolution is None:
+            return None
+
+        return (
+            self._field_resolution.resolution_mapping,
+            self._field_resolution.normalization_version,
+        )

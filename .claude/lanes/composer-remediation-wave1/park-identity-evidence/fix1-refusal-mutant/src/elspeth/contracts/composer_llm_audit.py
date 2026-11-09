@@ -1,0 +1,446 @@
+"""Composer LLM-call audit primitives (L0).
+
+Captures metadata for each outbound model call made by the web composer.
+The record deliberately stores request/response metadata, integrity hashes,
+and provider-supplied reasoning artifacts only when the provider returns them.
+It never stores raw prompts, system prompt text, tool specs, or full provider
+responses. Construction sites in L3 compute canonical hashes for the actual
+messages/tools payloads sent to LiteLLM.
+
+Layer: L0 (contracts). Imports nothing above contracts.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+from dataclasses import dataclass, field, fields
+from datetime import datetime
+from enum import StrEnum
+from typing import Any, Final, Literal, Protocol
+
+from elspeth.contracts.composer_audit import PrivateFailureFacts, PrivateReceivedDiagnostic
+from elspeth.contracts.composer_provider_context import PrivateProviderContext
+from elspeth.contracts.freeze import deep_thaw, freeze_fields, require_int
+
+ComposerLLMProviderCostSource = Literal[
+    "not_available",
+    "response_usage.cost",
+    "_hidden_params.response_cost",
+    "litellm.cost_per_token",
+]
+
+PROVIDER_COST_SOURCE_NOT_AVAILABLE: ComposerLLMProviderCostSource = "not_available"
+PROVIDER_COST_SOURCE_RESPONSE_USAGE_COST: ComposerLLMProviderCostSource = "response_usage.cost"
+PROVIDER_COST_SOURCE_HIDDEN_PARAMS_RESPONSE_COST: ComposerLLMProviderCostSource = "_hidden_params.response_cost"
+PROVIDER_COST_SOURCE_COST_PER_TOKEN: ComposerLLMProviderCostSource = "litellm.cost_per_token"
+_VALID_PROVIDER_COST_SOURCES = {
+    PROVIDER_COST_SOURCE_NOT_AVAILABLE,
+    PROVIDER_COST_SOURCE_RESPONSE_USAGE_COST,
+    PROVIDER_COST_SOURCE_HIDDEN_PARAMS_RESPONSE_COST,
+    PROVIDER_COST_SOURCE_COST_PER_TOKEN,
+}
+
+# Recorded in place of a served-endpoint name that is present but outside the
+# closed provider-name shape. Fixed and value-free: provider bytes that fail
+# the shape never reach the audit row.
+PROVIDER_SERVED_UNRECOGNISED: Final[str] = "unrecognised"
+
+# The closed shape of an OpenRouter served-endpoint name (the response's
+# top-level ``provider`` field): 1-64 characters, letters, digits, space, dot,
+# underscore and hyphen, starting and ending with a letter or digit. Every
+# ``provider_name`` the OpenRouter endpoints API listed for the measured
+# planner, advisor and default models on 2026-09-23 fits it (longest: 14).
+_PROVIDER_SERVED_SHAPE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9 ._-]{0,62}[A-Za-z0-9])?")
+
+
+def is_provider_served_name(value: str) -> bool:
+    """Return whether ``value`` has the closed served-endpoint-name shape."""
+    return _PROVIDER_SERVED_SHAPE.fullmatch(value) is not None
+
+
+class ComposerLLMCallStatus(StrEnum):
+    """Outcome of one outbound composer model call."""
+
+    SUCCESS = "success"
+    TIMEOUT = "timeout"
+    API_ERROR = "api_error"
+    AUTH_ERROR = "auth_error"
+    BAD_REQUEST_ERROR = "bad_request_error"
+    MALFORMED_RESPONSE = "malformed_response"
+    CANCELLED = "cancelled"
+
+
+class ToolContractDialect(StrEnum):
+    """The shape of the tool list a composer model call was sent.
+
+    ``NONE`` is the flat registry schema (plus the web set_pipeline
+    envelope) with no ``strict`` key: today's bytes. ``OPENAI_STRICT`` makes
+    every optional property of a strict-capable tool required and nullable,
+    and stamps every tool with an explicit ``strict`` flag. The web wire
+    projection builds one tool list per dialect; the LLM-call audit record
+    reads the dialect, so the type lives here rather than under ``web/``.
+    """
+
+    OPENAI_STRICT = "openai_strict"
+    NONE = "none"
+
+
+def _require_component_bytes(value: object, field_name: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be int, got {type(value).__name__}: {value!r}")
+    if value < 0:
+        raise ValueError(f"{field_name} must be >= 0, got {value}")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class ComposerLLMRequestByteSplit:
+    """Per-component UTF-8 byte sizes of one composer model call's request.
+
+    Measured at the capture point from the exact objects the call record
+    hashes (``messages_hash`` / ``tools_spec_hash``), which are the objects
+    handed to the provider client, without a second serialization:
+
+    - ``message_bytes``: one entry per sent message, in send order. A message
+      whose ``content`` is a string counts that content's UTF-8 bytes; any
+      other message (an assistant tool-call turn, structured content) counts
+      its canonical JSON encoding as hashed. For the pipeline planner the
+      first three are the rendered skill (system), the catalog reference block
+      (user 1: authoring aids and schema-contract evidence) and the provider
+      request (user 2); later entries are the accumulated continuation.
+    - ``tools_bytes``: the canonical JSON encoding of the whole tool-definition
+      array (the bytes ``tools_spec_hash`` covers), or ``None`` when the call
+      carried no tool list.
+    - ``total_bytes``: the sum of the components. Wire framing (roles, keys,
+      separators) is deliberately not accounted; a total that is not the sum
+      is refused.
+
+    Sizes are bytes, not tokens. No tokenizer for the routed models is
+    available in-process, so no per-component token count is recorded; the
+    provider's ``prompt_tokens`` on the call record is the only token total.
+    """
+
+    message_bytes: tuple[int, ...]
+    tools_bytes: int | None
+    total_bytes: int
+
+    def __post_init__(self) -> None:
+        if type(self.message_bytes) is not tuple:
+            raise TypeError(f"message_bytes must be tuple, got {type(self.message_bytes).__name__}")
+        for index, size in enumerate(self.message_bytes):
+            _require_component_bytes(size, f"message_bytes[{index}]")
+        if self.tools_bytes is not None:
+            _require_component_bytes(self.tools_bytes, "tools_bytes")
+        if type(self.total_bytes) is not int:
+            raise TypeError(f"total_bytes must be int, got {type(self.total_bytes).__name__}: {self.total_bytes!r}")
+        expected_total = sum(self.message_bytes) + (0 if self.tools_bytes is None else self.tools_bytes)
+        if self.total_bytes != expected_total:
+            raise ValueError(f"total_bytes {self.total_bytes} does not reconcile with the sum of its components ({expected_total})")
+
+    def to_dict(self) -> dict[str, list[int] | int | None]:
+        """JSON-friendly dict for sidecar serialization."""
+        return {
+            "message_bytes": list(self.message_bytes),
+            "tools_bytes": self.tools_bytes,
+            "total_bytes": self.total_bytes,
+        }
+
+
+def _require_non_empty_str(value: object, field_name: str, *, optional: bool = False) -> None:
+    if optional and value is None:
+        return
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be str, got {type(value).__name__}: {value!r}")
+    if not value.strip():
+        raise ValueError(f"{field_name} must be non-empty")
+
+
+def _require_datetime(value: object, field_name: str) -> None:
+    if type(value) is not datetime:
+        raise TypeError(f"{field_name} must be datetime, got {type(value).__name__}: {value!r}")
+
+
+def _require_optional_finite_number(value: object, field_name: str) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{field_name} must be int or float, got {type(value).__name__}: {value!r}")
+    if not math.isfinite(float(value)):
+        raise ValueError(f"{field_name} must be finite, got {value!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class ComposerLLMCall:
+    """One outbound LLM call as recorded for composer audit.
+
+    ``messages_hash`` is the canonical hash of the exact
+    ``request.messages`` array sent to LiteLLM, including system prompt,
+    accumulated history, assistant/tool-call turns, and the current user turn.
+    It is an integrity check over the bytes sent to LiteLLM, not a stable
+    identifier across deployments.
+
+    ``tools_spec_hash`` is the canonical hash of the exact ``tools=[...]``
+    specification sent to LiteLLM, or ``None`` when the call did not carry
+    tools (for example diagnostics text generation).
+
+    ``declared_tool_names`` is the ordered, public-safe projection of the
+    exact transmitted tool list. It proves declaration, not selection;
+    ``tools_spec_hash`` remains the integrity proof over the complete specs.
+
+    Cache-token fields (``cached_prompt_tokens``,
+    ``cache_creation_input_tokens``, ``cache_read_input_tokens``) capture
+    provider-reported prompt-cache statistics. They default to ``None``
+    because most providers do not report cache metadata when caching is
+    not active for the call. An absent cache field stays ``None`` rather
+    than coerced to zero: absence is evidence, and a fabricated zero is
+    indistinguishable from a measured one. An auditor can therefore
+    distinguish "no cache reported" from "cache reported zero hits."
+
+    ``reasoning_tokens`` and the reasoning artifact fields capture
+    provider-reported reasoning metadata from APIs that expose it (for
+    example OpenRouter ``message.reasoning`` / ``message.reasoning_details``
+    and LiteLLM ``reasoning_content`` / ``thinking_blocks`` shapes). These
+    fields are hidden audit data for operator debugging of tool-call and
+    config failures; normal session-message APIs must not surface them as
+    assistant chat content. Missing fields stay ``None`` rather than being
+    fabricated.
+
+    ``finish_reason`` is the provider's own termination signal for the call,
+    stored as the **raw provider string, verbatim** — never normalised,
+    mapped, or coerced into an ELSPETH vocabulary. It is the only audit
+    evidence that distinguishes a completed answer (``stop``) from one the
+    provider truncated (``length``) or refused (``content_filter``); without
+    it a truncated composer turn is indistinguishable from a short one.
+    Recording the string as-received means an unrecognised or newly
+    introduced provider value survives to the audit trail intact rather than
+    being flattened into a known bucket. A response that carries no finish
+    reason stays ``None`` — the same fabrication policy the cache and
+    reasoning fields follow. This field is *evidence only*: unlike the
+    pipeline LLM transform, the composer does not treat a non-``stop`` value
+    as an error, so it makes truncation visible without changing control flow.
+
+    Provider-authored strings (``model_returned``, ``provider_request_id``,
+    ``finish_reason``, ``error_message``, ``reasoning_content``) arrive
+    already bounded: ``web/composer/llm_response_parsing.build_llm_call_record``
+    is the sole construction site in ``src`` and caps each one at extraction,
+    so the envelope, the rendered summary, and the sidecar all inherit one
+    bounded value. This contract deliberately does **not** re-check their
+    length. Rejecting an oversized field would raise instead of recording —
+    discarding the very evidence that the endpoint misbehaved — and a second
+    bound in a second place would be a second limit to keep in sync. The
+    guarantee is therefore capture-point-enforced, not contract-enforced: a
+    record constructed directly (a test, or future code that bypasses
+    ``build_llm_call_record``) is not bounded by anything here.
+
+    ``temperature`` and ``seed`` capture the sampling parameters actually sent
+    on composer LLM requests. Both are operator-set
+    (``WebSettings.composer_temperature`` / ``composer_seed``) and recorded as
+    sent: the configured value when set, or ``None`` when the operator left it
+    unset and it was omitted from the request. The audit row mirrors the request
+    so a reviewer can correlate failures with the precise sampling regime.
+
+    ``provider_served`` is the endpoint that served the call, as OpenRouter
+    names it in the response's top-level ``provider`` field (one model id is
+    routed across many endpoints). It is provider-authored, so unlike the
+    strings above it is persisted only in a closed, public-safe shape: the
+    capture point records a conforming name verbatim, any other present value
+    as the fixed :data:`PROVIDER_SERVED_UNRECOGNISED` token, and absence as
+    ``None``. This contract enforces the same shape, because the persisted
+    audit projection exposes the field.
+
+    ``tool_contract_dialect`` and ``strict_tool_count`` say which
+    :class:`ToolContractDialect` the transmitted tool list was sent under and
+    how many of its tools carried ``strict: true``. The capture point derives
+    both from the same ``tools`` list that ``tools_spec_hash`` covers. They are
+    both ``None`` when the call carried no tools, and a ``none`` dialect always
+    has a count of ``0``.
+
+    ``request_byte_split`` is the per-component size of what the call sent
+    (:class:`ComposerLLMRequestByteSplit`): each message's and the tool
+    list's UTF-8 byte length and their sum. It is derived at the capture point
+    from the same serialization the two hashes use, carries sizes only (never
+    content), and is ``None`` only on a record constructed without it.
+    """
+
+    model_requested: str
+    model_returned: str | None
+    status: ComposerLLMCallStatus
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    latency_ms: int
+    provider_request_id: str | None
+    messages_hash: str
+    tools_spec_hash: str | None
+    declared_tool_names: tuple[str, ...]
+    started_at: datetime
+    finished_at: datetime
+    error_class: str | None
+    error_message: str | None
+    temperature: float | None
+    seed: int | None
+    finish_reason: str | None = None
+    cached_prompt_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    reasoning_content: str | None = None
+    reasoning_details: Any | None = None
+    thinking_blocks: Any | None = None
+    provider_cost: float | None = None
+    # Catalog identity configured for fallback pricing, independent of routing.
+    pricing_model: str | None = None
+    provider_cost_source: ComposerLLMProviderCostSource = PROVIDER_COST_SOURCE_NOT_AVAILABLE
+    max_completion_tokens_requested: int | None = None
+    planner_policy_hash: str | None = None
+    planner_call_ordinal: int | None = None
+    call_id: str | None = None
+    provider_served: str | None = None
+    tool_contract_dialect: ToolContractDialect | None = None
+    strict_tool_count: int | None = None
+    request_byte_split: ComposerLLMRequestByteSplit | None = None
+    private_failure: PrivateFailureFacts | None = field(default=None, repr=False)
+    private_diagnostics: tuple[PrivateReceivedDiagnostic, ...] = field(default=(), repr=False)
+    private_request: PrivateProviderContext | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.private_request is not None and type(self.private_request) is not PrivateProviderContext:
+            raise TypeError("LLM private request context must be owned")
+        if self.private_failure is not None and type(self.private_failure) is not PrivateFailureFacts:
+            raise TypeError("LLM private failure facts must be owned")
+        if type(self.private_diagnostics) is not tuple or any(
+            type(item) is not PrivateReceivedDiagnostic for item in self.private_diagnostics
+        ):
+            raise TypeError("LLM private diagnostics must be an owned tuple")
+        if type(self.status) is not ComposerLLMCallStatus:
+            raise TypeError(f"status must be ComposerLLMCallStatus, got {type(self.status).__name__}: {self.status!r}")
+        if self.request_byte_split is not None and type(self.request_byte_split) is not ComposerLLMRequestByteSplit:
+            raise TypeError(f"request_byte_split must be ComposerLLMRequestByteSplit or None, got {type(self.request_byte_split).__name__}")
+        if self.request_byte_split is not None and (self.request_byte_split.tools_bytes is None) != (self.tools_spec_hash is None):
+            raise ValueError("request_byte_split.tools_bytes and tools_spec_hash must agree on whether tools were sent")
+        if self.tool_contract_dialect is not None and type(self.tool_contract_dialect) is not ToolContractDialect:
+            raise TypeError(f"tool_contract_dialect must be ToolContractDialect or None, got {type(self.tool_contract_dialect).__name__}")
+        if self.strict_tool_count is not None:
+            if type(self.strict_tool_count) is not int:
+                raise TypeError(f"strict_tool_count must be int or None, got {type(self.strict_tool_count).__name__}")
+            if self.strict_tool_count < 0:
+                raise ValueError(f"strict_tool_count must be >= 0, got {self.strict_tool_count}")
+        if (self.tool_contract_dialect is None) != (self.strict_tool_count is None):
+            raise ValueError("tool_contract_dialect and strict_tool_count must be supplied together")
+        if self.tool_contract_dialect is ToolContractDialect.NONE and self.strict_tool_count != 0:
+            raise ValueError("a tool list sent under the none dialect carries no strict tools")
+        _require_non_empty_str(self.model_requested, "model_requested")
+        _require_non_empty_str(self.pricing_model, "pricing_model", optional=True)
+        _require_non_empty_str(self.call_id, "call_id", optional=True)
+        _require_non_empty_str(self.model_returned, "model_returned", optional=True)
+        _require_non_empty_str(self.provider_request_id, "provider_request_id", optional=True)
+        _require_non_empty_str(self.provider_served, "provider_served", optional=True)
+        if self.provider_served is not None and not is_provider_served_name(self.provider_served):
+            raise ValueError("provider_served must match the closed served-endpoint-name shape")
+        # An empty/whitespace finish_reason is not "the provider said nothing"
+        # — absence is ``None``. A blank string reaching here is a defect in
+        # the extraction site, not provider data worth recording.
+        _require_non_empty_str(self.finish_reason, "finish_reason", optional=True)
+        _require_non_empty_str(self.messages_hash, "messages_hash")
+        _require_non_empty_str(self.tools_spec_hash, "tools_spec_hash", optional=True)
+        if type(self.declared_tool_names) is not tuple:
+            raise TypeError(f"declared_tool_names must be tuple, got {type(self.declared_tool_names).__name__}")
+        for name in self.declared_tool_names:
+            if type(name) is not str or not name:
+                raise ValueError("declared_tool_names entries must be non-empty strings")
+            if not ("a" <= name[0] <= "z") or any(
+                not (("a" <= character <= "z") or ("0" <= character <= "9") or character == "_") for character in name
+            ):
+                raise ValueError("declared_tool_names entries must be tool names containing lowercase letters, digits, and underscores")
+        if len(set(self.declared_tool_names)) != len(self.declared_tool_names):
+            raise ValueError("declared_tool_names entries must be unique")
+        if self.declared_tool_names and self.tools_spec_hash is None:
+            raise ValueError("declared_tool_names require tools_spec_hash")
+        _require_datetime(self.started_at, "started_at")
+        _require_datetime(self.finished_at, "finished_at")
+        if self.finished_at < self.started_at:
+            raise ValueError("finished_at must be >= started_at")
+        require_int(self.prompt_tokens, "prompt_tokens", optional=True, min_value=0)
+        require_int(self.completion_tokens, "completion_tokens", optional=True, min_value=0)
+        require_int(self.total_tokens, "total_tokens", optional=True, min_value=0)
+        require_int(self.latency_ms, "latency_ms", min_value=0)
+        require_int(self.seed, "seed", optional=True)
+        require_int(self.cached_prompt_tokens, "cached_prompt_tokens", optional=True, min_value=0)
+        require_int(self.cache_creation_input_tokens, "cache_creation_input_tokens", optional=True, min_value=0)
+        require_int(self.cache_read_input_tokens, "cache_read_input_tokens", optional=True, min_value=0)
+        require_int(self.reasoning_tokens, "reasoning_tokens", optional=True, min_value=0)
+        require_int(
+            self.max_completion_tokens_requested,
+            "max_completion_tokens_requested",
+            optional=True,
+            min_value=1,
+        )
+        require_int(self.planner_call_ordinal, "planner_call_ordinal", optional=True, min_value=1)
+        _require_non_empty_str(self.planner_policy_hash, "planner_policy_hash", optional=True)
+        if self.planner_policy_hash is not None and (
+            len(self.planner_policy_hash) != 64 or any(character not in "0123456789abcdef" for character in self.planner_policy_hash)
+        ):
+            raise ValueError("planner_policy_hash must be exactly 64 lowercase hexadecimal characters")
+        planner_evidence = (
+            self.max_completion_tokens_requested,
+            self.planner_policy_hash,
+            self.planner_call_ordinal,
+        )
+        if any(value is not None for value in planner_evidence) and not all(value is not None for value in planner_evidence):
+            raise ValueError("planner request evidence fields must be supplied together")
+        _require_optional_finite_number(self.temperature, "temperature")
+        if self.temperature is not None:
+            object.__setattr__(self, "temperature", float(self.temperature))
+        _require_non_empty_str(self.error_class, "error_class", optional=True)
+        _require_non_empty_str(self.error_message, "error_message", optional=True)
+        if self.status is ComposerLLMCallStatus.SUCCESS and (self.error_class is not None or self.error_message is not None):
+            raise ValueError("SUCCESS calls must not include error_class or error_message")
+        if self.status is not ComposerLLMCallStatus.SUCCESS and (self.error_class is None or self.error_message is None):
+            raise ValueError("non-success calls must include error_class and error_message")
+        if self.reasoning_content is not None and type(self.reasoning_content) is not str:
+            raise TypeError(f"reasoning_content must be str or None, got {type(self.reasoning_content).__name__}")
+        freeze_fields(self, "declared_tool_names", "reasoning_details", "thinking_blocks")
+        if self.provider_cost_source not in _VALID_PROVIDER_COST_SOURCES:
+            raise ValueError(
+                f"provider_cost_source must be one of {sorted(_VALID_PROVIDER_COST_SOURCES)}, got {self.provider_cost_source!r}"
+            )
+        if self.provider_cost is not None:
+            if (
+                type(self.provider_cost) is bool
+                or type(self.provider_cost) not in (int, float)
+                or not math.isfinite(float(self.provider_cost))
+                or self.provider_cost < 0
+            ):
+                raise ValueError("provider_cost must be a finite non-negative number or None")
+            object.__setattr__(self, "provider_cost", float(self.provider_cost))
+        if self.provider_cost is None and self.provider_cost_source != PROVIDER_COST_SOURCE_NOT_AVAILABLE:
+            raise ValueError("provider_cost_source must be not_available when provider_cost is None")
+        if self.provider_cost is not None and self.provider_cost_source == PROVIDER_COST_SOURCE_NOT_AVAILABLE:
+            raise ValueError("provider_cost_source must identify the provider metadata field when provider_cost is set")
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-friendly dict for sidecar serialization."""
+        raw = {
+            field.name: deep_thaw(getattr(self, field.name))
+            for field in fields(self)
+            if field.name not in {"private_failure", "private_diagnostics", "private_request"}
+        }
+        raw["status"] = self.status.value
+        raw["tool_contract_dialect"] = self.tool_contract_dialect.value if self.tool_contract_dialect is not None else None
+        raw["request_byte_split"] = self.request_byte_split.to_dict() if self.request_byte_split is not None else None
+        raw["started_at"] = self.started_at.isoformat()
+        raw["finished_at"] = self.finished_at.isoformat()
+        return raw
+
+
+class ComposerLLMCallRecorder(Protocol):
+    """Append-only sink for :class:`ComposerLLMCall` records."""
+
+    def record_llm_call(self, call: ComposerLLMCall) -> None:
+        """Persist or buffer one LLM call record."""
+        ...
+
+    def resolve_session(self, session_id: str) -> None:
+        """Hint that the session_id is now resolved."""
+        ...

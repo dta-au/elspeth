@@ -1,0 +1,13 @@
+{
+  "source": "https://chroma-onnx-models.s3.amazonaws.com/all-MiniLM-L6-v2/onnx.tar.gz",
+  "sha256": "913d7300ceae3b2dbc2c50d1de4baacab4be7b9380491c27fab7418616a16ec3",
+  "expected_from": "installed chromadb 1.5.5 ONNXMiniLM_L6_V2._MODEL_SHA256",
+  "required_files": [
+    "config.json",
+    "model.onnx",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
+    "tokenizer.json",
+    "vocab.txt"
+  ]
+}

@@ -1,0 +1,7 @@
+# Temporary source-symbol inventory allowlist.
+#
+# Keep this narrow: the inventory is meant to catch downstream consumers of
+# `is_terminal` and brittle outcome/path string checks that the RowOutcome lint
+# guard cannot see.
+
+per_file_rules: []

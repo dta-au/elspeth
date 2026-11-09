@@ -1,0 +1,316 @@
+// ============================================================================
+// PluginCard (Phase 7B — reference, not toolkit)
+//
+// Renders one plugin as a reference card per design doc
+// 08-§"Plugin card content design":
+//
+//   ┌──────────────────────────────────────────────────┐
+//   │  CSV  csv                                        │  ← display name + id
+//   │  Read rows from a CSV file. ...                  │
+//   │                                                  │
+//   │  Audit: ✓ reads I/O  ✓ quarantines  ✓ coerces   │
+//   │                                                  │
+//   │  When you'd use this:   ...                      │
+//   │  When you wouldn't:     ...                      │
+//   │  Example use:           <pre>...</pre>           │
+//   │                                                  │
+//   │  [ Schema → ]                                    │
+//   └──────────────────────────────────────────────────┘
+//
+// The "Use in pipeline" button and supporting machinery (from the
+// pre-Phase-7B toolkit framing) are deliberately removed. The
+// PREFILL_CHAT_INPUT_EVENT export stays — InlineChatSourceEntry uses it
+// for its prefill action, and ChatInput.tsx remains the receiver.
+// ============================================================================
+
+import { type JSX, useEffect, useState, type MouseEvent } from "react";
+import type { PluginSummary, PluginSchemaInfo } from "@/types/index";
+import { Button } from "@/components/ui";
+import { useShowAdvanced } from "@/stores/preferencesStore";
+import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
+import { AuditCharacteristicIcon } from "./AuditCharacteristicIcon";
+import { DEFAULT_VISIBLE_AUDIT_FLAGS, lookupAuditCharacteristic } from "./auditCharacteristics";
+import { pluginDisplayName } from "./pluginDisplayName";
+
+/** Event name dispatched by InlineChatSourceEntry and consumed by
+ *  ChatInput.tsx. Re-exported here for backwards compatibility with
+ *  the existing import chain in ChatInput.tsx; do not rename. */
+export const PREFILL_CHAT_INPUT_EVENT = "composer:prefill-chat-input";
+
+interface JsonSchemaField {
+  type?: string;
+  description?: string;
+}
+interface JsonSchemaObject {
+  properties?: Record<string, JsonSchemaField>;
+  required?: string[];
+}
+interface DiscriminatedSchema {
+  oneOf?: Array<{ $ref?: string }>;
+  discriminator?: { propertyName?: string; mapping?: Record<string, string> };
+  $defs?: Record<string, JsonSchemaObject>;
+}
+
+const DEFS_REF_PREFIX = "#/$defs/";
+function pluginCardIdSegment(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "unnamed";
+}
+
+interface PluginCardProps {
+  plugin: PluginSummary;
+  schema: PluginSchemaInfo | null;
+  schemaError?: boolean;
+  onExpand: () => void;
+  onRetrySchema?: () => void;
+  /** Test-only: start in the expanded state to assert schema rendering. */
+  initialExpanded?: boolean;
+}
+
+function isDiscriminated(s: DiscriminatedSchema & JsonSchemaObject): boolean {
+  return Array.isArray(s.oneOf) && s.$defs !== undefined;
+}
+
+function resolveVariants(s: DiscriminatedSchema): Array<{ label: string; def: JsonSchemaObject }> {
+  const defs = s.$defs ?? {};
+  const mapping = s.discriminator?.mapping ?? {};
+  const refToValue = new Map<string, string>();
+  for (const [discValue, ref] of Object.entries(mapping)) {
+    if (ref.startsWith(DEFS_REF_PREFIX)) {
+      refToValue.set(ref.slice(DEFS_REF_PREFIX.length), discValue);
+    }
+  }
+  const discProp = s.discriminator?.propertyName ?? "variant";
+  const out: Array<{ label: string; def: JsonSchemaObject }> = [];
+  for (const entry of s.oneOf ?? []) {
+    const ref = entry.$ref ?? "";
+    if (!ref.startsWith(DEFS_REF_PREFIX)) continue;
+    const defName = ref.slice(DEFS_REF_PREFIX.length);
+    const def = defs[defName];
+    if (def === undefined) continue;
+    out.push({ label: `${discProp}: ${refToValue.get(defName) ?? defName}`, def });
+  }
+  return out;
+}
+
+function variantKindLabel(s: DiscriminatedSchema): string {
+  const name = s.discriminator?.propertyName?.trim() || "variant";
+  return name.endsWith("s") ? name : `${name}s`;
+}
+
+function renderFields(properties: Record<string, JsonSchemaField>, required: string[] | undefined): JSX.Element[] {
+  const req = new Set(required ?? []);
+  return Object.entries(properties).map(([name, field]) => (
+    <div key={name} className="plugin-card-field-row">
+      <span className="plugin-card-field-name">{name}</span>
+      <span className="plugin-card-field-type">{field.type ?? "any"}</span>
+      {req.has(name) && <span className="plugin-card-field-required">required</span>}
+      {field.description && <div className="plugin-card-field-desc">{field.description}</div>}
+    </div>
+  ));
+}
+
+function hasCatalogText(value: string | null): value is string {
+  return value !== null && value.trim().length > 0;
+}
+
+export function PluginCard({
+  plugin,
+  schema,
+  schemaError,
+  onExpand,
+  onRetrySchema,
+  initialExpanded = false,
+}: PluginCardProps) {
+  const showAdvanced = useShowAdvanced();
+  const displayName = pluginDisplayName(plugin.name);
+  const cardId = `${pluginCardIdSegment(plugin.plugin_type)}-${pluginCardIdSegment(plugin.name)}`;
+  const whenText = plugin.usage_when_to_use;
+  const avoidText = plugin.usage_when_not_to_use;
+  const exampleText = plugin.example_use;
+  const hasWhen = hasCatalogText(whenText);
+  const hasAvoid = hasCatalogText(avoidText);
+  const hasExample = hasCatalogText(exampleText);
+  const hasDetails = hasWhen || hasAvoid || hasExample;
+  const [expanded, setExpanded] = useState(initialExpanded);
+  const schemaOpen = expanded && showAdvanced;
+  const visibleAuditCharacteristics = [...plugin.audit_characteristics]
+    .filter((flag) => showAdvanced || (DEFAULT_VISIBLE_AUDIT_FLAGS as readonly string[]).includes(flag))
+    // An unknown flag renders nothing (AuditCharacteristicIcon), so leaving it
+    // in the list produces an EMPTY role="group" with an aria-label — a group
+    // announced as containing nothing. Drop it here instead.
+    .filter((flag) => lookupAuditCharacteristic(flag) !== null)
+    .sort();
+  const [detailsState, setDetailsState] = useState({ cardId, open: false });
+  const detailsOpen = hasDetails && detailsState.cardId === cardId && detailsState.open;
+  const nameId = `plugin-card-name-${cardId}`;
+  const detailsPanelId = `plugin-card-details-panel-${cardId}`;
+  const schemaPanelId = `plugin-card-schema-panel-${cardId}`;
+
+  useEffect(() => {
+    setDetailsState((current) => {
+      if (current.cardId === cardId && (hasDetails || !current.open)) return current;
+      return { cardId, open: false };
+    });
+  }, [cardId, hasDetails]);
+
+  function handleDisclosureClick(e: MouseEvent<HTMLButtonElement>) {
+    e.preventDefault();
+    if (!expanded) onExpand();
+    setExpanded((p) => !p);
+  }
+
+  function handleRetry(e: MouseEvent<HTMLButtonElement>) {
+    e.stopPropagation();
+    (onRetrySchema ?? onExpand)();
+  }
+
+  const configSchema = schema?.json_schema as (DiscriminatedSchema & JsonSchemaObject) | undefined;
+
+  return (
+    // role="article" + aria-labelledby promotes the card to a named region
+    // (WCAG 1.3.1): the plugin name reads as the card's accessible name
+    // instead of the name being an undifferentiated bold span.
+    <div className="plugin-card" role="article" aria-labelledby={nameId}>
+      <div className="plugin-card-header-row">
+        {/* Display name is the PRIMARY label (human register); the raw
+            plugin id is demoted to secondary mono metadata so operators
+            can still copy the exact wire name (elspeth-5ee1f76e39). */}
+        <span className="plugin-card-title-group">
+          <span id={nameId} className="plugin-card-name">{displayName}</span>
+          <code className="plugin-card-id">{plugin.name}</code>
+        </span>
+        <span className="plugin-card-kind">{plugin.plugin_type}</span>
+      </div>
+
+      <div className="plugin-card-desc" title={plugin.description}>
+        {plugin.description}
+      </div>
+
+      {visibleAuditCharacteristics.length > 0 && (
+        // role="group" so the aria-label is actually exposed — aria-label on
+        // a role-less div (role=generic) is ignored by AT (WCAG 1.3.1,
+        // elspeth-37293a3b7c).
+        <div
+          className="plugin-card-audit-strip"
+          role="group"
+          aria-label="Audit characteristics"
+        >
+          {visibleAuditCharacteristics.map((flag) => (
+            <AuditCharacteristicIcon key={flag} flag={flag} />
+          ))}
+        </div>
+      )}
+
+      <div className="plugin-card-actions">
+        {hasDetails && (
+          <Button
+            className="btn-small plugin-card-detail-toggle"
+            onClick={() =>
+              setDetailsState((current) => ({
+                cardId,
+                open: current.cardId === cardId ? !current.open : true,
+              }))
+            }
+            aria-expanded={detailsOpen}
+            aria-controls={detailsPanelId}
+            aria-label={`Reference details for ${displayName}`}
+          >
+            Details
+          </Button>
+        )}
+        {showAdvanced && (
+          <Button
+            className="btn-small plugin-card-disclosure"
+            onClick={handleDisclosureClick}
+            aria-expanded={schemaOpen}
+            aria-controls={schemaPanelId}
+            aria-label={`Schema for ${displayName}`}
+          >
+            Schema
+          </Button>
+        )}
+      </div>
+
+      {detailsOpen && (
+        <div id={detailsPanelId} className="plugin-card-details">
+          {hasWhen && (
+            <ProseSection label="Use when" body={whenText} />
+          )}
+          {hasAvoid && (
+            <ProseSection label="Avoid when" body={avoidText} />
+          )}
+          {hasExample && (
+            <div className="plugin-card-example">
+              <div className="plugin-card-example-label">Example</div>
+              <pre className="plugin-card-example-code">{exampleText}</pre>
+            </div>
+          )}
+        </div>
+      )}
+
+      {schemaOpen && (
+        <div id={schemaPanelId} className="plugin-card-expanded">
+          {schemaError ? (
+            <div className="plugin-card-schema-error">
+              <span>Failed to load schema.</span>
+              <Button className="btn-small" onClick={handleRetry} aria-label="Retry loading schema">
+                Retry
+              </Button>
+            </div>
+          ) : schema === null || configSchema === undefined ? (
+            <div role="status" aria-live="polite" className="plugin-card-schema-loading">
+              <span className="spinner" aria-hidden="true" /> Loading schema...
+            </div>
+          ) : isDiscriminated(configSchema) ? (
+            <div className="plugin-card-variants">
+              <div className="plugin-card-variants-hint">
+                This plugin supports multiple {variantKindLabel(configSchema)}. Configure exactly one:
+              </div>
+              {resolveVariants(configSchema).map((v) => (
+                <div key={v.label} className="plugin-card-variant">
+                  <div className="plugin-card-variant-label">{v.label}</div>
+                  {v.def.properties ? (
+                    <div className="plugin-card-fields">{renderFields(v.def.properties, v.def.required)}</div>
+                  ) : (
+                    <span className="plugin-card-no-fields">No configuration fields.</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : configSchema.properties ? (
+            <div className="plugin-card-fields">{renderFields(configSchema.properties, configSchema.required)}</div>
+          ) : (
+            <span className="plugin-card-no-fields">No configuration fields.</span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ProseSection({ label, body }: { label: string; body: string }) {
+  return (
+    <div className="plugin-card-prose-section">
+      <div className="plugin-card-prose-label">{label}:</div>
+      <FormattedCatalogProse body={body} />
+    </div>
+  );
+}
+
+/** Renders plugin authors' persona-facing prose (usage_when_to_use /
+ *  usage_when_not_to_use) through the shared MarkdownRenderer — the same
+ *  dialect chat and NarrativeResults use — so headings/bold/links/ordered
+ *  lists render as real markdown instead of literal text (elspeth-b7b1b62940).
+ *  The wrapper class keeps the catalog card's denser xs/1.4 typography
+ *  (see catalog.css) rather than MarkdownRenderer's default chat-sized text. */
+function FormattedCatalogProse({ body }: { body: string }) {
+  return (
+    <div className="plugin-card-prose-body">
+      <MarkdownRenderer content={body} />
+    </div>
+  );
+}

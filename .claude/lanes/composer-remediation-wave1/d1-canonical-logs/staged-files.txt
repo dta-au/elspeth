@@ -1,0 +1,13 @@
+src/elspeth/web/composer/pipeline_commit.py
+src/elspeth/web/composer/planning_application.py
+src/elspeth/web/composer/tool_batch.py
+src/elspeth/web/sessions/proposal_authority.py
+src/elspeth/web/sessions/protocol.py
+src/elspeth/web/sessions/routes/composer/pipeline_settlement.py
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py
+tests/integration/web/composer/test_pipeline_proposal_lifecycle.py
+tests/unit/web/composer/test_audit_cohort_settlement.py
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py
+tests/unit/web/composer/test_pipeline_planner.py
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py
+tests/unit/web/sessions/test_pipeline_rejection_callers.py

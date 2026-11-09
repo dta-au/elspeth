@@ -1,0 +1,411 @@
+# src/elspeth/core/dag/coalesce_merge.py
+"""Coalesce merge logic for schema computation.
+
+Extracted from builder.py to enable direct testing without reimplementation.
+This module contains the build-time wrappers for merging schemas at coalesce
+points.
+
+Three operations are provided:
+
+1. merge_coalesce_schema: Builds the final SchemaConfig for a coalesce node
+   across union, select, and nested strategies.
+
+2. merge_guaranteed_fields: Combines effective guarantees from branch schemas
+   using union (require_all) or intersection (other policies).
+
+3. merge_union_fields: Combines typed field definitions with policy-aware
+   required/optional semantics for union merge strategy. The per-field
+   algorithm lives in elspeth.contracts.union_merge (merge_union_field_flags)
+   and is shared with the runtime merge_union_contracts, so build-time and
+   runtime union merges cannot diverge.
+
+Both functions are called by builder.py during graph construction and can
+be called directly by tests to verify semantics without reimplementing logic.
+
+The runtime sibling merge_union_contracts lives in
+elspeth.contracts.union_merge; import it from there.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Hashable, Mapping, Sequence
+from itertools import combinations
+from typing import Literal
+
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.union_merge import (
+    UnionTypeConflictError,
+    merge_union_field_flags,
+)
+from elspeth.core.dag.models import GraphValidationError
+
+__all__ = [
+    "certain_union_collisions",
+    "merge_coalesce_schema",
+    "merge_guaranteed_fields",
+    "merge_union_fields",
+]
+
+
+def certain_union_collisions(
+    branch_guarantees: Mapping[str, frozenset[str]],
+    *,
+    require_all: bool,
+    policy: Literal["require_all", "quorum", "best_effort", "first"],
+    quorum_count: int | None,
+) -> dict[str, tuple[str, ...]]:
+    """Field collisions a ``union_collision_policy: fail`` coalesce hits on EVERY merge.
+
+    ``fail`` is name-based: any field two ARRIVED branches both carry fails the
+    group. A collision is certain from config only when every arrival set the
+    policy can merge contains two branches that both GUARANTEE the same field
+    (``branch_guarantees`` holds each declared branch's presence lower bound —
+    the propagation-walked effective guarantee; a branch that guarantees
+    nothing maps to an empty set). Which arrival sets can merge is the arrival
+    policy's fact:
+
+    - all branches (``require_all``, or a quorum equal to the branch count);
+    - exactly ``quorum_count`` branches for a smaller quorum (the merge fires
+      on the arrival that reaches the count), so EVERY such subset must hold a
+      shared guarantee;
+    - ``best_effort`` / ``first`` can merge a single arrived branch, which
+      never collides — nothing is certain.
+
+    Returns ``{field: branches that guarantee it}`` for every field guaranteed
+    by two or more branches when the collision is certain, else ``{}``. The
+    caller refuses the pipeline on a non-empty result; whatever this cannot
+    prove (fields observed only at runtime) stays a per-row group failure.
+    """
+    shared: dict[str, list[str]] = {}
+    for branch, fields in branch_guarantees.items():
+        for field_name in fields:
+            shared.setdefault(field_name, []).append(branch)
+    colliding = {field_name: tuple(branches) for field_name, branches in sorted(shared.items()) if len(branches) > 1}
+    if not colliding:
+        return {}
+    if require_all:
+        return colliding
+    if policy != "quorum":
+        return {}
+    if quorum_count is None:
+        raise RuntimeError(
+            "A quorum coalesce reached certain_union_collisions without a quorum_count. This indicates a config validation bug."
+        )
+    branches = tuple(branch_guarantees)
+
+    def has_shared_guarantee(arrived: tuple[str, ...]) -> bool:
+        return any(branch_guarantees[left] & branch_guarantees[right] for left, right in combinations(arrived, 2))
+
+    if all(has_shared_guarantee(arrived) for arrived in combinations(branches, quorum_count)):
+        return colliding
+    return {}
+
+
+def merge_coalesce_schema(
+    branch_schemas: Mapping[str, SchemaConfig],
+    *,
+    merge_strategy: Literal["union", "nested", "select"],
+    require_all: bool,
+    collision_policy: Literal["last_wins", "first_wins", "fail"] = "last_wins",
+    branch_order: Sequence[str] | None = None,
+    select_branch: str | None = None,
+    coalesce_id: str | None = None,
+    guarantee_branch_schemas: Mapping[str, SchemaConfig] | None = None,
+) -> SchemaConfig:
+    """Build the final build-time schema for a coalesce node.
+
+    This is the strategy boundary used by the DAG builder. It owns policy-aware
+    guarantee merging, audit-field union for union merges, and the schema shapes
+    for select and nested strategies.
+
+    ``guarantee_branch_schemas`` (union strategy only) supplies the per-branch
+    schemas used SOLELY for the ``guaranteed_fields`` merge, decoupled from the
+    ``branch_schemas`` used for the typed-field / mode / audit merge. The DAG
+    builder passes each branch producer's PROPAGATION-WALKED effective
+    guarantee here (an abstaining branch as a schema without guarantees, so
+    ``merge_guaranteed_fields`` can apply its policy rule to it), so fields a
+    pass-through branch inherits from upstream survive the union — the raw
+    per-branch ``guaranteed_fields`` omits them, which under-computed the
+    coalesce guarantee and made ``validate_edge_compatibility`` reject runnable
+    fork→pass-through→coalesce pipelines (elspeth-0b14977817). When ``None``
+    (direct/test callers), the guarantee merge falls back to ``branch_schemas``,
+    preserving the previous behaviour.
+    """
+    guarantee_source = guarantee_branch_schemas if guarantee_branch_schemas is not None else branch_schemas
+    if merge_strategy == "union":
+        return merge_union_fields(
+            branch_schemas,
+            require_all=require_all,
+            collision_policy=collision_policy,
+            branch_order=branch_order,
+            coalesce_id=coalesce_id,
+            guaranteed_fields=merge_guaranteed_fields(guarantee_source, require_all=require_all),
+            audit_fields=_merge_audit_fields(branch_schemas),
+        )
+
+    if merge_strategy == "select":
+        if select_branch is None:
+            raise GraphValidationError(
+                _coalesce_error_prefix(coalesce_id) + " uses select merge without select_branch.",
+                component_id=coalesce_id,
+                component_type="coalesce",
+            )
+        if select_branch not in branch_schemas:
+            raise GraphValidationError(
+                _coalesce_error_prefix(coalesce_id)
+                + f" select_branch '{select_branch}' has no schema mapping. "
+                + f"Available branches: {sorted(branch_schemas.keys())}. "
+                + "This indicates a graph construction bug.",
+                component_id=coalesce_id,
+                component_type="coalesce",
+            )
+        return branch_schemas[select_branch]
+
+    if merge_strategy == "nested":
+        optional = not require_all
+        nested_fields = tuple(
+            FieldDefinition(name=branch, field_type="any", required=not optional)
+            for branch in _ordered_branch_names(branch_schemas, branch_order)
+        )
+        return SchemaConfig(mode="flexible", fields=nested_fields)
+
+    raise GraphValidationError(
+        _coalesce_error_prefix(coalesce_id) + f" has unsupported merge strategy {merge_strategy!r}.",
+        component_id=coalesce_id,
+        component_type="coalesce",
+    )
+
+
+def merge_guaranteed_fields(
+    branch_schemas: Mapping[str, SchemaConfig],
+    *,
+    require_all: bool,
+) -> tuple[str, ...] | None:
+    """Merge guaranteed fields from branch schemas.
+
+    Computes the merged guaranteed_fields tuple for a coalesce node based on
+    the effective guarantees from each branch and the coalesce policy.
+
+    Every branch of the coalesce must be passed, an abstaining one included
+    (a schema without effective guarantees: the branch's producer vouches for
+    nothing, e.g. an observed pass-through). The two policies treat it
+    differently, because they differ in which branches a merged row is made of:
+
+    - ``require_all``: every branch arrives, so the merged row carries the
+      union of every branch's guarantees. An abstainer adds nothing to that
+      union and is skipped; the others' guarantees still hold.
+    - other policies: any branch may be lost, so a merged row can be made of
+      the abstaining branch alone and carries only what EVERY branch
+      guarantees. An abstainer vouches for nothing, so the coalesce can
+      vouch for nothing either and abstains — the same rule the queue and
+      row_union fan-ins apply (``walk_effective_guarantee_vote``: one
+      abstaining arm collapses the vote to abstention, which keeps a
+      downstream sink deferred to per-row enforcement). Skipping the
+      abstainer here published a field only one branch creates as
+      guaranteed, so a legitimate branch loss (a row fact) became a proven
+      declared-input miss and ended the run (ADR-013 Amendment 2026-09-27,
+      R2 fix round 1).
+
+    Args:
+        branch_schemas: Map of branch name to SchemaConfig, one per branch
+        require_all: If True, use union semantics (all branches always arrive,
+            so any branch's guarantee survives). If False, use intersection
+            semantics (some branches may be lost, so only shared guarantees
+            survive).
+
+    Returns:
+        Merged guaranteed fields tuple, or None to abstain (the coalesce makes
+        no claim): no branch has effective guarantees, or — under a policy
+        other than ``require_all`` — any branch has none.
+
+    Note:
+        The None-vs-empty-tuple distinction is semantic:
+        - None = the coalesce abstains from the vote
+        - () = branches have guarantees but merge is empty set (explicit zero)
+    """
+    guaranteed_sets: list[set[str]] = []
+    any_branch_abstains = False
+    for schema_cfg in branch_schemas.values():
+        if schema_cfg.has_effective_guarantees:
+            guaranteed_sets.append(set(schema_cfg.get_effective_guaranteed_fields()))
+        else:
+            any_branch_abstains = True
+
+    if not guaranteed_sets:
+        return None
+
+    if require_all:
+        merged = set.union(*guaranteed_sets)
+    elif any_branch_abstains:
+        return None
+    else:
+        merged = set.intersection(*guaranteed_sets)
+
+    return tuple(sorted(merged)) if merged else ()
+
+
+def merge_union_fields(
+    branch_schemas: Mapping[str, SchemaConfig],
+    *,
+    require_all: bool,
+    collision_policy: Literal["last_wins", "first_wins", "fail"] = "last_wins",
+    branch_order: Sequence[str] | None = None,
+    coalesce_id: str | None = None,
+    guaranteed_fields: tuple[str, ...] | None = None,
+    audit_fields: tuple[str, ...] | None = None,
+) -> SchemaConfig:
+    """Merge typed fields from branch schemas using union merge strategy.
+
+    Combines field definitions from all branches with policy-aware handling
+    of required/optional semantics:
+
+    - require_all (OR semantics): A field is required if required in ANY
+      branch. Since all branches always arrive under require_all, any branch's
+      guarantee is honored in the merged output.
+
+    - other policies (AND semantics): A field is required only if required in
+      ALL branches. Since some branches may be lost, only shared guarantees
+      survive.
+
+    Branch-exclusive fields (present in only one branch) are handled specially:
+    - require_all: Preserve source branch's required flag (branch always arrives)
+    - other policies: Force optional (branch may not arrive)
+
+    Nullable semantics for shared fields depend on collision_policy (D5 fix):
+    - first_wins: Use first branch's nullable (first branch's value always wins)
+    - last_wins: Use last branch's nullable (last branch's value always wins)
+    - fail: Use OR of all branches (conservative; collisions fail at runtime)
+
+    Args:
+        branch_schemas: Map of branch name to SchemaConfig
+        require_all: If True, use OR semantics for required; if False, use AND
+        collision_policy: How to resolve field-level collisions in union merge.
+            Affects nullable computation for shared fields.
+        branch_order: Declaration order of branches. If provided, branches are
+            processed in this order for deterministic first/last semantics.
+            If None, uses dict iteration order (insertion order in Python 3.7+).
+        coalesce_id: Optional node ID for error messages (default: generic)
+        guaranteed_fields: Pre-computed guaranteed_fields to include in result
+        audit_fields: Pre-computed audit_fields to include in result
+
+    Returns:
+        Merged SchemaConfig. If all branches are observed-mode or no branches
+        contribute fields, returns an observed-mode schema. Mixed observed and
+        typed explicit branches are rejected to match graph validation policy.
+        Otherwise returns a flexible-mode schema with merged field definitions.
+
+    Raises:
+        GraphValidationError: If branches have incompatible types for the same
+            field name.
+    """
+    # Check if ALL branches are observed BEFORE processing. Only return observed
+    # mode if every branch is observed - otherwise process the typed branches.
+    # Previous bug: the loop would break on the FIRST observed branch, silently
+    # discarding typed fields from subsequent branches.
+    all_observed = all(schema_cfg.is_observed for schema_cfg in branch_schemas.values())
+    if all_observed:
+        # Early return: all branches are observed, no typed fields to merge
+        return SchemaConfig(
+            mode="observed",
+            fields=None,
+            guaranteed_fields=guaranteed_fields,
+            audit_fields=audit_fields,
+        )
+
+    observed_branch_names = [branch_name for branch_name, schema_cfg in branch_schemas.items() if schema_cfg.is_observed]
+    explicit_branch_names = [
+        branch_name for branch_name, schema_cfg in branch_schemas.items() if not schema_cfg.is_observed and schema_cfg.fields is not None
+    ]
+    if observed_branch_names and explicit_branch_names:
+        node_desc = f"'{coalesce_id}'" if coalesce_id else "coalesce node"
+        raise GraphValidationError(
+            f"Coalesce {node_desc} has mixed observed/explicit schemas - "
+            "this is not allowed because observed branches may produce rows missing fields "
+            "expected by downstream consumers. "
+            f"Observed branches: {observed_branch_names}, explicit branches: {explicit_branch_names}. "
+            "Fix: ensure all branches produce explicit schemas with compatible fields, "
+            "or all branches produce observed schemas.",
+            component_id=coalesce_id,
+            component_type="coalesce",
+        )
+
+    # Build the core algorithm's input, EXCLUDING non-contributing branches:
+    # fields=None branches have nothing to contribute. A typed branch with
+    # fields=() still counts as contributing (it can force siblings' exclusive
+    # fields optional).
+    #
+    # Iteration order: branch_order if provided (declaration order from config),
+    # otherwise dict iteration order. This is critical for first_wins/last_wins
+    # nullable semantics — the first/last branch in declaration order determines
+    # the winning value. branch_order may include branches not in branch_schemas
+    # (e.g., not wired up yet); the core skips names absent from its input.
+    branch_fields: dict[str, list[tuple[str, Hashable, bool, bool]]] = {
+        branch_name: [(fd.name, fd.field_type, fd.required, fd.nullable) for fd in schema_cfg.fields]
+        for branch_name, schema_cfg in branch_schemas.items()
+        if not schema_cfg.is_observed and schema_cfg.fields is not None
+    }
+
+    try:
+        merged_flags = merge_union_field_flags(
+            branch_fields,
+            require_all=require_all,
+            collision_policy=collision_policy,
+            branch_order=branch_order,
+        )
+    except UnionTypeConflictError as e:
+        node_desc = f"'{coalesce_id}'" if coalesce_id else "coalesce node"
+        raise GraphValidationError(
+            f"Coalesce node {node_desc} receives incompatible "
+            f"types for field '{e.field}' in union merge: "
+            f"branch '{e.branch_a}' has {e.type_a!r}, "
+            f"branch '{e.branch_b}' has {e.type_b!r}. "
+            "Union merge requires compatible types on shared fields.",
+            component_id=coalesce_id,
+            component_type="coalesce",
+        ) from e
+
+    if not merged_flags:
+        # No typed fields from any branch (all branches had fields=None or were
+        # observed and skipped). Return observed mode.
+        return SchemaConfig(
+            mode="observed",
+            fields=None,
+            guaranteed_fields=guaranteed_fields,
+            audit_fields=audit_fields,
+        )
+
+    merged_fields = tuple(
+        FieldDefinition(name=name, field_type=ftype, required=req, nullable=is_nullable)  # type: ignore[arg-type]
+        for name, (ftype, req, is_nullable, _) in merged_flags.items()
+    )
+    return SchemaConfig(
+        mode="flexible",
+        fields=merged_fields,
+        guaranteed_fields=guaranteed_fields,
+        audit_fields=audit_fields,
+    )
+
+
+def _merge_audit_fields(branch_schemas: Mapping[str, SchemaConfig]) -> tuple[str, ...] | None:
+    audit_sets: list[set[str]] = []
+    for schema_cfg in branch_schemas.values():
+        if schema_cfg.audit_fields is not None:
+            audit_sets.append(set(schema_cfg.audit_fields))
+    return tuple(sorted(set.union(*audit_sets))) if audit_sets else None
+
+
+def _ordered_branch_names(
+    branch_schemas: Mapping[str, SchemaConfig],
+    branch_order: Sequence[str] | None,
+) -> tuple[str, ...]:
+    if branch_order is None:
+        return tuple(branch_schemas)
+
+    ordered = [branch for branch in branch_order if branch in branch_schemas]
+    ordered_set = set(ordered)
+    ordered.extend(branch for branch in branch_schemas if branch not in ordered_set)
+    return tuple(ordered)
+
+
+def _coalesce_error_prefix(coalesce_id: str | None) -> str:
+    return f"Coalesce node '{coalesce_id}'" if coalesce_id else "Coalesce node"

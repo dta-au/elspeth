@@ -1,0 +1,30 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 499 items
+
+tests/unit/web/composer/test_queue_scope_admission.py ...                [  0%]
+tests/unit/web/composer/test_tools.py ...................                [  4%]
+tests/unit/web/composer/test_promote_set_pipeline.py ........            [  6%]
+tests/unit/web/composer/test_state_collectors.py ....................... [ 10%]
+..................                                                       [ 14%]
+tests/unit/web/composer/test_transform_rejection_contracts.py .......... [ 16%]
+........................................................................ [ 30%]
+...................................................                      [ 40%]
+tests/unit/composer_mcp/test_server.py ...                               [ 41%]
+tests/unit/composer_mcp/test_call_tool_audit.py ........................ [ 46%]
+......                                                                   [ 47%]
+tests/unit/web/composer/test_tool_schema_contract.py ................... [ 51%]
+........................................................................ [ 65%]
+........................................                                 [ 73%]
+tests/unit/web/composer/test_tool_model_schema_bounds.py ............... [ 76%]
+..................                                                       [ 80%]
+tests/unit/web/composer/test_tool_declarations.py ...................... [ 84%]
+.......................................................................  [ 98%]
+tests/unit/web/test_sessions_composer_attribute_contracts.py .....       [100%]
+
+============================= 499 passed in 58.77s =============================

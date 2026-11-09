@@ -1,0 +1,836 @@
+diff --git a/src/elspeth/web/composer/error_codes.py b/src/elspeth/web/composer/error_codes.py
+index 62dedadc1..f081b34c3 100644
+--- a/src/elspeth/web/composer/error_codes.py
++++ b/src/elspeth/web/composer/error_codes.py
+@@ -199,6 +199,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
+         "source_blob_plugin_required",
+         "source_blob_review_required",
+         "source_blob_unavailable",
++        "proposal_resource_unavailable",
+         "source_name_invalid",
+         "source_not_found",
+         "source_data_contract_required",
+diff --git a/src/elspeth/web/composer/planning_application.py b/src/elspeth/web/composer/planning_application.py
+index 5113e4175..4dc3377d1 100644
+--- a/src/elspeth/web/composer/planning_application.py
++++ b/src/elspeth/web/composer/planning_application.py
+@@ -116,6 +116,7 @@ from elspeth.web.sessions.pipeline_rejection_custody import (
+     read_rejection_authority,
+     reject_pipeline_with_required_custody,
+ )
++from elspeth.web.sessions.proposal_blob_refs import PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE, ProposalResourceUnavailableError
+ from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, RedactedPipelineArguments, SessionServiceProtocol
+ 
+ slog = structlog.get_logger()
+@@ -719,22 +720,25 @@ class PlanningApplication:
+         preflight_green = runtime_result is not None and runtime_result.is_valid
+ 
+         if required_work is None:
+-            row, deferred = await _await_pipeline_staging_write_with_deferred_cancellation(
+-                sessions.create_pipeline_composition_proposal(
+-                    session_id=session_id,
+-                    plan=plan,
+-                    summary=summary.summary,
+-                    rationale=summary.rationale,
+-                    affects=summary.affects,
+-                    arguments_redacted_json=summary.arguments_redacted_json,
+-                    actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
+-                    composer_model_identifier=plan.model_identifier,
+-                    composer_model_version=plan.model_version,
+-                    composer_provider=plan.provider,
+-                    user_message_id=user_message_id,
+-                    session_operation_context=session_operation_context,
++            try:
++                row, deferred = await _await_pipeline_staging_write_with_deferred_cancellation(
++                    sessions.create_pipeline_composition_proposal(
++                        session_id=session_id,
++                        plan=plan,
++                        summary=summary.summary,
++                        rationale=summary.rationale,
++                        affects=summary.affects,
++                        arguments_redacted_json=summary.arguments_redacted_json,
++                        actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
++                        composer_model_identifier=plan.model_identifier,
++                        composer_model_version=plan.model_version,
++                        composer_provider=plan.provider,
++                        user_message_id=user_message_id,
++                        session_operation_context=session_operation_context,
++                    )
+                 )
+-            )
++            except ProposalResourceUnavailableError:
++                return ComposerResult(message=PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE, state=state, raw_assistant_content="")
+             if deferred is not None:
+                 if auto_commit_authorized:
+                     await _await_pipeline_staging_write_with_deferred_cancellation(
+@@ -791,6 +795,12 @@ class PlanningApplication:
+                 handoff,
+             )
+             if required_row is None:
++                if (
++                    len(creation_failures) == 1
++                    and type(creation_failures[0]) is ProposalResourceUnavailableError
++                    and not creation_cancellations
++                ):
++                    return ComposerResult(message=PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE, state=state, raw_assistant_content="")
+                 raise original_outcome_group(
+                     "Actual creation failure and original cancellation", *creation_failures, *creation_cancellations
+                 )
+diff --git a/src/elspeth/web/composer/tool_batch.py b/src/elspeth/web/composer/tool_batch.py
+index 0ca6f1af2..05a5b93db 100644
+--- a/src/elspeth/web/composer/tool_batch.py
++++ b/src/elspeth/web/composer/tool_batch.py
+@@ -191,6 +191,7 @@ from elspeth.web.interpretation_state import (
+     interpretation_sites,
+ )
+ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
++from elspeth.web.sessions.proposal_blob_refs import PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE, ProposalResourceUnavailableError
+ 
+ if TYPE_CHECKING:
+     from pathlib import Path
+@@ -2227,74 +2228,90 @@ async def run_tool_batch(
+                     arguments=proposal_summary_arguments,
+                     redacted_arguments=proposal_redacted_arguments,
+                 )
+-                if proposal_tool_name == "set_pipeline":
+-                    proposal_base = (
+-                        PresentBase(
+-                            state_id=UUID(current_state_id),
+-                            composition_content_hash=composition_content_hash(state),
++                try:
++                    if proposal_tool_name == "set_pipeline":
++                        proposal_base = (
++                            PresentBase(
++                                state_id=UUID(current_state_id),
++                                composition_content_hash=composition_content_hash(state),
++                            )
++                            if current_state_id is not None
++                            else AbsentBase()
+                         )
+-                        if current_state_id is not None
+-                        else AbsentBase()
+-                    )
+-                    pipeline_proposal = PipelineProposal.create(
+-                        pipeline=proposal_arguments,
+-                        base=proposal_base,
+-                        repair_count=0,
+-                        skill_hash=ctx.provenance.skill_hash,
+-                    )
+-                    if type(ctx.session_operation_context) is not SessionOperationContext:
+-                        raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
+-                    proposal = await _await_started_tool_stage(
+-                        turn_sessions_service.create_pipeline_composition_proposal(
+-                            session_id=turn_session_uuid,
+-                            session_operation_context=ctx.session_operation_context,
+-                            plan=PipelinePlanResult(
+-                                proposal=pipeline_proposal,
++                        pipeline_proposal = PipelineProposal.create(
++                            pipeline=proposal_arguments,
++                            base=proposal_base,
++                            repair_count=0,
++                            skill_hash=ctx.provenance.skill_hash,
++                        )
++                        if type(ctx.session_operation_context) is not SessionOperationContext:
++                            raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
++                        proposal = await _await_started_tool_stage(
++                            turn_sessions_service.create_pipeline_composition_proposal(
++                                session_id=turn_session_uuid,
++                                session_operation_context=ctx.session_operation_context,
++                                plan=PipelinePlanResult(
++                                    proposal=pipeline_proposal,
++                                    tool_call_id=tool_call.id,
++                                    custody_result=pipeline_custody_result,
++                                    model_identifier=ctx.provenance.model_identifier,
++                                    model_version=provider_model_version,
++                                    provider=ctx.provenance.provider or "unknown",
++                                ),
++                                summary=proposal_summary.summary,
++                                rationale=proposal_summary.rationale,
++                                affects=proposal_summary.affects,
++                                arguments_redacted_json=proposal_summary.arguments_redacted_json,
++                                actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
++                                user_message_id=UUID(user_message_id) if user_message_id is not None else None,
++                                composer_model_identifier=ctx.provenance.model_identifier,
++                                composer_model_version=provider_model_version,
++                                composer_provider=ctx.provenance.provider or "unknown",
++                            ),
++                            audit=audit,
++                            recorder=recorder,
++                        )
++                    else:
++                        if type(ctx.session_operation_context) is not SessionOperationContext:
++                            raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
++                        proposal = await _await_started_tool_stage(
++                            turn_sessions_service.create_composition_proposal(
++                                session_id=turn_session_uuid,
++                                session_operation_context=ctx.session_operation_context,
+                                 tool_call_id=tool_call.id,
+-                                custody_result=pipeline_custody_result,
+-                                model_identifier=ctx.provenance.model_identifier,
+-                                model_version=provider_model_version,
+-                                provider=ctx.provenance.provider or "unknown",
++                                tool_name=proposal_tool_name,
++                                summary=proposal_summary.summary,
++                                rationale=proposal_summary.rationale,
++                                affects=proposal_summary.affects,
++                                arguments_json=proposal_arguments,
++                                arguments_redacted_json=proposal_summary.arguments_redacted_json,
++                                base_state_id=UUID(current_state_id) if current_state_id is not None else None,
++                                actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
++                                user_message_id=UUID(user_message_id) if user_message_id is not None else None,
++                                composer_model_identifier=ctx.provenance.model_identifier,
++                                composer_model_version=provider_model_version,
++                                composer_provider=ctx.provenance.provider or "unknown",
++                                composer_skill_hash=ctx.provenance.skill_hash,
++                                tool_arguments_hash=audit.binding_arguments_hash,
+                             ),
+-                            summary=proposal_summary.summary,
+-                            rationale=proposal_summary.rationale,
+-                            affects=proposal_summary.affects,
+-                            arguments_redacted_json=proposal_summary.arguments_redacted_json,
+-                            actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
+-                            user_message_id=UUID(user_message_id) if user_message_id is not None else None,
+-                            composer_model_identifier=ctx.provenance.model_identifier,
+-                            composer_model_version=provider_model_version,
+-                            composer_provider=ctx.provenance.provider or "unknown",
+-                        ),
+-                        audit=audit,
+-                        recorder=recorder,
+-                    )
+-                else:
+-                    if type(ctx.session_operation_context) is not SessionOperationContext:
+-                        raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
+-                    proposal = await _await_started_tool_stage(
+-                        turn_sessions_service.create_composition_proposal(
+-                            session_id=turn_session_uuid,
+-                            session_operation_context=ctx.session_operation_context,
+-                            tool_call_id=tool_call.id,
+-                            tool_name=proposal_tool_name,
+-                            summary=proposal_summary.summary,
+-                            rationale=proposal_summary.rationale,
+-                            affects=proposal_summary.affects,
+-                            arguments_json=proposal_arguments,
+-                            arguments_redacted_json=proposal_summary.arguments_redacted_json,
+-                            base_state_id=UUID(current_state_id) if current_state_id is not None else None,
+-                            actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
+-                            user_message_id=UUID(user_message_id) if user_message_id is not None else None,
+-                            composer_model_identifier=ctx.provenance.model_identifier,
+-                            composer_model_version=provider_model_version,
+-                            composer_provider=ctx.provenance.provider or "unknown",
+-                            composer_skill_hash=ctx.provenance.skill_hash,
+-                            tool_arguments_hash=audit.binding_arguments_hash,
++                            audit=audit,
++                            recorder=recorder,
++                        )
++                except ProposalResourceUnavailableError:
++                    unapplied_admission = _unapplied_admission(
++                        _saved_graph_rejection_result(
++                            state,
++                            PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE,
++                            error_code="proposal_resource_unavailable",
++                            rejected_component=None,
+                         ),
+-                        audit=audit,
+-                        recorder=recorder,
++                        "refused",
++                        state=state,
++                        validation=last_validation if last_validation is not None else state.validate(),
++                        runtime_preflight=last_runtime_preflight,
+                     )
++                    proposal_redacted_arguments = None
++            if proposal_redacted_arguments is not None:
+                 proposals_this_turn += 1
+                 proposal_result = ToolResult(
+                     success=True,
+diff --git a/src/elspeth/web/sessions/proposal_blob_refs.py b/src/elspeth/web/sessions/proposal_blob_refs.py
+index 67bfc8833..2abc1606d 100644
+--- a/src/elspeth/web/sessions/proposal_blob_refs.py
++++ b/src/elspeth/web/sessions/proposal_blob_refs.py
+@@ -9,7 +9,7 @@ from uuid import UUID
+ from sqlalchemy import select
+ from sqlalchemy.engine import Connection
+ 
+-from elspeth.contracts.blobs import BLOB_REF_PATH_PREFIX
++from elspeth.contracts.blobs import BLOB_REF_PATH_PREFIX, BLOB_STATUSES
+ from elspeth.contracts.errors import AuditIntegrityError
+ from elspeth.web.composer.pipeline_proposal import is_owned_composition_state_authority
+ from elspeth.web.sessions.models import blobs_table, composition_proposals_table
+@@ -26,6 +26,15 @@ _BLOB_REFERENCE_TOOLS = _TOP_LEVEL_BLOB_TOOLS | {"set_pipeline", "set_source_fro
+ 
+ _BLOB_SENTINEL_OPTION_KEYS = frozenset({"path", "file"})
+ 
++PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE = (
++    "I couldn't prepare this proposal because a referenced file is no longer available for this session. "
++    "Please choose the file again and retry."
++)
++
++
++class ProposalResourceUnavailableError(Exception):
++    """A queried proposal resource is missing, foreign, or known not ready."""
++
+ 
+ def _canonical_sentinel_blob_id(value: str, *, position: str) -> str:
+     raw = value.removeprefix(BLOB_REF_PATH_PREFIX)
+@@ -173,11 +182,13 @@ def validate_proposal_blob_references(
+     for blob_id in proposal_blob_reference_ids(tool_name, arguments):
+         row = conn.execute(select(blobs_table.c.session_id, blobs_table.c.status).where(blobs_table.c.id == blob_id)).first()
+         if row is None:
+-            raise ValueError(f"Proposal references blob {blob_id!r}, but that blob does not exist")
++            raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
+         if row.session_id != session_id:
+-            raise ValueError(f"Proposal references blob {blob_id!r}, but it is not owned by this session")
++            raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
++        if type(row.status) is not str or row.status not in BLOB_STATUSES:
++            raise AuditIntegrityError("Tier 1: owned proposal blob has invalid persisted status")
+         if row.status != "ready":
+-            raise ValueError(f"Proposal references blob {blob_id!r}, but its status is {row.status!r}, not 'ready'")
++            raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
+ 
+ 
+ def pending_proposal_reference_id(
+diff --git a/tests/integration/web/composer/test_freeform_proposal_prevalidation.py b/tests/integration/web/composer/test_freeform_proposal_prevalidation.py
+index a387f5717..6ecaf453d 100644
+--- a/tests/integration/web/composer/test_freeform_proposal_prevalidation.py
++++ b/tests/integration/web/composer/test_freeform_proposal_prevalidation.py
+@@ -2347,3 +2347,120 @@ async def test_auto_commit_set_pipeline_uses_candidate_builder_once(tmp_path: Pa
+     assert builder.call_count == 1
+     assert result.state.version == state.version + 1
+     assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("publisher", ["canonical", "ordinary", "promoted"])
++async def test_publication_resource_race_refuses_once_then_allows_valid_repair(tmp_path: Path, publisher: str) -> None:
++    from sqlalchemy import update
++
++    from tests.helpers.session_fences import fenced_operation_context
++
++    harness = _harness(tmp_path)
++    state = _incremental_base_state(tmp_path)
++    if publisher == "canonical":
++        tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
++    elif publisher == "ordinary":
++        with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as operation:
++            blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
++                UUID(harness.session_id), "retained.txt", b"original", "text/plain", session_operation_context=operation
++            )
++        tool_name, arguments = "delete_blob", {"blob_id": str(blob.id)}
++    else:
++        from tests.integration.web.composer.test_freeform_required_controls import _incremental_textract_state, _required_textract_policy
++
++        view, snapshot = _required_textract_policy(tmp_path)
++        state, output = await _incremental_textract_state(tmp_path, harness=harness, view=view, snapshot=snapshot)
++        completed = real_execute_tool(
++            "set_output",
++            output,
++            state,
++            view,
++            plugin_snapshot=snapshot,
++            data_dir=str(tmp_path),
++            session_engine=harness.engine,
++            session_id=harness.session_id,
++            user_id="proposal-prevalidation-user",
++            validate_arguments=True,
++            require_data_dir_for_paths=True,
++            raise_schema_argument_errors=True,
++        )
++        assert completed.success and completed.validation.is_valid
++        state = completed.updated_state
++        tool_name, arguments = "set_metadata", {"patch": {}}
++
++    api = harness.sessions.create_composition_proposal if publisher == "ordinary" else harness.sessions.create_pipeline_composition_proposal
++    calls = []
++
++    async def change_resource_then_create(**kwargs: Any) -> Any:
++        calls.append(kwargs)
++        with harness.engine.begin() as conn:
++            assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() > 0
++            conn.execute(update(blobs_table).values(status="pending" if len(calls) == 1 else "ready"))
++        return await api(**kwargs)
++
++    llm = _ScriptedLLM(
++        _tool_turn("call_raced", tool_name, arguments),
++        _tool_turn("call_repaired", "set_metadata", {"patch": {"name": "repair"}}),
++        _fake_llm_response(content="The repair awaits approval."),
++    )
++    dispatches = []
++    dispatch = harness.service._dispatch_tool_batch
++
++    async def record_dispatch(**kwargs: Any) -> Any:
++        dispatched = await dispatch(**kwargs)
++        dispatches.append(dispatched[0])
++        return dispatched
++
++    with (
++        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
++        patch.object(
++            harness.sessions,
++            "create_composition_proposal" if publisher == "ordinary" else "create_pipeline_composition_proposal",
++            new=change_resource_then_create,
++        ),
++        patch.object(harness.service, "_dispatch_tool_batch", new=record_dispatch),
++        patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as handlers,
++    ):
++        if publisher == "promoted":
++            with patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)):
++                result = await harness.service.compose(
++                    "Prepare this change.",
++                    [],
++                    state,
++                    session_id=harness.session_id,
++                    user_id="proposal-prevalidation-user",
++                    user_message_id=harness.user_message_id,
++                )
++        else:
++            result = await harness.service.compose(
++                "Prepare this change.",
++                [],
++                state,
++                session_id=harness.session_id,
++                user_id="proposal-prevalidation-user",
++                user_message_id=harness.user_message_id,
++            )
++    assert len(calls) == (1 if publisher == "canonical" else 2)
++    assert [call.args[0] for call in handlers.call_args_list] == (
++        ["set_metadata", "set_metadata"] if publisher == "promoted" else ["set_metadata"]
++    )
++    assert dispatches[0].mutation_success_observed is False
++    feedback = [message for message in llm.message_snapshots[1] if message.get("tool_call_id") == "call_raced"]
++    assert len(feedback) == 1
++    payload = json.loads(feedback[0]["content"])
++    assert payload["success"] is False
++    assert payload["validation"]["errors"][0]["error_code"] == "proposal_resource_unavailable"
++    persisted = _persisted_tool_content(harness, "call_raced")
++    assert json.loads(persisted)["validation"]["errors"][0]["error_code"] == "proposal_resource_unavailable"
++    assert payload["version"] == state.version
++    assert payload["affected_nodes"] == []
++    assert "validation_delta" not in payload
++    assert [inv.tool_call_id for inv in result.tool_invocations] == ["call_raced", "call_repaired"]
++    assert result.tool_invocations[0].status is ComposerToolStatus.SUCCESS
++    assert len([outcome for dispatched in dispatches for outcome in dispatched.tool_outcomes if outcome.call.id == "call_raced"]) == 1
++    proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
++    assert [proposal.tool_call_id for proposal in proposals] == ["call_repaired"]
++    assert _count_rows(harness.engine, proposal_events_table) == 1
++    assert _count_rows(harness.engine, composition_states_table) == 0
++    assert result.state is state
+diff --git a/tests/unit/web/composer/test_audit_cohort_settlement.py b/tests/unit/web/composer/test_audit_cohort_settlement.py
+index c29a803df..87ee7ac05 100644
+--- a/tests/unit/web/composer/test_audit_cohort_settlement.py
++++ b/tests/unit/web/composer/test_audit_cohort_settlement.py
+@@ -707,3 +707,82 @@ async def test_planner_cohort_cancelled_mid_settlement_lands_whole_and_creates_n
+     assert _proposal_count(sessions_service, result_session_id) == 0, (
+         "evidence-without-proposal is the safe direction; a proposal must not follow a cancelled request"
+     )
++
++
++@pytest.mark.asyncio
++async def test_resource_race_after_planner_admission_preserves_cohort_once_and_no_candidate_verdict(
++    composer_service_with_real_sessions: ComposerServiceImpl,
++    result_session_id: str,
++    tmp_path,
++) -> None:
++    from dataclasses import replace
++
++    from sqlalchemy import update
++
++    from elspeth.web.blobs.service import BlobServiceImpl
++    from elspeth.web.sessions.models import blobs_table, composition_states_table, proposal_events_table
++    from elspeth.web.sessions.proposal_blob_refs import validate_proposal_blob_references
++    from tests.integration.web.composer.test_freeform_proposal_prevalidation import _valid_pipeline_args
++
++    service = composer_service_with_real_sessions
++    sessions = service._sessions_service
++    user_message_id = await _seed_user_message(sessions, result_session_id)
++    state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
++    async with acquire_compose_context(sessions, result_session_id) as context:
++        blob = await BlobServiceImpl(sessions._engine, tmp_path).create_blob(
++            UUID(result_session_id), "input.csv", b"value\n1\n", "text/csv", session_operation_context=context
++        )
++        arguments = _valid_pipeline_args(tmp_path)
++        arguments["source"]["blob_id"] = str(blob.id)
++        candidate = CompositionState.from_dict(
++            {
++                **arguments,
++                "version": 2,
++                "metadata": {**arguments["metadata"], "description": ""},
++                "outputs": [{**output, "name": output["sink_name"]} for output in arguments["outputs"]],
++            }
++        )
++        assert candidate.validate().is_valid
++        plan = replace(
++            _plan(),
++            proposal=PipelineProposal.create(
++                pipeline=arguments, base=AbsentBase(), repair_count=0, skill_hash=stable_hash("planner-skill")
++            ),
++            candidate_state=candidate,
++        )
++        with sessions._engine.connect() as conn:
++            validate_proposal_blob_references(conn, session_id=result_session_id, tool_name="set_pipeline", arguments=arguments)
++
++        async def preflight_then_change_resource(*args, **kwargs):
++            assert args[0] is candidate
++            with sessions._engine.begin() as conn:
++                conn.execute(update(blobs_table).where(blobs_table.c.id == str(blob.id)).values(status="error"))
++            return _green_preflight()
++
++        with patch.object(service._preflight, "cached_runtime_preflight", new=preflight_then_change_resource):
++            result = await service._planning_application._stage_pipeline_plan(
++                session_operation_context=context,
++                plan=plan,
++                state=state,
++                session_id=UUID(result_session_id),
++                current_state_id=None,
++                user_message_id=user_message_id,
++                user_id="phase3-test-user",
++                preferences=_FakePreferences(trust_mode="explicit_approve"),
++                recorder=BufferingRecorder(),
++                planner_llm_calls=(),
++                planner_private_candidates=(),
++                planner_attempts=(),
++                planner_invocations=_PLANNER_COHORT,
++                planner_withheld_replies=(),
++                plugin_snapshot=None,
++            )
++    assert result.state is state
++    assert result.runtime_preflight is None and result.pipeline_commit_intent is None
++    assert result.raw_assistant_content == ""
++    assert result.tool_invocations == () and result.llm_calls == ()
++    assert _invocation_occurrences(_chat_rows(sessions, result_session_id)) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
++    assert _proposal_count(sessions, result_session_id) == 0
++    with sessions._engine.connect() as conn:
++        assert conn.execute(select(composition_states_table.c.id)).all() == []
++        assert conn.execute(select(proposal_events_table.c.id)).all() == []
+diff --git a/tests/unit/web/sessions/test_composer_proposals.py b/tests/unit/web/sessions/test_composer_proposals.py
+index 8d1b5e4d8..273d8ace0 100644
+--- a/tests/unit/web/sessions/test_composer_proposals.py
++++ b/tests/unit/web/sessions/test_composer_proposals.py
+@@ -33,6 +33,7 @@ from elspeth.web.sessions.models import (
+     sessions_table,
+ )
+ from elspeth.web.sessions.proposal_authority import _pipeline_private_arguments_hash
++from elspeth.web.sessions.proposal_blob_refs import ProposalResourceUnavailableError
+ from elspeth.web.sessions.proposal_projection import project_composition_proposal
+ from elspeth.web.sessions.protocol import CompositionStateData, ProposalStateConflictError
+ from elspeth.web.sessions.schema import initialize_session_schema
+@@ -858,7 +859,7 @@ async def test_create_composition_proposal_rejects_unusable_blob_reference(engin
+             )
+         blob_id = record.id
+ 
+-    with pytest.raises(ValueError, match="blob"):
++    with pytest.raises(ProposalResourceUnavailableError, match="referenced file"):
+         async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+             await service.create_composition_proposal(
+                 session_id=session_id,
+@@ -1002,7 +1003,7 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
+         release.set()
+ 
+         await delete_task
+-        with pytest.raises(ValueError, match="does not exist"):
++        with pytest.raises(ProposalResourceUnavailableError, match="referenced file"):
+             await proposal_task
+         with pytest.raises(BlobNotFoundError):
+             await blob_service.get_blob(blob.id, session_operation_context=context)
+diff --git a/tests/unit/web/sessions/test_pipeline_rejection_callers.py b/tests/unit/web/sessions/test_pipeline_rejection_callers.py
+index 710f6f5ad..bdfbabd05 100644
+--- a/tests/unit/web/sessions/test_pipeline_rejection_callers.py
++++ b/tests/unit/web/sessions/test_pipeline_rejection_callers.py
+@@ -455,6 +455,226 @@ async def test_actual_planner_creation_cancel_retains_nonzero_child_rejection_sc
+         repository.release(running.session_operation_context)
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "required,trust_modes,cancel_creation,fault",
++    [
++        (required, modes, cancel, "pending")
++        for required in (False, True)
++        for modes in (
++            ("explicit_approve", "explicit_approve"),
++            ("auto_commit", "auto_commit"),
++            ("auto_commit", "explicit_approve"),
++            ("explicit_approve", "auto_commit"),
++        )
++        for cancel in (False, True)
++    ]
++    + [
++        (required, ("auto_commit", "auto_commit"), False, fault)
++        for required in (False, True)
++        for fault in ("missing", "error", "corrupt", "ValueError", "SQL", "group", "telemetry")
++    ],
++)
++async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
++    operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation, fault
++):
++    from dataclasses import replace
++
++    from sqlalchemy import delete, update
++
++    from elspeth.web.blobs.service import BlobServiceImpl
++    from elspeth.web.composer.pipeline_proposal import PipelineProposal
++    from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
++    from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness, _valid_pipeline_args
++    from tests.unit.web.composer.test_audit_cohort_settlement import _chat_rows, _discovery_invocation, _invocation_occurrences
++
++    engine, repository, _authority, service, sid = operation_store
++    expected, running = await prepared_rejection(operation_store)
++    planner = _harness(tmp_path / "planner").service._planning_application
++    planner._sessions_service_optional = service
++    prior_occurrences = _invocation_occurrences(_chat_rows(service, str(sid)))
++    assert prior_occurrences == {expected.authority.row.tool_call_id: 1}
++    blob = await BlobServiceImpl(engine, tmp_path).create_blob(
++        sid, "input.csv", b"value\n1\n", "text/csv", session_operation_context=running.session_operation_context
++    )
++    pipeline = _valid_pipeline_args(tmp_path)
++    pipeline["source"]["blob_id"] = str(blob.id)
++    proposal = PipelineProposal.create(pipeline=pipeline, base=expected.authority.proposal.base, repair_count=0, skill_hash="a" * 64)
++    plan = PipelinePlanResult(
++        proposal=proposal,
++        tool_call_id="raced-planner",
++        custody_result="not_required",
++        model_identifier="model",
++        model_version="version",
++        provider="test",
++    )
++    # The same authority passed admission; the resource changes only afterward.
++    from elspeth.web.sessions.proposal_blob_refs import validate_proposal_blob_references
++
++    with engine.begin() as conn:
++        validate_proposal_blob_references(conn, session_id=str(sid), tool_name="set_pipeline", arguments=pipeline)
++        if fault == "missing":
++            conn.execute(delete(blobs_table).where(blobs_table.c.id == str(blob.id)))
++        elif fault in {"pending", "error", "corrupt"}:
++            if fault == "corrupt":
++                conn.exec_driver_sql("PRAGMA ignore_check_constraints=ON")
++            conn.execute(
++                update(blobs_table).where(blobs_table.c.id == str(blob.id)).values(status="unknown" if fault == "corrupt" else fault)
++            )
++            if fault == "corrupt":
++                conn.exec_driver_sql("PRAGMA ignore_check_constraints=OFF")
++        conn.execute(update(sessions_table).where(sessions_table.c.id == str(sid)).values(trust_mode=trust_modes[1]))
++    preferences = replace(await service.get_composer_preferences(sid), trust_mode=trust_modes[0])
++    parent = RequiredWorkCoordinator(
++        RequiredWorkAuthority(
++            RequiredAuthorityKind.DURABLE_COMPOSE, running.session_operation_context, running.claim.operation_id, running.claim.attempt
++        )
++    )
++    binding = RequiredWorkBinding(parent, 7, 12, RequiredWorkRole.TURN, running) if required else None
++    entered, release = threading.Event(), threading.Event()
++    deliveries = []
++    actual_shield = asyncio.shield
++    injected = {
++        "ValueError": ValueError("private parser detail"),
++        "SQL": OperationalError("private SQL detail", {}, RuntimeError("driver detail")),
++        "group": ExceptionGroup("private grouped failures", [ValueError("parser"), RuntimeError("other")]),
++        "telemetry": RuntimeError("post-SQL telemetry detail"),
++    }
++    if fault == "telemetry":
++        from elspeth.web.sessions import service as service_module
++
++        class FailedCounter:
++            def add(self, amount, attributes):
++                raise injected["telemetry"]
++
++        monkeypatch.setattr(service_module, "_PIPELINE_PLANNER_COUNTER", FailedCounter())
++
++    async def observe_shield(awaitable):
++        try:
++            return await actual_shield(awaitable)
++        except asyncio.CancelledError as delivery:
++            deliveries.append(delivery)
++            raise
++
++    from elspeth.web import async_workers
++
++    actual_retain = async_workers._retain_cancellation
++
++    def observe_retain(cancellations, cancellation):
++        deliveries.append(cancellation)
++        actual_retain(cancellations, cancellation)
++
++    def park_validator(_conn, _cursor, statement, _parameters, _context, _many):
++        if statement.startswith("SELECT blobs.session_id, blobs.status"):
++            entered.set()
++            assert release.wait(5)
++            if fault in {"ValueError", "SQL", "group"}:
++                raise injected[fault]
++
++    monkeypatch.setattr(asyncio, "shield", observe_shield)
++    monkeypatch.setattr(async_workers, "_retain_cancellation", observe_retain)
++    event.listen(engine, "before_cursor_execute", park_validator)
++    state = _initial_composition_state()
++    planner_invocation = _discovery_invocation("completed-planner-evidence")
++    task = asyncio.create_task(
++        planner._stage_pipeline_plan(
++            plan=plan,
++            state=state,
++            session_id=sid,
++            current_state_id=None,
++            user_message_id=expected.authority.row.user_message_id,
++            user_id="alice",
++            session_operation_context=running.session_operation_context,
++            preferences=preferences,
++            recorder=BufferingRecorder(),
++            planner_llm_calls=(),
++            planner_private_candidates=(),
++            planner_attempts=(),
++            planner_invocations=(planner_invocation,),
++            planner_withheld_replies=(),
++            required_work=binding,
++        )
++    )
++    try:
++        async with asyncio.timeout(5):
++            while not entered.is_set():
++                if task.done():
++                    await task
++                await asyncio.sleep(0.01)
++        if cancel_creation:
++            task.cancel("original failed creation cancellation")
++            async with asyncio.timeout(5):
++                while not deliveries:
++                    await asyncio.sleep(0)
++            assert not task.done()
++        release.set()
++        if cancel_creation:
++            with pytest.raises(BaseException) as caught:
++                await task
++            leaves = originals(caught.value)
++            assert any(leaf is deliveries[0] for leaf in leaves)
++            if not required:
++                assert caught.value is deliveries[0]
++                assert type(caught.value.__cause__).__name__ == "ProposalResourceUnavailableError"
++        elif fault in {"corrupt", "ValueError", "SQL", "group", "telemetry"}:
++            with pytest.raises(BaseException) as caught:
++                await task
++            if fault == "corrupt":
++                assert type(caught.value) is AuditIntegrityError
++            elif fault == "group":
++                assert originals(caught.value) == originals(injected[fault])
++            elif fault == "telemetry" and required:
++                assert any(leaf is injected[fault] for leaf in originals(caught.value))
++            else:
++                assert caught.value is injected[fault]
++        else:
++            result = await task
++            assert result.state is state
++            assert result.raw_assistant_content == ""
++            assert result.pipeline_commit_intent is None and result.runtime_preflight is None
++            assert result.tool_invocations == () and result.llm_calls == ()
++            assert "no longer available" in result.message
++            assert str(blob.id) not in result.message
++        if required:
++            parent.assert_completed()
++            sql = next(ticket for ticket in parent.tickets if ticket.key.source is RequiredWorkSource.PROPOSAL_CREATION_SQL)
++            projection = next(ticket for ticket in parent.tickets if ticket.key.source is RequiredWorkSource.PROPOSAL_CREATION_PROJECTION)
++            assert sql.complete and projection.complete
++            if fault == "telemetry":
++                assert sql.errors == ()
++                assert any(
++                    any(leaf is injected[fault] for leaf in originals(receipt.original_root)) for receipt in parent.failure_receipts()
++                )
++            else:
++                assert len(sql.errors) == 1
++                if fault in {"pending", "missing", "error"}:
++                    assert type(sql.errors[0]).__name__ == "ProposalResourceUnavailableError"
++                elif fault != "corrupt":
++                    assert sql.errors[0] is injected[fault]
++                assert any(receipt.original_root is sql.errors[0] for receipt in parent.failure_receipts())
++            assert not parent._child_registrations
++            if cancel_creation:
++                assert any(leaf is sql.errors[0] for leaf in originals(caught.value))
++        with engine.connect() as conn:
++            assert len(
++                conn.execute(
++                    select(composition_proposals_table.c.id).where(composition_proposals_table.c.tool_call_id == plan.tool_call_id)
++                ).all()
++            ) == int(fault == "telemetry")
++            assert conn.execute(select(composition_states_table.c.id)).all() == []
++            assert len(
++                conn.execute(
++                    select(proposal_events_table.c.id).where(proposal_events_table.c.proposal_id != str(expected.authority.row.id))
++                ).all()
++            ) == int(fault == "telemetry")
++        assert _invocation_occurrences(_chat_rows(service, str(sid))) == {**prior_occurrences, planner_invocation.tool_call_id: 1}
++    finally:
++        release.set()
++        await asyncio.gather(task, return_exceptions=True)
++        event.remove(engine, "before_cursor_execute", park_validator)
++        repository.release(running.session_operation_context)
++
++
+ @pytest.mark.asyncio
+ async def test_mounted_manual_body_sql_and_close_failures_retain_originals_and_reduce_priority(operation_store, tmp_path, monkeypatch):
+     engine, repository, _authority, _service, sid = operation_store
+diff --git a/tests/unit/web/sessions/test_proposal_blob_refs.py b/tests/unit/web/sessions/test_proposal_blob_refs.py
+index 042fbfd68..f5c890652 100644
+--- a/tests/unit/web/sessions/test_proposal_blob_refs.py
++++ b/tests/unit/web/sessions/test_proposal_blob_refs.py
+@@ -12,7 +12,67 @@ from uuid import uuid4
+ import pytest
+ 
+ from elspeth.web.composer.pipeline_proposal import OWNED_COMPOSITION_STATE_AUTHORITY
+-from elspeth.web.sessions.proposal_blob_refs import proposal_blob_reference_ids
++from elspeth.web.sessions.proposal_blob_refs import ProposalResourceUnavailableError, proposal_blob_reference_ids
++
++
++@pytest.mark.parametrize("availability", ["missing", "foreign", "pending", "error", "ready", "corrupt", "null"])
++def test_final_reference_check_distinguishes_resource_refusal_from_owned_corruption(availability: str) -> None:
++    from sqlalchemy import Column, MetaData, String, Table, create_engine
++
++    from elspeth.contracts.errors import AuditIntegrityError
++    from elspeth.web.sessions import proposal_blob_refs
++
++    engine = create_engine("sqlite://")
++    metadata = MetaData()
++    blobs = Table("blobs", metadata, Column("id", String), Column("session_id", String), Column("status", String))
++    metadata.create_all(engine)
++    with engine.begin() as conn:
++        if availability != "missing":
++            conn.execute(
++                blobs.insert().values(
++                    id="private-resource",
++                    session_id="foreign" if availability == "foreign" else "owned",
++                    status=None if availability == "null" else "unknown" if availability == "corrupt" else availability,
++                )
++            )
++        if availability == "ready":
++            proposal_blob_refs.validate_proposal_blob_references(
++                conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"}
++            )
++        elif availability in {"corrupt", "null"}:
++            with pytest.raises(AuditIntegrityError):
++                proposal_blob_refs.validate_proposal_blob_references(
++                    conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"}
++                )
++        else:
++            with pytest.raises(ProposalResourceUnavailableError) as caught:
++                proposal_blob_refs.validate_proposal_blob_references(
++                    conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"}
++                )
++            assert type(caught.value) is ProposalResourceUnavailableError
++            assert "private-resource" not in str(caught.value)
++    engine.dispose()
++
++
++@pytest.mark.parametrize(
++    "arguments",
++    [
++        {"source": {"options": {"blob_ref": 7}}},
++        {"source": {"options": {"path": "blob:malformed"}}},
++        {"authority_kind": OWNED_COMPOSITION_STATE_AUTHORITY, "sources": []},
++    ],
++)
++def test_malformed_authority_is_not_an_expected_resource_refusal(arguments: dict) -> None:
++    from sqlalchemy import create_engine
++
++    from elspeth.web.sessions.proposal_blob_refs import validate_proposal_blob_references
++
++    engine = create_engine("sqlite://")
++    # No table exists: a malformed authority must fail before any resource query.
++    with engine.connect() as conn, pytest.raises(ValueError) as caught:
++        validate_proposal_blob_references(conn, session_id="owned", tool_name="set_pipeline", arguments=arguments)
++    assert type(caught.value) is ValueError
++    engine.dispose()
+ 
+ 
+ def _sha() -> str:

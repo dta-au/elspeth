@@ -1,0 +1,3 @@
+5	0	src/elspeth/composer_mcp/portable_supervisor.py
+128	0	tests/helpers/composer_stdio_ownership_probe.py
+14	0	tests/unit/composer_mcp/test_standalone_lifecycle.py

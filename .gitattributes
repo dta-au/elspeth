@@ -1,0 +1,5 @@
+.claude/lanes/composer-remediation-wave1/playwright-browsers/** filter=lfs diff=lfs merge=lfs -text
+.claude/lanes/composer-remediation-wave1/runtime-deps/**/*.onnx filter=lfs diff=lfs merge=lfs -text
+.claude/lanes/composer-remediation-wave1/runtime-deps/**/*.tar.gz filter=lfs diff=lfs merge=lfs -text
+.claude/lanes/composer-remediation-wave1/runtime-deps/**/*.deb filter=lfs diff=lfs merge=lfs -text
+.claude/lanes/composer-remediation-wave1/runtime-deps/caddy/caddy filter=lfs diff=lfs merge=lfs -text

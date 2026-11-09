@@ -1,0 +1,34 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 422 items
+
+tests/unit/contracts/test_blobs.py ....                                  [  0%]
+tests/unit/web/blobs/test_service.py ................................... [  9%]
+...........................................................s............ [ 26%]
+........................................................................ [ 43%]
+..................................                                       [ 51%]
+tests/unit/web/blobs/test_service_fencing.py ........................... [ 57%]
+....                                                                     [ 58%]
+tests/unit/web/blobs/test_composer_replacement_recovery.py ............. [ 61%]
+                                                                         [ 61%]
+tests/unit/web/blobs/test_deletion_driver_interop.py ........            [ 63%]
+tests/unit/web/blobs/test_atomic_deletion_recovery.py ....               [ 64%]
+tests/unit/web/blobs/test_atomic_deletion_obligation.py ..............   [ 68%]
+tests/unit/web/blobs/test_fork_deletion_recovery_ack.py ....             [ 68%]
+tests/unit/web/coordination/test_session_derived_mutations.py .......... [ 71%]
+...........                                                              [ 73%]
+tests/unit/web/coordination/test_storage_quota_authority.py ............ [ 76%]
+.............                                                            [ 79%]
+tests/unit/web/blobs/test_storage_quota_sites.py ....................... [ 85%]
+..                                                                       [ 85%]
+tests/unit/web/composer/test_blob_inline_tools.py ...................... [ 90%]
+......................................                                   [100%]
+
+=========================== short test summary info ============================
+SKIPPED [1] tests/unit/web/blobs/test_service.py:2945: ELSPETH_TEST_POSTGRES_URL is required for the server-backend custody exercise
+================== 421 passed, 1 skipped in 100.77s (0:01:40) ==================

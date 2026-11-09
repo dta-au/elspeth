@@ -1,0 +1,13 @@
+src/elspeth/contracts/blobs.py
+src/elspeth/web/blobs/replacement.py
+src/elspeth/web/blobs/service.py
+src/elspeth/web/composer/tool_batch.py
+src/elspeth/web/composer/tools/blobs.py
+src/elspeth/web/coordination/repository.py
+src/elspeth/web/sessions/protocol.py
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py
+tests/testcontainer/web/test_blob_mutation_admission_postgres.py
+tests/unit/architecture/test_session_db_mutation_authority.py
+tests/unit/web/blobs/test_mutation_admission.py
+tests/unit/web/blobs/test_mutation_admission_quota.py
+tests/unit/web/sessions/test_blob_proposal_accept.py

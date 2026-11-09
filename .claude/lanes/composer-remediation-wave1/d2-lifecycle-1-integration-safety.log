@@ -1,0 +1,15 @@
+tree   : /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata  [worktree of /workspace/elspeth]
+HEAD   : 205c56fe3  branch: (detached)  intent: merge
+
+[PASS] in-progress   none  (ls /workspace/elspeth/.git/worktrees/composer-remediation-landscape-metadata; git ls-files --unmerged)
+[WARN] branch        detached HEAD; a commit here is reachable only by sha  (git branch --show-current)
+[INFO] worktree      staged=0 unstaged=0 untracked=0  (git status --porcelain)
+[INFO] staged-paths  nothing staged  (git diff --cached --name-only)
+[INFO] fetch         not fetched (--fetch to refresh); origin/* is as of the last fetch
+[INFO] upstream      no upstream configured for HEAD  (git rev-parse --abbrev-ref @{u})
+[WARN] base          HEAD is behind b4064d2700bd4c9413a1cdcb794a95226681d373 by 1 (ahead 0); rebase ONLY when you are next  (git rev-list --count HEAD..b4064d2700bd4c9413a1cdcb794a95226681d373)
+[PASS] hmac-key      not present in the environment  (env | grep ^ELSPETH_JUDGE)
+[PASS] venv          /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv present  (ls -la .venv)
+[PASS] provenance    elspeth and elspeth_lints import from THIS tree  (PYTHONPATH=$ROOT/src:$ROOT/elspeth-lints/src python -c 'import elspeth; print(elspeth.__file__)')
+
+result : FAIL=0 WARN=2  intent=merge  HEAD=205c56fe3

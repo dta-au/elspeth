@@ -1,0 +1,1 @@
+{"pid": 319382, "command": ["/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/bin/python", "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src/elspeth/composer_mcp/runner.py", "--help"]}

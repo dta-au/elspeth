@@ -1,0 +1,64 @@
+diff --git a/tests/unit/web/composer/test_tools_discovery.py b/tests/unit/web/composer/test_tools_discovery.py
+index 9aa200b09..c3454d601 100644
+--- a/tests/unit/web/composer/test_tools_discovery.py
++++ b/tests/unit/web/composer/test_tools_discovery.py
+@@ -161,6 +161,7 @@ class TestDiscoveryTools:
+         before any text check.
+         """
+         import ast as _ast
++        import re as _re
+ 
+         from elspeth.core.expression_parser import (
+             _BINARY_OPS,
+@@ -198,14 +199,49 @@ class TestDiscoveryTools:
+         assert set(token_table) == set(_COMPARISON_OPS) | set(_BINARY_OPS) | set(_UNARY_OPS) | set(_BOOL_OPS)
+ 
+         grammar = get_expression_grammar()
+-        operators_section = grammar.split("Operators:")[1].split("Built-in functions")[0]
++        operators_section = grammar.split("Operators:", 1)[1].split("Literals:", 1)[0]
++        documented_tokens: set[str] = set()
++        for line in operators_section.strip().splitlines():
++            # Two or more spaces separate the entry list from its description;
++            # single spaces belong to multiword tokens such as "is not".
++            token_list = _re.split(r"\s{2,}", line.strip(), maxsplit=1)[0]
++            if token_list == "x if condition else y":
++                continue  # Ternary syntax is not an entry in the AST operator maps.
++            documented_tokens.update(token.strip() for token in token_list.split(","))
+         for op_type, token in token_table.items():
+-            assert token in operators_section, f"{op_type.__name__} token {token!r} missing from Operators section"
++            assert token in documented_tokens, f"{op_type.__name__} token {token!r} missing from Operators section"
+ 
+         # Safe constants are part of the accepted grammar too.
+         for constant in _SAFE_CONSTANTS:
+             assert constant in grammar, f"constant {constant!r} undocumented"
+ 
++    @pytest.mark.parametrize(
++        ("documented_span", "replacement", "removed_token"),
++        [
++            pytest.param(", <,", ",", "<", id="less-than"),
++            pytest.param(", >,", ",", ">", id="greater-than"),
++            pytest.param(", /,", ",", "/", id="division"),
++            pytest.param("==, ", "", "==", id="equality"),
++            pytest.param(", is not  ", "  ", "is not", id="identity-negation"),
++            pytest.param(", not in  ", "  ", "not in", id="membership-negation"),
++        ],
++    )
++    def test_operator_parity_rejects_missing_standalone_token(
++        self,
++        monkeypatch: pytest.MonkeyPatch,
++        documented_span: str,
++        replacement: str,
++        removed_token: str,
++    ) -> None:
++        """Longer operators and description prose cannot hide a missing entry."""
++        grammar = get_expression_grammar()
++        assert grammar.count(documented_span) == 1, "the mutation must remove exactly one documented entry"
++        mutated_grammar = grammar.replace(documented_span, replacement, 1)
++        monkeypatch.setattr(f"{__name__}.get_expression_grammar", lambda: mutated_grammar)
++
++        with pytest.raises(AssertionError, match=f"token {removed_token!r} missing from Operators section"):
++            self.test_expression_grammar_documents_every_operator()
++
+     def test_expression_grammar_documents_every_builtin_bidirectionally(self) -> None:
+         """Text↔parser doc-parity for builtins, both directions (A4).
+ 

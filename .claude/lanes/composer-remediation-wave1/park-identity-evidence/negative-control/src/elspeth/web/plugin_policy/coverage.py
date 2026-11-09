@@ -1,0 +1,951 @@
+"""Queue-aware typed graph coverage for required web controls."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Literal, Protocol, cast
+
+from elspeth.contracts.enums import Determinism
+from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
+from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.plugins.infrastructure.manager import PluginNotFoundError, get_shared_plugin_manager
+from elspeth.web.composer._producer_resolver import published_success_connection, source_producer_id
+from elspeth.web.composer.state import CompositionState, NodeSpec, SourceSpec, _coalesce_branch_connections
+
+_NON_PRODUCED_ROUTE_TARGETS = frozenset({"discard", "fork", "stop"})
+
+
+class _ControlEffectEvaluator(Protocol):
+    @classmethod
+    def is_effective_blocking_control(
+        cls,
+        *,
+        capability: PluginCapability,
+        role: ControlRole,
+        options: Mapping[str, object],
+    ) -> bool: ...
+
+
+@dataclass(frozen=True, slots=True)
+class OutputStreamGraph:
+    """Canonical producer/consumer indexes for authored stream names."""
+
+    producers_by_stream: Mapping[str, tuple[NodeSpec, ...]]
+    queue_predecessors: Mapping[str, tuple[NodeSpec, ...]]
+    consumers_by_stream: Mapping[str, tuple[NodeSpec, ...]]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "producers_by_stream", "queue_predecessors", "consumers_by_stream")
+
+
+@dataclass(frozen=True, slots=True)
+class _ProtectedFields:
+    """Known prompt fields plus whether that set is statically complete."""
+
+    fields: frozenset[str]
+    provable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ControlCoverageFinding:
+    """One uncovered required-control site, with enough detail to explain it.
+
+    ``reason`` discriminates the diagnosis only — every variant is the same
+    rejection with the same severity. ``output_error_route_not_post_dominated``
+    is the narrow, fully-diagnosable output case: the node's own ``on_error``
+    edge is the single uncovered stream, so the message can name the one
+    authorable repair instead of a generic "not covered". The source-side
+    ``output_validation_failure_route_not_post_dominated`` is the equivalent
+    diagnosis for an unrepairable ``on_validation_failure`` route.
+    ``uncovered_stream`` carries the offending target for either diagnosis.
+
+    ``component_type`` keeps the stable component id nominal across every
+    policy and execution validation boundary. ``source`` ids use the composer
+    convention (``source`` or ``source:<name>``); transform ids are node ids.
+
+    ``input_fields_unprovable`` is the second fully-diagnosable case: the
+    node's protected field set is not an explicit declaration (its
+    ``required_input_fields`` is ``[]``, the whole row, or absent), so a
+    control scoped to a specific field list cannot be credited (only
+    ``fields: all`` can). This reason remains authoritative even when the
+    topology is also broken: ``input_not_dominated`` is auto-wirable, and
+    auto-wiring from a guessed field list would install a control that still
+    cannot cover what the template sees.
+    ``protected_fields`` and ``scanned_fields`` carry the two sets the message
+    can name; ``scanned_fields`` is populated only when a control structurally
+    dominates, is diagnosis-only, and is never a credit decision.
+    """
+
+    component_id: str
+    component_type: Literal["source", "transform"]
+    capability: PluginCapability
+    role: ControlRole
+    reason: Literal[
+        "input_not_dominated",
+        "input_fields_unprovable",
+        "output_not_post_dominated",
+        "output_error_route_not_post_dominated",
+        "output_validation_failure_route_not_post_dominated",
+    ]
+    uncovered_stream: str | None = None
+    protected_fields: tuple[str, ...] = ()
+    scanned_fields: tuple[str, ...] = ()
+
+
+def build_output_stream_graph(nodes: Sequence[NodeSpec]) -> OutputStreamGraph:
+    """Build insertion-order-independent queue-aware stream indexes."""
+    queue_ids = {node.id for node in nodes if node.node_type == "queue"}
+    ordinary: dict[str, dict[str, NodeSpec]] = {}
+    queue_predecessors: dict[str, dict[str, NodeSpec]] = {queue_id: {} for queue_id in queue_ids}
+    consumers: dict[str, dict[str, NodeSpec]] = {}
+
+    def register_first(index: dict[str, dict[str, NodeSpec]], stream: str, node: NodeSpec) -> None:
+        """Record ``node`` under ``stream`` unless that id is already indexed.
+
+        First-wins on a repeated node id, spelled as an explicit membership
+        test: the whole point of these indexes is that the answer does not
+        depend on where a node sits in ``nodes``.
+        """
+        if stream not in index:
+            index[stream] = {}
+        entries = index[stream]
+        if node.id not in entries:
+            entries[node.id] = node
+
+    def register(stream: str | None, producer: NodeSpec) -> None:
+        if stream is None or stream == "" or stream in _NON_PRODUCED_ROUTE_TARGETS:
+            return
+        if stream in queue_ids and producer.id != stream:
+            register_first(queue_predecessors, stream, producer)
+            return
+        register_first(ordinary, stream, producer)
+
+    for node in nodes:
+        for stream in _node_output_streams(node):
+            register(stream, node)
+        for stream in _node_input_streams(node):
+            register_first(consumers, stream, node)
+
+    for node in nodes:
+        if node.node_type == "queue":
+            ordinary[node.id] = {node.id: node}
+
+    return OutputStreamGraph(
+        producers_by_stream={stream: tuple(entries[key] for key in sorted(entries)) for stream, entries in ordinary.items()},
+        queue_predecessors={queue_id: tuple(entries[key] for key in sorted(entries)) for queue_id, entries in queue_predecessors.items()},
+        consumers_by_stream={stream: tuple(entries[key] for key in sorted(entries)) for stream, entries in consumers.items()},
+    )
+
+
+def node_has_blocking_control(
+    node: NodeSpec,
+    capability: PluginCapability,
+    role: ControlRole,
+    *,
+    protected_fields: frozenset[str] | None = None,
+) -> bool:
+    """Credit only registered typed blocking controls with effective config."""
+    if node.plugin is None:
+        return False
+    try:
+        plugin_cls = cast(
+            "type[_ControlEffectEvaluator]",
+            get_shared_plugin_manager().get_transform_by_name(node.plugin),
+        )
+    except PluginNotFoundError:
+        return False
+    effective = plugin_cls.is_effective_blocking_control(
+        capability=capability,
+        role=role,
+        options=node.options,
+    )
+    if not effective:
+        return False
+    return protected_fields is None or _control_covers_fields(node, protected_fields)
+
+
+@observation_boundary(
+    tier=3,
+    source="NodeSpec carrying web-authored control options (untrusted 'fields' scope value)",
+    source_param="node",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns False (not credited) for any 'fields' scope value other than the literal string 'all' or a "
+        "well-formed sequence of non-empty strings; never raises on a malformed scope. An ABSENT 'fields' key "
+        "reads as None and takes that same not-credited path — the absent case is never a credit"
+    ),
+)
+def _control_covers_fields(node: NodeSpec, protected_fields: frozenset[str]) -> bool:
+    """Return whether a control scans every field whose content it protects.
+
+    ``fields: all`` is decided FIRST because it is a superset of every
+    protected set — provable or not — so it covers the empty set too. The
+    empty-set bail-out below is the fail-closed rule for every OTHER scope: an
+    empty protected set is not proof that no field needs protecting (an LLM
+    node whose declaration is ``[]`` sees the whole row, and one with no
+    provable declaration reads as the empty set — see ``_llm_input_fields``),
+    so a control scoped to a specific field list cannot be credited against it.
+    Ordering these the other way round rejected correctly-shielded pipelines
+    outright (AWS acceptance run 2, R2-F17 / elspeth-5c0c09db31).
+    """
+    configured = node.options.get("fields")
+    if configured == "all":
+        return True
+    if not protected_fields:
+        return False
+    if isinstance(configured, str):
+        scanned_fields = frozenset({configured}) if configured.strip() else frozenset()
+    elif isinstance(configured, Sequence) and not isinstance(configured, (str, bytes)):
+        if any(not isinstance(field, str) or not field.strip() for field in configured):
+            return False
+        scanned_fields = frozenset(configured)
+    else:
+        return False
+    return protected_fields.issubset(scanned_fields)
+
+
+@observation_boundary(
+    tier=3,
+    source="NodeSpec carrying web-authored LLM options (untrusted required_input_fields and query definitions)",
+    source_param="node",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns a _ProtectedFields with provable=False unless 'required_input_fields' is a non-empty sequence of "
+        "non-empty strings, and whenever 'queries' or any query definition, its input_fields mapping, or a "
+        "row-field name deviates from the expected shape; never raises on malformed options. An ABSENT "
+        "'required_input_fields' is the plugin default (None: the template sees no field) and an absent 'queries' "
+        "is a single-query node (LLMConfig.queries); neither is ever credited as a provable field set"
+    ),
+)
+def _llm_input_fields(node: NodeSpec) -> _ProtectedFields:
+    """The fields an LLM node's prompts can carry: its declaration, never what a template analysis found.
+
+    At render a template's ``row`` (a query's ``row.source_row``) holds exactly
+    the node's ``required_input_fields`` (ADR-051), and a query's
+    ``input_fields`` values are read into its variables in the parent. So the
+    protected set is the declaration plus every query's ``input_fields``
+    values, whatever the template text reads. ``[]`` (the whole row) and an
+    omitted or malformed declaration are not a provable set: only a control
+    scanning ``fields: all`` can cover them.
+    """
+    declared = node.options.get("required_input_fields")
+    if not isinstance(declared, Sequence) or isinstance(declared, (str, bytes)) or len(declared) == 0:
+        return _ProtectedFields(frozenset(), False)
+    if any(not isinstance(field, str) or not field.strip() for field in declared):
+        return _ProtectedFields(frozenset(), False)
+    fields = set(cast("Sequence[str]", declared))
+
+    queries = node.options.get("queries")
+    if queries is None:
+        return _ProtectedFields(frozenset(fields), True)
+    if not isinstance(queries, (Mapping, Sequence)) or isinstance(queries, (str, bytes)):
+        return _ProtectedFields(frozenset(fields), False)
+    # A mapping's query definitions are its VALUES; a value that is both a
+    # Mapping and a Sequence keeps the mapping reading.
+    definitions = tuple(queries.values()) if isinstance(queries, Mapping) else tuple(queries)
+    for definition in definitions:
+        if not isinstance(definition, Mapping):
+            return _ProtectedFields(frozenset(fields), False)
+        input_fields = definition.get("input_fields")
+        if not isinstance(input_fields, Mapping):
+            return _ProtectedFields(frozenset(fields), False)
+        row_fields = tuple(input_fields.values())
+        if any(not isinstance(field, str) or not field.strip() for field in row_fields):
+            return _ProtectedFields(frozenset(fields), False)
+        fields.update(cast("tuple[str, ...]", row_fields))
+    return _ProtectedFields(frozenset(fields), True)
+
+
+def _llm_output_fields(node: NodeSpec) -> frozenset[str]:
+    """Return the raw model-response fields emitted by this LLM config."""
+    return _llm_output_fields_from_options(node.options)
+
+
+@observation_boundary(
+    tier=3,
+    source="NodeSpec.options for a web-authored LLM node (untrusted response_field/queries values)",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns an empty frozenset whenever response_field, or 'queries' (its keys, entries, or a query's "
+        "'name'), deviates from the expected shape; never raises on malformed options. The 'llm_response' default "
+        "for an absent response_field is the plugin's own declared default (LLMConfig.response_field, "
+        "plugins/transforms/llm/base.py and plugins/sources/llm/config.py), so it names the field the node will "
+        "actually write rather than assuming one; an absent 'queries' is a single-query node"
+    ),
+)
+def _llm_output_fields_from_options(options: Mapping[str, object]) -> frozenset[str]:
+    """Return only raw model-response fields, excluding operational diagnostics."""
+    response_field = options.get("response_field", "llm_response")
+    if not isinstance(response_field, str) or not response_field.strip():
+        return frozenset()
+    queries = options.get("queries")
+    if queries is None:
+        return frozenset({response_field})
+
+    query_names: list[str] = []
+    if isinstance(queries, Mapping):
+        query_names.extend(name for name in queries if isinstance(name, str) and name.strip())
+        if len(query_names) != len(queries):
+            return frozenset()
+    elif isinstance(queries, Sequence) and not isinstance(queries, (str, bytes)):
+        for query in queries:
+            if not isinstance(query, Mapping):
+                return frozenset()
+            name = query.get("name")
+            if not isinstance(name, str) or not name.strip():
+                return frozenset()
+            query_names.append(name)
+    else:
+        return frozenset()
+    return frozenset(f"{name}_{response_field}" for name in query_names)
+
+
+@observation_boundary(
+    tier=3,
+    source="SourceSpec carrying web-authored/deserialized LLM source options (untrusted response_field value)",
+    source_param="source",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns None whenever source.options or its response_field deviates from the expected shape; never raises "
+        "on malformed options. An absent response_field takes the plugin's own declared default 'llm_response' "
+        "(plugins/sources/llm/config.py), the field the source will actually write"
+    ),
+)
+def _llm_source_output_fields(source: SourceSpec) -> frozenset[str] | None:
+    """Return the one generated field, or ``None`` when options are malformed."""
+    options: object = source.options
+    if not isinstance(options, Mapping):
+        return None
+    response_field = options.get("response_field", "llm_response")
+    if type(response_field) is not str or not response_field.strip():
+        return None
+    return frozenset({response_field})
+
+
+def transform_plugin_has_capability(plugin: str | None, capability: PluginCapability) -> bool:
+    """Resolve a transform capability through the nominal plugin registry."""
+    if plugin is None:
+        return False
+    try:
+        plugin_cls = get_shared_plugin_manager().get_transform_by_name(plugin)
+    except PluginNotFoundError:
+        return False
+    return any(declaration.capability is capability for declaration in plugin_cls.policy_capabilities)
+
+
+def node_has_capability(node: NodeSpec, capability: PluginCapability) -> bool:
+    return transform_plugin_has_capability(node.plugin, capability)
+
+
+def source_has_capability(source: SourceSpec, capability: PluginCapability) -> bool:
+    """Resolve source capabilities through the nominal source registry."""
+    if type(source.plugin) is not str:
+        return False
+    try:
+        plugin_cls = get_shared_plugin_manager().get_source_by_name(source.plugin)
+    except PluginNotFoundError:
+        return False
+    return any(declaration.capability is capability for declaration in plugin_cls.policy_capabilities)
+
+
+def _source_component_id(source_name: object) -> str:
+    """Return a value-safe stable id for a possibly malformed source name."""
+    if type(source_name) is not str:
+        return "source:<invalid>"
+    return source_producer_id(source_name)
+
+
+def _stable_source_items(state: CompositionState) -> tuple[tuple[object, SourceSpec], ...]:
+    """Order valid source names lexically and malformed names stably last."""
+    sources = cast("Mapping[object, SourceSpec]", state.sources)
+    return tuple(
+        sorted(
+            sources.items(),
+            key=lambda item: (0, item[0]) if type(item[0]) is str else (1, ""),
+        )
+    )
+
+
+def _valid_source_stream(value: object) -> str | None:
+    """Return an exact non-empty authored stream name, else fail closed."""
+    return value if type(value) is str and bool(value.strip()) else None
+
+
+def control_coverage_findings(
+    state: CompositionState,
+    capability: PluginCapability,
+) -> tuple[ControlCoverageFinding, ...]:
+    """Return one stable finding for each LLM lacking required coverage."""
+    if capability not in (PluginCapability.PROMPT_SHIELD, PluginCapability.CONTENT_SAFETY):
+        return ()
+    graph = build_output_stream_graph(state.nodes)
+    source_items = _stable_source_items(state)
+    source_streams = frozenset(
+        stream for _source_name, source in source_items if (stream := _valid_source_stream(source.on_success)) is not None
+    )
+    sink_streams = frozenset(output.name for output in state.outputs)
+    findings: list[ControlCoverageFinding] = []
+    if capability is PluginCapability.CONTENT_SAFETY:
+        for source_name, source in source_items:
+            if not source_has_capability(source, PluginCapability.LLM):
+                continue
+            protected_fields = _llm_source_output_fields(source)
+            success_stream = _valid_source_stream(source.on_success)
+            success_covered = (
+                protected_fields is not None
+                and success_stream is not None
+                and _stream_proves_output_control(
+                    success_stream,
+                    graph,
+                    sink_streams=sink_streams,
+                    visited=frozenset(),
+                    protected_fields=protected_fields,
+                )
+            )
+            validation_failure_destination = source.on_validation_failure if type(source.on_validation_failure) is str else None
+            validation_failure_covered = validation_failure_destination == "discard"
+            if success_covered and validation_failure_covered:
+                continue
+            validation_failure_only = success_covered and not validation_failure_covered
+            findings.append(
+                ControlCoverageFinding(
+                    component_id=_source_component_id(source_name),
+                    component_type="source",
+                    capability=capability,
+                    role=ControlRole.OUTPUT,
+                    reason=(
+                        "output_validation_failure_route_not_post_dominated" if validation_failure_only else "output_not_post_dominated"
+                    ),
+                    uncovered_stream=validation_failure_destination if validation_failure_only else None,
+                )
+            )
+    for node in state.nodes:
+        if not node_has_capability(node, PluginCapability.LLM):
+            continue
+        if capability is PluginCapability.PROMPT_SHIELD:
+            input_fields = _llm_input_fields(node)
+            covered = _stream_proves_input_control(
+                node.input,
+                graph,
+                source_streams=source_streams,
+                visited=frozenset(),
+                protected_fields=input_fields,
+                enforce_field_scope=True,
+            )
+            if not covered:
+                # Diagnosis is decided HERE, where both field sets are in
+                # hand — never threaded through the recursion, which stays a
+                # pure predicate over coverage. The probe re-asks the SAME
+                # predicate with the field-scope rule switched off, so a
+                # scope-only failure is distinguished from a broken topology
+                # by the credit walk itself rather than by a second, weaker
+                # traversal that could disagree with it.
+                structurally_covered = _stream_proves_input_control(
+                    node.input,
+                    graph,
+                    source_streams=source_streams,
+                    visited=frozenset(),
+                    protected_fields=input_fields,
+                    enforce_field_scope=False,
+                )
+                # Field sets are named only when a control provably dominates:
+                # every control the scan then finds is a real dominator, so the
+                # message cannot point at an irrelevant one.
+                scanned_fields = _upstream_control_scan_scopes(node, graph, capability) if structurally_covered else None
+                findings.append(
+                    ControlCoverageFinding(
+                        component_id=node.id,
+                        component_type="transform",
+                        capability=capability,
+                        role=ControlRole.INPUT,
+                        reason=(
+                            "input_fields_unprovable"
+                            if not input_fields.provable or (not input_fields.fields and structurally_covered)
+                            else "input_not_dominated"
+                        ),
+                        protected_fields=tuple(sorted(input_fields.fields)),
+                        scanned_fields=scanned_fields or (),
+                    )
+                )
+        else:
+            protected_fields = _llm_output_fields(node)
+            outputs = _node_output_streams(node)
+            # Same predicate as before, evaluated per stream instead of through
+            # a short-circuiting all(): ``covered`` is still "every authored
+            # output stream is post-dominated by the control". The helpers are
+            # pure, so dropping the short circuit changes cost on the failing
+            # path only — never the verdict.
+            uncovered = tuple(
+                stream
+                for stream in outputs
+                if not _stream_proves_output_control(
+                    stream,
+                    graph,
+                    sink_streams=sink_streams,
+                    visited=frozenset({node.id}),
+                    protected_fields=protected_fields,
+                )
+            )
+            if not outputs or uncovered:
+                # Diagnosis only. The node's own on_error edge is singled out
+                # when it is the SOLE uncovered stream, because that case has
+                # exactly one authorable repair (on_error must name a sink or
+                # 'discard' — engine invariant, core/dag/builder.py:1108 — so
+                # no control can be interposed on an error branch). An
+                # on_error of 'discard' is exempt in
+                # ``_NON_PRODUCED_ROUTE_TARGETS`` and therefore never lands in
+                # ``uncovered``, so a failure elsewhere in the graph keeps the
+                # general reason even when on_error is set.
+                error_route = node.on_error if node.on_error and node.on_error != node.on_success else None
+                names_error_route = error_route is not None and uncovered == (error_route,)
+                findings.append(
+                    ControlCoverageFinding(
+                        component_id=node.id,
+                        component_type="transform",
+                        capability=capability,
+                        role=ControlRole.OUTPUT,
+                        reason=("output_error_route_not_post_dominated" if names_error_route else "output_not_post_dominated"),
+                        uncovered_stream=error_route if names_error_route else None,
+                    )
+                )
+    return tuple(findings)
+
+
+def _upstream_producers(node: NodeSpec, graph: OutputStreamGraph) -> tuple[NodeSpec, ...]:
+    """Return the nodes producing this node's inputs, queue predecessors included."""
+    if node.node_type == "queue":
+        return graph.queue_predecessors[node.id] if node.id in graph.queue_predecessors else ()
+    return tuple(
+        producer
+        for stream in _node_input_streams(node)
+        if stream in graph.producers_by_stream
+        for producer in graph.producers_by_stream[stream]
+    )
+
+
+def _upstream_control_scan_scopes(
+    node: NodeSpec,
+    graph: OutputStreamGraph,
+    capability: PluginCapability,
+) -> tuple[str, ...] | None:
+    """Return the field scopes of the nearest upstream blocking controls.
+
+    DIAGNOSIS ONLY. This never decides coverage — ``_stream_proves_input_control``
+    is the sole credit authority and this walk deliberately ignores the
+    field-scope, mapper-translation and overwrite rules that make coverage
+    sound. It answers exactly one question for the message: is there a blocking
+    control upstream at all, and what does it scan? ``None`` means none was
+    found on any path, which keeps "no control anywhere" reported as a topology
+    failure rather than a field-scope failure.
+    """
+    seen = {node.id}
+    frontier = list(_upstream_producers(node, graph))
+    scopes: set[str] = set()
+    found = False
+    while frontier:
+        producer = frontier.pop()
+        if producer.id in seen:
+            continue
+        seen.add(producer.id)
+        if node_has_blocking_control(producer, capability, ControlRole.INPUT):
+            found = True
+            scopes.update(_declared_scan_scopes(producer.options))
+            continue
+        frontier.extend(_upstream_producers(producer, graph))
+    return tuple(sorted(scopes)) if found else None
+
+
+@observation_boundary(
+    tier=3,
+    source="the 'fields' scope value authored on a web control node (NodeSpec.options, untrusted)",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns only the field names the scope literally contains as strings; a non-string entry contributes "
+        "nothing and is never rendered into a name. Returns an empty frozenset whenever 'fields' is absent or is "
+        "neither a string nor a non-string sequence; never raises on a malformed scope. DIAGNOSIS ONLY — never a "
+        "credit decision"
+    ),
+)
+def _declared_scan_scopes(options: Mapping[str, object]) -> frozenset[str]:
+    """Return the field names a control's ``fields`` scope literally states.
+
+    DIAGNOSIS ONLY, and deliberately weaker than ``_control_covers_fields``:
+    that function decides credit and refuses a malformed scope outright, while
+    this one reports what the author wrote so the rejection message can name it.
+    Weaker on ADMISSION, never on honesty — a non-string entry is DROPPED rather
+    than stringified. The set is echoed verbatim into an author-facing rejection
+    that ``web/composer/required_controls.py`` also renders into a proposal
+    message, so ``str(7)`` there would state that the control scans a field
+    named ``7``, which is not a field name and not something the author wrote.
+    Dropping instead means the message under-reports a malformed scope, which is
+    the safe direction: the rejection stands either way, and only its explanatory
+    field list is affected.
+
+    ``Sequence`` (not ``list``) is required because ``NodeSpec.__post_init__``
+    deep-freezes ``options``, so an authored list arrives here as a ``tuple``.
+    """
+    configured = options["fields"] if "fields" in options else None
+    if isinstance(configured, str):
+        return frozenset({configured})
+    if isinstance(configured, Sequence) and not isinstance(configured, (str, bytes)):
+        return frozenset(field for field in configured if isinstance(field, str))
+    return frozenset()
+
+
+def _node_output_streams(node: NodeSpec) -> tuple[str, ...]:
+    # ``published_success_connection`` is THE statement of this rule and is
+    # called rather than restated. The previous form tested ``node.on_success``
+    # with a coalesce-only fallback — one of the authority's three arms — so an
+    # AGGREGATION or QUEUE omitting ``on_success`` published under its own id at
+    # runtime while reading here as publishing nothing. That is a security
+    # defect, not a cosmetic one: such a node's only remaining stream is its
+    # ``on_error`` target, and ``_stream_proves_output_control`` short-circuits
+    # True on a non-produced route target like ``discard``, so a REQUIRED
+    # CONTENT_SAFETY control was reported satisfied on a pipeline carrying none
+    # (elspeth-b231af0c16). A false accept on an admission gate.
+    published = published_success_connection(node)
+    streams: list[str] = []
+    if published:
+        streams.append(published)
+    if node.on_error:
+        streams.append(node.on_error)
+    if node.routes:
+        streams.extend(node.routes.values())
+    if node.fork_to:
+        streams.extend(node.fork_to)
+    return tuple(dict.fromkeys(streams))
+
+
+def _node_input_streams(node: NodeSpec) -> tuple[str, ...]:
+    if node.node_type == "queue":
+        return ()
+    if node.node_type in ("coalesce", "row_union"):
+        return _coalesce_branch_connections(node.branches)
+    return (node.input,) if node.input else ()
+
+
+@observation_boundary(
+    tier=3,
+    source="NodeSpec carrying web-authored field_mapper options (untrusted mapping/select_only values)",
+    source_param="node",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns None whenever node.options['mapping'] or node.options['select_only'], or a mapping entry's "
+        "source/target, deviates from the expected shape; never raises on a malformed mapper config. The absent-key "
+        "defaults are the plugin's own (FieldMapperConfig.mapping default_factory=dict, select_only default False), "
+        "so an absent key models what the mapper will actually do — an empty mapping renames nothing and passes "
+        "every protected field through unchanged"
+    ),
+)
+def _translate_protected_fields_through_mapper(
+    node: NodeSpec,
+    protected_fields: frozenset[str],
+    *,
+    direction: Literal["upstream", "downstream"],
+) -> frozenset[str] | None:
+    """Translate protected field names across an exact field-mapper node.
+
+    ``None`` means the mapper configuration or resulting field lineage is
+    unprovable, so required-control coverage must fail closed on that path.
+    """
+    if node.plugin != "field_mapper":
+        return protected_fields
+
+    configured_mapping = node.options.get("mapping", {})
+    select_only = node.options.get("select_only", False)
+    if not isinstance(configured_mapping, Mapping) or not isinstance(select_only, bool):
+        return None
+
+    mapping: dict[str, str] = {}
+    for source, target in configured_mapping.items():
+        if not isinstance(source, str) or not source.strip() or not isinstance(target, str) or not target.strip():
+            return None
+        mapping[source] = target
+
+    targets = tuple(mapping.values())
+    sources = frozenset(mapping)
+    if len(frozenset(targets)) != len(targets):
+        return None
+    if any(source != target and target in sources for source, target in mapping.items()):
+        return None
+
+    translated: set[str] = set()
+    if direction == "upstream":
+        source_by_target = {target: source for source, target in mapping.items()}
+        for field in protected_fields:
+            if field in source_by_target:
+                source = source_by_target[field]
+                if "." in source:
+                    # FieldMapper resolves dotted sources by nested traversal,
+                    # while controls scan exact top-level row keys.
+                    return None
+                translated.add(source)
+            elif field in sources:
+                if "." in field and not select_only:
+                    # Nested extraction does not remove a same-named literal
+                    # top-level key from the passthrough row.
+                    translated.add(field)
+                else:
+                    return None
+            elif select_only:
+                return None
+            else:
+                translated.add(field)
+    else:
+        target_fields = frozenset(targets)
+        for field in protected_fields:
+            if field in mapping:
+                target = mapping[field]
+                if "." in field:
+                    translated.add(target)
+                    if not select_only:
+                        # Exact dotted keys are copied to the target but are
+                        # not deleted from a passthrough row.
+                        translated.add(field)
+                else:
+                    translated.add(target)
+            elif field in target_fields or select_only:
+                return None
+            else:
+                translated.add(field)
+    return frozenset(translated)
+
+
+@observation_boundary(
+    tier=3,
+    source="NodeSpec carrying web-authored value_transform options (untrusted operations list)",
+    source_param="node",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns None whenever node.options['operations'], including an ABSENT one, or an operation's 'target' "
+        "deviates from the expected shape; never raises on a malformed operations list. Absent reads as None and "
+        "takes the same fail-closed path as malformed: an unproven write set means coverage cannot be credited"
+    ),
+)
+def _deterministic_written_fields(node: NodeSpec) -> frozenset[str] | None:
+    """Return the top-level row fields a deterministic transform writes.
+
+    ``None`` means the write set is unprovable, so required-control coverage
+    must fail closed on that path: an unproven transform may overwrite a
+    shielded field with unscanned content. ``field_mapper`` is excluded here
+    because ``_translate_protected_fields_through_mapper`` models its writes.
+    """
+    if node.plugin == "passthrough":
+        return frozenset()
+    if node.plugin != "value_transform":
+        return None
+    operations = node.options.get("operations")
+    if not isinstance(operations, Sequence) or isinstance(operations, (str, bytes)):
+        return None
+    targets: set[str] = set()
+    for operation in operations:
+        if not isinstance(operation, Mapping):
+            return None
+        target = operation.get("target")
+        if not isinstance(target, str) or not target.strip():
+            return None
+        targets.add(target)
+    return frozenset(targets)
+
+
+def _stream_proves_input_control(
+    stream: str | None,
+    graph: OutputStreamGraph,
+    *,
+    source_streams: frozenset[str],
+    visited: frozenset[str],
+    protected_fields: _ProtectedFields,
+    enforce_field_scope: bool,
+) -> bool:
+    """Prove a blocking input control dominates ``stream``.
+
+    ``enforce_field_scope=False`` is the DIAGNOSIS PROBE: it asks the same
+    question with the field-scope rule switched off — "does a blocking control
+    dominate this input at all, whatever it scans?" Every
+    structural refusal (external calls, unprovable write sets, unprovable
+    mapper config, cycles, unknown producers) still applies, so a probe answer
+    of True means the topology really is right and only the control's scope is
+    at fault. The probe is never a credit decision: coverage is decided by the
+    call with the real protected set.
+    """
+    if type(stream) is not str or not stream:
+        return False
+    producers = graph.producers_by_stream[stream] if stream in graph.producers_by_stream else ()
+    if producers:
+        return all(
+            _producer_proves_input_control(
+                producer,
+                graph,
+                source_streams=source_streams,
+                visited=visited,
+                protected_fields=protected_fields,
+                enforce_field_scope=enforce_field_scope,
+            )
+            for producer in producers
+        )
+    # Source rows and missing/unknown producers are untrusted.
+    return False
+
+
+def _producer_proves_input_control(
+    producer: NodeSpec,
+    graph: OutputStreamGraph,
+    *,
+    source_streams: frozenset[str],
+    visited: frozenset[str],
+    protected_fields: _ProtectedFields,
+    enforce_field_scope: bool,
+) -> bool:
+    if producer.id in visited:
+        return False
+    visited = visited | {producer.id}
+    if node_has_blocking_control(
+        producer,
+        PluginCapability.PROMPT_SHIELD,
+        ControlRole.INPUT,
+        protected_fields=(protected_fields.fields if protected_fields.provable else frozenset()) if enforce_field_scope else None,
+    ):
+        return True
+    if producer.node_type == "queue":
+        predecessors = graph.queue_predecessors[producer.id] if producer.id in graph.queue_predecessors else ()
+        return bool(predecessors) and all(
+            _producer_proves_input_control(
+                predecessor,
+                graph,
+                source_streams=source_streams,
+                visited=visited,
+                protected_fields=protected_fields,
+                enforce_field_scope=enforce_field_scope,
+            )
+            for predecessor in predecessors
+        )
+    if producer.node_type == "row_union":
+        branches = _coalesce_branch_connections(producer.branches)
+        return bool(branches) and all(
+            _stream_proves_input_control(
+                branch,
+                graph,
+                source_streams=source_streams,
+                visited=visited,
+                protected_fields=protected_fields,
+                enforce_field_scope=enforce_field_scope,
+            )
+            for branch in branches
+        )
+    if producer.node_type == "gate" and producer.plugin is None:
+        # Config gates route and fork rows without modifying them (GateExecutor
+        # emits output_hash == input_hash and forks children with the parent's
+        # row data verbatim), so a control dominating the gate's single input
+        # dominates every route and fork branch it emits.
+        return _stream_proves_input_control(
+            producer.input,
+            graph,
+            source_streams=source_streams,
+            visited=visited,
+            protected_fields=protected_fields,
+            enforce_field_scope=enforce_field_scope,
+        )
+    if producer.plugin is None:
+        return False
+    try:
+        plugin_cls = get_shared_plugin_manager().get_transform_by_name(producer.plugin)
+    except PluginNotFoundError:
+        return False
+    if plugin_cls.determinism is Determinism.EXTERNAL_CALL:
+        return False
+    if producer.plugin != "field_mapper":
+        written_fields = _deterministic_written_fields(producer)
+        if (
+            written_fields is None
+            or (not protected_fields.provable and bool(written_fields))
+            or bool(written_fields & protected_fields.fields)
+        ):
+            # A write below the nearest shield replaces scanned content with
+            # unscanned data, so upstream shielding cannot cover it. Unknown
+            # write sets fail closed — including under the diagnosis probe,
+            # which switches off the field-scope rule only.
+            return False
+    translated_fields = _translate_protected_fields_through_mapper(
+        producer,
+        protected_fields.fields,
+        direction="upstream",
+    )
+    if translated_fields is None:
+        return False
+    return _stream_proves_input_control(
+        producer.input,
+        graph,
+        source_streams=source_streams,
+        visited=visited,
+        protected_fields=_ProtectedFields(translated_fields, protected_fields.provable),
+        enforce_field_scope=enforce_field_scope,
+    )
+
+
+def _stream_proves_output_control(
+    stream: str,
+    graph: OutputStreamGraph,
+    *,
+    sink_streams: frozenset[str],
+    visited: frozenset[str],
+    protected_fields: frozenset[str],
+) -> bool:
+    if stream in _NON_PRODUCED_ROUTE_TARGETS:
+        return True
+    if stream in sink_streams:
+        return False
+    consumers = graph.consumers_by_stream[stream] if stream in graph.consumers_by_stream else ()
+    if not consumers:
+        return False
+    return all(
+        _consumer_proves_output_control(
+            consumer,
+            graph,
+            sink_streams=sink_streams,
+            visited=visited,
+            protected_fields=protected_fields,
+        )
+        for consumer in consumers
+    )
+
+
+def _consumer_proves_output_control(
+    consumer: NodeSpec,
+    graph: OutputStreamGraph,
+    *,
+    sink_streams: frozenset[str],
+    visited: frozenset[str],
+    protected_fields: frozenset[str],
+) -> bool:
+    if consumer.id in visited:
+        return False
+    visited = visited | {consumer.id}
+    if node_has_blocking_control(
+        consumer,
+        PluginCapability.CONTENT_SAFETY,
+        ControlRole.OUTPUT,
+        protected_fields=protected_fields,
+    ):
+        return True
+    translated_fields = _translate_protected_fields_through_mapper(
+        consumer,
+        protected_fields,
+        direction="downstream",
+    )
+    if translated_fields is None:
+        return False
+    outputs = _node_output_streams(consumer)
+    return bool(outputs) and all(
+        _stream_proves_output_control(
+            stream,
+            graph,
+            sink_streams=sink_streams,
+            visited=visited,
+            protected_fields=translated_fields,
+        )
+        for stream in outputs
+    )

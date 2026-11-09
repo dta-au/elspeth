@@ -1,0 +1,11 @@
+{
+  "cohort_frozen": true,
+  "final_frozen": true,
+  "delta_after_cohort": [
+    "tests/helpers/composer_stdio_ownership_probe.py"
+  ],
+  "production_unchanged": true,
+  "cohort_sha256": "af698df59e8498e9f626b2bbc3730232a51c60643ed7d07f606cf18cc7b5900f",
+  "final_sha256": "4c5e043b97da9c0821c125efb68eef781c0e9fdeeaf9e44edbb2f5cf90e70f89",
+  "inputs": 6222
+}

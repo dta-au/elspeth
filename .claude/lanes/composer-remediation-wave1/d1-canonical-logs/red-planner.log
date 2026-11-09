@@ -1,0 +1,156 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 15 items
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py FFF..... [ 53%]
+.......                                                                  [100%]
+
+=================================== FAILURES ===================================
+_ test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-explicit_approve-explicit_approve] _
+
+snapshot = 'explicit_approve', live = 'explicit_approve'
+
+    @pytest.mark.parametrize("snapshot,live", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve")])
+    async def test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged(snapshot: str, live: str) -> None:
+        state = replace(_empty_state(), version=7)
+>       result, sessions = await _stage(
+            trust_mode=snapshot, live_trust_mode=live, preflight=AssertionError("no new runtime claim"),
+            candidate_state=replace(state, version=8), state=state,
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:261: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:230: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:701: in _stage_pipeline_plan
+    runtime_result = await self._preflight.cached_runtime_preflight(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <AsyncMock spec='method' id='140437877619936'>
+args = (CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(name='Untitled Pipeline', description=''), version=8, sources=mappingproxy({})),)
+kwargs = {'cache': {}, 'initial_version': 7, 'llm_calls': (), 'plugin_snapshot': None, ...}
+_call = call(CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(name='Untitled Pipeline', description=...oken='b3ee27680bd442ffa10ea7091166ef92', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>))
+effect = AssertionError('no new runtime claim')
+
+    async def _execute_mock_call(self, /, *args, **kwargs):
+        # This is nearly just like super(), except for special handling
+        # of coroutines
+    
+        _call = _Call((args, kwargs), two=True)
+        self.await_count += 1
+        self.await_args = _call
+        self.await_args_list.append(_call)
+    
+        effect = self.side_effect
+        if effect is not None:
+            if _is_exception(effect):
+>               raise effect
+E               AssertionError: no new runtime claim
+
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/mock.py:2291: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:43:33 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:43:35 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:43:35 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-auto_commit-auto_commit] _
+
+snapshot = 'auto_commit', live = 'auto_commit'
+
+    @pytest.mark.parametrize("snapshot,live", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve")])
+    async def test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged(snapshot: str, live: str) -> None:
+        state = replace(_empty_state(), version=7)
+>       result, sessions = await _stage(
+            trust_mode=snapshot, live_trust_mode=live, preflight=AssertionError("no new runtime claim"),
+            candidate_state=replace(state, version=8), state=state,
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:261: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:230: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:701: in _stage_pipeline_plan
+    runtime_result = await self._preflight.cached_runtime_preflight(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <AsyncMock spec='method' id='140437875626432'>
+args = (CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(name='Untitled Pipeline', description=''), version=8, sources=mappingproxy({})),)
+kwargs = {'cache': {}, 'initial_version': 7, 'llm_calls': (), 'plugin_snapshot': None, ...}
+_call = call(CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(name='Untitled Pipeline', description=...oken='aa1624d6cbec44f5b22f7071a24f4572', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>))
+effect = AssertionError('no new runtime claim')
+
+    async def _execute_mock_call(self, /, *args, **kwargs):
+        # This is nearly just like super(), except for special handling
+        # of coroutines
+    
+        _call = _Call((args, kwargs), two=True)
+        self.await_count += 1
+        self.await_args = _call
+        self.await_args_list.append(_call)
+    
+        effect = self.side_effect
+        if effect is not None:
+            if _is_exception(effect):
+>               raise effect
+E               AssertionError: no new runtime claim
+
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/mock.py:2291: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:43:35 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:43:35 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:43:35 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-auto_commit-explicit_approve] _
+
+snapshot = 'auto_commit', live = 'explicit_approve'
+
+    @pytest.mark.parametrize("snapshot,live", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve")])
+    async def test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged(snapshot: str, live: str) -> None:
+        state = replace(_empty_state(), version=7)
+>       result, sessions = await _stage(
+            trust_mode=snapshot, live_trust_mode=live, preflight=AssertionError("no new runtime claim"),
+            candidate_state=replace(state, version=8), state=state,
+        )
+
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:261: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py:230: in _stage
+    result = await service._planning_application._stage_pipeline_plan(
+src/elspeth/web/composer/planning_application.py:701: in _stage_pipeline_plan
+    runtime_result = await self._preflight.cached_runtime_preflight(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <AsyncMock spec='method' id='140437875807712'>
+args = (CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(name='Untitled Pipeline', description=''), version=8, sources=mappingproxy({})),)
+kwargs = {'cache': {}, 'initial_version': 7, 'llm_calls': (), 'plugin_snapshot': None, ...}
+_call = call(CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(name='Untitled Pipeline', description=...oken='867f00c7e8ab4b70a711c70f08098de6', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>))
+effect = AssertionError('no new runtime claim')
+
+    async def _execute_mock_call(self, /, *args, **kwargs):
+        # This is nearly just like super(), except for special handling
+        # of coroutines
+    
+        _call = _Call((args, kwargs), two=True)
+        self.await_count += 1
+        self.await_args = _call
+        self.await_args_list.append(_call)
+    
+        effect = self.side_effect
+        if effect is not None:
+            if _is_exception(effect):
+>               raise effect
+E               AssertionError: no new runtime claim
+
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/mock.py:2291: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:43:35 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:43:35 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:43:35 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-explicit_approve-explicit_approve]
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-auto_commit-auto_commit]
+FAILED tests/unit/web/composer/test_planner_stage_runtime_preflight.py::test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged[asyncio-auto_commit-explicit_approve]
+========================= 3 failed, 12 passed in 2.44s =========================

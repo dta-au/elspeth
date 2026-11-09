@@ -1,0 +1,62 @@
+{
+  "retained_hashes_match": {
+    "src/elspeth/web/blobs/service.py": true,
+    "src/elspeth/web/coordination/repository.py": true
+  },
+  "scanned_paths": [
+    "src/elspeth/web/composer/tools/blobs.py",
+    "src/elspeth/web/composer/tool_batch.py"
+  ],
+  "hashes_before": {
+    "src/elspeth/web/composer/tools/blobs.py": "754515678443c32b15a51c22fb431c722579c8f6622718acdd8a9bf4014225db",
+    "src/elspeth/web/composer/tool_batch.py": "30245b0384b43f1c508a10da2cd6a176c613cd8c35ff0cc21a79fc0eeb6717ee",
+    "src/elspeth/web/blobs/service.py": "ed7bbfcf0ee8ca4fa660bdda4657d8c391100ea26437783b6503e8ebb8aa4e72",
+    "src/elspeth/web/coordination/repository.py": "8bdc440f63e454ad9b3034010ebb784ab0743ffc46ffb604cf94792a6194f511"
+  },
+  "hashes_after": {
+    "src/elspeth/web/composer/tools/blobs.py": "754515678443c32b15a51c22fb431c722579c8f6622718acdd8a9bf4014225db",
+    "src/elspeth/web/composer/tool_batch.py": "30245b0384b43f1c508a10da2cd6a176c613cd8c35ff0cc21a79fc0eeb6717ee",
+    "src/elspeth/web/blobs/service.py": "ed7bbfcf0ee8ca4fa660bdda4657d8c391100ea26437783b6503e8ebb8aa4e72",
+    "src/elspeth/web/coordination/repository.py": "8bdc440f63e454ad9b3034010ebb784ab0743ffc46ffb604cf94792a6194f511"
+  },
+  "identities": [
+    {
+      "path": "src/elspeth/web/composer/tools/blobs.py",
+      "symbol": "_sync_get_blob",
+      "table": "<sessions-write-connection>",
+      "operation": "write_connection",
+      "fingerprint": "6d19cc377aa5042b",
+      "ordinal": 1,
+      "authority": null,
+      "line": 501,
+      "connection_escape": false
+    },
+    {
+      "path": "src/elspeth/web/composer/tools/blobs.py",
+      "symbol": "_sync_list_blobs",
+      "table": "<sessions-write-connection>",
+      "operation": "write_connection",
+      "fingerprint": "6d0dc169d76447ab",
+      "ordinal": 1,
+      "authority": null,
+      "line": 536,
+      "connection_escape": false
+    },
+    {
+      "path": "src/elspeth/web/composer/tools/blobs.py",
+      "symbol": "_sync_list_ready_blob_inline_descriptors",
+      "table": "<sessions-write-connection>",
+      "operation": "write_connection",
+      "fingerprint": "a447ba3ecc90a1f8",
+      "ordinal": 1,
+      "authority": null,
+      "line": 561,
+      "connection_escape": false
+    }
+  ],
+  "exact_identity_drift": {
+    "unexpected": [],
+    "stale": []
+  },
+  "frozen": true
+}

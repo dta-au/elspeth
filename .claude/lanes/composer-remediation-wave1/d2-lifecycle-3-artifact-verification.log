@@ -1,0 +1,158 @@
+{
+  "head": "8c35a2e2a9092260f15e88525cbe343df5410d4e",
+  "artifact": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-review.diff",
+  "bytes": 81379,
+  "sha256": "fa0297dbf92d5faeb6a80099d28b216daa7fb282b1c1eaa25b66e1a19c629949",
+  "tracked": [
+    "src/elspeth/composer_mcp/__init__.py",
+    "src/elspeth/composer_mcp/portable_supervisor.py",
+    "src/elspeth/composer_mcp/server.py",
+    "src/elspeth/web/async_workers.py",
+    "src/elspeth/web/required_executor.py",
+    "tests/conftest.py",
+    "tests/fixtures/required_executor.py",
+    "tests/unit/composer_mcp/test_server.py"
+  ],
+  "new": [
+    "docs/guides/composer-mcp-lifecycle.md",
+    "src/elspeth/composer_mcp/runner.py",
+    "src/elspeth/composer_mcp/standalone.py",
+    "tests/helpers/composer_lifecycle_probe.py",
+    "tests/helpers/composer_parent_death_probe.py",
+    "tests/helpers/composer_stdio_probe.py",
+    "tests/unit/composer_mcp/test_standalone_lifecycle.py",
+    "tests/unit/web/test_async_worker_settlement.py"
+  ],
+  "checks": [
+    {
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "git",
+        "apply",
+        "--reverse",
+        "--check",
+        "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-review.diff"
+      ],
+      "returncode": 0
+    }
+  ],
+  "freeze_command": [
+    "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/bin/python",
+    "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/freeze_tree.py",
+    "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-review-freeze.json"
+  ],
+  "freeze_returncode": 0,
+  "freeze": {
+    "head": "8c35a2e2a9092260f15e88525cbe343df5410d4e",
+    "inputs": 6221,
+    "sha256": "3decb176b74092fbbb291e9a0ce855ad91928a88698015a6cc039491362e167f"
+  }
+}
+{
+  "public": {
+    "returncode": 0,
+    "topology": {
+      "supervisor": 320433,
+      "runner": 320434
+    },
+    "original_preview_valid": true,
+    "singular_file_valid": true,
+    "plural_file_valid": true,
+    "legacy_valid": false,
+    "provider_author_success": true,
+    "provider_export_success": true,
+    "provider_canaries_absent_from_export": true,
+    "legacy_actual_failed_checks": [
+      "path_allowlist"
+    ],
+    "legacy_skipped_checks": [
+      "web_scrape_network_policy",
+      "web_fetch_resource_policy",
+      "secret_refs",
+      "semantic_contracts",
+      "batch_transform_options",
+      "interpretation_review",
+      "blob_inline_refs",
+      "llm_retry_budget_policy",
+      "llm_base_url_policy",
+      "llm_tracing_policy",
+      "aws_s3_endpoint_url_policy",
+      "aws_s3_source_policy",
+      "settings_load",
+      "plugin_instantiation",
+      "value_source_compliance",
+      "graph_structure",
+      "route_target_resolution",
+      "schema_compatibility",
+      "state_exists",
+      "advisor_signoff",
+      "proof_diagnostics"
+    ]
+  },
+  "processes": {
+    "d2-lifecycle-3-final-pytest/test_blocked_actual_preflight_0/status.json": {
+      "returncode": 1,
+      "wait_seconds": 1.0137957269980689
+    },
+    "d2-lifecycle-3-final-pytest/test_blocked_actual_preflight_1/status.json": {
+      "returncode": -9,
+      "wait_seconds": 29.85834994299512
+    },
+    "d2-lifecycle-3-final-pytest/test_blocked_actual_preflight_2/status.json": {
+      "returncode": 70,
+      "wait_seconds": 0.040113143004418816
+    },
+    "d2-lifecycle-3-final-pytest/test_real_partial_startup_tran0/status.json": {
+      "returncode": 0
+    },
+    "d2-lifecycle-3-final-pytest/test_real_partial_startup_tran1/status.json": {
+      "returncode": 1
+    },
+    "d2-lifecycle-3-final-pytest/test_real_partial_startup_tran2/status.json": {
+      "returncode": 1
+    },
+    "d2-lifecycle-3-final-pytest/test_real_partial_startup_tran3/status.json": {
+      "returncode": 70
+    }
+  },
+  "parent-death.json": {
+    "path": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-final-pytest/test_actual_controller_death_s0/parent-death.json",
+    "result": {
+      "controller_returncode": -9,
+      "supervisor_returncode": 1,
+      "supervisor_reaped": true,
+      "runner_reaped_by_supervisor": true
+    }
+  },
+  "channel-loss.json": {
+    "path": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-final-pytest/test_supervisor_loss_forces_ac0/channel-loss.json",
+    "result": {
+      "supervisor_returncode": -9,
+      "runner_returncode": 70,
+      "runner_reaped_by_subreaper": true,
+      "controller_returncode": 0
+    }
+  },
+  "timeout_control": {
+    "path": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-supplement-pytest/test_blocked_actual_preflight_0/status.json",
+    "result": {
+      "returncode": 1,
+      "wait_seconds": 0.9186467769977753,
+      "caller_timeout_observed": true
+    }
+  },
+  "deadline_cases": [
+    {
+      "classname": "tests.unit.composer_mcp.test_standalone_lifecycle",
+      "name": "test_blocked_actual_preflight_retains_admission_until_join_or_deadline[real-deadline-kills]",
+      "time": "33.714"
+    }
+  ]
+}

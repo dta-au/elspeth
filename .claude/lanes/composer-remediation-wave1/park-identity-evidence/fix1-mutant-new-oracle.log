@@ -1,0 +1,64 @@
+FFFF                                                                     [100%]
+=================================== FAILURES ===================================
+_ test_refused_provider_recovery_retains_exact_private_control_and_physical_binding[False-braced-False] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:150: in test_refused_provider_recovery_retains_exact_private_control_and_physical_binding
+    assert response.recovery_notice.content == expected_notice
+E   AssertionError: assert 'Graph recove...18c779a7b7e}.' == 'Graph recove...is unchanged.'
+E     
+E     Skipping 109 identical leading characters in diff, use -v to show
+E     -  unchanged.
+E     +  unchanged. Requested selector: {a703b51d-fa8b-4fbc-add9-618c779a7b7e}.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:55:46 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:55:46 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:55:46 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:55:46 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:55:47 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=0e60e22e-41a2-4f34-9f6a-b0b17f368e02 state_is_structurally_empty=False
+_ test_refused_provider_recovery_retains_exact_private_control_and_physical_binding[False-braced-True] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:150: in test_refused_provider_recovery_retains_exact_private_control_and_physical_binding
+    assert response.recovery_notice.content == expected_notice
+E   AssertionError: assert 'Graph recove...as preserved.' == 'Graph recove...as preserved.'
+E     
+E     Skipping 111 identical leading characters in diff, use -v to show
+E     - nchanged. The previous stored graph or its completion metadata could not be decoded; its historical row was preserved.
+E     + nchanged. Requested selector: {a8a68c46-a671-4e76-a0c7-176e7172d495}. The previous stored graph or its completion metadata could not be decoded; its historical row was preserved.
+E     ?           ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:55:48 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:55:48 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:55:48 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:55:48 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_refused_provider_recovery_retains_exact_private_control_and_physical_binding[True-braced-False] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:150: in test_refused_provider_recovery_retains_exact_private_control_and_physical_binding
+    assert response.recovery_notice.content == expected_notice
+E   AssertionError: assert 'Graph recove...9fab54ef57b}.' == 'Graph recove...is unchanged.'
+E     
+E     Skipping 109 identical leading characters in diff, use -v to show
+E     -  unchanged.
+E     +  unchanged. Requested selector: {abb88605-4f00-4f0e-8618-09fab54ef57b}.
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:55:48 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:55:48 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:55:48 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:55:48 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:55:49 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=d8b88102-d018-4ce6-bd85-0f8d7384f132 state_is_structurally_empty=False
+_ test_refused_provider_recovery_retains_exact_private_control_and_physical_binding[True-braced-True] _
+tests/unit/web/sessions/test_graph_recovery_turn.py:150: in test_refused_provider_recovery_retains_exact_private_control_and_physical_binding
+    assert response.recovery_notice.content == expected_notice
+E   AssertionError: assert 'Graph recove...as preserved.' == 'Graph recove...as preserved.'
+E     
+E     Skipping 111 identical leading characters in diff, use -v to show
+E     - nchanged. The previous stored graph or its completion metadata could not be decoded; its historical row was preserved.
+E     + nchanged. Requested selector: {a3b62d0b-adb8-483f-9504-18651fdcf7ff}. The previous stored graph or its completion metadata could not be decoded; its historical row was preserved.
+E     ?           ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:55:49 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:55:49 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:55:49 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:55:49 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+=========================== short test summary info ============================
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_refused_provider_recovery_retains_exact_private_control_and_physical_binding[False-braced-False]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_refused_provider_recovery_retains_exact_private_control_and_physical_binding[False-braced-True]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_refused_provider_recovery_retains_exact_private_control_and_physical_binding[True-braced-False]
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_refused_provider_recovery_retains_exact_private_control_and_physical_binding[True-braced-True]
+4 failed, 24 deselected in 5.95s

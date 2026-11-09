@@ -1,0 +1,158 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-discovery
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 6 items
+
+tests/unit/web/composer/test_tools_discovery.py FFF.F.                   [100%]
+
+=================================== FAILURES ===================================
+_ TestDiscoveryTools.test_operator_parity_rejects_missing_standalone_token[less-than] _
+
+self = <tests.unit.web.composer.test_tools_discovery.TestDiscoveryTools object at 0x7f6e88504290>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f6e88504f20>
+documented_span = ', <,', replacement = ',', removed_token = '<'
+
+    @pytest.mark.parametrize(
+        ("documented_span", "replacement", "removed_token"),
+        [
+            pytest.param(", <,", ",", "<", id="less-than"),
+            pytest.param(", >,", ",", ">", id="greater-than"),
+            pytest.param(", /,", ",", "/", id="division"),
+            pytest.param("==, ", "", "==", id="equality"),
+            pytest.param(", is not  ", "  ", "is not", id="identity-negation"),
+            pytest.param(", not in  ", "  ", "not in", id="membership-negation"),
+        ],
+    )
+    def test_operator_parity_rejects_missing_standalone_token(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        documented_span: str,
+        replacement: str,
+        removed_token: str,
+    ) -> None:
+        """Longer operators and description prose cannot hide a missing entry."""
+        grammar = get_expression_grammar()
+        assert grammar.count(documented_span) == 1, "the mutation must remove exactly one documented entry"
+        mutated_grammar = grammar.replace(documented_span, replacement, 1)
+        monkeypatch.setattr(f"{__name__}.get_expression_grammar", lambda: mutated_grammar)
+    
+>       with pytest.raises(AssertionError, match=f"token {removed_token!r} missing from Operators section"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'AssertionError'>
+
+tests/unit/web/composer/test_tools_discovery.py:233: Failed
+_ TestDiscoveryTools.test_operator_parity_rejects_missing_standalone_token[greater-than] _
+
+self = <tests.unit.web.composer.test_tools_discovery.TestDiscoveryTools object at 0x7f6e88504530>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f6e88505190>
+documented_span = ', >,', replacement = ',', removed_token = '>'
+
+    @pytest.mark.parametrize(
+        ("documented_span", "replacement", "removed_token"),
+        [
+            pytest.param(", <,", ",", "<", id="less-than"),
+            pytest.param(", >,", ",", ">", id="greater-than"),
+            pytest.param(", /,", ",", "/", id="division"),
+            pytest.param("==, ", "", "==", id="equality"),
+            pytest.param(", is not  ", "  ", "is not", id="identity-negation"),
+            pytest.param(", not in  ", "  ", "not in", id="membership-negation"),
+        ],
+    )
+    def test_operator_parity_rejects_missing_standalone_token(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        documented_span: str,
+        replacement: str,
+        removed_token: str,
+    ) -> None:
+        """Longer operators and description prose cannot hide a missing entry."""
+        grammar = get_expression_grammar()
+        assert grammar.count(documented_span) == 1, "the mutation must remove exactly one documented entry"
+        mutated_grammar = grammar.replace(documented_span, replacement, 1)
+        monkeypatch.setattr(f"{__name__}.get_expression_grammar", lambda: mutated_grammar)
+    
+>       with pytest.raises(AssertionError, match=f"token {removed_token!r} missing from Operators section"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'AssertionError'>
+
+tests/unit/web/composer/test_tools_discovery.py:233: Failed
+_ TestDiscoveryTools.test_operator_parity_rejects_missing_standalone_token[division] _
+
+self = <tests.unit.web.composer.test_tools_discovery.TestDiscoveryTools object at 0x7f6e885045f0>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f6e88505ca0>
+documented_span = ', /,', replacement = ',', removed_token = '/'
+
+    @pytest.mark.parametrize(
+        ("documented_span", "replacement", "removed_token"),
+        [
+            pytest.param(", <,", ",", "<", id="less-than"),
+            pytest.param(", >,", ",", ">", id="greater-than"),
+            pytest.param(", /,", ",", "/", id="division"),
+            pytest.param("==, ", "", "==", id="equality"),
+            pytest.param(", is not  ", "  ", "is not", id="identity-negation"),
+            pytest.param(", not in  ", "  ", "not in", id="membership-negation"),
+        ],
+    )
+    def test_operator_parity_rejects_missing_standalone_token(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        documented_span: str,
+        replacement: str,
+        removed_token: str,
+    ) -> None:
+        """Longer operators and description prose cannot hide a missing entry."""
+        grammar = get_expression_grammar()
+        assert grammar.count(documented_span) == 1, "the mutation must remove exactly one documented entry"
+        mutated_grammar = grammar.replace(documented_span, replacement, 1)
+        monkeypatch.setattr(f"{__name__}.get_expression_grammar", lambda: mutated_grammar)
+    
+>       with pytest.raises(AssertionError, match=f"token {removed_token!r} missing from Operators section"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'AssertionError'>
+
+tests/unit/web/composer/test_tools_discovery.py:233: Failed
+_ TestDiscoveryTools.test_operator_parity_rejects_missing_standalone_token[identity-negation] _
+
+self = <tests.unit.web.composer.test_tools_discovery.TestDiscoveryTools object at 0x7f6e88504770>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f6e884ff020>
+documented_span = ', is not  ', replacement = '  ', removed_token = 'is not'
+
+    @pytest.mark.parametrize(
+        ("documented_span", "replacement", "removed_token"),
+        [
+            pytest.param(", <,", ",", "<", id="less-than"),
+            pytest.param(", >,", ",", ">", id="greater-than"),
+            pytest.param(", /,", ",", "/", id="division"),
+            pytest.param("==, ", "", "==", id="equality"),
+            pytest.param(", is not  ", "  ", "is not", id="identity-negation"),
+            pytest.param(", not in  ", "  ", "not in", id="membership-negation"),
+        ],
+    )
+    def test_operator_parity_rejects_missing_standalone_token(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        documented_span: str,
+        replacement: str,
+        removed_token: str,
+    ) -> None:
+        """Longer operators and description prose cannot hide a missing entry."""
+        grammar = get_expression_grammar()
+        assert grammar.count(documented_span) == 1, "the mutation must remove exactly one documented entry"
+        mutated_grammar = grammar.replace(documented_span, replacement, 1)
+        monkeypatch.setattr(f"{__name__}.get_expression_grammar", lambda: mutated_grammar)
+    
+>       with pytest.raises(AssertionError, match=f"token {removed_token!r} missing from Operators section"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'AssertionError'>
+
+tests/unit/web/composer/test_tools_discovery.py:233: Failed
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_tools_discovery.py::TestDiscoveryTools::test_operator_parity_rejects_missing_standalone_token[less-than]
+FAILED tests/unit/web/composer/test_tools_discovery.py::TestDiscoveryTools::test_operator_parity_rejects_missing_standalone_token[greater-than]
+FAILED tests/unit/web/composer/test_tools_discovery.py::TestDiscoveryTools::test_operator_parity_rejects_missing_standalone_token[division]
+FAILED tests/unit/web/composer/test_tools_discovery.py::TestDiscoveryTools::test_operator_parity_rejects_missing_standalone_token[identity-negation]
+========================= 4 failed, 2 passed in 0.57s ==========================

@@ -1,0 +1,3 @@
+09b8788b990592142790604255fa4ba1926a5c47ae2dfb01b052191dffd0679e  src/elspeth/web/composer/tool_batch.py
+b6a78ae07b8fae60098f96a6097e56ae4c546458337e0864c9eadab8ad541243  tests/unit/web/composer/test_service.py
+6de566a36946306dcf8efa7b4303852f67279662f94a2db6e58a1cf7cbda5426  tests/unit/web/composer/test_compose_loop_audit_wiring.py

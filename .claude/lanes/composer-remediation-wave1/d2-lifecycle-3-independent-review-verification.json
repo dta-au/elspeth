@@ -1,0 +1,59 @@
+{
+  "head": "8c35a2e2a9092260f15e88525cbe343df5410d4e",
+  "artifact_bytes": 81379,
+  "artifact_sha256": "fa0297dbf92d5faeb6a80099d28b216daa7fb282b1c1eaa25b66e1a19c629949",
+  "artifact_matches_full_live_diff": true,
+  "changed_paths": 16,
+  "freeze_matches": true,
+  "freeze_inputs": 6221,
+  "test_only_delta": [
+    "tests/helpers/composer_stdio_probe.py",
+    "tests/unit/composer_mcp/test_standalone_lifecycle.py"
+  ],
+  "checks": [
+    {
+      "command": [
+        "git",
+        "apply",
+        "--reverse",
+        "--check",
+        "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-review.diff"
+      ],
+      "exit": 0
+    },
+    {
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit": 0
+    }
+  ],
+  "recorded_suites": {
+    "final": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "0",
+        "tests": "600",
+        "time": "256.084",
+        "timestamp": "2026-11-09T19:54:09.903828+00:00",
+        "hostname": "af0377a21211"
+      }
+    ],
+    "supplement": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "0",
+        "tests": "2",
+        "time": "17.078",
+        "timestamp": "2026-11-09T20:05:11.060614+00:00",
+        "hostname": "af0377a21211"
+      }
+    ]
+  }
+}

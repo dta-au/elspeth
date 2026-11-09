@@ -1,0 +1,242 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 36 items
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py . [  2%]
+...................FF..........FF.                                       [ 97%]
+tests/unit/web/composer/test_proposal_cap_turn_counts.py .               [100%]
+
+=================================== FAILURES ===================================
+_ test_unapplied_incremental_feedback_then_repair_stages_once[same-value-noop-openai_strict] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-42/test_unapplied_incremental_fee2')
+dialect = <ToolContractDialect.OPENAI_STRICT: 'openai_strict'>
+tool_name = 'set_metadata', arguments = {'patch': {'name': ''}}
+expected_success = True, expected_error = None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dialect", tuple(ToolContractDialect))
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments", "expected_success", "expected_error"),
+        [
+            ("set_metadata", {"patch": {}}, True, None),
+            ("set_metadata", {"patch": {"name": ""}}, True, None),
+            ("set_metadata", {"patch": "invalid"}, None, "ToolArgumentError"),
+            ("patch_node_options", {"node_id": "absent", "patch": {}}, False, None),
+        ],
+        ids=("empty-noop", "same-value-noop", "argument-error", "handler-refusal"),
+    )
+    async def test_unapplied_incremental_feedback_then_repair_stages_once(
+        tmp_path: Path,
+        dialect: ToolContractDialect,
+        tool_name: str,
+        arguments: dict[str, Any],
+        expected_success: bool | None,
+        expected_error: str | None,
+    ) -> None:
+        harness = _harness(tmp_path)
+        harness.service._planner_dialect = dialect
+        state = _incremental_base_state(tmp_path)
+        repair = {"patch": {"name": "local-repair"}}
+        llm = _ScriptedLLM(
+            _tool_turn("call_unapplied", tool_name, encode_semantic_arguments(tool_name, dialect, arguments)),
+            _tool_turn("call_repair", "set_metadata", encode_semantic_arguments("set_metadata", dialect, repair)),
+            _fake_llm_response(content="The repair awaits approval."),
+        )
+        progress = []
+        async def record_progress(event: Any) -> None:
+            progress.append(event)
+    
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Update the metadata.", [], state, session_id=harness.session_id,
+                user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                progress=record_progress,
+            )
+        proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+>       assert [proposal.tool_call_id for proposal in proposals] == ["call_repair"]
+E       AssertionError: assert ['call_unappl...'call_repair'] == ['call_repair']
+E         
+E         At index 0 diff: 'call_unapplied' != 'call_repair'
+E         Left contains one more item: 'call_repair'
+E         Use -v to get more diff
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1587: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:16:20 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:16:20 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:16:20 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:16:20 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_unapplied_incremental_feedback_then_repair_stages_once[same-value-noop-none] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-42/test_unapplied_incremental_fee3')
+dialect = <ToolContractDialect.NONE: 'none'>, tool_name = 'set_metadata'
+arguments = {'patch': {'name': ''}}, expected_success = True
+expected_error = None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dialect", tuple(ToolContractDialect))
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments", "expected_success", "expected_error"),
+        [
+            ("set_metadata", {"patch": {}}, True, None),
+            ("set_metadata", {"patch": {"name": ""}}, True, None),
+            ("set_metadata", {"patch": "invalid"}, None, "ToolArgumentError"),
+            ("patch_node_options", {"node_id": "absent", "patch": {}}, False, None),
+        ],
+        ids=("empty-noop", "same-value-noop", "argument-error", "handler-refusal"),
+    )
+    async def test_unapplied_incremental_feedback_then_repair_stages_once(
+        tmp_path: Path,
+        dialect: ToolContractDialect,
+        tool_name: str,
+        arguments: dict[str, Any],
+        expected_success: bool | None,
+        expected_error: str | None,
+    ) -> None:
+        harness = _harness(tmp_path)
+        harness.service._planner_dialect = dialect
+        state = _incremental_base_state(tmp_path)
+        repair = {"patch": {"name": "local-repair"}}
+        llm = _ScriptedLLM(
+            _tool_turn("call_unapplied", tool_name, encode_semantic_arguments(tool_name, dialect, arguments)),
+            _tool_turn("call_repair", "set_metadata", encode_semantic_arguments("set_metadata", dialect, repair)),
+            _fake_llm_response(content="The repair awaits approval."),
+        )
+        progress = []
+        async def record_progress(event: Any) -> None:
+            progress.append(event)
+    
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Update the metadata.", [], state, session_id=harness.session_id,
+                user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                progress=record_progress,
+            )
+        proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+>       assert [proposal.tool_call_id for proposal in proposals] == ["call_repair"]
+E       AssertionError: assert ['call_unappl...'call_repair'] == ['call_repair']
+E         
+E         At index 0 diff: 'call_unapplied' != 'call_repair'
+E         Left contains one more item: 'call_repair'
+E         Use -v to get more diff
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1587: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:16:21 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:16:21 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:16:21 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:16:21 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_identical_canonical_candidate_returns_unchanged_without_proposal[public] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-42/test_identical_canonical_candi0')
+owned = False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owned", (False, True), ids=("public", "owned"))
+    async def test_identical_canonical_candidate_returns_unchanged_without_proposal(tmp_path: Path, owned: bool) -> None:
+        harness = _harness(tmp_path)
+        arguments = _valid_pipeline_args(tmp_path)
+>       state = CompositionState.from_dict({**arguments, "version": 7})
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1656: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/composer/state.py:8436: in from_dict
+    outputs=tuple(OutputSpec.from_dict(o) for o in d["outputs"]),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/state.py:8436: in <genexpr>
+    outputs=tuple(OutputSpec.from_dict(o) for o in d["outputs"]),
+                  ^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+cls = <class 'elspeth.web.composer.state.OutputSpec'>
+d = {'on_write_failure': 'discard', 'options': {'collision_policy': 'auto_increment', 'format': 'jsonl', 'mode': 'write', ...nonical_candi0/outputs/00000000-0000-4000-8000-000000000001/result.jsonl', ...}, 'plugin': 'json', 'sink_name': 'main'}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Self:
+        """Reconstruct from a plain dict (inverse of to_dict serialisation).
+    
+        ``description`` defaults to None when absent so sessions persisted
+        before the field existed deserialise unchanged.
+        """
+        return cls(
+>           name=d["name"],
+                 ^^^^^^^^^
+            plugin=d["plugin"],
+            options=d["options"],
+            on_write_failure=d["on_write_failure"],
+            description=d["description"] if "description" in d else None,
+        )
+E       KeyError: 'name'
+
+src/elspeth/web/composer/state.py:1351: KeyError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:16:28 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:16:28 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:16:28 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_identical_canonical_candidate_returns_unchanged_without_proposal[owned] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-42/test_identical_canonical_candi1')
+owned = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owned", (False, True), ids=("public", "owned"))
+    async def test_identical_canonical_candidate_returns_unchanged_without_proposal(tmp_path: Path, owned: bool) -> None:
+        harness = _harness(tmp_path)
+        arguments = _valid_pipeline_args(tmp_path)
+>       state = CompositionState.from_dict({**arguments, "version": 7})
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1656: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/composer/state.py:8436: in from_dict
+    outputs=tuple(OutputSpec.from_dict(o) for o in d["outputs"]),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/state.py:8436: in <genexpr>
+    outputs=tuple(OutputSpec.from_dict(o) for o in d["outputs"]),
+                  ^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+cls = <class 'elspeth.web.composer.state.OutputSpec'>
+d = {'on_write_failure': 'discard', 'options': {'collision_policy': 'auto_increment', 'format': 'jsonl', 'mode': 'write', ...nonical_candi1/outputs/00000000-0000-4000-8000-000000000001/result.jsonl', ...}, 'plugin': 'json', 'sink_name': 'main'}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Self:
+        """Reconstruct from a plain dict (inverse of to_dict serialisation).
+    
+        ``description`` defaults to None when absent so sessions persisted
+        before the field existed deserialise unchanged.
+        """
+        return cls(
+>           name=d["name"],
+                 ^^^^^^^^^
+            plugin=d["plugin"],
+            options=d["options"],
+            on_write_failure=d["on_write_failure"],
+            description=d["description"] if "description" in d else None,
+        )
+E       KeyError: 'name'
+
+src/elspeth/web/composer/state.py:1351: KeyError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:16:28 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:16:28 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:16:28 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+=========================== short test summary info ============================
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_unapplied_incremental_feedback_then_repair_stages_once[same-value-noop-openai_strict]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_unapplied_incremental_feedback_then_repair_stages_once[same-value-noop-none]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_identical_canonical_candidate_returns_unchanged_without_proposal[public]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_identical_canonical_candidate_returns_unchanged_without_proposal[owned]
+======================== 4 failed, 32 passed in 26.78s =========================

@@ -1,0 +1,6 @@
+cwd=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+HEAD=cf23f38d889eac66231797782ed129fa299f250f
+PYTHONPATH=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src:/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src
+elspeth=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src/elspeth/__init__.py
+elspeth_lints=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src/elspeth_lints/__init__.py
+frontend_node_modules_symlink=True

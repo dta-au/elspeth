@@ -1,0 +1,8 @@
+Counter comparison by path/rule/full message; line/column excluded. R_TB_SUPPRESSED observations excluded because only --rules all emits them.
+Controls passed: equal/line-offset, changed message, duplicate occurrence, unrelated rule/suppression observation.
+before_occurrences=205
+after_occurrences=205
+before_distinct=204
+after_distinct=204
+added_occurrences=0
+removed_occurrences=0

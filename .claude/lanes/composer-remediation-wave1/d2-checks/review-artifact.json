@@ -1,0 +1,14 @@
+{
+  "head": "f9c23c59c63bbd3099029e995a778bade594f6c8",
+  "freeze_inputs": 6207,
+  "freeze_sha256": "60a4be8cb90a2b4cc89af42356f1cee054d739a132b1b9494f12dcaa784dde59",
+  "source_test_symlinks": [],
+  "diff": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-path-admission-review.diff",
+  "diff_sha256": "f0308cf72acfb23967069c712d3e3d1bde3f567e70d4ed91251485b52e831d39",
+  "new_files": [
+    "src/elspeth/contracts/composer_paths.py",
+    "tests/unit/composer_mcp/test_configured_root_admission.py"
+  ],
+  "reverse_check_exit": 0,
+  "whitespace_exit": 0
+}

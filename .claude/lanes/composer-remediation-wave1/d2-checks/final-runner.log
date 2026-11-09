@@ -1,0 +1,19 @@
+/workspace/elspeth/.claude/worktrees/composer-remediation-d2/src/elspeth/__init__.py
+/workspace/elspeth/.claude/worktrees/composer-remediation-d2/elspeth-lints/src/elspeth_lints/__init__.py
+{"head": "f9c23c59c63bbd3099029e995a778bade594f6c8", "inputs": 6206, "sha256": "a330f0c83ce0b9156f9ee16f2b6e878cd730d77f36e23eb26ed1745554634e97"}
+START ruff
+EXIT ruff 0
+START format
+EXIT format 0
+START mypy
+EXIT mypy 0
+START contracts
+EXIT contracts 1
+START inventory
+EXIT inventory 0
+START boundaries
+EXIT boundaries 1
+START pytest
+EXIT pytest 0
+{"head": "f9c23c59c63bbd3099029e995a778bade594f6c8", "inputs": 6206, "sha256": "a330f0c83ce0b9156f9ee16f2b6e878cd730d77f36e23eb26ed1745554634e97"}
+FROZEN True

@@ -1,0 +1,690 @@
+import { describe, it, expect, vi } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { MessageBubble } from "./MessageBubble";
+import { PENDING_REVIEW_NOTICE } from "./pendingReviewNotice";
+import type { ChatMessage, CompositionProposal } from "@/types/api";
+
+// This file no longer reads chat.css. It used to scrape rule bodies with a
+// regex to assert on literal declarations, which pinned values rather than
+// constraints and could only ever see the first matching rule. Stylesheet
+// invariants for these components belong to chatBubbleGutter.test.ts.
+
+function makeMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
+  return {
+    id: "msg-1",
+    session_id: "session-1",
+    role: "user",
+    content: "Hello world",
+    tool_calls: null,
+    created_at: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+function makeProposal(
+  overrides: Partial<CompositionProposal> = {},
+): CompositionProposal {
+  return {
+    id: "proposal-1",
+    session_id: "session-1",
+    tool_call_id: "tc-1",
+    tool_name: "set_pipeline",
+    status: "pending",
+    summary: "Replace the pipeline.",
+    rationale: "Requested by the current composer turn.",
+    affects: ["graph"],
+    arguments_redacted_json: {},
+    base_state_id: null,
+    committed_state_id: null,
+    audit_event_id: "event-1",
+    created_at: "2026-05-14T00:00:00Z",
+    updated_at: "2026-05-14T00:00:00Z",
+    ...overrides,
+  };
+}
+
+describe("MessageBubble", () => {
+  // The edit box always opens over a real message, so it sizes to that
+  // content (floor 4, cap 10) — the ChatInput read-only formula. The browser
+  // default it replaces (rows="2") hid all but the first lines of the very
+  // message being edited.
+  describe("edit-mode textarea sizing", () => {
+    function startEditing(content: string): HTMLElement {
+      render(
+        <MessageBubble
+          message={makeMessage({ content })}
+          isComposing={false}
+          onFork={vi.fn()}
+        />,
+      );
+      fireEvent.click(screen.getByLabelText("Edit and fork from this message"));
+      return screen.getByLabelText("Edit message");
+    }
+
+    it("opens at the four-row floor for a one-line message", () => {
+      expect(startEditing("one line")).toHaveAttribute("rows", "4");
+    });
+
+    it("sizes to the message being edited", () => {
+      expect(startEditing("a\nb\nc\nd\ne")).toHaveAttribute("rows", "6");
+    });
+
+    it("caps growth at ten rows", () => {
+      expect(startEditing(Array(40).fill("line").join("\n"))).toHaveAttribute(
+        "rows",
+        "10",
+      );
+    });
+
+    it("grows as the user adds lines while editing", () => {
+      const textarea = startEditing("a\nb\nc\nd\ne");
+      fireEvent.change(textarea, {
+        target: { value: "a\nb\nc\nd\ne\nf\ng" },
+      });
+      expect(textarea).toHaveAttribute("rows", "8");
+    });
+  });
+
+  describe("send-state suppression", () => {
+    it("shows Sending... when pending and not composing", () => {
+      render(
+        <MessageBubble
+          message={makeMessage({ local_status: "pending" })}
+          isComposing={false}
+        />,
+      );
+      expect(screen.getByText("Sending...")).toBeInTheDocument();
+    });
+
+    it("hides Sending... when pending and composing is active", () => {
+      render(
+        <MessageBubble
+          message={makeMessage({ local_status: "pending" })}
+          isComposing={true}
+        />,
+      );
+      expect(screen.queryByText("Sending...")).not.toBeInTheDocument();
+    });
+
+    it("shows failed state with retry regardless of composing", () => {
+      const onRetry = vi.fn();
+      render(
+        <MessageBubble
+          message={makeMessage({ local_status: "failed", local_error: "The AI service is temporarily unavailable. Please try again in a moment." })}
+          isComposing={false}
+          onRetry={onRetry}
+        />,
+      );
+      expect(screen.getByText("Retry")).toBeInTheDocument();
+      expect(screen.getByText("The AI service is temporarily unavailable. Please try again in a moment.")).toBeInTheDocument();
+    });
+
+    it("disables Retry while a compose is active (elspeth-3f38ebb1b5)", () => {
+      // Retry is a compose entry point: while one freeform compose is in
+      // flight it must not admit a second (the store gate refuses it, and
+      // the affordance must say so).
+      const onRetry = vi.fn();
+      render(
+        <MessageBubble
+          message={makeMessage({ local_status: "failed" })}
+          isComposing={true}
+          onRetry={onRetry}
+        />,
+      );
+      const retry = screen.getByRole("button", { name: "Retry" });
+      expect(retry).toBeDisabled();
+      fireEvent.click(retry);
+      expect(onRetry).not.toHaveBeenCalled();
+    });
+
+    it.each(["compose_outcome_unconfirmed", "recompose_saved_proposal", "recompose_already_completed"])("labels read-only recovery as Refresh for %s", (failureCode) => {
+      const onRetry = vi.fn();
+      render(
+        <MessageBubble
+          message={makeMessage({
+            local_status: "failed",
+            local_error: "Refresh the saved outcome before requesting another response.",
+            local_failure_code: failureCode,
+          })}
+          isComposing={false}
+          onRetry={onRetry}
+        />,
+      );
+      expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+      expect(onRetry).toHaveBeenCalledExactlyOnceWith("msg-1");
+    });
+
+    it("shows default error when local_error is absent", () => {
+      const onRetry = vi.fn();
+      render(
+        <MessageBubble
+          message={makeMessage({ local_status: "failed" })}
+          isComposing={false}
+          onRetry={onRetry}
+        />,
+      );
+      expect(screen.getByText("Failed to send message. Please try again.")).toBeInTheDocument();
+    });
+
+    it.each(["policy_blocked", "admission_refused", "token_accounting_unavailable", "composer_operation_conflict", "recompose_user_message_mismatch"])("suppresses the Retry button but keeps the failed text for %s", (failureCode) => {
+      // policy_blocked is permanent by construction — a deployment policy
+      // refused the pipeline — so the failed row must not invite a retry.
+      const onRetry = vi.fn();
+      render(
+        <MessageBubble
+          message={makeMessage({
+            local_status: "failed",
+            local_error: "This pipeline is not permitted by deployment policy.",
+            local_failure_code: failureCode,
+          })}
+          isComposing={false}
+          onRetry={onRetry}
+        />,
+      );
+      expect(
+        screen.getByText("This pipeline is not permitted by deployment policy."),
+      ).toBeInTheDocument();
+      expect(screen.queryByText("Retry")).not.toBeInTheDocument();
+    });
+  });
+
+  describe("copy button", () => {
+    // The overlay's resting legibility and its width floor used to be pinned
+    // here as raw chat.css substrings ("opacity: 0.3;", "min-width: 44px;").
+    // Both pinned the LITERAL rather than the property it was chosen for, so
+    // both locked in the very values elspeth-8174010851 and elspeth-e6db9519d2
+    // file as defects — and the regex read only the first matching rule, so
+    // neither could see the @media (hover: none) branch. They now live in
+    // chatBubbleGutter.test.ts, in the stylesheet's own lane, expressed as the
+    // constraints that have to hold: resting opacity above a legibility floor
+    // across every declared branch, and a width derived from
+    // --size-control-compact rather than a hardcoded 44.
+    it("renders a copy button on user messages", () => {
+      render(<MessageBubble message={makeMessage()} />);
+      expect(screen.getByLabelText("Copy message")).toBeInTheDocument();
+    });
+
+    it("renders a copy button on assistant messages", () => {
+      render(
+        <MessageBubble message={makeMessage({ role: "assistant" })} />,
+      );
+      expect(screen.getByLabelText("Copy message")).toBeInTheDocument();
+    });
+
+    it("does not render a copy button on system messages", () => {
+      render(
+        <MessageBubble message={makeMessage({ role: "system" })} />,
+      );
+      expect(screen.queryByLabelText("Copy message")).not.toBeInTheDocument();
+    });
+
+    it("copies message content to clipboard", async () => {
+      const user = userEvent.setup();
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", {
+        value: { writeText },
+        writable: true,
+        configurable: true,
+      });
+
+      render(
+        <MessageBubble message={makeMessage({ content: "Test copy" })} />,
+      );
+      await user.click(screen.getByLabelText("Copy message"));
+
+      expect(writeText).toHaveBeenCalledWith("Test copy");
+      // The confirmation is announced through the accessible name, which is
+      // where it always lived — aria-label overrides text content.
+      expect(screen.getByLabelText("Copied to clipboard")).toBeInTheDocument();
+    });
+
+    // elspeth-091695b241 — the confirmation must not change the control's
+    // FOOTPRINT. `.bubble-action-overlay` is `position: absolute; right: 0`
+    // over the prose with `min-width: 44px`, so any label wider than 44px can
+    // only grow leftward, over the message text the user just copied, for the
+    // full 2000ms window. jsdom has no layout engine, so this pins the
+    // mechanism that keeps the width inside the floor: the visible
+    // confirmation is a single glyph, never a word.
+    it("confirms with a single glyph, never a word that could outgrow the overlay", async () => {
+      const user = userEvent.setup();
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", {
+        value: { writeText },
+        writable: true,
+        configurable: true,
+      });
+
+      render(<MessageBubble message={makeMessage({ content: "Test copy" })} />);
+      const button = screen.getByLabelText("Copy message");
+      const idleGlyph = button.textContent ?? "";
+      await user.click(button);
+
+      const confirmed = screen.getByLabelText("Copied to clipboard");
+      const confirmedGlyph = confirmed.textContent ?? "";
+      expect(confirmedGlyph).toBe("✓");
+      // Same visible footprint in both states: one character either way.
+      expect([...confirmedGlyph]).toHaveLength(1);
+      expect([...idleGlyph]).toHaveLength(1);
+      // And explicitly not the old word form, in either voice.
+      expect(confirmed.textContent).not.toMatch(/copied/i);
+    });
+
+    // The overlay's min-width floor is what makes a one-character
+    // confirmation footprint-neutral. That floor is pinned in
+    // chatBubbleGutter.test.ts against --size-control-compact, together with
+    // the gutter arithmetic that keeps the overlay off the prose entirely.
+  });
+
+  describe("tool call exclusion from copy", () => {
+    it("copies only message.content, not tool call details", async () => {
+      const user = userEvent.setup();
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", {
+        value: { writeText },
+        writable: true,
+        configurable: true,
+      });
+
+      const message = makeMessage({
+        role: "assistant",
+        content: "I'll set that up.",
+        tool_calls: [
+          {
+            id: "tc-1",
+            type: "function",
+            function: { name: "set_source", arguments: '{"plugin":"csv"}' },
+          },
+        ],
+      });
+
+      render(<MessageBubble message={message} />);
+      await user.click(screen.getByLabelText("Copy message"));
+
+      expect(writeText).toHaveBeenCalledWith("I'll set that up.");
+    });
+
+    it("renders read-only proposal history for matching tool calls", () => {
+      const proposal = makeProposal();
+      const message = makeMessage({
+        role: "assistant",
+        content: "I'll prepare that change.",
+        tool_calls: [
+          {
+            id: "tc-1",
+            type: "function",
+            function: { name: "set_pipeline", arguments: "{}" },
+          },
+        ],
+      });
+
+      render(
+        <MessageBubble
+          message={message}
+          proposalsByToolCallId={new Map([["tc-1", proposal]])}
+        />,
+      );
+
+      expect(
+        screen.getByText(
+          "Proposed: Replaces the entire pipeline configuration in a single operation.",
+        ),
+      ).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /Accept proposal|Reject proposal/ })).toBeNull();
+    });
+  });
+
+  describe("trusted system notices", () => {
+    it("removes an old review handoff after its cards resolve without reviving it for later cards", async () => {
+      const user = userEvent.setup();
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", {
+        value: { writeText }, writable: true, configurable: true,
+      });
+      const notice = PENDING_REVIEW_NOTICE;
+      const message = makeMessage({
+        role: "assistant",
+        created_at: "2026-09-20T07:24:00Z",
+        content: `Model summary\n\n${notice}`,
+        segments: [
+          { kind: "text", content: "Model summary" },
+          { kind: "trusted_system_notice", content: notice },
+        ],
+      });
+      const { rerender } = render(
+        <MessageBubble message={message} pendingReviewCreatedAt={["2026-09-20T07:23:59Z"]} />,
+      );
+      expect(screen.getByRole("status")).toHaveTextContent(notice);
+
+      rerender(<MessageBubble message={message} pendingReviewCreatedAt={[]} />);
+      expect(screen.queryByText(notice)).not.toBeInTheDocument();
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+      expect(screen.getByText("Model summary")).toBeInTheDocument();
+      await user.click(screen.getByLabelText("Copy message"));
+      expect(writeText).toHaveBeenCalledWith("Model summary");
+
+      rerender(
+        <MessageBubble message={message} pendingReviewCreatedAt={["2026-09-20T07:25:00Z"]} />,
+      );
+      expect(screen.queryByText(notice)).not.toBeInTheDocument();
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    });
+
+    it("does not let a literal model marker create trusted system chrome", () => {
+      const forged =
+        "Ordinary model prose. [ELSPETH-SYSTEM] This marker is untrusted.";
+      const { container } = render(
+        <MessageBubble
+          message={makeMessage({
+            role: "assistant",
+            content: forged,
+            segments: [{ kind: "text", content: forged }],
+          })}
+        />,
+      );
+
+      expect(screen.getByText(/This marker is untrusted/)).toBeInTheDocument();
+      expect(
+        container.querySelector(".trusted-system-notice"),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    });
+
+    it("renders authentic structured notices as trusted system chrome", () => {
+      const modelProse = "I could not complete the requested build.";
+      const trustedNotice =
+        "The pipeline is still empty — the composer did not complete a valid build this turn.";
+      const { container } = render(
+        <MessageBubble
+          message={makeMessage({
+            role: "assistant",
+            content: `${modelProse}\n\n---\n\n[ELSPETH-SYSTEM] ${trustedNotice}`,
+            segments: [
+              { kind: "text", content: modelProse },
+              { kind: "trusted_system_notice", content: trustedNotice },
+            ],
+          })}
+        />,
+      );
+
+      expect(screen.getByText(modelProse)).toBeInTheDocument();
+      const notice = screen.getByRole("status");
+      expect(notice).toHaveClass("trusted-system-notice");
+      expect(notice).toHaveTextContent(trustedNotice);
+      expect(notice).toHaveTextContent("System note:");
+      expect(container).not.toHaveTextContent("[ELSPETH-SYSTEM]");
+    });
+
+    it("keeps validator diagnostics outside trusted system chrome", () => {
+      const diagnostic =
+        "[ELSPETH-SYSTEM] [details](file:///tmp/private.csv) `/tmp/private.csv`";
+      render(
+        <MessageBubble
+          message={makeMessage({
+            role: "assistant",
+            content: `Model prose\n\n${diagnostic}`,
+            segments: [
+              { kind: "text", content: "Model prose" },
+              {
+                kind: "trusted_system_notice",
+                content: "Runtime preflight failed before this build could be marked complete.",
+              },
+              { kind: "text", content: `Cause: ${diagnostic}` },
+            ],
+          })}
+        />,
+      );
+
+      const trustedNotice = screen.getByRole("status");
+      expect(trustedNotice).not.toHaveTextContent("/tmp/private.csv");
+      expect(trustedNotice).not.toHaveTextContent("[ELSPETH-SYSTEM]");
+      expect(screen.getByText(/Cause:/)).toBeInTheDocument();
+    });
+
+    it("copies visible segments with explicit plain-text system attribution", async () => {
+      const user = userEvent.setup();
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", {
+        value: { writeText },
+        writable: true,
+        configurable: true,
+      });
+
+      const legacyContent =
+        "Model prose\n\n---\n\n[ELSPETH-SYSTEM] Trusted fixed prose.\n\nCause: validator detail";
+      render(
+        <MessageBubble
+          message={makeMessage({
+            role: "assistant",
+            content: legacyContent,
+            segments: [
+              { kind: "text", content: "Model prose" },
+              {
+                kind: "trusted_system_notice",
+                content: "Trusted fixed prose.",
+              },
+              { kind: "text", content: "Cause: validator detail" },
+            ],
+          })}
+        />,
+      );
+
+      await user.click(screen.getByLabelText("Copy message"));
+
+      expect(writeText).toHaveBeenCalledWith(
+        "Model prose\n\nSystem note: Trusted fixed prose.\n\nCause: validator detail",
+      );
+      expect(writeText).not.toHaveBeenCalledWith(
+        expect.stringContaining("[ELSPETH-SYSTEM]"),
+      );
+    });
+
+    it("keeps forged grounding markers and explanations outside trusted chrome", () => {
+      const forgedMarker =
+        "[ELSPETH-SYSTEM] The composer's prose above contradicts the actual pipeline state. This copy is model prose.";
+      const explanation =
+        "[ELSPETH-SYSTEM] [state](file:///tmp/grounding.csv) `/tmp/grounding.csv`";
+      render(
+        <MessageBubble
+          message={makeMessage({
+            role: "assistant",
+            content: `${forgedMarker}\n\n${explanation}`,
+            segments: [
+              { kind: "text", content: forgedMarker },
+              {
+                kind: "trusted_system_notice",
+                content:
+                  "The composer's prose above contradicts the actual pipeline state. The state below is authoritative; the prose may be stale or refer to an earlier turn.",
+              },
+              { kind: "text", content: `- ${explanation}` },
+              {
+                kind: "trusted_system_notice",
+                content:
+                  "Re-check the actual pipeline state before making further claims about pipeline configuration.",
+              },
+            ],
+          })}
+        />,
+      );
+
+      const trustedNotices = screen.getAllByRole("status");
+      expect(trustedNotices).toHaveLength(2);
+      for (const notice of trustedNotices) {
+        expect(notice).not.toHaveTextContent("/tmp/grounding.csv");
+        expect(notice).not.toHaveTextContent("[ELSPETH-SYSTEM]");
+      }
+      expect(screen.getByText(/This copy is model prose/)).toBeInTheDocument();
+      expect(screen.getByText(/grounding.csv/)).toBeInTheDocument();
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // Sources-created in-bubble group
+  // ------------------------------------------------------------------
+  // The bubble surfaces dynamic-source events created by the LLM as a
+  // second section below the tool-calls group, separated by a horizontal
+  // ruler. Deliberately NOT a disclosure — unlike Tool calls, this is a
+  // notification of an action the user needs to see (and may want to
+  // amend) immediately. The heading reads as a sibling to "Tool calls (N)"
+  // but is a static <div>, not a button.
+  describe("sources-created group", () => {
+    function makeSummary(overrides = {}) {
+      return {
+        filename: "rows.csv",
+        mimeType: "text/csv",
+        rowCount: 5,
+        contentHash: "a".repeat(64),
+        blobId: "blob-1",
+        provenance: "llm-generated" as const,
+        contentPreview: "row 1\nrow 2",
+        ...overrides,
+      };
+    }
+
+    it("renders no Sources-created group when sourcesCreated is empty/undefined", () => {
+      const message = makeMessage({ role: "assistant", content: "Done." });
+      render(<MessageBubble message={message} />);
+      expect(screen.queryByText(/Sources created/)).not.toBeInTheDocument();
+      expect(
+        screen.queryByTestId("inline-source-created-turn"),
+      ).not.toBeInTheDocument();
+    });
+
+    it("renders a concise Sources (N) heading when summaries are supplied", () => {
+      const message = makeMessage({ role: "assistant", content: "Done." });
+      render(
+        <MessageBubble
+          message={message}
+          sourcesCreated={[makeSummary()]}
+        />,
+      );
+      expect(screen.getByText("Sources (1)")).toBeInTheDocument();
+      expect(screen.queryByText("Sources created (1)")).not.toBeInTheDocument();
+    });
+
+    it("heading is NOT a button — no click affordance, no aria-expanded", () => {
+      // Source creation is a notification, not a disclosure. The label
+      // exists to name what follows, not to invite a toggle. Pinning the
+      // absence of button semantics keeps a future maintainer from
+      // re-introducing the twisty by force of habit.
+      const message = makeMessage({ role: "assistant", content: "Done." });
+      render(
+        <MessageBubble
+          message={message}
+          sourcesCreated={[makeSummary()]}
+        />,
+      );
+      expect(
+        screen.queryByRole("button", { name: /Sources/i }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("inner widget is in the DOM immediately — no click required", () => {
+      // 'Hey, this happened, you need to know'. Burying the widget behind
+      // a click would defer an actionable moment (was that the right source?
+      // amend or proceed?) behind the disclosure that hides it.
+      const message = makeMessage({ role: "assistant", content: "Done." });
+      render(
+        <MessageBubble
+          message={message}
+          sourcesCreated={[makeSummary()]}
+        />,
+      );
+      expect(
+        screen.getByTestId("inline-source-created-turn"),
+      ).toBeInTheDocument();
+    });
+
+    it("renders a horizontal ruler between Tool calls and Sources created when BOTH are present", () => {
+      const message = makeMessage({
+        role: "assistant",
+        content: "Done.",
+        tool_calls: [
+          {
+            id: "tc-1",
+            type: "function",
+            function: { name: "list_models", arguments: "{}" },
+          },
+        ],
+      });
+      const { container } = render(
+        <MessageBubble
+          message={message}
+          sourcesCreated={[makeSummary()]}
+        />,
+      );
+      expect(container.querySelector("hr.message-group-separator")).not.toBeNull();
+    });
+
+    it("omits the horizontal ruler when only Sources created is present (no tool calls)", () => {
+      // First-message hello-world shape: the LLM produces a dynamic source
+      // from the user's prompt text directly, without invoking any tools.
+      // A ruler in that case would float above nothing.
+      const message = makeMessage({ role: "assistant", content: "Done." });
+      const { container } = render(
+        <MessageBubble
+          message={message}
+          sourcesCreated={[makeSummary()]}
+        />,
+      );
+      expect(container.querySelector("hr.message-group-separator")).toBeNull();
+    });
+
+    it("omits the horizontal ruler when only Tool calls are present (no sources)", () => {
+      const message = makeMessage({
+        role: "assistant",
+        content: "Done.",
+        tool_calls: [
+          {
+            id: "tc-1",
+            type: "function",
+            function: { name: "list_models", arguments: "{}" },
+          },
+        ],
+      });
+      const { container } = render(<MessageBubble message={message} />);
+      expect(container.querySelector("hr.message-group-separator")).toBeNull();
+    });
+  });
+});
+
+describe("author attribution for assistive tech (C1, elspeth-f700d8d8a5)", () => {
+  it("labels a user turn 'You said:' (sr-only)", () => {
+    render(<MessageBubble message={makeMessage({ role: "user", content: "hi" })} />);
+    expect(screen.getByText("You said:")).toBeInTheDocument();
+  });
+
+  it("labels an assistant turn 'ELSPETH said:' (sr-only)", () => {
+    render(
+      <MessageBubble message={makeMessage({ role: "assistant", content: "hello" })} />,
+    );
+    expect(screen.getByText("ELSPETH said:")).toBeInTheDocument();
+  });
+
+  it("labels a system turn 'System note:' (sr-only)", () => {
+    render(
+      <MessageBubble
+        message={makeMessage({ role: "system", content: "Pipeline reverted." })}
+      />,
+    );
+    expect(screen.getByText("System note:")).toBeInTheDocument();
+  });
+});
+
+describe("current validation notice", () => {
+  it("uses a readable notice treatment without changing ordinary system markers", () => {
+    const { rerender } = render(
+      <MessageBubble message={makeMessage({
+        id: "system-validation-current",
+        role: "system",
+        content: "**Validation failed** — fix the following errors before running:\n- Check the model settings",
+      })} />,
+    );
+    expect(screen.getByRole("status")).toHaveClass("bubble-system--validation");
+    expect(screen.getByText("Check the model settings")).toBeInTheDocument();
+
+    rerender(<MessageBubble message={makeMessage({ role: "system", content: "Pipeline reverted." })} />);
+    expect(screen.getByRole("status")).not.toHaveClass("bubble-system--validation");
+  });
+});

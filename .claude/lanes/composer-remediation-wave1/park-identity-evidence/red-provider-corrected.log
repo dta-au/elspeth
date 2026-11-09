@@ -1,0 +1,98 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-park-identity
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 2 items
+
+tests/unit/web/sessions/test_graph_recovery_turn.py .F                   [100%]
+
+=================================== FAILURES ===================================
+_ test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-none-freeform] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-203/test_provider_park_alias_resto1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f51b4703dd0>
+entry = 'freeform', dialect = <ToolContractDialect.NONE: 'none'>
+spelling = 'uppercase'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entry", ["freeform", "planner", "malformed-head"])
+    @pytest.mark.parametrize("dialect", [ToolContractDialect.NONE, ToolContractDialect.OPENAI_STRICT])
+    @pytest.mark.parametrize("spelling", PARK_UUID_SPELLINGS)
+    async def test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence(
+        tmp_path, monkeypatch, entry, dialect, spelling
+    ):
+        app, service = _make_app(tmp_path)
+        session = await service.create_session("alice", "Park aliases", "local")
+        target_graph = replace(_EMPTY_STATE, metadata=PipelineMetadata(name="Exact parked draft", description="Unfinished work"))
+        target = await service.save_composition_state(session.id, checkpoint_data(target_graph), provenance="session_seed")
+        park_id = _park(app.state.session_engine, session.id, target.id)
+        if entry == "planner":
+            initial = await service.save_composition_state(session.id, checkpoint_data(_EMPTY_STATE), provenance="session_seed")
+        else:
+            initial = await _seed_output_only_draft(app, service, session.id)
+        model = "openrouter/openai/gpt-4o" if dialect is ToolContractDialect.OPENAI_STRICT else "anthropic/claude-opus-4-7"
+        composer = ComposerServiceImpl.for_trained_operator(
+            catalog=app.state.catalog_service,
+            settings=_make_settings(data_dir=tmp_path, composer_model=model),
+            sessions_service=service,
+            session_engine=app.state.session_engine,
+        )
+        assert composer._planner_dialect is dialect
+        monkeypatch.setattr(composer, "_availability", ComposerAvailability(True, model, "openrouter" if "openrouter" in model else "anthropic"))
+        app.state.composer_service = composer
+        arguments = {"park_id": park_uuid_spelling(park_id, spelling), "message": " \tLet's edit that draft.\n"}
+        requests = []
+    
+        async def provider(*args, **kwargs):
+            requests.append(kwargs)
+            definitions = {tool["function"]["name"]: tool["function"] for tool in kwargs["tools"]}
+            assert "restore_parked_graph" in definitions
+            assert definitions["restore_parked_graph"].get("strict", False) is (dialect is ToolContractDialect.OPENAI_STRICT)
+            assert ("emit_pipeline_proposal" in definitions) is (entry == "planner")
+            if entry == "malformed-head":
+                assert set(definitions) == {"handoff_to_user", "restore_parked_graph"}
+            assert park_id in json.dumps(kwargs["messages"])
+            assert str(target.id) in json.dumps(kwargs["messages"])
+            return _tool_batch_response(("alias-restore", "restore_parked_graph", arguments))
+    
+        original_validate = CompositionState.validate
+    
+        def forbid_restored_validation(state):
+            if state.metadata == target_graph.metadata:
+                raise AssertionError("Graph restoration grants no execution validation")
+            return original_validate(state)
+    
+        monkeypatch.setattr("litellm.acompletion", provider)
+        async with _running_job(app, service, session.id, kind="compose_message", content="Restore the advertised parked draft.") as job:
+            if entry == "malformed-head":
+                with app.state.session_engine.begin() as conn:
+                    conn.execute(update(composition_states_table).where(composition_states_table.c.id == str(initial.id)).values(nodes={"bad": True}))
+            monkeypatch.setattr(CompositionState, "validate", forbid_restored_validation)
+            record = await _run(app, job)
+            assert job.observation.audit_cohort_durable
+        assert len(requests) == 1
+        assert record.status == "completed"
+        response = MessageWithStateResponse.model_validate_json(record.result_json)
+>       assert response.message.content == arguments["message"]
+E       assert '\n\n---\n\n[... to continue.' == " \tLet's edit that draft.\n"
+E         
+E         -  	Let's edit that draft.
+E         + 
+E         + 
+E         + ---
+E         + 
+E         + [ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue.
+
+tests/unit/web/sessions/test_graph_recovery_turn.py:222: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 20:27:21 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:27:21 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 20:27:21 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 20:27:21 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 20:27:21 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=b29a125d-d6ce-4c13-b182-850f0b99f857 state_is_structurally_empty=False
+=========================== short test summary info ============================
+FAILED tests/unit/web/sessions/test_graph_recovery_turn.py::test_provider_park_alias_restores_exact_advertised_graph_and_retains_raw_evidence[uppercase-none-freeform]
+========================= 1 failed, 1 passed in 5.58s ==========================

@@ -1,0 +1,375 @@
+import { readFileSync } from "node:fs";
+
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { axe, toHaveNoViolations } from "jest-axe";
+import { SaveForReviewDialog } from "./SaveForReviewDialog";
+import { useShareableReviewStore } from "@/stores/shareableReviewStore";
+import { useExecutionStore } from "@/stores/executionStore";
+import {
+  COMPLETION_BLOCKED_VALIDATION_READINESS,
+  makeValidationResult,
+} from "@/test/composerFixtures";
+import type { ValidationResult } from "@/types/index";
+import * as api from "@/api/shareableReviews";
+
+expect.extend(toHaveNoViolations);
+
+const _validResponse = {
+  token: "abc",
+  share_url: "/#/shared/abc",
+  expires_at: "2026-06-19T00:00:00+00:00",
+  payload_digest: "sha256:" + "ab".repeat(32),
+};
+
+function _withOrigin(origin: string, fn: () => void) {
+  const original = window.location;
+  Object.defineProperty(window, "location", {
+    writable: true,
+    value: { ...original, origin } as Location,
+  });
+  try {
+    fn();
+  } finally {
+    Object.defineProperty(window, "location", { writable: true, value: original });
+  }
+}
+
+describe("SaveForReviewDialog", () => {
+  beforeEach(() => {
+    useShareableReviewStore.getState().reset();
+    useExecutionStore.setState({
+      validationResult: makeValidationResult(),
+    });
+  });
+
+  it("renders nothing when dialogOpen is false", () => {
+    const { container } = render(<SaveForReviewDialog />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it("shows the spinner when inFlight is true", () => {
+    useShareableReviewStore.setState({ dialogOpen: true, inFlight: true } as never);
+    render(<SaveForReviewDialog />);
+    expect(screen.getByTestId("save-for-review-spinner")).toBeInTheDocument();
+  });
+
+  it("renders as a modal dialog with an accessible name", () => {
+    useShareableReviewStore.setState({ dialogOpen: true, inFlight: true } as never);
+    render(<SaveForReviewDialog />);
+
+    const dialog = screen.getByRole("dialog", { name: "Share for review" });
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    expect(dialog).toHaveAttribute("aria-labelledby", "save-for-review-dialog-title");
+  });
+
+  it("uses the dynamic viewport when bounding its scroll owner", () => {
+    const css = readFileSync("src/components/composer/composer.css", "utf8");
+    expect(css).toMatch(
+      /\.save-for-review-dialog\s*\{[^}]*max-height:\s*calc\(100dvh - 32px\);[^}]*overflow:\s*auto;/s,
+    );
+    expect(css).not.toMatch(
+      /\.save-for-review-dialog\s*\{[^}]*max-height:\s*calc\(100vh - 32px\);/s,
+    );
+  });
+
+  // M09 (WCAG 4.1.2): the dialog used to *announce* aria-modal="true" while
+  // behaving as an in-flow block — no backdrop and no focus management. It is
+  // now a real modal (useFocusTrap + a backdrop sibling), consistent with
+  // GraphModal / ConfirmDialog. These two tests assert the *behaviour*, not
+  // just DOM presence: focus lands inside the dialog on open, and clicking the
+  // backdrop dismisses it.
+  it("moves focus to the Close button when the dialog opens", () => {
+    useShareableReviewStore.setState({ dialogOpen: true, inFlight: true } as never);
+    render(<SaveForReviewDialog />);
+
+    // useFocusTrap's initialFocusSelector (".save-for-review-close") is
+    // load-bearing — if the Close button loses that class the trap silently
+    // moves no focus, which this assertion catches.
+    expect(screen.getByTestId("save-for-review-close")).toHaveFocus();
+  });
+
+  it("closes the dialog when the backdrop is clicked", () => {
+    useShareableReviewStore.setState({
+      dialogOpen: true,
+      latestResponse: _validResponse,
+      sessionIdForResponse: "sess-1",
+    } as never);
+    render(<SaveForReviewDialog />);
+
+    fireEvent.click(screen.getByTestId("save-for-review-dialog-backdrop"));
+
+    expect(useShareableReviewStore.getState().dialogOpen).toBe(false);
+    expect(screen.queryByTestId("save-for-review-dialog")).not.toBeInTheDocument();
+  });
+
+  it("shows the error banner and retry button when error is set", () => {
+    useShareableReviewStore.setState({
+      dialogOpen: true,
+      error: "composition validation failed",
+    } as never);
+    render(<SaveForReviewDialog />);
+    expect(screen.getByTestId("save-for-review-error")).toHaveTextContent(
+      "composition validation failed",
+    );
+    expect(screen.getByTestId("save-for-review-retry")).toBeInTheDocument();
+  });
+
+  it("retries a failed first mint attempt with the failed session id", async () => {
+    const apiSpy = vi.spyOn(api, "markReadyForReview");
+    apiSpy
+      .mockRejectedValueOnce({
+        status: 409,
+        detail: "composition validation failed",
+      })
+      .mockResolvedValueOnce(_validResponse);
+
+    await useShareableReviewStore.getState().openAndMark("sess-retry");
+    render(<SaveForReviewDialog />);
+
+    fireEvent.click(screen.getByTestId("save-for-review-retry"));
+
+    await waitFor(() => expect(apiSpy).toHaveBeenCalledTimes(2));
+    expect(apiSpy).toHaveBeenLastCalledWith("sess-retry");
+    await waitFor(() =>
+      expect(screen.getByTestId("save-for-review-success")).toBeInTheDocument(),
+    );
+  });
+
+  it("disables and suppresses Retry when completion readiness becomes false", async () => {
+    const apiSpy = vi.spyOn(api, "markReadyForReview");
+    apiSpy.mockRejectedValueOnce({
+      status: 409,
+      detail: "composition validation failed",
+    });
+    await useShareableReviewStore.getState().openAndMark("sess-retry");
+    render(<SaveForReviewDialog />);
+
+    act(() => {
+      useExecutionStore.setState({
+        validationResult: makeValidationResult({
+          readiness: COMPLETION_BLOCKED_VALIDATION_READINESS,
+        }),
+      });
+    });
+
+    const retry = screen.getByTestId("save-for-review-retry");
+    const callsBeforeBlockedRetry = apiSpy.mock.calls.length;
+    expect(retry).toBeDisabled();
+    fireEvent.click(retry);
+    expect(apiSpy).toHaveBeenCalledTimes(callsBeforeBlockedRetry);
+  });
+
+  it("disables Retry when a malformed validation response omits readiness", () => {
+    useExecutionStore.setState({
+      // Deliberately model untrusted wire data that violates the mandatory
+      // TypeScript contract. Ordinary fixtures use makeValidationResult.
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+      } as unknown as ValidationResult,
+    });
+    useShareableReviewStore.setState({
+      dialogOpen: true,
+      error: "composition validation failed",
+    } as never);
+
+    render(<SaveForReviewDialog />);
+
+    expect(screen.getByTestId("save-for-review-retry")).toBeDisabled();
+  });
+
+  it("shows the share URL and prepends location.origin on success", () => {
+    _withOrigin("https://elspeth.example", () => {
+      useShareableReviewStore.setState({
+        dialogOpen: true,
+        latestResponse: _validResponse,
+        sessionIdForResponse: "sess-1",
+      } as never);
+      render(<SaveForReviewDialog />);
+      const input = screen.getByTestId("save-for-review-url-input") as HTMLInputElement;
+      expect(input.value).toBe("https://elspeth.example/#/shared/abc");
+    });
+  });
+
+  it("copy button writes the absolute URL to the clipboard and shows feedback", async () => {
+    _withOrigin("https://elspeth.example", () => {
+      useShareableReviewStore.setState({
+        dialogOpen: true,
+        latestResponse: _validResponse,
+        sessionIdForResponse: "sess-1",
+      } as never);
+    });
+    const writeText = vi.fn().mockResolvedValueOnce(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+
+    render(<SaveForReviewDialog />);
+    fireEvent.click(screen.getByTestId("save-for-review-copy"));
+    await waitFor(() => expect(writeText).toHaveBeenCalled());
+    expect(writeText).toHaveBeenCalledWith(
+      expect.stringContaining("/#/shared/abc"),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("save-for-review-copy")).toHaveTextContent(/copied/i),
+    );
+  });
+
+  // elspeth-6eb60a33a9: the failure message must NOT land in the button label.
+  // Both .btn and .btn-compact declare white-space: nowrap, so a sentence-long
+  // label made the button grow and reflowed the URL row under the pointer that
+  // had just clicked it. The button keeps a two-state label and the message
+  // renders in a sibling live region that is mounted BEFORE it has any text.
+  it("copy failure renders beside the button, not inside its label", async () => {
+    useShareableReviewStore.setState({
+      dialogOpen: true,
+      latestResponse: _validResponse,
+      sessionIdForResponse: "sess-1",
+    } as never);
+    const writeText = vi.fn().mockRejectedValueOnce(new Error("not allowed"));
+    Object.assign(navigator, { clipboard: { writeText } });
+
+    render(<SaveForReviewDialog />);
+    const copyButton = screen.getByTestId("save-for-review-copy");
+    const status = screen.getByTestId("save-for-review-copy-status");
+
+    // The live region pre-exists its content: mounted, addressable, empty.
+    expect(status).toHaveAttribute("role", "status");
+    expect(status).toBeEmptyDOMElement();
+    expect(copyButton).toHaveTextContent(/^copy$/i);
+
+    fireEvent.click(copyButton);
+
+    await waitFor(() => expect(status).toHaveTextContent(/copy failed/i));
+    // Same node, so the region was updated rather than re-inserted.
+    expect(screen.getByTestId("save-for-review-copy-status")).toBe(status);
+    // The label never takes the message, and the button stays retryable.
+    expect(copyButton).toHaveTextContent(/^copy$/i);
+    expect(copyButton).not.toHaveTextContent(/copy failed/i);
+  });
+
+  it("Close button dispatches close()", () => {
+    useShareableReviewStore.setState({
+      dialogOpen: true,
+      latestResponse: _validResponse,
+      sessionIdForResponse: "sess-1",
+    } as never);
+    render(<SaveForReviewDialog />);
+    fireEvent.click(screen.getByTestId("save-for-review-close"));
+    expect(useShareableReviewStore.getState().dialogOpen).toBe(false);
+  });
+
+  it("URL input is readonly and selects on focus", () => {
+    useShareableReviewStore.setState({
+      dialogOpen: true,
+      latestResponse: _validResponse,
+      sessionIdForResponse: "sess-1",
+    } as never);
+    render(<SaveForReviewDialog />);
+    const input = screen.getByTestId("save-for-review-url-input") as HTMLInputElement;
+    expect(input.readOnly).toBe(true);
+  });
+
+  // Plan line 276 (`docs/composer/ux-redesign-2026-05/19b-phase-6b-frontend.md`)
+  // names jest-axe accessibility-clean assertion on SaveForReviewDialog as a
+  // load-bearing GO condition for Phase 6B (a11y was a multi-reviewer GO
+  // gate). The success state is the user-visible terminal state of the
+  // happy path — the share URL display, the Copy button, and the Close
+  // button must be accessible. axe-core inspects roles, labels, focus
+  // management, and contrast-of-context against the rendered DOM.
+  it("has no accessibility violations in the success state", async () => {
+    useShareableReviewStore.setState({
+      dialogOpen: true,
+      latestResponse: _validResponse,
+      sessionIdForResponse: "sess-1",
+    } as never);
+    const { container } = render(<SaveForReviewDialog />);
+    const results = await axe(container);
+    expect(results).toHaveNoViolations();
+  });
+
+  // Plan line 278 (`docs/composer/ux-redesign-2026-05/19b-phase-6b-frontend.md`)
+  // requires Esc-to-close focus management on the modal. WAI-ARIA Authoring
+  // Practices: any element with `role="dialog"` + `aria-modal="true"` must
+  // close on Escape. The listener is attached to `document` rather than the
+  // dialog element itself — the canonical React modal pattern (GraphModal /
+  // ConfirmDialog do the same) — so Escape closes regardless of which trapped
+  // control currently holds focus.
+  it("closes the dialog when Escape is pressed", () => {
+    useShareableReviewStore.setState({
+      dialogOpen: true,
+      latestResponse: _validResponse,
+      sessionIdForResponse: "sess-1",
+    } as never);
+    render(<SaveForReviewDialog />);
+    expect(screen.getByTestId("save-for-review-dialog")).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(useShareableReviewStore.getState().dialogOpen).toBe(false);
+    expect(screen.queryByTestId("save-for-review-dialog")).not.toBeInTheDocument();
+  });
+
+  // Plan line 272 AC 6 (`docs/composer/ux-redesign-2026-05/19b-phase-6b-frontend.md`):
+  // "Copied!" feedback after clicking copy auto-clears after 2000ms. The
+  // timer is named COPY_FEEDBACK_TIMEOUT_MS in the component; vi fake
+  // timers exercise the setTimeout branch end-to-end.
+  it("auto-clears the 'Copied!' confirmation after 2000ms", async () => {
+    // Fake setTimeout/clearTimeout only — leave the microtask queue
+    // (Promise / queueMicrotask) on real timers so the awaited
+    // navigator.clipboard.writeText promise can resolve. Then flush
+    // microtasks via a real-timer `setImmediate`-style yield, assert
+    // the "Copied!" state, advance the fake setTimeout by 2000ms inside
+    // `act(...)`, and assert the auto-clear has fired.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      useShareableReviewStore.setState({
+        dialogOpen: true,
+        latestResponse: _validResponse,
+        sessionIdForResponse: "sess-1",
+      } as never);
+      const writeText = vi.fn().mockResolvedValueOnce(undefined);
+      Object.assign(navigator, { clipboard: { writeText } });
+
+      render(<SaveForReviewDialog />);
+      fireEvent.click(screen.getByTestId("save-for-review-copy"));
+      // Flush the awaited writeText promise + React state update.
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(screen.getByTestId("save-for-review-copy")).toHaveTextContent(
+        /copied/i,
+      );
+      act(() => {
+        vi.advanceTimersByTime(2000);
+      });
+      expect(screen.getByTestId("save-for-review-copy")).toHaveTextContent(
+        /^copy$/i,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Plan line 273 AC 7 (`docs/composer/ux-redesign-2026-05/19b-phase-6b-frontend.md`):
+  // Open-link affordance opens in a new tab with rel="noopener noreferrer"
+  // — security hardening for the user-shared URL.
+  it("renders an open-in-new-tab anchor with noopener/noreferrer and correct href", () => {
+    _withOrigin("https://elspeth.example", () => {
+      useShareableReviewStore.setState({
+        dialogOpen: true,
+        latestResponse: _validResponse,
+        sessionIdForResponse: "sess-1",
+      } as never);
+      render(<SaveForReviewDialog />);
+      const link = screen.getByTestId("save-for-review-open-link");
+      expect(link.tagName).toBe("A");
+      expect(link).toHaveAttribute("target", "_blank");
+      expect(link).toHaveAttribute("rel", "noopener noreferrer");
+      expect(link).toHaveAttribute(
+        "href",
+        "https://elspeth.example/#/shared/abc",
+      );
+    });
+  });
+});

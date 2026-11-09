@@ -1,0 +1,2967 @@
+"""FastAPI application factory."""
+
+from __future__ import annotations
+
+import asyncio
+import errno
+import hmac
+import os
+import re
+import sys
+import threading
+import time
+import weakref
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal
+from uuid import UUID
+
+import httpx
+import structlog
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler as fastapi_http_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+from opentelemetry.metrics import Counter, Histogram
+from opentelemetry.util.types import AttributeValue
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from starlette.datastructures import Headers, MutableHeaders
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import Response as StarletteResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+import elspeth.contracts.errors as contract_errors
+from elspeth import __version__
+from elspeth.contracts import RunStatus
+from elspeth.contracts.blobs import BlobRecord
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionPolicy
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, mint_worker_id
+from elspeth.contracts.credential_material import scrub_credential_material
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.secrets import (
+    FingerprintKeyMissingError,
+    SecretDecryptionError,
+)
+from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.core.checkpoint.recovery import NonResumableRunError
+from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.logging import configure_logging
+from elspeth.core.payload_store import FilesystemPayloadStore
+from elspeth.plugins.transforms.llm.model_catalog import (
+    prime_openrouter_catalog_from_live,
+    read_openrouter_catalog_snapshot_id,
+)
+from elspeth.web.application_finalizers import ApplicationFinalizerOwner
+from elspeth.web.async_workers import (
+    AsyncWorkerAdmissionTimeoutError,
+    configure_required_executor_recovery,
+    required_generation_unavailable,
+    run_sync_in_worker,
+)
+from elspeth.web.audit_readiness.routes import create_audit_readiness_router
+from elspeth.web.audit_readiness.service import ReadinessService, build_boot_plugin_policy_readiness
+from elspeth.web.auth.admin_routes import create_dev_admin_router
+from elspeth.web.auth.audit import AuthAuditRecorder
+from elspeth.web.auth.identity_admin_routes import create_identity_admin_router
+from elspeth.web.auth.local import LocalAuthProvider
+from elspeth.web.auth.models import IdentityClaims
+from elspeth.web.auth.people_routes import create_people_router
+from elspeth.web.auth.protocol import AuthProvider
+from elspeth.web.auth.quota_routes import create_quota_router
+from elspeth.web.auth.routes import create_auth_router
+from elspeth.web.auth.session_token import (
+    DEFAULT_MAX_REFRESH_CHAIN_HOURS,
+    DEFAULT_TOKEN_EXPIRY_HOURS,
+    SessionFamilyAuthority,
+    SessionTokenIssuer,
+    session_token_audience,
+)
+from elspeth.web.auth.sso import SsoAuthProvider, SsoDiscoveryFailed
+from elspeth.web.blobs.routes import create_blobs_router
+from elspeth.web.blobs.service import BlobServiceImpl
+from elspeth.web.catalog.routes import catalog_router
+from elspeth.web.composer import yaml_generator as yaml_generator_module
+from elspeth.web.composer.progress import ComposerProgressRegistry
+from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.tools.wire_projection import loop_tool_count, strict_capable_tool_count
+from elspeth.web.composer.tutorial_abandon_routes import create_tutorial_abandon_router
+from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
+from elspeth.web.composer_stream import ComposerStreamPermits
+from elspeth.web.composer_stream_auth import ComposerStreamAuthServices
+from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
+from elspeth.web.coordination.approval_authority import ApprovalTransactionAuthority
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
+from elspeth.web.coordination.auth_session_authority import RepositoryAuthSessionAuthority
+from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+from elspeth.web.coordination.composer_progress_authority import DatabaseComposerProgressRegistry, SessionComposerProgressAuthority
+from elspeth.web.coordination.identity_authority import (
+    IdentityDormancyExempted,
+    IdentityDormant,
+    IdentityRebound,
+    IdentityRetired,
+    RepositoryIdentityAuthority,
+    local_identity_retirer,
+)
+from elspeth.web.coordination.library_authority import RepositoryLibraryAuthority
+from elspeth.web.coordination.membership_authority import (
+    RepositoryWebInstanceMembershipAuthority,
+    web_instance_identity_from_settings,
+)
+from elspeth.web.coordination.membership_lifecycle import (
+    RegisteredWebInstanceMembership,
+    SingleProcessWebInstanceMembership,
+    WebInstanceMembership,
+)
+from elspeth.web.coordination.quota_authority import ContainerQuotaPolicyRow
+from elspeth.web.coordination.quota_policy_authority import RepositoryQuotaPolicyAuthority
+from elspeth.web.coordination.rate_limit_authority import RepositoryRateLimitAuthority
+from elspeth.web.coordination.repository import PostgresSessionOperationRepository
+from elspeth.web.coordination.review_authority import RepositoryReviewAuthority
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+from elspeth.web.coordination.websocket_ticket_authority import RepositorySessionWebsocketTicketAuthority
+from elspeth.web.coordination.workflow_scope_reader import RepositoryWorkflowScopeReader
+from elspeth.web.credential_guard import CredentialMaterialRefused
+from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.deployment_contract import resolve_deployment_state_mode
+from elspeth.web.deployment_profiles import deployment_startup_profile, read_platform_identity, resolve_instance_id
+from elspeth.web.execution.progress import ProgressBroadcaster
+from elspeth.web.execution.recovery import RunRecoveryCoordinator
+from elspeth.web.execution.routes import create_execution_router
+from elspeth.web.execution.run_progress_reader import RepositoryRunProgressReader
+from elspeth.web.execution.runtime_preflight import RuntimePreflightCoordinator
+from elspeth.web.execution.service import ExecutionServiceImpl
+from elspeth.web.execution.validation import validate_pipeline
+from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
+from elspeth.web.execution_lease_cleanup import ExecutionLeaseReleaseRegistry
+from elspeth.web.external_state_startup import _CONNECT_TIMEOUT_SECONDS
+from elspeth.web.key_derivation import (
+    derive_binding_generation_key,
+    derive_rate_limit_key,
+    derive_session_token_key,
+    derive_user_secret_master_key,
+)
+from elspeth.web.landscape_access import open_landscape_db
+from elspeth.web.middleware.instance_identity import InstanceIdentityMiddleware
+from elspeth.web.middleware.rate_limit import ComposerRateLimiter, SharedRateLimiter
+from elspeth.web.middleware.request_id import RequestIdMiddleware
+from elspeth.web.operator_telemetry import bootstrap_operator_telemetry
+from elspeth.web.operator_telemetry_custody import OperatorTelemetryCleanupOwner
+from elspeth.web.preferences.routes import create_preferences_router
+from elspeth.web.preferences.service import CorruptPreferencesError, PreferencesService
+from elspeth.web.process_recovery import ProcessRecovery
+from elspeth.web.process_watchdog import (
+    BootstrapCompletionWitness,
+    ProcessCompletionWitness,
+    ProcessWatchdogControl,
+    ProcessWatchdogFactory,
+    create_process_watchdog,
+)
+from elspeth.web.process_watchdog_codec import RecoveryReason
+from elspeth.web.readiness import (
+    ReadinessCache,
+    ReadinessProbeRunner,
+    ReadinessReport,
+    overall_timeout_report,
+    readiness_report,
+)
+from elspeth.web.required_executor import RequiredGenerationUnavailable
+from elspeth.web.schema_probe import admit_pool_diagnostics, database_sqlstate, postgres_engine_kwargs
+from elspeth.web.secrets.routes import create_secrets_router
+from elspeth.web.secrets.server_store import ServerSecretStore
+from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
+from elspeth.web.secrets.user_store import RepositoryUserSecretAuthority, UserSecretStore
+from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
+from elspeth.web.session_operation_handlers import register_session_operation_exception_handlers
+from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
+from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
+from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
+from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome
+from elspeth.web.sessions.manual_proposal_failure import ComposerManualProposalFailure, consume_manual_proposal_failure
+from elspeth.web.sessions.protocol import (
+    LANDSCAPE_RECONCILIATION_PENDING_SUFFIX,
+    AuditAccessLogWriteError,
+    RunAlreadyActiveError,
+    RunRecord,
+    SessionOperationAuthority,
+    StaleComposeStateError,
+)
+from elspeth.web.sessions.routes import create_session_router
+from elspeth.web.sessions.routes.composer.state import seed_state_from_runtime_yaml
+from elspeth.web.sessions.routes.workflow.approvals import create_approvals_router
+from elspeth.web.sessions.routes.workflow.audit_view import create_workflow_audit_view_router
+from elspeth.web.sessions.routes.workflow.inspect import create_workflow_inspect_router
+from elspeth.web.sessions.routes.workflow.library import create_library_router
+from elspeth.web.sessions.routes.workflow.mailbox import create_mailbox_router
+from elspeth.web.sessions.routes.workflow.reviews import create_reviews_router
+from elspeth.web.sessions.schema import initialize_session_schema
+from elspeth.web.sessions.service import SessionServiceImpl
+from elspeth.web.sessions.skill_markdown_history import RepositorySkillMarkdownHistoryAuthority
+from elspeth.web.sessions.telemetry import _SessionsTelemetry, build_sessions_telemetry
+from elspeth.web.shareable_reviews.routes import create_shareable_reviews_router
+from elspeth.web.shareable_reviews.service import ShareableReviewService
+from elspeth.web.shareable_reviews.signer import ShareTokenSigner
+from elspeth.web.sso_wiring import SsoWiring, build_sso_wiring, resolve_sso_runtime, sso_missing_settings
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.state import CompositionState
+    from elspeth.web.execution.schemas import ValidationResult
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+
+# Assigned by create_app only after the idempotent process MeterProvider
+# bootstrap. Keeping these names module-level preserves the existing lifespan
+# test seams without creating instruments as an import side effect.
+_COMPOSER_BOOT_CONFIG_COUNTER: Counter
+_COMPOSER_BOOT_CONFIG_PROBE_LATENCY: Histogram
+# Boot-time provider probe budget (strict-tool-contracts plan, section 4
+# "Boot-time budget"). The composer probes run in the lifespan before uvicorn
+# binds, so /api/health refuses connections for their whole duration. The
+# startup contract is 150 s (ACA startup probe 15 s x 10 in
+# deploy/azure-container-apps/workload.bicep; ECS startPeriod 150 in
+# docs/runbooks/aws-ecs-deployment.md), about 90 s of which is the database
+# budget. That leaves 60 s for boot-time provider probes.
+_BOOT_PROVIDER_PROBE_BUDGET_SECONDS = 60.0
+# One deadline shared by every composer probe request (loop list, planner
+# list, advisor), so the worst case is this value, not a sum of per-request
+# timeouts. With the OpenRouter catalog prime's total deadline
+# (_OPENROUTER_CATALOG_PRIME_DEADLINE_SECONDS) it fits the 60 s budget. Measured advisor
+# checkpoint latency (23 archived calls): p95 11.0 s, max 50.8 s. With both
+# planner requests at their cap the advisor still has 35 s, about 3x its p95;
+# a call as slow as the 50.8 s outlier becomes a nonfatal, logged unverified
+# boot.
+_COMPOSER_BOOT_PROBE_DEADLINE_SECONDS = 45.0
+# Each planner request is also capped inside the shared deadline, so a slow
+# planner endpoint cannot consume the advisor's time. A provider rejects a bad
+# request before it generates, so the cap keeps the probe's main signal (a
+# 400); a slower, accepted request is logged as unverified. Measured compose
+# loop calls with at most 200 completion tokens (11 archived calls, prompts of
+# 56k-104k tokens): p50 1.6 s, max 2.75 s.
+_COMPOSER_PLANNER_BOOT_PROBE_TIMEOUT_SECONDS = 5.0
+# httpx's connect and read timeouts are per operation: the read timeout
+# bounds each wait for a chunk, so a response that trickles in never trips it.
+# The prime is therefore also held to a total deadline, which is what the boot
+# budget counts (10 s + the 45 s probe deadline = 55 s of the 60 s).
+_OPENROUTER_CATALOG_PRIME_TIMEOUT = httpx.Timeout(5.0, connect=5.0)
+_OPENROUTER_CATALOG_PRIME_DEADLINE_SECONDS = 10.0
+_FORBIDDEN_METRICS_LABEL_PATTERN = re.compile(rb"(?:\{|,)\s*(run_id|session_id|user_id)\s*=")
+_METRICS_NO_STORE_HEADERS = {"Cache-Control": "no-store"}
+# Reserve bounded headroom inside the public five-second readiness contract
+# for timeout finalization, redacted logging, JSON serialization, and ASGI
+# response dispatch. The shared cache task remains shielded from this waiter.
+_READINESS_ROUTE_COMPUTE_TIMEOUT_SECONDS = 4.5
+
+_RETRYABLE_STORAGE_ERRNOS: frozenset[int] = frozenset(
+    {
+        errno.ENOSPC,
+        errno.EROFS,
+        errno.EIO,
+    }
+)
+
+
+def _dispose_session_engine(engine: Engine) -> None:
+    """Dispose the sessions DB pool for app instances that never run lifespan."""
+    engine.dispose()
+
+
+def _run_session_engine_finalizer(
+    finalizer: Callable[[], object],
+    *,
+    primary_error: BaseException | None = None,
+) -> None:
+    """Run one-shot engine cleanup without replacing a primary failure."""
+    try:
+        finalizer()
+    except BaseException as finalization_exc:
+        if primary_error is None:
+            raise
+        structlog.get_logger().error(
+            "session_engine_finalization_failed",
+            primary_exc_class=type(primary_error).__name__,
+            finalization_exc_class=type(finalization_exc).__name__,
+        )
+
+
+def _close_readiness_runner(runner: ReadinessProbeRunner) -> None:
+    """Close readiness workers for app instances that never run lifespan."""
+    runner.close()
+
+
+def _run_auth_audit_finalizer(finalizer: Callable[[], object], *, primary_error: BaseException | None = None) -> None:
+    """Close the audit pool without replacing an application failure."""
+    try:
+        finalizer()
+    except BaseException as exc:
+        if primary_error is None:
+            raise
+        structlog.get_logger().error(
+            "auth_audit_finalization_failed",
+            primary_exc_class=type(primary_error).__name__,
+            finalization_exc_class=type(exc).__name__,
+        )
+
+
+def _parse_worker_count(raw_value: str, *, signal_name: str) -> int:
+    try:
+        return int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{signal_name}={raw_value!r} is not a valid integer worker count. "
+            "Single-worker enforcement cannot safely determine the process model."
+        ) from exc
+
+
+def _finalize_orphaned_landscape_runs(
+    landscape_url: str,
+    cancelled_runs: list[RunRecord],
+    *,
+    create_tables: bool = True,
+) -> tuple[frozenset[UUID], frozenset[UUID]]:
+    """Idempotently reconcile candidates and classify complete versus absent."""
+    complete_run_ids: set[UUID] = set()
+    absent_run_ids: set[UUID] = set()
+    by_landscape_id: dict[str, list[UUID]] = {}
+    for run in cancelled_runs:
+        if run.landscape_run_id is None:
+            complete_run_ids.add(run.id)
+            continue
+        by_landscape_id.setdefault(run.landscape_run_id, []).append(run.id)
+
+    if not by_landscape_id:
+        return frozenset(complete_run_ids), frozenset()
+
+    with LandscapeDB.from_url(landscape_url, create_tables=create_tables) as landscape_db:
+        repositories = RecorderFactory(landscape_db)
+        for landscape_run_id, session_run_ids in by_landscape_id.items():
+            landscape_run = repositories.run_lifecycle.get_run(landscape_run_id)
+            if landscape_run is None:
+                absent_run_ids.update(session_run_ids)
+                continue
+            if landscape_run.status == RunStatus.RUNNING:
+                # ADR-048 §4: the web tier is a token boundary, not a token
+                # source. Take the dead leader's seat through the takeover CAS
+                # (epoch+1) and finalize under that token; a seat that is
+                # still live means the run is NOT orphaned and is left alone.
+                try:
+                    coordination_token = _acquire_orphaned_run_leadership(repositories, run_id=landscape_run_id)
+                except NonResumableRunError:
+                    structlog.get_logger().warning(
+                        "orphan_landscape_run_leader_live",
+                        landscape_run_id=landscape_run_id,
+                        operator_action="run still led by a live worker; reconciliation deferred",
+                    )
+                    continue
+                _finalize_orphan_as_interrupted(repositories, coordination_token=coordination_token)
+            complete_run_ids.update(session_run_ids)
+    if absent_run_ids:
+        structlog.get_logger().error(
+            "orphan_landscape_run_absent",
+            outcome="absent",
+            count=len(absent_run_ids),
+            operator_action="investigate audit-row absence",
+        )
+    return frozenset(complete_run_ids), frozenset(absent_run_ids)
+
+
+def _acquire_orphaned_run_leadership(repositories: RecorderFactory, *, run_id: str) -> CoordinationToken:
+    """Acquire the expired seat for one orphan reconciliation attempt."""
+    return repositories.run_coordination.acquire_run_leadership(
+        run_id=run_id,
+        worker_id=mint_worker_id(run_id),
+        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+        entry_point="orphan-finalize",
+    )
+
+
+def _finalize_orphan_as_interrupted(repositories: RecorderFactory, *, coordination_token: CoordinationToken) -> None:
+    """Stamp INTERRUPTED under the seat just taken, then vacate it (ADR-030 §D seat hygiene)."""
+    repositories.run_lifecycle.complete_run(RunStatus.INTERRUPTED, coordination_token=coordination_token)
+    repositories.run_coordination.release_seat(token=coordination_token)
+
+
+async def _reconcile_pending_landscape_runs(
+    session_service: SessionServiceImpl,
+    landscape_url: str,
+    *,
+    create_tables: bool,
+) -> None:
+    candidates = await session_service.list_pending_landscape_reconciliations()
+    complete_run_ids, absent_run_ids = _finalize_orphaned_landscape_runs(
+        landscape_url,
+        candidates,
+        create_tables=create_tables,
+    )
+    await session_service.mark_landscape_reconciliation_outcomes(
+        complete_run_ids=complete_run_ids,
+        absent_run_ids=absent_run_ids,
+    )
+
+
+_ORPHAN_CLEANUP_MAX_CONSECUTIVE_FAILURES = 5
+"""Consecutive transient-failure bound for the periodic orphan sweeper.
+
+One or two ``OperationalError`` sweeps are DB contention and retry cleanly;
+this many in a row means the fault is standing, so the sweeper stops
+presuming transience and re-raises — terminating the task so the stored
+failure surfaces at lifespan shutdown instead of being absorbed every
+interval forever."""
+
+
+async def _periodic_orphan_cleanup(
+    session_service: SessionServiceImpl,
+    execution_service: ExecutionServiceImpl,
+    telemetry: _SessionsTelemetry,
+    *,
+    interval_seconds: int,
+    max_age_seconds: int,
+    landscape_url: str | None = None,
+    create_tables: bool = True,
+    recovery_coordinator: RunRecoveryCoordinator | None = None,
+) -> None:
+    """Periodically recover runs whose durable owners have expired.
+
+    Production supplies the coordinator, which classifies Landscape truth
+    before any terminal projection. Local worker exclusion avoids reclaiming
+    a thread during its final unwind; durable fences decide replica ownership.
+    """
+    import structlog
+
+    slog = structlog.get_logger()
+    consecutive_failures = 0
+    archive_cleanup_failures = 0
+    while True:
+        await asyncio.sleep(interval_seconds)
+        cancelled = 0
+        live_run_ids: frozenset[str] = frozenset()
+        try:
+            try:
+                await session_service.reconcile_consumed_archives()
+            except OSError as cleanup_exc:
+                archive_cleanup_failures += 1
+                if archive_cleanup_failures >= _ORPHAN_CLEANUP_MAX_CONSECUTIVE_FAILURES:
+                    raise
+                slog.error(
+                    "periodic_archive_cleanup_pending",
+                    exc_class=type(cleanup_exc).__name__,
+                    errno=cleanup_exc.errno,
+                    consecutive_failures=archive_cleanup_failures,
+                )
+            else:
+                archive_cleanup_failures = 0
+            live_run_ids = execution_service.get_live_run_ids()
+            if recovery_coordinator is not None:
+                await recovery_coordinator.recover()
+            elif landscape_url is None:
+                cancelled = await session_service.cancel_all_orphaned_runs(
+                    max_age_seconds=max_age_seconds,
+                    exclude_run_ids=live_run_ids,
+                    reason="Orphaned by periodic cleanup — no active executor thread",
+                )
+            else:
+                cancelled_runs = await session_service.cancel_all_orphaned_run_records(
+                    max_age_seconds=max_age_seconds,
+                    exclude_run_ids=live_run_ids,
+                    reason=(f"Orphaned by periodic cleanup — no active executor thread {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}"),
+                )
+                cancelled = len(cancelled_runs)
+                await _reconcile_pending_landscape_runs(
+                    session_service,
+                    landscape_url,
+                    create_tables=create_tables,
+                )
+            consecutive_failures = 0
+        except OperationalError as cleanup_exc:
+            # Only OperationalError is retried — the one DB failure class
+            # that models transient contention (lock timeout, dropped
+            # connection, sqlite-busy) rather than standing operator or
+            # programmer state. Every other SQLAlchemyError subclass
+            # (ProgrammingError, IntegrityError, ...), OSError, and
+            # SchemaCompatibilityError propagates, terminating the task
+            # so the fault surfaces at lifespan shutdown (the outer
+            # contextlib.suppress narrows to CancelledError only) —
+            # retrying those every interval can never fix them.
+            # The retry itself is bounded: past the consecutive-failure
+            # bound contention is no longer presumed transient and the
+            # exception re-raises through the same task-death route.
+            #
+            # exc_info deliberately omitted: SQLAlchemyError __cause__
+            # chains routinely carry the DB connection URL, schema
+            # names, and the sqlite file path — the same leak vector
+            # closed across every HTTP-path slog.error site when the
+            # redaction pattern was standardised. Structured logs carry
+            # exc_class only; operators reading logs get enough
+            # correlation to triage without the traceback text.
+            consecutive_failures += 1
+            if consecutive_failures >= _ORPHAN_CLEANUP_MAX_CONSECUTIVE_FAILURES:
+                slog.error(
+                    "periodic_orphan_cleanup_escalating",
+                    exc_class=type(cleanup_exc).__name__,
+                    consecutive_failures=consecutive_failures,
+                )
+                raise
+            slog.error(
+                "periodic_orphan_cleanup_failed",
+                exc_class=type(cleanup_exc).__name__,
+                consecutive_failures=consecutive_failures,
+            )
+        if cancelled:
+            telemetry.orphaned_runs_cancelled_total.add(
+                cancelled,
+                attributes={"source": "periodic", "excluded_live_runs": len(live_run_ids)},
+            )
+
+
+_OPENROUTER_PROVIDER_ID = "openrouter"
+"""Provider discriminator for OpenRouter in ``WebSettings.llm_profiles``.
+
+This matches the ``provider`` field of a configured LLM profile (the
+discriminated-variant key ``WebLLMProfileSettings`` validates against),
+not the model-catalog id — the two happen to share a spelling.
+"""
+
+
+def _configured_llm_providers(settings: WebSettings) -> tuple[str, ...]:
+    """Sorted, deduplicated providers bound by the deployment's LLM profiles.
+
+    ``WebSettings.llm_profiles`` is the deployment's declaration of which
+    LLM providers it uses (``ELSPETH_WEB__LLM_PROFILES``): the AWS ECS
+    deployment binds Bedrock through the task role; staging binds
+    OpenRouter. An empty tuple means the deployment configured no LLM
+    provider at all.
+    """
+    return tuple(sorted({profile.provider for profile in settings.llm_profiles.values()}))
+
+
+async def _prime_openrouter_catalog_within_deadline(
+    http_get: Callable[[str], Awaitable[httpx.Response]],
+) -> Literal["primed", "failed", "deadline_exceeded"]:
+    """Run the live catalog prime under its total boot deadline.
+
+    Cancellation at the deadline can land only in ``http_get``: the prime has
+    no other await and publishes its snapshot after the response is read, so a
+    cancelled prime leaves no live snapshot (and at boot there is no earlier
+    one to clear).
+    """
+    try:
+        primed = await asyncio.wait_for(
+            prime_openrouter_catalog_from_live(http_get=http_get),
+            timeout=_OPENROUTER_CATALOG_PRIME_DEADLINE_SECONDS,
+        )
+    except TimeoutError:
+        return "deadline_exceeded"
+    return "primed" if primed else "failed"
+
+
+async def _boot_prime_openrouter_catalog(settings: WebSettings) -> None:
+    """Prime the OpenRouter model catalog iff OpenRouter is a configured provider.
+
+    The live prime closes the validate/runtime drift bug where the bundled
+    litellm catalog still listed models OpenRouter has retired (e.g.
+    ``anthropic/claude-3.5-sonnet``), letting the value-source compliance
+    walker pass configs that 404 at runtime preflight. The request-level
+    probe is graceful inside ``prime_openrouter_catalog_from_live``; failures
+    before the request boundary (client construction/context management) are
+    startup failures rather than undocumented fallback decisions.
+
+    Gate (elspeth-c67ba40e4a): a deployment must not egress to providers it
+    has not configured. When no configured LLM profile binds the OpenRouter
+    provider (e.g. a Bedrock-only AWS ECS deployment), the prime is skipped
+    entirely — no boot-time request to openrouter.ai, no availability
+    dependency on an unused service — and the catalog reader serves the
+    bundled litellm fallback, exactly as it does when the prime fails.
+    """
+    slog = structlog.get_logger()
+    configured_providers = _configured_llm_providers(settings)
+    if _OPENROUTER_PROVIDER_ID not in configured_providers:
+        slog.info(
+            "openrouter_catalog_boot_prime_skipped",
+            reason="openrouter is not a configured LLM provider for this deployment",
+            configured_llm_providers=configured_providers,
+            action="serving bundled litellm catalog; no boot-time egress to openrouter.ai",
+        )
+        return
+
+    probe_start = time.monotonic()
+    async with httpx.AsyncClient(timeout=_OPENROUTER_CATALOG_PRIME_TIMEOUT) as _probe_client:
+
+        async def _probe_get(url: str) -> httpx.Response:
+            # ``request("GET", ...)`` rather than ``.get(...)``: identical
+            # httpx semantics, but avoids the L3 walker's token-level
+            # false match on the literal ``.get`` (R1 targets defensive
+            # ``dict.get`` reads, not HTTP client method calls).
+            return await _probe_client.request("GET", url)
+
+        outcome = await _prime_openrouter_catalog_within_deadline(_probe_get)
+    probe_latency_ms = int((time.monotonic() - probe_start) * 1000)
+    if outcome == "primed":
+        slog.info(
+            "openrouter_catalog_boot_prime_complete",
+            latency_ms=probe_latency_ms,
+        )
+    elif outcome == "deadline_exceeded":
+        slog.warning(
+            "openrouter_catalog_boot_prime_failed",
+            latency_ms=probe_latency_ms,
+            failure_class="PrimeDeadlineExceeded",
+            deadline_seconds=_OPENROUTER_CATALOG_PRIME_DEADLINE_SECONDS,
+            action="serving bundled litellm catalog (may include retired models)",
+        )
+    else:
+        slog.warning(
+            "openrouter_catalog_boot_prime_failed",
+            latency_ms=probe_latency_ms,
+            action="serving bundled litellm catalog (may include retired models)",
+        )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Own session and authentication audit engines for the application lifespan."""
+    registry: ExecutionLeaseReleaseRegistry | None = None
+    primary_error: BaseException | None = None
+    serving_started = False
+    try:
+        registry = ExecutionLeaseReleaseRegistry(
+            owner=app.state.application_finalizer_owner,
+            recovery=app.state.process_recovery,
+            loop=asyncio.get_running_loop(),
+        )
+        app.state.execution_lease_release_registry = registry
+        app.state.process_watchdog.assert_watching()
+        app.state.process_recovery.start_monitor()
+        app.state.auth_audit_recorder.start()
+        await _initialize_container_token_policy(app)
+        async with _service_lifespan(app):
+            serving_started = True
+            yield
+    except BaseException as exc:
+        if registry is not None:
+            registry.seal()
+        primary_error = exc
+        try:
+            if serving_started:
+                app.state.process_recovery.request_shutdown()
+            else:
+                app.state.process_recovery.request_startup_failure()
+            await app.state.process_recovery.join_escalation()
+        except BaseException as supervision_failure:
+            primary_error = BaseExceptionGroup("Application lifespan and supervision failed", [exc, supervision_failure])
+            raise primary_error from None
+        raise
+    finally:
+        if registry is not None:
+            registry.seal()
+        finalizer_failures: list[BaseException] = []
+        try:
+            _run_auth_audit_finalizer(app.state._auth_audit_finalizer)
+        except BaseException as failure:
+            finalizer_failures.append(failure)
+        try:
+            _run_session_engine_finalizer(app.state._session_engine_finalizer)
+        except BaseException as failure:
+            finalizer_failures.append(failure)
+        if finalizer_failures:
+            failures = ([primary_error] if primary_error is not None else []) + finalizer_failures
+            if len(failures) == 1:
+                raise failures[0]
+            raise BaseExceptionGroup("Application lifespan and finalizers failed", failures) from None
+        if primary_error is None and not app.state.required_generation_unavailable.is_set():
+            assert registry is not None
+            registry.assert_completed()
+            await app.state.process_recovery.join_escalation()
+            await app.state.process_watchdog.complete(ProcessCompletionWitness(app.state.process_watchdog.target))
+            await app.state.process_recovery.join_monitor_after_completion()
+
+
+async def _initialize_container_token_policy(app: FastAPI) -> None:
+    """Join startup provisioning before its database owners can be finalized."""
+
+    def record(policy: ContainerQuotaPolicyRow) -> None:
+        app.state.auth_audit_recorder.record_container_quota_set(provider=app.state.settings.auth_provider, policy=policy)
+
+    # Landscape is already open. Keep the exact worker Task owned even if the
+    # lifespan is cancelled during SQL lock acquisition or the audit callback.
+    work = run_sync_in_worker(
+        app.state.quota_policy_authority.ensure_container_token_policy,
+        tokens_per_day=app.state.settings.quota_container_tokens_per_day,
+        storage_bytes=app.state.settings.quota_container_storage_bytes,
+        record=record,
+    )
+    try:
+        task = asyncio.create_task(work, name="container-token-policy-startup")
+    except BaseException:
+        work.close()
+        raise
+    failures: list[BaseException] = []
+    while not task.done():
+        try:
+            await asyncio.wait({task}, timeout=0.1)
+        except asyncio.CancelledError as cancellation:
+            failures.append(cancellation)
+            try:
+                # Arm independent supervision while retaining the worker; the
+                # watchdog still enforces the process recovery deadline.
+                app.state.process_recovery.request_startup_failure()
+            except BaseException as failure:
+                failures.append(failure)
+    try:
+        task.result()
+    except BaseException as failure:
+        failures.append(failure)
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        raise BaseExceptionGroup("Container token policy startup failed", failures)
+
+
+async def _join_cancelled_orphan_task(task: asyncio.Task[None]) -> list[BaseException]:
+    """Retain caller cancellation while observing the exact orphan task finish."""
+    failures: list[BaseException] = []
+    task.cancel()
+    while not task.done():
+        try:
+            # Waiting on our own timer cannot propagate caller cancellation
+            # into the already owned orphan task or hide its eventual fault.
+            await asyncio.sleep(0.001)
+        except asyncio.CancelledError as original:
+            failures.append(original)
+    if not task.cancelled():
+        original_error = task.exception()
+        if original_error is not None:
+            failures.append(original_error)
+    return failures
+
+
+@dataclass
+class _ExecutionShutdownObserver:
+    """Predeclared observer custody survives Task allocation-after-side-effect failure."""
+
+    action: Callable[[], Awaitable[None]]
+    task: asyncio.Task[None] | None = None
+    coroutine: Coroutine[object, object, None] | None = None
+    observed: bool = False
+    original_error: BaseException | None = None
+
+    def bind(self, task: asyncio.Task[None]) -> None:
+        if self.task is not None and self.task is not task:
+            raise contract_errors.AuditIntegrityError("Execution shutdown replaced its actual observer Task")
+        self.task = task
+
+    async def run(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise contract_errors.AuditIntegrityError("Execution shutdown observer lacks actual Task")
+        self.bind(task)
+        try:
+            await self.action()
+        except BaseException as original:
+            self.original_error = original
+            raise
+
+
+async def _join_execution_lifecycle(registry: ExecutionLeaseReleaseRegistry, service: ExecutionServiceImpl | None) -> list[BaseException]:
+    """Observe every declared actual owner; absent Tasks remain Unknown under supervision."""
+    failures: list[BaseException] = []
+
+    def retain(original: BaseException) -> None:
+        if not any(existing is original for existing in failures):
+            failures.append(original)
+
+    actions: list[Callable[[], Awaitable[None]]] = [registry.join_all]
+    if service is not None:
+        actions.append(service.shutdown)
+    elif registry.executor_finalizer is not None:
+
+        async def join_partial_executor() -> None:
+            from elspeth.web.async_workers import run_application_finalizer_in_worker
+
+            capability = registry.executor_finalizer
+            assert capability is not None
+            if capability.claimed:
+                # The single-use physical producer already has an owner; do not replay it.
+                while not registry.executor_join_physically_observed:
+                    registry.observe_ready()
+                    await asyncio.sleep(0.01)
+                return
+            await run_application_finalizer_in_worker(capability)
+
+        actions.append(join_partial_executor)
+    owners = [_ExecutionShutdownObserver(action) for action in actions]
+    for owner in owners:
+        try:
+            owner.coroutine = owner.run()
+            owner.bind(asyncio.create_task(owner.coroutine))
+        except BaseException as original:
+            # Task factory may have allocated an actual Task before raising.
+            # Its entry binds here later; no missing owner means absence/completion.
+            retain(original)
+            registry.record_failure(original)
+    while not all(owner.observed for owner in owners) or (
+        registry.executor_finalizer is not None and not registry.executor_join_physically_observed
+    ):
+        try:
+            registry.observe_ready()
+        except BaseException as original:
+            retain(original)
+            registry.record_failure(original)
+        for join_failure in registry.executor_join_failures:
+            retain(join_failure)
+        for owner in owners:
+            task = owner.task
+            if task is not None and task.done() and not owner.observed:
+                owner.observed = True
+                try:
+                    task.result()
+                except BaseException as original:
+                    retain(owner.original_error if owner.original_error is not None else original)
+        if not all(owner.observed for owner in owners) or (
+            registry.executor_finalizer is not None and not registry.executor_join_physically_observed
+        ):
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError as original:
+                retain(original)
+    return failures
+
+
+@asynccontextmanager
+async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Async lifespan context manager for the FastAPI application.
+
+    Services that require a running event loop must be constructed here,
+    not in the synchronous create_app() function. The ProgressBroadcaster
+    captures asyncio.get_running_loop() and the ExecutionServiceImpl
+    depends on both the broadcaster and the loop.
+    """
+    import structlog
+
+    slog = structlog.get_logger()
+
+    execution_service: ExecutionServiceImpl | None = None
+    orphan_task: asyncio.Task[None] | None = None
+    serving_started = False
+    primary_failure: BaseException | None = None
+    shutdown_failures: list[BaseException] = []
+    try:
+        # Recovery waits until the executor and current identity policy are wired.
+        # Candidate ownership is decided by durable fences and membership.
+        settings: WebSettings = app.state.settings
+        state_mode: str = app.state.deployment_state_mode
+        create_landscape_tables = state_mode == "sqlite-single"
+        if state_mode == "external-postgresql":
+            landscape_url = settings.landscape_url
+            assert landscape_url is not None
+        else:
+            landscape_url = settings.get_landscape_url()
+        session_service = app.state.session_service
+        # Consumed in-place roots must settle before inline custody can inspect
+        # their contents. Live owners are skipped under the same custody lock.
+        await session_service.reconcile_consumed_archives()
+        # Inline custody stages are part of the blob integrity protocol, not
+        # best-effort orphan bookkeeping. Do not serve until every stage has a
+        # row-authoritative outcome.
+        await app.state.blob_service.reconcile_inline_custody_publications()
+
+        # An SSO deployment resolves its IdP endpoints (break-glass override or
+        # discovery) and binds the runtime the three /api/auth/sso routes read.
+        # Discovery is a hard IdP dependency at startup, which is why the
+        # override exists: the moment rollback is forbidden is the moment an IdP
+        # outage must not stop the service from booting. It runs BEFORE this
+        # process joins the deployment below: a boot that is going to fail here
+        # must not first announce itself to peers as a live owner.
+        sso_wiring: SsoWiring | None = app.state.sso_wiring
+        if sso_wiring is not None:
+            try:
+                app.state.sso = await resolve_sso_runtime(sso_wiring, settings)
+            except SsoDiscoveryFailed as exc:
+                raise SystemExit(
+                    f"FATAL: SSO discovery failed ({type(exc).__name__}). "
+                    "Configure the sso_authorization_endpoint/sso_token_endpoint/sso_jwks_uri override or fix discovery."
+                ) from None
+
+        # Join the deployment only after the startup sweeps have settled: from
+        # here on peers see this process as a live owner. A registration failure
+        # (a live process already holds this instance id, or the database is
+        # unreachable) fails boot, exactly like the sweeps above.
+        await app.state.web_instance_membership.start()
+
+        # Sub-5: Construct ProgressBroadcaster and ExecutionServiceImpl
+        # These require a running event loop, which is only available here.
+        loop = asyncio.get_running_loop()
+        broadcaster = ProgressBroadcaster(loop, telemetry=app.state.sessions_telemetry)
+        app.state.broadcaster = broadcaster
+
+        execution_service = ExecutionServiceImpl(
+            loop=loop,
+            broadcaster=broadcaster,
+            settings=settings,
+            session_service=session_service,
+            yaml_generator=yaml_generator_module,
+            telemetry=app.state.sessions_telemetry,
+            blob_service=app.state.blob_service,
+            secret_service=app.state.scoped_secret_resolver,
+            plugin_snapshot_factory=app.state.plugin_snapshot_factory.for_user_id,
+            operator_profile_registry=app.state.operator_profile_registry,
+            web_plugin_policy=app.state.web_plugin_policy,
+            catalog=app.state.catalog_service,
+            principal_is_active=app.state.principal_is_active,
+            execution_lease_release_registry=app.state.execution_lease_release_registry,
+        )
+        app.state.execution_service = execution_service
+
+        # ReadinessService aggregates validation / catalog / secrets / retention
+        # signals for the audit-readiness panel.  It depends on
+        # ``execution_service`` (for ``validate``) so it is constructed here in
+        # lifespan rather than in ``create_app``.  ``scoped_secret_resolver``
+        # (NOT ``secret_service``) is the correct collaborator — it has
+        # ``auth_provider_type`` baked in at construction (app.py:470), matching
+        # the precedent set by ExecutionService above.
+        app.state.readiness_service = ReadinessService(
+            execution_service=execution_service,
+            session_service=session_service,
+            scoped_secret_resolver=app.state.scoped_secret_resolver,
+            settings=settings,
+            web_plugin_policy=app.state.web_plugin_policy,
+            plugin_snapshot_factory=app.state.plugin_snapshot_factory.for_user_id,
+            operator_profile_registry=app.state.operator_profile_registry,
+            catalog=app.state.catalog_service,
+            tutorial_profile=settings.default_llm_profile,
+        )
+
+        # ShareableReviewService — Phase 6A completion gestures.
+        #
+        # Depends on:
+        #   * ``execution_service`` (for mark-time validation)
+        #   * ``readiness_service`` (for the frozen-at-mark-time audit-readiness
+        #     snapshot embedded in the share blob)
+        #   * the sessions-DB engine (for authenticated completion-event reads)
+        #   * the session-operation authority (for fenced completion-event writes)
+        #   * a ``FilesystemPayloadStore`` (for the content-addressed snapshot
+        #     blob — created here, not shared with ``BlobServiceImpl`` because
+        #     ``BlobServiceImpl`` owns its own internal payload store with a
+        #     different retention semantics)
+        #   * the ``ShareTokenSigner`` primitive (HMAC over WebSettings'
+        #     required ``shareable_link_signing_key``)
+        if state_mode == "external-postgresql":
+            payload_store_path = settings.payload_store_path
+            assert payload_store_path is not None
+        else:
+            payload_store_path = settings.get_payload_store_path()
+        payload_store = FilesystemPayloadStore(payload_store_path)
+        app.state.payload_store = payload_store
+        app.state.library_authority = RepositoryLibraryAuthority(app.state.session_engine, payload_store=payload_store)
+        # ``shareable_link_signing_key`` is a ``SecretBytes`` (DC-2 FIX-L —
+        # masks repr to prevent plaintext leakage in tracebacks/logs).
+        # ``.get_secret_value()`` returns the raw bytes the HMAC primitive needs.
+        share_token_signer = ShareTokenSigner(settings.shareable_link_signing_key.get_secret_value())
+        app.state.share_token_signer = share_token_signer
+        app.state.shareable_review_service = ShareableReviewService(
+            session_service=session_service,
+            execution_service=execution_service,
+            readiness_service=app.state.readiness_service,
+            signer=share_token_signer,
+            settings=settings,
+            sessions_db_engine=app.state.session_engine,
+            session_operation_authority=session_service.session_operation_authority,
+            payload_store=payload_store,
+            # Phase 8 Sub-task 7c — composer.session.completed_total counter.
+            # ``app.state.sessions_telemetry`` is set in ``create_app`` (the
+            # synchronous factory) BEFORE the lifespan runs, so it is
+            # available here. Mirrors the
+            # ``telemetry=app.state.sessions_telemetry`` pattern at line 259
+            # for the execution service.
+            telemetry=app.state.sessions_telemetry,
+        )
+
+        # Prime the OpenRouter model catalog from the live ``/models``
+        # endpoint — gated on OpenRouter actually being a configured LLM
+        # provider for this deployment (elspeth-c67ba40e4a). Rationale and
+        # gate semantics live on ``_boot_prime_openrouter_catalog``.
+        await _boot_prime_openrouter_catalog(settings)
+
+        if settings.composer_boot_probe_enabled:
+            from elspeth.web.composer.boot_probe import ComposerBootConfigError, build_composer_probe_requests, probe_composer_config
+
+            # Advisor is mandatory, so the advisor model is always probed. Each
+            # surface probes its own endpoint and capability even when model IDs
+            # match. Every request shares one deadline (see
+            # _COMPOSER_BOOT_PROBE_DEADLINE_SECONDS).
+            probe_deadline = loop.time() + _COMPOSER_BOOT_PROBE_DEADLINE_SECONDS
+            for probe_request in build_composer_probe_requests(settings, env=os.environ):
+                composer_probe_start = time.monotonic()
+                probe_status = "started"
+                role = probe_request.role
+                is_advisor = probe_request.surface == "advisor"
+                conformance_warning = {"structured_output_conformance_verified": False} if is_advisor else {}
+                failure_action = (
+                    "booting; structured-output conformance was not verified this boot"
+                    if is_advisor
+                    else "booting; tool schemas unverified at boot; composer LLM calls will be exercised at first use"
+                )
+                attributes: dict[str, AttributeValue] = {
+                    "composer_model": settings.composer_model,
+                    "composer_temperature": str(settings.composer_temperature),
+                    "composer_seed": str(settings.composer_seed),
+                    "composer_advisor_model": settings.composer_advisor_model,
+                    "probed_model": probe_request.model,
+                    "probed_role": role,
+                    "probed_surface": probe_request.surface,
+                    "structured_output": is_advisor,
+                    "probe_status": probe_status,
+                }
+                remaining = probe_deadline - loop.time()
+                probe_timeout = min(remaining, _COMPOSER_PLANNER_BOOT_PROBE_TIMEOUT_SECONDS) if role == "planner" else remaining
+                try:
+                    if remaining <= 0:
+                        # The shared deadline is spent: send nothing rather than a
+                        # request that cannot complete.
+                        probe_status = "transient_failure"
+                        slog.warning(
+                            "composer_boot_probe_transient_failure",
+                            model=probe_request.model,
+                            probed_role=role,
+                            probed_surface=probe_request.surface,
+                            failure_class="SharedDeadlineExhausted",
+                            deadline_seconds=_COMPOSER_BOOT_PROBE_DEADLINE_SECONDS,
+                            action=failure_action,
+                            **conformance_warning,
+                        )
+                        continue
+                    ok = await asyncio.wait_for(probe_composer_config(probe_request), timeout=probe_timeout)
+                    if ok is None:
+                        probe_status = "skipped_no_durable_guard_audit"
+                        slog.warning(
+                            "composer_boot_probe_not_qualified",
+                            probed_surface=probe_request.surface,
+                            probed_role=role,
+                            mode=settings.composer_prompt_guard_mode,
+                            reason="No durable lifecycle prompt-guard audit sink is available for sessionless probes.",
+                        )
+                        continue
+                    if ok:
+                        probe_status = "success"
+                        if probe_request.thinking_route_unproven:
+                            slog.info(
+                                "composer_boot_probe_thinking_route_unproven",
+                                model=probe_request.model,
+                                probed_surface=probe_request.surface,
+                                max_tokens=probe_request.kwargs["max_tokens"],
+                                reason=(
+                                    "the probe's max_tokens is at or below the minimum thinking budget, so LiteLLM "
+                                    "sent this request without extended thinking; the planner_tools request "
+                                    "exercises the thinking route on the same model and endpoint"
+                                ),
+                            )
+                    if not ok:
+                        probe_status = "transient_failure"
+                        slog.warning(
+                            "composer_boot_probe_transient_failure",
+                            model=probe_request.model,
+                            probed_role=role,
+                            probed_surface=probe_request.surface,
+                            failure_class="provider_or_transport_error",
+                            action=failure_action,
+                            **conformance_warning,
+                        )
+                except TimeoutError:
+                    probe_status = "transient_failure"
+                    slog.warning(
+                        "composer_boot_probe_transient_failure",
+                        model=probe_request.model,
+                        probed_role=role,
+                        probed_surface=probe_request.surface,
+                        failure_class="TimeoutError",
+                        timeout_seconds=probe_timeout,
+                        action=failure_action,
+                        **conformance_warning,
+                    )
+                except ComposerBootConfigError:
+                    probe_status = "rejected"
+                    if probe_request.surface == "hatch_terminal":
+                        # Ruling 8 (b): a rejected escape-hatch terminal does not
+                        # stop boot; planner-route and advisor rejections stay
+                        # fatal. Owned request facts only, never the exception
+                        # text or its cause chain.
+                        slog.warning(
+                            "composer_boot_probe_rejected_nonfatal",
+                            model=probe_request.model,
+                            probed_role=role,
+                            probed_surface=probe_request.surface,
+                            tool_count=probe_request.tool_count,
+                            strict_true_count=probe_request.strict_true_count,
+                            strict_false_count=probe_request.strict_false_count,
+                            strict_key_omitted=probe_request.strict_key_omitted,
+                            action=(
+                                "booting; the escape-hatch terminal was rejected at boot; hatch turns will fail until the "
+                                "hatch route or composer_strict_tools is changed"
+                            ),
+                        )
+                        continue
+                    raise
+                except asyncio.CancelledError:
+                    probe_status = "cancelled"
+                    raise
+                except Exception:
+                    probe_status = "local_error"
+                    raise
+                finally:
+                    attributes["probe_status"] = probe_status
+                    # One per sent surface, beside the OTel counter (ruling 2):
+                    # the per-surface outcome is operator-side only. Owned request
+                    # facts, never an endpoint, a key or the exception text.
+                    slog.info(
+                        "composer_boot_probe_outcome",
+                        probed_surface=probe_request.surface,
+                        probed_role=role,
+                        probe_status=probe_status,
+                        tool_count=probe_request.tool_count,
+                        strict_true_count=probe_request.strict_true_count,
+                        strict_false_count=probe_request.strict_false_count,
+                        strict_key_omitted=probe_request.strict_key_omitted,
+                    )
+                    composer_probe_latency_ms = int((time.monotonic() - composer_probe_start) * 1000)
+                    _COMPOSER_BOOT_CONFIG_COUNTER.add(1, attributes)
+                    _COMPOSER_BOOT_CONFIG_PROBE_LATENCY.record(composer_probe_latency_ms, attributes)
+
+        # Resolve the catalog snapshot id (always populated — bundled fallback
+        # is always available) and stash on ``app.state``. Run-create writes
+        # this into the Landscape ``runs`` row so an auditor can reconstruct
+        # which catalog blessed any historical decision. Both fields are
+        # invariant for the process lifetime; the orchestrator reads them via
+        # ``ExecutionServiceImpl`` (web path) or directly from the module
+        # reader (CLI path).
+        catalog_sha, catalog_source = read_openrouter_catalog_snapshot_id()
+        app.state.openrouter_catalog_sha256 = catalog_sha
+        app.state.openrouter_catalog_source = catalog_source
+        execution_service.set_openrouter_catalog_snapshot(
+            sha256=catalog_sha,
+            source=catalog_source,
+        )
+
+        recovery_coordinator = RunRecoveryCoordinator(
+            session_service,
+            execution_service,
+            app.state.blob_service,
+            landscape_url=landscape_url,
+            create_tables=create_landscape_tables,
+            landscape_passphrase=settings.landscape_passphrase,
+        )
+        await recovery_coordinator.recover()
+        await app.state.composer_async_worker.reap_once()
+
+        # Recover expired owners throughout process uptime, with the same
+        # coordinator used at startup.
+        orphan_task = asyncio.create_task(
+            _periodic_orphan_cleanup(
+                session_service,
+                execution_service,
+                app.state.sessions_telemetry,
+                interval_seconds=settings.orphan_run_check_interval_seconds,
+                max_age_seconds=settings.orphan_run_max_age_seconds,
+                landscape_url=landscape_url,
+                create_tables=create_landscape_tables,
+                recovery_coordinator=recovery_coordinator,
+            )
+        )
+
+        def _recover_process_on_orphan_failure(completed: asyncio.Task[None]) -> None:
+            if not completed.cancelled() and completed.exception() is not None:
+                app.state.execution_lease_release_registry.seal()
+                app.state.instance_draining.set()
+                app.state.process_recovery.request_shutdown()
+
+        orphan_task.add_done_callback(_recover_process_on_orphan_failure)
+        app.state.application_finalizer_owner.seal()
+        app.state.composer_async_worker.start()
+
+        serving_started = True
+        yield
+    except BaseException as failure:
+        app.state.execution_lease_release_registry.seal()
+        primary_failure = failure
+        try:
+            if serving_started:
+                app.state.process_recovery.request_shutdown()
+            else:
+                app.state.process_recovery.request_startup_failure()
+            await app.state.process_recovery.join_escalation()
+        except BaseException as supervision_failure:
+            shutdown_failures.append(supervision_failure)
+    finally:
+        app.state.execution_lease_release_registry.seal()
+
+        async def observe_shutdown(action: Callable[[], Awaitable[object]]) -> None:
+            try:
+                await action()
+            except BaseException as failure:
+                shutdown_failures.append(failure)
+
+        # Seal only capabilities bound to actually constructed lifecycle owners.
+        # Startup failure cannot admit new business work during owned cleanup.
+        app.state.application_finalizer_owner.seal()
+        if primary_failure is None:
+            try:
+                app.state.process_recovery.begin_shutdown()
+            except BaseException as failure:
+                shutdown_failures.append(failure)
+        await observe_shutdown(app.state.web_instance_membership.begin_drain)
+        if orphan_task is not None:
+            shutdown_failures.extend(await _join_cancelled_orphan_task(orphan_task))
+        try:
+            app.state.readiness_probe_runner.close()
+        except BaseException as failure:
+            shutdown_failures.append(failure)
+        await observe_shutdown(app.state.composer_async_worker.stop)
+        try:
+            app.state.composer_async_worker.assert_shutdown_complete()
+        except BaseException as failure:
+            shutdown_failures.append(failure)
+        shutdown_failures.extend(await _join_execution_lifecycle(app.state.execution_lease_release_registry, execution_service))
+        try:
+            app.state.execution_lease_release_registry.assert_completed()
+        except BaseException as failure:
+            shutdown_failures.append(failure)
+        await observe_shutdown(app.state.web_instance_membership.stop)
+        await observe_shutdown(app.state.operator_telemetry.shutdown)
+        from elspeth.web.async_workers import shutdown_async_workers
+
+        await observe_shutdown(shutdown_async_workers)
+    failures = ([primary_failure] if primary_failure is not None else []) + shutdown_failures
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        raise BaseExceptionGroup("Application lifecycle obligations failed", failures) from None
+
+
+class _BodySizeLimitMiddleware:
+    """Bound HTTP bodies before routing, authentication, or JSON parsing.
+
+    Content-Length permits early rejection, but the received bytes enforce
+    the ceiling even when that header is absent or understates the body.
+    Buffer at most 10 MiB within 30 seconds, then replay through the normal ASGI path.
+    No downstream response has begun when an oversized stream is refused.
+    """
+
+    _MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
+    _MAX_BODY_READ_SECONDS = 30.0
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    @trust_boundary(
+        tier=3,
+        source="client-supplied Content-Length HTTP request header at the ASGI middleware layer; "
+        "clients may omit or falsify it, so absence is legal and every present value is validated "
+        "before use",
+        source_param="scope",
+        suppresses=("R1",),
+        invariant="a malformed Content-Length returns 400 before reading; declared or received "
+        "bytes over _MAX_BODY_BYTES return 413 before downstream dispatch; absent headers do not "
+        "bypass received-byte accounting; an incomplete body returns 408 within the "
+        "overall read deadline before downstream dispatch",
+        non_raising=True,
+    )
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        content_length = Headers(scope=scope).get("content-length")
+        if content_length is not None:
+            if not content_length.isascii() or not content_length.isdecimal():
+                response = StarletteResponse(content='{"error": "Invalid Content-Length"}', status_code=400, media_type="application/json")
+                await response(scope, receive, send)
+                return
+            try:
+                content_length_bytes = int(content_length)
+            except ValueError:
+                response = StarletteResponse(content='{"error": "Invalid Content-Length"}', status_code=400, media_type="application/json")
+                await response(scope, receive, send)
+                return
+            if content_length_bytes > self._MAX_BODY_BYTES:
+                response = StarletteResponse(
+                    content='{"error": "Request body too large (max 10 MB)"}', status_code=413, media_type="application/json"
+                )
+                await response(scope, receive, send)
+                return
+
+        body = bytearray()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._MAX_BODY_READ_SECONDS
+        while True:
+            # Empty immediately-ready chunks still yield to cancellation
+            # and other requests; awaiting receive alone need not yield.
+            await asyncio.sleep(0)
+            remaining = deadline - loop.time()
+            try:
+                if remaining <= 0:
+                    raise TimeoutError
+                # Join receive cancellation before sending a timeout refusal.
+                message = await asyncio.wait_for(receive(), timeout=remaining)
+            except TimeoutError:
+                response = StarletteResponse(
+                    content='{"error": "Request body read timed out"}',
+                    status_code=408,
+                    media_type="application/json",
+                    headers={"Connection": "close"},
+                )
+                await response(scope, receive, send)
+                return
+            if message["type"] == "http.disconnect":
+                return
+            chunk = message.get("body", b"")
+            if len(chunk) > self._MAX_BODY_BYTES - len(body):
+                response = StarletteResponse(
+                    content='{"error": "Request body too large (max 10 MB)"}', status_code=413, media_type="application/json"
+                )
+                await response(scope, receive, send)
+                return
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                break
+
+        pending_body: bytes | None = bytes(body)
+        del body
+
+        async def receive_bounded_body() -> Message:
+            nonlocal pending_body
+            if pending_body is not None:
+                payload = pending_body
+                pending_body = None
+                return {"type": "http.request", "body": payload, "more_body": False}
+            return await receive()
+
+        await self.app(scope, receive_bounded_body, send)
+
+
+# The browser only ever talks to ELSPETH itself: the SSO code exchange is the
+# backend's, as a confidential client (spec D2), so no IdP origin is ever
+# admitted to ``connect-src``. The legacy browser-client path that widened
+# it to the token endpoint's origin was deleted in identity sprint step E.
+_SPA_CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "font-src 'self'; img-src 'self' data:; "
+    "connect-src 'self' ws://localhost:* wss://localhost:*; "
+    "frame-ancestors 'none'"
+)
+
+
+class _BrowserDocumentHeadersMiddleware:
+    """Apply callback secrecy and framing denial without replacing the send boundary."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_document_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                content_type = Headers(scope=message).get("content-type", "")
+                if content_type.lower().startswith("text/html"):
+                    headers = MutableHeaders(scope=message)
+                    headers["Content-Security-Policy"] = _SPA_CSP
+                    headers["X-Frame-Options"] = "DENY"
+                    headers["Referrer-Policy"] = "no-referrer"
+                    headers["Cache-Control"] = "no-store"
+            await send(message)
+
+        await self.app(scope, receive, send_with_document_headers)
+
+
+@trust_boundary(
+    tier=3,
+    source="HTTPException.detail raised by route handlers (Starlette narrows it to str; FastAPI's subclass widens it to Any)",
+    source_param="detail",
+    suppresses=("R5",),
+    invariant="returns the dict envelope unchanged, or None for any non-dict detail; never raises on detail shape",
+    non_raising=True,
+)
+def _structured_error_envelope(detail: object) -> dict[str, object] | None:
+    """Discriminate a structured HTTP error envelope from a plain-string detail.
+
+    Every structured envelope in this app is a dict raised through FastAPI's
+    ``HTTPException`` subclass; a bare ``detail="..."`` string is a plain-
+    language message, not an envelope, and must fall through to FastAPI's
+    default renderer unchanged.
+    """
+    if isinstance(detail, dict):
+        return detail
+    return None
+
+
+def _frontend_build_identity(dist_dir: Path) -> str | None:
+    """Parse the served SPA bundle's identity from the built index.html.
+
+    Deploy-cache coherence beacon: the hashed entry asset name (e.g.
+    ``index-Bk0OsIay.js``) identifies the deployed frontend generation. The
+    SPA compares this against its own entry script at runtime and offers a
+    refresh when they diverge (a stale tab otherwise 404s lazy chunks and
+    silently lacks newly shipped features). Read once at startup — never per
+    request. Returns ``None`` when the dist or a hashed entry is absent
+    (dev/test deployments), which disarms the client feature.
+    """
+    import re
+
+    index_html = dist_dir / "index.html"
+    # Absence (dev/test: no built dist) legitimately disarms the feature.
+    # Any other read failure on a file that EXISTS (permissions, IO) is a
+    # deployment defect and must crash create_app rather than silently
+    # disarm the cache-coherence beacon (the prior `except OSError: return
+    # None` collapsed both into the absence path).
+    if not index_html.is_file():
+        return None
+    content = index_html.read_text(encoding="utf-8")
+    match = re.search(r"/assets/(index-[A-Za-z0-9_-]+\.js)", content)
+    return match.group(1) if match else None
+
+
+def _configure_web_logging(settings: WebSettings) -> None:
+    """Route web-process logs through the shared structlog configuration.
+
+    ``log_json=True`` selects the JSON renderer whose lines CloudWatch Logs
+    Insights auto-parses into queryable fields — with the request-id
+    middleware's contextvar bind, ``filter request_id = "..."`` becomes a
+    working single-lookup query (elspeth-cd98ea9d82 Tiers 2+3).
+    """
+    configure_logging(json_output=settings.log_json)
+
+
+def _session_token_audience(settings: WebSettings) -> str:
+    """The audience rule lives with the issuer; every builder reads it from there."""
+    return session_token_audience(settings.public_base_url)
+
+
+def _build_local_auth_provider(
+    settings: WebSettings,
+    identity_authority: RepositoryIdentityAuthority,
+    *,
+    audit_recorder: AuthAuditRecorder,
+    sessions: SessionFamilyAuthority,
+) -> LocalAuthProvider:
+    """Assemble the local provider from its three separate concerns.
+
+    ``auth.db`` holds credentials, the identities substrate holds admission,
+    and the issuer holds the token. This function is the only place that knows
+    all three, which is what keeps ``LocalAuthProvider`` from needing an
+    engine and the issuer from needing settings. The substrate arrives as the
+    ``RepositoryIdentityAuthority`` -- the one writer of the identity tables --
+    never as the engine, so nothing built here can reach those tables around
+    it (P4-D6).
+    """
+
+    def _principal_is_active(identity_id: str) -> bool:
+        return identity_authority.is_active_human_identity(identity_id=identity_id, provider="local")
+
+    def _record_admission(identity_id: str, username: str, quota_written: bool) -> None:
+        # Runs INSIDE ensure_identity's transaction, so a failed audit rolls
+        # the activation back rather than leaving an activated identity that
+        # no later login will ever audit. The surrounding ``login`` event
+        # carries the request context; this pair carries the authority
+        # decision and joins to it by identity_id.
+        #
+        # The quota caps are passed ONLY when a policy row was written. A
+        # container may configure one default and not the other, in which case
+        # no row is created — and a quota_set event carrying a cap that no row
+        # records would tell an auditor an allowance was granted when none
+        # was, and point a later refusal at corruption rather than at the
+        # missing configuration.
+        audit_recorder.record_identity_admitted(
+            provider="local",
+            identity_id=identity_id,
+            username=username,
+            tokens_per_day=settings.quota_default_tokens_per_day if quota_written else None,
+            storage_bytes=settings.quota_default_storage_bytes if quota_written else None,
+        )
+
+    def _record_retirement(outcome: IdentityRetired) -> None:
+        # Runs INSIDE retire_identity's transaction: a credential deletion
+        # whose identity event the Landscape cannot hold does not retire the
+        # identity, the same rule the admission pair follows.
+        audit_recorder.record_identity_retired(
+            provider="local",
+            identity_id=outcome.record.identity_id,
+            username=outcome.record.username,
+            retired_subject=outcome.record.subject,
+            reason=outcome.reason,
+        )
+
+    def _record_rebound(event: IdentityRebound) -> None:
+        # R3 EXCLUDES LOCAL AUTH, so this cannot fire for this provider, and
+        # it is wired rather than stubbed for one reason: a no-op here would
+        # be the thing that silently swallows the audit row if the exclusion
+        # were ever narrowed. The recorder is real; the exclusion is what
+        # makes it unused.
+        #
+        # Why local is excluded (the authority carries the full reasoning):
+        # its subject IS the username, freeing a username RETIRES the identity
+        # so nothing is inherited, and a local user who changed their email
+        # address would otherwise lock themselves out on the next login.
+        audit_recorder.record_identity_rebound(
+            provider="local",
+            identity_id=event.record.identity_id,
+            username=event.record.username,
+            previous_email=event.previous_email,
+            current_email=event.current_email,
+        )
+
+    def _record_dormant(event: IdentityDormant | IdentityDormancyExempted) -> None:
+        # R9 does NOT exclude local auth the way R3 does: R3's exclusion rests
+        # on facts about the local subject (it IS the username, freeing it
+        # retires the identity, an email change would lock the person out),
+        # and none of them says anything about how long an account has sat
+        # unused. A dormant local account holds exactly the access a dormant
+        # IdP account does, so this callback really fires here.
+        #
+        # Runs INSIDE ensure_identity's transaction: a re-pend this trail
+        # cannot hold does not commit.
+        record = (
+            audit_recorder.record_identity_dormancy_exempted
+            if isinstance(event, IdentityDormancyExempted)
+            else audit_recorder.record_identity_dormant
+        )
+        record(
+            provider="local",
+            identity_id=event.record.identity_id,
+            username=event.record.username,
+            last_login_at=event.last_login_at,
+            dormancy_days=event.dormancy_days,
+        )
+
+    def _admit_identity(claims: IdentityClaims) -> EnsureIdentityOutcome:
+        # D12 puts a first login behind an administrator by default. A local
+        # deployment with OPEN registration has already declared that anyone
+        # may admit themselves, so it would be incoherent to hold back the
+        # people who did so before this table existed while admitting every
+        # newcomer instantly.
+        outcome = identity_authority.ensure_identity(
+            claims=claims,
+            activate=settings.registration_mode == "open",
+            quota_tokens_per_day=settings.quota_default_tokens_per_day,
+            quota_storage_bytes=settings.quota_default_storage_bytes,
+            identity_dormancy_days=settings.identity_dormancy_days,
+            record_admission=_record_admission,
+            record_rebound=_record_rebound,
+            record_dormant=_record_dormant,
+        )
+        return outcome
+
+    issuer = SessionTokenIssuer(
+        signing_key=derive_session_token_key(settings.secret_key),
+        provider="local",
+        audience=_session_token_audience(settings),
+        token_expiry_hours=DEFAULT_TOKEN_EXPIRY_HOURS,
+        max_refresh_chain_hours=DEFAULT_MAX_REFRESH_CHAIN_HOURS,
+        principal_is_active=_principal_is_active,
+        sessions=sessions,
+    )
+
+    return LocalAuthProvider(
+        db_path=settings.data_dir / "auth.db",
+        token_issuer=issuer,
+        admit_identity=_admit_identity,
+        # The same retirement collaborator every surface that deletes a local
+        # credential binds, so the provider, subject and reason are decided
+        # in exactly one place.
+        # The web surface cannot recover from zero administrators, so a
+        # deletion here may not retire the last one (R5).
+        retire_identity=local_identity_retirer(identity_authority, _record_retirement),
+    )
+
+
+_FAILED_BOOTSTRAP_RECOVERY: ProcessRecovery | None = None
+
+
+def create_app(settings: WebSettings | None = None, *, process_watchdog_factory: ProcessWatchdogFactory | None = None) -> FastAPI:
+    """Create the application and synchronously clean up failed engine ownership."""
+    global _FAILED_BOOTSTRAP_RECOVERY
+    configure_process_logging = settings is None
+    resolved_settings = settings_from_env() if settings is None else settings
+    instance_draining = threading.Event()
+    watchdog_factory = create_process_watchdog if process_watchdog_factory is None else process_watchdog_factory
+    watchdog = watchdog_factory(instance_draining)
+    if not isinstance(watchdog, ProcessWatchdogControl):
+        raise TypeError("Factory requires an owned process watchdog")
+    process_recovery = ProcessRecovery(watchdog=watchdog, instance_draining=instance_draining)
+    generation_unavailable = threading.Event()
+    finalizer_owner = ApplicationFinalizerOwner()
+    construction_side_effects_started = False
+
+    def mark_construction_side_effects() -> None:
+        nonlocal construction_side_effects_started
+        construction_side_effects_started = True
+
+    session_engine_finalizer: weakref.finalize[..., FastAPI] | None = None
+    auth_audit_finalizer: weakref.finalize[..., FastAPI] | None = None
+    telemetry_owner: OperatorTelemetryCleanupOwner | None = None
+
+    def register_auth_audit_finalizer(finalizer: weakref.finalize[..., FastAPI]) -> None:
+        nonlocal auth_audit_finalizer
+        auth_audit_finalizer = finalizer
+
+    def register_session_engine_finalizer(finalizer: weakref.finalize[..., FastAPI]) -> None:
+        nonlocal session_engine_finalizer
+        if session_engine_finalizer is not None:
+            raise RuntimeError("session engine finalizer registered more than once")
+        session_engine_finalizer = finalizer
+
+    try:
+        watchdog.assert_watching()
+        configure_required_executor_recovery(
+            drain_seconds=resolved_settings.composer_async_drain_seconds,
+            instance_draining=instance_draining,
+            generation_unavailable=generation_unavailable,
+            recovery_callback=process_recovery.required_generation_expired,
+            application_finalizer_owner=finalizer_owner,
+        )
+        telemetry_owner = OperatorTelemetryCleanupOwner.create_for_application()
+        return _create_app(
+            resolved_settings,
+            register_session_engine_finalizer,
+            register_auth_audit_finalizer,
+            process_recovery=process_recovery,
+            watchdog=watchdog,
+            instance_draining=instance_draining,
+            generation_unavailable=generation_unavailable,
+            mark_construction_side_effects=mark_construction_side_effects,
+            configure_process_logging=configure_process_logging,
+            finalizer_owner=finalizer_owner,
+            telemetry_owner=telemetry_owner,
+        )
+    except BaseException as exc:
+        failures: list[BaseException] = [exc]
+        try:
+            if construction_side_effects_started:
+                _FAILED_BOOTSTRAP_RECOVERY = process_recovery
+                watchdog.abort_bootstrap(RecoveryReason.FAILED_STARTUP)
+            else:
+                watchdog.complete_bootstrap(BootstrapCompletionWitness(watchdog.target))
+        except BaseException as supervision_failure:
+            failures.append(supervision_failure)
+        try:
+            if telemetry_owner is not None:
+                telemetry_owner.shutdown_sync()
+        except BaseException as telemetry_cleanup_failure:
+            failures.append(telemetry_cleanup_failure)
+        try:
+            if auth_audit_finalizer is not None:
+                _run_auth_audit_finalizer(auth_audit_finalizer)
+        except BaseException as auth_cleanup_failure:
+            failures.append(auth_cleanup_failure)
+        try:
+            if session_engine_finalizer is not None:
+                _run_session_engine_finalizer(session_engine_finalizer)
+        except BaseException as engine_cleanup_failure:
+            failures.append(engine_cleanup_failure)
+        if len(failures) != 1:
+            raise BaseExceptionGroup("Application construction and owned cleanup failed", failures) from None
+        raise
+
+
+def _create_app(
+    settings: WebSettings | None,
+    register_session_engine_finalizer: Callable[[weakref.finalize[..., FastAPI]], None],
+    register_auth_audit_finalizer: Callable[[weakref.finalize[..., FastAPI]], None],
+    *,
+    process_recovery: ProcessRecovery,
+    watchdog: ProcessWatchdogControl,
+    instance_draining: threading.Event,
+    generation_unavailable: threading.Event,
+    mark_construction_side_effects: Callable[[], None],
+    configure_process_logging: bool,
+    finalizer_owner: ApplicationFinalizerOwner,
+    telemetry_owner: OperatorTelemetryCleanupOwner,
+) -> FastAPI:
+    """Create and configure the FastAPI application.
+
+    Args:
+        settings: Web application settings. When None, reads from
+            ELSPETH_WEB__* environment variables (set by the CLI).
+
+    Returns:
+        Configured FastAPI instance with CORS middleware and health endpoint.
+    """
+    if settings is None:
+        raise TypeError("Internal factory requires resolved settings")
+    if configure_process_logging:
+        mark_construction_side_effects()
+        _configure_web_logging(settings)
+
+    resolved_state_mode = resolve_deployment_state_mode(settings)
+    external_state = resolved_state_mode == "external-postgresql"
+    # One closed profile per deployment target names the startup hooks this
+    # process boots through and the platform variables that carry its replica
+    # identity (web/deployment_profiles.py); app.py never branches on the
+    # target vocabulary itself.
+    profile = deployment_startup_profile(settings.deployment_target)
+    # The identity this process presents: on every response as
+    # X-Elspeth-Instance, in /api/system/status, and as the owner of the
+    # session-operation fences it acquires. Minted once per process unless
+    # WebSettings.instance_id pins it.
+    instance_id = resolve_instance_id(settings)
+    # Tier-3 read of the platform-stamped revision/replica names (absent off
+    # the platform; a malformed value refuses the boot).
+    platform_identity = read_platform_identity(profile)
+
+    # Reject incomplete deployment policy before installing the process-global
+    # provider. A failed first create_app() must not strand a later corrected
+    # boot on a provider selected from invalid settings. The aws-ecs contract
+    # is enforced in every state mode (it is the contract that rejects a
+    # non-external mode); the provider-neutral one only under external state.
+    if external_state or profile.contract_family == "aws-ecs":
+        profile.enforce_contract(settings, resolved_state_mode=resolved_state_mode)
+
+    mark_construction_side_effects()
+    operator_runtime = bootstrap_operator_telemetry(settings, cleanup_owner=telemetry_owner)
+    operator_meter = operator_runtime.provider.get_meter(__name__, __version__)
+    global _COMPOSER_BOOT_CONFIG_COUNTER, _COMPOSER_BOOT_CONFIG_PROBE_LATENCY
+    _COMPOSER_BOOT_CONFIG_COUNTER = operator_meter.create_counter(
+        "composer.boot_config",
+        description="Composer effective sampling config recorded at boot",
+    )
+    _COMPOSER_BOOT_CONFIG_PROBE_LATENCY = operator_meter.create_histogram(
+        "composer.boot_config.probe_latency_ms",
+        description="Composer boot config probe latency in milliseconds",
+        unit="ms",
+    )
+
+    app = FastAPI(title="ELSPETH Web", version=__version__, lifespan=lifespan)
+    app.state.operator_telemetry = operator_runtime
+    app.state.process_recovery = process_recovery
+    app.state.process_watchdog = watchdog
+    app.state.instance_draining = instance_draining
+    app.state.required_generation_unavailable = generation_unavailable
+    app.state.application_finalizer_owner = finalizer_owner
+    app.state.deployment_state_mode = resolved_state_mode
+
+    register_session_operation_exception_handlers(app)
+
+    @app.exception_handler(CredentialMaterialRefused)
+    async def _credential_material_refused_handler(
+        request: Request,
+        exc: CredentialMaterialRefused,
+    ) -> JSONResponse:
+        """Render only fixed, value-free classifier evidence."""
+        return JSONResponse(
+            status_code=422,
+            content={"detail": exc.to_payload(), "request_id": _correlation_id(request)},
+        )
+
+    @app.exception_handler(AuditIntegrityError)
+    async def _audit_integrity_error_handler(request: Request, exc: AuditIntegrityError) -> JSONResponse:
+        # ~40 raise sites produce byte-identical fail-closed 500s through
+        # this handler; before the structured log below the server recorded
+        # NOTHING for any of them, so operators diagnosed Tier-1 refusals
+        # from the browser banner alone. ``message=str(exc)`` is safe to
+        # log server-side: AuditIntegrityError messages are server-authored
+        # literals that name their raise site verbatim (no user or provider
+        # content). The HTTP ``detail`` stays static per the redaction
+        # convention shared with the secret/DB handlers below — the copy
+        # must be honest: a READ-side verification refused to proceed;
+        # persistence of the caller's message did not fail.
+        failed_turn = exc.failed_turn
+        request_id = _request_id(request)
+        _handler_slog.error(
+            "http_audit_integrity_error",
+            path=request.url.path,
+            method=request.method,
+            request_id=request_id,
+            exc_class=type(exc).__name__,
+            message=str(exc),
+            failed_turn_present=failed_turn is not None,
+        )
+        if failed_turn is None:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error_type": "audit_integrity_error",
+                    "detail": "ELSPETH stopped before replying because it could not verify this session's audit trail.",
+                    "diagnostic": "no_failed_turn_metadata",
+                    "reason": "originated outside compose-loop annotation scope",
+                    "request_id": request_id,
+                },
+            )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error_type": "audit_integrity_error",
+                "detail": "ELSPETH stopped before replying because it could not verify this session's audit trail.",
+                "failed_turn": {
+                    "assistant_message_id": failed_turn.assistant_message_id,
+                    "tool_calls_attempted": failed_turn.tool_calls_attempted,
+                    "tool_responses_persisted": failed_turn.tool_responses_persisted or 0,
+                    "transcript_url": None,
+                },
+                "request_id": request_id,
+            },
+        )
+
+    @app.exception_handler(CorruptPreferencesError)
+    async def _corrupt_preferences_error_handler(request: Request, exc: CorruptPreferencesError) -> JSONResponse:
+        # Named Tier-1 read-guard exception from
+        # ``preferences/service.py`` — a stored composer-preferences row
+        # violates a closed-list invariant (default_composer_mode outside
+        # ``_VALID_MODES``, tutorial_completed_at unparseable, etc.). The
+        # docstring on the exception promises this handler exists so that
+        # incident-response code can switch on ``error_type`` rather than
+        # string-grep the message; without the handler the failure was
+        # rendered as a bare 500 and the frontend's bootstrap path
+        # silently swallowed it (``App.tsx``'s
+        # ``bootstrapPrefs().catch(console.error)``), leaving a corrupt-
+        # row user with no signal anything was wrong.
+        #
+        # Body contract: ``error_type`` is the discriminator the frontend
+        # store branches on; ``field_name`` (closed enum) and ``user_id``
+        # (caller's own id) help the operator locate the row.
+        # ``detail`` is a static phrase rather than ``str(exc)`` because
+        # the exception's __str__ embeds ``bad_value`` — corrupt content
+        # could carry arbitrary writes from a tampering or fuzzing event
+        # and must not echo to the client. Same redaction pattern as
+        # ``_audit_integrity_error_handler`` and
+        # ``_audit_access_log_write_error_handler``.
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error_type": "corrupt_preferences",
+                "detail": "Saved preferences are corrupt; the composer is using defaults.",
+                "field_name": exc.field_name,
+                "user_id": exc.user_id,
+                "request_id": _correlation_id(request),
+            },
+        )
+
+    @app.exception_handler(AuditStoryIntegrityError)
+    async def _audit_story_integrity_error_handler(request: Request, exc: AuditStoryIntegrityError) -> JSONResponse:
+        # Sibling shape to ``_audit_integrity_error_handler`` above. The
+        # named-type discriminator was getting flattened to bare
+        # ``RuntimeError`` at the route boundary (sessions/routes.py),
+        # which routed the failure to FastAPI's default 500 handler and
+        # destroyed the ``error_type`` discriminator that incident-response
+        # code switches on. The route's wrap was removed in the same
+        # change that registered this handler; both halves of the fix are
+        # load-bearing.
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error_type": "audit_story_integrity_error",
+                "detail": str(exc),
+                "request_id": _correlation_id(request),
+            },
+        )
+
+    @app.exception_handler(AuditStoryNotRecordedError)
+    async def _audit_story_not_recorded_error_handler(request: Request, _exc: AuditStoryNotRecordedError) -> JSONResponse:
+        # Absent-state sibling of ``_audit_story_integrity_error_handler``
+        # above: the run exists but no audit story was ever recorded for it
+        # (today only the tutorial projection writes the audit-story columns,
+        # so this is the normal state for every non-tutorial run). Structured
+        # 404 with a stable machine code; the detail is fixed plain language —
+        # the internal exception text (which names Landscape run ids) is
+        # deliberately not echoed.
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error_type": "audit_story_not_recorded",
+                "detail": "No audit story was recorded for this run.",
+                "request_id": _correlation_id(request),
+            },
+        )
+
+    @app.exception_handler(StaleComposeStateError)
+    async def _stale_compose_state_error_handler(request: Request, _exc: StaleComposeStateError) -> JSONResponse:
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error_type": "stale_compose_state",
+                "detail": "The session changed while the compose turn was running.",
+                "request_id": _correlation_id(request),
+            },
+        )
+
+    @app.exception_handler(AuditAccessLogWriteError)
+    async def _audit_access_log_write_error_handler(request: Request, _exc: AuditAccessLogWriteError) -> JSONResponse:
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error_type": "audit_access_log_write_failed",
+                "detail": "Audit-grade transcript access could not be recorded; no audit-grade data returned.",
+                "request_id": _correlation_id(request),
+            },
+        )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Request-id middleware registered AFTER CORS so it runs outermost
+    # (Starlette's add_middleware is LIFO): the correlation id is set on
+    # request.state before any downstream code — including the CORS
+    # middleware, route handlers, and the app-level exception handlers
+    # below — can read it.  Echoed back as the X-Request-ID response
+    # header for client-side log correlation.
+    app.add_middleware(RequestIdMiddleware)
+
+    # Body-size guard registered LAST so it runs OUTERMOST (Starlette
+    # add_middleware is LIFO).  Phase 5b.0.5 (F-3): reject oversized
+    # Content-Length declarations before any other middleware or handler
+    # touches the body.  The 413 response is emitted without a request
+    # id — by design the check fires before RequestIdMiddleware — which
+    # is acceptable: the response carries the standard 413 semantics and
+    # a body-too-large rejection has no useful pairing to a slog event.
+    app.add_middleware(_BodySizeLimitMiddleware)
+    app.add_middleware(_BrowserDocumentHeadersMiddleware)
+    # Instance identity registered after every other middleware so it runs
+    # OUTERMOST: every response — the body-size 413, the request-id
+    # middleware's synthesized 500, error envelopes — carries
+    # X-Elspeth-Instance, because a probe scoring a cross-replica conflict
+    # needs the identity of the replica that refused as much as the one that
+    # served. It only wraps send; nothing inbound is read.
+    app.add_middleware(InstanceIdentityMiddleware, instance_id=instance_id)
+
+    app.state.settings = settings
+    app.state.instance_id = instance_id
+    app.state.platform_identity = platform_identity
+
+    external_session_engine: Engine | None = None
+    if settings.auth_provider == "local" and external_state:
+        from elspeth.web.auth.local import validate_existing_local_auth_store
+
+        auth_db_path = settings.data_dir / "auth.db"
+        if auth_db_path.exists() or auth_db_path.is_symlink():
+            validate_existing_local_auth_store(auth_db_path)
+    if external_state:
+        profile.require_runtime_directories_mounted(settings)
+        raw_session_url = settings.session_db_url
+        assert raw_session_url is not None
+        try:
+            external_session_engine = create_session_engine(
+                raw_session_url,
+                connect_args={"connect_timeout": _CONNECT_TIMEOUT_SECONDS},
+                **postgres_engine_kwargs(raw_session_url),
+            )
+        except (SQLAlchemyError, ImportError):
+            raise profile.session_engine_not_ready_error() from None
+        session_engine_finalizer = weakref.finalize(app, _dispose_session_engine, external_session_engine)
+        register_session_engine_finalizer(session_engine_finalizer)
+        app.state._session_engine_finalizer = session_engine_finalizer
+        profile.validate_only_schema_or_raise(settings, external_session_engine)
+    else:
+        from elspeth.web.local_store_admission import admit_local_stores
+
+        admit_local_stores(settings)
+        # Ensure data directory and subdirectories exist before any DB access.
+        # get_landscape_url() defaults to data_dir/runs/audit.db — SQLite does
+        # not create parent directories, so we must ensure runs/ exists too.
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        (settings.data_dir / "runs").mkdir(exist_ok=True)
+
+        # Landscape-backed auth auditing opens lazily on each request, so a
+        # stale pre-1.0 store would otherwise survive startup and fail only
+        # after traffic arrived. Open once now to initialize a fresh store or
+        # reject an old schema before auth/session state can be mutated.
+        with open_landscape_db(settings, resolved_state_mode):
+            pass
+
+    # --- Catalog ---
+    app.state.catalog_service = create_catalog_service()
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+    from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+    from elspeth.web.plugin_policy.profiles import RuntimeWebPluginConfig
+
+    app.state.runtime_web_plugin_config = RuntimeWebPluginConfig.from_settings(settings)
+    app.state.web_plugin_policy = compile_web_plugin_policy(
+        registry=get_shared_plugin_manager(),
+        settings=app.state.runtime_web_plugin_config,
+    )
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+
+    app.state.operator_profile_registry = OperatorProfileRegistry(
+        policy=app.state.web_plugin_policy,
+        settings=app.state.runtime_web_plugin_config,
+    )
+    app.include_router(catalog_router, prefix="/api/catalog")
+
+    # W16/S3: Secret key production guard -- hard crash
+    if settings.secret_key == "change-me-in-production" and not _allow_insecure_test_keys(settings.host):
+        raise SystemExit(
+            "FATAL: WebSettings.secret_key is set to the default value. "
+            "Set a secure secret_key before starting the web server. "
+            "See WebSettings documentation."
+        )
+
+    # --- Session database setup ---
+    if external_session_engine is not None:
+        session_engine = external_session_engine
+    else:
+        session_db_url = settings.get_session_db_url()
+        session_engine = create_session_engine(session_db_url, **postgres_engine_kwargs(session_db_url))
+        session_engine_finalizer = weakref.finalize(app, _dispose_session_engine, session_engine)
+        register_session_engine_finalizer(session_engine_finalizer)
+        app.state._session_engine_finalizer = session_engine_finalizer
+        initialize_session_schema(session_engine)
+        session_db_path = session_engine.url.database
+        if session_engine.dialect.name == "sqlite" and session_db_path not in (None, ":memory:"):
+            session_engine.dispose()
+
+    # Build the sessions-telemetry container ONCE per process and share it
+    # across every consumer (SessionServiceImpl, ExecutionServiceImpl, and
+    # any future surface). The counters are intentionally process-scoped —
+    # one Counter per metric, not one per consumer — so OTel aggregates by
+    # attribute set instead of by injection site.
+    sessions_telemetry = build_sessions_telemetry(meter=operator_runtime.provider.get_meter("elspeth.web.composer", __version__))
+    app.state.sessions_telemetry = sessions_telemetry
+
+    app.state.session_engine = session_engine
+    # --- Identity authority ---
+    # The ONE writer of identities / identity_roles / identity_relationships
+    # (and the quota row an admission grants). Built before the auth provider
+    # because a local provider admits and retires through it, and published
+    # on app.state for the identity routes.
+    identity_authority = RepositoryIdentityAuthority(session_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+    app.state.identity_authority = identity_authority
+    app.state.quota_policy_authority = RepositoryQuotaPolicyAuthority(session_engine)
+    app.state.approval_authority = ApprovalTransactionAuthority(session_engine)
+    app.state.review_authority = RepositoryReviewAuthority(session_engine)
+    app.state.workflow_scope_reader = RepositoryWorkflowScopeReader(session_engine)
+    app.state.library_state_seeder = seed_state_from_runtime_yaml
+
+    def recovery_principal_is_active(identity_id: str) -> bool:
+        return identity_authority.is_active_human_identity(identity_id=identity_id, provider=settings.auth_provider)
+
+    app.state.principal_is_active = recovery_principal_is_active
+
+    # --- Auth provider setup ---
+    #
+    # ORDER: this block now sits AFTER the session engine, because a local
+    # provider needs the identities substrate to mint a token at all -- ``sub``
+    # is the identity_id. It used to run before the engine existed.
+    auth_provider: AuthProvider
+    audit_recorder = AuthAuditRecorder.from_settings(settings, resolved_state_mode)
+    app.state.auth_audit_recorder = audit_recorder
+    # Lifespan starts the audit engine before any auth callback can acquire
+    # the Sessions write lock, and shares it with both provider callbacks.
+    auth_audit_finalizer = weakref.finalize(app, audit_recorder.close)
+    register_auth_audit_finalizer(auth_audit_finalizer)
+    app.state._auth_audit_finalizer = auth_audit_finalizer
+    # Wired for SSO when the active profile has every setting it requires
+    # (the same rule readiness reports on). ``None`` for a non-local provider
+    # means the deployment cannot serve anyone and boot refuses below; the
+    # /api/auth/sso routes read the same fact. There is no other bearer path:
+    # the legacy OIDC/Entra providers were deleted in identity sprint step E.
+    sso_wiring = build_sso_wiring(
+        settings,
+        session_engine=session_engine,
+        identity_authority=identity_authority,
+        audit_recorder=audit_recorder,
+    )
+    app.state.sso_wiring = sso_wiring
+    if settings.auth_provider == "local":
+        local_provider = _build_local_auth_provider(
+            settings,
+            identity_authority,
+            audit_recorder=audit_recorder,
+            sessions=RepositoryAuthSessionAuthority(session_engine),
+        )
+        local_provider.publish_pending_email_verifications(settings.data_dir / "email-verifications.jsonl")
+        auth_provider = local_provider
+        stream_provider: LocalAuthProvider | SsoAuthProvider = local_provider
+        stream_decode = local_provider._issuer.decode
+    elif sso_wiring is not None:
+        # Every bearer after ``complete`` is an ELSPETH session token; the
+        # IdP's tokens never leave the backend (spec D2).
+        stream_provider = SsoAuthProvider(issuer=sso_wiring.token_issuer, read_identity=sso_wiring.read_identity)
+        auth_provider = stream_provider
+        stream_decode = sso_wiring.token_issuer.decode
+    else:
+        # A registered profile with an incomplete SSO configuration cannot
+        # serve anyone; readiness names the same fields, this names them
+        # before the first request. ``WebSettings`` refuses the shape first,
+        # so this is the total boundary for a mocked or corrupted settings
+        # object, not the operator-facing message.
+        raise RuntimeError(f"{settings.auth_provider} is not wired for single sign-on: missing {', '.join(sso_missing_settings(settings))}")
+    app.state.auth_provider = auth_provider
+
+    # --- Preferences service ---
+    # Per-user composer settings (default_composer_mode, freeform_intro_dismissed_at,
+    # tutorial_completed_at).
+    # Shares the session engine; preferences live on the same metadata.
+    app.state.preferences_service = PreferencesService(session_engine)
+
+    session_operation_authority: SessionOperationAuthority
+    if session_engine.dialect.name == "sqlite":
+        session_operation_authority = SQLiteLocalSessionOperationAuthority(
+            session_engine,
+            quota_exceeded_recorder=audit_recorder.record_quota_exceeded,
+            approval_supersession_recorder=audit_recorder.record_approval_superseded,
+        )
+    elif session_engine.dialect.name == "postgresql":
+        session_operation_authority = PostgresSessionOperationRepository(
+            session_engine,
+            quota_exceeded_recorder=audit_recorder.record_quota_exceeded,
+            approval_supersession_recorder=audit_recorder.record_approval_superseded,
+        )
+    else:
+        raise NotImplementedError(f"Session operation authority is not implemented for dialect {session_engine.dialect.name}")
+    audit_access_log_authority = RepositoryAuditAccessLogAuthority(session_engine)
+    app.state.audit_access_log_authority = audit_access_log_authority
+    skill_markdown_history_authority = RepositorySkillMarkdownHistoryAuthority(session_engine)
+    app.state.skill_markdown_history_authority = skill_markdown_history_authority
+
+    # --- Blob service ---
+    # Shares the session-operation authority built above so blob effects
+    # compare-and-swap the same fences the session service issues.
+    app.state.blob_service = BlobServiceImpl(
+        session_engine,
+        settings.data_dir,
+        settings.max_blob_storage_per_session_bytes,
+        session_operation_authority=session_operation_authority,
+        quota_exceeded_recorder=audit_recorder.record_quota_exceeded,
+    )
+
+    # --- Secret service ---
+    user_secret_authority = RepositoryUserSecretAuthority(session_engine)
+    app.state.user_secret_authority = user_secret_authority
+    # Purpose-derived, not the raw secret_key: see web/key_derivation.py. This
+    # value decrypts every stored user secret, so it is bound to the epoch
+    # window in which the sessions store is recreated.
+    user_secret_store = UserSecretStore(
+        session_engine,
+        derive_user_secret_master_key(settings.secret_key),
+        mutation_authority=user_secret_authority,
+    )
+    server_secret_store = ServerSecretStore(settings.server_secret_allowlist)
+    app.state.user_secret_store = user_secret_store
+    app.state.server_secret_store = server_secret_store
+    app.state.secret_service = WebSecretService(
+        user_secret_store,
+        server_secret_store,
+        user_secrets_enabled=settings.user_secrets_enabled,
+    )
+    app.state.scoped_secret_resolver = ScopedSecretResolver(app.state.secret_service, settings.auth_provider)
+    from elspeth.web.plugin_policy.availability import RequestPluginSnapshotFactory
+
+    app.state.plugin_snapshot_factory = RequestPluginSnapshotFactory(
+        policy=app.state.web_plugin_policy,
+        catalog=app.state.catalog_service,
+        profiles=app.state.operator_profile_registry,
+        auth_provider=settings.auth_provider,
+        secret_service=app.state.secret_service,
+        server_store=server_secret_store,
+        user_store=user_secret_store,
+        generation_key=derive_binding_generation_key(settings.secret_key),
+    )
+
+    # Interpretation-resolution state writes persist the full runtime-preflight
+    # verdict, not the authoring-only one (elspeth-155947ca47). Same binding as
+    # ComposerServiceImpl._runtime_preflight; the sessions layer receives it as
+    # an opaque callable so it never imports the execution stack.
+    def _session_runtime_preflight(
+        state: CompositionState,
+        user_id: str | None,
+        session_id: str,
+        plugin_snapshot: PluginAvailabilitySnapshot | None,
+        blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
+    ) -> ValidationResult:
+        if plugin_snapshot is None:
+            raise ValueError("session runtime preflight requires a principal snapshot")
+
+        def _blob_get_metadata(blob_id: UUID) -> BlobRecord | None:
+            if blob_get_content is None:
+                return None
+            try:
+                record, _content = blob_get_content(blob_id)
+            except KeyError:
+                return None
+            return record
+
+        return validate_pipeline(
+            state,
+            settings,
+            yaml_generator_module,
+            secret_service=app.state.scoped_secret_resolver,
+            secret_wiring_policy=runtime_secret_wiring_policy(settings.secret_wiring_allowlist),
+            user_id=user_id,
+            session_id=session_id,
+            blob_get_metadata=_blob_get_metadata,
+            blob_get_content=blob_get_content,
+            plugin_snapshot=plugin_snapshot,
+            profile_registry=app.state.operator_profile_registry,
+            catalog=app.state.catalog_service,
+        )
+
+    session_service = SessionServiceImpl(
+        session_engine,
+        chargeable_admission_policy=ChargeableAdmissionPolicy(
+            identity_token_quota_configured=settings.quota_default_tokens_per_day is not None,
+            container_token_quota_configured=settings.quota_container_tokens_per_day is not None,
+            workflow_governance_on=settings.workflow_governance == "on",
+            secret_wiring_hash=runtime_secret_wiring_policy(settings.secret_wiring_allowlist).canonical_hash,
+        ),
+        data_dir=settings.data_dir,
+        telemetry=sessions_telemetry,
+        log=structlog.get_logger("sessions"),
+        plugin_snapshot_factory=app.state.plugin_snapshot_factory.for_user_id,
+        operator_profile_registry=app.state.operator_profile_registry,
+        catalog=app.state.catalog_service,
+        runtime_preflight=_session_runtime_preflight,
+        inline_blob_read=lambda context, blob_id: app.state.blob_service.read_blob_content_sync(blob_id, context),
+        session_operation_authority=session_operation_authority,
+        audit_access_log_authority=audit_access_log_authority,
+        skill_markdown_history_authority=skill_markdown_history_authority,
+        # The fence rows this replica writes name the same identity the wire
+        # shows, so a 409 from one replica pairs with the 2xx from the other.
+        owner_instance_id=instance_id,
+        # R14 refusals write their Landscape quota_exceeded row through the one
+        # auth audit engine this app owns (Task I1).
+        quota_exceeded_recorder=audit_recorder.record_quota_exceeded,
+        approval_supersession_recorder=audit_recorder.record_approval_superseded,
+    )
+    app.state.session_service = session_service
+    app.state.composer_stream_auth = ComposerStreamAuthServices(
+        provider=stream_provider,
+        decode=stream_decode,
+        identity_authority=identity_authority,
+        sessions=session_service,
+        provider_type=settings.auth_provider,
+    )
+    app.state.composer_stream_permits = ComposerStreamPermits()
+
+    # --- Web-instance membership (the web_instances writer) ---
+    # A PostgreSQL-backed replica registers itself under the SAME instance id
+    # it fences with (session_operation_owner_instance_id): peers join an
+    # expired fence's owner to web_instances and may take over only once the
+    # membership lease has also expired. A single-process SQLite deployment
+    # keeps no membership rows but owns the same draining signal, so the
+    # readiness gate reads identically on both modes. Registration and the
+    # heartbeat start in the lifespan, after the startup sweeps.
+    web_instance_membership: WebInstanceMembership
+    if session_engine.dialect.name == "postgresql":
+        web_instance_membership = RegisteredWebInstanceMembership(
+            RepositoryWebInstanceMembershipAuthority(session_engine),
+            web_instance_identity_from_settings(settings, instance_id=session_service.session_operation_owner_instance_id),
+            lease_seconds=session_service.session_operation_lease_seconds,
+            process_recovery=process_recovery,
+            instance_draining=instance_draining,
+            finalizer_owner=finalizer_owner,
+        )
+    else:
+        web_instance_membership = SingleProcessWebInstanceMembership(instance_draining=instance_draining)
+    app.state.web_instance_membership = web_instance_membership
+    if web_instance_membership.draining is not instance_draining:
+        raise RuntimeError("Membership must retain exact process draining signal")
+    readiness_probe_runner = ReadinessProbeRunner()
+    app.state.readiness_probe_runner = readiness_probe_runner
+    app.state.readiness_cache = ReadinessCache()
+    weakref.finalize(app, _close_readiness_runner, readiness_probe_runner)
+
+    # --- Composer service (singleton, not per-request) ---
+    runtime_preflight_coordinator = RuntimePreflightCoordinator()
+    app.state.runtime_preflight_coordinator = runtime_preflight_coordinator
+    app.state.composer_service = ComposerServiceImpl(
+        catalog=app.state.catalog_service,
+        settings=settings,
+        sessions_service=session_service,
+        session_engine=session_engine,
+        secret_service=app.state.scoped_secret_resolver,
+        blob_service=app.state.blob_service,
+        runtime_preflight_coordinator=runtime_preflight_coordinator,
+        plugin_snapshot_factory=app.state.plugin_snapshot_factory.for_user_id,
+        operator_profile_registry=app.state.operator_profile_registry,
+    )
+    app.state.interpretation_surfacing = app.state.composer_service._interpretation_surfacing
+    app.state.planning_application = app.state.composer_service._planning_application
+    app.state.schema_disclosure = app.state.composer_service._schema_disclosure
+    app.state.composer_availability = app.state.composer_service.get_availability()
+    composer_async_authority = ComposerAsyncOperationAuthority(
+        session_engine,
+        owner_instance_id=session_service.session_operation_owner_instance_id,
+        claim_lease_seconds=settings.composer_async_claim_lease_seconds,
+    )
+    app.state.composer_async_operation_authority = composer_async_authority
+    app.state.composer_async_worker = ComposerAsyncWorker(
+        app=app,
+        authority=composer_async_authority,
+        concurrency=settings.composer_async_worker_concurrency,
+        scan_interval_seconds=settings.composer_async_scan_interval_seconds,
+        claim_lease_seconds=settings.composer_async_claim_lease_seconds,
+        drain_seconds=settings.composer_async_drain_seconds,
+        owner_instance_id=session_service.session_operation_owner_instance_id,
+        process_recovery=process_recovery,
+        instance_draining=app.state.instance_draining,
+    )
+    # Composer job admission and every composer-budget consumer share SQL quota
+    # on both databases. SQLite's window intentionally survives app restarts.
+    rate_limit_authority = RepositoryRateLimitAuthority(
+        session_engine,
+        signing_key=derive_rate_limit_key(settings.secret_key),
+    )
+    app.state.rate_limiter = SharedRateLimiter(settings.composer_rate_limit_per_minute, authority=rate_limit_authority, scope="composer")
+    # PostgreSQL owns cross-process UI state and other quotas. Construction never
+    # falls back to a process-local store when the database refuses a call.
+    if session_engine.dialect.name == "postgresql":
+        app.state.composer_progress_registry = DatabaseComposerProgressRegistry(
+            SessionComposerProgressAuthority(session_engine, owner_instance_id=instance_id)
+        )
+        app.state.websocket_ticket_store = RepositorySessionWebsocketTicketAuthority(session_engine)
+        app.state.run_progress_reader = RepositoryRunProgressReader(session_engine)
+        app.state.write_rate_limiter = SharedRateLimiter(
+            settings.write_rate_limit_per_minute, authority=rate_limit_authority, scope="write"
+        )
+        # Audit-readiness snapshots run canonical validation in the shared
+        # worker pool; their own per-user bucket keeps them off the LLM-call
+        # budget while stopping one user monopolising that capacity.
+        app.state.audit_readiness_rate_limiter = SharedRateLimiter(
+            settings.audit_readiness_rate_limit_per_minute, authority=rate_limit_authority, scope="audit_readiness"
+        )
+        app.state.auth_rate_limiter = SharedRateLimiter(settings.auth_rate_limit_per_minute, authority=rate_limit_authority, scope="auth")
+    else:
+        app.state.composer_progress_registry = ComposerProgressRegistry()
+        app.state.websocket_ticket_store = WebSocketTicketStore()
+        app.state.run_progress_reader = None
+        app.state.write_rate_limiter = ComposerRateLimiter(settings.write_rate_limit_per_minute)
+        app.state.audit_readiness_rate_limiter = ComposerRateLimiter(settings.audit_readiness_rate_limit_per_minute)
+        app.state.auth_rate_limiter = ComposerRateLimiter(settings.auth_rate_limit_per_minute)
+
+    # --- Multi-worker enforcement (W10 -> R6) ---
+    # One worker per container remains the deployment contract. Replicas
+    # coordinate through PostgreSQL; SQLite retains local UI state. Check
+    # multiple signals because
+    # different deployment tools advertise workers in different ways.
+    multi_worker_reason: str | None = None
+
+    # 1. WEB_CONCURRENCY env var (Heroku, Railway, render.com).
+    # Absence is the documented single-worker default; a present value is
+    # validated immediately below and malformed input crashes startup.
+    web_concurrency_str = os.environ["WEB_CONCURRENCY"] if "WEB_CONCURRENCY" in os.environ else "1"
+    if _parse_worker_count(web_concurrency_str, signal_name="WEB_CONCURRENCY") > 1:
+        multi_worker_reason = f"WEB_CONCURRENCY={web_concurrency_str}"
+
+    # 2. sys.argv: uvicorn --workers N, gunicorn -w N / --workers N
+    if multi_worker_reason is None:
+        argv = sys.argv
+        for i, arg in enumerate(argv):
+            if arg == "--workers" and i + 1 < len(argv):
+                if _parse_worker_count(argv[i + 1], signal_name="--workers") > 1:
+                    multi_worker_reason = f"--workers {argv[i + 1]}"
+            elif arg.startswith("--workers="):
+                worker_value = arg.split("=", 1)[1]
+                if _parse_worker_count(worker_value, signal_name="--workers") > 1:
+                    multi_worker_reason = f"{arg}"
+            elif arg == "-w" and i + 1 < len(argv) and _parse_worker_count(argv[i + 1], signal_name="-w") > 1:
+                multi_worker_reason = f"-w {argv[i + 1]}"
+
+    if multi_worker_reason is not None:
+        raise RuntimeError(
+            f"Multi-worker mode detected ({multi_worker_reason}) but is not supported. "
+            "Run one web worker per container and use separate PostgreSQL-backed replicas for scaling."
+        )
+
+    # --- Register routers ---
+    app.include_router(create_auth_router())
+    app.include_router(create_dev_admin_router())
+    app.include_router(create_identity_admin_router())
+    app.include_router(create_people_router())
+    app.include_router(create_quota_router())
+    app.include_router(create_approvals_router())
+    app.include_router(create_workflow_inspect_router())
+    app.include_router(create_workflow_audit_view_router())
+    app.include_router(create_reviews_router())
+    app.include_router(create_library_router())
+    app.include_router(create_mailbox_router())
+    app.include_router(create_session_router())
+    app.include_router(create_preferences_router())
+    app.include_router(create_tutorial_run_router())
+    app.include_router(create_tutorial_abandon_router())
+    app.include_router(create_blobs_router())
+    app.include_router(create_secrets_router())
+    app.include_router(create_execution_router())
+    app.include_router(create_audit_readiness_router())
+    app.include_router(create_shareable_reviews_router())
+
+    # --- Seam contract D: RunAlreadyActiveError -> 409 with error_type ---
+    @app.exception_handler(RunAlreadyActiveError)
+    async def handle_run_already_active(
+        request: Request,
+        exc: RunAlreadyActiveError,
+    ) -> JSONResponse:
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
+        return JSONResponse(
+            status_code=409,
+            content={"detail": str(exc), "error_type": "run_already_active", "request_id": _correlation_id(request)},
+        )
+
+    # --- Secret-subsystem typed error translation ---
+    # Trust-boundary translation layer: store/service-level typed errors
+    # become deterministic HTTP contracts for API consumers.  Each handler
+    # follows the canonical SQLAlchemy-redaction pattern used across the
+    # web package for handler-level ``__cause__`` chains:
+    #
+    #   * slog event carries ``exc_class`` only — NO ``exc_info``.
+    #   * response body contains NO ``str(exc)`` — the message is a
+    #     static operator-authored string, not the exception text (which
+    #     may carry DB URLs, bound SQL parameters, stored secret names,
+    #     or other Tier-3 data the redaction was meant to protect).
+    #   * ``request_id`` correlation id surfaced in both the response
+    #     body and the slog event so operators can pair a user-reported
+    #     error to its triage trail with one lookup.
+    #
+    # The pending (elspeth-149856079f) Landscape audit events will hang
+    # off these same handlers — the correlation id threads through to
+    # those records when that work lands.
+
+    _handler_slog = structlog.get_logger()
+
+    def _log_correlation_warning(
+        event: Literal["http_error_envelope", "http_validation_error_envelope"],
+        *,
+        status_code: int,
+        request_id: str,
+    ) -> None:
+        """Emit bounded lookup evidence without replacing the HTTP response.
+
+        These events are operational logging, the recovery channel of last
+        resort, while the already-classified and redacted HTTP response is the
+        primary outcome. An ordinary logging-backend failure therefore cannot
+        be allowed to turn a deterministic 4xx response into an unrelated 500.
+        Registered Tier-1 framework/audit failures remain fail-closed and
+        escape, matching the canonical engine best-effort boundary. There is no
+        safe secondary logger to report an ordinary failure of the logger.
+        """
+        try:
+            _handler_slog.warning(
+                event,
+                status_code=status_code,
+                request_id=request_id,
+            )
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except Exception:
+            return
+
+    def _request_id(request: Request) -> str:
+        """Read the correlation id set by RequestIdMiddleware.
+
+        ``RequestIdMiddleware`` sets ``request.state.request_id``
+        before delegating to ``call_next``, so every request that reaches
+        a route handler, dependency, or app-level exception handler has the
+        id assigned. The exception handlers that call this helper
+        (``FingerprintKeyMissingError``, ``SecretDecryptionError``,
+        ``OperationalError``, ``OSError``) are invoked by Starlette's
+        ``ExceptionMiddleware``, which wraps the router *inside*
+        ``RequestIdMiddleware`` — the id is therefore guaranteed present.
+        A missing attribute here would mean the middleware contract is
+        broken, which is our bug to surface, not to paper over with a
+        sentinel. Mirrors the direct read in ``web/auth/audit.py``.
+        """
+        request_id: str = request.state.request_id
+        return request_id
+
+    def _correlation_id(request: Request) -> str | None:
+        """Lenient sibling of :func:`_request_id` for the direct-render handlers.
+
+        Same value, weaker contract. ``_request_id`` is used where a missing
+        id would mean the middleware contract is broken *on a path that
+        already reached a route*. The handlers that call this one render a
+        ``JSONResponse`` directly and are the last line of defence for a
+        request that has already failed: raising ``AttributeError`` while
+        gathering a correlation field would replace a well-classified,
+        redacted error body with an uncorrelated bare 500 — strictly worse
+        for the operator this field exists to serve. A None here is honest
+        ("no middleware stamped an id"), not fabricated.
+        """
+        scope = request.scope
+        if "state" not in scope:
+            return None
+        state = scope["state"]
+        if type(state) is not dict or "request_id" not in state:
+            return None
+        request_id = state["request_id"]
+        return request_id if type(request_id) is str else None
+
+    @app.exception_handler(FingerprintKeyMissingError)
+    async def handle_fingerprint_missing(
+        request: Request,
+        exc: FingerprintKeyMissingError,
+    ) -> JSONResponse:
+        request_id = _request_id(request)
+        _handler_slog.error(
+            "http_fingerprint_key_missing",
+            path=request.url.path,
+            method=request.method,
+            request_id=request_id,
+            exc_class=type(exc).__name__,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": (
+                    "Secret resolver is not configured: ELSPETH_FINGERPRINT_KEY is unset. "
+                    "Set the environment variable on the server and retry."
+                ),
+                "error_type": "fingerprint_key_missing",
+                "request_id": request_id,
+            },
+        )
+
+    @app.exception_handler(SecretDecryptionError)
+    async def handle_secret_decryption_failed(
+        request: Request,
+        exc: SecretDecryptionError,
+    ) -> JSONResponse:
+        request_id = _request_id(request)
+        _handler_slog.error(
+            "http_secret_decryption_failed",
+            path=request.url.path,
+            method=request.method,
+            request_id=request_id,
+            exc_class=type(exc).__name__,
+        )
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": ("Stored secret cannot be decrypted — likely a web secret_key rotation. Re-save the secret to resolve."),
+                "error_type": "secret_decryption_failed",
+                "request_id": request_id,
+            },
+        )
+
+    @app.exception_handler(RequiredGenerationUnavailable)
+    async def handle_required_generation_unavailable(request: Request, exc: RequiredGenerationUnavailable) -> JSONResponse:
+        request_id = _request_id(request)
+        _handler_slog.error(
+            "http_required_generation_unavailable",
+            path=request.url.path,
+            method=request.method,
+            request_id=request_id,
+            exc_class=type(exc).__name__,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Database is currently unavailable. Please retry in a moment.",
+                "error_type": "database_unavailable",
+                "request_id": request_id,
+            },
+        )
+
+    @app.exception_handler(OperationalError)
+    async def handle_database_unavailable(
+        request: Request,
+        exc: OperationalError,
+    ) -> JSONResponse:
+        request_id = _request_id(request)
+        session_pool_size, session_pool_checked_out, session_pool_overflow = admit_pool_diagnostics(request.app.state.session_engine.pool)
+        driver_error_class = type(exc.orig).__name__
+        _handler_slog.error(
+            "http_database_unavailable",
+            path=request.url.path,
+            method=request.method,
+            request_id=request_id,
+            exc_class=type(exc).__name__,
+            db_sqlstate=database_sqlstate(exc),
+            db_driver_error_class=(driver_error_class if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", driver_error_class) else None),
+            db_connection_invalidated=exc.connection_invalidated,
+            session_pool_size=session_pool_size,
+            session_pool_checked_out=session_pool_checked_out,
+            session_pool_overflow=session_pool_overflow,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": ("Database is currently unavailable. Please retry in a moment."),
+                "error_type": "database_unavailable",
+                "request_id": request_id,
+            },
+        )
+
+    @app.exception_handler(OSError)
+    async def handle_storage_unavailable(
+        request: Request,
+        exc: OSError,
+    ) -> JSONResponse:
+        """Translate retryable storage-backend failures to a redacted 503.
+
+        Only backend availability failures become ``storage_unavailable``.
+        Programmer/configuration bugs such as missing-path errors are
+        re-raised so they surface as 500s instead of misleading retryable
+        outage responses.
+        """
+        if exc.errno not in _RETRYABLE_STORAGE_ERRNOS:
+            raise exc
+        request_id = _request_id(request)
+        _handler_slog.error(
+            "http_storage_unavailable",
+            path=request.url.path,
+            method=request.method,
+            request_id=request_id,
+            exc_class=type(exc).__name__,
+            errno=exc.errno,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": ("Storage backend is currently unavailable. Please retry in a moment."),
+                "error_type": "storage_unavailable",
+                "request_id": request_id,
+            },
+        )
+
+    # --- 422 input redaction (all routes) ---
+    # FastAPI's default RequestValidationError handler echoes the ``input``
+    # field, which leaks plaintext values from the request body (secret
+    # values on /api/secrets, passwords on /api/auth/login, etc.).
+    # We allowlist only the structurally safe keys: type, loc, msg.
+    # This is deliberately global — any route can carry sensitive fields,
+    # and callers can reconstruct the failing input from their own request.
+    _SAFE_VALIDATION_ERROR_KEYS = frozenset({"type", "loc", "msg"})
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_validation_error(
+        request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        safe_errors = scrub_credential_material(
+            [{k: v for k, v in error.items() if k in _SAFE_VALIDATION_ERROR_KEYS} for error in exc.errors()]
+        )
+        request_id = _request_id(request)
+        # Operational correlation only: never project the validation errors,
+        # request body, URL, identity, or exception into this event. Even the
+        # response-safe ``loc``/``msg`` fields are unnecessary for finding the
+        # user-reported id and would enlarge the log trust surface.
+        _log_correlation_warning(
+            "http_validation_error_envelope",
+            status_code=422,
+            request_id=request_id,
+        )
+        return JSONResponse(status_code=422, content={"detail": safe_errors, "request_id": request_id})
+
+    # --- request_id on every structured error envelope (all routes) ---
+    # ``RequestIdMiddleware`` stamps ``X-Request-ID`` on every response and
+    # the named-exception handlers above put the same id in their bodies.
+    # Route-raised structured ``HTTPException`` envelopes also need that id;
+    # FastAPI's default renderer does not add it.
+    #
+    # The injection lives at the ONE boundary
+    # every ``HTTPException`` already passes through. It is registered
+    # against ``starlette.exceptions.HTTPException`` — the same key FastAPI's
+    # ``setup()`` uses — so this REPLACES the default renderer rather than
+    # forking the boundary in two; registering against ``fastapi``'s
+    # subclass instead would leave router-raised 404s on the old path.
+    # Rendering itself is still delegated to FastAPI's handler, which owns
+    # the bodiless-status (204/304) and ``headers`` behaviour.
+    #
+    # Only dict details are touched. The middleware-issued id is authoritative
+    # and overwrites any route-provided body value, which has not crossed the
+    # middleware's grammar/length validation and could otherwise split body,
+    # header, and log correlation. A bare ``detail="..."`` string is a plain-
+    # language message, not an envelope; wrapping it would change the response
+    # contract of every string raise site in the app.
+    @app.exception_handler(StarletteHTTPException)
+    async def handle_http_exception(request: Request, exc: StarletteHTTPException) -> Response:
+        envelope = _structured_error_envelope(exc.detail)
+        if envelope is None:
+            return await fastapi_http_exception_handler(request, exc)
+        request_id = _request_id(request)
+        # One bounded lookup event for every structured HTTP error envelope.
+        # The request id has already crossed the middleware's closed grammar;
+        # no envelope fields or other request-derived values belong here.
+        _log_correlation_warning(
+            "http_error_envelope",
+            status_code=exc.status_code,
+            request_id=request_id,
+        )
+        correlated = HTTPException(
+            status_code=exc.status_code,
+            detail={**envelope, "request_id": request_id},
+            headers=exc.headers,
+        )
+        return await fastapi_http_exception_handler(request, correlated)
+
+    @app.exception_handler(ComposerManualProposalFailure)
+    async def handle_completed_manual_proposal_failure(request: Request, carrier: ComposerManualProposalFailure) -> Response:
+        observation = consume_manual_proposal_failure(carrier)
+        selected = observation.selected_original
+        projected = observation.project(request_id=_request_id(request), timeout_seconds=settings.composer_sync_timeout_seconds)
+        nominal = project_composer_operation_error(selected, request_id=_request_id(request))
+        # Equal-category conflict rendering is the unchanged shared reducer
+        # policy, never the first witness's convenient error envelope.
+        if projected != nominal:
+            return JSONResponse(status_code=projected.http_status, content=projected.body)
+        if isinstance(selected, AuditIntegrityError):
+            return await _audit_integrity_error_handler(request, selected)
+        if isinstance(selected, OperationalError):
+            return await handle_database_unavailable(request, selected)
+        if isinstance(selected, RequiredGenerationUnavailable):
+            return await handle_required_generation_unavailable(request, selected)
+        if isinstance(selected, AsyncWorkerAdmissionTimeoutError):
+            return JSONResponse(status_code=projected.http_status, content=projected.body)
+        if isinstance(selected, OSError):
+            return await handle_storage_unavailable(request, selected)
+        if isinstance(selected, FingerprintKeyMissingError):
+            return await handle_fingerprint_missing(request, selected)
+        if isinstance(selected, SecretDecryptionError):
+            return await handle_secret_decryption_failed(request, selected)
+        if isinstance(selected, StarletteHTTPException):
+            return await handle_http_exception(request, selected)
+        return JSONResponse(status_code=projected.http_status, content=projected.body)
+
+    @app.get("/api/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    def _readiness_response(report: ReadinessReport) -> JSONResponse:
+        return JSONResponse(
+            status_code=200 if report.ready else 503,
+            content={"ready": report.ready, "checks": [asdict(check) for check in report.checks]},
+        )
+
+    @app.get("/api/ready")
+    async def ready(request: Request) -> JSONResponse:
+        def unavailable() -> bool:
+            return (
+                request.app.state.instance_draining.is_set()
+                or request.app.state.required_generation_unavailable.is_set()
+                or required_generation_unavailable()
+            )
+
+        def unavailable_response() -> JSONResponse:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "ready": False,
+                    "checks": [
+                        {
+                            "name": "instance_membership",
+                            "ok": False,
+                            "detail": "instance draining or required executor unavailable; new work refused",
+                        }
+                    ],
+                },
+            )
+
+        if unavailable():
+            return unavailable_response()
+        request.app.state.process_watchdog.assert_watching()
+
+        async def compute():  # type: ignore[no-untyped-def]
+            return await readiness_report(
+                request.app.state.settings,
+                request.app.state.session_engine,
+                request.app.state.readiness_probe_runner,
+                request.app.state.deployment_state_mode,
+                instance_draining=request.app.state.instance_draining,
+            )
+
+        try:
+            async with asyncio.timeout(_READINESS_ROUTE_COMPUTE_TIMEOUT_SECONDS):
+                report = await request.app.state.readiness_cache.get_or_compute(compute)
+        except TimeoutError:
+            # Explicit error outcome: the timeout is reified as a failed
+            # (503) readiness report rather than swallowed.
+            return _readiness_response(overall_timeout_report())
+        if unavailable():
+            return unavailable_response()
+        return _readiness_response(report)
+
+    # Deploy-cache coherence beacon: resolved once at startup from the same
+    # dist the SPA mount below serves; None disarms the client feature.
+    app.state.frontend_build = _frontend_build_identity(Path(__file__).parent / "frontend" / "dist")
+
+    @app.get("/api/system/status")
+    async def system_status() -> dict[str, object]:
+        composer = app.state.composer_availability
+        plugin_policy_readiness = build_boot_plugin_policy_readiness(
+            policy=app.state.web_plugin_policy,
+            settings=app.state.runtime_web_plugin_config,
+            catalog=app.state.catalog_service,
+        )
+        tutorial_profile_row = next(row for row in plugin_policy_readiness.rows if row.id == "tutorial_profile")
+        return {
+            "composer_available": composer.available,
+            "composer_model": composer.model,
+            # The advisor model that gates completion, beside the planner
+            # model above and with the same (unauthenticated) disclosure
+            # posture. Always a non-null string: WebSettings has no
+            # advisor-disabled state (composer_advisor_model is a required
+            # ``str`` with a code default), so there is no null to publish.
+            # Read from settings directly — the same value the service hands
+            # the advisor call — because the boot availability snapshot does
+            # not carry it.
+            "composer_advisor_model": settings.composer_advisor_model,
+            "composer_provider": composer.provider,
+            "composer_reason": composer.reason,
+            "composer_missing_keys": list(composer.missing_keys),
+            "plugin_policy_readiness": plugin_policy_readiness.model_dump(mode="json"),
+            "tutorial_ready": plugin_policy_readiness.tutorial_ready,
+            "tutorial_reason": None if plugin_policy_readiness.tutorial_ready else tutorial_profile_row.summary,
+            # The SPA derives its compose abort ceiling from this at boot:
+            # client cap = wall clock + client grace, keeping the backend's
+            # structured 422 ahead of the client abort for ANY configured
+            # wall clock (there is no fixed maximum — only transport-ceiling
+            # headroom), not just the checked-in deployment default.
+            "composer_timeout_seconds": settings.composer_timeout_seconds,
+            # Locked-down server-only mode: False tells the SPA not to offer
+            # the add-a-key form. Advisory only — POST/DELETE /api/secrets
+            # refuse with 403 regardless of what a client believes.
+            "user_secrets_enabled": settings.user_secrets_enabled,
+            # The served SPA bundle's identity (deploy-cache coherence
+            # beacon); null when no built dist is present.
+            "frontend_build": app.state.frontend_build,
+            # Operator-declared protective marking (the closed
+            # WebSettings.classification_banner vocabulary, or null); the SPA
+            # renders it as the classification banner in the reserved
+            # overlay band.
+            "classification_banner": settings.classification_banner,
+            # The answering process's identity — the same value every
+            # response carries as X-Elspeth-Instance and the session-
+            # operation fences record as their owner; distinct per replica.
+            "instance_id": instance_id,
+            "deployment_target": settings.deployment_target,
+            # Platform-stamped revision/replica names when the target's
+            # platform publishes them through the environment (Azure
+            # Container Apps: CONTAINER_APP_REVISION /
+            # CONTAINER_APP_REPLICA_NAME); null elsewhere.
+            "deployment_revision": platform_identity.revision,
+            "deployment_replica": platform_identity.replica,
+            # Strict tool contracts (S1, ruling 2): only the setting and two
+            # properties of the tool set, never a route's transport, its
+            # effective strict count or a boot-probe outcome. Those reveal
+            # whether a custom endpoint is configured and whether a provider
+            # was reachable, so they go to structured logs only
+            # (composer_tool_contract_resolved, composer_boot_probe_outcome).
+            "composer_tool_contract": {
+                "setting": settings.composer_strict_tools,
+                "strict_capable_tool_count": strict_capable_tool_count(),
+                "tool_count": loop_tool_count(),
+            },
+        }
+
+    # --- Prometheus metrics scrape endpoint ---
+    # Registered as a route (not a mount) so bare `/metrics` matches without
+    # the trailing-slash redirect that a Mount requires. The SPA StaticFiles
+    # mount at `/` (registered below) would otherwise shadow `/metrics` for
+    # the non-slash variant, returning 404 because no `metrics` file exists
+    # in dist/. Route handlers match before mounts in Starlette, so this
+    # also wins precedence over the SPA catch-all regardless of order.
+    # Scrape the registry retained by this application's telemetry owner.
+    # The production installation uses the process-global REGISTRY; isolated
+    # test installations retain their own registry and provider.
+    @app.get("/metrics", include_in_schema=False)
+    def _prometheus_metrics(request: Request) -> Response:
+        configured_token = request.app.state.settings.operator_metrics_bearer_token
+        if configured_token is None:
+            return Response(
+                content=b"Not Found\n",
+                status_code=404,
+                media_type="text/plain",
+                headers=_METRICS_NO_STORE_HEADERS,
+            )
+
+        authorization = request.headers["Authorization"] if "Authorization" in request.headers else ""
+        scheme, separator, candidate = authorization.partition(" ")
+        expected = configured_token.get_secret_value()
+        if separator != " " or scheme.casefold() != "bearer" or not candidate.isascii() or not hmac.compare_digest(candidate, expected):
+            return Response(
+                content=b"Unauthorized\n",
+                status_code=401,
+                media_type="text/plain",
+                headers={**_METRICS_NO_STORE_HEADERS, "WWW-Authenticate": 'Bearer realm="metrics"'},
+            )
+
+        # ``generate_latest()`` walks the app's retained registry; a corrupted
+        # collector would raise here and Starlette's default 500 handler
+        # leaks the traceback into the response body. /metrics is a
+        # scrape endpoint — return a safe 503 with no internal detail so
+        # scrapers retry gracefully.  Audit primacy (the logging-telemetry-policy
+        # skill §The Primacy Test): this endpoint reads in-memory counter state
+        # only, so failure is a telemetry-system failure (operational, not
+        # legal) — logged, not audited. A bounded message is safe to log here
+        # (unlike the secret-bearing DB exceptions elsewhere): the route has
+        # already authenticated before collection, and the bounded message
+        # identifies which collector broke without reading request-controlled
+        # input.
+        try:
+            body = generate_latest(request.app.state.operator_telemetry.cleanup_owner.installation.registry)
+        except Exception as scrape_exc:
+            _handler_slog.error(
+                "prometheus_scrape_failed",
+                exc_class=type(scrape_exc).__name__,
+                detail=str(scrape_exc)[:200],
+            )
+            return Response(
+                content=b"# scrape failed\n",
+                status_code=503,
+                media_type=CONTENT_TYPE_LATEST,
+                headers=_METRICS_NO_STORE_HEADERS,
+            )
+        forbidden_labels = sorted({match.group(1).decode("ascii") for match in _FORBIDDEN_METRICS_LABEL_PATTERN.finditer(body)})
+        if forbidden_labels:
+            _handler_slog.error(
+                "prometheus_scrape_forbidden_tenant_labels",
+                label_names=forbidden_labels,
+            )
+            return Response(
+                content=b"# scrape failed\n",
+                status_code=503,
+                media_type=CONTENT_TYPE_LATEST,
+                headers=_METRICS_NO_STORE_HEADERS,
+            )
+        return Response(content=body, media_type=CONTENT_TYPE_LATEST, headers=_METRICS_NO_STORE_HEADERS)
+
+    # --- Static file serving for the React SPA (production) ---
+    # Mount frontend/dist/ AFTER all API and WS routes so /api/* takes precedence.
+    # Only active when the build output exists (i.e., after `npm run build`).
+    frontend_dist = Path(__file__).parent / "frontend" / "dist"
+    if frontend_dist.is_dir():
+        from starlette.staticfiles import StaticFiles
+
+        app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="spa")
+
+    return app

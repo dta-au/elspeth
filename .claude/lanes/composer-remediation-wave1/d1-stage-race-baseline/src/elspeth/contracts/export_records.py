@@ -1,0 +1,566 @@
+"""TypedDict definitions for Landscape export records.
+
+Each TypedDict defines the exact shape of one record type yielded by
+``LandscapeExporter._iter_records()``. Replaces ``dict[str, Any]``
+so that mypy can verify field names and types at construction sites.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Literal, TypedDict
+
+
+class AuditExportPublicConfig(TypedDict):
+    auth_events: Literal["omitted", "deployment_snapshot"]
+    compartment_id: str
+    chunking_algorithm_version: str
+    export_format: str
+    exporter_version: str
+    include_raw_error_rows: bool
+    per_chunk_byte_limit: int
+    per_chunk_record_limit: int
+    serialization_version: str
+    signer_key_id: str
+    signing_mode: Literal["unsigned", "hmac_sha256"]
+
+
+class AuditExportConfigRecord(TypedDict):
+    """Signed public shaping configuration, independently bound to the registry."""
+
+    record_type: Literal["audit_export_config"]
+    public_config: AuditExportPublicConfig
+
+
+class AuthEventCoverageExportRecord(TypedDict):
+    """Signed selection declaration; omission is never an empty history."""
+
+    record_type: Literal["auth_event_coverage"]
+    policy: Literal["omitted", "deployment_snapshot"]
+    selection_cutoff: str | None
+    selection_basis: Literal["visible_rows_at_or_before_run_completion"] | None
+    selected_count: int | None
+    reason: Literal["not_requested", "deployment_snapshot"]
+
+
+class AuthEventExportRecord(TypedDict):
+    """Stored auth evidence without reconstructing missing historical identity."""
+
+    record_type: Literal["auth_event"]
+    event_id: str
+    occurred_at: str
+    event_type: str
+    outcome: str
+    provider: str
+    user_id: str | None
+    username: str | None
+    failure_category: str | None
+    request_id: str | None
+    client_host: str | None
+    user_agent: str | None
+    identity_id: str | None
+    metadata: dict[str, Any]
+
+
+class RunExportRecord(TypedDict):
+    record_type: Literal["run"]
+    run_id: str
+    status: str
+    started_at: str | None
+    completed_at: str | None
+    canonical_version: str
+    config_hash: str
+    initiated_by_user_id: str | None
+    auth_provider_type: str | None
+    settings: Any  # Resolved config — structure varies by pipeline
+    reproducibility_grade: str | None
+
+
+class SecretResolutionExportRecord(TypedDict):
+    record_type: Literal["secret_resolution"]
+    run_id: str
+    resolution_id: str
+    timestamp: float  # Epoch seconds — not ISO-formatted, stored raw
+    env_var_name: str
+    source: str
+    vault_url: str | None
+    secret_name: str | None
+    fingerprint: str | None
+    resolution_latency_ms: float | None
+
+
+class WebPluginPolicyExportRecord(TypedDict):
+    record_type: Literal["web_plugin_policy"]
+    run_id: str
+    schema_version: int
+    policy_hash: str
+    snapshot_hash: str
+    authorized_plugin_ids: list[str]
+    available_plugin_ids: list[str]
+    control_modes: list[list[str]]
+    selected_implementations: list[list[str | None]]
+    selected_profile_aliases: list[list[str | None]]
+    plugin_code_identities: list[list[str]]
+    binding_generation_fingerprint: str
+    decision_codes: list[str]
+    admission_decision_json: str | None
+    admission_decision_hash: str | None
+
+
+class NodeExportRecord(TypedDict):
+    record_type: Literal["node"]
+    run_id: str
+    node_id: str
+    plugin_name: str
+    node_type: str
+    plugin_version: str | None
+    source_file_hash: str | None
+    determinism: str
+    config_hash: str
+    config: Any  # Resolved config — structure varies by plugin
+    schema_mode: str | None
+    schema_fields: list[dict[str, object]] | None
+    sequence_in_pipeline: int | None
+    registered_at: str
+
+
+class EdgeExportRecord(TypedDict):
+    record_type: Literal["edge"]
+    run_id: str
+    edge_id: str
+    from_node_id: str
+    to_node_id: str
+    label: str | None
+    default_mode: str
+    created_at: str
+
+
+class OperationExportRecord(TypedDict):
+    record_type: Literal["operation"]
+    run_id: str
+    operation_id: str
+    node_id: str
+    operation_type: str
+    sink_effect_id: str | None
+    status: str
+    started_at: str | None
+    completed_at: str | None
+    duration_ms: float | None
+    error_message: str | None
+    input_data_ref: str | None
+    input_data_hash: str | None
+    output_data_ref: str | None
+    output_data_hash: str | None
+
+
+class ValidationErrorExportRecord(TypedDict):
+    """Source validation failure evidence.
+
+    ``row_data_json`` is None unless the export was configured with the
+    explicit ``include_raw_error_rows`` opt-in (elspeth-384184c6ab) —
+    ``row_hash`` correlates back to the raw row in the audit database.
+    """
+
+    record_type: Literal["validation_error"]
+    run_id: str
+    error_id: str
+    node_id: str | None
+    row_id: str | None
+    row_hash: str
+    row_data_json: str | None
+    error: str
+    schema_mode: str
+    destination: str
+    created_at: str
+    violation_type: str | None
+    original_field_name: str | None
+    normalized_field_name: str | None
+    expected_type: str | None
+    actual_type: str | None
+
+
+class TransformErrorExportRecord(TypedDict):
+    """Transform processing failure evidence.
+
+    ``row_data_json`` is None unless the export was configured with the
+    explicit ``include_raw_error_rows`` opt-in (elspeth-384184c6ab) —
+    ``row_hash`` correlates back to the raw row in the audit database.
+    """
+
+    record_type: Literal["transform_error"]
+    run_id: str
+    error_id: str
+    token_id: str
+    transform_id: str
+    row_hash: str
+    row_data_json: str | None
+    error_details_json: str | None
+    destination: str
+    created_at: str
+
+
+class CallVerificationExportRecord(TypedDict):
+    """Persisted comparison evidence, including unmatched source calls."""
+
+    record_type: Literal["call_verification"]
+    run_id: str
+    current_call_id: str
+    source_run_id: str
+    source_call_id: str | None
+    is_match: bool | None
+    differences_json: str
+    recorded_at: str
+
+
+class CallExportRecord(TypedDict):
+    """External call record — parented by either a node_state or an operation.
+
+    Exactly one of ``state_id`` and ``operation_id`` is non-None per record.
+    """
+
+    record_type: Literal["call"]
+    run_id: str
+    call_id: str
+    state_id: str | None
+    operation_id: str | None
+    call_index: int
+    call_type: str
+    status: str
+    request_hash: str | None
+    response_hash: str | None
+    approved_prompt_artifact_hash: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    cached_prompt_tokens: int | None
+    reasoning_tokens: int | None
+    returned_model: str | None
+    latency_ms: float | None
+    request_ref: str | None
+    response_ref: str | None
+    error_json: str | None
+    created_at: str | None
+
+
+class RowExportRecord(TypedDict):
+    record_type: Literal["row"]
+    run_id: str
+    row_id: str
+    row_index: int
+    source_row_index: int
+    ingest_sequence: int
+    source_node_id: str
+    source_data_hash: str | None
+    source_data_ref: str | None
+    source_contract_json: str | None
+    created_at: str
+
+
+class TokenExportRecord(TypedDict):
+    record_type: Literal["token"]
+    run_id: str
+    token_id: str
+    row_id: str
+    step_in_pipeline: int | None
+    lineage_path: list[list[str]]  # [[kind, group_id, member_key], ...] outermost first
+    join_group_id: str | None  # merge event (tokens.join_group_id — kept column)
+    created_at: str
+
+
+class GroupRecordExportRecord(TypedDict):
+    """Roster record for one lineage-opening operation (fork/expand), spec §4.3."""
+
+    record_type: Literal["group_record"]
+    run_id: str
+    group_id: str
+    kind: str
+    opener_token_id: str
+    member_count: int
+    created_at: str
+    # META-38: the group a collector RELEASE group closed; None for a real
+    # fork/expand opener.
+    closes_group_id: str | None
+
+
+class GroupLossExportRecord(TypedDict):
+    """One member-loss entry in the unified group-loss ledger (spec §6.2, WS3)."""
+
+    record_type: Literal["group_loss"]
+    loss_id: str
+    run_id: str
+    closer_name: str
+    group_id: str
+    member_key: str
+    token_id: str
+    reason: str
+    recorded_by: str
+    recorded_at: str
+    adopted_epoch: int | None
+
+
+class CollectorGroupFailureExportRecord(TypedDict):
+    """One durable failure verdict per collector group."""
+
+    record_type: Literal["collector_group_failure"]
+    run_id: str
+    group_id: str
+    collector_node_id: str
+    failure_reason: str
+    recorded_at: str
+
+
+class TokenParentExportRecord(TypedDict):
+    record_type: Literal["token_parent"]
+    run_id: str
+    token_id: str
+    parent_token_id: str
+    ordinal: int
+
+
+class TokenOutcomeExportRecord(TypedDict):
+    record_type: Literal["token_outcome"]
+    run_id: str
+    outcome_id: str
+    token_id: str
+    outcome: str | None
+    path: str
+    completed: bool
+    recorded_at: str
+    sink_name: str | None
+    batch_id: str | None
+    error_hash: str | None
+    context_json: str | None
+
+
+class SchedulerEventExportRecord(TypedDict):
+    record_type: Literal["scheduler_event"]
+    run_id: str
+    # Authoritative replay order (epoch 38); event_id is a content digest.
+    seq: int
+    event_id: str
+    token_id: str
+    work_item_id: str
+    node_id: str | None
+    event_type: str
+    from_status: str | None
+    to_status: str
+    from_lease_owner: str | None
+    to_lease_owner: str | None
+    from_lease_expires_at: str | None
+    to_lease_expires_at: str | None
+    from_attempt: int | None
+    to_attempt: int
+    recorded_at: str
+    caller_owner: str | None
+    context_json: str
+
+
+class NodeStateExportRecord(TypedDict):
+    """Processing record for a token passing through a node.
+
+    The underlying NodeState type has four variants (Open, Pending, Completed,
+    Failed). This export record flattens them into a single shape; fields that
+    only apply to certain variants are None for others.
+    """
+
+    record_type: Literal["node_state"]
+    run_id: str
+    state_id: str
+    token_id: str
+    node_id: str
+    step_index: int
+    attempt: int
+    status: str
+    input_hash: str | None
+    output_hash: str | None
+    duration_ms: float | None
+    started_at: str
+    completed_at: str | None
+    context_before_json: str | None
+    context_after_json: str | None
+    error_json: str | None
+    success_reason_json: str | None
+
+
+class RoutingEventExportRecord(TypedDict):
+    record_type: Literal["routing_event"]
+    run_id: str
+    event_id: str
+    state_id: str
+    edge_id: str | None
+    routing_group_id: str | None
+    ordinal: int
+    mode: str
+    reason_hash: str | None
+    reason_ref: str | None
+    created_at: str | None
+
+
+class BatchExportRecord(TypedDict):
+    record_type: Literal["batch"]
+    run_id: str
+    batch_id: str
+    aggregation_node_id: str
+    attempt: int
+    status: str
+    trigger_type: str | None
+    trigger_reason: str | None
+    created_at: str | None
+    completed_at: str | None
+
+
+class BatchMemberExportRecord(TypedDict):
+    record_type: Literal["batch_member"]
+    run_id: str
+    batch_id: str
+    token_id: str
+    ordinal: int
+
+
+class ArtifactExportRecord(TypedDict):
+    record_type: Literal["artifact"]
+    run_id: str
+    artifact_id: str
+    sink_node_id: str
+    producer_kind: Literal["node_state", "sink_effect"]
+    produced_by_state_id: str | None
+    sink_effect_id: str | None
+    artifact_type: str
+    path_or_uri: str | None
+    content_hash: str | None
+    size_bytes: int | None
+    idempotency_key: str | None
+    publication_performed: bool
+    publication_evidence_kind: Literal["returned", "reconciled", "inherited", "virtual", "legacy_returned"]
+    created_at: str
+
+
+class SinkEffectStreamExportRecord(TypedDict):
+    """Credential-free ordering authority for a replacing sink target."""
+
+    record_type: Literal["sink_effect_stream"]
+    run_id: str
+    stream_id: str
+    sink_node_id: str
+    role: str
+    requested_target_hash: str
+    next_sequence: int
+    tail_effect_id: str | None
+    head_effect_id: str | None
+    head_descriptor_hash: str | None
+
+
+class SinkEffectExportRecord(TypedDict):
+    """Durable effect lifecycle without raw target or provider payloads."""
+
+    record_type: Literal["sink_effect"]
+    run_id: str
+    effect_id: str
+    sink_node_id: str
+    role: str
+    state: str
+    protocol_version: str
+    input_kind: str
+    config_hash: str
+    membership_or_manifest_hash: str
+    group_payload_hash: str
+    artifact_id: str
+    artifact_idempotency_key: str
+    inspection_mode: str | None
+    inspection_attempt_id: str | None
+    plan_hash: str | None
+    descriptor_mode: str | None
+    expected_descriptor_hash: str | None
+    precondition_hash: str | None
+    prepared_at: str | None
+    lease_owner: str | None
+    generation: int
+    lease_expires_at: str | None
+    lease_heartbeat_at: str | None
+    reconcile_kind: str | None
+    reconcile_evidence_hash: str | None
+    result_descriptor_hash: str | None
+    publication_performed: bool | None
+    publication_evidence_kind: str | None
+    primary_effect_id: str | None
+    stream_id: str | None
+    stream_sequence: int | None
+    predecessor_effect_id: str | None
+    created_at: str
+    updated_at: str
+    finalized_at: str | None
+
+
+class SinkEffectMemberExportRecord(TypedDict):
+    """Hash-only member identity and durable member progress."""
+
+    record_type: Literal["sink_effect_member"]
+    run_id: str
+    effect_id: str
+    ordinal: int
+    sink_node_id: str
+    role: str
+    token_id: str
+    row_id: str
+    ingest_sequence: int
+    lineage_hash: str
+    payload_hash: str
+    primary_effect_id: str | None
+    prepared_disposition: str | None
+    reason_hash: str | None
+    member_effect_id: str | None
+    member_state: str | None
+    descriptor_hash: str | None
+    evidence_hash: str | None
+
+
+class SinkEffectAttemptExportRecord(TypedDict):
+    """One ordered external-call intent/result without provider bodies."""
+
+    record_type: Literal["sink_effect_attempt"]
+    run_id: str
+    attempt_id: str
+    effect_id: str
+    attempt_index: int
+    member_ordinal: int | None
+    generation: int
+    action: str
+    call_kind: str
+    request_hash: str
+    state: str
+    evidence_hash: str | None
+    started_at: str
+    completed_at: str | None
+    latency_ms: float | None
+
+
+ExportRecord = (
+    RunExportRecord
+    | AuditExportConfigRecord
+    | AuthEventExportRecord
+    | AuthEventCoverageExportRecord
+    | WebPluginPolicyExportRecord
+    | SecretResolutionExportRecord
+    | NodeExportRecord
+    | EdgeExportRecord
+    | OperationExportRecord
+    | ValidationErrorExportRecord
+    | TransformErrorExportRecord
+    | CallExportRecord
+    | CallVerificationExportRecord
+    | RowExportRecord
+    | TokenExportRecord
+    | TokenParentExportRecord
+    | TokenOutcomeExportRecord
+    | GroupRecordExportRecord
+    | GroupLossExportRecord
+    | CollectorGroupFailureExportRecord
+    | SchedulerEventExportRecord
+    | NodeStateExportRecord
+    | RoutingEventExportRecord
+    | BatchExportRecord
+    | BatchMemberExportRecord
+    | ArtifactExportRecord
+    | SinkEffectStreamExportRecord
+    | SinkEffectExportRecord
+    | SinkEffectMemberExportRecord
+    | SinkEffectAttemptExportRecord
+)

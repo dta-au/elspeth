@@ -1,0 +1,430 @@
+"""Datadog exporter for telemetry events.
+
+Exports telemetry events to Datadog via the ddtrace library. Uses native
+Datadog APM integration with full tracing features.
+
+Unlike OTLP which converts events to spans post-hoc, ddtrace creates real
+Datadog spans that are automatically batched and exported to the Datadog agent.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from datetime import datetime
+from enum import Enum
+from typing import TYPE_CHECKING, Any, cast
+
+import structlog
+
+from elspeth.contracts.events import EngineSpanCompleted, EngineSpanStatus
+from elspeth.telemetry.errors import TELEMETRY_TRANSPORT_ERRORS, TelemetryExporterError
+from elspeth.telemetry.serialization import derive_trace_id
+
+if TYPE_CHECKING:
+    from ddtrace._trace.tracer import Tracer
+
+    from elspeth.contracts.events import TelemetryEvent
+
+logger = structlog.get_logger(__name__)
+
+
+class DatadogExporter:
+    """Export telemetry events to Datadog via native API.
+
+    Uses ddtrace for native Datadog integration with full APM features.
+    Each telemetry event is exported as a span with appropriate tags.
+
+    Configuration options:
+        service_name: Service name for Datadog APM (default: "elspeth")
+        env: Environment tag (default: "production")
+        agent_host: Datadog agent hostname (default: "localhost")
+        agent_port: Datadog agent port (default: 8126)
+        version: Service version tag (optional)
+
+    Example configuration:
+        telemetry:
+          exporters:
+            - name: datadog
+              service_name: "elspeth-pipeline"
+              env: "production"
+              agent_host: "localhost"
+              agent_port: 8126
+
+    Note:
+        Authentication is handled by the Datadog agent process. This exporter
+        communicates with the local agent and does not send traces directly to
+        the Datadog API.
+    """
+
+    _name = "datadog"
+
+    def __init__(self) -> None:
+        """Initialize unconfigured exporter."""
+        self._tracer: Tracer | None = None
+        self._service_name: str = "elspeth"
+        self._env: str = "production"
+        self._version: str | None = None
+        self._configured: bool = False
+
+    @property
+    def name(self) -> str:
+        """Exporter name for configuration reference."""
+        return self._name
+
+    def configure(self, config: Mapping[str, Any]) -> None:
+        """Configure the exporter with settings from pipeline configuration.
+
+        Args:
+            config: Exporter-specific configuration dict containing:
+                - service_name (required): Service name for APM
+                - env (required): Environment tag (e.g. "production", "staging")
+                - agent_host (required): Datadog Agent hostname
+                - agent_port (required): Datadog Agent port
+                - version (optional): Service version tag
+
+        Raises:
+            TelemetryExporterError: If ddtrace is not installed or config types are wrong
+        """
+        # Validate and extract service_name (required — distinguishes this
+        # pipeline in APM; "elspeth" is not a useful default for orgs running
+        # multiple instances)
+        if "service_name" not in config:
+            raise TelemetryExporterError(
+                self._name,
+                "Datadog exporter requires 'service_name' in config",
+            )
+        service_name = config["service_name"]
+        if not isinstance(service_name, str):
+            raise TelemetryExporterError(
+                self._name,
+                f"'service_name' must be a string, got {type(service_name).__name__}",
+            )
+        self._service_name = service_name
+
+        # Validate and extract env (required — defaulting to "production"
+        # risks dev traces polluting the production telemetry namespace)
+        if "env" not in config:
+            raise TelemetryExporterError(
+                self._name,
+                "Datadog exporter requires 'env' in config (e.g. 'production', 'staging', 'development')",
+            )
+        env = config["env"]
+        if not isinstance(env, str):
+            raise TelemetryExporterError(
+                self._name,
+                f"'env' must be a string, got {type(env).__name__}",
+            )
+        self._env = env
+
+        # Validate and extract version (optional)
+        version = config.get("version")
+        if version is not None and not isinstance(version, str):
+            raise TelemetryExporterError(
+                self._name,
+                f"'version' must be a string or null, got {type(version).__name__}",
+            )
+        self._version = version
+
+        # This exporter supports agent-based Datadog export only.
+        # Direct API (agentless) mode is not implemented in this code path.
+        api_key = config.get("api_key")
+        if api_key is not None:
+            raise TelemetryExporterError(
+                self._name,
+                "Datadog exporter does not support 'api_key' in exporter options. "
+                "Configure a local Datadog Agent and use agent_host/agent_port instead.",
+            )
+
+        # Validate and extract agent_host (required — infrastructure addressing;
+        # guessing "localhost" silently sends traces to the wrong destination)
+        if "agent_host" not in config:
+            raise TelemetryExporterError(
+                self._name,
+                "Datadog exporter requires 'agent_host' in config",
+            )
+        agent_host = config["agent_host"]
+        if not isinstance(agent_host, str):
+            raise TelemetryExporterError(
+                self._name,
+                f"'agent_host' must be a string, got {type(agent_host).__name__}",
+            )
+
+        # Validate agent_port type and value (required — infrastructure addressing)
+        if "agent_port" not in config:
+            raise TelemetryExporterError(
+                self._name,
+                "Datadog exporter requires 'agent_port' in config",
+            )
+        agent_port = config["agent_port"]
+        if not isinstance(agent_port, int):
+            raise TelemetryExporterError(
+                self._name,
+                f"'agent_port' must be an integer, got {type(agent_port).__name__}",
+            )
+        if agent_port < 1 or agent_port > 65535:
+            raise TelemetryExporterError(
+                self._name,
+                f"agent_port must be a valid port number (1-65535), got {agent_port}",
+            )
+
+        # Import and configure the tracer
+        # ddtrace reads DD_AGENT_HOST/DD_TRACE_AGENT_PORT at init. We scope
+        # the env mutation: set before import, restore originals afterward.
+        try:
+            import os
+
+            old_host = os.environ.get("DD_AGENT_HOST")
+            old_port = os.environ.get("DD_TRACE_AGENT_PORT")
+
+            os.environ["DD_AGENT_HOST"] = agent_host
+            os.environ["DD_TRACE_AGENT_PORT"] = str(agent_port)
+
+            try:
+                from ddtrace import tracer
+            finally:
+                # Always restore original env, regardless of import outcome
+                # (ddtrace caches connection info internally at import time)
+                if old_host is None:
+                    os.environ.pop("DD_AGENT_HOST", None)
+                else:
+                    os.environ["DD_AGENT_HOST"] = old_host
+                if old_port is None:
+                    os.environ.pop("DD_TRACE_AGENT_PORT", None)
+                else:
+                    os.environ["DD_TRACE_AGENT_PORT"] = old_port
+
+            self._tracer = tracer
+        except ImportError as e:
+            raise TelemetryExporterError(
+                self._name,
+                f"ddtrace not installed: {e}. Install with: uv pip install ddtrace",
+            ) from e
+
+        self._configured = True
+
+        logger.debug(
+            "Datadog exporter configured",
+            service_name=self._service_name,
+            env=self._env,
+            agent_host=agent_host,
+            agent_port=agent_port,
+        )
+
+    def export(self, event: TelemetryEvent) -> bool | None:
+        """Export a single telemetry event as a Datadog span.
+
+        Creates a span with the event class name as the operation name.
+        All event fields are added as span tags.
+
+        This method MUST NOT raise exceptions - telemetry failures should
+        not crash the pipeline. Errors are logged internally.
+        Handled transport failures return False so TelemetryManager can account
+        for them without crashing the pipeline.
+
+        Args:
+            event: The telemetry event to export
+        """
+        if not self._configured or self._tracer is None:
+            logger.warning(
+                "Datadog exporter not configured, dropping event",
+                event_type=type(event).__name__,
+            )
+            return False
+
+        try:
+            self._create_span_for_event(event)
+        except Exception as e:
+            if not isinstance(e, TELEMETRY_TRANSPORT_ERRORS):
+                raise  # Programming error — must crash
+            # Export MUST NOT raise - log and continue
+            logger.warning(
+                "Failed to export telemetry event to Datadog",
+                exporter=self._name,
+                event_type=type(event).__name__,
+                error=str(e),
+            )
+            return False
+        return None
+
+    def _create_span_for_event(self, event: TelemetryEvent) -> None:
+        """Create a Datadog span for the given event.
+
+        Point telemetry is represented as an instant span. Engine span
+        completions retain their original start and completion timestamps.
+
+        IMPORTANT: Uses explicit timestamps from event.timestamp rather than
+        letting ddtrace auto-timestamp at export time. This ensures spans
+        reflect when events actually occurred, not when they were exported
+        (critical for buffered/async export scenarios).
+
+        Args:
+            event: The telemetry event to convert to a span
+        """
+        if self._tracer is None:
+            return
+
+        event_class = type(event)
+        if event_class is EngineSpanCompleted:
+            engine_event = cast("EngineSpanCompleted", event)
+            event_type = engine_event.name.value
+            started_at = engine_event.started_at
+        else:
+            engine_event = None
+            event_type = type(event).__name__
+            started_at = event.timestamp
+
+        # Convert event timestamp to Unix seconds and nanoseconds
+        # ddtrace finish() expects seconds, but start_ns is in nanoseconds
+        event_unix_seconds = event.timestamp.timestamp()
+        event_ns = int(started_at.timestamp() * 1_000_000_000)
+
+        # Create span (ddtrace 4.x removed 'start' parameter from start_span)
+        span = self._tracer.start_span(
+            name=event_type,
+            service=self._service_name,
+            resource=event_type,
+        )
+
+        # Set explicit start time from event.timestamp (ddtrace 4.x API)
+        # This ensures span timing reflects when the event occurred, not export time
+        span.start_ns = event_ns
+
+        try:
+            # Set standard Datadog tags
+            span.set_tag("env", self._env)
+            if self._version:
+                span.set_tag("version", self._version)
+
+            # Set ELSPETH-specific tags
+            span.set_tag("elspeth.run_id", event.run_id)
+            span.set_tag("elspeth.event_type", event_type)
+
+            if engine_event is not None:
+                trace_id = derive_trace_id(engine_event.run_id, started_at=engine_event.trace_started_at)
+                # The public ddtrace Tracer.start_span API accepts a parent
+                # Context but always generates the current span ID. ELSPETH's
+                # post-hoc completion events need their caller-selected IDs so
+                # later events can reference them. A child_of Context alone
+                # would therefore create orphaned native links. Preserve the
+                # coherent cross-export hierarchy as explicit correlation tags
+                # without private SDK mutation or provider-specific buffering.
+                span.set_tag("elspeth.trace_id", f"{trace_id:032x}")
+                span.set_tag("elspeth.span_id", engine_event.span_id)
+                if engine_event.parent_span_id is not None:
+                    span.set_tag("elspeth.parent_span_id", engine_event.parent_span_id)
+                span.set_tag("elspeth.hierarchy_mode", "correlation_tags")
+                span.set_tag("elspeth.trace_started_at", engine_event.trace_started_at.isoformat())
+                span.set_tag("elspeth.span_status", engine_event.status.value)
+                for key, value in engine_event.attributes.items():
+                    self._set_tag_value(span, key, value)
+                if engine_event.status is EngineSpanStatus.ERROR:
+                    span.error = 1
+                    if engine_event.exception_type is not None:
+                        span.set_tag("error.type", engine_event.exception_type)
+            else:
+                # Set all event fields as tags
+                self._set_event_tags(span, event)
+        finally:
+            # Finish with the event completion timestamp. For point events it
+            # equals start; completed engine spans retain their real duration.
+            span.finish(finish_time=event_unix_seconds)
+
+    def _set_event_tags(self, span: Any, event: TelemetryEvent) -> None:
+        """Set event fields as span tags.
+
+        Handles type conversions for Datadog compatibility:
+        - datetime -> ISO 8601 string
+        - Enum -> value
+        - dict -> individual tags with dotted keys
+        - tuple -> list (JSON-compatible)
+        - None values are skipped
+
+        Args:
+            span: The Datadog span to add tags to
+            event: The telemetry event with fields to convert
+        """
+        data = event.to_dict()
+
+        for key, value in data.items():
+            if value is None:
+                continue
+            tag_key = f"elspeth.{key}"
+            self._set_tag_value(span, tag_key, value)
+
+    _MAX_TAG_DEPTH = 5  # Maximum nesting depth for dict flattening
+
+    def _set_tag_value(self, span: Any, key: str, value: Any, *, _depth: int = 0) -> None:
+        """Set a single tag value with appropriate type conversion.
+
+        Args:
+            span: The Datadog span
+            key: Tag key
+            value: Tag value to convert and set
+            _depth: Current recursion depth (internal, do not set)
+        """
+        if isinstance(value, datetime):
+            span.set_tag(key, value.isoformat())
+        elif isinstance(value, Enum):
+            span.set_tag(key, value.value)
+        elif isinstance(value, dict):
+            if _depth >= self._MAX_TAG_DEPTH:
+                # Serialize remaining depth as string to prevent unbounded recursion
+                span.set_tag(key, str(value))
+            else:
+                # Flatten dict to dotted keys for Datadog
+                for sub_key, sub_value in value.items():
+                    self._set_tag_value(span, f"{key}.{sub_key}", sub_value, _depth=_depth + 1)
+        elif isinstance(value, tuple):
+            # Convert tuple to list for JSON compatibility
+            span.set_tag(key, list(value))
+        else:
+            span.set_tag(key, value)
+
+    def flush(self) -> bool | None:
+        """Flush any buffered spans to the Datadog agent.
+
+        The ddtrace tracer handles its own batching and flushing.
+        This method triggers an immediate flush of any pending spans.
+        Returns False for a handled transport failure so TelemetryManager
+        can account for it.
+        """
+        if not self._tracer:
+            return False
+
+        try:
+            # ddtrace tracer has a flush method that sends pending spans
+            self._tracer.flush()
+        except Exception as e:
+            if not isinstance(e, TELEMETRY_TRANSPORT_ERRORS):
+                raise  # Programming error — must crash
+            logger.warning(
+                "Failed to flush Datadog exporter",
+                exporter=self._name,
+                error=str(e),
+            )
+            return False
+        return None
+
+    def close(self) -> None:
+        """Release resources held by the exporter.
+
+        Flushes any remaining buffered spans and shuts down the tracer.
+        Idempotent - safe to call multiple times.
+        """
+        self.flush()
+
+        if self._tracer:
+            try:
+                # Shutdown the tracer
+                self._tracer.shutdown()
+            except Exception as e:
+                if not isinstance(e, TELEMETRY_TRANSPORT_ERRORS):
+                    raise  # Programming error — must crash
+                logger.warning(
+                    "Failed to shutdown Datadog tracer",
+                    exporter=self._name,
+                    error=str(e),
+                )
+            self._tracer = None
+
+        self._configured = False

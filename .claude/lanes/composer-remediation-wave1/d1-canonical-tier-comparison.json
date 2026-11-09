@@ -1,0 +1,794 @@
+{
+  "after_count": 5220,
+  "before_count": 5220,
+  "compared_fields": [
+    "rule_id",
+    "file_path",
+    "severity",
+    "message",
+    "suggestion"
+  ],
+  "location_changes": [
+    {
+      "after": [
+        {
+          "location": {
+            "column": 7,
+            "fingerprint": "a7e8e43a9bf2e804",
+            "line": 665
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 7,
+            "fingerprint": "a7e8e43a9bf2e804",
+            "line": 664
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/proposal_authority.py",
+        "message": "Potential dict.get() usage: if payload.get(\"schema\") == \"pipeline_proposal_accepted.v2\":",
+        "rule_id": "R1",
+        "severity": "error",
+        "suggestion": "Access dict keys directly (dict[key]) and fix the schema/contract if KeyError occurs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "e15874f3f6a3b73e",
+            "line": 861
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "c27eee642b920289",
+            "line": 855
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/planning_application.py",
+        "message": "Broad exception caught without re-raise: except BaseException as cleanup_error:",
+        "rule_id": "R4",
+        "severity": "error",
+        "suggestion": "Catch specific exceptions, or re-raise after logging/quarantining"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "14fad2d909a51c77",
+            "line": 1842
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "c48bb857b147a911",
+            "line": 2230
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "f2faa598c27710fa",
+            "line": 2150
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "4a9a0eb03bff8f1b",
+            "line": 2045
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "14fad2d909a51c77",
+            "line": 1822
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "c48bb857b147a911",
+            "line": 2210
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "f2faa598c27710fa",
+            "line": 2130
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "4a9a0eb03bff8f1b",
+            "line": 2025
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tool_batch.py",
+        "message": "Broad exception caught without re-raise: except BaseException as exc:",
+        "rule_id": "R4",
+        "severity": "error",
+        "suggestion": "Catch specific exceptions, or re-raise after logging/quarantining"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "c593f4ad7d2dc4fd",
+            "line": 2673
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "c593f4ad7d2dc4fd",
+            "line": 2653
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tool_batch.py",
+        "message": "Broad exception caught without re-raise: except Exception as advisor_context_error:",
+        "rule_id": "R4",
+        "severity": "error",
+        "suggestion": "Catch specific exceptions, or re-raise after logging/quarantining"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "f26b1913598ac891",
+            "line": 2920
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 8,
+            "fingerprint": "731d5b70836afd46",
+            "line": 3333
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "f26b1913598ac891",
+            "line": 2900
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 8,
+            "fingerprint": "731d5b70836afd46",
+            "line": 3313
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tool_batch.py",
+        "message": "Broad exception caught without re-raise: except Exception as tool_exc:",
+        "rule_id": "R4",
+        "severity": "error",
+        "suggestion": "Catch specific exceptions, or re-raise after logging/quarantining"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 44,
+            "fingerprint": "4951b9766740452e",
+            "line": 3399
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 44,
+            "fingerprint": "4951b9766740452e",
+            "line": 3379
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tool_batch.py",
+        "message": "isinstance() used: admitted_result = outcome.result if isinstance(outcome.result, AdmittedDiscoveryResult) else None",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 15,
+            "fingerprint": "9473c7ed228bff82",
+            "line": 3211
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 15,
+            "fingerprint": "9473c7ed228bff82",
+            "line": 3191
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tool_batch.py",
+        "message": "isinstance() used: if isinstance(_result, AdmittedDiscoveryResult):",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 19,
+            "fingerprint": "03178707f3bdfad1",
+            "line": 2752
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 19,
+            "fingerprint": "03178707f3bdfad1",
+            "line": 2732
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tool_batch.py",
+        "message": "isinstance() used: if isinstance(first_party_exc, PromptGuardRefused):",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 19,
+            "fingerprint": "ba422f9b01177e28",
+            "line": 2428
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 19,
+            "fingerprint": "ba422f9b01177e28",
+            "line": 2408
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tool_batch.py",
+        "message": "isinstance() used: if not isinstance(advisor_arg_error, RequestAdvisorHintArgumentsModel):",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 15,
+            "fingerprint": "03e4d9126601dfc7",
+            "line": 1032
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 15,
+            "fingerprint": "03e4d9126601dfc7",
+            "line": 1031
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/protocol.py",
+        "message": "isinstance() used: if not isinstance(item, dict) or type(item) is not dict or set(item) != {\"message\", \"error_code\", \"component\"}:",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "eec0ff24fdc9ca31",
+            "line": 1028
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "eec0ff24fdc9ca31",
+            "line": 1027
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/protocol.py",
+        "message": "isinstance() used: if not isinstance(value, list) or type(value) is not list:",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 7,
+            "fingerprint": "285061b6d215baa1",
+            "line": 663
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 7,
+            "fingerprint": "285061b6d215baa1",
+            "line": 647
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/routes/composer/pipeline_settlement.py",
+        "message": "isinstance() used: if isinstance(handoff, (ComposerPipelineRevocationCompleted, ComposerPipelineRaised)):",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 7,
+            "fingerprint": "c489a69d9417592a",
+            "line": 652
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 7,
+            "fingerprint": "c489a69d9417592a",
+            "line": 636
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/routes/composer/pipeline_settlement.py",
+        "message": "isinstance() used: if isinstance(handoff, ComposerPipelineBusinessReturned):",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "f641391c50a02aab",
+            "line": 667
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "f641391c50a02aab",
+            "line": 651
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/routes/composer/pipeline_settlement.py",
+        "message": "isinstance() used: if isinstance(handoff, ComposerPipelineRaised):",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "16d68d21fee4a7d7",
+            "line": 569
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "16d68d21fee4a7d7",
+            "line": 553
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/routes/composer/pipeline_settlement.py",
+        "message": "isinstance() used: if isinstance(prepared, RecoveredPipelineCommit):",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "8cf356addd94366b",
+            "line": 718
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "2c520aaf86792958",
+            "line": 712
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/planning_application.py",
+        "message": "Exception swallowed without re-raise or explicit error: except ComposerRuntimePreflightError:",
+        "rule_id": "R6",
+        "severity": "error",
+        "suggestion": "Raise the exception or return an explicit error/quarantine result"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "e6227c8a9a561852",
+            "line": 968
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "e6227c8a9a561852",
+            "line": 962
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/planning_application.py",
+        "message": "Exception swallowed without re-raise or explicit error: except _AdvisorCheckpointComposeDeadlineExpired:",
+        "rule_id": "R6",
+        "severity": "error",
+        "suggestion": "Raise the exception or return an explicit error/quarantine result"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 8,
+            "fingerprint": "87172bf6964042ff",
+            "line": 263
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 8,
+            "fingerprint": "87172bf6964042ff",
+            "line": 262
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/proposal_authority.py",
+        "message": "Exception swallowed without re-raise or explicit error: except ValueError:",
+        "rule_id": "R6",
+        "severity": "error",
+        "suggestion": "Raise the exception or return an explicit error/quarantine result"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "961124fbc2443513",
+            "line": 228
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "19104230d836520a",
+            "line": 211
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 21,
+            "fingerprint": "18aa3075410105bd",
+            "line": 201
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 21,
+            "fingerprint": "6eb679a5950baed5",
+            "line": 209
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 23,
+            "fingerprint": "23a30c598de583a3",
+            "line": 210
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 25,
+            "fingerprint": "3786f68a8b3690fd",
+            "line": 205
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 27,
+            "fingerprint": "bbb0741444526443",
+            "line": 208
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 30,
+            "fingerprint": "2601f4f6cb242d77",
+            "line": 204
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 35,
+            "fingerprint": "65e417b95528e3a3",
+            "line": 207
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 40,
+            "fingerprint": "f1d5ecc07837f397",
+            "line": 206
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 41,
+            "fingerprint": "5f5a5505db205142",
+            "line": 199
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "e2fb5e928bbfc587",
+            "line": 227
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "9889dfb2f88c4756",
+            "line": 210
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 21,
+            "fingerprint": "7ef0870210662d26",
+            "line": 208
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 21,
+            "fingerprint": "d3b8e822cec654c3",
+            "line": 200
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 23,
+            "fingerprint": "7edfde7545d4e471",
+            "line": 209
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 25,
+            "fingerprint": "d863dfe2899bf983",
+            "line": 204
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 27,
+            "fingerprint": "d5d78b637997de96",
+            "line": 207
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 30,
+            "fingerprint": "04dc65dcf4467927",
+            "line": 203
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 35,
+            "fingerprint": "ffbb0a9aeb4884a4",
+            "line": 206
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 40,
+            "fingerprint": "2d486dab3da999b8",
+            "line": 205
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 41,
+            "fingerprint": "4da8c8f70650f21e",
+            "line": 198
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/pipeline_commit.py",
+        "message": "@trust_boundary suppressed R1 under source_param='envelope'; source='persisted redacted pipeline-dispatch envelope re-read from chat audit storage'; test_ref='tests/unit/web/composer/test_row_union_authority_hashing.py::test_persisted_set_pipeline_binding_rejects_recomputed_authority_member_tampering'; suppresses=('R1', 'R5')",
+        "rule_id": "R_TB_SUPPRESSED",
+        "severity": "note",
+        "suggestion": null
+      }
+    }
+  ],
+  "normalized_only_checkout_prefix": true,
+  "positive_negative_controls": "passed, including duplicate multiplicity and each semantic field",
+  "semantic_added": [],
+  "semantic_added_count": 0,
+  "semantic_removed": [],
+  "semantic_removed_count": 0
+}

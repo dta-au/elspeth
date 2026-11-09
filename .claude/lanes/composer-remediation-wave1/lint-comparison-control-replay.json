@@ -1,0 +1,705 @@
+{
+  "after_count": 5424,
+  "before_count": 5424,
+  "compared_fields": [
+    "rule_id",
+    "file_path",
+    "severity",
+    "message",
+    "suggestion"
+  ],
+  "location_changes": [
+    {
+      "after": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "61723859ace07d14",
+            "line": 839
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "4f3b56d34777eb1f",
+            "line": 837
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/routes/composer/proposals.py",
+        "message": "Broad exception caught without re-raise: except BaseException as incomplete:",
+        "rule_id": "R4",
+        "severity": "error",
+        "suggestion": "Catch specific exceptions, or re-raise after logging/quarantining"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "c827aa2bd117c76c",
+            "line": 830
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "4020502355b406c5",
+            "line": 828
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/routes/composer/proposals.py",
+        "message": "Broad exception caught without re-raise: except BaseException as original:",
+        "rule_id": "R4",
+        "severity": "error",
+        "suggestion": "Catch specific exceptions, or re-raise after logging/quarantining"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "8f1c41467777c807",
+            "line": 363
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "b95556f317f9c03a",
+            "line": 362
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/routes/composer/proposals.py",
+        "message": "Broad exception caught without re-raise: except BaseException as primary:",
+        "rule_id": "R4",
+        "severity": "error",
+        "suggestion": "Catch specific exceptions, or re-raise after logging/quarantining"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 8,
+            "fingerprint": "1178bedaf443dfef",
+            "line": 845
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 8,
+            "fingerprint": "56f633694b35cacb",
+            "line": 843
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/routes/composer/proposals.py",
+        "message": "Broad exception caught without re-raise: except BaseException as scope_failure:",
+        "rule_id": "R4",
+        "severity": "error",
+        "suggestion": "Catch specific exceptions, or re-raise after logging/quarantining"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 8,
+            "fingerprint": "da981ab22569ee2c",
+            "line": 98
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 8,
+            "fingerprint": "d77eb490f4e5a4ec",
+            "line": 97
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/routes/composer/proposals.py",
+        "message": "Broad exception caught without re-raise: except BaseException:",
+        "rule_id": "R4",
+        "severity": "error",
+        "suggestion": "Catch specific exceptions, or re-raise after logging/quarantining"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "43c83b89c8e227d2",
+            "line": 3010
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "43c83b89c8e227d2",
+            "line": 3000
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tools/generation.py",
+        "message": "isinstance() used: and isinstance(node.args[0], ast.Constant)",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "88d4e98960372469",
+            "line": 3011
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "88d4e98960372469",
+            "line": 3001
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tools/generation.py",
+        "message": "isinstance() used: and isinstance(node.args[0].value, str)",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "ed3408f35595d988",
+            "line": 3005
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "ed3408f35595d988",
+            "line": 2995
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tools/generation.py",
+        "message": "isinstance() used: and isinstance(node.func, ast.Attribute)",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "67379f5c9b9f8986",
+            "line": 3007
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "67379f5c9b9f8986",
+            "line": 2997
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tools/generation.py",
+        "message": "isinstance() used: and isinstance(node.func.value, ast.Name)",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "42c27bfd88c8d9c9",
+            "line": 2998
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "42c27bfd88c8d9c9",
+            "line": 2988
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tools/generation.py",
+        "message": "isinstance() used: and isinstance(node.slice, ast.Constant)",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "fd994c0bc6e5458a",
+            "line": 2999
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "fd994c0bc6e5458a",
+            "line": 2989
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tools/generation.py",
+        "message": "isinstance() used: and isinstance(node.slice.value, str)",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "fa9dca0e8ffc779e",
+            "line": 2996
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "fa9dca0e8ffc779e",
+            "line": 2986
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tools/generation.py",
+        "message": "isinstance() used: and isinstance(node.value, ast.Name)",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 9,
+            "fingerprint": "db1ba79320f0c86d",
+            "line": 2454
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 9,
+            "fingerprint": "db1ba79320f0c86d",
+            "line": 2444
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tools/generation.py",
+        "message": "isinstance() used: elif isinstance(value, Mapping) and value.keys() == {\"enabled\", \"composer_modifiable\", \"summary\", \"audit_export_summary\"}:",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "7b2cf1a485c4e2cc",
+            "line": 3004
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "7b2cf1a485c4e2cc",
+            "line": 2994
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tools/generation.py",
+        "message": "isinstance() used: isinstance(node, ast.Call)",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "934dd1bb1010de5b",
+            "line": 2995
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "934dd1bb1010de5b",
+            "line": 2985
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tools/generation.py",
+        "message": "isinstance() used: isinstance(node, ast.Subscript)",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 33,
+            "fingerprint": "4fe191b1db678774",
+            "line": 123
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 33,
+            "fingerprint": "17543b9a98e8f440",
+            "line": 122
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/routes/composer/proposals.py",
+        "message": "isinstance() used: if cleanup_cancelled and not isinstance(primary, asyncio.CancelledError):",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 7,
+            "fingerprint": "4eb4c04d06053043",
+            "line": 139
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 7,
+            "fingerprint": "6844e89e664b1885",
+            "line": 138
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/routes/composer/proposals.py",
+        "message": "isinstance() used: if isinstance(cleanup_error, Exception):",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 7,
+            "fingerprint": "907e56b5140febcd",
+            "line": 137
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 7,
+            "fingerprint": "c29d7706cde59339",
+            "line": 136
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/routes/composer/proposals.py",
+        "message": "isinstance() used: if isinstance(cleanup_error, contract_errors.TIER_1_ERRORS):",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "b7bf93d7599d3e86",
+            "line": 618
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "bdbc7b807017aeec",
+            "line": 616
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/routes/composer/proposals.py",
+        "message": "Exception swallowed without re-raise or explicit error: except ProposalStateConflictError:",
+        "rule_id": "R6",
+        "severity": "error",
+        "suggestion": "Raise the exception or return an explicit error/quarantine result"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "559f4f85b297445c",
+            "line": 3242
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 15,
+            "fingerprint": "62c5111149b67825",
+            "line": 3245
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "559f4f85b297445c",
+            "line": 3232
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 15,
+            "fingerprint": "62c5111149b67825",
+            "line": 3235
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tools/generation.py",
+        "message": "@trust_boundary suppressed R5 under source_param='node'; source='value_transform NodeSpec options (composer/user-authored config re-read from persisted session state)'; test_ref=None; suppresses=('R5',)",
+        "rule_id": "R_TB_SUPPRESSED",
+        "severity": "note",
+        "suggestion": null
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "332483304a80c035",
+            "line": 2970
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "332483304a80c035",
+            "line": 2960
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tools/generation.py",
+        "message": "@trust_boundary suppressed R5 under source_param='source'; source='The `schema` block inside a persisted SourceSpec options mapping \u2014 composer/operator-authored values re-read from session state'; test_ref=None; suppresses=('R5',)",
+        "rule_id": "R_TB_SUPPRESSED",
+        "severity": "note",
+        "suggestion": null
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "2b265fa2b7162b9b",
+            "line": 168
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "d77c40f0b296e747",
+            "line": 165
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 22,
+            "fingerprint": "f0d7fa9a426297f1",
+            "line": 171
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "44cdf01c800f8e74",
+            "line": 167
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "5c7f3e3e74718110",
+            "line": 164
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 22,
+            "fingerprint": "10d15db3cf63db98",
+            "line": 170
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/sessions/routes/composer/proposals.py",
+        "message": "@trust_boundary suppressed R5 under source_param='arguments'; source='persisted LLM tool-call arguments of a stored CompositionProposalRecord (Tier-3 on read-back)'; test_ref=None; suppresses=('R5',)",
+        "rule_id": "R_TB_SUPPRESSED",
+        "severity": "note",
+        "suggestion": null
+      }
+    }
+  ],
+  "normalized_only_checkout_prefix": true,
+  "positive_negative_controls": "passed, including duplicate multiplicity and each semantic field",
+  "semantic_added": [],
+  "semantic_added_count": 0,
+  "semantic_removed": [],
+  "semantic_removed_count": 0
+}

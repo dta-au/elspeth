@@ -1,0 +1,679 @@
+"""Data-flow recording repository — compatibility facade.
+
+The behaviour lives in the cohesive components under
+:mod:`elspeth.core.landscape.data_flow` (archived issue elspeth-b194136580):
+row/token lifecycle with the atomic fork/coalesce/expand lineage writes
+(:class:`RowTokenRepository`), token (outcome, path) terminals with the
+ADR-019 policy (:class:`TokenOutcomeRepository`), execution-graph
+nodes/edges (:class:`GraphAuditRepository`), validation/transform errors
+(:class:`ErrorAuditRepository`), and the shared Tier-1 row/token ownership
+guards (:class:`RowTokenOwnership`). :class:`DataFlowRepository` composes
+them behind the historical surface so call sites can migrate
+incrementally — new code should prefer the component attributes
+(``.tokens``, ``.outcomes``, ``.graph``, ``.errors``, ``.ownership``) over
+the flat delegators.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any
+
+from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Row as SQLAlchemyRow
+
+from elspeth.contracts import (
+    AggregationParentDisposition,
+    Determinism,
+    Edge,
+    Node,
+    NodeType,
+    RoutingMode,
+    Row,
+    Token,
+    TokenOutcome,
+    TransformErrorReason,
+    TransformErrorRecord,
+    ValidationErrorRecord,
+)
+from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.engine import CoalesceParentCompletion, CommittedCollect
+from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.identity import LineageFrame
+from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.core.landscape._database_ops import DatabaseOps
+from elspeth.core.landscape.data_flow import (
+    ErrorAuditRepository,
+    GraphAuditRepository,
+    RowTokenOwnership,
+    RowTokenRepository,
+    TokenOutcomeRepository,
+)
+from elspeth.core.landscape.data_flow.serialization import (
+    canonical_or_recorded_error_details_json,
+    canonical_or_recorded_hash,
+    canonical_or_recorded_json,
+    canonical_or_recorded_repr_payload,
+)
+from elspeth.core.landscape.model_loaders import (
+    EdgeLoader,
+    NodeLoader,
+    TokenOutcomeLoader,
+    TransformErrorLoader,
+    ValidationErrorLoader,
+)
+from elspeth.core.landscape.ports import LandscapeConnectionProvider
+
+if TYPE_CHECKING:
+    from elspeth.contracts.errors import ContractViolation
+    from elspeth.contracts.payload_store import PayloadStore
+    from elspeth.contracts.schema import SchemaConfig
+    from elspeth.contracts.schema_contract import PipelineRow
+    from elspeth.core.landscape.execution.node_states import NodeStateRepository
+
+__all__ = ["DataFlowRepository"]
+
+
+class DataFlowRepository:
+    """Records data flow: tokens, rows, graph structure, and errors.
+
+    Compatibility facade over the data-flow components: every historical
+    verb delegates to exactly one component. The components share the same
+    connection provider and :class:`DatabaseOps` instances, so test seams
+    that patch ``repo._db`` / ``repo._ops`` attributes remain effective.
+
+    Atomic transactions in fork/coalesce/expand use the connection provider's
+    explicit write-transaction boundary.
+
+    NOTE: nodes table has composite PK (node_id, run_id). Always filter
+    by both columns when querying individual nodes.
+    """
+
+    def __init__(
+        self,
+        db: LandscapeConnectionProvider,
+        ops: DatabaseOps,
+        *,
+        token_outcome_loader: TokenOutcomeLoader,
+        node_loader: NodeLoader,
+        edge_loader: EdgeLoader,
+        validation_error_loader: ValidationErrorLoader,
+        transform_error_loader: TransformErrorLoader,
+        payload_store: PayloadStore | None = None,
+        node_state_repository: NodeStateRepository | None = None,
+    ) -> None:
+        self._db = db
+        self._ops = ops
+        self._payload_store = payload_store
+        self.ownership = RowTokenOwnership(ops)
+        self.outcomes = TokenOutcomeRepository(db, ops, token_outcome_loader=token_outcome_loader, ownership=self.ownership)
+        self.tokens = RowTokenRepository(
+            db,
+            ops,
+            ownership=self.ownership,
+            payload_store=payload_store,
+            outcomes=self.outcomes,
+            node_states=node_state_repository,
+        )
+        self.graph = GraphAuditRepository(db, ops, node_loader=node_loader, edge_loader=edge_loader)
+        self.errors = ErrorAuditRepository(
+            db,
+            ops,
+            validation_error_loader=validation_error_loader,
+            transform_error_loader=transform_error_loader,
+            ownership=self.ownership,
+        )
+
+    # ── Tier-3 audit serialization (module functions in data_flow.serialization) ──
+
+    def _canonical_or_recorded_hash(self, data: Any) -> str:
+        """Hash external row data, recording a non-canonical fallback on failure."""
+        return canonical_or_recorded_hash(data)
+
+    def _canonical_or_recorded_json(self, data: Any) -> str:
+        """Serialize external row data, recording a non-canonical fallback on failure."""
+        return canonical_or_recorded_json(data)
+
+    def _canonical_or_recorded_error_details_json(self, error_details: Any) -> str:
+        """Serialize transform error_details, recording a non-canonical fallback."""
+        return canonical_or_recorded_error_details_json(error_details)
+
+    def _canonical_or_recorded_repr_payload(self, data: Any) -> str:
+        """Serialize a quarantined payload, recording a repr sentinel on failure."""
+        return canonical_or_recorded_repr_payload(data)
+
+    # ── Row/token ownership (RowTokenOwnership) ────────────────────────────
+
+    def _resolve_run_id_for_row(self, row_id: str) -> str:
+        """Resolve the run_id that owns a given row_id."""
+        return self.ownership.resolve_run_id_for_row(row_id)
+
+    def resolve_row_ingest_sequence(self, row_id: str) -> int:
+        """Resolve a row's global ingest ordering for scheduler fairness."""
+        return self.ownership.resolve_row_ingest_sequence(row_id)
+
+    def _resolve_token_ownership(self, token_id: str) -> tuple[str, str]:
+        """Resolve the (row_id, run_id) that owns a given token_id."""
+        return self.ownership.resolve_token_ownership(token_id)
+
+    def _validate_token_run_ownership(self, ref: TokenRef) -> None:
+        """Validate that a token belongs to the specified run."""
+        self.ownership.validate_token_run_ownership(ref)
+
+    def _validate_token_row_ownership(self, token_id: str, row_id: str) -> None:
+        """Validate that a token belongs to the specified row."""
+        self.ownership.validate_token_row_ownership(token_id, row_id)
+
+    # ── Token recording (RowTokenRepository) ───────────────────────────────
+
+    def _prepare_source_row_record(
+        self,
+        run_id: str,
+        source_node_id: str,
+        row_index: int,
+        data: Mapping[str, object],
+        *,
+        source_row_index: int | None,
+        ingest_sequence: int | None,
+        row_id: str | None,
+        quarantined: bool,
+        source_contract_json: str | None = None,
+    ) -> Row:
+        return self.tokens._prepare_source_row_record(
+            run_id=run_id,
+            source_node_id=source_node_id,
+            row_index=row_index,
+            data=data,
+            source_row_index=source_row_index,
+            ingest_sequence=ingest_sequence,
+            row_id=row_id,
+            quarantined=quarantined,
+            source_contract_json=source_contract_json,
+        )
+
+    @staticmethod
+    def _row_insert_values(row: Row) -> dict[str, object]:
+        return RowTokenRepository._row_insert_values(row)
+
+    def create_row_with_token(
+        self,
+        source_node_id: str,
+        row_index: int,
+        data: Mapping[str, object],
+        *,
+        source_row_index: int | None = None,
+        ingest_sequence: int | None = None,
+        row_id: str | None = None,
+        token_id: str | None = None,
+        quarantined: bool = False,
+        source_contract_json: str | None = None,
+        coordination_token: CoordinationToken,
+    ) -> tuple[Row, Token]:
+        """Create a source row and its initial token in one audit transaction."""
+        return self.tokens.create_row_with_token(
+            source_node_id,
+            row_index,
+            data,
+            source_row_index=source_row_index,
+            ingest_sequence=ingest_sequence,
+            row_id=row_id,
+            token_id=token_id,
+            quarantined=quarantined,
+            source_contract_json=source_contract_json,
+            coordination_token=coordination_token,
+        )
+
+    def insert_row_with_token_on(
+        self,
+        conn: Connection,
+        *,
+        coordination_token: CoordinationToken,
+        source_node_id: str,
+        row_index: int,
+        data: Mapping[str, object],
+        source_row_index: int | None = None,
+        ingest_sequence: int | None = None,
+        row_id: str | None = None,
+        token_id: str | None = None,
+        quarantined: bool = False,
+        source_contract_json: str | None = None,
+    ) -> tuple[Row, Token]:
+        """Connection-accepting rows+tokens insert: composes into the caller's transaction."""
+        return self.tokens.insert_row_with_token_on(
+            conn,
+            coordination_token=coordination_token,
+            source_node_id=source_node_id,
+            row_index=row_index,
+            data=data,
+            source_row_index=source_row_index,
+            ingest_sequence=ingest_sequence,
+            row_id=row_id,
+            token_id=token_id,
+            quarantined=quarantined,
+            source_contract_json=source_contract_json,
+        )
+
+    def create_token(
+        self,
+        row_id: str,
+        *,
+        coordination_token: CoordinationToken,
+        token_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
+        join_group_id: str | None = None,
+    ) -> Token:
+        """Create a token (row instance in DAG path)."""
+        return self.tokens.create_token(
+            row_id,
+            coordination_token=coordination_token,
+            token_id=token_id,
+            lineage_path=lineage_path,
+            join_group_id=join_group_id,
+        )
+
+    def fork_token(
+        self,
+        parent_ref: TokenRef,
+        row_id: str,
+        branches: list[str],
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
+        step_in_pipeline: int | None = None,
+        parent_lineage_path: tuple[LineageFrame, ...] | None = None,
+    ) -> tuple[list[Token], str]:
+        """Fork a token to multiple branches."""
+        return self.tokens.fork_token(
+            parent_ref,
+            row_id,
+            branches,
+            member_token=member_token,
+            work_item=work_item,
+            step_in_pipeline=step_in_pipeline,
+            parent_lineage_path=parent_lineage_path,
+        )
+
+    def load_lineage_paths(self, run_id: str, token_ids: Sequence[str]) -> dict[str, tuple[LineageFrame, ...]]:
+        """Batch-load durable lineage paths for many tokens in one query."""
+        return self.tokens.load_lineage_paths(run_id, token_ids)
+
+    def coalesce_tokens(
+        self,
+        parent_refs: list[TokenRef],
+        row_id: str,
+        merged_payload: Mapping[str, object],
+        *,
+        coordination_token: CoordinationToken,
+        coalesce_node_id: str | None = None,
+        parent_state_ids: Sequence[str] | None = None,
+        merged_contract: SchemaContract,
+        step_in_pipeline: int | None = None,
+        parent_lineage_paths: Mapping[str, tuple[LineageFrame, ...]] | None = None,
+    ) -> Token:
+        """Coalesce multiple tokens into one (join operation)."""
+        return self.tokens.coalesce_tokens(
+            parent_refs,
+            row_id,
+            merged_payload,
+            coordination_token=coordination_token,
+            coalesce_node_id=coalesce_node_id,
+            parent_state_ids=parent_state_ids,
+            merged_contract=merged_contract,
+            step_in_pipeline=step_in_pipeline,
+            parent_lineage_paths=parent_lineage_paths,
+        )
+
+    def finalize_coalesce_effect(
+        self,
+        *,
+        coordination_token: CoordinationToken,
+        merged: Token,
+        parent_completions: Sequence[CoalesceParentCompletion],
+    ) -> None:
+        """Atomically terminalize the parents of one materialized coalesce."""
+        self.tokens.finalize_coalesce_effect(coordination_token=coordination_token, merged=merged, parent_completions=parent_completions)
+
+    def expand_token(
+        self,
+        parent_ref: TokenRef,
+        row_id: str,
+        child_payloads: Sequence[Mapping[str, object]],
+        *,
+        member_token: WorkerMembershipToken,
+        output_contract: SchemaContract,
+        step_in_pipeline: int | None = None,
+        parent_path: TerminalPath = TerminalPath.EXPAND_PARENT,
+        parent_batch_id: str | None = None,
+        aggregation_parent_dispositions: Sequence[AggregationParentDisposition] = (),
+        parent_lineage_path: tuple[LineageFrame, ...] | None = None,
+    ) -> tuple[list[Token], str]:
+        """Expand a token into multiple child tokens (deaggregation)."""
+        return self.tokens.expand_token(
+            parent_ref,
+            row_id,
+            child_payloads,
+            member_token=member_token,
+            output_contract=output_contract,
+            step_in_pipeline=step_in_pipeline,
+            parent_path=parent_path,
+            parent_batch_id=parent_batch_id,
+            aggregation_parent_dispositions=aggregation_parent_dispositions,
+            parent_lineage_path=parent_lineage_path,
+        )
+
+    def collect_tokens(
+        self,
+        member_refs: Sequence[TokenRef],
+        group_id: str,
+        collector_node_id: str,
+        output_payloads: Sequence[Mapping[str, object]],
+        output_contracts: Sequence[SchemaContract],
+        *,
+        coordination_token: CoordinationToken,
+        step_in_pipeline: int | None = None,
+        member_lineage_paths: Mapping[str, tuple[LineageFrame, ...]] | None = None,
+    ) -> CommittedCollect:
+        """Close a bound EXPAND group: strict-pop the closer's frame, mint the release."""
+        return self.tokens.collect_tokens(
+            member_refs,
+            group_id,
+            collector_node_id,
+            output_payloads,
+            output_contracts,
+            coordination_token=coordination_token,
+            step_in_pipeline=step_in_pipeline,
+            member_lineage_paths=member_lineage_paths,
+        )
+
+    def record_empty_expansion(self, parent_ref: TokenRef, *, member_token: WorkerMembershipToken) -> str:
+        """Mint the durable member_count=0 group record for a zero-row expansion."""
+        return self.tokens.record_empty_expansion(parent_ref, member_token=member_token)
+
+    def is_release_group(self, *, run_id: str, group_id: str) -> bool:
+        """META-38: whether ``group_id`` is a collector RELEASE group (durable fact)."""
+        return self.tokens.is_release_group(run_id=run_id, group_id=group_id)
+
+    def get_group_records_for_run(self, run_id: str) -> list[Any]:
+        """All group_records rows for a run (export surface)."""
+        return self.tokens.get_group_records_for_run(run_id)
+
+    def get_group_losses_for_run(self, run_id: str) -> list[Any]:
+        """All group_losses rows for a run (export surface, WS3 writes the ledger)."""
+        return self.tokens.get_group_losses_for_run(run_id)
+
+    # ── Token outcome recording (TokenOutcomeRepository) ───────────────────
+
+    def lock_token_outcome_dependencies(self, refs: Sequence[TokenRef], *, conn: Connection) -> None:
+        """Prelock token dependencies before a composed outcome transaction mutates states."""
+        self.outcomes.lock_token_outcome_dependencies(refs, conn=conn)
+
+    def _validate_outcome_fields(
+        self,
+        outcome: TerminalOutcome | None,
+        path: TerminalPath,
+        *,
+        sink_name: str | None,
+        batch_id: str | None,
+        error_hash: str | None,
+    ) -> None:
+        """Validate discriminator fields for the (outcome, path) pair."""
+        self.outcomes._validate_outcome_fields(
+            outcome,
+            path,
+            sink_name=sink_name,
+            batch_id=batch_id,
+            error_hash=error_hash,
+        )
+
+    def _validate_cross_table_invariants(
+        self,
+        ref: TokenRef,
+        outcome: TerminalOutcome | None,
+        path: TerminalPath,
+        *,
+        sink_name: str | None,
+        sink_node_id: str | None,
+        artifact_id: str | None,
+    ) -> None:
+        """Validate ADR-019 real-time cross-table invariants."""
+        self.outcomes._validate_cross_table_invariants(
+            ref,
+            outcome,
+            path,
+            sink_name=sink_name,
+            sink_node_id=sink_node_id,
+            artifact_id=artifact_id,
+        )
+
+    def record_token_outcome(
+        self,
+        ref: TokenRef,
+        outcome: TerminalOutcome | None,
+        path: TerminalPath,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
+        sink_name: str | None = None,
+        sink_node_id: str | None = None,
+        artifact_id: str | None = None,
+        batch_id: str | None = None,
+        error_hash: str | None = None,
+        context: Mapping[str, object] | None = None,
+    ) -> str:
+        """Record a token's (outcome, path) audit terminal in the audit trail."""
+        return self.outcomes.record_token_outcome(
+            ref,
+            outcome,
+            path,
+            member_token=member_token,
+            work_item=work_item,
+            sink_name=sink_name,
+            sink_node_id=sink_node_id,
+            artifact_id=artifact_id,
+            batch_id=batch_id,
+            error_hash=error_hash,
+            context=context,
+        )
+
+    def record_token_outcome_leader(
+        self,
+        ref: TokenRef,
+        outcome: TerminalOutcome | None,
+        path: TerminalPath,
+        *,
+        coordination_token: CoordinationToken,
+        sink_name: str | None = None,
+        sink_node_id: str | None = None,
+        artifact_id: str | None = None,
+        batch_id: str | None = None,
+        error_hash: str | None = None,
+        context: Mapping[str, object] | None = None,
+    ) -> str:
+        """Record a leader-owned finalization outcome under the epoch fence."""
+        return self.outcomes.record_token_outcome_leader(
+            ref,
+            outcome,
+            path,
+            coordination_token=coordination_token,
+            sink_name=sink_name,
+            sink_node_id=sink_node_id,
+            artifact_id=artifact_id,
+            batch_id=batch_id,
+            error_hash=error_hash,
+            context=context,
+        )
+
+    def find_orphaned_transient_parents(self, run_id: str) -> list[SQLAlchemyRow[Any]]:
+        """Find I1a parent tokens with no child token outcome witnesses."""
+        return self.outcomes.find_orphaned_transient_parents(run_id)
+
+    def find_orphaned_batch_consumptions(self, run_id: str) -> list[str]:
+        """Find I1b batch IDs consumed by tokens whose batch did not complete."""
+        return self.outcomes.find_orphaned_batch_consumptions(run_id)
+
+    def sweep_deferred_invariants_or_crash(self, run_id: str) -> None:
+        """Sweep ADR-019 deferred I1a/I1b invariants at a stable run boundary."""
+        self.outcomes.sweep_deferred_invariants_or_crash(run_id)
+
+    def get_token_outcome(self, token_id: str) -> TokenOutcome | None:
+        """Get the terminal outcome for a token."""
+        return self.outcomes.get_token_outcome(token_id)
+
+    def get_token_outcomes_for_row(self, run_id: str, row_id: str) -> list[TokenOutcome]:
+        """Get all token outcomes for a row in a single query."""
+        return self.outcomes.get_token_outcomes_for_row(run_id, row_id)
+
+    # ── Graph recording (GraphAuditRepository) ─────────────────────────────
+
+    def _sanitize_node_config_for_audit(self, config: Mapping[str, object], *, plugin_name: str | None) -> Mapping[str, object]:
+        """Return an audit-safe node config with secrets fingerprinted."""
+        from elspeth.core.config import sanitize_node_config_for_audit
+
+        return sanitize_node_config_for_audit(config, plugin_name=plugin_name)
+
+    def register_node(
+        self,
+        plugin_name: str,
+        node_type: NodeType,
+        plugin_version: str,
+        config: Mapping[str, object],
+        *,
+        coordination_token: CoordinationToken,
+        node_id: str | None = None,
+        sequence: int | None = None,
+        determinism: Determinism = Determinism.DETERMINISTIC,
+        schema_config: SchemaConfig,
+        source_file_hash: str | None = None,
+        input_contract: SchemaContract | None = None,
+        output_contract: SchemaContract | None = None,
+    ) -> Node:
+        """Register a node in the execution graph."""
+        return self.graph.register_node(
+            plugin_name,
+            node_type,
+            plugin_version,
+            config,
+            coordination_token=coordination_token,
+            node_id=node_id,
+            sequence=sequence,
+            determinism=determinism,
+            schema_config=schema_config,
+            source_file_hash=source_file_hash,
+            input_contract=input_contract,
+            output_contract=output_contract,
+        )
+
+    def register_edge(
+        self,
+        from_node_id: str,
+        to_node_id: str,
+        label: str,
+        mode: RoutingMode,
+        *,
+        coordination_token: CoordinationToken,
+        edge_id: str | None = None,
+    ) -> Edge:
+        """Register an edge in the execution graph."""
+        return self.graph.register_edge(from_node_id, to_node_id, label, mode, coordination_token=coordination_token, edge_id=edge_id)
+
+    def get_node(self, node_id: str, run_id: str) -> Node | None:
+        """Get a node by its composite primary key (node_id, run_id)."""
+        return self.graph.get_node(node_id, run_id)
+
+    def get_nodes(self, run_id: str) -> list[Node]:
+        """Get all nodes for a run."""
+        return self.graph.get_nodes(run_id)
+
+    def get_node_contracts(
+        self, run_id: str, node_id: str, *, allow_missing: bool = False
+    ) -> tuple[SchemaContract | None, SchemaContract | None]:
+        """Get input and output contracts for a node."""
+        return self.graph.get_node_contracts(run_id, node_id, allow_missing=allow_missing)
+
+    def get_edges(self, run_id: str) -> list[Edge]:
+        """Get all edges for a run."""
+        return self.graph.get_edges(run_id)
+
+    def get_edge(self, edge_id: str) -> Edge:
+        """Get a single edge by ID."""
+        return self.graph.get_edge(edge_id)
+
+    def get_edge_map(self, run_id: str) -> dict[tuple[str, str], str]:
+        """Get edge mapping for a run (from_node_id, label) -> edge_id."""
+        return self.graph.get_edge_map(run_id)
+
+    def update_node_output_contract(
+        self,
+        node_id: str,
+        contract: SchemaContract,
+        *,
+        member_token: WorkerMembershipToken,
+    ) -> None:
+        """Update a node's output_contract after first-row inference or schema evolution."""
+        self.graph.update_node_output_contract(node_id, contract, member_token=member_token)
+
+    # ── Error recording (ErrorAuditRepository) ─────────────────────────────
+
+    def record_validation_error(
+        self,
+        node_id: str | None,
+        row_data: Any,
+        error: str,
+        schema_mode: str,
+        destination: str,
+        *,
+        coordination_token: CoordinationToken,
+        row_id: str | None = None,
+        contract_violation: ContractViolation | None = None,
+    ) -> str:
+        """Record a validation error in the audit trail."""
+        return self.errors.record_validation_error(
+            node_id,
+            row_data,
+            error,
+            schema_mode,
+            destination,
+            coordination_token=coordination_token,
+            row_id=row_id,
+            contract_violation=contract_violation,
+        )
+
+    def record_transform_error(
+        self,
+        ref: TokenRef,
+        transform_id: str,
+        row_data: Mapping[str, object] | PipelineRow,
+        error_details: TransformErrorReason,
+        destination: str,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
+    ) -> str:
+        """Record a transform processing error in the audit trail."""
+        return self.errors.record_transform_error(
+            ref, transform_id, row_data, error_details, destination, member_token=member_token, work_item=work_item
+        )
+
+    def get_validation_errors_for_row(
+        self,
+        run_id: str,
+        row_hash: str | None = None,
+        *,
+        row_id: str | None = None,
+    ) -> list[ValidationErrorRecord]:
+        """Get validation errors for a row by stable row linkage or legacy hash."""
+        return self.errors.get_validation_errors_for_row(run_id, row_hash, row_id=row_id)
+
+    def get_validation_errors_for_run(self, run_id: str) -> list[ValidationErrorRecord]:
+        """Get all validation errors for a run."""
+        return self.errors.get_validation_errors_for_run(run_id)
+
+    def get_transform_errors_for_token(self, token_id: str) -> list[TransformErrorRecord]:
+        """Get transform errors for a specific token."""
+        return self.errors.get_transform_errors_for_token(token_id)
+
+    def get_transform_errors_for_run(self, run_id: str) -> list[TransformErrorRecord]:
+        """Get all transform errors for a run."""
+        return self.errors.get_transform_errors_for_run(run_id)

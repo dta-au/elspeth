@@ -1,0 +1,6 @@
+❌ Type definition violations found:
+
+  src/elspeth/web/paths.py:24: dataclass 'McpConfiguredRootAuthority'
+    Used in: src/elspeth/composer_mcp/server.py
+    Fix: Move to src/elspeth/contracts/ or add to config/cicd/contracts-whitelist.yaml
+

@@ -1,0 +1,5543 @@
+"""ExecutionServiceImpl — background pipeline execution with thread safety.
+
+Thread safety fixes implemented here:
+- B2: Always pass shutdown_event=threading.Event() to Orchestrator.run()
+- B3: Construct LandscapeDB/PayloadStore from WebSettings resolvers
+- B7: except BaseException + future.add_done_callback() safety net
+- B8/C1: _call_async() bridges sync thread to async event loop for SessionService
+
+The _run_pipeline() method is the ONLY code that runs outside the asyncio
+event loop. Everything else runs in the main async context. Because
+SessionService methods are async, _run_pipeline() uses _call_async() to
+schedule coroutines on the main event loop from the background thread.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import threading
+import time
+import traceback
+from collections.abc import Callable, Coroutine, Mapping, Sequence
+from concurrent.futures import CancelledError as FutureCancelledError
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from functools import partial
+from pathlib import Path, PurePath
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
+from uuid import UUID
+
+import structlog
+from opentelemetry import metrics
+from pydantic import ValidationError as PydanticValidationError
+from sqlalchemy import and_, select
+from sqlalchemy.exc import DBAPIError, DisconnectionError, InterfaceError, OperationalError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+
+from elspeth.config_loading import load_settings_from_config_dict, load_settings_from_yaml_string
+from elspeth.contracts.audit import SecretResolutionInput
+from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
+from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities
+from elspeth.contracts.call_governance import LLMCallGovernance
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionDecision, ChargeableAdmissionRefused, ChargeableOperation
+from elspeth.contracts.cli import ProgressEvent
+from elspeth.contracts.enums import CallType, NodeStateStatus, RunStatus, is_llm_authored_creation_modality
+from elspeth.contracts.errors import AuditIntegrityError, GracefulShutdownError, IncompleteSourceResumeError
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import CANONICAL_VERSION, stable_hash
+from elspeth.contracts.plugin_capabilities import PluginCapability
+from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
+from elspeth.contracts.plugin_semantics import SemanticOutcome, UnknownSemanticPolicy
+from elspeth.contracts.run_start import RunStartPermitBinding
+from elspeth.contracts.secret_scrub import scrub_text_for_audit
+from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.core.blobs_inline import (
+    _NODE_COLLECTION_KEYS,
+    BLOB_INLINE_AGGREGATE_BYTE_CAP,
+    BLOB_INLINE_PER_REF_BYTE_CAP,
+    _discover_blob_content_refs,
+    _enforce_blob_content_ref_metadata,
+    _resolve_blob_content_results,
+    _substitute_blob_content_refs,
+)
+from elspeth.core.checkpoint.recovery import NonResumableRunError, RecoveryManager, check_source_lifecycle_resumable
+from elspeth.core.config import load_bounded_pipeline_yaml
+from elspeth.core.events import EventBus
+from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_lifecycle_repository import is_valid_sha256_hex
+from elspeth.core.landscape.schema import calls_table, node_states_table, nodes_table, operations_table
+from elspeth.core.payload_store import FilesystemPayloadStore
+from elspeth.core.secrets import SecretResolutionError, collect_secret_ref_marker_sites
+from elspeth.engine.orchestrator.core import Orchestrator
+from elspeth.engine.orchestrator.preflight import (
+    SinkEffectCapabilityError,
+    SinkEffectExecutionPurpose,
+    assemble_and_validate_pipeline_config,
+)
+from elspeth.engine.orchestrator.types import PipelineConfig
+from elspeth.plugins.infrastructure.runtime_factory import (
+    validate_landscape_export_settings_from_raw_config,
+    validate_sink_effect_eligibility_from_raw_config,
+)
+from elspeth.plugins.sources.blob_rows import BlobRowsEntry
+from elspeth.web.application_finalizers import ApplicationFinalizerCapability, ApplicationFinalizerKind
+from elspeth.web.async_workers import (
+    _raise_lifecycle_originals,
+    _retain_cancellation,
+    run_application_finalizer_in_worker,
+    run_sync_in_worker,
+)
+from elspeth.web.auth.models import UserIdentity
+from elspeth.web.blobs.protocol import (
+    AllowedMimeType,
+    BlobContentMissingError,
+    BlobIntegrityError,
+    BlobNotFoundError,
+    BlobQuotaExceededError,
+    BlobRecord,
+    BlobServiceProtocol,
+    BlobStateError,
+)
+from elspeth.web.composer._semantic_validator import validate_semantic_contracts
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.composer.state import CompositionState
+from elspeth.web.config import WebSettings
+from elspeth.web.coordination.approval_authority import (
+    ApprovalBinding,
+    ApprovalGateInputs,
+    runtime_val_manifest_sha256,
+)
+from elspeth.web.coordination.contracts import RecoveryRequiredReason, SessionOperationFenceLost
+from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.coordination.quota_authority import TokenUsageEntry
+from elspeth.web.credential_guard import require_no_credential_material_in_state
+from elspeth.web.execution._semantic_helpers import semantic_affected_component_id
+from elspeth.web.execution._validation_materialization import is_llm_authored_prompt_surface_binding
+from elspeth.web.execution.accounting import load_run_accounting_from_db
+from elspeth.web.execution.completion_gates import (
+    CompletionGateFacts,
+    merge_completion_gates,
+    parse_completion_gates,
+)
+from elspeth.web.execution.discard_summary import load_discard_summaries_from_db
+from elspeth.web.execution.envelope import (
+    ExecutionEnvelope,
+    ExecutionEnvelopeRefused,
+    RestoredExecutionEnvelope,
+    RetainedBlobInput,
+    build_run_execution_input,
+    capture_execution_envelope,
+    discover_execution_blob_inputs,
+    read_cancelled_execution_envelope,
+    restore_execution_envelope,
+    runtime_implementation_fingerprint,
+    validate_run_execution_input,
+)
+from elspeth.web.execution.errors import (
+    BlobRowsSourceAdmissionError,
+    BlobSourcePathMismatchError,
+    CompletionGateIntegrityError,
+    ExecutionApprovalRequired,
+    ExecutionReadinessError,
+    MalformedBlobRefError,
+    PathAllowlistViolationError,
+    PipelineValidationError,
+    RunSessionIntegrityError,
+    SemanticContractViolationError,
+    UnresolvedInterpretationPlaceholderError,
+)
+from elspeth.web.execution.failure_samples import format_failure_categories, load_top_failure_categories
+from elspeth.web.execution.fanout_guard import (
+    ExecutionFanoutGuardRequired,
+    annotate_pipeline_yaml_with_fanout_guard,
+    evaluate_execution_fanout_guard,
+)
+from elspeth.web.execution.preflight import (
+    audit_safe_resolved_config,
+    build_validated_runtime_graph,
+    make_policy_bound_sink_factory,
+    preflight_runtime_sink_effects,
+    resolve_runtime_yaml_paths,
+)
+from elspeth.web.execution.progress import BroadcastResult, ProgressBroadcaster
+from elspeth.web.execution.protocol import ExecutionService, FrozenRunSettings, StateAccessError, YamlGenerator
+from elspeth.web.execution.provider_clock import RunProviderAttemptClock
+from elspeth.web.execution.retained_inputs import read_retained_input, retain_execution_inputs, retain_source_bytes
+from elspeth.web.execution.schemas import (
+    CHECK_PROOF_DIAGNOSTICS,
+    VALIDATION_CHECK_NAMES,
+    CancelledData,
+    CompletedData,
+    FailedData,
+    ProgressData,
+    RunAccounting,
+    RunEvent,
+    RunStatusResponse,
+    ValidationCheck,
+    ValidationError,
+    ValidationReadiness,
+    ValidationReadinessBlocker,
+    ValidationResult,
+)
+from elspeth.web.execution.secret_guard import (
+    ExecutionSecretApprovalRequired,
+    annotate_pipeline_yaml_with_secret_guard,
+    evaluate_execution_secret_guard,
+)
+from elspeth.web.execution.validation_memo import BlobReadLog, BlobReads, ValidationMemoKey, ValidationResultMemo
+from elspeth.web.execution_lease_cleanup import ExecutionAcquisitionObligation, ExecutionLeaseReleaseRegistry
+from elspeth.web.interpretation_state import InterpretationReviewPending, materialize_state_for_execution
+from elspeth.web.landscape_access import open_landscape_db
+from elspeth.web.plugin_policy.coverage import node_has_capability
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, WebPluginPolicy
+from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+from elspeth.web.plugin_policy.validation import validate_plugin_policy
+from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error
+from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
+from elspeth.web.sessions.converters import state_from_record
+from elspeth.web.sessions.protocol import (
+    SESSION_TERMINAL_RUN_STATUS_VALUES,
+    IllegalRunTransitionError,
+    RunAlreadyActiveError,
+    RunRecord,
+    SessionNotFoundError,
+    SessionRunStatus,
+    SessionServiceProtocol,
+)  # B1: canonical definition
+from elspeth.web.sessions.telemetry import _SessionsTelemetry
+
+if TYPE_CHECKING:
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.web.catalog.protocol import CatalogService
+    from elspeth.web.composer.tools.generation import (
+        ProofEvaluated,
+        ProofNotApplicable,
+        ProofUnavailable,
+        ResolvedProofBlob,
+        UnresolvedClaimedProofBlob,
+        _AuthoritativeProofContext,
+    )
+
+slog = structlog.get_logger()
+_meter = metrics.get_meter(__name__)
+_BLOB_INLINE_HASH_MISMATCH_TOTAL = _meter.create_counter(
+    name="composer.blob_inline.hash_mismatch_total",
+    description="composer-pinned hash did not match runtime-fetched blob content; SLO threshold = 0",
+)
+_BLOB_INLINE_AUDIT_ROW_TIER1_VIOLATION_TOTAL = _meter.create_counter(
+    name="composer.blob_inline.audit_row_tier1_violation_total",
+    description="resolved inline blob ref produced no audit row; SLO threshold = 0",
+)
+
+_MAX_AUTHORITATIVE_PROOF_DIAGNOSTICS = 16
+_MAX_AUTHORITATIVE_PROOF_TEXT_CHARS = 1000
+
+# Execution loss watcher (``_signal_shutdown_on_operation_loss``). The watcher
+# is the only carrier of a durable ``cancel_requested_at`` written by another
+# replica to the worker that owns the run, so one transient session-DB error in
+# its poll must not end it. The healthy poll interval is unchanged; after a
+# transient session-DB error the interval doubles per consecutive failure up to
+# the cap, and from the escalation threshold onward every failure is logged at
+# error level. The lease-loss wait stays armed during every backoff interval.
+_LOSS_WATCHER_POLL_SECONDS = 0.25
+_LOSS_WATCHER_MAX_BACKOFF_SECONDS = 5.0
+_LOSS_WATCHER_ESCALATE_AFTER_FAILURES = 5
+# Poll failures classified by what the fault is, not by one class. Transient
+# means a later identical poll can succeed with no change to code or schema:
+# - ``OperationalError``: lock contention, a dropped connection, failover.
+# - ``InterfaceError``: the DBAPI connection object is unusable
+#   (``connection already closed``).
+# - ``sqlalchemy.exc.TimeoutError``: pool checkout timed out. The PostgreSQL
+#   session engine is a bounded ``QueuePool`` (``postgres_engine_kwargs``), so
+#   contention raises this, and it is not an ``OperationalError``.
+# - ``DisconnectionError``: the pool detected a dead connection at checkout.
+# The watcher also retries any other ``DBAPIError`` whose
+# ``connection_invalidated`` flag SQLAlchemy's disconnect detection set. All
+# other faults (``ProgrammingError``, ``IntegrityError``, an unflagged
+# ``DBAPIError``, ``PendingRollbackError``) are logged and re-raised. ``get_run``
+# opens a fresh ``engine.begin()`` per poll, so no failed transaction carries
+# over between polls and a ``PendingRollbackError`` there would be a code defect.
+_LOSS_WATCHER_TRANSIENT_DB_ERRORS: tuple[type[SQLAlchemyError], ...] = (
+    OperationalError,
+    InterfaceError,
+    SQLAlchemyTimeoutError,
+    DisconnectionError,
+)
+
+
+def _log_loss_watcher_poll_retry(exc: SQLAlchemyError, *, run_id: UUID, consecutive_failures: int) -> None:
+    """Log one transient loss-watcher poll failure; error level from the threshold on.
+
+    Class names only, no ``exc_info``: SQLAlchemy cause chains carry the URL.
+    """
+    if consecutive_failures >= _LOSS_WATCHER_ESCALATE_AFTER_FAILURES:
+        slog.error(
+            "execution_loss_watcher_poll_degraded",
+            run_id=str(run_id),
+            exc_class=type(exc).__name__,
+            consecutive_failures=consecutive_failures,
+        )
+    else:
+        slog.warning(
+            "execution_loss_watcher_poll_retrying",
+            run_id=str(run_id),
+            exc_class=type(exc).__name__,
+            consecutive_failures=consecutive_failures,
+        )
+
+
+def _log_loss_watcher_poll_failed(exc: SQLAlchemyError, *, run_id: UUID) -> None:
+    """Log a non-transient loss-watcher poll failure before it propagates.
+
+    Logged at once because the run may continue for a long time before
+    ``_on_pipeline_done`` observes the dead task. Class names only.
+    """
+    slog.error(
+        "execution_loss_watcher_poll_failed",
+        run_id=str(run_id),
+        exc_class=type(exc).__name__,
+    )
+
+
+class InlineBlobPromptSurfaceAdmissionError(Exception):
+    """An LLM-authored blob was bound as inline content into an LLM prompt surface.
+
+    Raised at run admission, before any blob is linked to the run or read, when
+    an ``inline_content`` marker in an ``llm`` node's prompt surface or model
+    (the domain ``llm_prompt_surface_field`` defines, shared with /validate and
+    the authoring tools) names a blob whose creation modality is LLM-authored.
+    Substituting such a blob would put
+    planner-written text into the executed prompt (or model choice) without the
+    human prompt-template / model-choice review that a literal value receives.
+    Mirrors the ``blob_rows`` modality refusal (``BlobRowsSourceAdmissionError``).
+    """
+
+
+def _bounded_proof_text(value: object, *, field_name: str) -> str:
+    """Validate and bound one detector-owned, client-visible proof string."""
+    if type(value) is not str or not value:
+        raise RuntimeError(f"proof diagnostic {field_name} must be a non-empty exact string")
+    return value[:_MAX_AUTHORITATIVE_PROOF_TEXT_CHARS]
+
+
+def _proof_component_type(code: str, evidence: Mapping[str, Any]) -> str:
+    """Label a proof blocker with the node kind the DETECTOR recorded.
+
+    A diagnostic that names a node carries that node's ``node_type`` in its
+    evidence_locator, so the kind is read from the detector's own record rather
+    than guessed back out of the diagnostic code. The code-keyed fallbacks below
+    survive only for detectors that do not (yet) record it; guessing was how a
+    collector-hosted batch plugin got labelled "aggregation" on a user-facing
+    blocker (archived issue elspeth-1016a47e8f).
+
+    NOT the same question as the node-kind reads in the path-allowlist and
+    managed-identity loops further down this file (elspeth-df8082552d), which
+    take ``node.node_type`` off the NodeSpec. That asks "what IS this node",
+    against live composition state. This asks "what did the DETECTOR see",
+    against a recorded diagnostic that may predate the current state — which is
+    why it must read the evidence and cannot substitute a NodeSpec lookup. Two
+    derived answers to two questions; do not unify them.
+    """
+    recorded_kind = evidence["node_type"] if "node_type" in evidence else None
+    if type(recorded_kind) is str and recorded_kind:
+        return recorded_kind
+    if code == "gate_expression_type_mismatch_against_source_schema":
+        return "gate"
+    if code == "aggregation_numeric_value_field_type_mismatch_against_source_schema":
+        return "aggregation"
+    return "source"
+
+
+def _insert_proof_check(
+    checks: Sequence[ValidationCheck],
+    proof_check: ValidationCheck,
+) -> list[ValidationCheck]:
+    """Insert the authoritative proof at its registered canonical rank."""
+    if any(check.name == CHECK_PROOF_DIAGNOSTICS for check in checks):
+        raise RuntimeError("authoritative preflight received a duplicate proof_diagnostics check")
+    result = [check.model_copy(deep=True) for check in checks]
+    proof_rank = VALIDATION_CHECK_NAMES.index(CHECK_PROOF_DIAGNOSTICS)
+    for index, check in enumerate(result):
+        if VALIDATION_CHECK_NAMES.index(check.name) > proof_rank:
+            result.insert(index, proof_check)
+            break
+    else:
+        result.append(proof_check)
+    return result
+
+
+def _merge_authoritative_proof_diagnostics(
+    result: ValidationResult,
+    proof: ProofNotApplicable | ProofEvaluated | ProofUnavailable,
+) -> ValidationResult:
+    """Append the real proof check and fail readiness on sampled blockers."""
+    from elspeth.web.composer.tools.generation import ProofEvaluated, ProofNotApplicable, ProofUnavailable
+
+    if not result.is_valid:
+        return result
+    if type(proof) is ProofNotApplicable:
+        return result
+    if type(proof) not in (ProofEvaluated, ProofUnavailable):
+        raise TypeError("Authoritative proof requires an owned proof outcome")
+    diagnostics = proof.diagnostics
+
+    blocking = [diagnostic for diagnostic in diagnostics if diagnostic["severity"] == "blocking"]
+    bounded_blocking = blocking[:_MAX_AUTHORITATIVE_PROOF_DIAGNOSTICS]
+    affected_nodes: list[str] = []
+    errors: list[ValidationError] = []
+    blockers: list[ValidationReadinessBlocker] = []
+    for diagnostic in bounded_blocking:
+        code = _bounded_proof_text(diagnostic["code"], field_name="code")
+        message = _bounded_proof_text(diagnostic["message"], field_name="message")
+        repair = diagnostic["suggested_repair"]
+        suggestion = None if repair is None else _bounded_proof_text(repair, field_name="suggested_repair")
+        evidence = diagnostic["evidence_locator"]
+        if not isinstance(evidence, Mapping):
+            raise RuntimeError("proof diagnostic evidence_locator must be a mapping")
+        raw_node_id = evidence["node_id"] if "node_id" in evidence else None
+        node_id = raw_node_id if type(raw_node_id) is str and raw_node_id else None
+        if node_id is not None and node_id not in affected_nodes:
+            affected_nodes.append(node_id)
+        component_type = _proof_component_type(code, evidence)
+        errors.append(
+            ValidationError(
+                component_id=node_id,
+                component_type=component_type,
+                message=message,
+                suggestion=suggestion,
+                error_code=code,
+            )
+        )
+        blockers.append(
+            ValidationReadinessBlocker(
+                code=code,
+                suggestion=None,
+                note=None,
+                component_id=node_id,
+                component_type=component_type,
+                detail=f"Bounded source proof blocked execution: {code}.",
+            )
+        )
+
+    proof_check = ValidationCheck(
+        name=CHECK_PROOF_DIAGNOSTICS,
+        passed=not blocking,
+        detail=(
+            "Bounded source proof found no blocking diagnostics."
+            if not blocking
+            else f"Bounded source proof found {len(blocking)} blocking diagnostic(s)."
+        ),
+        affected_nodes=tuple(affected_nodes),
+        outcome_code=None,
+    )
+    checks = _insert_proof_check(result.checks, proof_check)
+    if not blocking:
+        return result.model_copy(update={"checks": checks})
+
+    if len(blocking) > len(bounded_blocking):
+        blockers.append(
+            ValidationReadinessBlocker(
+                code="proof_diagnostics",
+                suggestion=None,
+                note=None,
+                component_id=None,
+                component_type="pipeline",
+                detail=(
+                    "Additional bounded source proof diagnostics were withheld after "
+                    f"the {_MAX_AUTHORITATIVE_PROOF_DIAGNOSTICS}-diagnostic response cap."
+                ),
+            )
+        )
+    return result.model_copy(
+        update={
+            "is_valid": False,
+            "checks": checks,
+            "errors": [*result.errors, *errors],
+            "readiness": ValidationReadiness(
+                authoring_valid=result.readiness.authoring_valid
+                and type(proof) is ProofUnavailable
+                and all(diagnostic["code"] == "source_blob_unavailable" for diagnostic in blocking),
+                execution_ready=False,
+                completion_ready=False,
+                blockers=[*result.readiness.blockers, *blockers],
+            ),
+        }
+    )
+
+
+def _build_web_plugin_policy_evidence(
+    *,
+    snapshot: PluginAvailabilitySnapshot,
+    policy: WebPluginPolicy | None,
+) -> WebPluginPolicyEvidence:
+    """Project the immutable request snapshot into the sanitized L0 audit DTO."""
+    if policy is None:
+        authorized = snapshot.available | frozenset(item.plugin_id for item in snapshot.unavailable)
+        identities: tuple[tuple[str, str, str], ...] = ()
+    else:
+        if snapshot.policy_hash != policy.policy_hash:
+            raise RuntimeError("plugin snapshot policy hash does not match the boot-time policy")
+        authorized = policy.authorized
+        identities = tuple((str(plugin_id), version, source_hash) for plugin_id, version, source_hash in policy.plugin_code_identities)
+    return WebPluginPolicyEvidence(
+        schema_version=policy.schema_version if policy is not None else 1,
+        policy_hash=snapshot.policy_hash,
+        snapshot_hash=snapshot.snapshot_hash,
+        authorized_plugin_ids=tuple(sorted(map(str, authorized))),
+        available_plugin_ids=tuple(sorted(map(str, snapshot.available))),
+        control_modes=tuple(sorted((capability.value, mode.value) for capability, mode in snapshot.control_modes)),
+        selected_implementations=tuple(
+            sorted((capability.value, None if plugin_id is None else str(plugin_id)) for capability, plugin_id in snapshot.selected)
+        ),
+        selected_profile_aliases=tuple(sorted((str(plugin_id), alias) for plugin_id, alias in snapshot.selected_profile_aliases)),
+        plugin_code_identities=tuple(sorted(identities)),
+        binding_generation_fingerprint=snapshot.binding_generation_fingerprint,
+        decision_codes=("policy_allowed",),
+        power_automate_allowed_origins=snapshot.power_automate_allowed_origins,
+    )
+
+
+T = TypeVar("T")
+
+
+def _state_has_secret_ref_sites(state: CompositionState, env_ref_names: frozenset[str]) -> bool:
+    """Return whether any authored plugin option wires a deferred secret.
+
+    Validation resolves a wired secret's value; the inventory lists names and
+    availability only, so such a state is kept out of the validate_state memo.
+    """
+    option_trees = (
+        *(source.options for source in state.sources.values()),
+        *(node.options for node in state.nodes),
+        *(output.options for output in state.outputs),
+    )
+    return any(collect_secret_ref_marker_sites(options, env_ref_names) for options in option_trees)
+
+
+@observation_boundary(
+    tier=3,
+    source="the runtime YAML config mapping generated from user-authored composition state — every source "
+    "block and option mapping inside it was authored through the composer tool loop or an imported YAML document",
+    source_param="config",
+    suppresses=("R1",),
+    invariant="returns one (label, raw_options) pair per declared blob_rows source and abstains on any "
+    "non-mapping source block or non-string source name; a frozen source block reads as the mapping it is, "
+    "so the admission block always sees every declared blob_rows source; option values are handed back RAW "
+    "for the caller's BlobRowsEntry strict parse to reject — never raises",
+)
+def _discover_blob_rows_sources(config: Mapping[str, Any]) -> list[tuple[str, Any]]:
+    """Return ``(source_label, raw_options)`` for every ``blob_rows`` source.
+
+    Walks the same YAML-shaped config surfaces as the inline-content
+    discovery: the legacy singular ``source`` block and the plural
+    ``sources`` mapping.  Labels use the canonical audit form (``source`` /
+    ``source:<name>``).  Options are returned raw — the admission block
+    parses each entry with the plugin-owned ``BlobRowsEntry`` model so both
+    surfaces share one definition of a well-formed entry.
+
+    The source-block tests name ``(dict, MappingProxyType)`` — exactly
+    ``deep_freeze``'s output pair for a mapping — rather than ``type(x) is
+    dict``.  This function's answer decides whether the blob_rows ADMISSION
+    block runs at all, so a source block it fails to recognise is not a
+    conservative abstention — it silently skips ownership, status, payload-hash
+    and metadata-divergence checks for that source.  ``FrozenRunSettings``
+    freezes ``executable_config`` in ``__post_init__``, so every nested source
+    block reachable from a run's policy decision is a ``mappingproxy``: an
+    exact-``dict`` test here would return ``[]`` for a config whose only thaw
+    (``deep_thaw`` in ``_run_pipeline``) had been moved or removed, and every
+    existing test would stay green.  Naming the frozen form makes the
+    recognition independent of that upstream thaw; a frozen block that reaches
+    the admission strict parse is then rejected there, loudly, by
+    ``BlobRowsSourceAdmissionError`` — fail closed rather than fail open.
+    """
+    found: list[tuple[str, Any]] = []
+    if "source" in config:
+        source = config["source"]
+        if type(source) in (dict, MappingProxyType):
+            singular: Mapping[str, Any] = source
+            if singular.get("plugin") == "blob_rows":
+                found.append(("source", singular.get("options")))
+    if "sources" in config:
+        sources = config["sources"]
+        if type(sources) in (dict, MappingProxyType):
+            named: Mapping[str, Any] = sources
+            for source_name, named_source in named.items():
+                if type(source_name) is not str or type(named_source) not in (dict, MappingProxyType):
+                    continue
+                entry: Mapping[str, Any] = named_source
+                if entry.get("plugin") != "blob_rows":
+                    continue
+                found.append((f"source:{source_name}", entry.get("options")))
+    return found
+
+
+async def acquire_execute_lease(
+    session_service: SessionServiceProtocol,
+    registry: ExecutionLeaseReleaseRegistry,
+    *,
+    session_id: UUID,
+) -> tuple[ExecutionAcquisitionObligation, SessionOperationLease]:
+    """Admit EXECUTE ownership before allocating or dispatching its SQL lease."""
+    if type(registry) is not ExecutionLeaseReleaseRegistry:
+        raise AuditIntegrityError("EXECUTE route lacks application cleanup registry")
+    obligation = registry.admit(
+        session_service.session_operation_authority,
+        session_id=session_id,
+        owner_instance_id=session_service.session_operation_owner_instance_id,
+        lease_seconds=session_service.session_operation_lease_seconds,
+    )
+    lease = await SessionOperationLease.acquire(
+        session_service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.EXECUTE,
+        owner_instance_id=session_service.session_operation_owner_instance_id,
+        lease_seconds=session_service.session_operation_lease_seconds,
+        execution_obligation=obligation,
+    )
+    return obligation, lease
+
+
+async def close_execute_lease_before_transfer(
+    lease: SessionOperationLease,
+    *,
+    primary: BaseException | None = None,
+) -> None:
+    """Join actual EXECUTE close, retaining every caller cancel and close fault."""
+    obligation = lease.execution_obligation
+    if type(obligation) is not ExecutionAcquisitionObligation or obligation.lease is not lease:
+        raise AuditIntegrityError("EXECUTE close lost actual acquisition ownership")
+    cancellations: list[asyncio.CancelledError] = []
+    if isinstance(primary, asyncio.CancelledError):
+        _retain_cancellation(cancellations, primary)
+    failures: list[BaseException] = []
+    try:
+        task = asyncio.create_task(lease.close(), name="execution-pretransfer-lease-close")
+    except BaseException as original:
+        obligation.registry.record_failure(original)
+        failures.append(original)
+    else:
+        while not task.done():
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError as original:
+                _retain_cancellation(cancellations, original)
+        try:
+            task.result()
+        except BaseException as original:
+            obligation.registry.record_failure(original)
+            failures.append(original)
+        else:
+            if cancellations:
+                lease._retain_execution_loss_originals(failures)
+                for retained_failure in failures:
+                    obligation.registry.record_failure(retained_failure)
+    if (failures or cancellations) and primary is not None and not isinstance(primary, asyncio.CancelledError):
+        failures.insert(0, primary)
+    _raise_lifecycle_originals(cancellations, failures)
+
+
+def _sanitize_error_for_client(exc: BaseException) -> str:
+    """Return a client-safe error message for a pipeline failure.
+
+    Only typed exceptions with purpose-built safe messages may expose
+    details. Broad built-ins such as ValueError, TypeError, and KeyError
+    are reduced to a generic class-name message because their str() output
+    can carry validation structure, function signatures, and internal keys.
+
+    This is the *live-stream* surface only — it is the ``detail`` on the
+    ``failed`` SSE event. The operator-facing detail is assembled separately
+    by :func:`_operator_failure_diagnostic` and persisted to ``runs.error``
+    by _run_pipeline's except-BaseException block.
+    """
+    if isinstance(exc, SecretResolutionError):
+        return "One or more secret references could not be resolved. Check the Secrets panel."
+    return f"Pipeline execution failed ({type(exc).__name__})"
+
+
+# Bound on the scrubbed ``str(exc)`` that reaches ``runs.error``. It is the
+# only unbounded component of the operator diagnostic — a Pydantic
+# validation error or a provider response body can run to many kilobytes,
+# and ``runs.error`` is a single text column rendered inline in the runs view.
+_MAX_OPERATOR_EXC_MESSAGE_CHARS = 500
+# Structural frames kept from the traceback tail. The fault surfaces at the
+# *end* of the stack, so the tail is the informative slice.
+_MAX_OPERATOR_TRACEBACK_FRAMES = 10
+# Bound on the ``__cause__`` / ``__context__`` walk.
+_MAX_EXC_CLASS_CHAIN = 5
+# Package directory that anchors a repo-relative frame path.
+_FRAME_PACKAGE_ROOT = "elspeth"
+# Hard cap on path components in a rendered frame. The anchor below is a
+# readability preference; this cap is the actual disclosure guarantee.
+_MAX_FRAME_PATH_PARTS = 4
+
+
+def _exception_class_chain(exc: BaseException, *, limit: int = _MAX_EXC_CLASS_CHAIN) -> list[str]:
+    """Return ``exc``'s class-name chain, following ``__cause__`` / ``__context__``.
+
+    Class names carry the fault topology (what wrapped what) with none of
+    the payload: an exception's ``str()`` may embed SQLAlchemy ``[SQL: ...]``
+    / ``[parameters: ...]`` fragments, Tier-3 sanitizer output, or rendered
+    source via a chained cause. The walk is bounded on both length and
+    object identity — ``__context__`` cycles are rare but possible.
+
+    Shared by the ``_run_pipeline`` except-block diagnostic and
+    ``_on_pipeline_done``'s last-resort safety-net log so the two channels
+    describe the same failure the same way.
+    """
+    chain: list[str] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and len(chain) < limit:
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+        chain.append(type(current).__name__)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _structural_frame_path(filename: str) -> str:
+    """Reduce an absolute traceback filename to a bounded relative code path.
+
+    ``traceback.extract_tb`` reports absolute paths, which disclose the
+    deployment layout (home directory, checkout location, virtualenv path)
+    to every reader of ``runs.error``. Frames inside the package render from
+    the package root for readability (``elspeth/web/execution/service.py``);
+    everything else degrades to the bare filename.
+
+    The trailing-component cap, not the anchor, is what makes this safe:
+    the anchor is a *preference* and can over-match (a checkout directory
+    may itself be named ``elspeth``), so the result is unconditionally
+    truncated to its last ``_MAX_FRAME_PATH_PARTS`` components. No absolute
+    path and no unbounded prefix can survive that.
+    """
+    parts = PurePath(filename).parts
+    if _FRAME_PACKAGE_ROOT in parts:
+        # Last occurrence: for ``/opt/project/elspeth/src/elspeth/web/...`` it is
+        # the package directory, not the checkout, that names the module.
+        start = len(parts) - 1 - parts[::-1].index(_FRAME_PACKAGE_ROOT)
+        parts = parts[start:]
+    else:
+        parts = (PurePath(filename).name,)
+    return "/".join(parts[-_MAX_FRAME_PATH_PARTS:])
+
+
+def _structural_traceback_frames(exc: BaseException, *, limit: int = _MAX_OPERATOR_TRACEBACK_FRAMES) -> list[str]:
+    """Return the tail of ``exc``'s traceback as ``file:line:function`` strings.
+
+    Code structure only. ``FrameSummary.line`` (the rendered source text) and
+    frame locals are deliberately dropped: source text and locals can carry
+    literals, credentials, and row payloads — exactly the material the audit
+    trail keeps out of the run-level error column. A file/line/function
+    triple names *where* the fault surfaced without quoting anything.
+    """
+    frames = traceback.extract_tb(exc.__traceback__)
+    return [f"{_structural_frame_path(frame.filename)}:{frame.lineno}:{frame.name}" for frame in frames[-limit:]]
+
+
+def _scrubbed_exception_message(exc: BaseException) -> str:
+    """Return ``str(exc)`` secret-scrubbed and length-bounded.
+
+    ``scrub_text_for_audit`` replaces the whole string when it matches a
+    candidate-secret pattern (partial redaction leaks structure), so a
+    message carrying a token becomes the redaction marker rather than a
+    truncated token. Truncation is applied after scrubbing — it is a bound,
+    never a redaction mechanism.
+
+    Operator-diagnostic callers must go through :func:`_operator_exc_message`
+    instead: scrubbing alone does NOT make a ``pydantic.ValidationError``
+    safe, because its ``str()`` interleaves raw ``input_value=...`` fragments
+    that only *sometimes* match a candidate-secret pattern.
+    """
+    return _bounded_scrubbed_text(str(exc))
+
+
+def _bounded_scrubbed_text(text: str) -> str:
+    scrubbed = scrub_text_for_audit(text).strip()
+    if len(scrubbed) > _MAX_OPERATOR_EXC_MESSAGE_CHARS:
+        return scrubbed[: _MAX_OPERATOR_EXC_MESSAGE_CHARS - 1].rstrip() + "…"
+    return scrubbed
+
+
+def _operator_exc_message(exc: BaseException) -> str:
+    """Return the exception-message component of the operator diagnostic.
+
+    ``pydantic.ValidationError`` is special-cased: its ``str()`` embeds an
+    ``input_value=...`` fragment for every error — the raw config/row payload
+    the audit trail keeps out of ``runs.error`` — and ``scrub_text_for_audit``
+    only replaces candidate-secret *patterns*, so an arbitrary payload sails
+    through the scrubber intact. The field-name diagnostics from
+    :func:`_schema_contract_violation_errors` (dotted ``loc`` plus the
+    pydantic error ``type``, never the input) carry the actionable part with
+    no input echo. ``isinstance`` — not the exact-type check the
+    schema-contract slog uses for its closed taxonomy — so a ValidationError
+    subclass cannot reintroduce the leak. Every other exception keeps the
+    scrubbed, bounded ``str(exc)``.
+    """
+    if isinstance(exc, PydanticValidationError):
+        violations = "; ".join(f"{error['loc']} ({error['type']})" for error in _schema_contract_violation_errors(exc))
+        rendered = f"{exc.error_count()} schema contract violation(s)" + (f": {violations}" if violations else "")
+        return _bounded_scrubbed_text(rendered)
+    return _scrubbed_exception_message(exc)
+
+
+def _operator_failure_diagnostic(
+    *,
+    class_chain: Sequence[str],
+    exc_message: str,
+    node_id: str | None,
+    frames: Sequence[str],
+) -> str:
+    """Assemble the operator-facing text persisted to ``runs.error``.
+
+    Sibling of :func:`_sanitize_error_for_client` and deliberately NOT the
+    same string. Before this split both surfaces carried the bare
+    ``"Pipeline execution failed (ValueError)"`` message, so a web run
+    failure recorded the fault's *class* and nothing else — while the engine
+    had already written the full exception, its type, and the failing node to
+    the Landscape ``node_states`` row. An operator reading the runs view got
+    39 characters; the evidence existed but never reached them.
+
+    ``runs.error`` is the operator surface, so it carries what an operator
+    needs to act: which class chain fired, what it said, which node died,
+    and where in the code it surfaced. Precedent for richer text in this
+    column is :func:`_structural_failure_message`, which inlines per-row
+    failure samples read back from Landscape; the REST diagnostics
+    projection makes the same call for raw operation error text (see
+    ``diagnostics.llm_safe_diagnostics_snapshot``, which re-scrubs at the
+    LLM boundary rather than starving the operator UI).
+
+    Every component is bounded and secret-scrubbed by its producer, and none
+    of them echoes a row payload — including ``exc_message``, which callers
+    obtain from :func:`_operator_exc_message` so that a
+    ``pydantic.ValidationError``'s ``input_value=...`` fragments are replaced
+    by field-name diagnostics before the text reaches this column. The live
+    SSE ``detail`` stays sanitized.
+
+    The node line is hedged ("Most recent recorded node failure"), not
+    asserted as THE failing node: ``_lookup_failed_node_id`` returns the
+    newest FAILED ``node_states`` row for the run, which is the fault site in
+    the common single-failure case but is an attribution heuristic when
+    several nodes failed before the run unwound.
+    """
+    lines = [f"Pipeline execution failed ({class_chain[0]})"]
+    if len(class_chain) > 1:
+        lines.append(f"Exception chain (outermost first): {' <- '.join(class_chain)}")
+    if exc_message:
+        lines.append(f"Message: {exc_message}")
+    if node_id is not None:
+        lines.append(f"Most recent recorded node failure: {node_id}")
+    else:
+        lines.append("Most recent recorded node failure: none recorded (failure occurred before any node reached a FAILED state)")
+    if frames:
+        lines.append("Structural traceback (most recent call last):")
+        lines.extend(f"  • {frame}" for frame in frames)
+    return "\n".join(lines)
+
+
+def _schema_contract_violation_errors(exc: PydanticValidationError) -> list[dict[str, str]]:
+    """Extract field-level schema diagnostics without raw input values."""
+    return [
+        {
+            "loc": ".".join(str(part) for part in error["loc"]) or "<root>",
+            "type": str(error["type"]),
+        }
+        for error in exc.errors(include_url=False, include_input=False)
+    ]
+
+
+# Phase 2.2 (elspeth-0de989c56d): mapping from the engine's L0 RunStatus
+# to the L3 SessionRunStatus Literal that the API surfaces and the web
+# sessions DB persists.  The two enums share the same value strings for
+# the four-value taxonomy (completed / completed_with_failures / failed /
+# empty) so the mapping is the lower-case enum value.  RUNNING and
+# INTERRUPTED don't appear here — INTERRUPTED is mapped to "cancelled" in
+# the GracefulShutdownError branch separately, and RUNNING is non-terminal
+# (the engine never returns it from a normal completion path).
+_RUN_RESULT_STATUS_TO_SESSION_STATUS: dict[RunStatus, SessionRunStatus] = {
+    RunStatus.COMPLETED: "completed",
+    RunStatus.COMPLETED_WITH_FAILURES: "completed_with_failures",
+    RunStatus.FAILED: "failed",
+    RunStatus.EMPTY: "empty",
+}
+
+
+def _run_token_usage_entries(landscape_db: LandscapeDB, *, landscape_run_id: str) -> tuple[TokenUsageEntry, ...]:
+    """The run's LLM calls in creation order, as token-ledger entries (Task I1 run adapter).
+
+    Reads the Landscape ``calls`` token columns (epoch 40): ``call_type='llm'``
+    rows are the logical LLM calls, parented by a node state or by an operation;
+    transport rows never carry the charge (sso-design.md:855). Prefer the
+    provider-returned model persisted with the outcome. Calls without a
+    returned model use node configuration, then plugin name. Missing usage stays
+    unknown even for errors: a dispatched timeout may already have been billed.
+    Call identity and creation time preserve replay and UTC-day attribution.
+    """
+    measures = (
+        calls_table.c.call_id,
+        calls_table.c.created_at,
+        calls_table.c.status,
+        calls_table.c.prompt_tokens,
+        calls_table.c.completion_tokens,
+        calls_table.c.cached_prompt_tokens,
+        calls_table.c.reasoning_tokens,
+        calls_table.c.returned_model,
+        nodes_table.c.plugin_name,
+        nodes_table.c.config_json,
+    )
+    with landscape_db.read_only_connection() as conn:
+        state_calls = conn.execute(
+            select(*measures)
+            .select_from(
+                calls_table.join(node_states_table, calls_table.c.state_id == node_states_table.c.state_id).join(
+                    nodes_table,
+                    and_(nodes_table.c.node_id == node_states_table.c.node_id, nodes_table.c.run_id == node_states_table.c.run_id),
+                )
+            )
+            .where(node_states_table.c.run_id == landscape_run_id, calls_table.c.call_type == CallType.LLM.value)
+        ).all()
+        operation_calls = conn.execute(
+            select(*measures)
+            .select_from(
+                calls_table.join(operations_table, calls_table.c.operation_id == operations_table.c.operation_id).join(
+                    nodes_table,
+                    and_(nodes_table.c.node_id == operations_table.c.node_id, nodes_table.c.run_id == operations_table.c.run_id),
+                )
+            )
+            .where(operations_table.c.run_id == landscape_run_id, calls_table.c.call_type == CallType.LLM.value)
+        ).all()
+    entries: list[TokenUsageEntry] = []
+    for row in sorted([*state_calls, *operation_calls], key=lambda call: (call.created_at, call.call_id)):
+        config = json.loads(row.config_json)
+        model = row.returned_model
+        if model is None:
+            model = row.plugin_name
+            for key in ("model", "deployment_name"):
+                if key in config and config[key] is not None:
+                    model = config[key]
+                    break
+        entries.append(
+            TokenUsageEntry(
+                model=model,
+                prompt_tokens=row.prompt_tokens,
+                completion_tokens=row.completion_tokens,
+                cached_prompt_tokens=row.cached_prompt_tokens,
+                reasoning_tokens=row.reasoning_tokens,
+                call_id=row.call_id,
+                recorded_at=row.created_at.replace(tzinfo=UTC) if row.created_at.tzinfo is None else row.created_at,
+            )
+        )
+    return tuple(entries)
+
+
+def _session_status_from_run_result_status(status: RunStatus) -> SessionRunStatus:
+    """Translate the engine's L0 RunStatus to the API's SessionRunStatus.
+
+    Raises:
+        ValueError: when the engine returns a status this site does not
+            handle (RUNNING, INTERRUPTED).  RUNNING from a normal
+            completion path is a framework-level invariant violation;
+            INTERRUPTED is handled by the GracefulShutdownError branch
+            with explicit ``status="cancelled"``.
+    """
+    try:
+        return _RUN_RESULT_STATUS_TO_SESSION_STATUS[status]
+    except KeyError as exc:
+        raise ValueError(
+            f"Cannot translate RunStatus {status!r} to a SessionRunStatus on the success path. "
+            f"INTERRUPTED is handled by the GracefulShutdownError branch; RUNNING is non-terminal "
+            f"and must not appear after orchestrator.run() returns."
+        ) from exc
+
+
+def _structural_failure_message(*, rows_processed: int, collector_groups_failed: int = 0, failure_samples: str = "") -> str:
+    """elspeth-0de989c56d / elspeth-5069612f3c — synthetic structural error
+    for FAILED-from-row-shape after the rows_routed split.
+
+    The L3 RunRecord.__post_init__ invariant requires a non-empty error for
+    status='failed'. When the engine returns RunStatus.FAILED from a row or
+    collector-group verdict (no exception propagated; no success indicator:
+    rows_succeeded == 0 AND rows_routed_success == 0), this helper produces a structural fact —
+    operator-readable, no candidate-secret material, no echoed user-row data.
+
+    After elspeth-5069612f3c, gate-routed pipelines (rows_routed_success > 0)
+    no longer reach this code path — they classify as COMPLETED. This message
+    fires only when no row reached EITHER the success-counted terminal state
+    OR an intentional gate-routed sink. A collector group can fail with no
+    arrived members, so the message includes its separate structural count.
+
+    ``failure_samples`` is an optional pre-formatted bullet list summarising
+    the dominant per-row failures as count + failing node + error category
+    (see ``failure_samples.format_failure_categories``).  It carries no
+    per-row error text: this string egresses to the non-audit sessions DB,
+    the HTTP run-status response, and the SSE stream, so the raw Tier-3
+    message is deliberately not available to it (elspeth-30416e67cc).  When
+    supplied, it is appended so the runs view names the dominant failure
+    modes inline — the panel-expand affordance still has the full per-token
+    drill-down, including the free text.
+    """
+    base = (
+        f"No row reached a success path (rows_processed={rows_processed}, "
+        f"rows_succeeded=0, rows_routed_success=0, "
+        f"collector_groups_failed={collector_groups_failed})."
+    )
+    if collector_groups_failed:
+        base += " Structural collector-group failures occurred."
+    else:
+        base += " All rows either failed terminally or were routed via on_error to a failure sink."
+    if failure_samples:
+        return f"{base} Top per-row failures:\n{failure_samples}"
+    if collector_groups_failed:
+        return f"{base} Expand this run for failure accounting."
+    return f"{base} Expand this run for per-row failure details."
+
+
+def _partial_completion_message(
+    *,
+    rows_succeeded: int,
+    rows_failed: int,
+    rows_routed_failure: int,
+    rows_quarantined: int,
+    collector_groups_failed: int = 0,
+    failure_samples: str = "",
+) -> str:
+    """Operator-readable summary for COMPLETED_WITH_FAILURES runs.
+
+    Sibling to ``_structural_failure_message``: a structural fact, no
+    candidate-secret material, no echoed user-row data. Populated into
+    ``session_error`` so the frontend (and any other audit consumer) has a
+    single field to render for failure-like terminal runs without needing to
+    re-implement the L0 ``failure_indicator`` predicate.
+
+    The RunRecord invariant at sessions/protocol.py:237-238 requires a
+    non-empty ``error`` only for ``status='failed'`` — populating ``error``
+    on COMPLETED_WITH_FAILURES is permitted, and the schema validators
+    accept it (see tests/unit/web/execution/test_schemas.py:1156).
+
+    ``failure_samples`` mirrors the same parameter on
+    ``_structural_failure_message`` — see its docstring.
+    """
+    base = (
+        f"Run completed with failures (rows_succeeded={rows_succeeded}, "
+        f"rows_failed={rows_failed}, rows_routed_failure={rows_routed_failure}, "
+        f"rows_quarantined={rows_quarantined}, "
+        f"collector_groups_failed={collector_groups_failed})."
+    )
+    if failure_samples:
+        return f"{base} Top per-row failures:\n{failure_samples}"
+    return f"{base} Expand this run for per-row failure details."
+
+
+def _load_most_recent_failed_node_id(landscape_db: LandscapeDB, *, run_id: str) -> str | None:
+    """Read the newest recorded failed node from Landscape.
+
+    This read-only audit query lives outside ``ExecutionServiceImpl`` so the
+    class's authority-bearing ``execute`` method cannot be confused with a
+    SQLAlchemy connection's method of the same name by the static execution-
+    effect analysis. Session and blob mutations remain direct, inspected
+    class calls carrying the exact transferred operation context.
+    """
+    stmt = (
+        select(node_states_table.c.node_id)
+        .where(
+            node_states_table.c.run_id == run_id,
+            node_states_table.c.status == NodeStateStatus.FAILED,
+        )
+        .order_by(
+            # ``completed_at`` newest-first is the temporal signal; the
+            # ``state_id`` tiebreak is NOT temporal (ids are not ordered by
+            # time) — it only makes the pick deterministic when two FAILED
+            # rows share a timestamp.
+            node_states_table.c.completed_at.desc(),
+            node_states_table.c.state_id.desc(),
+        )
+        .limit(1)
+    )
+    with landscape_db.read_only_connection() as conn:
+        # Row iteration over a LIMIT-1 select mirrors
+        # ``load_top_failure_samples``. An empty result falls through to the
+        # node-less return without fabricating a diagnostic.
+        for (node_id,) in conn.execute(stmt):
+            return str(node_id)
+    return None
+
+
+# B1 fix: RunAlreadyActiveError is NOT defined here — imported from
+# sessions.protocol where the canonical definition lives. Defining a
+# second class with the same name would prevent app.py's global
+# exception handler (which catches sessions.protocol.RunAlreadyActiveError)
+# from catching exceptions raised here.
+
+
+_TRAINED_OPERATOR_COMPOSITION_ROOT = object()
+
+
+@dataclass(eq=False, slots=True)
+class _ExecutionLossWatcherOwner:
+    lease: SessionOperationLease
+    close_requested: asyncio.Event
+    task: asyncio.Task[None] | None = None
+    outcome: tuple[asyncio.Task[None], BaseException | None] | None = None
+
+
+class ExecutionServiceImpl:
+    """Pipeline execution service with ThreadPoolExecutor backend.
+
+    Construction: Created inside the FastAPI lifespan async context manager
+    (after ProgressBroadcaster), NOT in the synchronous create_app() factory.
+    Stored as application state and injected into route handlers via FastAPI's
+    dependency injection. The event loop reference is obtained from
+    asyncio.get_running_loop() in the lifespan (same loop as ProgressBroadcaster).
+
+    Thread model: execute() submits _run_pipeline() to a ThreadPoolExecutor
+    with max_workers=1. The pipeline runs in a background thread. All other
+    methods run in the asyncio event loop thread.
+
+    B8/C1 fix: SessionService methods are async. _run_pipeline() runs in a
+    background thread and uses _call_async() to bridge async calls back to
+    the main event loop via asyncio.run_coroutine_threadsafe().
+    """
+
+    def __init__(
+        self,
+        *,
+        loop: asyncio.AbstractEventLoop,
+        broadcaster: ProgressBroadcaster,
+        settings: WebSettings,
+        session_service: SessionServiceProtocol,
+        yaml_generator: YamlGenerator,
+        telemetry: _SessionsTelemetry,
+        execution_lease_release_registry: ExecutionLeaseReleaseRegistry,
+        blob_service: BlobServiceProtocol | None = None,
+        secret_service: WebSecretResolver | None = None,
+        plugin_snapshot_factory: Callable[[str], PluginAvailabilitySnapshot] | None,
+        operator_profile_registry: OperatorProfileRegistry | None,
+        web_plugin_policy: WebPluginPolicy | None,
+        catalog: CatalogService,
+        principal_is_active: Callable[[str], bool] | None = None,
+        _composition_root: object | None = None,
+    ) -> None:
+        if type(execution_lease_release_registry) is not ExecutionLeaseReleaseRegistry:
+            raise AuditIntegrityError("Execution service lacks exact application cleanup registry")
+        self.execution_lease_release_registry = execution_lease_release_registry
+        trained_operator_mode = _composition_root is _TRAINED_OPERATOR_COMPOSITION_ROOT
+        if plugin_snapshot_factory is None:
+            raise TypeError("plugin_snapshot_factory must be provided")
+        if operator_profile_registry is None and not trained_operator_mode:
+            raise TypeError("operator_profile_registry must be provided")
+        if web_plugin_policy is None and not trained_operator_mode:
+            raise TypeError("web_plugin_policy must be provided")
+        self._loop = loop
+        self._broadcaster = broadcaster
+        self._settings = settings
+        self._session_service = session_service
+        self._yaml_generator = yaml_generator
+        self._telemetry = telemetry
+        self._blob_service = blob_service
+        self._secret_service = secret_service
+        # Server-authored secret→destination allowlist (elspeth-f3c1aafd25);
+        # derived once from settings — deny-by-default when no rules exist.
+        self._secret_wiring_policy = runtime_secret_wiring_policy(settings.secret_wiring_allowlist)
+        self._plugin_snapshot_factory = plugin_snapshot_factory
+        self._operator_profile_registry = operator_profile_registry
+        self._web_plugin_policy = web_plugin_policy
+        self._catalog = catalog
+        self._trained_operator_mode = trained_operator_mode
+        self._principal_is_active = principal_is_active
+        # AC #17: No run_repository — all Run CRUD delegates to SessionService
+        # via create_run(), update_run_status(), get_active_run(), get_run().
+        # R6 expanded params: landscape_run_id, pipeline_yaml, rows_processed,
+        # rows_failed.
+        self._executor: ThreadPoolExecutor | None = None
+        self._executor_join_task: asyncio.Task[None] | None = None
+        self._registry_join_task: asyncio.Task[None] | None = None
+        self._shutdown_join_declared = False
+        self._executor_join_outcome: tuple[asyncio.Task[None], BaseException | None] | None = None
+        self._registry_join_outcome: tuple[asyncio.Task[None], BaseException | None] | None = None
+        self._pipeline_completion_owners: dict[Future[_RunPipelineOutcome], ExecutionAcquisitionObligation] = {}
+        self._pipeline_completion_started: set[Future[_RunPipelineOutcome]] = set()
+        self._pipeline_watchers: dict[ExecutionAcquisitionObligation, asyncio.Task[None]] = {}
+        self._loss_watcher_owners: list[_ExecutionLossWatcherOwner] = []
+        self._failed_submission_cleanup_started: set[ExecutionAcquisitionObligation] = set()
+        self._shutdown_events: dict[str, threading.Event] = {}
+        self._shutdown_events_lock = threading.Lock()
+        self._lease_completion_futures: set[Future[None]] = set()
+        # Advisory validate_state memo: collapses the POST /validate +
+        # GET /audit-readiness pair for one composition version. Execution
+        # and approval binding never read it (they call the preflight
+        # directly). See validation_memo.py for key, bound and lifetime.
+        self._validation_memo = ValidationResultMemo()
+
+        # Per-session asyncio lock to prevent TOCTOU on the active-run check.
+        # Keyed by session_id string; lazily created, cleaned up on session
+        # deletion via cleanup_session_lock().
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        # OpenRouter catalog snapshot id, populated by the lifespan after
+        # the boot probe via ``set_openrouter_catalog_snapshot()``. Both
+        # fields are required to be present before any pipeline executes
+        # — run-create writes them into the Landscape ``runs`` row.
+        # ``None`` here is a programmer bug (lifespan never set them) and
+        # crashes loudly at ``_run_pipeline`` rather than silently
+        # dropping the audit field.
+        self._openrouter_catalog_sha256: str | None = None
+        self._openrouter_catalog_source: Literal["live", "bundled"] | None = None
+        # The application retains this exact bound owner even if construction
+        # fails after allocation and the service never reaches app.state.
+        self._shutdown_finalizer = execution_lease_release_registry.owner.register(
+            ApplicationFinalizerKind.EXECUTION_EXECUTOR_JOIN, self.join_executor_shutdown
+        )
+        execution_lease_release_registry.bind_executor_finalizer(self._shutdown_finalizer)
+        execution_lease_release_registry.declare_executor_allocation(self._shutdown_finalizer)
+        try:
+            self._executor = ThreadPoolExecutor(max_workers=1)
+            execution_lease_release_registry.bind_execution_executor(self._shutdown_finalizer, self._executor)
+        except BaseException as original:
+            execution_lease_release_registry.record_failure(original)
+            raise
+
+    @classmethod
+    def for_trained_operator(cls, **kwargs: Any) -> ExecutionServiceImpl:
+        """Explicit non-web composition root with unrestricted local policy context."""
+        from elspeth.web.dependencies import create_catalog_service
+
+        catalog, snapshot = _trained_operator_catalog_and_snapshot(kwargs, create_catalog_service)
+        return cls(
+            plugin_snapshot_factory=lambda _user_id: snapshot,
+            operator_profile_registry=None,
+            web_plugin_policy=None,
+            catalog=catalog,
+            _composition_root=_TRAINED_OPERATOR_COMPOSITION_ROOT,
+            **kwargs,
+        )
+
+    def _plugin_snapshot_for_user(self, user_id: str | None, *, operation: str) -> PluginAvailabilitySnapshot:
+        """Resolve policy context without treating missing wiring as a mode switch."""
+        if user_id is None:
+            if not self._trained_operator_mode:
+                raise RuntimeError(f"Authenticated user_id is required for web plugin policy {operation}.")
+            user_id = "trained-operator"
+        return self._plugin_snapshot_factory(user_id)
+
+    def _approval_inputs_from_frozen(
+        self,
+        frozen: FrozenRunSettings,
+        *,
+        user_id: str,
+        session_id: UUID,
+        session_operation_context: SessionOperationContext,
+    ) -> ApprovalGateInputs:
+        """Compile the approval tuple from the same frozen inputs used by a run.
+
+        This path deliberately applies the operator's telemetry and export
+        settings before hashing. Those settings also enter the Landscape run
+        config; the authored settings alone are not the run's config.
+        """
+        from elspeth.core.secrets import resolve_secret_refs
+        from elspeth.web.execution.export_marking import apply_operator_export_marking, operator_marked_config_dict
+        from elspeth.web.operator_telemetry import apply_operator_pipeline_telemetry
+
+        catalog_sha = self._openrouter_catalog_sha256
+        if catalog_sha is None:
+            raise RuntimeError("ExecutionServiceImpl has no OpenRouter catalog snapshot")
+        executable_config = cast(dict[str, Any], deep_thaw(frozen.executable_config))
+        # Durable execution replaces path sources with content-addressed retained
+        # paths. Predict that exact path without creating a retained copy while
+        # compiling a request; at execute the copy is made and hashed again.
+        sources: list[Any] = []
+        if "sources" in executable_config:
+            sources.extend(executable_config["sources"].values())
+        if "source" in executable_config:
+            sources.append(executable_config["source"])
+        retained_root = Path(self._settings.data_dir) / "retained-run-inputs"
+        for source in sources:
+            options = source["options"]
+            if "path" not in options:
+                continue
+            source_path = Path(options["path"])
+            with source_path.open("rb") as stream:
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            options["path"] = str(retained_root / f"{digest}{source_path.suffix}")
+        if self._secret_service is not None:
+            env_ref_names = {item.name for item in self._secret_service.list_refs(user_id)}
+            executable_config, _ = resolve_secret_refs(
+                executable_config,
+                self._secret_service,
+                user_id,
+                env_ref_names=env_ref_names,
+            )
+        inline_refs = _discover_blob_content_refs(executable_config)
+        if inline_refs:
+            blob_service = self._blob_service
+            if blob_service is None:
+                raise RuntimeError("Inline blob approval compilation requires the blob service")
+            records_by_id: dict[UUID, BlobRecord] = {}
+            for ref in inline_refs:
+                if ref.blob_id in records_by_id:
+                    continue
+                record = self._call_async(blob_service.get_blob(ref.blob_id, session_operation_context=session_operation_context))
+                if record.session_id != session_id:
+                    raise BlobNotFoundError(str(ref.blob_id))
+                records_by_id[ref.blob_id] = record
+            _enforce_blob_content_ref_metadata(
+                inline_refs,
+                records_by_id,
+                per_ref_byte_cap=BLOB_INLINE_PER_REF_BYTE_CAP,
+                aggregate_byte_cap=BLOB_INLINE_AGGREGATE_BYTE_CAP,
+            )
+            llm_node_names = {
+                node["name"]
+                for collection_key in _NODE_COLLECTION_KEYS
+                if collection_key in executable_config and type(executable_config[collection_key]) is list
+                for node in executable_config[collection_key]
+                if type(node) is dict and "plugin" in node and node["plugin"] == "llm" and "name" in node
+            }
+            refused_prompt_refs = [
+                ref
+                for ref in inline_refs
+                if is_llm_authored_prompt_surface_binding(
+                    ref.field_path,
+                    llm_node_names=llm_node_names,
+                    creation_modality=records_by_id[ref.blob_id].creation_modality,
+                )
+            ]
+            if refused_prompt_refs:
+                bound = ", ".join(f"{ref.field_path} (blob {ref.blob_id})" for ref in refused_prompt_refs)
+                raise InlineBlobPromptSurfaceAdmissionError(
+                    f"{bound} binds LLM-authored blob content into an llm prompt surface; inline prompt, "
+                    "system prompt, query template and model content admits only user-verbatim blobs"
+                )
+            contents = {
+                blob_id: self._call_async(blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context))
+                for blob_id in records_by_id
+            }
+            executable_config, _ = _substitute_blob_content_refs(
+                executable_config,
+                {ref: contents[ref.blob_id] for ref in inline_refs},
+                refs=inline_refs,
+                blob_metadata={
+                    blob_id: (cast(AllowedMimeType, record.mime_type), record.size_bytes) for blob_id, record in records_by_id.items()
+                },
+            )
+        settings = load_settings_from_config_dict(operator_marked_config_dict(executable_config, self._settings), expand_env_vars=False)
+        settings = apply_operator_pipeline_telemetry(settings, self._settings)
+        effective_export = apply_operator_export_marking(settings.landscape.export, self._settings)
+        settings = settings.model_copy(update={"landscape": settings.landscape.model_copy(update={"export": effective_export})})
+        audit_config = audit_safe_resolved_config(
+            settings,
+            audit_safe_settings=cast(dict[str, Any], deep_thaw(frozen.audit_safe_config)),
+            plugin_snapshot=frozen.plugin_snapshot,
+        )
+        return ApprovalGateInputs(
+            evidence=_build_web_plugin_policy_evidence(snapshot=frozen.plugin_snapshot, policy=self._web_plugin_policy),
+            config_hash=stable_hash(audit_config),
+            canonical_version=CANONICAL_VERSION,
+            openrouter_catalog_sha256=catalog_sha,
+            runtime_val_manifest_sha256=runtime_val_manifest_sha256(),
+        )
+
+    async def compile_approval_binding(
+        self,
+        session_id: UUID,
+        state_id: UUID,
+        *,
+        user_id: str,
+        session_operation_context: SessionOperationContext,
+    ) -> ApprovalBinding:
+        """Validate and compile a state for a human approval request."""
+        if session_operation_context.fence.session_id != str(session_id):
+            raise ValueError("approval binding context belongs to a different session")
+        try:
+            record = await self._session_service.get_state(state_id)
+        except ValueError as exc:
+            raise StateAccessError(str(state_id)) from exc
+        if record.session_id != session_id:
+            raise StateAccessError(str(state_id))
+        authored = state_from_record(record)
+        env_ref_names = (
+            frozenset(item.name for item in self._secret_service.list_refs(user_id)) if self._secret_service is not None else frozenset()
+        )
+        require_no_credential_material_in_state(
+            authored,
+            surface="composer_approval_state",
+            env_ref_names=env_ref_names,
+        )
+        semantic_errors, _, semantic_contracts = validate_semantic_contracts(authored)
+        if semantic_errors:
+            raise SemanticContractViolationError(entries=semantic_errors, contracts=semantic_contracts)
+        try:
+            completion_gates = parse_completion_gates(record.composer_meta)
+        except ValueError as exc:
+            raise CompletionGateIntegrityError(session_id=str(session_id), state_id=str(state_id)) from exc
+        materialized = materialize_state_for_execution(authored)
+        if isinstance(materialized, InterpretationReviewPending):
+            raise UnresolvedInterpretationPlaceholderError(sites=tuple(materialized.sites))
+        snapshot = self._plugin_snapshot_for_user(user_id, operation="approval binding")
+        preflight = await self._authoritative_state_preflight(
+            materialized,
+            plugin_snapshot=snapshot,
+            user_id=user_id,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+            completion_gates=completion_gates,
+            completion_gate_state=authored,
+        )
+        if not preflight.is_valid:
+            raise PipelineValidationError(errors=tuple(preflight.errors), readiness=preflight.readiness)
+        if not preflight.readiness.execution_ready:
+            raise ExecutionReadinessError(blockers=tuple(preflight.readiness.blockers))
+        policy_result = validate_plugin_policy(
+            materialized,
+            snapshot=snapshot,
+            profile_registry=self._operator_profile_registry,
+            catalog=self._catalog,
+        )
+        if policy_result.findings:
+            raise RuntimeError("Plugin policy validation diverged between approval preflight and runtime preparation")
+        audit_yaml = resolve_runtime_yaml_paths(
+            self._yaml_generator.generate_yaml(materialized), str(self._settings.data_dir), session_id=str(session_id)
+        )
+        executable_yaml = resolve_runtime_yaml_paths(
+            self._yaml_generator.generate_yaml(policy_result.executable_state),
+            str(self._settings.data_dir),
+            session_id=str(session_id),
+        )
+        audit_config = load_bounded_pipeline_yaml(audit_yaml)
+        executable_config = load_bounded_pipeline_yaml(executable_yaml)
+        if type(audit_config) is not dict or type(executable_config) is not dict:
+            raise TypeError("YamlGenerator.generate_yaml() must produce a mapping for approval compilation")
+        frozen = FrozenRunSettings(
+            plugin_snapshot=snapshot,
+            executable_config=cast(dict[str, Any], executable_config),
+            audit_safe_config=cast(dict[str, Any], audit_config),
+            profiled_s3_audit_identities=policy_result.profiled_s3_audit_identities,
+            profiled_textract_audit_identities=policy_result.profiled_textract_audit_identities,
+        )
+        inputs = await run_sync_in_worker(
+            self._approval_inputs_from_frozen,
+            frozen,
+            user_id=user_id,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+        )
+        return inputs.binding
+
+    def _authoritative_proof_blob_resolver(
+        self,
+        state: CompositionState,
+        *,
+        session_id: UUID | None,
+        session_operation_context: SessionOperationContext,
+        blob_reads: BlobReadLog | None = None,
+    ) -> _AuthoritativeProofContext:
+        """Resolve only exact, session-owned, ready blob bindings for proof.
+
+        ``blob_reads`` (advisory validate_state memo only) records every
+        metadata row consulted; a failed content read marks the run
+        uncacheable.
+        """
+        from elspeth.web.composer.tools.blobs import BlobToolRecord
+        from elspeth.web.composer.tools.generation import (
+            MalformedSourceProofClaim,
+            ResolvedProofBlob,
+            UnresolvedClaimedProofBlob,
+            _admit_source_proof_claims,
+            _AuthoritativeProofContext,
+        )
+        from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS
+
+        # Every authored source blob_ref is a custody claim. If its live
+        # binding cannot be resolved, the bounded proof must fail closed.
+        claimed_blob_ids: set[str] = set()
+        expected_paths_by_blob_id: dict[str, set[str]] = {}
+        if type(session_operation_context) is not SessionOperationContext:
+            raise AuditIntegrityError("Authoritative source proof requires the actual session operation context")
+        if session_id is not None and session_operation_context.fence.session_id != str(session_id):
+            raise AuditIntegrityError("Authoritative source proof context belongs to another session")
+        try:
+            claims = _admit_source_proof_claims(state)
+        except MalformedSourceProofClaim as exc:
+            raise MalformedBlobRefError(f"sources.{exc.source_name}.blob_ref must be a canonical UUID string") from exc
+        for _source_name, source, raw_blob_id in claims:
+            claimed_blob_ids.add(raw_blob_id)
+            paths = {
+                value
+                for key in SOURCE_LOCAL_PATH_OPTION_KEYS
+                if type(value := source.options[key] if key in source.options else None) is str
+            }
+            if not paths:
+                continue
+            if raw_blob_id not in expected_paths_by_blob_id:
+                expected_paths_by_blob_id[raw_blob_id] = set()
+            expected_paths_by_blob_id[raw_blob_id].update(paths)
+
+        resolved_by_blob_id: dict[str, ResolvedProofBlob | UnresolvedClaimedProofBlob | None] = {}
+
+        def _unresolved(blob_id: str) -> UnresolvedClaimedProofBlob | None:
+            return UnresolvedClaimedProofBlob() if blob_id in claimed_blob_ids else None
+
+        def _resolve(blob_id: str) -> ResolvedProofBlob | UnresolvedClaimedProofBlob | None:
+            if blob_id in resolved_by_blob_id:
+                return resolved_by_blob_id[blob_id]
+            if self._blob_service is None or session_id is None or blob_id not in expected_paths_by_blob_id:
+                resolved_by_blob_id[blob_id] = _unresolved(blob_id)
+                return resolved_by_blob_id[blob_id]
+            # Membership above proves this is a canonical UUID admitted while
+            # building expected_paths_by_blob_id; a second parse cannot fail.
+            parsed_blob_id = UUID(blob_id)
+            try:
+                record = self._call_async(self._blob_service.get_blob(parsed_blob_id, session_operation_context=session_operation_context))
+            except BlobNotFoundError:
+                if blob_reads is not None:
+                    blob_reads.record(parsed_blob_id, None)
+                resolved_by_blob_id[blob_id] = _unresolved(blob_id)
+                return resolved_by_blob_id[blob_id]
+            if type(record) is not BlobRecord:
+                raise TypeError("BlobServiceProtocol.get_blob() must return an exact BlobRecord")
+            if blob_reads is not None:
+                blob_reads.record(parsed_blob_id, record)
+            if (
+                record.id != parsed_blob_id
+                or record.session_id != session_id
+                or record.status != "ready"
+                or expected_paths_by_blob_id[blob_id] != {record.storage_path}
+            ):
+                resolved_by_blob_id[blob_id] = _unresolved(blob_id)
+                return resolved_by_blob_id[blob_id]
+            metadata = cast(
+                BlobToolRecord,
+                {
+                    "id": str(record.id),
+                    "session_id": str(record.session_id),
+                    "filename": record.filename,
+                    "mime_type": record.mime_type,
+                    "size_bytes": record.size_bytes,
+                    "content_hash": record.content_hash,
+                    "storage_path": record.storage_path,
+                    "created_by": record.created_by,
+                    "source_description": record.source_description,
+                    "status": record.status,
+                    "creation_modality": record.creation_modality.value,
+                    "created_from_message_id": record.created_from_message_id,
+                    "creating_model_identifier": record.creating_model_identifier,
+                    "creating_model_version": record.creating_model_version,
+                    "creating_provider": record.creating_provider,
+                    "creating_composer_skill_hash": record.creating_composer_skill_hash,
+                    "creating_arguments_hash": record.creating_arguments_hash,
+                },
+            )
+            try:
+                verified_prefix, verified_content_hash, total_size_bytes = self._call_async(
+                    self._blob_service.read_blob_content_prefix_verified(
+                        parsed_blob_id,
+                        prefix_bytes=8 * 1024,
+                        session_operation_context=session_operation_context,
+                    )
+                )
+            except (BlobNotFoundError, BlobContentMissingError, BlobStateError):
+                if blob_reads is not None:
+                    blob_reads.mark_uncacheable()
+                resolved_by_blob_id[blob_id] = _unresolved(blob_id)
+                return resolved_by_blob_id[blob_id]
+            resolved = ResolvedProofBlob(
+                metadata=metadata,
+                verified_prefix=verified_prefix,
+                verified_content_hash=verified_content_hash,
+                total_size_bytes=total_size_bytes,
+            )
+            resolved_by_blob_id[blob_id] = resolved
+            return resolved
+
+        return _AuthoritativeProofContext(resolve=_resolve)
+
+    def _authoritative_state_preflight_sync(
+        self,
+        state: CompositionState,
+        *,
+        plugin_snapshot: PluginAvailabilitySnapshot,
+        user_id: str | None,
+        session_id: UUID | None,
+        session_operation_context: SessionOperationContext,
+        blob_reads: BlobReadLog | None = None,
+    ) -> ValidationResult:
+        """Run the canonical 23 checks and bounded source proof in one worker.
+
+        ``blob_reads`` is supplied only by the advisory validate_state memo.
+        """
+        from elspeth.web.composer.tools.generation import compute_proof_diagnostics
+        from elspeth.web.execution.validation import validate_pipeline
+
+        def _blob_get_metadata(blob_id: UUID) -> BlobRecord | None:
+            if self._blob_service is None:
+                return None
+            try:
+                record = self._call_async(self._blob_service.get_blob(blob_id, session_operation_context=session_operation_context))
+            except BlobNotFoundError:
+                return None
+            if type(record) is not BlobRecord:
+                raise TypeError("BlobServiceProtocol.get_blob() must return an exact BlobRecord")
+            if session_id is not None and record.session_id != session_id:
+                return None
+            return record
+
+        def _observed_blob_metadata(blob_id: UUID) -> BlobRecord | None:
+            # The advisory validate_state memo records what validation SAW:
+            # the session-filtered view above (a row owned by another session
+            # reads as absent). ``_blob_reads_still_current`` applies the same
+            # filter when it re-checks a hit, so the two views agree.
+            record = _blob_get_metadata(blob_id)
+            if blob_reads is not None:
+                blob_reads.record(blob_id, record)
+            return record
+
+        def _blob_get_content(blob_id: UUID) -> tuple[BlobRecord, bytes]:
+            if self._blob_service is None:
+                raise BlobNotFoundError(str(blob_id))
+            try:
+                content = self._call_async(
+                    self._blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context)
+                )
+            except BaseException:
+                # A failed content read is not a function of the metadata row
+                # the memo re-checks on a hit, so the run must not be stored.
+                if blob_reads is not None:
+                    blob_reads.mark_uncacheable()
+                raise
+            record = _observed_blob_metadata(blob_id)
+            if record is None:
+                raise BlobNotFoundError(str(blob_id))
+            return record, content
+
+        result = validate_pipeline(
+            state,
+            self._settings,
+            self._yaml_generator,
+            secret_service=self._secret_service,
+            secret_wiring_policy=self._secret_wiring_policy,
+            user_id=user_id,
+            blob_get_metadata=_observed_blob_metadata,
+            blob_get_content=_blob_get_content,
+            session_id=str(session_id) if session_id is not None else None,
+            plugin_snapshot=plugin_snapshot,
+            profile_registry=self._operator_profile_registry,
+            catalog=self._catalog,
+        )
+        if not result.is_valid:
+            return result
+
+        diagnostics = compute_proof_diagnostics(
+            state,
+            context=self._authoritative_proof_blob_resolver(
+                state,
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+                blob_reads=blob_reads,
+            ),
+        )
+        return _merge_authoritative_proof_diagnostics(result, diagnostics)
+
+    async def _authoritative_state_preflight(
+        self,
+        state: CompositionState,
+        *,
+        plugin_snapshot: PluginAvailabilitySnapshot,
+        user_id: str | None,
+        session_id: UUID | None,
+        session_operation_context: SessionOperationContext,
+        completion_gates: CompletionGateFacts | None,
+        completion_gate_state: CompositionState | None = None,
+        blob_reads: BlobReadLog | None = None,
+    ) -> ValidationResult:
+        """Authoritative shared validation used by both validate and execute."""
+
+        def _preflight() -> ValidationResult:
+            # A real call edge, not a ``partial``: the session-operation-lease
+            # gate follows ``self.<member>(...)`` and proves the exact context
+            # reaches the worker-side preflight (elspeth-01e919e13e).
+            return self._authoritative_state_preflight_sync(
+                state,
+                plugin_snapshot=plugin_snapshot,
+                user_id=user_id,
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+                blob_reads=blob_reads,
+            )
+
+        result = await run_sync_in_worker(_preflight)
+        fingerprint_state = state if completion_gate_state is None else completion_gate_state
+        return merge_completion_gates(result, completion_gates, fingerprint_state)
+
+    def _require_current_binding_generation(self, frozen: FrozenRunSettings, *, user_id: str | None) -> None:
+        """Refuse a queued run when its credential/profile binding has rotated."""
+        current = self._plugin_snapshot_for_user(user_id, operation="queued execution revalidation")
+        if current.binding_generation_fingerprint != frozen.plugin_snapshot.binding_generation_fingerprint:
+            raise RuntimeError("Plugin binding changed while execution was queued; submit the run again.")
+
+    def set_openrouter_catalog_snapshot(self, *, sha256: str, source: str) -> None:
+        """Record the boot-time OpenRouter catalog snapshot id.
+
+        Called once from the FastAPI lifespan after
+        :func:`prime_openrouter_catalog_from_live` completes (success or
+        bundled fallback). Both arguments are required and concrete
+        (non-empty string) — the lifespan reads them from
+        :func:`elspeth.plugins.transforms.llm.model_catalog.read_openrouter_catalog_snapshot_id`
+        which never returns ``None``.
+
+        Snapshot is invariant for the process lifetime: re-priming is
+        not supported (staging is restarted on deploys, and a restart
+        re-runs the lifespan).
+        """
+        if not is_valid_sha256_hex(sha256):
+            raise RuntimeError(f"openrouter_catalog_sha256 must be 64 lowercase hex chars, got {sha256!r}")
+        if source not in ("live", "bundled"):
+            raise RuntimeError(f"openrouter_catalog_source must be 'live' or 'bundled', got {source!r}")
+        self._openrouter_catalog_sha256 = sha256
+        self._openrouter_catalog_source = cast(Literal["live", "bundled"], source)
+
+    def _call_async(self, coro: Coroutine[Any, Any, T]) -> T:
+        """Bridge an async call from the background thread to the main event loop.
+
+        B8/C1 fix: SessionService methods are async, but _run_pipeline() runs
+        in a ThreadPoolExecutor worker thread. This helper schedules the
+        coroutine on the main event loop and blocks until it completes.
+
+        R6 fix: 30-second timeout prevents indefinite hangs if the event loop
+        cannot run the scheduled coroutine during shutdown or another
+        infrastructure stall.
+        """
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=30.0)
+
+    def get_live_run_ids(self) -> frozenset[str]:
+        """Return run IDs still owned by an executor thread.
+
+        A run ID is present in _shutdown_events from the moment it is
+        registered in _execute_locked (before thread pool submission)
+        until the _run_pipeline finally block removes it.
+
+        Cancellation only signals the worker thread via Event.set(); it
+        does not mean the thread has finished its GracefulShutdownError
+        unwinding or finalization work. Periodic orphan cleanup must keep
+        excluding signalled runs until the worker removes them here.
+
+        Thread-safe: returns a snapshot under the lock.
+        """
+        with self._shutdown_events_lock:
+            return frozenset(self._shutdown_events)
+
+    def cleanup_session_lock(self, session_id: str) -> None:
+        """Remove the per-session asyncio lock for a deleted session.
+
+        Called from the delete_session route after archive_session()
+        completes. Matches the ProgressBroadcaster.cleanup_run() pattern.
+        """
+        self._session_locks.pop(session_id, None)
+
+    def get_session_lock(self, session_id: str) -> asyncio.Lock:
+        """Return the per-session lock shared by execute() and deletion."""
+        return self._session_locks.setdefault(session_id, asyncio.Lock())
+
+    @property
+    def shutdown_finalizer(self) -> ApplicationFinalizerCapability:
+        return self._shutdown_finalizer
+
+    @property
+    def executor_join_task(self) -> asyncio.Task[None] | None:
+        return self._executor_join_task
+
+    def join_executor_shutdown(self) -> None:
+        executor = self._executor
+        if executor is not None:
+            executor.shutdown(wait=True)
+        self.execution_lease_release_registry.record_executor_join_return(self._shutdown_finalizer, executor)
+
+    async def _join_executor_owner(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise AuditIntegrityError("Execution executor join lacks actual Task")
+        if self._executor_join_task is not None and self._executor_join_task is not task:
+            raise AuditIntegrityError("Execution executor join replaced its actual owner")
+        self._executor_join_task = task
+        try:
+            await self._finish_executor_join()
+        except BaseException as original:
+            self._executor_join_outcome = (task, original)
+            raise
+        else:
+            self._executor_join_outcome = (task, None)
+
+    async def _finish_executor_join(self) -> None:
+        registry = self.execution_lease_release_registry
+        failures: list[BaseException] = []
+        try:
+            await run_application_finalizer_in_worker(self._shutdown_finalizer)
+        except BaseException as original:
+            failures.append(original)
+        # The bridge can retain a caller cancellation after actual physical success.
+        # Only the exact source/bridge receipt can authorize cleanup, never the
+        # exception class or whether the await happened to return normally.
+        joined_failures = registry.joined_pipeline_submission_failures() if registry.executor_join_physically_observed else ()
+        for obligation in joined_failures:
+            if obligation in self._failed_submission_cleanup_started:
+                continue
+            # This branch is issued only for the literal submit-no-return catch,
+            # after the exact private executor's actual joined receipt. Callback
+            # allocation Unknown cannot use it and no pipeline Future is invented.
+            try:
+                obligation.declare_unknown_pipeline_cleanup()
+                self._failed_submission_cleanup_started.add(obligation)
+                lease = obligation.lease
+                if lease is None:
+                    raise AuditIntegrityError("Joined submission failure lost exact acquired lease")
+                watcher = self._pipeline_watchers[obligation]
+                cleanup = asyncio.create_task(
+                    self._finish_execution_authority(obligation, lease, watcher, None),
+                    name=f"execution-joined-submit-failure-{obligation.session_id}",
+                )
+                obligation.bind_completion_task(cleanup)
+            except BaseException as original:
+                registry.record_failure(original)
+                failures.append(original)
+        _raise_lifecycle_originals([], failures)
+
+    async def _join_registry_owner(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise AuditIntegrityError("Execution registry join lacks actual Task")
+        if self._registry_join_task is not None and self._registry_join_task is not task:
+            raise AuditIntegrityError("Execution registry join replaced its actual owner")
+        self._registry_join_task = task
+        try:
+            await self.execution_lease_release_registry.join_all()
+        except BaseException as original:
+            self._registry_join_outcome = (task, original)
+            raise
+        else:
+            self._registry_join_outcome = (task, None)
+
+    async def shutdown(self) -> None:
+        """Join independent physical owners before projecting any original fault."""
+        registry = self.execution_lease_release_registry
+        registry.seal()
+        with self._shutdown_events_lock:
+            events = tuple(self._shutdown_events.values())
+        for event in events:
+            event.set()
+        for watcher_owner in self._loss_watcher_owners:
+            watcher_owner.close_requested.set()
+        failures: list[BaseException] = []
+        cancellations: list[asyncio.CancelledError] = []
+        if not self._shutdown_join_declared:
+            self._shutdown_join_declared = True
+            # An allocation-after-side-effect fault must not cause another invoke.
+            # Each coroutine binds its actual Task on entry even if create_task
+            # failed to return it. An absent owner remains Unknown under supervision.
+            try:
+                task = asyncio.create_task(self._join_executor_owner(), name="execution-executor-join")
+                self._executor_join_task = task
+            except BaseException as original:
+                registry.record_failure(original)
+                failures.append(original)
+            try:
+                task = asyncio.create_task(self._join_registry_owner(), name="execution-registry-join")
+                self._registry_join_task = task
+            except BaseException as original:
+                registry.record_failure(original)
+                failures.append(original)
+        observed: set[asyncio.Task[None]] = set()
+        observation_failures: dict[asyncio.Task[None], BaseException] = {}
+        while True:
+            registry.observe_ready()
+            for watcher_owner in self._loss_watcher_owners:
+                watcher_task, watcher_outcome = watcher_owner.task, watcher_owner.outcome
+                if watcher_task is not None and watcher_task.done() and watcher_outcome is not None and watcher_task not in observed:
+                    if watcher_outcome[0] is not watcher_task:
+                        if watcher_task not in observation_failures:
+                            integrity_error = AuditIntegrityError("Execution loss watcher replaced its actual outcome owner")
+                            observation_failures[watcher_task] = integrity_error
+                            registry.record_failure(integrity_error)
+                            failures.append(integrity_error)
+                        continue
+                    observed.add(watcher_task)
+                    try:
+                        watcher_task.result()
+                    except BaseException as projected:
+                        if watcher_outcome[1] is None:
+                            registry.record_failure(projected)
+                            failures.append(projected)
+                    if watcher_outcome[1] is not None:
+                        registry.record_failure(watcher_outcome[1])
+                        failures.append(watcher_outcome[1])
+                elif watcher_task is not None and watcher_task.done() and watcher_outcome is None:
+                    if watcher_task not in observation_failures:
+                        integrity_error = AuditIntegrityError("Execution loss watcher lacks actual producer outcome")
+                        observation_failures[watcher_task] = integrity_error
+                        registry.record_failure(integrity_error)
+                        failures.append(integrity_error)
+            executor_task, registry_task = self._executor_join_task, self._registry_join_task
+            for owned_task in (executor_task, registry_task):
+                if owned_task is not None and owned_task.done() and owned_task not in observed:
+                    outcome = self._executor_join_outcome if owned_task is executor_task else self._registry_join_outcome
+                    if outcome is None:
+                        # Cancellation before actual coroutine entry has no producer
+                        # receipt. Task.done alone cannot retire this join owner.
+                        if owned_task not in observation_failures:
+                            integrity_error = AuditIntegrityError("Execution join lacks actual producer outcome")
+                            observation_failures[owned_task] = integrity_error
+                            registry.record_failure(integrity_error)
+                            failures.append(integrity_error)
+                        continue
+                    if outcome[0] is not owned_task:
+                        if owned_task not in observation_failures:
+                            integrity_error = AuditIntegrityError("Execution join outcome replaced its actual Task")
+                            observation_failures[owned_task] = integrity_error
+                            registry.record_failure(integrity_error)
+                            failures.append(integrity_error)
+                        continue
+                    observed.add(owned_task)
+                    try:
+                        owned_task.result()
+                    except BaseException as projected:
+                        # Consume the Task projection, but use the exact original
+                        # captured by its producer before Task cancellation settled.
+                        if outcome[1] is None:
+                            registry.record_failure(projected)
+                            failures.append(projected)
+                    source_original = outcome[1]
+                    if source_original is not None:
+                        registry.record_failure(source_original)
+                        failures.append(source_original)
+            if (
+                executor_task is not None
+                and registry_task is not None
+                and executor_task in observed
+                and registry_task in observed
+                and all(owner.task is not None and owner.task in observed for owner in self._loss_watcher_owners)
+            ):
+                break
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError as original:
+                _retain_cancellation(cancellations, original)
+        _raise_lifecycle_originals(cancellations, failures)
+        registry.assert_completed()
+        if not registry.executor_join_succeeded:
+            raise AuditIntegrityError("Execution executor lacks joined physical finalizer receipt")
+
+    def _execution_obligation(self, lease: SessionOperationLease) -> ExecutionAcquisitionObligation:
+        if type(lease) is not SessionOperationLease:
+            raise AuditIntegrityError("Execution dispatch lacks actual lease")
+        obligation = lease.execution_obligation
+        if type(obligation) is not ExecutionAcquisitionObligation or obligation.registry is not self.execution_lease_release_registry:
+            raise AuditIntegrityError("Execution dispatch lost pre-admitted application ownership")
+        if obligation.lease is not lease:
+            raise AuditIntegrityError("Execution dispatch replaced its exact acquired lease")
+        obligation.assert_business_dispatch(lease.context)
+        return obligation
+
+    def _execution_retirement_ready(self, obligation: ExecutionAcquisitionObligation) -> bool:
+        """Require consumed physical receipts, never a done wrapper alone."""
+        if type(obligation) is not ExecutionAcquisitionObligation or obligation.registry is not self.execution_lease_release_registry:
+            raise AuditIntegrityError("Execution retirement lost exact application obligation")
+        pipeline, completion, wrapper, release, lease = (
+            obligation.pipeline,
+            obligation.completion_task,
+            obligation.completion,
+            obligation.release_submission,
+            obligation.lease,
+        )
+        if (
+            pipeline is None
+            or not pipeline.done()
+            or wrapper is None
+            or not wrapper.done()
+            or completion is None
+            or not completion.done()
+            or not obligation.completion_outcome_recorded
+            or obligation.completion_original_error is not None
+            or not obligation.completion_observed
+            or not obligation.lifecycle_required
+            or not obligation.lifecycle_observed
+            or not obligation.lifecycle_outcome_recorded
+            or obligation.lifecycle_original_error is not None
+            or obligation.lifecycle_task is None
+            or not obligation.lifecycle_task.done()
+            or release is None
+            or not release.observed
+            or (release.original_error is not None and not obligation.release_lost)
+            or release.future is None
+            or not release.future.done()
+            or not obligation.release_settled
+            or lease is None
+            or not lease.closed
+            or obligation.pipeline_submission_unknown is not None
+            or obligation.construction_error is not None
+            or obligation.observation_failures
+        ):
+            return False
+        if not wrapper.cancelled() and wrapper.exception() is not None:
+            return False
+        # This nominal public method validates the exact registration/submission
+        # and its canonical retirement witness before returning False. Core2's
+        # observation also requires the actual callback-return release receipt.
+        return not obligation.registry.owns_submission(release)
+
+    def _retire_settled_execution(self, obligation: ExecutionAcquisitionObligation) -> None:
+        if not self._execution_retirement_ready(obligation):
+            return
+        pipeline, lease = obligation.pipeline, obligation.lease
+        if pipeline is None or lease is None:
+            raise AuditIntegrityError("Execution retirement lost its actual pipeline or lease")
+        with self._shutdown_events_lock:
+            retained = self._pipeline_completion_owners.get(pipeline)
+            if retained is None and obligation not in self._pipeline_watchers:
+                # A second actual done callback can follow the first retirement.
+                return
+            if retained is not obligation:
+                raise AuditIntegrityError("Execution retirement replaced its actual pipeline owner")
+            watcher = self._pipeline_watchers[obligation]
+            owner = self._loss_watcher_owner(watcher, lease)
+            if not watcher.done() or owner.outcome is None or owner.outcome[0] is not watcher or owner.outcome[1] is not None:
+                return
+            del self._pipeline_completion_owners[pipeline]
+            self._pipeline_completion_started.discard(pipeline)
+            del self._pipeline_watchers[obligation]
+            self._failed_submission_cleanup_started.discard(obligation)
+            self._loss_watcher_owners.remove(owner)
+            if obligation.completion is not None:
+                self._lease_completion_futures.discard(obligation.completion)
+
+    def _observe_execution_completion(
+        self,
+        obligation: ExecutionAcquisitionObligation,
+        task: asyncio.Task[None] | None = None,
+    ) -> None:
+        try:
+            if task is not None and task is not obligation.completion_task:
+                raise AuditIntegrityError("Execution retirement observer replaced actual completion Task")
+            obligation.registry.observe_ready()
+            self._retire_settled_execution(obligation)
+        except BaseException as original:
+            obligation.registry.record_failure(original)
+
+    def _loss_watcher_owner(self, task: asyncio.Task[None], lease: SessionOperationLease) -> _ExecutionLossWatcherOwner:
+        for owner in self._loss_watcher_owners:
+            if owner.task is task and owner.lease is lease:
+                return owner
+        raise AuditIntegrityError("Execution cleanup lacks its actual loss watcher owner")
+
+    def _create_loss_watcher(self, lease: SessionOperationLease, shutdown_event: threading.Event, *, run_id: UUID) -> asyncio.Task[None]:
+        owner = _ExecutionLossWatcherOwner(lease, asyncio.Event())
+        self._loss_watcher_owners.append(owner)
+        try:
+            task = asyncio.create_task(
+                self._run_loss_watcher(owner, shutdown_event, run_id=run_id), name=f"execution-operation-loss-{run_id}"
+            )
+        except BaseException as original:
+            self.execution_lease_release_registry.record_failure(original)
+            raise
+        if owner.task is not None and owner.task is not task:
+            raise AuditIntegrityError("Execution loss watcher factory replaced its actual Task")
+        owner.task = task
+        return task
+
+    async def _run_loss_watcher(self, owner: _ExecutionLossWatcherOwner, shutdown_event: threading.Event, *, run_id: UUID) -> None:
+        task = asyncio.current_task()
+        if task is None or not any(owner is retained for retained in self._loss_watcher_owners):
+            raise AuditIntegrityError("Execution loss watcher lacks preallocated ownership")
+        if owner.task is not None and owner.task is not task:
+            raise AuditIntegrityError("Execution loss watcher replaced its actual Task")
+        owner.task = task
+        try:
+            await self._signal_shutdown_on_operation_loss(owner.lease, shutdown_event, run_id=run_id, close_requested=owner.close_requested)
+        except BaseException as original:
+            owner.outcome = (task, original)
+            raise
+        else:
+            owner.outcome = (task, None)
+
+    async def _join_loss_watcher(
+        self,
+        task: asyncio.Task[None],
+        lease: SessionOperationLease,
+    ) -> tuple[list[asyncio.CancelledError], BaseException | None]:
+        owner = self._loss_watcher_owner(task, lease)
+        owner.close_requested.set()
+        cancellations: list[asyncio.CancelledError] = []
+        while not task.done():
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError as original:
+                _retain_cancellation(cancellations, original)
+        outcome = owner.outcome
+        if outcome is None or outcome[0] is not task:
+            return cancellations, AuditIntegrityError("Execution loss watcher lacks actual producer outcome")
+        source_original = outcome[1]
+        try:
+            task.result()
+        except BaseException as projected:
+            if source_original is None:
+                source_original = projected
+        return cancellations, source_original
+
+    def _submit_owned_pipeline(
+        self,
+        obligation: ExecutionAcquisitionObligation,
+        lease: SessionOperationLease,
+        loss_watcher: asyncio.Task[None],
+        invocation: Callable[[], _RunPipelineOutcome],
+    ) -> None:
+        """Keep the actual generation/registry decision through physical submit."""
+        executor = self._executor
+        if executor is None:
+            raise AuditIntegrityError("Execution executor was not allocated")
+        with self._shutdown_events_lock:
+            if obligation in self._pipeline_watchers:
+                raise AuditIntegrityError("Execution obligation attempted another pipeline submission")
+            self._pipeline_watchers[obligation] = loss_watcher
+        try:
+            with obligation.pipeline_submission_decision(lease.context):
+                try:
+                    future = executor.submit(invocation)
+                except BaseException as original:
+                    obligation.record_pipeline_submission_unknown(original)
+                    raise
+                obligation.bind_pipeline_future(future)
+                with self._shutdown_events_lock:
+                    self._pipeline_completion_owners[future] = obligation
+        except BaseException as original:
+            if obligation.completion_required:
+                obligation.registry.record_failure(original)
+            raise
+        # Future may already be done: add_done_callback can execute inline. Neither
+        # the generation nor registry decision lock is held at this boundary.
+        try:
+            future.add_done_callback(partial(self._observe_pipeline_done, session_operation_lease=lease, loss_watcher=loss_watcher))
+        except BaseException as original:
+            obligation.registry.record_failure(original)
+            raise
+
+    async def execute(
+        self,
+        session_id: UUID,
+        state_id: UUID | None = None,
+        *,
+        session_operation_lease: SessionOperationLease,
+        user_id: str | None = None,
+        auth_provider_type: str | None = None,
+        fanout_ack_token: str | None = None,
+        secret_ack_token: str | None = None,
+    ) -> UUID:
+        """Start a background pipeline run.
+
+        B6 enforcement: raises RunAlreadyActiveError if a pending or running
+        run already exists for this session.
+
+        Returns the run_id immediately.
+
+        Args:
+            session_id: Session to execute.
+            state_id: Specific state to execute (latest if None).
+            user_id: Authenticated user's ID for scoped secret resolution.
+            auth_provider_type: Auth provider namespace for Landscape run attribution.
+            fanout_ack_token: Optional launch acknowledgement for high-fanout
+                LLM/provider-call risk.
+            secret_ack_token: Optional out-of-band approval of the run's
+                wired secret→destination set (elspeth-f3c1aafd25).
+
+        Note: async because SessionService methods are async. The pipeline
+        itself runs in a background thread — only setup is async.
+        """
+        if type(session_operation_lease) is not SessionOperationLease:
+            raise TypeError("session_operation_lease must be an exact SessionOperationLease")
+        session_operation_context = session_operation_lease.context
+        if session_operation_context.operation_kind is not SessionOperationKind.EXECUTE:
+            raise ValueError("session_operation_lease must carry EXECUTE authority")
+        if session_operation_context.fence.session_id != str(session_id):
+            raise ValueError("session_operation_lease belongs to a different session")
+
+        obligation = self._execution_obligation(session_operation_lease)
+
+        # TOCTOU fix: per-session asyncio lock serialises the
+        # get_active_run → create_run window so two concurrent execute()
+        # calls cannot both pass the check before either creates a run.
+        session_key = str(session_id)
+        lock = self.get_session_lock(session_key)
+        async with lock:
+            prepared = await self._execute_locked(
+                session_id,
+                state_id,
+                session_operation_lease=session_operation_lease,
+                user_id=user_id,
+                auth_provider_type=auth_provider_type,
+                fanout_ack_token=fanout_ack_token,
+                secret_ack_token=secret_ack_token,
+            )
+            loss_watcher = self._create_loss_watcher(
+                session_operation_lease,
+                prepared.shutdown_event,
+                run_id=prepared.run_id,
+            )
+            try:
+                self._submit_owned_pipeline(
+                    obligation,
+                    session_operation_lease,
+                    loss_watcher,
+                    partial(
+                        self._run_pipeline,
+                        str(prepared.run_id),
+                        prepared.pipeline_yaml,
+                        prepared.shutdown_event,
+                        prepared.frozen_run_settings,
+                        prepared.user_id,
+                        prepared.auth_provider_type,
+                        session_operation_lease=session_operation_lease,
+                        durable_admission=True,
+                    ),
+                )
+            except BaseException as exc:
+                if not obligation.completion_required:
+                    cancellations, watcher_error = await self._join_loss_watcher(loss_watcher, session_operation_lease)
+                    failures: list[BaseException] = [exc]
+                    if watcher_error is not None:
+                        failures.append(watcher_error)
+                    try:
+                        await self._handle_pipeline_submission_failure(
+                            prepared.run_id,
+                            exc,
+                            session_operation_lease=session_operation_lease,
+                        )
+                    except BaseException as original:
+                        failures.append(original)
+                    _raise_lifecycle_originals(cancellations, failures)
+                raise
+            return prepared.run_id
+
+    async def _execute_locked(
+        self,
+        session_id: UUID,
+        state_id: UUID | None = None,
+        *,
+        session_operation_lease: SessionOperationLease,
+        user_id: str | None = None,
+        auth_provider_type: str | None = None,
+        fanout_ack_token: str | None = None,
+        secret_ack_token: str | None = None,
+    ) -> _PreparedPipelineExecution:
+        """Inner execute — runs under the per-session asyncio.Lock."""
+        session_operation_context = session_operation_lease.context
+        await run_sync_in_worker(session_operation_lease.guard_external_effect)
+        # B6: One active run per session (AC #17: via SessionService)
+        active = await self._session_service.get_active_run(session_id)
+        if active is not None:
+            raise RunAlreadyActiveError(str(session_id))
+
+        # B4 fix: get_composition_state() doesn't exist on SessionService.
+        # Use get_state() for explicit state_id, get_current_state() for latest.
+        #
+        # IDOR contract: the two "state unreachable" branches below
+        # (state does not exist anywhere / state exists in another
+        # user's session) MUST be indistinguishable from the client's
+        # perspective.  They are folded into a single ``StateAccessError``
+        # whose route handler returns a fixed "State not found" literal.
+        # See ``protocol.StateAccessError`` for the full rationale; the
+        # ``send_message`` route in ``sessions/routes.py`` is the
+        # canonical precedent for this IDOR contract.  Do NOT
+        # re-introduce distinguishable messages here: the whole reason
+        # this branch exists as a discriminated check is to prevent
+        # the attacker's probe, and a distinguishable message reopens
+        # exactly the oracle the check was added to close.
+        state_record = None
+        if state_id is not None:
+            try:
+                state_record = await self._session_service.get_state(state_id)
+            except ValueError as exc:
+                raise StateAccessError(str(state_id)) from exc
+            # Verify state belongs to the requested session (IDOR prevention)
+            if state_record.session_id != session_id:
+                raise StateAccessError(str(state_id))
+        else:
+            state_record = await self._session_service.get_current_state(session_id)
+            if state_record is None:
+                raise ValueError(f"No composition state exists for session {session_id}")
+
+        assert state_record is not None
+
+        # Bridge CompositionStateRecord → CompositionState for generate_yaml().
+        # The record stores raw dicts; generate_yaml() needs the typed domain object.
+        authored_state = state_from_record(state_record)
+        credential_env_ref_names = (
+            frozenset(item.name for item in self._secret_service.list_refs(user_id))
+            if self._secret_service is not None and user_id is not None
+            else frozenset()
+        )
+        require_no_credential_material_in_state(
+            authored_state,
+            surface="composer_execution_state",
+            env_ref_names=credential_env_ref_names,
+        )
+        try:
+            completion_gates = parse_completion_gates(state_record.composer_meta)
+        except ValueError as exc:
+            raise CompletionGateIntegrityError(
+                session_id=str(session_id),
+                state_id=str(state_record.id),
+            ) from exc
+        composition_state = authored_state
+
+        # Advisory (UNKNOWN + WARN) findings are deliberately not raised here —
+        # see validate_semantic_evidence for the rationale. Only FAIL-policy
+        # violations block a run. They are still recorded: a run that proceeded
+        # with an unproven contract must not look identical to one where every
+        # contract was satisfied.
+        semantic_errors, semantic_warnings, semantic_contracts = validate_semantic_contracts(composition_state)
+        if semantic_warnings:
+            slog.info(
+                "semantic_contract_advisory_at_execute",
+                advisory_count=len(semantic_warnings),
+                # Shared helper, not a bare removeprefix: a semantic advisory
+                # can name a transform node OR a sink output, and the helper
+                # carries the rule for keeping a sink's ``output:`` qualifier.
+                affected_nodes=sorted({semantic_affected_component_id(entry.component) for entry in semantic_warnings}),
+                requirement_codes=sorted(
+                    {
+                        contract.requirement.requirement_code
+                        for contract in semantic_contracts
+                        if contract.outcome is SemanticOutcome.UNKNOWN
+                        and contract.requirement.unknown_policy is not UnknownSemanticPolicy.FAIL
+                    }
+                ),
+            )
+        if semantic_errors:
+            raise SemanticContractViolationError(
+                entries=semantic_errors,
+                contracts=semantic_contracts,
+            )
+
+        # F-17 / F-21 (Phase 5b Task 5 follow-on) — unresolved interpretation
+        # placeholder gate. Runs AFTER semantic-contract validation (the
+        # placeholder isn't a contract violation; the LLM transform's
+        # prompt_template is still a string) and BEFORE the path allowlist /
+        # YAML generation (we fail fast so the placeholder never reaches the
+        # runtime engine that would substitute the literal string into the
+        # LLM call). Operational telemetry counter emitted with non-content
+        # component metadata per unresolved site — explicitly NOT the
+        # prompt_template or user-authored term value.
+        #
+        # Operates under the operator-acknowledged assumption that 18a Task 0
+        # (empirical LLM gate ≥ 8/10 staging runs emit
+        # {{interpretation:<term>}}) passes; this detector is the
+        # runtime-safety net catching cases where the LLM under-fires.
+        materialized_state = materialize_state_for_execution(composition_state)
+        if isinstance(materialized_state, InterpretationReviewPending):
+            for site in materialized_state.sites:
+                self._telemetry.interpretation_placeholder_unresolved_at_runtime_total.add(
+                    1,
+                    attributes={
+                        "component_id": site.component_id,
+                        "component_type": site.component_type,
+                        "kind": site.kind.value,
+                    },
+                )
+            raise UnresolvedInterpretationPlaceholderError(
+                sites=tuple(materialized_state.sites),
+            )
+        composition_state = materialized_state
+
+        # Path allowlist check — defense-in-depth. The validate endpoint also
+        # checks this, but /execute does not require /validate first. An
+        # authenticated user could skip validation and execute a state that
+        # reads files outside the allowed directories.
+        if composition_state.sources:
+            from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS, allowed_source_directories, resolve_data_path
+
+            allowed_dirs = allowed_source_directories(str(self._settings.data_dir), session_id=str(session_id))
+            for source_name, source in composition_state.sources.items():
+                for key in SOURCE_LOCAL_PATH_OPTION_KEYS:
+                    value = source.options[key] if key in source.options else None
+                    if value is not None:
+                        resolved = resolve_data_path(value, str(self._settings.data_dir))
+                        if not any(resolved.is_relative_to(d) for d in allowed_dirs):
+                            raise PathAllowlistViolationError(
+                                f"Source '{source_name}' {key}='{value}' resolves outside allowed directories"
+                            )
+
+        # Sink path allowlist — prevents arbitrary file writes via sink options.
+        # Without this, a client can set sink options.path to any absolute or
+        # ../ path and /execute will write there.
+        if composition_state.outputs:
+            from elspeth.web.paths import SINK_LOCAL_PATH_OPTION_KEYS, allowed_sink_directories, resolve_sink_data_path
+
+            allowed_sink_dirs = allowed_sink_directories(str(self._settings.data_dir), session_id=str(session_id))
+            for output in composition_state.outputs:
+                for key in SINK_LOCAL_PATH_OPTION_KEYS:
+                    value = output.options[key] if key in output.options else None
+                    if value is not None:
+                        resolved = resolve_sink_data_path(value, str(self._settings.data_dir), session_id=str(session_id))
+                        if not any(resolved.is_relative_to(d) for d in allowed_sink_dirs):
+                            raise PathAllowlistViolationError(
+                                f"Sink '{output.name}' {key}='{value}' resolves outside allowed output directories"
+                            )
+
+        # Nested transform provider_config path allowlist — RAG retrieval
+        # transforms carry a local Chroma persist_directory under
+        # options.provider_config. It is a read/write target like a sink, so it
+        # is confined to the allowed SINK directories.
+        if composition_state.nodes:
+            from elspeth.web.paths import (
+                NESTED_LOCAL_PATH_OPTION_KEYS,
+                allowed_sink_directories,
+                resolve_sink_data_path,
+            )
+
+            allowed_sink_dirs = allowed_sink_directories(str(self._settings.data_dir), session_id=str(session_id))
+            # Every PLUGIN-BEARING node (elspeth-df8082552d). This is the
+            # defence-in-depth mirror of validate_path_policy, and it carried
+            # the IDENTICAL node-kind blind spot — so the "a second gate
+            # catches it" reassurance did not hold: both lines were blind the
+            # same way. See that gate for why the subject set keys on the
+            # plugin rather than on a node-kind set.
+            #
+            # ``node.node_type`` here is the node's OWN kind, read off live
+            # composition state — a different question from
+            # ``_proof_component_type``'s evidence-recorded kind near the top
+            # of this file (elspeth-1016a47e8f). Both derive rather than guess;
+            # they are not competing vocabularies and must not be merged.
+            for node in composition_state.nodes:
+                if node.plugin is None:
+                    continue
+                if "provider_config" not in node.options:
+                    continue
+                provider_config = node.options["provider_config"]
+                if not isinstance(provider_config, Mapping):
+                    continue
+                for key in NESTED_LOCAL_PATH_OPTION_KEYS:
+                    value = provider_config[key] if key in provider_config else None
+                    if value is not None:
+                        resolved = resolve_sink_data_path(value, str(self._settings.data_dir), session_id=str(session_id))
+                        if not any(resolved.is_relative_to(d) for d in allowed_sink_dirs):
+                            raise PathAllowlistViolationError(
+                                f"{node.node_type.capitalize()} '{node.id}' {key}='{value}' resolves outside allowed output directories"
+                            )
+
+        # The sequential-multi-query retry-budget policy gate
+        # was previously evaluated HERE, on the un-lowered ``composition_state``.
+        # That false-positived operator-profiled multi-query LLM nodes: an
+        # operator profile supplies the web-safe ``max_capacity_retry_seconds``
+        # only at LOWERING, so the persisted
+        # authored-minimal options legitimately omit the retry budget and would
+        # trip ``web_llm_retry_budget_policy_error`` before the profile resolved.
+        # The gate now runs below on ``policy_result.executable_state`` (the
+        # profile-lowered state), mirroring the authoritative ``validate_pipeline``
+        # check (validation.py, after its ``state = policy_result.executable_state``
+        # rebind).
+
+        # Fail-closed pre-run validation gate (notes/composer-advisor-surface-map-2026-06-08.md).
+        # Previously execute() created a run and let an invalid pipeline fail OPAQUELY
+        # at run-init (status=failed, rows_processed=0, error="Pipeline execution failed
+        # (GraphValidationError)"); the tutorial path bypassed validation entirely. Run
+        # the SAME authoritative state preflight the /validate endpoint uses, BEFORE create_run,
+        # and reject with a structured PipelineValidationError when invalid. This catches
+        # the Mechanism-A classes (Graph/ValueSource/generic plugin-config) at the server
+        # boundary and closes the tutorial bypass; SchemaConfigModeViolation (post-emission
+        # row check) and the Chroma-SSRF plugin check (deferred network I/O) remain
+        # runtime-only by design.
+
+        plugin_snapshot = self._plugin_snapshot_for_user(user_id, operation="execution")
+
+        preflight_result = await self._authoritative_state_preflight(
+            composition_state,
+            plugin_snapshot=plugin_snapshot,
+            user_id=user_id,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+            completion_gates=completion_gates,
+            completion_gate_state=authored_state,
+        )
+        if not preflight_result.is_valid:
+            raise PipelineValidationError(
+                errors=tuple(preflight_result.errors),
+                readiness=preflight_result.readiness,
+            )
+        if not preflight_result.readiness.execution_ready:
+            raise ExecutionReadinessError(blockers=tuple(preflight_result.readiness.blockers))
+
+        policy_result = validate_plugin_policy(
+            composition_state,
+            snapshot=plugin_snapshot,
+            profile_registry=self._operator_profile_registry,
+            catalog=self._catalog,
+        )
+        if policy_result.findings:
+            raise RuntimeError("Plugin policy validation diverged between execution preflight and runtime preparation.")
+
+        # Defence-in-depth sequential-multi-query retry-budget gate, evaluated on
+        # the PROFILE-LOWERED executable state so an operator profile's injected
+        # retry budget is honoured (raw authored options omit it). Azure AI Search
+        # needs no mirror here: the ``validate_plugin_policy`` call above refuses any
+        # node without a clean operator-profile binding. ``validate_pipeline`` above
+        # already runs the identical check on this same lowered state; this mirror keeps the
+        # execution service fail-closed even if that gate were bypassed (the
+        # tutorial path calls ``execute`` directly). Running it on the un-lowered
+        # ``composition_state`` false-positived operator-profiled multi-query nodes.
+        # Every PLUGIN-BEARING node (elspeth-df8082552d) — same widening as
+        # the validate_pipeline gates this mirrors. This loop's own comment
+        # above calls it the fail-closed backstop "even if that gate were
+        # bypassed"; before this change it shared the blind spot with the
+        # gate, so it could not have caught that bypass.
+        for node in policy_result.executable_state.nodes:
+            if node.plugin is None:
+                continue
+            llm_retry_policy_error = (
+                web_llm_retry_budget_policy_error(node.options) if node_has_capability(node, PluginCapability.LLM) else None
+            )
+            if llm_retry_policy_error is not None:
+                raise PipelineValidationError(
+                    errors=(
+                        ValidationError(
+                            component_id=node.id,
+                            component_type="transform",
+                            message=llm_retry_policy_error,
+                            suggestion=(
+                                "Set max_capacity_retry_seconds to a small positive value "
+                                "or configure pool_size > 1 for pooled retry handling."
+                            ),
+                            error_code=None,
+                        ),
+                    ),
+                    readiness=ValidationReadiness(
+                        authoring_valid=False,
+                        execution_ready=False,
+                        completion_ready=False,
+                        blockers=[
+                            ValidationReadinessBlocker(
+                                code="llm_retry_budget_policy",
+                                suggestion=None,
+                                note=None,
+                                component_id=node.id,
+                                component_type="transform",
+                                detail=f"transform {node.id} uses an unsafe sequential multi-query LLM retry budget",
+                            )
+                        ],
+                    ),
+                )
+
+        pipeline_yaml = self._yaml_generator.generate_yaml(composition_state)
+        executable_pipeline_yaml = self._yaml_generator.generate_yaml(policy_result.executable_state)
+
+        # Resolve relative source/sink paths to absolute in the YAML so
+        # plugins see the same paths the allowlist approved.  Without this,
+        # plugins call PathConfig.resolved_path() with no base_dir, which
+        # resolves relative paths against CWD — not data_dir.
+        pipeline_yaml = resolve_runtime_yaml_paths(pipeline_yaml, str(self._settings.data_dir), session_id=str(session_id))
+        executable_pipeline_yaml = resolve_runtime_yaml_paths(
+            executable_pipeline_yaml,
+            str(self._settings.data_dir),
+            session_id=str(session_id),
+        )
+
+        # Pre-validate blob_ref UUID before creating the run record.
+        # UUID() can raise ValueError on malformed strings; if that happens
+        # after create_run(), the pending run blocks the session permanently
+        # because the except block below only cleans up _shutdown_events.
+        #
+        # Defense-in-depth: verify the blob belongs to this session via the
+        # DB ownership record. Without this, a crafted composition state
+        # could reference another session's blob path (which would pass the
+        # shared-root path allowlist above).
+        parsed_blob_ids: list[UUID] = []
+        if composition_state.sources and self._blob_service is not None:
+            for source_name, source in composition_state.sources.items():
+                if "blob_ref" not in source.options:
+                    continue
+                blob_ref = source.options["blob_ref"]
+                if blob_ref is None:
+                    continue
+                try:
+                    parsed_blob_id = UUID(blob_ref)
+                except ValueError as exc:
+                    raise MalformedBlobRefError(f"sources.{source_name}.blob_ref must be a UUID") from exc
+                parsed_blob_ids.append(parsed_blob_id)
+                # IDOR contract (mirrors the state_id branch above): the
+                # nonexistent-blob and cross-session-blob cases MUST be
+                # indistinguishable from the client's perspective.  Both
+                # surface as ``BlobNotFoundError`` — ``get_blob`` already
+                # raises it for missing rows; we raise the same type for
+                # cross-session rows so the route handler returns a
+                # byte-identical "Blob not found" 404.  Raising
+                # ``ValueError`` here (as an earlier iteration did) not
+                # only produced a distinguishable body but also a
+                # distinguishable HTTP status (404 vs 500, because
+                # ``BlobNotFoundError`` was uncaught), a two-channel
+                # oracle strictly worse than the state_id surface.
+                await run_sync_in_worker(session_operation_lease.guard_external_effect)
+                blob_record = await self._blob_service.get_blob(
+                    parsed_blob_id,
+                    session_operation_context=session_operation_context,
+                )
+                if blob_record.session_id != session_id:
+                    raise BlobNotFoundError(blob_ref)
+
+                # Tier 1 read guard: composition_states source options path
+                # is our own audit data and must equal the canonical blob
+                # storage_path.  A mismatch (or absence on a blob-backed
+                # source) indicates a bug in composer persistence — crash
+                # informatively rather than letting the source plugin 500
+                # with FileNotFoundError on a structurally invalid path.
+                # Offensive-programming pattern: membership check +
+                # indexing instead of .get() so the absence case raises
+                # the structured BlobSourcePathMismatchError rather than
+                # an opaque KeyError.
+                source_options = source.options
+                canonical_path = blob_record.storage_path
+                stored_path = source_options["path"] if "path" in source_options else None
+                if stored_path != canonical_path:
+                    raise BlobSourcePathMismatchError(
+                        stored_path=stored_path,
+                        canonical_path=canonical_path,
+                        blob_id=str(parsed_blob_id),
+                        session_id=str(session_id),
+                    )
+
+        # Out-of-band secret approval (elspeth-f3c1aafd25) runs BEFORE the
+        # fanout guard: approving what credentials a run may use is a
+        # privilege decision, spend acknowledgement comes after. The token is
+        # derived from the composition snapshot + disclosure set, so it can
+        # only be produced by a caller who was shown this exact wiring set —
+        # never by LLM tool arguments (no composer/MCP tool reaches execute).
+        # Evaluated over the AUTHORED state (pre profile-lowering):
+        # operator-profile lowering injects its own credential markers from
+        # deployment settings, which are server-authored and need no
+        # per-run user approval — and must never appear in this disclosure.
+        secret_guard_env_ref_names: frozenset[str] = frozenset()
+        if self._secret_service is not None and user_id is not None:
+            secret_guard_env_ref_names = frozenset(item.name for item in self._secret_service.list_refs(user_id))
+        secret_guard = evaluate_execution_secret_guard(
+            composition_state,
+            env_ref_names=secret_guard_env_ref_names,
+        )
+        if secret_guard is not None:
+            if secret_ack_token != secret_guard.ack_token:
+                raise ExecutionSecretApprovalRequired(secret_guard)
+            pipeline_yaml = annotate_pipeline_yaml_with_secret_guard(pipeline_yaml, secret_guard)
+            executable_pipeline_yaml = annotate_pipeline_yaml_with_secret_guard(executable_pipeline_yaml, secret_guard)
+
+        fanout_guard = evaluate_execution_fanout_guard(
+            policy_result.executable_state,
+            data_dir=self._settings.data_dir,
+        )
+        if fanout_guard is not None:
+            if fanout_ack_token != fanout_guard.ack_token:
+                raise ExecutionFanoutGuardRequired(fanout_guard)
+            pipeline_yaml = annotate_pipeline_yaml_with_fanout_guard(pipeline_yaml, fanout_guard)
+            executable_pipeline_yaml = annotate_pipeline_yaml_with_fanout_guard(executable_pipeline_yaml, fanout_guard)
+
+        audit_safe_config = load_bounded_pipeline_yaml(pipeline_yaml)
+        executable_config = load_bounded_pipeline_yaml(executable_pipeline_yaml)
+        if type(audit_safe_config) is not dict or type(executable_config) is not dict:
+            raise TypeError("YamlGenerator.generate_yaml() must produce a mapping for runtime preparation")
+        # Export policy has an operator-owned compartment binding. Validate
+        # the effective version and marking before creating a Sessions run;
+        # otherwise an export without a compartment returns HTTP 202 and
+        # fails later in the background worker after admission side effects.
+        landscape_config = executable_config["landscape"] if "landscape" in executable_config else None
+        if type(landscape_config) is dict and "export" in landscape_config:
+            from elspeth.web.execution.export_marking import apply_operator_export_marking, operator_marked_config_dict
+
+            preliminary_settings = load_settings_from_config_dict(
+                operator_marked_config_dict(executable_config, self._settings), expand_env_vars=False
+            )
+            effective_export = apply_operator_export_marking(preliminary_settings.landscape.export, self._settings)
+            if effective_export.auth_events == "deployment_snapshot":
+                raise ValueError("landscape.export.auth_events=deployment_snapshot is not permitted in Web execution")
+            if effective_export.enabled:
+                effective_export.public_snapshot_config()
+        frozen_run_settings = FrozenRunSettings(
+            plugin_snapshot=plugin_snapshot,
+            executable_config=cast(dict[str, Any], executable_config),
+            audit_safe_config=cast(dict[str, Any], audit_safe_config),
+            profiled_s3_audit_identities=policy_result.profiled_s3_audit_identities,
+            profiled_textract_audit_identities=policy_result.profiled_textract_audit_identities,
+        )
+        if self._settings.workflow_governance == "on":
+            if user_id is None:
+                raise AuditIntegrityError("Governed execution requires an authenticated user")
+            approval_inputs = await run_sync_in_worker(
+                self._approval_inputs_from_frozen,
+                frozen_run_settings,
+                user_id=user_id,
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+            )
+            reason = await self._session_service.check_approval_binding(
+                session_id,
+                state_record.id,
+                approval=approval_inputs,
+                session_operation_context=session_operation_context,
+            )
+            if reason is not None:
+                raise ExecutionApprovalRequired(reason=reason, binding=approval_inputs.binding)
+        frozen_run_settings, retained_inputs = await run_sync_in_worker(
+            retain_execution_inputs,
+            frozen_run_settings,
+            root=Path(self._settings.data_dir) / "retained-run-inputs",
+        )
+        if self._settings.workflow_governance == "on":
+            if user_id is None:
+                raise AuditIntegrityError("Governed execution requires an authenticated user")
+            approval_inputs = await run_sync_in_worker(
+                self._approval_inputs_from_frozen,
+                frozen_run_settings,
+                user_id=user_id,
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+            )
+            reason = await self._session_service.check_approval_binding(
+                session_id,
+                state_record.id,
+                approval=approval_inputs,
+                session_operation_context=session_operation_context,
+            )
+            if reason is not None:
+                raise ExecutionApprovalRequired(reason=reason, binding=approval_inputs.binding)
+        retained_blobs: list[RetainedBlobInput] = []
+        for reference in discover_execution_blob_inputs(frozen_run_settings):
+            if self._blob_service is None:
+                raise RuntimeError("Durable blob input admission requires the blob service")
+            blob = await self._blob_service.get_blob(reference.blob_id, session_operation_context=session_operation_context)
+            if blob.session_id != session_id:
+                raise BlobNotFoundError(str(reference.blob_id))
+            if blob.status != "ready" or blob.content_hash != reference.content_hash:
+                raise BlobRowsSourceAdmissionError("Durable blob input metadata changed before admission")
+            content = await self._blob_service.read_blob_content(reference.blob_id, session_operation_context=session_operation_context)
+            retained = await run_sync_in_worker(
+                retain_source_bytes,
+                content,
+                original_path=blob.storage_path,
+                root=Path(self._settings.data_dir) / "retained-run-inputs",
+            )
+            retained_blobs.append(
+                RetainedBlobInput(
+                    reference=reference, retained=retained, size_bytes=blob.size_bytes, filename=blob.filename, mime_type=blob.mime_type
+                )
+            )
+            if reference.blob_id not in parsed_blob_ids:
+                parsed_blob_ids.append(reference.blob_id)
+        implementation = await run_sync_in_worker(runtime_implementation_fingerprint, plugin_snapshot)
+        envelope = await run_sync_in_worker(
+            capture_execution_envelope,
+            frozen_run_settings,
+            user_id=user_id,
+            auth_provider_type=auth_provider_type,
+            resolver=self._secret_service,
+            env_ref_names=secret_guard_env_ref_names,
+            implementation_fingerprint=implementation,
+            deployment_generation=implementation,
+            retained_inputs=retained_inputs,
+            blob_inputs=tuple(retained_blobs),
+            openrouter_catalog_sha256=self._openrouter_catalog_sha256,
+            openrouter_catalog_source=self._openrouter_catalog_source,
+            web_plugin_policy_evidence=_build_web_plugin_policy_evidence(snapshot=plugin_snapshot, policy=self._web_plugin_policy),
+        )
+        execution_input = build_run_execution_input(envelope, frozen_run_settings, implementation, implementation, retained_inputs)
+
+        # B9 fix: create_run() generates its own UUID internally and returns
+        # a RunRecord. Read the run_id back from the returned record so our
+        # _shutdown_events key matches the DB record.
+        await run_sync_in_worker(session_operation_lease.guard_external_effect)
+        run_record = await self._session_service.create_run(
+            session_id=session_id,
+            state_id=state_record.id,  # From the record, not the domain object
+            pipeline_yaml=pipeline_yaml,
+            session_operation_context=session_operation_context,
+            execution_input=execution_input,
+        )
+        run_id = run_record.id  # Use the DB-generated UUID as canonical
+
+        # Register shutdown event immediately so cancel() always finds it.
+        # Without this, cancel() firing between create_run() and registration
+        # bypasses the event and updates DB to "cancelled" directly — causing
+        # an illegal cancelled→running transition when _run_pipeline starts.
+        shutdown_event = threading.Event()
+        with self._shutdown_events_lock:
+            self._shutdown_events[str(run_id)] = shutdown_event
+
+        try:
+            # Record blob-to-run linkage for input blobs before the worker starts.
+            if parsed_blob_ids and self._blob_service is not None:
+                for parsed_blob_id in parsed_blob_ids:
+                    await run_sync_in_worker(session_operation_lease.guard_external_effect)
+                    await self._blob_service.link_blob_to_run(
+                        blob_id=parsed_blob_id,
+                        run_id=run_id,
+                        direction="input",
+                        session_operation_context=session_operation_context,
+                    )
+        except BaseException as exc:
+            await self._handle_pipeline_submission_failure(
+                run_id,
+                exc,
+                session_operation_lease=session_operation_lease,
+            )
+            raise
+
+        return _PreparedPipelineExecution(
+            run_id=run_id,
+            pipeline_yaml=pipeline_yaml,
+            shutdown_event=shutdown_event,
+            frozen_run_settings=frozen_run_settings,
+            user_id=user_id,
+            auth_provider_type=auth_provider_type,
+        )
+
+    async def recover_run(
+        self,
+        run: RunRecord,
+        session_operation_lease: SessionOperationLease,
+        *,
+        resume_existing: bool,
+    ) -> bool:
+        """Rehydrate one admitted run and transfer its renewable web lease."""
+        from elspeth.web.coordination.contracts import RecoveryRequiredReason, StartPermitState
+
+        obligation = self._execution_obligation(session_operation_lease)
+        if session_operation_lease.context.fence.session_id != str(run.session_id):
+            raise AuditIntegrityError("Recovered execution lease belongs to another session")
+        if run.cancel_requested_at is not None:
+            try:
+                await self._materialize_durable_cancellation(run, session_operation_lease)
+            except NonResumableRunError:
+                # A still-live Landscape seat is retryable; do not project it.
+                return False
+            return False
+        approval_inputs: ApprovalGateInputs | None = None
+        restored: RestoredExecutionEnvelope | None = None
+        session = None
+        if self._settings.workflow_governance == "on":
+            session = await self._session_service.get_session(run.session_id)
+            active = self._principal_is_active
+            if session.archived_at is not None or (
+                not self._trained_operator_mode and (active is None or not await run_sync_in_worker(active, session.user_id))
+            ):
+                await run_sync_in_worker(
+                    self._session_service.session_operation_authority.mutate,
+                    session_operation_lease.context,
+                    lambda tx: tx.runs.mark_recovery_required(run_id=run.id, reason=RecoveryRequiredReason.COMPATIBILITY_MISMATCH),
+                )
+                return False
+            try:
+                restored = await self._restore_admitted_run(
+                    run,
+                    user_id=session.user_id,
+                    auth_provider_type=session.auth_provider_type,
+                    session_operation_context=session_operation_lease.context,
+                )
+            except ExecutionEnvelopeRefused as exc:
+                await self._record_recovery_refusal(run.id, session_operation_lease, exc)
+                return False
+            approval_inputs = await run_sync_in_worker(
+                self._approval_inputs_from_frozen,
+                restored.settings,
+                user_id=session.user_id,
+                session_id=run.session_id,
+                session_operation_context=session_operation_lease.context,
+            )
+        if approval_inputs is None:
+            permit = await self._session_service.assess_run_start_admission(
+                run.id, session_operation_context=session_operation_lease.context
+            )
+        else:
+            permit = await self._session_service.assess_run_start_admission(
+                run.id, session_operation_context=session_operation_lease.context, approval=approval_inputs
+            )
+        if permit.state is StartPermitState.CANCELLED_BEFORE_PERMIT:
+            return False
+        if permit.state is StartPermitState.REFUSED or permit.execution_refusal is not None:
+            await self._settle_admission_refusal(run.id, session_operation_lease)
+            return False
+        if session is None:
+            session = await self._session_service.get_session(run.session_id)
+            active = self._principal_is_active
+            if session.archived_at is not None or (
+                not self._trained_operator_mode and (active is None or not await run_sync_in_worker(active, session.user_id))
+            ):
+                await run_sync_in_worker(
+                    self._session_service.session_operation_authority.mutate,
+                    session_operation_lease.context,
+                    lambda tx: tx.runs.mark_recovery_required(run_id=run.id, reason=RecoveryRequiredReason.COMPATIBILITY_MISMATCH),
+                )
+                return False
+        if restored is None:
+            try:
+                restored = await self._restore_admitted_run(
+                    run,
+                    user_id=session.user_id,
+                    auth_provider_type=session.auth_provider_type,
+                    session_operation_context=session_operation_lease.context,
+                )
+            except ExecutionEnvelopeRefused as exc:
+                await self._record_recovery_refusal(run.id, session_operation_lease, exc)
+                return False
+        assert run.pipeline_yaml is not None
+        shutdown_event = threading.Event()
+        with self._shutdown_events_lock:
+            self._shutdown_events[str(run.id)] = shutdown_event
+        watcher = self._create_loss_watcher(session_operation_lease, shutdown_event, run_id=run.id)
+        try:
+            self._submit_owned_pipeline(
+                obligation,
+                session_operation_lease,
+                watcher,
+                partial(
+                    self._run_pipeline,
+                    str(run.id),
+                    run.pipeline_yaml,
+                    shutdown_event,
+                    restored.settings,
+                    session.user_id,
+                    session.auth_provider_type,
+                    session_operation_lease=session_operation_lease,
+                    durable_admission=True,
+                    resume_existing=resume_existing,
+                    restored_envelope=restored,
+                ),
+            )
+        except BaseException as primary:
+            if not obligation.completion_required:
+                cancellations, watcher_error = await self._join_loss_watcher(watcher, session_operation_lease)
+                failures: list[BaseException] = [primary]
+                if watcher_error is not None:
+                    failures.append(watcher_error)
+                try:
+                    with self._shutdown_events_lock:
+                        del self._shutdown_events[str(run.id)]
+                except BaseException as original:
+                    failures.append(original)
+                _raise_lifecycle_originals(cancellations, failures)
+            raise
+        return True
+
+    async def _settle_admission_refusal(self, run_id: UUID, lease: SessionOperationLease) -> None:
+        """Reconcile refused work before removing its durable recovery candidacy."""
+        from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id
+        from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+
+        loop = asyncio.get_running_loop()
+
+        async def finish_cleanup() -> None:
+            if self._blob_service is not None:
+                lease.guard_external_effect()
+                outcome = await self._blob_service.finalize_run_output_blobs(
+                    run_id,
+                    success=False,
+                    session_operation_context=lease.context,
+                )
+                if outcome.errors:
+                    raise RuntimeError("Admission refusal output cleanup remains pending")
+            await run_sync_in_worker(
+                self._session_service.session_operation_authority.mutate,
+                lease.context,
+                lambda transaction: transaction.runs.complete_admission_refusal(run_id=run_id),
+            )
+
+        def reconcile_landscape() -> None:
+            with open_landscape_db(self._settings) as db:
+                repositories = RecorderFactory(db)
+                existing = repositories.run_lifecycle.get_run(str(run_id))
+                if existing is None:
+                    asyncio.run_coroutine_threadsafe(finish_cleanup(), loop).result()
+                    return
+                if existing is not None and existing.status is RunStatus.RUNNING:
+                    transition_token = repositories.run_coordination.acquire_run_leadership(
+                        run_id=str(run_id),
+                        worker_id=mint_worker_id(str(run_id)),
+                        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                        entry_point="web-admission-refusal",
+                    )
+                    try:
+                        lease.guard_external_effect()
+                        repositories.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=transition_token)
+                    finally:
+                        repositories.run_coordination.release_seat(token=transition_token)
+                    expected_status = RunStatus.FAILED
+                else:
+                    expected_status = existing.status
+                if expected_status not in {RunStatus.FAILED, RunStatus.INTERRUPTED}:
+                    raise AuditIntegrityError("Admission refusal conflicts with a successful Landscape result")
+                reconciliation_token = repositories.run_coordination.acquire_reconciliation_leadership(
+                    run_id=str(run_id),
+                    worker_id=mint_worker_id(str(run_id)),
+                    window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                    expected_status=expected_status,
+                )
+                try:
+                    with fenced_leader_transaction(
+                        db.engine,
+                        token=reconciliation_token,
+                        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                        verb="web_admission_refusal_reconciliation",
+                    ):
+                        # Acquisition checked the expected status under the
+                        # seat lock; this fence proves that same leader epoch
+                        # still owns it and holds the seat until cleanup ends.
+                        lease.guard_external_effect()
+                        asyncio.run_coroutine_threadsafe(finish_cleanup(), loop).result()
+                finally:
+                    repositories.run_coordination.release_seat(token=reconciliation_token)
+
+        # The lock owner must not occupy the shared pool used by the awaited
+        # Sessions/blob operations. Keep the task alive until authority releases.
+        task = lease.create_task(asyncio.to_thread(reconcile_landscape), name="admission-refusal-reconciliation")
+        await asyncio.shield(task)
+
+    async def _materialize_durable_cancellation(self, run: RunRecord, lease: SessionOperationLease) -> None:
+        from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id
+        from elspeth.contracts.hashing import CANONICAL_VERSION
+        from elspeth.core.landscape.run_start_admission import RunStartAdmissionRepository, RunStartAdmissionState
+        from elspeth.web.coordination.contracts import StartPermitState
+        from elspeth.web.execution.envelope import EnvelopeRecoveryReason
+
+        execution_input = await self._session_service.get_run_execution_input(run.id)
+        if execution_input is None:
+            raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.INVALID_ENVELOPE)
+        cancellation = read_cancelled_execution_envelope(execution_input)
+        permit = await self._session_service.observe_run_start_permit_for_cleanup(run.id, session_operation_context=lease.context)
+        if permit.state in {StartPermitState.CANCELLED_BEFORE_PERMIT, StartPermitState.REFUSED}:
+            return
+        assert permit.permit_id is not None and permit.permit_epoch is not None and permit.subject_hash is not None
+        binding = RunStartPermitBinding(str(run.id), permit.permit_id, permit.permit_epoch, permit.subject_hash)
+
+        def materialize() -> None:
+            with open_landscape_db(self._settings) as db:
+                repositories = RecorderFactory(db)
+                admission = RunStartAdmissionRepository(db).observe(binding)
+                if admission is not None and admission.state is RunStartAdmissionState.EXECUTING:
+                    token = repositories.run_coordination.acquire_run_leadership(
+                        run_id=str(run.id),
+                        worker_id=mint_worker_id(str(run.id)),
+                        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                        entry_point="web-durable-cancel",
+                    )
+                    try:
+                        lease.guard_external_effect()
+                        repositories.run_lifecycle.complete_run(RunStatus.INTERRUPTED, coordination_token=token)
+                    finally:
+                        repositories.run_coordination.release_seat(token=token)
+                    return
+                existing = repositories.run_lifecycle.get_run(str(run.id))
+                config = json.loads(existing.settings_json) if existing is not None else deep_thaw(cancellation.audit_safe_config)
+                repositories.run_lifecycle.materialize_cancelled_permit(
+                    binding,
+                    config,
+                    CANONICAL_VERSION,
+                    openrouter_catalog_sha256=cancellation.openrouter_catalog_sha256,
+                    openrouter_catalog_source=cancellation.openrouter_catalog_source,
+                    initiated_by_user_id=cancellation.user_id,
+                    auth_provider_type=cancellation.auth_provider_type,
+                    web_plugin_policy_evidence=(
+                        replace(cancellation.web_plugin_policy_evidence, admission_decision=permit.admission_decision)
+                        if cancellation.web_plugin_policy_evidence is not None
+                        else None
+                    ),
+                    pre_effect_guard=lease.guard_external_effect,
+                )
+
+        await run_sync_in_worker(materialize)
+
+    async def _restore_admitted_run(
+        self,
+        run: RunRecord,
+        *,
+        user_id: str | None,
+        auth_provider_type: str | None,
+        session_operation_context: SessionOperationContext,
+    ) -> RestoredExecutionEnvelope:
+        from elspeth.web.execution.envelope import EnvelopeRecoveryReason
+
+        execution_input = await self._session_service.get_run_execution_input(run.id)
+        if execution_input is None or ExecutionEnvelope(execution_input.envelope_json).digest != execution_input.canonical_input_digest:
+            raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.INVALID_ENVELOPE)
+        await run_sync_in_worker(validate_run_execution_input, execution_input)
+        snapshot = self._plugin_snapshot_for_user(user_id, operation="run recovery")
+        implementation = await run_sync_in_worker(runtime_implementation_fingerprint, snapshot)
+
+        def verify_blob(item: RetainedBlobInput) -> None:
+            if self._blob_service is None:
+                raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.SOURCE_UNAVAILABLE)
+            try:
+                blob = self._call_async(
+                    self._blob_service.get_blob(item.reference.blob_id, session_operation_context=session_operation_context)
+                )
+            except BlobNotFoundError:
+                raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.SOURCE_UNAVAILABLE) from None
+            if (
+                blob.session_id != run.session_id
+                or blob.status != "ready"
+                or blob.content_hash != item.reference.content_hash
+                or blob.size_bytes != item.size_bytes
+                or blob.filename != item.filename
+                or blob.mime_type != item.mime_type
+            ):
+                raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.SOURCE_UNAVAILABLE)
+
+        return await run_sync_in_worker(
+            restore_execution_envelope,
+            execution_input.envelope_json,
+            current_snapshot=snapshot,
+            user_id=user_id,
+            auth_provider_type=auth_provider_type,
+            resolver=self._secret_service,
+            implementation_fingerprint=implementation,
+            deployment_generation=implementation,
+            blob_verifier=verify_blob,
+        )
+
+    async def _record_recovery_refusal(
+        self, run_id: UUID, session_operation_lease: SessionOperationLease, error: ExecutionEnvelopeRefused
+    ) -> None:
+        from elspeth.web.coordination.contracts import RecoveryRequiredReason
+        from elspeth.web.execution.envelope import EnvelopeRecoveryReason
+
+        if error.reason is EnvelopeRecoveryReason.IMPLEMENTATION_CHANGED:
+            reason = RecoveryRequiredReason.IMPLEMENTATION_DRIFT
+        elif error.reason is EnvelopeRecoveryReason.DEPLOYMENT_CHANGED:
+            reason = RecoveryRequiredReason.GENERATION_DRIFT
+        elif error.reason in (EnvelopeRecoveryReason.SECRET_VERSION_CHANGED, EnvelopeRecoveryReason.SECRET_VERSION_UNAVAILABLE):
+            reason = RecoveryRequiredReason.SECRET_VERSION_UNAVAILABLE
+        elif error.reason is EnvelopeRecoveryReason.SOURCE_UNAVAILABLE:
+            reason = RecoveryRequiredReason.INCOMPLETE_SOURCE
+        else:
+            reason = RecoveryRequiredReason.COMPATIBILITY_MISMATCH
+        await run_sync_in_worker(
+            self._session_service.session_operation_authority.mutate,
+            session_operation_lease.context,
+            lambda tx: tx.runs.mark_recovery_required(run_id=run_id, reason=reason),
+        )
+
+    async def _handle_pipeline_submission_failure(
+        self,
+        run_id: UUID,
+        exc: BaseException,
+        *,
+        session_operation_lease: SessionOperationLease,
+    ) -> None:
+        """Terminalize a prepared run when the worker cannot be submitted."""
+        session_operation_context = session_operation_lease.context
+        with self._shutdown_events_lock:
+            run_key = str(run_id)
+            if run_key in self._shutdown_events:
+                del self._shutdown_events[run_key]
+        try:
+            await run_sync_in_worker(session_operation_lease.guard_external_effect)
+            await self._session_service.update_run_status(
+                run_id,
+                status="failed",
+                error=f"Setup failed: {_sanitize_error_for_client(exc)}",
+                session_operation_context=session_operation_context,
+            )
+        except (SQLAlchemyError, OSError) as cleanup_err:
+            slog.error(
+                "run_cleanup_status_update_failed",
+                run_id=str(run_id),
+                original_exc_class=type(exc).__name__,
+                cleanup_exc_class=type(cleanup_err).__name__,
+            )
+
+    async def _signal_shutdown_on_operation_loss(
+        self,
+        session_operation_lease: SessionOperationLease,
+        shutdown_event: threading.Event,
+        *,
+        run_id: UUID,
+        close_requested: asyncio.Event | None = None,
+    ) -> None:
+        """Bridge durable cancellation and loss of the exact web owner."""
+        consecutive_poll_failures = 0
+        while True:
+            if close_requested is not None and close_requested.is_set():
+                return
+            # Exponent capped so a long outage cannot overflow the float; the
+            # interval itself is capped by _LOSS_WATCHER_MAX_BACKOFF_SECONDS.
+            poll_seconds = min(
+                _LOSS_WATCHER_POLL_SECONDS * (2 ** min(consecutive_poll_failures, 16)),
+                _LOSS_WATCHER_MAX_BACKOFF_SECONDS,
+            )
+            try:
+                await asyncio.wait_for(session_operation_lease.wait_until_lost(), timeout=poll_seconds)
+            except TimeoutError:
+                if close_requested is not None and close_requested.is_set():
+                    return
+                try:
+                    run = await self._session_service.get_run(run_id)
+                except _LOSS_WATCHER_TRANSIENT_DB_ERRORS as exc:
+                    # Transient session-DB failure (lock contention, pool
+                    # checkout timeout, dropped connection, failover). This task
+                    # is the only path by which a cancel persisted on another
+                    # replica reaches this worker, so it keeps polling with
+                    # backoff rather than dying. It does NOT set shutdown_event:
+                    # cancelling a running pipeline because the session DB is
+                    # flaky is not this watcher's call. Lease loss is still
+                    # observed during every backoff interval.
+                    consecutive_poll_failures += 1
+                    _log_loss_watcher_poll_retry(exc, run_id=run_id, consecutive_failures=consecutive_poll_failures)
+                    continue
+                except DBAPIError as exc:
+                    # Any other DBAPI error is transient only when SQLAlchemy's
+                    # disconnect detection invalidated the connection.
+                    if not exc.connection_invalidated:
+                        _log_loss_watcher_poll_failed(exc, run_id=run_id)
+                        raise
+                    consecutive_poll_failures += 1
+                    _log_loss_watcher_poll_retry(exc, run_id=run_id, consecutive_failures=consecutive_poll_failures)
+                    continue
+                except SQLAlchemyError as exc:
+                    # Non-transient database fault: retrying cannot fix it.
+                    _log_loss_watcher_poll_failed(exc, run_id=run_id)
+                    raise
+                consecutive_poll_failures = 0
+                if run.cancel_requested_at is None:
+                    continue
+            shutdown_event.set()
+            return
+
+    async def get_status(
+        self,
+        run_id: UUID,
+        *,
+        accounting: RunAccounting | None = None,
+        run_record: RunRecord | None = None,
+    ) -> RunStatusResponse:
+        """Return current run status. AC #17: delegates to SessionService."""
+        if run_record is not None:
+            if run_record.id != run_id:
+                raise RuntimeError(f"Status snapshot run_id mismatch: expected {run_id}, got {run_record.id}")
+            run = run_record
+        else:
+            run = await self._session_service.get_run(run_id)
+        cancel_requested = run.cancel_requested_at is not None and run.status not in SESSION_TERMINAL_RUN_STATUS_VALUES
+        return RunStatusResponse(
+            run_id=str(run.id),
+            status=run.status,
+            started_at=run.started_at,
+            finished_at=run.finished_at,
+            accounting=accounting,
+            error=run.error,
+            landscape_run_id=run.landscape_run_id,
+            cancel_requested=cancel_requested,
+        )
+
+    async def validate(
+        self,
+        session_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+        user_id: str | None = None,
+    ) -> ValidationResult:
+        """Dry-run validation using real engine code paths.
+
+        Wraps the sync validate_pipeline() call via run_in_executor
+        to avoid blocking the event loop (AC #16).
+
+        Args:
+            session_id: Session whose current state to validate.
+            user_id: Authenticated user's ID for scoped secret ref validation.
+        """
+        state_record = await self._session_service.get_current_state(session_id)
+        if state_record is None:
+            return ValidationResult(
+                is_valid=False,
+                checks=[
+                    ValidationCheck(
+                        name="state_exists",
+                        passed=False,
+                        detail="No composition state exists for this session",
+                        affected_nodes=(),
+                        outcome_code=None,
+                    )
+                ],
+                errors=[
+                    ValidationError(
+                        component_id=None,
+                        component_type=None,
+                        message="No composition state exists for this session",
+                        suggestion="Use the composer to build a pipeline first.",
+                        error_code=None,
+                    )
+                ],
+                readiness=ValidationReadiness(
+                    authoring_valid=False,
+                    execution_ready=False,
+                    completion_ready=False,
+                    blockers=[
+                        ValidationReadinessBlocker(
+                            code="state_exists",
+                            suggestion=None,
+                            note=None,
+                            component_id=None,
+                            component_type=None,
+                            detail="No composition state exists for this session.",
+                        )
+                    ],
+                ),
+            )
+
+        composition_state = state_from_record(state_record)
+        return await self.validate_state(
+            composition_state,
+            session_operation_context=session_operation_context,
+            user_id=user_id,
+            session_id=session_id,
+            completion_gates=parse_completion_gates(state_record.composer_meta),
+        )
+
+    async def validate_state(
+        self,
+        state: CompositionState,
+        *,
+        session_operation_context: SessionOperationContext,
+        user_id: str | None = None,
+        session_id: UUID | None = None,
+        completion_gates: CompletionGateFacts | None = None,
+        fresh: bool = False,
+    ) -> ValidationResult:
+        """Dry-run validation for an already-read composition state.
+
+        Snapshot-style callers use this to keep every projected row on the
+        same ``CompositionState.version`` instead of re-reading mutable session
+        state between adjacent readiness calculations. When supplied,
+        ``session_id`` scopes inline-blob metadata lookups to the same session
+        boundary enforced by ``link_blob_to_run()`` at execution time.
+
+        ``completion_gates`` carries persisted composer completion-gate facts
+        parsed off the state's ``composition_states`` row (advisor sign-off,
+        R2-F14). The recompute cannot rediscover those events, so callers that
+        hold the record pass them here and the merged result withholds
+        ``completion_ready`` accordingly. ``None`` — no record at hand, or no
+        envelope ever written — leaves the recompute untouched.
+
+        The pre-merge result is memoized briefly (``validation_memo``) so the
+        ``/validate`` + ``/audit-readiness`` pair for one composition version
+        runs the inner validation once. A state carrying a user-authored
+        secret reference bypasses the memo: validation resolves the secret's
+        value, and nothing on this path fingerprints that value.
+
+        ``fresh=True`` always runs the inner validation and neither reads nor
+        writes the memo. Callers whose verdict is written into a durable,
+        audit-bearing record (the shareable-review mark) must pass it: such a
+        record is never derived from an advisory cache.
+        """
+        secret_inventory = (
+            frozenset(self._secret_service.list_refs(user_id)) if self._secret_service is not None and user_id is not None else frozenset()
+        )
+        env_ref_names = frozenset(item.name for item in secret_inventory)
+        require_no_credential_material_in_state(
+            state,
+            surface="composer_validation_state",
+            env_ref_names=env_ref_names,
+        )
+        plugin_snapshot = self._plugin_snapshot_for_user(user_id, operation="validation")
+
+        async def _compute(blob_reads: BlobReadLog | None) -> ValidationResult:
+            return await self._authoritative_state_preflight(
+                state,
+                plugin_snapshot=plugin_snapshot,
+                user_id=user_id,
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+                completion_gates=None,
+                blob_reads=blob_reads,
+            )
+
+        async def _blob_reads_current(blob_reads: BlobReads) -> bool:
+            return await self._blob_reads_still_current(
+                blob_reads, session_id=session_id, session_operation_context=session_operation_context
+            )
+
+        if fresh or _state_has_secret_ref_sites(state, env_ref_names):
+            result = await _compute(None)
+        else:
+            result = await self._validation_memo.get_or_compute(
+                ValidationMemoKey(
+                    user_id=user_id,
+                    session_id=session_id,
+                    state_content_hash=composition_content_hash(state),
+                    state_version=state.version,
+                    plugin_snapshot_hash=plugin_snapshot.snapshot_hash,
+                    secret_inventory=secret_inventory,
+                ),
+                compute=_compute,
+                blob_reads_current=_blob_reads_current,
+            )
+        return merge_completion_gates(result, completion_gates, state)
+
+    async def _blob_reads_still_current(
+        self,
+        blob_reads: BlobReads,
+        *,
+        session_id: UUID | None,
+        session_operation_context: SessionOperationContext,
+    ) -> bool:
+        """Re-read each blob row a memoized validation consulted; True iff all are unchanged."""
+        for blob_id, recorded in blob_reads:
+            if not await self._blob_row_matches(
+                blob_id, recorded, session_id=session_id, session_operation_context=session_operation_context
+            ):
+                return False
+        return True
+
+    async def _blob_row_matches(
+        self,
+        blob_id: UUID,
+        recorded: BlobRecord | None,
+        *,
+        session_id: UUID | None,
+        session_operation_context: SessionOperationContext,
+    ) -> bool:
+        """True iff the blob row, seen through validation's session filter, equals what was recorded."""
+        if self._blob_service is None:
+            return False
+        try:
+            current = await self._blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
+        except BlobNotFoundError:
+            return recorded is None
+        if type(current) is not BlobRecord:
+            raise TypeError("BlobServiceProtocol.get_blob() must return an exact BlobRecord")
+        if session_id is not None and current.session_id != session_id:
+            # Validation's metadata view reads a row owned by another session
+            # as absent, so the recorded observation for it is ``None``.
+            return recorded is None
+        return current == recorded
+
+    async def verify_run_ownership(self, user: UserIdentity, run_id: str) -> bool:
+        """Verify that a run belongs to the authenticated user's session.
+
+        Used by the WebSocket handler for IDOR protection. Checks both
+        user_id and auth_provider_type to prevent cross-provider access
+        when user_id namespaces overlap between providers.
+        """
+        # Tier-3 boundary: ``UUID(run_id)`` raises ValueError on a malformed
+        # run id, and ``get_run`` raises a bare ValueError when no run row
+        # matches. Both are legitimate external not-found cases — the caller
+        # maps them to an IDOR-safe 4004 close.
+        run = await self._session_service.get_run(UUID(run_id))
+        # Tier-1 invariant: an existing run's ``session_id`` FK MUST resolve to
+        # a sessions row. If it does not, that is referential corruption of our
+        # own sessions DB, not hostile client input. ``get_session`` signals
+        # this as ``SessionNotFoundError`` (a ValueError subclass); we re-raise
+        # it as a non-ValueError integrity error so the ownership-check caller's
+        # broad ``except ValueError`` cannot silently collapse Tier-1 corruption
+        # into a benign "Run not found" response.
+        try:
+            session = await self._session_service.get_session(run.session_id)
+        except SessionNotFoundError as exc:
+            raise RunSessionIntegrityError(run_id=run_id, session_id=str(run.session_id)) from exc
+        return (
+            session.archived_at is None and session.user_id == user.user_id and session.auth_provider_type == self._settings.auth_provider
+        )
+
+    async def cancel(self, run_id: UUID, *, user: UserIdentity) -> None:
+        """Persist authenticated intent so any replica can stop the owner."""
+        run = await self._session_service.get_run(run_id)
+        await self._session_service.request_run_cancellation(
+            run_id,
+            session_id=run.session_id,
+            user_id=user.user_id,
+            auth_provider_type=self._settings.auth_provider,
+        )
+        with self._shutdown_events_lock:
+            event = self._shutdown_events.get(str(run_id))
+        if event is not None:
+            event.set()
+
+    # ── Background Thread ──────────────────────────────────────────────
+
+    def _run_pipeline(
+        self,
+        run_id: str,
+        pipeline_yaml: str,
+        shutdown_event: threading.Event,
+        frozen_run_settings: FrozenRunSettings | None = None,
+        user_id: str | None = None,
+        auth_provider_type: str | None = None,
+        *,
+        session_operation_lease: SessionOperationLease,
+        durable_admission: bool = False,
+        resume_existing: bool = False,
+        restored_envelope: RestoredExecutionEnvelope | None = None,
+    ) -> _RunPipelineOutcome:
+        """Execute a pipeline in the background thread.
+
+        B7 fix: Wrapped in try/except BaseException/finally.
+        - except BaseException: Updates run to failed, re-raises.
+        - finally: Removes shutdown event from _shutdown_events.
+
+        B2 fix: shutdown_event is ALWAYS passed to orchestrator.run().
+        B3 fix: LandscapeDB and PayloadStore from WebSettings resolvers.
+
+        Secret resolution: If secret_service and user_id are available,
+        resolves {"secret_ref": "NAME"} patterns in the YAML config before
+        loading settings. Resolved values exist only in the worker thread's
+        local memory — never persisted.
+        """
+        landscape_db: LandscapeDB | None = None
+        rate_limit_registry: Any | None = None
+        telemetry_manager: Any | None = None
+        run_uuid = UUID(run_id)
+        session_operation_context = session_operation_lease.context
+        sink_effect_gate_passed = False
+        run_start_permit: RunStartPermitBinding | None = None
+        admission_decision: ChargeableAdmissionDecision | None = None
+        admission_refusal_pending = False
+        outputs_finalized = False
+        terminal_event_persisted = False
+        try:
+            session_operation_lease.guard_external_effect()
+            approval_inputs: ApprovalGateInputs | None = None
+            if durable_admission and self._settings.workflow_governance == "on":
+                approval_settings = frozen_run_settings if restored_envelope is None else restored_envelope.settings
+                if approval_settings is None or user_id is None:
+                    raise AuditIntegrityError("Governed worker start requires frozen settings and an authenticated user")
+                approval_run = self._call_async(self._session_service.get_run(run_uuid))
+                approval_inputs = self._approval_inputs_from_frozen(
+                    approval_settings,
+                    user_id=user_id,
+                    session_id=approval_run.session_id,
+                    session_operation_context=session_operation_context,
+                )
+            if durable_admission and restored_envelope is None:
+                admitted_run = self._call_async(self._session_service.get_run(run_uuid))
+                if admitted_run.cancel_requested_at is not None:
+                    self._call_async(self._materialize_durable_cancellation(admitted_run, session_operation_lease))
+                    return None
+            if durable_admission:
+                from elspeth.web.coordination.contracts import StartPermitState
+
+                if approval_inputs is None:
+                    permit = self._call_async(
+                        self._session_service.assess_run_start_admission(run_uuid, session_operation_context=session_operation_context)
+                    )
+                else:
+                    permit = self._call_async(
+                        self._session_service.assess_run_start_admission(
+                            run_uuid, session_operation_context=session_operation_context, approval=approval_inputs
+                        )
+                    )
+                if (
+                    permit.state in {StartPermitState.CANCELLED_BEFORE_PERMIT, StartPermitState.REFUSED}
+                    or permit.execution_refusal is not None
+                ):
+                    if permit.state is not StartPermitState.CANCELLED_BEFORE_PERMIT:
+                        admission_refusal_pending = True
+                        self._call_async(self._settle_admission_refusal(run_uuid, session_operation_lease))
+                    return None
+                if restored_envelope is None:
+                    admitted_run = self._call_async(self._session_service.get_run(run_uuid))
+                    restored_envelope = self._call_async(
+                        self._restore_admitted_run(
+                            admitted_run,
+                            user_id=user_id,
+                            auth_provider_type=auth_provider_type,
+                            session_operation_context=session_operation_context,
+                        )
+                    )
+                    frozen_run_settings = restored_envelope.settings
+                if approval_inputs is None:
+                    permit = self._call_async(
+                        self._session_service.issue_run_start_permit(run_uuid, session_operation_context=session_operation_context)
+                    )
+                else:
+                    permit = self._call_async(
+                        self._session_service.issue_run_start_permit(
+                            run_uuid, session_operation_context=session_operation_context, approval=approval_inputs
+                        )
+                    )
+                if (
+                    permit.state in {StartPermitState.CANCELLED_BEFORE_PERMIT, StartPermitState.REFUSED}
+                    or permit.execution_refusal is not None
+                ):
+                    if permit.state is not StartPermitState.CANCELLED_BEFORE_PERMIT:
+                        admission_refusal_pending = True
+                        self._call_async(self._settle_admission_refusal(run_uuid, session_operation_lease))
+                    return None
+                admission_decision = permit.admission_decision
+                assert permit.permit_id is not None and permit.permit_epoch is not None and permit.subject_hash is not None
+                run_start_permit = RunStartPermitBinding(run_id, permit.permit_id, permit.permit_epoch, permit.subject_hash)
+                from elspeth.core.landscape.run_start_admission import RunStartAdmissionRepository, RunStartAdmissionState
+
+                landscape_db = open_landscape_db(self._settings)
+                admission = RunStartAdmissionRepository(landscape_db).observe(run_start_permit)
+                if admission is not None and admission.state is RunStartAdmissionState.PREPARED:
+                    resume_existing = False
+                latest_run = self._call_async(self._session_service.get_run(run_uuid))
+                if latest_run.cancel_requested_at is not None:
+                    shutdown_event.set()
+                if shutdown_event.is_set() and not resume_existing:
+                    self._call_async(self._materialize_durable_cancellation(latest_run, session_operation_lease))
+                    return None
+            if not durable_admission:
+                admission_decision = self._call_async(
+                    self._session_service.assess_chargeable_operation(
+                        session_operation_context=session_operation_context,
+                        operation=ChargeableOperation.RUN,
+                    )
+                )
+                if not admission_decision.allowed:
+                    assert admission_decision.refusal_reason is not None
+                    raise ChargeableAdmissionRefused(admission_decision)
+            # Early shutdown check: if cancel()/shutdown() fired before we
+            # start setup, skip the expensive LandscapeDB/plugin/graph work.
+            if shutdown_event.is_set() and not resume_existing:
+                outputs_finalized = self._finalize_output_blobs(
+                    run_id,
+                    success=False,
+                    session_operation_lease=session_operation_lease,
+                )
+                session_operation_lease.guard_external_effect()
+                self._call_async(
+                    self._session_service.update_run_status(
+                        run_uuid,
+                        status="cancelled",
+                        session_operation_context=session_operation_context,
+                    )
+                )
+                self._persist_and_broadcast_run_event(
+                    run_id,
+                    RunEvent(
+                        run_id=run_id,
+                        timestamp=datetime.now(tz=UTC),
+                        event_type="cancelled",
+                        data=CancelledData(
+                            source_rows_processed=0,
+                            tokens_succeeded=0,
+                            tokens_failed=0,
+                            tokens_quarantined=0,
+                            tokens_routed_success=0,
+                            tokens_routed_failure=0,
+                        ),
+                    ),
+                    session_operation_lease=session_operation_lease,
+                )
+                terminal_event_persisted = True
+                return None
+
+            profiled_s3_audit_identities: S3ProfiledAuditIdentities = ()
+            profiled_textract_audit_identities: TextractProfiledAuditIdentities = ()
+            if frozen_run_settings is None:
+                if not self._trained_operator_mode:
+                    raise RuntimeError("Web execution requires frozen request policy settings")
+                plugin_snapshot = self._plugin_snapshot_for_user(None, operation="execution")
+                executable_config: dict[str, Any] | None = None
+                audit_safe_config: dict[str, Any] | None = None
+            else:
+                plugin_snapshot = frozen_run_settings.plugin_snapshot
+                executable_config = cast(dict[str, Any], deep_thaw(frozen_run_settings.executable_config))
+                audit_safe_config = cast(dict[str, Any], deep_thaw(frozen_run_settings.audit_safe_config))
+                profiled_s3_audit_identities = frozen_run_settings.profiled_s3_audit_identities
+                profiled_textract_audit_identities = frozen_run_settings.profiled_textract_audit_identities
+
+            raw_eligibility_config = executable_config
+            if raw_eligibility_config is None:
+                loaded_eligibility_config = load_bounded_pipeline_yaml(pipeline_yaml)
+                raw_eligibility_config = (
+                    cast(dict[str, Any], loaded_eligibility_config) if type(loaded_eligibility_config) is dict else None
+                )
+            if raw_eligibility_config is None:
+                raise TypeError("Pipeline YAML must produce a mapping before sink effect eligibility")
+            if "run_mode" in raw_eligibility_config and raw_eligibility_config["run_mode"] != "live":
+                raise ValueError("Web execution does not support nonlive run invocation")
+            if "replay_from" in raw_eligibility_config and raw_eligibility_config["replay_from"] is not None:
+                raise ValueError("Web execution does not support nonlive run invocation")
+            from elspeth.web.execution.export_marking import operator_marked_config_dict
+
+            effective_eligibility_config = operator_marked_config_dict(raw_eligibility_config, self._settings)
+            validate_sink_effect_eligibility_from_raw_config(
+                effective_eligibility_config,
+                purpose=SinkEffectExecutionPurpose.RESUME if resume_existing else SinkEffectExecutionPurpose.FRESH,
+            )
+            export_settings = validate_landscape_export_settings_from_raw_config(effective_eligibility_config)
+            # Session download authority does not grant access to deployment-wide
+            # authentication history, including for restored or operator-authored runs.
+            if export_settings.auth_events == "deployment_snapshot":
+                raise ValueError("landscape.export.auth_events=deployment_snapshot is not permitted in Web execution")
+            if export_settings.enabled:
+                validate_sink_effect_eligibility_from_raw_config(
+                    effective_eligibility_config,
+                    purpose=SinkEffectExecutionPurpose.AUDIT_EXPORT,
+                )
+
+            # B8/C1: SessionService is async — bridge from background thread.
+            # Cancelled-race recovery: catch only the narrow subclass.  See
+            # IllegalRunTransitionError docstring for why bare ValueError must
+            # propagate (Tier-1 invariant breaches must not be masked).
+            # Resolve secret refs before writing YAML to temp file.
+            # Resolved values exist only in this thread's local memory — the
+            # original pipeline_yaml (persisted in the Run record) is untouched.
+            resolved_dict: dict[str, Any] | None = executable_config
+            secret_resolution_inputs: list[SecretResolutionInput] = []
+            inline_blob_candidate = (
+                bool(_discover_blob_content_refs(executable_config))
+                if executable_config is not None
+                else "blob_ref" in pipeline_yaml and "inline_content" in pipeline_yaml
+            )
+            blob_rows_candidate = (
+                bool(_discover_blob_rows_sources(executable_config)) if executable_config is not None else "blob_rows" in pipeline_yaml
+            )
+            # blob ids and expected payload refs admitted for staging into the
+            # run's payload store after it is constructed below.
+            admitted_blob_rows: list[tuple[UUID, str]] = []
+            needs_config_tree = (
+                executable_config is not None
+                or (self._secret_service is not None and user_id is not None)
+                or inline_blob_candidate
+                or blob_rows_candidate
+            )
+            if needs_config_tree:
+                if resolved_dict is None:
+                    config_dict = load_bounded_pipeline_yaml(pipeline_yaml)
+                    if type(config_dict) is not dict:
+                        raise TypeError(
+                            f"generate_yaml() produced non-dict YAML (got {type(config_dict).__name__}) — this is a bug in the YAML generator"
+                        )
+                    resolved_dict = cast(dict[str, Any], config_dict)
+
+                runtime_secret_resolver = self._secret_service if restored_envelope is None else restored_envelope.secret_resolver
+                if runtime_secret_resolver is not None and user_id is not None:
+                    from elspeth.core.secrets import resolve_secret_refs
+
+                    env_ref_names = (
+                        {item.name for item in runtime_secret_resolver.list_refs(user_id)}
+                        if restored_envelope is None
+                        else set(restored_envelope.env_ref_names)
+                    )
+                    resolved_dict, resolutions = resolve_secret_refs(
+                        resolved_dict,
+                        runtime_secret_resolver,
+                        user_id,
+                        env_ref_names=env_ref_names,
+                    )
+
+                    # Map ResolvedSecret.scope (web domain) to
+                    # SecretResolutionInput.source (audit domain).
+                    # "server" secrets are env vars on the host → audit source "env".
+                    _SCOPE_TO_AUDIT_SOURCE: dict[str, str] = {
+                        "user": "user",
+                        "server": "env",
+                    }
+                    for rs in resolutions:
+                        # Offensive lookup against our own code-controlled
+                        # mapping: rs.scope is a typed SecretScope Literal, so
+                        # an unmapped scope (e.g. a valid "org" with no audit
+                        # mapping added yet) is a programmer coverage gap, not
+                        # external absence. Direct subscript surfaces it as a
+                        # KeyError, re-raised as a meaningful ValueError.
+                        try:
+                            audit_source = _SCOPE_TO_AUDIT_SOURCE[rs.scope]
+                        except KeyError as exc:
+                            raise ValueError(
+                                f"No audit source mapping for secret scope {rs.scope!r} "
+                                f"(secret: {rs.name!r}) — add mapping to _SCOPE_TO_AUDIT_SOURCE"
+                            ) from exc
+                        secret_resolution_inputs.append(
+                            SecretResolutionInput(
+                                env_var_name=rs.name,
+                                source=audit_source,
+                                vault_url=None,
+                                secret_name=None,
+                                timestamp=time.time(),
+                                resolution_latency_ms=0.0,
+                                fingerprint=rs.fingerprint,
+                            )
+                        )
+
+                inline_refs = _discover_blob_content_refs(resolved_dict) if inline_blob_candidate else []
+                if inline_refs:
+                    if self._blob_service is None:
+                        raise RuntimeError("Inline-content blob refs require BlobServiceProtocol wiring")
+                    blob_service = self._blob_service
+
+                    unique_blob_ids: list[UUID] = []
+                    seen_blob_ids: set[UUID] = set()
+                    for ref in inline_refs:
+                        if ref.blob_id in seen_blob_ids:
+                            continue
+                        seen_blob_ids.add(ref.blob_id)
+                        unique_blob_ids.append(ref.blob_id)
+
+                    async def _link_inline_blobs_to_run() -> None:
+                        async def _link_one(blob_id: UUID) -> None:
+                            await run_sync_in_worker(session_operation_lease.guard_external_effect)
+                            await blob_service.link_blob_to_run(
+                                blob_id=blob_id,
+                                run_id=run_uuid,
+                                direction="input",
+                                session_operation_context=session_operation_context,
+                            )
+
+                        await asyncio.gather(*(_link_one(blob_id) for blob_id in unique_blob_ids))
+
+                    try:
+                        # IDOR contract (mirrors the source blob_ref path at
+                        # lines 645-647 and the /validate _blob_get_metadata
+                        # path at 862-871): inline-content markers carry a
+                        # caller-supplied blob_id, so the cross-session and the
+                        # genuinely-missing cases MUST be indistinguishable.
+                        # ``get_blob`` is global (not session-scoped), so we
+                        # resolve the run's owning session once and treat any
+                        # blob owned by another session exactly as missing —
+                        # raising ``BlobNotFoundError`` BEFORE any status / hash
+                        # / size comparison in ``_enforce_blob_content_ref_metadata``
+                        # or any ``link_blob_to_run`` / ``read_blob_content``
+                        # access, so no metadata of another session's blob is
+                        # ever observable.
+                        session_operation_lease.guard_external_effect()
+                        owning_session_id = self._call_async(self._session_service.get_run(run_uuid)).session_id
+
+                        async def _get_blob_scoped(blob_id: UUID) -> BlobRecord:
+                            await run_sync_in_worker(session_operation_lease.guard_external_effect)
+                            record = await blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
+                            if record.session_id != owning_session_id:
+                                raise BlobNotFoundError(str(blob_id))
+                            return record
+
+                        async def _gather_inline_blob_metadata() -> list[Any]:
+                            return await asyncio.gather(*(_get_blob_scoped(blob_id) for blob_id in unique_blob_ids))
+
+                        metadata_records = self._call_async(_gather_inline_blob_metadata())
+                        records_by_blob_id: dict[UUID, BlobRecord] = {
+                            blob_id: cast(BlobRecord, record) for blob_id, record in zip(unique_blob_ids, metadata_records, strict=True)
+                        }
+                        _enforce_blob_content_ref_metadata(
+                            inline_refs,
+                            records_by_blob_id,
+                            per_ref_byte_cap=BLOB_INLINE_PER_REF_BYTE_CAP,
+                            aggregate_byte_cap=BLOB_INLINE_AGGREGATE_BYTE_CAP,
+                        )
+                        # Modality is checked at ADMISSION, as the blob_rows arm
+                        # below does: the prompt-template and model-choice reviews
+                        # read those options as strings, so an inline_content
+                        # marker there opens no review site, and substituting an
+                        # LLM-authored blob would make planner-written text the
+                        # executed prompt (or model) with no human review. Fail
+                        # closed before any link or read.
+                        llm_node_names = {
+                            node["name"]
+                            for collection_key in _NODE_COLLECTION_KEYS
+                            if collection_key in resolved_dict and type(resolved_dict[collection_key]) is list
+                            for node in resolved_dict[collection_key]
+                            if type(node) is dict and "plugin" in node and node["plugin"] == "llm" and "name" in node
+                        }
+                        llm_authored_prompt_refs = [
+                            ref
+                            for ref in inline_refs
+                            if is_llm_authored_prompt_surface_binding(
+                                ref.field_path,
+                                llm_node_names=llm_node_names,
+                                creation_modality=records_by_blob_id[ref.blob_id].creation_modality,
+                            )
+                        ]
+                        if llm_authored_prompt_refs:
+                            bound = ", ".join(f"{ref.field_path} (blob {ref.blob_id})" for ref in llm_authored_prompt_refs)
+                            raise InlineBlobPromptSurfaceAdmissionError(
+                                f"{bound} binds LLM-authored blob content into an llm prompt surface; inline prompt, "
+                                "system prompt, query template and model content admits only user-verbatim blobs — "
+                                "write the reviewed text into the option instead so its review is staged"
+                            )
+                        self._call_async(_link_inline_blobs_to_run())
+
+                        async def _read_inline_blob_contents() -> dict[Any, bytes]:
+                            async def _read_one(blob_id: UUID) -> bytes:
+                                await run_sync_in_worker(session_operation_lease.guard_external_effect)
+                                if restored_envelope is not None:
+                                    item = next(item for item in restored_envelope.blob_inputs if item.reference.blob_id == blob_id)
+                                    return await run_sync_in_worker(read_retained_input, item.retained)
+                                return await blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context)
+
+                            results = await asyncio.gather(
+                                *(_read_one(blob_id) for blob_id in unique_blob_ids),
+                                return_exceptions=True,
+                            )
+                            return _resolve_blob_content_results(inline_refs, unique_blob_ids, results)
+
+                        fetched = self._call_async(_read_inline_blob_contents())
+                        blob_metadata: dict[UUID, tuple[AllowedMimeType, int]] = {
+                            blob_id: (cast(AllowedMimeType, record.mime_type), record.size_bytes)
+                            for blob_id, record in zip(unique_blob_ids, metadata_records, strict=True)
+                        }
+                        resolved_dict, blob_resolutions = _substitute_blob_content_refs(
+                            resolved_dict,
+                            fetched,
+                            refs=inline_refs,
+                            blob_metadata=blob_metadata,
+                        )
+                    except BlobIntegrityError:
+                        _BLOB_INLINE_HASH_MISMATCH_TOTAL.add(1)
+                        raise
+                    session_operation_lease.guard_external_effect()
+                    self._call_async(
+                        self._session_service.record_blob_inline_resolutions(
+                            run_id=run_uuid,
+                            resolutions=blob_resolutions,
+                            attempt=1,
+                            session_operation_context=session_operation_context,
+                        )
+                    )
+
+                blob_rows_bindings = _discover_blob_rows_sources(resolved_dict) if blob_rows_candidate else []
+                if blob_rows_bindings:
+                    if self._blob_service is None:
+                        raise RuntimeError("blob_rows sources require BlobServiceProtocol wiring")
+                    rows_blob_service = self._blob_service
+
+                    # The persisted entries were authored by the trusted plural
+                    # resolver (set_source_from_blobs), but the sessions DB is
+                    # not the authority at run time — the blob records are.
+                    # Strict-parse every entry with the plugin-owned model,
+                    # then re-resolve each against the session's authoritative
+                    # record and fail admission on ANY divergence.
+                    parsed_entries: list[tuple[str, BlobRowsEntry]] = []
+                    for source_label, raw_options in blob_rows_bindings:
+                        if type(raw_options) is not dict:
+                            raise BlobRowsSourceAdmissionError(f"{source_label}.options must be a mapping")
+                        options_mapping: dict[str, Any] = raw_options
+                        raw_blobs = options_mapping["blobs"] if "blobs" in options_mapping else None
+                        if type(raw_blobs) is not list or not raw_blobs:
+                            raise BlobRowsSourceAdmissionError(f"{source_label}.options.blobs must be a non-empty list")
+                        for position, raw_entry in enumerate(raw_blobs):
+                            try:
+                                entry = BlobRowsEntry.model_validate(raw_entry)
+                            except PydanticValidationError as exc:
+                                raise BlobRowsSourceAdmissionError(f"{source_label}.options.blobs[{position}] failed validation") from exc
+                            parsed_entries.append((f"{source_label}.options.blobs[{position}]", entry))
+
+                    # IDOR contract (same as the inline-content block above):
+                    # resolve the run's owning session once and treat any blob
+                    # owned by another session exactly as missing, BEFORE any
+                    # status / hash / metadata comparison, linking, or read.
+                    rows_session_id = self._call_async(self._session_service.get_run(run_uuid)).session_id
+
+                    async def _get_blob_rows_scoped(blob_id: UUID) -> BlobRecord:
+                        record = await rows_blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
+                        if record.session_id != rows_session_id:
+                            raise BlobNotFoundError(str(blob_id))
+                        return record
+
+                    unique_rows_blob_ids: list[UUID] = []
+                    seen_rows_blob_ids: set[UUID] = set()
+                    for _entry_path, entry in parsed_entries:
+                        entry_blob_id = UUID(entry.blob_id)
+                        if entry_blob_id not in seen_rows_blob_ids:
+                            seen_rows_blob_ids.add(entry_blob_id)
+                            unique_rows_blob_ids.append(entry_blob_id)
+
+                    async def _gather_blob_rows_records() -> list[Any]:
+                        return await asyncio.gather(*(_get_blob_rows_scoped(blob_id) for blob_id in unique_rows_blob_ids))
+
+                    rows_records_by_id: dict[UUID, BlobRecord] = {
+                        blob_id: cast(BlobRecord, record)
+                        for blob_id, record in zip(unique_rows_blob_ids, self._call_async(_gather_blob_rows_records()), strict=True)
+                    }
+
+                    for entry_path, entry in parsed_entries:
+                        record = rows_records_by_id[UUID(entry.blob_id)]
+                        if record.status != "ready":
+                            raise BlobStateError(
+                                entry.blob_id,
+                                message=(
+                                    f"Cannot bind blob {entry.blob_id} at {entry_path} — status is {record.status!r}, expected 'ready'"
+                                ),
+                            )
+                        if record.content_hash != entry.payload_ref:
+                            raise BlobIntegrityError(
+                                entry.blob_id,
+                                expected=entry.payload_ref,
+                                actual=record.content_hash or "<missing>",
+                            )
+                        diverged = [
+                            field_name
+                            for field_name, persisted, authoritative in (
+                                ("filename", entry.filename, record.filename),
+                                ("mime_type", entry.mime_type, record.mime_type),
+                                ("size_bytes", entry.size_bytes, record.size_bytes),
+                            )
+                            if persisted != authoritative
+                        ]
+                        if diverged:
+                            raise BlobRowsSourceAdmissionError(
+                                f"{entry_path} diverged from the session blob record on: {', '.join(diverged)}"
+                            )
+                        # Modality is checked at ADMISSION, not only in the
+                        # plural resolver: generic composer writers
+                        # (set_source/set_pipeline/patch_source_options) can
+                        # also author blob_rows options, and only this gate
+                        # holds for every authoring path. LLM-authored blobs
+                        # must flow through set_source_from_blob, whose
+                        # interpretation review stamps the invented-source
+                        # custody (elspeth-0c6a343921 review).
+                        if is_llm_authored_creation_modality(record.creation_modality):
+                            raise BlobRowsSourceAdmissionError(
+                                f"{entry_path} binds LLM-authored blob {entry.blob_id}; blob_rows admits only "
+                                "user-verbatim content — bind it through set_source_from_blob so its "
+                                "interpretation review is staged"
+                            )
+
+                    async def _link_blob_rows_to_run() -> None:
+                        await asyncio.gather(
+                            *(
+                                rows_blob_service.link_blob_to_run(
+                                    blob_id=blob_id,
+                                    run_id=run_uuid,
+                                    direction="input",
+                                    session_operation_context=session_operation_context,
+                                )
+                                for blob_id in unique_rows_blob_ids
+                            )
+                        )
+
+                    self._call_async(_link_blob_rows_to_run())
+                    # content_hash == payload_ref was verified above, so the
+                    # non-None narrowing here is structural, not hopeful.
+                    admitted_blob_rows = [
+                        (blob_id, cast(str, rows_records_by_id[blob_id].content_hash)) for blob_id in unique_rows_blob_ids
+                    ]
+
+            if frozen_run_settings is not None:
+                # Rebuild the principal snapshot after secret resolution and
+                # immediately before runtime config use. A queued run must not
+                # pair newly rotated credentials/profile bindings with the
+                # request-time generation retained in its audit evidence.
+                self._require_current_binding_generation(frozen_run_settings, user_id=user_id)
+
+            # Load settings in-process — never write resolved secrets or inline
+            # blob contents to disk, and never serialize them back through YAML.
+            # Web-authored pipeline YAML must not expand host ${VAR}
+            # placeholders: known secret inventory names are resolved above via
+            # the audited resolve_secret_refs path, and any remaining ${VAR} is
+            # user-authored data, not a licence to read the host environment.
+            # Operator ${VAR} expansion remains available on the CLI loader,
+            # load_settings().
+            if resolved_dict is None:
+                if effective_eligibility_config is raw_eligibility_config:
+                    settings = load_settings_from_yaml_string(pipeline_yaml, expand_env_vars=False)
+                else:
+                    settings = load_settings_from_config_dict(effective_eligibility_config, expand_env_vars=False)
+            else:
+                settings = load_settings_from_config_dict(operator_marked_config_dict(resolved_dict, self._settings), expand_env_vars=False)
+
+            # AWS ECS web execution is governed by operator-owned telemetry
+            # routing. Apply the fixed task-local policy before graph/config
+            # assembly: PipelineConfig.config therefore contains the sanitized
+            # effective policy, Landscape.begin_run persists it and its hash,
+            # and only then may RunStarted telemetry fire. The original YAML in
+            # the sessions database remains the authored-policy comparison
+            # surface; no authored endpoint/header/credential enters Landscape.
+            from elspeth.web.operator_telemetry import apply_operator_pipeline_telemetry
+
+            settings = apply_operator_pipeline_telemetry(settings, self._settings)
+            from elspeth.web.execution.export_marking import apply_operator_export_marking
+
+            effective_export = apply_operator_export_marking(settings.landscape.export, self._settings)
+            settings = settings.model_copy(update={"landscape": settings.landscape.model_copy(update={"export": effective_export})})
+            if audit_safe_config is None:
+                parsed_audit_config = load_bounded_pipeline_yaml(pipeline_yaml)
+                if type(parsed_audit_config) is dict:
+                    audit_safe_config = cast(dict[str, Any], parsed_audit_config)
+            runtime_graph = build_validated_runtime_graph(
+                settings,
+                plugin_snapshot=plugin_snapshot,
+                audit_safe_settings=audit_safe_config,
+                profiled_s3_audit_identities=profiled_s3_audit_identities,
+                profiled_textract_audit_identities=profiled_textract_audit_identities,
+            )
+            bundle = runtime_graph.plugin_bundle
+            graph = runtime_graph.graph
+
+            # The composer validation surface intentionally remains ungated.
+            # Only the executable service admits exact factory-owned bindings.
+            _execution_sinks, execution_sink_modes, sink_effect_admission = preflight_runtime_sink_effects(settings, bundle)
+            sink_effect_gate_passed = True
+
+            try:
+                session_operation_lease.guard_external_effect()
+                current_run = self._call_async(self._session_service.get_run(run_uuid)) if durable_admission else None
+                if current_run is not None and current_run.status == "running":
+                    if current_run.landscape_run_id != run_id:
+                        raise RuntimeError("Recovered run linkage disagrees with its immutable run identity")
+                else:
+                    self._call_async(
+                        self._session_service.update_run_status(
+                            run_uuid,
+                            status="running",
+                            landscape_run_id=run_id,
+                            session_operation_context=session_operation_context,
+                        )
+                    )
+            except IllegalRunTransitionError:
+                session_operation_lease.guard_external_effect()
+                current = self._call_async(self._session_service.get_run(run_uuid))
+                if current.status == "cancelled":
+                    outputs_finalized = self._finalize_output_blobs(
+                        run_id,
+                        success=False,
+                        session_operation_lease=session_operation_lease,
+                    )
+                    self._persist_and_broadcast_run_event(
+                        run_id,
+                        RunEvent(
+                            run_id=run_id,
+                            timestamp=datetime.now(tz=UTC),
+                            event_type="cancelled",
+                            data=CancelledData(
+                                source_rows_processed=0,
+                                tokens_succeeded=0,
+                                tokens_failed=0,
+                                tokens_quarantined=0,
+                                tokens_routed_success=0,
+                                tokens_routed_failure=0,
+                            ),
+                        ),
+                        session_operation_lease=session_operation_lease,
+                    )
+                    terminal_event_persisted = True
+                    return None
+                raise
+
+            # These are the first durable runtime resources. The exact sink
+            # instances have already earned admission above.
+            session_operation_lease.guard_external_effect()
+            if landscape_db is None:
+                landscape_db = open_landscape_db(self._settings)
+            if resume_existing:
+                # Replay committed outcomes before the resumed executor can
+                # request another admission. This is independent of whether
+                # the previous worker received its settlement receipt.
+                self._record_run_token_usage(run_uuid, session_operation_lease, landscape_db=landscape_db, landscape_run_id=run_id)
+
+            # Fold aggregations into transforms, assemble PipelineConfig, and
+            # run the four orchestrator route-target validators. The
+            # orchestrator runs these validators again at run-init
+            # (engine/orchestrator/core.py:1746-1777). The validators are pure
+            # and idempotent — calling them here surfaces dangling-reference
+            # errors before any rows flow, with a cleaner error surface, and
+            # closes the composer/runtime parity gap (issue elspeth-127de6865a).
+            pipeline_config = assemble_and_validate_pipeline_config(
+                sources=bundle.sources,
+                transforms=bundle.transforms,
+                sinks=bundle.sinks,
+                aggregations=bundle.aggregations,
+                settings=settings,
+                graph=graph,
+                sink_effect_modes=execution_sink_modes,
+                sink_effect_admission=sink_effect_admission,
+                sink_effect_bindings=bundle.sink_effect_bindings,
+            )
+            if isinstance(pipeline_config, PipelineConfig) and audit_safe_config is not None:
+                pipeline_config = replace(
+                    pipeline_config,
+                    config=audit_safe_resolved_config(
+                        settings,
+                        audit_safe_settings=audit_safe_config,
+                        plugin_snapshot=plugin_snapshot,
+                    ),
+                )
+            if approval_inputs is not None:
+                actual_hash = stable_hash(pipeline_config.config)
+                if actual_hash != approval_inputs.config_hash:
+                    # The worker can materialize inline blob content and
+                    # secrets after the early permit check. Recheck the exact
+                    # Landscape-bound config before orchestrator I/O.
+                    actual_approval = replace(approval_inputs, config_hash=actual_hash)
+                    permit = self._call_async(
+                        self._session_service.assess_run_start_admission(
+                            run_uuid,
+                            session_operation_context=session_operation_context,
+                            approval=actual_approval,
+                        )
+                    )
+                    if permit.execution_refusal is None and permit.state is not StartPermitState.REFUSED:
+                        raise AuditIntegrityError("Changed runtime config did not persist an approval refusal")
+                    admission_refusal_pending = True
+                    self._call_async(self._settle_admission_refusal(run_uuid, session_operation_lease))
+                    return None
+
+            # No blob payload bytes enter durable runtime storage until the
+            # final Landscape config agrees with the approval binding.
+            session_operation_lease.guard_external_effect()
+            payload_store = FilesystemPayloadStore(base_path=self._settings.get_payload_store_path())
+
+            # Stage admitted blob_rows content before the orchestrator runs:
+            # the source validates each payload ref with ``exists()`` before
+            # emitting a row, and the transform retrieves by content hash.
+            # The blob read verifies bytes under the custody lock; store is
+            # content-addressed and idempotent. The equality check binds the
+            # run payload to the session blob's content identity.
+            if admitted_blob_rows:
+                staging_blob_service = self._blob_service
+                if staging_blob_service is None:
+                    raise RuntimeError("blob_rows sources require BlobServiceProtocol wiring")
+                for staged_blob_id, expected_ref in admitted_blob_rows:
+                    if restored_envelope is not None:
+                        item = next(item for item in restored_envelope.blob_inputs if item.reference.blob_id == staged_blob_id)
+                        staged_content = read_retained_input(item.retained)
+                    else:
+                        staged_content = self._call_async(
+                            staging_blob_service.read_blob_content(staged_blob_id, session_operation_context=session_operation_context)
+                        )
+                    stored_ref = payload_store.store(staged_content)
+                    if stored_ref != expected_ref:
+                        raise BlobIntegrityError(str(staged_blob_id), expected=expected_ref, actual=stored_ref)
+
+            # Set up EventBus to bridge ProgressEvent -> RunEvent -> broadcaster.
+            # _to_run_event is a pure mapping (system code) — let it crash.
+            # ProgressBroadcaster reports the only accepted drop mode (event
+            # loop already closed) as an explicit telemetry outcome. Any
+            # RuntimeError from an open loop remains a programmer/infrastructure
+            # invariant failure and propagates through EventBus.
+            def _broadcast_progress(evt: ProgressEvent) -> None:
+                self._broadcast_progress_event(
+                    run_id,
+                    evt,
+                    session_operation_lease=session_operation_lease,
+                )
+
+            event_bus = EventBus()
+            event_bus.subscribe(ProgressEvent, _broadcast_progress)
+
+            # Match the CLI run path's runtime infrastructure. External-call
+            # plugins such as web_scrape require a RateLimitRegistry during
+            # on_start(), and the orchestrator also consumes runtime
+            # concurrency/checkpoint/telemetry configs.
+            from elspeth.contracts.config.runtime import (
+                RuntimeCheckpointConfig,
+                RuntimeConcurrencyConfig,
+                RuntimeRateLimitConfig,
+                RuntimeTelemetryConfig,
+            )
+            from elspeth.core.checkpoint import CheckpointManager
+            from elspeth.core.rate_limit import RateLimitRegistry
+            from elspeth.telemetry import create_telemetry_manager
+
+            # Operator-owned: a composition cannot carry ``rate_limit``, so
+            # ``settings.rate_limit`` here is only ever the engine default.
+            rate_limit_config = RuntimeRateLimitConfig.from_settings(self._settings.execution_rate_limit, state_dir=self._settings.data_dir)
+            concurrency_config = RuntimeConcurrencyConfig.from_settings(settings.concurrency)
+            checkpoint_config = RuntimeCheckpointConfig.from_settings(settings.checkpoint)
+            telemetry_config = RuntimeTelemetryConfig.from_settings(settings.telemetry)
+
+            rate_limit_registry = RateLimitRegistry(rate_limit_config)
+            if self._settings.deployment_target == "aws-ecs":
+                from elspeth.web.operator_telemetry import record_operator_pipeline_event
+
+                telemetry_manager = create_telemetry_manager(
+                    telemetry_config,
+                    event_observers=(record_operator_pipeline_event,),
+                )
+            else:
+                telemetry_manager = create_telemetry_manager(telemetry_config)
+            checkpoint_manager = CheckpointManager(landscape_db) if checkpoint_config.enabled or resume_existing else None
+
+            provider_clock = RunProviderAttemptClock()
+            orchestrator = Orchestrator(
+                db=landscape_db,
+                event_bus=event_bus,
+                rate_limit_registry=rate_limit_registry,
+                concurrency_config=concurrency_config,
+                checkpoint_manager=checkpoint_manager,
+                checkpoint_config=checkpoint_config,
+                telemetry_manager=telemetry_manager,
+                llm_call_governance=LLMCallGovernance(
+                    before_call=partial(self._admit_run_llm_call, run_uuid, session_operation_lease, clock=provider_clock),
+                    after_call=partial(
+                        self._settle_run_llm_call,
+                        run_uuid,
+                        session_operation_lease,
+                        landscape_db=landscape_db,
+                        landscape_run_id=run_id,
+                    ),
+                    outcome_timestamp=provider_clock.timestamp_for_outcome,
+                ),
+            )
+
+            # B2 fix: ALWAYS pass shutdown_event — suppresses signal handler
+            # installation from background thread (Python forbids
+            # signal.signal() from non-main threads)
+            # Read the boot-time catalog snapshot. Direct attribute access
+            # (offensive programming): if the lifespan never called
+            # ``set_openrouter_catalog_snapshot()`` these are ``None`` and
+            # the assertions below crash loudly, surfacing the wiring bug
+            # rather than silently writing a NULL audit field.
+            catalog_sha = self._openrouter_catalog_sha256 if restored_envelope is None else restored_envelope.openrouter_catalog_sha256
+            catalog_source = self._openrouter_catalog_source if restored_envelope is None else restored_envelope.openrouter_catalog_source
+            if catalog_sha is None or catalog_source is None:
+                raise RuntimeError(
+                    "ExecutionServiceImpl has no OpenRouter catalog snapshot. "
+                    "set_openrouter_catalog_snapshot() must be called from the "
+                    "lifespan before any pipeline executes; this is a wiring bug."
+                )
+
+            audit_export_content_store = None
+            audit_export_content_store_resolver = None
+            if settings.landscape.export.enabled:
+                from elspeth.core.audit_export_content_store import create_audit_export_content_store
+
+                audit_export_content_store, audit_export_content_store_resolver = create_audit_export_content_store(
+                    settings.landscape.export
+                )
+
+            session_operation_lease.guard_external_effect()
+            output_admission = (
+                self._blob_service.run_output_write_admission(run_uuid, session_operation_context=session_operation_context)
+                if self._blob_service is not None
+                else nullcontext()
+            )
+            with output_admission:
+                if resume_existing:
+                    assert checkpoint_manager is not None
+                    if checkpoint_manager.get_latest_checkpoint(run_id) is None:
+                        raise _RunRecoveryRequired(RecoveryRequiredReason.MISSING_BASELINE)
+                    lifecycle = check_source_lifecycle_resumable(landscape_db, run_id)
+                    if not lifecycle.check.can_resume:
+                        raise _RunRecoveryRequired(RecoveryRequiredReason.INCOMPLETE_SOURCE)
+                    recovery = RecoveryManager(landscape_db, checkpoint_manager)
+                    resume_point = recovery.get_resume_point(run_id, graph)
+                    if resume_point is None:
+                        raise _RunRecoveryRequired(RecoveryRequiredReason.COMPATIBILITY_MISMATCH)
+                    result = orchestrator.resume(
+                        resume_point,
+                        pipeline_config,
+                        graph,
+                        payload_store=payload_store,
+                        settings=settings,
+                        shutdown_event=shutdown_event,
+                        pre_effect_guard=session_operation_lease.guard_external_effect,
+                        check_coordination_latch=session_operation_lease.guard_external_effect,
+                    )
+                else:
+                    result = orchestrator.run(
+                        pipeline_config,
+                        graph=graph,
+                        settings=settings,
+                        payload_store=payload_store,
+                        audit_export_content_store=audit_export_content_store,
+                        audit_export_content_store_resolver=audit_export_content_store_resolver,
+                        secret_resolutions=secret_resolution_inputs or None,
+                        shutdown_event=shutdown_event,  # B2: NEVER omit this
+                        sink_factory=make_policy_bound_sink_factory(
+                            settings,
+                            plugin_snapshot=plugin_snapshot,
+                        ),
+                        run_id=run_id,
+                        initiated_by_user_id=user_id,
+                        auth_provider_type=auth_provider_type,
+                        openrouter_catalog_sha256=catalog_sha,
+                        openrouter_catalog_source=catalog_source,
+                        web_plugin_policy_evidence=replace(
+                            restored_envelope.web_plugin_policy_evidence
+                            if restored_envelope is not None and restored_envelope.web_plugin_policy_evidence is not None
+                            else _build_web_plugin_policy_evidence(snapshot=plugin_snapshot, policy=self._web_plugin_policy),
+                            admission_decision=admission_decision,
+                        ),
+                        check_coordination_latch=session_operation_lease.guard_external_effect,
+                        pre_effect_guard=session_operation_lease.guard_external_effect,
+                        run_start_permit=run_start_permit,
+                    )
+
+            # Orchestrator.run() returns normally ONLY on completion.
+            # If shutdown was requested, it raises GracefulShutdownError
+            # (caught below). Do NOT check shutdown_event.is_set() here —
+            # cancel() can set the event after processing finishes but
+            # before we persist status, causing a completed run to be
+            # misclassified as cancelled.
+
+            # Persist the terminal run status before success-finalizing
+            # output blobs. If the DB transition loses a race to an
+            # external cancellation, we must never expose ready outputs
+            # for a cancelled run.
+            #
+            # Phase 2.2 (elspeth-0de989c56d): the orchestrator's RunResult
+            # carries the engine-decided four-value terminal status
+            # (completed / completed_with_failures / failed / empty); pass
+            # it verbatim to the session-runs DB so an operator reading
+            # ``/api/runs/{rid}`` sees the same verdict the engine wrote
+            # to Landscape.  The legacy hard-coded ``status="completed"``
+            # collapsed S1A's reproducer ("0 succeeded, 6 routed via
+            # on_error") into a clean-completion label.
+            session_status = _session_status_from_run_result_status(result.status)
+            # FAILED-from-row-shape (engine returned normally with
+            # rows_succeeded==0) has no exception to surface.  Provide a
+            # structural error message that satisfies the
+            # ``failed-requires-error`` audit invariant while remaining
+            # operator-readable and free of secret/row content.
+            session_error: str | None = None
+            if result.status in (RunStatus.FAILED, RunStatus.COMPLETED_WITH_FAILURES):
+                # Enrich the structural message with the top distinct per-row
+                # failures so the runs view shows the dominant cause inline.
+                # Tier-1 read. Narrowed to the transient infrastructure
+                # failure modes (DB-layer errors, disk/filesystem errors)
+                # only: run-status persistence is more important than the
+                # optional sample enrichment, so a transient audit-system
+                # degradation degrades to the bare structural message (still
+                # satisfying the failed-requires-error invariant) and is
+                # recorded via the slog warning (audit-system failure
+                # exemption per the logging-telemetry-policy skill
+                # §Logging Policy).
+                # Malformed audit JSON (json.JSONDecodeError, a ValueError
+                # subclass raised by load_top_failure_categories) is Tier-1
+                # audit-data corruption and is DELIBERATELY not caught — it
+                # must crash per the tier model, not be silently degraded.
+                samples_outcome = self._enrich_failure_samples(
+                    landscape_db,
+                    run_id=run_id,
+                    landscape_run_id=result.run_id,
+                )
+                samples_text = samples_outcome.samples_text
+                if result.status == RunStatus.FAILED:
+                    session_error = _structural_failure_message(
+                        rows_processed=result.rows_processed,
+                        collector_groups_failed=result.collector_groups_failed,
+                        failure_samples=samples_text,
+                    )
+                else:
+                    # RunRecord invariant (sessions/protocol.py:237-238) permits
+                    # error on COMPLETED_WITH_FAILURES; only FAILED *requires* it.
+                    session_error = _partial_completion_message(
+                        rows_succeeded=result.rows_succeeded,
+                        rows_failed=result.rows_failed,
+                        rows_routed_failure=result.rows_routed_failure,
+                        rows_quarantined=result.rows_quarantined,
+                        collector_groups_failed=result.collector_groups_failed,
+                        failure_samples=samples_text,
+                    )
+            # R14 (Task I1): charge the run's LLM calls before its terminal status.
+            self._record_run_token_usage(run_uuid, session_operation_lease, landscape_db=landscape_db, landscape_run_id=result.run_id)
+            # Cancelled-race recovery: catch only the narrow subclass.  See
+            # IllegalRunTransitionError docstring for why bare ValueError must
+            # propagate (Tier-1 invariant breaches must not be masked).
+            try:
+                session_operation_lease.guard_external_effect()
+                self._call_async(
+                    self._session_service.update_run_status(
+                        run_uuid,
+                        status=session_status,
+                        error=session_error,
+                        rows_processed=result.rows_processed,
+                        rows_succeeded=result.rows_succeeded,
+                        rows_failed=result.rows_failed,
+                        rows_routed_success=result.rows_routed_success,
+                        rows_routed_failure=result.rows_routed_failure,
+                        rows_quarantined=result.rows_quarantined,
+                        session_operation_context=session_operation_context,
+                    )
+                )
+            except IllegalRunTransitionError:
+                session_operation_lease.guard_external_effect()
+                current = self._call_async(self._session_service.get_run(run_uuid))
+                if current.status == "cancelled":
+                    slog.warning(
+                        "run_completed_but_externally_cancelled",
+                        run_id=run_id,
+                        landscape_run_id=result.run_id,
+                        rows_processed=result.rows_processed,
+                        rows_failed=result.rows_failed,
+                    )
+                    outputs_finalized = self._finalize_output_blobs(
+                        run_id,
+                        success=False,
+                        session_operation_lease=session_operation_lease,
+                    )
+                    self._persist_and_broadcast_run_event(
+                        run_id,
+                        RunEvent(
+                            run_id=run_id,
+                            timestamp=datetime.now(tz=UTC),
+                            event_type="cancelled",
+                            data=CancelledData(
+                                source_rows_processed=result.rows_processed,
+                                tokens_succeeded=result.rows_succeeded,
+                                tokens_failed=result.rows_failed,
+                                tokens_quarantined=result.rows_quarantined,
+                                tokens_routed_success=result.rows_routed_success,
+                                tokens_routed_failure=result.rows_routed_failure,
+                            ),
+                        ),
+                        session_operation_lease=session_operation_lease,
+                    )
+                    terminal_event_persisted = True
+                    return None
+                raise
+
+            # Finalize blobs after the authoritative completion transition
+            # succeeds, but before broadcasting the completed terminal event.
+            # Finalization failures are logged in _finalize_output_blobs()
+            # and must not trigger a second terminal event.
+            #
+            # Phase 2.2 (elspeth-0de989c56d): treat the four operator-
+            # completion statuses (the run reached engine completion and
+            # produced output) as success for blob finalization.  The
+            # FAILED-from-row-shape case is "engine ran, no row succeeded"
+            # — the partial output that exists is still legitimate
+            # evidence (e.g. quarantine sink contents), so finalize as
+            # success=False to keep the failure-track outputs distinct
+            # from clean-completion outputs in the blob lifecycle.
+            outputs_finalized = self._finalize_output_blobs(
+                run_id,
+                success=(result.status != RunStatus.FAILED),
+                session_operation_lease=session_operation_lease,
+            )
+
+            if result.status == RunStatus.FAILED:
+                # Engine returned normally but no row reached success.  Emit
+                # the operator-visible failure event so the frontend can
+                # render the structural failure mode (S1A / S1B-msg2 shape).
+                # session_error is unconditionally populated by the FAILED
+                # branch above; assert the structural invariant offensively
+                # rather than re-deriving silently via
+                # ``or _structural_failure_message(...)``.  A regenerated
+                # message would mask a structural inconsistency between
+                # the audit-side and SSE-side failure detail.
+                assert session_error is not None, (
+                    "Tier-1 invariant: session_error must be populated when result.status == RunStatus.FAILED (see the FAILED branch above)"
+                )
+                self._persist_and_broadcast_run_event(
+                    run_id,
+                    RunEvent(
+                        run_id=run_id,
+                        timestamp=datetime.now(tz=UTC),
+                        event_type="failed",
+                        data=FailedData(
+                            detail=session_error,
+                            node_id=None,
+                        ),
+                    ),
+                    session_operation_lease=session_operation_lease,
+                )
+            else:
+                if landscape_db is None:
+                    raise RuntimeError("Tier-1 invariant: completed run has no open LandscapeDB for accounting projection")
+                session_operation_lease.guard_external_effect()
+                accounting = load_run_accounting_from_db(landscape_db, landscape_run_id=result.run_id)
+                # Operator disclosure for discarded rows (elspeth-43f52d69a4):
+                # before this line, a run that discarded rows at source
+                # validation completed with NO log signal at all — the
+                # engine ran clean, so none of the failure-path slogs fire.
+                # Aggregate counts and node attribution only; row content
+                # and validation error text stay in Landscape
+                # (validation_errors / the /diagnostics discards section),
+                # matching the count-only posture of the neighbouring
+                # run_completed_but_externally_cancelled warning.
+                # Sparse by contract: load_discard_summaries_from_db emits an
+                # entry only for a run whose discard total is above zero, so an
+                # absent key is "this run discarded nothing", never a failed
+                # read that a default would paper over.
+                discard_summaries = load_discard_summaries_from_db(landscape_db, (result.run_id,))
+                discard_summary = discard_summaries[result.run_id] if result.run_id in discard_summaries else None
+                if discard_summary is not None:
+                    slog.warning(
+                        "run_completed_with_discarded_rows",
+                        run_id=run_id,
+                        landscape_run_id=result.run_id,
+                        discard_total=discard_summary.total,
+                        stages=[{"stage": stage.stage, "node_id": stage.node_id, "count": stage.count} for stage in discard_summary.stages],
+                    )
+                self._persist_and_broadcast_run_event(
+                    run_id,
+                    RunEvent(
+                        run_id=run_id,
+                        timestamp=datetime.now(tz=UTC),
+                        event_type="completed",
+                        data=CompletedData(
+                            # session_status is the engine-decided four-value
+                            # operator-completion classification (completed /
+                            # completed_with_failures / empty); pass it
+                            # verbatim so the SSE event carries the same
+                            # status the run-status DB row has.  Frontend
+                            # MUST NOT re-derive from row counts.
+                            #
+                            # cast is sound: in the else branch of
+                            # ``if result.status == RunStatus.FAILED`` we know
+                            # result.status ∈ {COMPLETED, COMPLETED_WITH_FAILURES,
+                            # EMPTY} (RUNNING/INTERRUPTED raise in the mapper),
+                            # so session_status ∈ {"completed",
+                            # "completed_with_failures", "empty"}.  Pydantic
+                            # offensively re-validates the narrow Literal.
+                            status=cast(
+                                Literal["completed", "completed_with_failures", "empty"],
+                                session_status,
+                            ),
+                            accounting=accounting,
+                            landscape_run_id=result.run_id,
+                        ),
+                    ),
+                    session_operation_lease=session_operation_lease,
+                )
+
+            terminal_event_persisted = True
+
+        except SessionOperationFenceLost:
+            # A successor now owns the session.  Do not translate authority
+            # loss into user cancellation or failure: either would finalize
+            # blobs, allocate an event sequence, or broadcast stale state.
+            # The finally block still retires worker-local resources.
+            raise
+
+        except ExecutionEnvelopeRefused as exc:
+            self._call_async(self._record_recovery_refusal(run_uuid, session_operation_lease, exc))
+            return None
+
+        except (NonResumableRunError, _RunRecoveryRequired) as exc:
+            refusal_reason = exc.reason if isinstance(exc, _RunRecoveryRequired) else RecoveryRequiredReason.COMPATIBILITY_MISMATCH
+            if landscape_db is not None:
+                repositories = RecorderFactory(landscape_db)
+                if repositories.run_coordination.live_leader(run_id=run_id) is not None:
+                    return None
+            self._call_async(
+                run_sync_in_worker(
+                    self._session_service.session_operation_authority.mutate,
+                    session_operation_context,
+                    lambda tx: tx.runs.mark_recovery_required(
+                        run_id=run_uuid,
+                        reason=refusal_reason,
+                    ),
+                )
+            )
+            return None
+
+        except GracefulShutdownError as gse:
+            # Orchestrator detected shutdown during processing and raised
+            # after flushing in-progress work. Finalize → status → broadcast.
+            outputs_finalized = self._finalize_output_blobs(
+                run_id,
+                success=False,
+                session_operation_lease=session_operation_lease,
+            )
+            # R14 (Task I1): calls made before the shutdown are spent.
+            self._record_run_token_usage(run_uuid, session_operation_lease, landscape_db=landscape_db, landscape_run_id=run_id)
+            session_operation_lease.guard_external_effect()
+            self._call_async(
+                self._session_service.update_run_status(
+                    run_uuid,
+                    status="cancelled",
+                    rows_processed=gse.rows_processed,
+                    rows_succeeded=gse.rows_succeeded,
+                    rows_failed=gse.rows_failed,
+                    rows_routed_success=gse.rows_routed_success,
+                    rows_routed_failure=gse.rows_routed_failure,
+                    rows_quarantined=gse.rows_quarantined,
+                    session_operation_context=session_operation_context,
+                )
+            )
+            self._persist_and_broadcast_run_event(
+                run_id,
+                RunEvent(
+                    run_id=run_id,
+                    timestamp=datetime.now(tz=UTC),
+                    event_type="cancelled",
+                    data=CancelledData(
+                        source_rows_processed=gse.rows_processed,
+                        tokens_succeeded=gse.rows_succeeded,
+                        tokens_failed=gse.rows_failed,
+                        tokens_quarantined=gse.rows_quarantined,
+                        tokens_routed_success=gse.rows_routed_success,
+                        tokens_routed_failure=gse.rows_routed_failure,
+                    ),
+                ),
+                session_operation_lease=session_operation_lease,
+            )
+            terminal_event_persisted = True
+            return _RUN_PIPELINE_GRACEFUL_SHUTDOWN_HANDLED
+
+        except BaseException as exc:
+            if admission_refusal_pending:
+                # The terminal refusal is already durable; preserve its pending
+                # reconciliation marker so a peer retries failed cleanup.
+                raise
+            if durable_admission and isinstance(exc, (SinkEffectCapabilityError, IncompleteSourceResumeError)):
+                reason = (
+                    RecoveryRequiredReason.UNSAFE_EFFECT
+                    if isinstance(exc, SinkEffectCapabilityError)
+                    else RecoveryRequiredReason.INCOMPLETE_SOURCE
+                )
+                self._call_async(
+                    run_sync_in_worker(
+                        self._session_service.session_operation_authority.mutate,
+                        session_operation_context,
+                        lambda tx: tx.runs.mark_recovery_required(run_id=run_uuid, reason=reason),
+                    )
+                )
+                return None
+            if not sink_effect_gate_passed and isinstance(exc, SinkEffectCapabilityError):
+                raise
+
+            # B7 fix: Catch BaseException (not Exception) to handle
+            # KeyboardInterrupt, SystemExit, and OOM-triggered exceptions.
+            # Without this, the Run record stays in 'running' forever.
+
+            # Finalize blobs first — before any terminal event surfaces.
+            outputs_finalized = self._finalize_output_blobs(
+                run_id,
+                success=False,
+                session_operation_lease=session_operation_lease,
+            )
+
+            client_msg = _sanitize_error_for_client(exc)
+            if type(exc) is PydanticValidationError:
+                slog.error(
+                    "run_schema_contract_violation",
+                    run_id=run_id,
+                    exc_class=type(exc).__name__,
+                    error_count=exc.error_count(),
+                    schema_errors=_schema_contract_violation_errors(exc),
+                )
+
+            # Operator-diagnostic split.  ``client_msg`` above is the
+            # live-stream surface and stays sanitized; the audit row and the
+            # operator log get the detail the engine already holds.
+            #
+            # Signals (KeyboardInterrupt / SystemExit) are excluded from the
+            # whole block for the same reason the status update below skips
+            # them: the event loop is shutting down, so this is not the moment
+            # to open an audit read or do avoidable work.  A signal-killed run
+            # therefore reports ``node_id=None``, which is honest — the run
+            # was interrupted, not failed at a node.
+            exc_is_signal = isinstance(exc, (KeyboardInterrupt, SystemExit))
+            failed_node_id: str | None = None
+            if not exc_is_signal:
+                failed_node_id = self._lookup_failed_node_id(landscape_db, run_id=run_id).node_id
+                # Unconditional (both terminality branches below): this is the
+                # only channel carrying the scrubbed message, the failing node,
+                # and the frame list.  It is NOT a duplicate of
+                # ``_on_pipeline_done``'s safety net — that callback fires from
+                # the Future with no run_id, no node id, and no Landscape
+                # handle, so it can only ever emit the class chain.
+                slog.error(
+                    "run_pipeline_failed",
+                    run_id=run_id,
+                    exc_class=type(exc).__name__,
+                    exc_class_chain=_exception_class_chain(exc),
+                    exc_message=_operator_exc_message(exc),
+                    failed_node_id=failed_node_id,
+                    traceback_frames=_structural_traceback_frames(exc),
+                )
+
+            # elspeth-879f6de6bd: when an exception fires AFTER the success
+            # path has already committed a terminal status (post-completion
+            # broadcast crash, audit-write failure, telemetry exhaustion,
+            # OOM mid-finalize, etc.), update_run_status(status="failed", ...)
+            # raises ValueError because LEGAL_RUN_TRANSITIONS makes every
+            # terminal status outgoing-empty.  The pre-fix recovery let that
+            # ValueError escape, losing the original ``exc`` into __context__.
+            #
+            # Recovery has three branches keyed on what we can learn about the
+            # audit row's current status:
+            #
+            #   1. Probe succeeds, row is terminal → skip the illegal status
+            #      update AND the ``"failed"`` SSE broadcast (which would
+            #      otherwise contradict the audit row's true terminal status —
+            #      audit primacy).
+            #
+            #   2. Probe succeeds, row is non-terminal → fall through to the
+            #      normal ``update_run_status("failed", ...)`` recovery
+            #      (e.g. a crash mid-orchestration with the row still in
+            #      ``running``).
+            #
+            #   3. Probe fails (SQLAlchemyError / OSError) AND the row is
+            #      actually terminal → fall-through update_run_status raises
+            #      IllegalRunTransitionError, caught narrowly below.  IRTE
+            #      carries ``current_status``, which is the validator's read
+            #      of ground truth immediately before it rejected the
+            #      transition — so IRTE is in-band proof of terminality and
+            #      promotes us into branch 1's audit-primacy stance (suppress
+            #      the failed-SSE broadcast).  This is the resolution of the
+            #      ambiguity that ``post_exception_run_state_probe_failed``
+            #      logged above.
+            #
+            # Probe is non-signal-only: signals (KeyboardInterrupt, SystemExit)
+            # mean the event loop is shutting down — async calls including
+            # get_run() are unsafe.  Signal-path broadcast preserves the R6/B7
+            # shape; if a signal fires mid-broadcast against a completed run
+            # the SSE may diverge from audit, but the event loop is closing
+            # and consumers likely won't receive the event regardless.  A
+            # narrower fix for that asymmetry is tracked separately if
+            # observed in the wild.
+            run_already_terminal = False
+            if not exc_is_signal:
+                probe_outcome = self._probe_run_already_terminal(
+                    run_uuid,
+                    run_id=run_id,
+                    original_exc_class=type(exc).__name__,
+                    session_operation_lease=session_operation_lease,
+                )
+                run_already_terminal = probe_outcome.run_already_terminal
+
+                if run_already_terminal:
+                    # Post-audit-terminal exception path.  The run already
+                    # transitioned to a terminal status before this exception
+                    # fired (e.g. broadcast crashed AFTER update_run_status
+                    # succeeded), so the audit DB carries the truthful
+                    # operator-visible outcome and there is nothing more to
+                    # record on the audit side.
+                    #
+                    # We deliberately do NOT add a slog *at this site*.  Per
+                    # the logging-telemetry-policy skill §Logging Policy the
+                    # logger is not for post-audit operational signal — the
+                    # SRE-discoverable surface for this scenario is already
+                    # three channels:
+                    #   1. The audit ``runs`` row (queryable by run_id) —
+                    #      carries the truthful terminal status the run
+                    #      reached before the post-audit exception.
+                    #   2. ``run_pipeline_failed`` — emitted unconditionally
+                    #      at the top of this handler for every non-signal
+                    #      failure, so the class chain, the scrubbed message,
+                    #      the failing node, and the structural frames are
+                    #      already recorded against this run_id even though
+                    #      the audit row cannot legally be updated.
+                    #   3. ``_on_pipeline_done``'s safety-net slog
+                    #      (``pipeline_done_callback_exception``) — fires
+                    #      against the re-raised ``exc`` once the Future
+                    #      completes, with the same class-name chain.
+                    # Together these give an SRE the post-audit signal
+                    # (correlate them by run_id) without violating audit
+                    # primacy at this site.  A fourth log here would be
+                    # operational noise contributing nothing beyond the
+                    # three above.
+                    pass
+                else:
+                    try:
+                        status_update_exc_class = self._persist_failed_run_status(
+                            run_uuid,
+                            landscape_db=landscape_db,
+                            error=_operator_failure_diagnostic(
+                                class_chain=_exception_class_chain(exc),
+                                exc_message=_operator_exc_message(exc),
+                                node_id=failed_node_id,
+                                frames=_structural_traceback_frames(exc),
+                            ),
+                            session_operation_lease=session_operation_lease,
+                        )
+                    except IllegalRunTransitionError as irte:
+                        # elspeth-879f6de6bd recovery branch 3 (probe-failed
+                        # AND row-actually-terminal — see the comment block
+                        # at the top of this BaseException handler).
+                        #
+                        # IRTE here is the mechanical artefact of attempting
+                        # ``failed`` against a row whose true status is
+                        # terminal; ``irte.current_status`` is the validator's
+                        # authoritative read of that row, taken inside
+                        # SessionService.update_run_status immediately before
+                        # it rejected the transition.  That gives us the
+                        # ground truth the probe couldn't establish, so we
+                        # promote into the audit-primacy stance (suppress the
+                        # ``failed`` SSE that would otherwise contradict the
+                        # audit row).
+                        #
+                        # This is a distinct semantic from the established
+                        # IllegalRunTransitionError catches at the
+                        # ``"running"`` and terminal transitions earlier in
+                        # this method (see those sites' ``Cancelled-race
+                        # recovery`` comments and the IRTE class docstring):
+                        # those handle the cancelled-race artefact; this one
+                        # handles the post-completion + probe-failure
+                        # artefact.  The IRTE docstring's narrow-subclass
+                        # sanction ("never bare ValueError — Tier-1 invariant
+                        # breaches must propagate") applies the same way to
+                        # both: the other four ValueErrors update_run_status
+                        # can raise (run-not-found, landscape_run_id
+                        # overwrite, completed-without-landscape,
+                        # failed-without-error) are not subclasses of IRTE
+                        # and remain uncaught here.
+                        #
+                        # Offensive Tier-1 assert: if IRTE fires for a
+                        # non-terminal current_status, the SessionService
+                        # validator has a bug (it shouldn't reject a
+                        # non-terminal → failed transition).  Reraise so the
+                        # validator regression surfaces rather than being
+                        # silently absorbed; the original ``exc`` remains on
+                        # ``__context__`` via Python's implicit chaining and
+                        # the SRE-discoverable surface is identical to the
+                        # pre-fix bug — the right tradeoff for a validator
+                        # regression.
+                        if irte.current_status not in SESSION_TERMINAL_RUN_STATUS_VALUES:
+                            raise
+                        run_already_terminal = True
+                        slog.error(
+                            "post_exception_recovery_aborted_run_terminal",
+                            run_id=run_id,
+                            original_exc_class=type(exc).__name__,
+                            irte_current_status=irte.current_status,
+                        )
+                    else:
+                        # The helper returns an explicit degradation result for
+                        # DB/filesystem persistence failure instead of raising
+                        # that transient over the original pipeline exception.
+                        if status_update_exc_class is not None:
+                            # Class names only: ``str(status_err)`` can surface
+                            # SQL + bound parameters + ``__cause__`` credentials.
+                            # The original exception's own detail is already
+                            # recorded by ``run_pipeline_failed`` above (scrubbed
+                            # and bounded); this record is about the *status
+                            # update* failing, so it adds only its own class.
+                            slog.error(
+                                "run_status_update_failed_in_except",
+                                run_id=run_id,
+                                original_exc_class=type(exc).__name__,
+                                status_update_exc_class=status_update_exc_class,
+                            )
+            else:
+                slog.warning(
+                    "skipping_status_update_on_signal",
+                    run_id=run_id,
+                    exc_type=type(exc).__name__,
+                )
+
+            # Broadcast a "failed" SSE event ONLY when the audit row isn't
+            # already terminal.  Broadcasting "failed" against a "completed"
+            # audit row would tell SSE consumers the opposite of audit truth
+            # and violate audit primacy (the logging-telemetry-policy skill
+            # §The Primacy Test).
+            # Re-emitting the *correct* terminal SSE event for consumer
+            # continuity is a separate UX improvement.
+            #
+            # ``detail`` stays ``client_msg`` — this is the live client
+            # surface, and the operator detail belongs on ``runs.error``.
+            # ``node_id`` is the exception: naming which node died is
+            # structural (a graph node the author wrote), carries no payload,
+            # and is what lets the run panel highlight the failing step
+            # instead of only reporting that the run failed.
+            if not run_already_terminal:
+                self._persist_and_broadcast_run_event(
+                    run_id,
+                    RunEvent(
+                        run_id=run_id,
+                        timestamp=datetime.now(tz=UTC),
+                        event_type="failed",
+                        data=FailedData(detail=client_msg, node_id=failed_node_id),
+                    ),
+                    session_operation_lease=session_operation_lease,
+                )
+                terminal_event_persisted = True
+            raise
+        finally:
+            # Always clean up, regardless of success or failure
+            with self._shutdown_events_lock:
+                # Idempotent cleanup of an internal bookkeeping key. Access it
+                # directly (R9 remediation); the membership guard preserves the
+                # silent no-op when cleanup races or runs twice, and matches the
+                # sibling submit-failure cleanup above. run_id is contractually
+                # registered (str key, synchronous, before submit) so a bare
+                # pop-with-default would mask a broken invariant.
+                if run_id in self._shutdown_events:
+                    del self._shutdown_events[run_id]
+            if landscape_db is not None:
+                landscape_db.close()
+            if rate_limit_registry is not None:
+                rate_limit_registry.close()
+            if telemetry_manager is not None:
+                telemetry_manager.close()
+                if self._settings.deployment_target == "aws-ecs":
+                    from elspeth.web.operator_telemetry import record_operator_pipeline_queue_drops
+
+                    record_operator_pipeline_queue_drops(telemetry_manager.health_metrics["queue_drops"])
+            self._broadcaster.cleanup_run(run_id)
+            if outputs_finalized and terminal_event_persisted:
+                # Failure/cancellation can finalize outputs before recording
+                # terminal status; normal completion does so afterward. Settle
+                # only after both and the terminal event have succeeded, under
+                # the owner's live fence. Missing events or unfinished outputs
+                # remain discoverable by peer recovery.
+                session_operation_lease.guard_external_effect()
+                # The mutation rechecks terminal status inside its fenced
+                # transaction; a separate status read would add a race.
+                self._call_async(
+                    run_sync_in_worker(
+                        self._session_service.session_operation_authority.mutate,
+                        session_operation_context,
+                        lambda tx: tx.runs.mark_recovery_outputs_finalized(run_id=run_uuid),
+                    )
+                )
+        return None
+
+    def _admit_run_llm_call(
+        self,
+        run_uuid: UUID,
+        session_operation_lease: SessionOperationLease,
+        *,
+        clock: RunProviderAttemptClock | None = None,
+    ) -> str:
+        """Persist an admitted pending attempt before the provider can spend."""
+        session_operation_lease.guard_external_effect()
+        attempt = self._session_service.begin_run_provider_attempt_sync(
+            session_operation_context=session_operation_lease.context,
+            run_id=run_uuid,
+        )
+        if clock is not None:
+            clock.bind(attempt)
+        return attempt.attempt_id
+
+    def _settle_run_llm_call(
+        self,
+        run_uuid: UUID,
+        session_operation_lease: SessionOperationLease,
+        attempt_id: str,
+        call_id: str,
+        *,
+        landscape_db: LandscapeDB,
+        landscape_run_id: str,
+    ) -> None:
+        """Settle one pending attempt using its committed Landscape outcome."""
+        session_operation_lease.guard_external_effect()
+        entries = tuple(
+            entry for entry in _run_token_usage_entries(landscape_db, landscape_run_id=landscape_run_id) if entry.call_id == call_id
+        )
+        if len(entries) != 1:
+            raise AuditIntegrityError(f"Run {run_uuid} provider outcome must identify exactly one durable LLM call")
+        self._session_service.settle_run_provider_attempt_sync(
+            session_operation_context=session_operation_lease.context,
+            attempt_id=attempt_id,
+            entry=entries[0],
+        )
+
+    def _record_run_token_usage(
+        self,
+        run_uuid: UUID,
+        session_operation_lease: SessionOperationLease,
+        *,
+        landscape_db: LandscapeDB | None,
+        landscape_run_id: str,
+    ) -> None:
+        """Charge the run's LLM calls to the run owner's token ledger under the run's EXECUTE authority (R14)."""
+        if landscape_db is None:
+            return
+        entries = _run_token_usage_entries(landscape_db, landscape_run_id=landscape_run_id)
+        if not entries:
+            return
+        session_operation_lease.guard_external_effect()
+        self._call_async(
+            self._session_service.record_token_usage(
+                session_operation_context=session_operation_lease.context,
+                source="run",
+                run_id=run_uuid,
+                entries=entries,
+            )
+        )
+
+    def _persist_failed_run_status(
+        self,
+        run_uuid: UUID,
+        *,
+        error: str,
+        session_operation_lease: SessionOperationLease,
+        landscape_db: LandscapeDB | None,
+    ) -> str | None:
+        """Best-effort failed-status persistence for exception recovery.
+
+        Returns the transient DB/filesystem exception class when persistence
+        cannot be recorded, rather than raising it and masking the original
+        pipeline exception being recovered.
+        """
+        session_operation_context = session_operation_lease.context
+        try:
+            session_operation_lease.guard_external_effect()
+            self._call_async(
+                self._session_service.update_run_status(
+                    run_uuid,
+                    status="failed",
+                    error=error,
+                    session_operation_context=session_operation_context,
+                )
+            )
+            # R14 (Task I1): the failed run's calls are spent. After the status
+            # write, so a ledger failure degrades to the same transient report.
+            self._record_run_token_usage(run_uuid, session_operation_lease, landscape_db=landscape_db, landscape_run_id=str(run_uuid))
+        except (SQLAlchemyError, OSError) as status_err:
+            # Narrow catch (canonical pattern, commits b8ba2214/127417cb):
+            # SQLAlchemyError family + OSError only. Programmer bugs in
+            # update_run_status must propagate so they don't masquerade
+            # as a transient status-update failure.
+            return type(status_err).__name__
+        return None
+
+    def _enrich_failure_samples(
+        self,
+        landscape_db: LandscapeDB | None,
+        *,
+        run_id: str,
+        landscape_run_id: str,
+    ) -> _FailureSampleEnrichmentOutcome:
+        if landscape_db is None:
+            return _FailureSampleEnrichmentOutcome(samples_text="")
+        try:
+            summaries = load_top_failure_categories(landscape_db, landscape_run_id)
+            return _FailureSampleEnrichmentOutcome(samples_text=format_failure_categories(summaries))
+        except (SQLAlchemyError, OSError):
+            slog.warning(
+                "failure_sample_enrichment_failed",
+                run_id=run_id,
+                landscape_run_id=landscape_run_id,
+                exc_info=True,
+            )
+            return _FailureSampleEnrichmentOutcome(samples_text="", failed=True)
+
+    def _lookup_failed_node_id(self, landscape_db: LandscapeDB | None, *, run_id: str) -> _FailedNodeLookupOutcome:
+        """Return the node_id of the run's most recent FAILED node state.
+
+        The engine already records failures against the node that died — the
+        coalesce and transform executors write a FAILED ``node_states`` row
+        carrying the exception, its type, and the phase. Reading the node_id
+        back here is what lets ``runs.error`` and the ``failed`` SSE event
+        name *where* the run died rather than only *that* it did.
+
+        The web run_id IS the Landscape run_id (``orchestrator.run`` is called
+        with ``run_id=run_id``, and ``update_run_status`` records the same
+        value as ``landscape_run_id``), so no second identifier is threaded.
+
+        Returns ``node_id=None`` — never raises — when the answer is
+        unavailable: the run failed before Landscape was opened, no node
+        reached a FAILED state (a setup or pre-ingest failure), or the audit DB
+        is degraded. This runs inside ``_run_pipeline``'s exception recovery,
+        where anything escaping would replace the original pipeline exception;
+        the narrow ``(SQLAlchemyError, OSError)`` catch mirrors
+        ``_enrich_failure_samples`` and ``_probe_run_already_terminal`` on the
+        same recovery path.
+
+        The explicit ``_FailedNodeLookupOutcome`` result is what keeps that
+        recovery handler honest: "no FAILED node recorded" and "the audit read
+        itself broke" are different facts, and a bare ``None`` return would
+        collapse them into one silent default (the same reason the two sibling
+        helpers return outcome records rather than plain values).
+        """
+        if landscape_db is None:
+            return _FailedNodeLookupOutcome(node_id=None)
+        try:
+            node_id = _load_most_recent_failed_node_id(landscape_db, run_id=run_id)
+        except (SQLAlchemyError, OSError):
+            # Audit-system degradation — the slog exemption applies (see
+            # ``_enrich_failure_samples``). The diagnostic degrades to a
+            # node-less error message; the run still records as failed.
+            slog.warning(
+                "failed_node_id_lookup_failed",
+                run_id=run_id,
+                exc_info=True,
+            )
+            return _FailedNodeLookupOutcome(node_id=None, failed=True)
+        return _FailedNodeLookupOutcome(node_id=node_id)
+
+    def _probe_run_already_terminal(
+        self,
+        run_uuid: UUID,
+        *,
+        run_id: str,
+        original_exc_class: str,
+        session_operation_lease: SessionOperationLease,
+    ) -> _RunStateProbeOutcome:
+        try:
+            session_operation_lease.guard_external_effect()
+            current_run = self._call_async(self._session_service.get_run(run_uuid))
+            return _RunStateProbeOutcome(run_already_terminal=current_run.status in SESSION_TERMINAL_RUN_STATUS_VALUES)
+        except (SQLAlchemyError, OSError) as probe_err:
+            # Narrow catch — mirrors the sibling pattern at the
+            # ``update_run_status`` recovery below (commits b8ba2214/127417cb).
+            # Audit-system degradation falls through to the best-effort
+            # recovery so we don't make the probe-failure scenario worse than
+            # today; slog here is policy-correct because this IS an
+            # audit-system-degradation case.
+            #
+            # ValueError is deliberately NOT caught.  The ValueErrors ``get_run``
+            # can raise — "Run not found" (the row vanished mid-run),
+            # ``UUID(row.id)`` malformed, non-UTC datetimes via ``_ensure_utc`` —
+            # are all Tier 1 audit-data corruption. ``RunRecord``'s explicit
+            # invariant breaches surface as ``AuditIntegrityError(Exception)``
+            # and are likewise — correctly — uncaught here.
+            slog.error(
+                "post_exception_run_state_probe_failed",
+                run_id=run_id,
+                original_exc_class=original_exc_class,
+                probe_exc_class=type(probe_err).__name__,
+            )
+            return _RunStateProbeOutcome(run_already_terminal=False, failed=True)
+
+    def _broadcast_progress_event(
+        self,
+        run_id: str,
+        progress: ProgressEvent,
+        *,
+        session_operation_lease: SessionOperationLease,
+    ) -> None:
+        run_event = self._to_run_event(run_id, progress)
+        broadcast_result = self._persist_and_broadcast_run_event(
+            run_id,
+            run_event,
+            session_operation_lease=session_operation_lease,
+        )
+        if broadcast_result.dropped_count > 0:
+            assert broadcast_result.drop_reason is not None, "BroadcastResult with drops must carry a drop_reason"
+            self._telemetry.progress_broadcast_dropped_total.add(
+                broadcast_result.dropped_count,
+                attributes={"reason": broadcast_result.drop_reason},
+            )
+
+    def _persist_and_broadcast_run_event(
+        self,
+        run_id: str,
+        run_event: RunEvent,
+        *,
+        session_operation_lease: SessionOperationLease,
+    ) -> BroadcastResult:
+        session_operation_context = session_operation_lease.context
+        # A live event must have durable replay identity before it is exposed.
+        # Database/IO failures cannot turn an unrecorded event into success.
+        session_operation_lease.guard_external_effect()
+        record = self._call_async(
+            self._session_service.append_run_event(
+                run_id=UUID(run_id),
+                timestamp=run_event.timestamp,
+                event_type=run_event.event_type,
+                data=run_event.data.model_dump(mode="json"),
+                session_operation_context=session_operation_context,
+            )
+        )
+        run_event = run_event.with_event_sequence(record.sequence)
+        session_operation_lease.guard_external_effect()
+        return self._broadcaster.broadcast(run_id, run_event)
+
+    # Exceptions that can escape finalize_run_output_blobs itself
+    # (not per-blob errors, which are captured in the result).
+    # Covers: initial query failure (SQLAlchemyError), any OS-level
+    # failure outside the per-blob loop (OSError), and blob lifecycle
+    # errors from the service layer.  BlobStateError is belt-and-
+    # suspenders — caught per-blob inside the service, but included
+    # here in case of a code path change.
+    #
+    # RuntimeError deliberately excluded — too broad.  It would
+    # suppress Tier 1 anomaly signals, asyncio errors, and recursion
+    # failures.  If the blob service needs a "vanished mid-transaction"
+    # signal, it should raise BlobNotFoundError or BlobStateError.
+    _FINALIZE_SUPPRESSED: tuple[type[BaseException], ...] = (
+        OSError,
+        SQLAlchemyError,
+        BlobNotFoundError,
+        BlobQuotaExceededError,
+        BlobStateError,
+    )
+
+    def _finalize_output_blobs_outcome(
+        self,
+        run_id: str,
+        *,
+        success: bool,
+        session_operation_lease: SessionOperationLease,
+    ) -> _OutputBlobFinalizationOutcome:
+        blob_service = self._blob_service
+        if blob_service is None:
+            raise RuntimeError("_finalize_output_blobs_outcome requires blob_service; caller must check before finalizing")
+        session_operation_context = session_operation_lease.context
+        try:
+            session_operation_lease.guard_external_effect()
+            result = self._call_async(
+                blob_service.finalize_run_output_blobs(
+                    UUID(run_id),
+                    success=success,
+                    session_operation_context=session_operation_context,
+                )
+            )
+        except self._FINALIZE_SUPPRESSED as blob_err:
+            return _OutputBlobFinalizationOutcome(
+                finalized_count=0,
+                errors=(),
+                failure_exc_type=type(blob_err).__name__,
+            )
+        return _OutputBlobFinalizationOutcome(
+            finalized_count=len(result.finalized),
+            errors=tuple({"blob_id": str(e.blob_id), "exc_type": e.exc_type} for e in result.errors),
+        )
+
+    def _finalize_output_blobs(
+        self,
+        run_id: str,
+        *,
+        success: bool,
+        session_operation_lease: SessionOperationLease,
+    ) -> bool:
+        """Finalize pending output blobs after a run completes/fails/cancels.
+
+        Uses _call_async to bridge from the background thread to the async
+        blob service. Failure here must not mask the original run outcome —
+        errors are logged, not raised. Programmer bugs (TypeError,
+        AttributeError) are deliberately not caught.
+
+        Return whether every output is settled, including the no-blob case.
+        The worker uses this outcome to close its saga only after terminal
+        status is durable; unsuccessful settlement must remain recoverable.
+        """
+        if self._blob_service is None:
+            return True
+        outcome = self._finalize_output_blobs_outcome(
+            run_id,
+            success=success,
+            session_operation_lease=session_operation_lease,
+        )
+        if outcome.failure_exc_type is not None:
+            slog.error(
+                "blob_finalization_failed",
+                run_id=run_id,
+                success=success,
+                exc_type=outcome.failure_exc_type,
+            )
+            return False
+        if outcome.errors:
+            slog.error(
+                "blob_finalization_partial_failure",
+                run_id=run_id,
+                success=success,
+                finalized_count=outcome.finalized_count,
+                error_count=len(outcome.errors),
+                errors=list(outcome.errors),
+            )
+            return False
+        return True
+
+    async def _finish_execution_authority(
+        self,
+        obligation: ExecutionAcquisitionObligation,
+        session_operation_lease: SessionOperationLease,
+        loss_watcher: asyncio.Task[None] | None,
+        exc: BaseException | None,
+    ) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise AuditIntegrityError("Pipeline completion lacks actual Task")
+        obligation.bind_completion_task(task)
+        try:
+            failures: list[BaseException] = []
+            try:
+                task.add_done_callback(partial(self._observe_execution_completion, obligation))
+            except BaseException as original:
+                failures.append(original)
+            try:
+                await self._close_execution_authority(session_operation_lease, loss_watcher, exc)
+            except BaseException as original:
+                failures.append(original)
+            else:
+                if failures:
+                    session_operation_lease._retain_execution_loss_originals(failures)
+                    for retained_failure in failures:
+                        obligation.registry.record_failure(retained_failure)
+            _raise_lifecycle_originals([], failures)
+        except BaseException as original:
+            obligation.record_completion_outcome(original)
+            raise
+        else:
+            obligation.record_completion_outcome(None)
+
+    async def _close_execution_authority(
+        self,
+        session_operation_lease: SessionOperationLease,
+        loss_watcher: asyncio.Task[None] | None,
+        exc: BaseException | None,
+    ) -> None:
+        failures: list[BaseException] = []
+        cancellations: list[asyncio.CancelledError] = []
+        failed_loss_watcher: BaseException | None = None
+        if loss_watcher is not None:
+            try:
+                cancellations, failed_loss_watcher = await self._join_loss_watcher(loss_watcher, session_operation_lease)
+            except BaseException as original:
+                failed_loss_watcher = original
+            if failed_loss_watcher is not None:
+                failures.append(failed_loss_watcher)
+        try:
+            await close_execute_lease_before_transfer(session_operation_lease)
+        except BaseException as original:
+            failures.append(original)
+            close_succeeded = False
+        else:
+            close_succeeded = True
+        try:
+            if failed_loss_watcher is not None and loss_watcher is not None:
+                slog.error(
+                    "execution_loss_watcher_failed",
+                    watcher_task=loss_watcher.get_name(),
+                    exc_class_chain=_exception_class_chain(failed_loss_watcher),
+                )
+            if exc is not None and not isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                # The actual pipeline Future retains the business outcome.
+                # A failed run is not a fabricated release failure.
+                slog.error("pipeline_done_callback_exception", exc_type=type(exc).__name__, exc_class_chain=_exception_class_chain(exc))
+        except BaseException as original:
+            failures.append(original)
+        if close_succeeded and (cancellations or failures):
+            session_operation_lease._retain_execution_loss_originals(failures)
+            obligation = session_operation_lease.execution_obligation
+            if type(obligation) is not ExecutionAcquisitionObligation:
+                raise AuditIntegrityError("EXECUTE completion lost actual acquisition ownership")
+            for retained_failure in failures:
+                obligation.registry.record_failure(retained_failure)
+        _raise_lifecycle_originals(cancellations, failures)
+
+    def _observe_pipeline_done(
+        self,
+        future: Future[_RunPipelineOutcome],
+        *,
+        session_operation_lease: SessionOperationLease,
+        loss_watcher: asyncio.Task[None],
+    ) -> None:
+        # concurrent.Future logs escaping callback exceptions with traceback
+        # text. Custody goes to the actual registry; private SQL/provider
+        # payloads never go to that unredacted library diagnostic.
+        try:
+            self._on_pipeline_done(future, session_operation_lease=session_operation_lease, loss_watcher=loss_watcher)
+        except BaseException as original:
+            self.execution_lease_release_registry.record_failure(original)
+
+    def _on_pipeline_done(
+        self,
+        future: Future[_RunPipelineOutcome],
+        *,
+        session_operation_lease: SessionOperationLease,
+        loss_watcher: asyncio.Task[None] | None = None,
+    ) -> None:
+        registry = self.execution_lease_release_registry
+        obligation = session_operation_lease.execution_obligation
+        try:
+            if type(obligation) is not ExecutionAcquisitionObligation or obligation.registry is not registry:
+                raise AuditIntegrityError("Pipeline callback lacks exact application obligation")
+            if obligation.lease is not session_operation_lease or obligation.pipeline is not future or not future.done():
+                raise AuditIntegrityError("Pipeline callback replaced actual terminal owner")
+            # Retired receipt validation preserves exact duplicate identity without
+            # keeping every settled Future alive in service-owned history.
+            if self._execution_retirement_ready(obligation):
+                return
+            with self._shutdown_events_lock:
+                if self._pipeline_completion_owners.get(future) is not obligation:
+                    raise AuditIntegrityError("Pipeline callback lacks retained actual Future")
+                if future in self._pipeline_completion_started:
+                    return
+                self._pipeline_completion_started.add(future)
+            try:
+                exc = future.exception()
+            except FutureCancelledError as original:
+                exc = original
+
+            scheduled = asyncio.run_coroutine_threadsafe(
+                self._finish_execution_authority(obligation, session_operation_lease, loss_watcher, exc),
+                self._loop,
+            )
+            obligation.bind_completion_future(scheduled)
+            with self._shutdown_events_lock:
+                self._lease_completion_futures.add(scheduled)
+
+            def observe_wrapper(done: Future[None]) -> None:
+                try:
+                    self._loop.call_soon_threadsafe(self._observe_execution_completion, obligation)
+                except BaseException as original:
+                    registry.record_failure(original)
+                try:
+                    error = done.exception()
+                except FutureCancelledError:
+                    # This handle is not physical completion authority. The actual
+                    # Task continues owning close and is observed by the registry.
+                    return
+                if error is None:
+                    with self._shutdown_events_lock:
+                        self._lease_completion_futures.discard(done)
+                else:
+                    registry.record_failure(error)
+
+            scheduled.add_done_callback(observe_wrapper)
+        except BaseException as original:
+            registry.record_failure(original)
+            raise
+
+    def _to_run_event(self, run_id: str, progress: ProgressEvent) -> RunEvent:
+        """Translate engine ProgressEvent to web RunEvent.
+
+        Only handles progress events — terminal events (completed, failed,
+        cancelled) are constructed inline in _run_pipeline where the full
+        run result is available.
+
+        elspeth-5069612f3c — ``rows_routed_success`` / ``rows_routed_failure``
+        are plumbed verbatim from the engine ProgressEvent so the streaming
+        wire payload mirrors the terminal CompletedData/CancelledData shape
+        and matches the TS ``RunEventProgress`` interface.
+
+        ``rows_succeeded`` / ``rows_quarantined`` are plumbed verbatim from
+        the engine ProgressEvent. ProgressData requires both fields — see
+        the schema docstring for the fabrication-test rationale.
+        """
+        return RunEvent(
+            run_id=run_id,
+            timestamp=datetime.now(tz=UTC),
+            event_type="progress",
+            data=ProgressData(
+                source_rows_processed=progress.rows_processed,
+                tokens_succeeded=progress.rows_succeeded,
+                tokens_failed=progress.rows_failed,
+                tokens_quarantined=progress.rows_quarantined,
+                tokens_routed_success=progress.rows_routed_success,
+                tokens_routed_failure=progress.rows_routed_failure,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _OutputBlobFinalizationOutcome:
+    finalized_count: int
+    errors: tuple[Mapping[str, str], ...]
+    failure_exc_type: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedPipelineExecution:
+    run_id: UUID
+    pipeline_yaml: str
+    shutdown_event: threading.Event
+    frozen_run_settings: FrozenRunSettings
+    user_id: str | None
+    auth_provider_type: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _FailureSampleEnrichmentOutcome:
+    samples_text: str
+    failed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _FailedNodeLookupOutcome:
+    node_id: str | None
+    failed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _RunStateProbeOutcome:
+    run_already_terminal: bool
+    failed: bool = False
+
+
+type _RunPipelineOutcome = Literal["graceful_shutdown_handled"] | None
+_RUN_PIPELINE_GRACEFUL_SHUTDOWN_HANDLED: Literal["graceful_shutdown_handled"] = "graceful_shutdown_handled"
+
+
+class _RunRecoveryRequired(Exception):
+    def __init__(self, reason: RecoveryRequiredReason) -> None:
+        self.reason = reason
+        super().__init__(reason.value)
+
+
+# Protocol conformance enforcement — mypy verifies ExecutionServiceImpl
+# structurally satisfies ExecutionService at this assignment. Without this,
+# drift between protocol and impl is only caught at cast() call sites.
+_: type[ExecutionService] = ExecutionServiceImpl
+
+
+def _trained_operator_catalog_and_snapshot(
+    kwargs: dict[str, Any],
+    catalog_factory: Callable[[], CatalogService],
+) -> tuple[CatalogService, PluginAvailabilitySnapshot]:
+    """Consume an optional catalog and build the local trust snapshot."""
+    catalog = kwargs.pop("catalog") if "catalog" in kwargs else catalog_factory()
+    return catalog, PluginAvailabilitySnapshot.for_trained_operator(catalog)

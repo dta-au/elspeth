@@ -1,0 +1,49 @@
+  + Exception Group Traceback (most recent call last):
+  |   File "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/tests/helpers/composer_stdio_probe.py", line 130, in <module>
+  |     asyncio.run(probe(Path(sys.argv[1])))
+  |   File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/runners.py", line 195, in run
+  |     return runner.run(main)
+  |            ^^^^^^^^^^^^^^^^
+  |   File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/runners.py", line 118, in run
+  |     return self._loop.run_until_complete(task)
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |   File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/base_events.py", line 691, in run_until_complete
+  |     return future.result()
+  |            ^^^^^^^^^^^^^^^
+  |   File "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/tests/helpers/composer_stdio_probe.py", line 36, in probe
+  |     async with stdio.stdio_client(parameters, errlog=errors) as streams, ClientSession(*streams) as session:
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |   File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/contextlib.py", line 231, in __aexit__
+  |     await self.gen.athrow(value)
+  |   File "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/lib/python3.12/site-packages/mcp/client/stdio/__init__.py", line 183, in stdio_client
+  |     anyio.create_task_group() as tg,
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |   File "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/lib/python3.12/site-packages/anyio/_backends/_asyncio.py", line 815, in __aexit__
+  |     raise BaseExceptionGroup(
+  | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+  +-+---------------- 1 ----------------
+    | Exception Group Traceback (most recent call last):
+    |   File "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/lib/python3.12/site-packages/mcp/client/stdio/__init__.py", line 189, in stdio_client
+    |     yield read_stream, write_stream
+    |   File "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/tests/helpers/composer_stdio_probe.py", line 36, in probe
+    |     async with stdio.stdio_client(parameters, errlog=errors) as streams, ClientSession(*streams) as session:
+    |                                                                          ^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/lib/python3.12/site-packages/mcp/shared/session.py", line 238, in __aexit__
+    |     return await self._task_group.__aexit__(exc_type, exc_val, exc_tb)
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/lib/python3.12/site-packages/anyio/_backends/_asyncio.py", line 815, in __aexit__
+    |     raise BaseExceptionGroup(
+    | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+    +-+---------------- 1 ----------------
+      | Traceback (most recent call last):
+      |   File "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/tests/helpers/composer_stdio_probe.py", line 40, in probe
+      |     children = Path(f"/proc/{launcher}/task/{launcher}/children").read_text().split()
+      |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |   File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/pathlib.py", line 1027, in read_text
+      |     with self.open(mode='r', encoding=encoding, errors=errors) as f:
+      |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |   File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/pathlib.py", line 1013, in open
+      |     return io.open(self, mode, buffering, encoding, errors, newline)
+      |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      | FileNotFoundError: [Errno 2] No such file or directory: '/proc/318235/task/318235/children'
+      +------------------------------------

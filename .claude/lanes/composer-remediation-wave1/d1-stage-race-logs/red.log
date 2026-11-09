@@ -1,0 +1,674 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 111 items / 102 deselected / 9 selected
+
+tests/unit/web/sessions/test_proposal_blob_refs.py FFFF.F                [ 66%]
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py F [ 77%]
+FF                                                                       [100%]
+
+=================================== FAILURES ===================================
+_ test_final_reference_check_distinguishes_resource_refusal_from_owned_corruption[missing] _
+
+availability = 'missing'
+
+    @pytest.mark.parametrize("availability", ["missing", "foreign", "pending", "error", "ready", "corrupt"])
+    def test_final_reference_check_distinguishes_resource_refusal_from_owned_corruption(availability: str) -> None:
+        from sqlalchemy import Column, MetaData, String, Table, create_engine
+    
+        from elspeth.contracts.errors import AuditIntegrityError
+        from elspeth.web.sessions import proposal_blob_refs
+    
+        engine = create_engine("sqlite://")
+        metadata = MetaData()
+        blobs = Table("blobs", metadata, Column("id", String), Column("session_id", String), Column("status", String))
+        metadata.create_all(engine)
+        with engine.begin() as conn:
+            if availability != "missing":
+                conn.execute(blobs.insert().values(id="private-resource", session_id="foreign" if availability == "foreign" else "owned",
+                                                   status="unknown" if availability == "corrupt" else availability))
+            if availability == "ready":
+                proposal_blob_refs.validate_proposal_blob_references(conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"})
+            elif availability == "corrupt":
+                with pytest.raises(AuditIntegrityError):
+                    proposal_blob_refs.validate_proposal_blob_references(conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"})
+            else:
+                with pytest.raises(Exception) as caught:
+                    proposal_blob_refs.validate_proposal_blob_references(conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"})
+>               assert type(caught.value).__name__ == "ProposalResourceUnavailableError"
+E               AssertionError: assert 'ValueError' == 'ProposalReso...vailableError'
+E                 
+E                 - ProposalResourceUnavailableError
+E                 + ValueError
+
+tests/unit/web/sessions/test_proposal_blob_refs.py:41: AssertionError
+_ test_final_reference_check_distinguishes_resource_refusal_from_owned_corruption[foreign] _
+
+availability = 'foreign'
+
+    @pytest.mark.parametrize("availability", ["missing", "foreign", "pending", "error", "ready", "corrupt"])
+    def test_final_reference_check_distinguishes_resource_refusal_from_owned_corruption(availability: str) -> None:
+        from sqlalchemy import Column, MetaData, String, Table, create_engine
+    
+        from elspeth.contracts.errors import AuditIntegrityError
+        from elspeth.web.sessions import proposal_blob_refs
+    
+        engine = create_engine("sqlite://")
+        metadata = MetaData()
+        blobs = Table("blobs", metadata, Column("id", String), Column("session_id", String), Column("status", String))
+        metadata.create_all(engine)
+        with engine.begin() as conn:
+            if availability != "missing":
+                conn.execute(blobs.insert().values(id="private-resource", session_id="foreign" if availability == "foreign" else "owned",
+                                                   status="unknown" if availability == "corrupt" else availability))
+            if availability == "ready":
+                proposal_blob_refs.validate_proposal_blob_references(conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"})
+            elif availability == "corrupt":
+                with pytest.raises(AuditIntegrityError):
+                    proposal_blob_refs.validate_proposal_blob_references(conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"})
+            else:
+                with pytest.raises(Exception) as caught:
+                    proposal_blob_refs.validate_proposal_blob_references(conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"})
+>               assert type(caught.value).__name__ == "ProposalResourceUnavailableError"
+E               AssertionError: assert 'ValueError' == 'ProposalReso...vailableError'
+E                 
+E                 - ProposalResourceUnavailableError
+E                 + ValueError
+
+tests/unit/web/sessions/test_proposal_blob_refs.py:41: AssertionError
+_ test_final_reference_check_distinguishes_resource_refusal_from_owned_corruption[pending] _
+
+availability = 'pending'
+
+    @pytest.mark.parametrize("availability", ["missing", "foreign", "pending", "error", "ready", "corrupt"])
+    def test_final_reference_check_distinguishes_resource_refusal_from_owned_corruption(availability: str) -> None:
+        from sqlalchemy import Column, MetaData, String, Table, create_engine
+    
+        from elspeth.contracts.errors import AuditIntegrityError
+        from elspeth.web.sessions import proposal_blob_refs
+    
+        engine = create_engine("sqlite://")
+        metadata = MetaData()
+        blobs = Table("blobs", metadata, Column("id", String), Column("session_id", String), Column("status", String))
+        metadata.create_all(engine)
+        with engine.begin() as conn:
+            if availability != "missing":
+                conn.execute(blobs.insert().values(id="private-resource", session_id="foreign" if availability == "foreign" else "owned",
+                                                   status="unknown" if availability == "corrupt" else availability))
+            if availability == "ready":
+                proposal_blob_refs.validate_proposal_blob_references(conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"})
+            elif availability == "corrupt":
+                with pytest.raises(AuditIntegrityError):
+                    proposal_blob_refs.validate_proposal_blob_references(conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"})
+            else:
+                with pytest.raises(Exception) as caught:
+                    proposal_blob_refs.validate_proposal_blob_references(conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"})
+>               assert type(caught.value).__name__ == "ProposalResourceUnavailableError"
+E               AssertionError: assert 'ValueError' == 'ProposalReso...vailableError'
+E                 
+E                 - ProposalResourceUnavailableError
+E                 + ValueError
+
+tests/unit/web/sessions/test_proposal_blob_refs.py:41: AssertionError
+_ test_final_reference_check_distinguishes_resource_refusal_from_owned_corruption[error] _
+
+availability = 'error'
+
+    @pytest.mark.parametrize("availability", ["missing", "foreign", "pending", "error", "ready", "corrupt"])
+    def test_final_reference_check_distinguishes_resource_refusal_from_owned_corruption(availability: str) -> None:
+        from sqlalchemy import Column, MetaData, String, Table, create_engine
+    
+        from elspeth.contracts.errors import AuditIntegrityError
+        from elspeth.web.sessions import proposal_blob_refs
+    
+        engine = create_engine("sqlite://")
+        metadata = MetaData()
+        blobs = Table("blobs", metadata, Column("id", String), Column("session_id", String), Column("status", String))
+        metadata.create_all(engine)
+        with engine.begin() as conn:
+            if availability != "missing":
+                conn.execute(blobs.insert().values(id="private-resource", session_id="foreign" if availability == "foreign" else "owned",
+                                                   status="unknown" if availability == "corrupt" else availability))
+            if availability == "ready":
+                proposal_blob_refs.validate_proposal_blob_references(conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"})
+            elif availability == "corrupt":
+                with pytest.raises(AuditIntegrityError):
+                    proposal_blob_refs.validate_proposal_blob_references(conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"})
+            else:
+                with pytest.raises(Exception) as caught:
+                    proposal_blob_refs.validate_proposal_blob_references(conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"})
+>               assert type(caught.value).__name__ == "ProposalResourceUnavailableError"
+E               AssertionError: assert 'ValueError' == 'ProposalReso...vailableError'
+E                 
+E                 - ProposalResourceUnavailableError
+E                 + ValueError
+
+tests/unit/web/sessions/test_proposal_blob_refs.py:41: AssertionError
+_ test_final_reference_check_distinguishes_resource_refusal_from_owned_corruption[corrupt] _
+
+availability = 'corrupt'
+
+    @pytest.mark.parametrize("availability", ["missing", "foreign", "pending", "error", "ready", "corrupt"])
+    def test_final_reference_check_distinguishes_resource_refusal_from_owned_corruption(availability: str) -> None:
+        from sqlalchemy import Column, MetaData, String, Table, create_engine
+    
+        from elspeth.contracts.errors import AuditIntegrityError
+        from elspeth.web.sessions import proposal_blob_refs
+    
+        engine = create_engine("sqlite://")
+        metadata = MetaData()
+        blobs = Table("blobs", metadata, Column("id", String), Column("session_id", String), Column("status", String))
+        metadata.create_all(engine)
+        with engine.begin() as conn:
+            if availability != "missing":
+                conn.execute(blobs.insert().values(id="private-resource", session_id="foreign" if availability == "foreign" else "owned",
+                                                   status="unknown" if availability == "corrupt" else availability))
+            if availability == "ready":
+                proposal_blob_refs.validate_proposal_blob_references(conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"})
+            elif availability == "corrupt":
+                with pytest.raises(AuditIntegrityError):
+>                   proposal_blob_refs.validate_proposal_blob_references(conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"})
+
+tests/unit/web/sessions/test_proposal_blob_refs.py:37: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+conn = <sqlalchemy.engine.base.Connection object at 0x7f74681bca10>
+
+    def validate_proposal_blob_references(
+        conn: Connection,
+        *,
+        session_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> None:
+        """Require every authoritative proposal blob to be owned and ready."""
+        for blob_id in proposal_blob_reference_ids(tool_name, arguments):
+            row = conn.execute(select(blobs_table.c.session_id, blobs_table.c.status).where(blobs_table.c.id == blob_id)).first()
+            if row is None:
+                raise ValueError(f"Proposal references blob {blob_id!r}, but that blob does not exist")
+            if row.session_id != session_id:
+                raise ValueError(f"Proposal references blob {blob_id!r}, but it is not owned by this session")
+            if row.status != "ready":
+>               raise ValueError(f"Proposal references blob {blob_id!r}, but its status is {row.status!r}, not 'ready'")
+E               ValueError: Proposal references blob 'private-resource', but its status is 'unknown', not 'ready'
+
+src/elspeth/web/sessions/proposal_blob_refs.py:180: ValueError
+_ test_publication_resource_race_refuses_once_then_allows_valid_repair[canonical] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-110/test_publication_resource_race0')
+publisher = 'canonical'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("publisher", ["canonical", "ordinary", "promoted"])
+    async def test_publication_resource_race_refuses_once_then_allows_valid_repair(tmp_path: Path, publisher: str) -> None:
+        from sqlalchemy import update
+    
+        from tests.helpers.session_fences import fenced_operation_context
+    
+        harness = _harness(tmp_path)
+        state = _incremental_base_state(tmp_path)
+        if publisher == "canonical":
+            tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
+        elif publisher == "ordinary":
+            with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as operation:
+                blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+                    UUID(harness.session_id), "retained.txt", b"original", "text/plain", session_operation_context=operation
+                )
+            tool_name, arguments = "delete_blob", {"blob_id": str(blob.id)}
+        else:
+            from tests.integration.web.composer.test_freeform_required_controls import _incremental_textract_state, _required_textract_policy
+    
+            view, snapshot = _required_textract_policy(tmp_path)
+            state, output = await _incremental_textract_state(tmp_path, harness=harness, view=view, snapshot=snapshot)
+            completed = real_execute_tool(
+                "set_output", output, state, view, plugin_snapshot=snapshot, data_dir=str(tmp_path),
+                session_engine=harness.engine, session_id=harness.session_id, user_id="proposal-prevalidation-user",
+                validate_arguments=True, require_data_dir_for_paths=True, raise_schema_argument_errors=True,
+            )
+            assert completed.success and completed.validation.is_valid
+            state = completed.updated_state
+            tool_name, arguments = "set_metadata", {"patch": {}}
+    
+        api = harness.sessions.create_composition_proposal if publisher == "ordinary" else harness.sessions.create_pipeline_composition_proposal
+        calls = []
+    
+        async def change_resource_then_create(**kwargs: Any) -> Any:
+            calls.append(kwargs)
+            with harness.engine.begin() as conn:
+                assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() > 0
+                conn.execute(update(blobs_table).values(status="pending"))
+            return await api(**kwargs)
+    
+        llm = _ScriptedLLM(
+            _tool_turn("call_raced", tool_name, arguments),
+            _tool_turn("call_repaired", "set_metadata", {"patch": {"name": "repair"}}),
+            _fake_llm_response(content="The repair awaits approval."),
+        )
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            patch.object(harness.sessions, "create_composition_proposal" if publisher == "ordinary" else "create_pipeline_composition_proposal", new=change_resource_then_create),
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            if publisher == "promoted":
+                with patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)):
+                    result = await harness.service.compose("Prepare this change.", [], state, session_id=harness.session_id,
+                                                           user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id)
+            else:
+>               result = await harness.service.compose("Prepare this change.", [], state, session_id=harness.session_id,
+                                                       user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id)
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:2408: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/helpers/composer_lease.py:165: in compose
+    return await _with_lease(self, session_id, kwargs, call, bind_provider_owner=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:108: in _with_lease
+    return await _with_provider_owner(self, forwarded, call, lease) if bind_provider_owner else await call(**forwarded)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:50: in _with_provider_owner
+    return await call(**forwarded)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:163: in call
+    return await real_compose(self, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:1274: in compose
+    return await self._compose_loop(
+src/elspeth/web/composer/service.py:2870: in _compose_loop
+    ) = await _await_tool_turn_with_deferred_cancellation(
+src/elspeth/web/composer/service.py:204: in _await_tool_turn_with_deferred_cancellation
+    return await asyncio.shield(task), deferred
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:2724: in _dispatch_and_persist_tool_turn
+    dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:337: in record
+    result = await dispatch(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:1690: in _dispatch_tool_batch
+    return await run_tool_batch(
+src/elspeth/web/composer/tool_batch.py:2247: in run_tool_batch
+    proposal = await _await_started_tool_stage(
+src/elspeth/web/composer/tool_batch.py:969: in _await_started_tool_stage
+    return await awaitable
+           ^^^^^^^^^^^^^^^
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:2391: in change_resource_then_create
+    return await api(**kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+tests/unit/web/sessions/session_test_authority.py:219: in _wrapped
+    return await parent(*args, session_operation_context=session_operation_context, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3174: in create_pipeline_composition_proposal
+    result = await self._create_pipeline_composition_proposal(
+src/elspeth/web/sessions/service.py:3377: in _create_pipeline_composition_proposal
+    await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_composer_sql(_sync)
+                                                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:9042: in _run_composer_sql
+    return await run_stream_read_in_worker(func)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:675: in run_stream_read_in_worker
+    return concurrent_future.result()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/required_executor.py:119: in invoke
+    return callable_()
+           ^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3349: in _sync
+    return transaction.composer.create_pipeline_composition_proposal(
+src/elspeth/web/sessions/mutation_capabilities.py:217: in create_pipeline_composition_proposal
+    validate_proposal_blob_references(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+conn = <sqlalchemy.engine.base.Connection object at 0x7f745c4a2630>
+
+    def validate_proposal_blob_references(
+        conn: Connection,
+        *,
+        session_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> None:
+        """Require every authoritative proposal blob to be owned and ready."""
+        for blob_id in proposal_blob_reference_ids(tool_name, arguments):
+            row = conn.execute(select(blobs_table.c.session_id, blobs_table.c.status).where(blobs_table.c.id == blob_id)).first()
+            if row is None:
+                raise ValueError(f"Proposal references blob {blob_id!r}, but that blob does not exist")
+            if row.session_id != session_id:
+                raise ValueError(f"Proposal references blob {blob_id!r}, but it is not owned by this session")
+            if row.status != "ready":
+>               raise ValueError(f"Proposal references blob {blob_id!r}, but its status is {row.status!r}, not 'ready'")
+E               ValueError: Proposal references blob 'fcdf29d9-d437-59da-b39a-7ce5c3f9b4ba', but its status is 'pending', not 'ready'
+
+src/elspeth/web/sessions/proposal_blob_refs.py:180: ValueError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:11:28 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:11:30 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:11:30 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 13:11:30 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_publication_resource_race_refuses_once_then_allows_valid_repair[ordinary] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-110/test_publication_resource_race1')
+publisher = 'ordinary'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("publisher", ["canonical", "ordinary", "promoted"])
+    async def test_publication_resource_race_refuses_once_then_allows_valid_repair(tmp_path: Path, publisher: str) -> None:
+        from sqlalchemy import update
+    
+        from tests.helpers.session_fences import fenced_operation_context
+    
+        harness = _harness(tmp_path)
+        state = _incremental_base_state(tmp_path)
+        if publisher == "canonical":
+            tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
+        elif publisher == "ordinary":
+            with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as operation:
+                blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+                    UUID(harness.session_id), "retained.txt", b"original", "text/plain", session_operation_context=operation
+                )
+            tool_name, arguments = "delete_blob", {"blob_id": str(blob.id)}
+        else:
+            from tests.integration.web.composer.test_freeform_required_controls import _incremental_textract_state, _required_textract_policy
+    
+            view, snapshot = _required_textract_policy(tmp_path)
+            state, output = await _incremental_textract_state(tmp_path, harness=harness, view=view, snapshot=snapshot)
+            completed = real_execute_tool(
+                "set_output", output, state, view, plugin_snapshot=snapshot, data_dir=str(tmp_path),
+                session_engine=harness.engine, session_id=harness.session_id, user_id="proposal-prevalidation-user",
+                validate_arguments=True, require_data_dir_for_paths=True, raise_schema_argument_errors=True,
+            )
+            assert completed.success and completed.validation.is_valid
+            state = completed.updated_state
+            tool_name, arguments = "set_metadata", {"patch": {}}
+    
+        api = harness.sessions.create_composition_proposal if publisher == "ordinary" else harness.sessions.create_pipeline_composition_proposal
+        calls = []
+    
+        async def change_resource_then_create(**kwargs: Any) -> Any:
+            calls.append(kwargs)
+            with harness.engine.begin() as conn:
+                assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() > 0
+                conn.execute(update(blobs_table).values(status="pending"))
+            return await api(**kwargs)
+    
+        llm = _ScriptedLLM(
+            _tool_turn("call_raced", tool_name, arguments),
+            _tool_turn("call_repaired", "set_metadata", {"patch": {"name": "repair"}}),
+            _fake_llm_response(content="The repair awaits approval."),
+        )
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            patch.object(harness.sessions, "create_composition_proposal" if publisher == "ordinary" else "create_pipeline_composition_proposal", new=change_resource_then_create),
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            if publisher == "promoted":
+                with patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)):
+                    result = await harness.service.compose("Prepare this change.", [], state, session_id=harness.session_id,
+                                                           user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id)
+            else:
+>               result = await harness.service.compose("Prepare this change.", [], state, session_id=harness.session_id,
+                                                       user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id)
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:2408: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/helpers/composer_lease.py:165: in compose
+    return await _with_lease(self, session_id, kwargs, call, bind_provider_owner=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:108: in _with_lease
+    return await _with_provider_owner(self, forwarded, call, lease) if bind_provider_owner else await call(**forwarded)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:50: in _with_provider_owner
+    return await call(**forwarded)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:163: in call
+    return await real_compose(self, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:1274: in compose
+    return await self._compose_loop(
+src/elspeth/web/composer/service.py:2870: in _compose_loop
+    ) = await _await_tool_turn_with_deferred_cancellation(
+src/elspeth/web/composer/service.py:204: in _await_tool_turn_with_deferred_cancellation
+    return await asyncio.shield(task), deferred
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:2724: in _dispatch_and_persist_tool_turn
+    dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:337: in record
+    result = await dispatch(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:1690: in _dispatch_tool_batch
+    return await run_tool_batch(
+src/elspeth/web/composer/tool_batch.py:2275: in run_tool_batch
+    proposal = await _await_started_tool_stage(
+src/elspeth/web/composer/tool_batch.py:969: in _await_started_tool_stage
+    return await awaitable
+           ^^^^^^^^^^^^^^^
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:2391: in change_resource_then_create
+    return await api(**kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+tests/unit/web/sessions/session_test_authority.py:219: in _wrapped
+    return await parent(*args, session_operation_context=session_operation_context, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3153: in create_composition_proposal
+    return cast(CompositionProposalRecord, await self._run_sync(_sync))
+                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:1030: in _run_sync
+    return await run_sync_in_worker(func, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:650: in run_sync_in_worker
+    return await _await_worker_future(concurrent_future, cancel_queued=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:720: in _await_worker_future
+    return future.result()
+           ^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/required_executor.py:119: in invoke
+    return callable_()
+           ^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3137: in _sync
+    return transaction.composer.create_composition_proposal(
+src/elspeth/web/sessions/mutation_capabilities.py:129: in create_composition_proposal
+    validate_proposal_blob_references(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+conn = <sqlalchemy.engine.base.Connection object at 0x7f745a61b1d0>
+
+    def validate_proposal_blob_references(
+        conn: Connection,
+        *,
+        session_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> None:
+        """Require every authoritative proposal blob to be owned and ready."""
+        for blob_id in proposal_blob_reference_ids(tool_name, arguments):
+            row = conn.execute(select(blobs_table.c.session_id, blobs_table.c.status).where(blobs_table.c.id == blob_id)).first()
+            if row is None:
+                raise ValueError(f"Proposal references blob {blob_id!r}, but that blob does not exist")
+            if row.session_id != session_id:
+                raise ValueError(f"Proposal references blob {blob_id!r}, but it is not owned by this session")
+            if row.status != "ready":
+>               raise ValueError(f"Proposal references blob {blob_id!r}, but its status is {row.status!r}, not 'ready'")
+E               ValueError: Proposal references blob '8436522c-7a0b-4404-bd5f-931a183f6353', but its status is 'pending', not 'ready'
+
+src/elspeth/web/sessions/proposal_blob_refs.py:180: ValueError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:11:31 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:11:31 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:11:31 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 13:11:31 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_publication_resource_race_refuses_once_then_allows_valid_repair[promoted] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-110/test_publication_resource_race2')
+publisher = 'promoted'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("publisher", ["canonical", "ordinary", "promoted"])
+    async def test_publication_resource_race_refuses_once_then_allows_valid_repair(tmp_path: Path, publisher: str) -> None:
+        from sqlalchemy import update
+    
+        from tests.helpers.session_fences import fenced_operation_context
+    
+        harness = _harness(tmp_path)
+        state = _incremental_base_state(tmp_path)
+        if publisher == "canonical":
+            tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
+        elif publisher == "ordinary":
+            with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as operation:
+                blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+                    UUID(harness.session_id), "retained.txt", b"original", "text/plain", session_operation_context=operation
+                )
+            tool_name, arguments = "delete_blob", {"blob_id": str(blob.id)}
+        else:
+            from tests.integration.web.composer.test_freeform_required_controls import _incremental_textract_state, _required_textract_policy
+    
+            view, snapshot = _required_textract_policy(tmp_path)
+            state, output = await _incremental_textract_state(tmp_path, harness=harness, view=view, snapshot=snapshot)
+            completed = real_execute_tool(
+                "set_output", output, state, view, plugin_snapshot=snapshot, data_dir=str(tmp_path),
+                session_engine=harness.engine, session_id=harness.session_id, user_id="proposal-prevalidation-user",
+                validate_arguments=True, require_data_dir_for_paths=True, raise_schema_argument_errors=True,
+            )
+            assert completed.success and completed.validation.is_valid
+            state = completed.updated_state
+            tool_name, arguments = "set_metadata", {"patch": {}}
+    
+        api = harness.sessions.create_composition_proposal if publisher == "ordinary" else harness.sessions.create_pipeline_composition_proposal
+        calls = []
+    
+        async def change_resource_then_create(**kwargs: Any) -> Any:
+            calls.append(kwargs)
+            with harness.engine.begin() as conn:
+                assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() > 0
+                conn.execute(update(blobs_table).values(status="pending"))
+            return await api(**kwargs)
+    
+        llm = _ScriptedLLM(
+            _tool_turn("call_raced", tool_name, arguments),
+            _tool_turn("call_repaired", "set_metadata", {"patch": {"name": "repair"}}),
+            _fake_llm_response(content="The repair awaits approval."),
+        )
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            patch.object(harness.sessions, "create_composition_proposal" if publisher == "ordinary" else "create_pipeline_composition_proposal", new=change_resource_then_create),
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            if publisher == "promoted":
+                with patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)):
+>                   result = await harness.service.compose("Prepare this change.", [], state, session_id=harness.session_id,
+                                                           user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id)
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:2405: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/helpers/composer_lease.py:165: in compose
+    return await _with_lease(self, session_id, kwargs, call, bind_provider_owner=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:108: in _with_lease
+    return await _with_provider_owner(self, forwarded, call, lease) if bind_provider_owner else await call(**forwarded)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:50: in _with_provider_owner
+    return await call(**forwarded)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:163: in call
+    return await real_compose(self, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:1274: in compose
+    return await self._compose_loop(
+src/elspeth/web/composer/service.py:2870: in _compose_loop
+    ) = await _await_tool_turn_with_deferred_cancellation(
+src/elspeth/web/composer/service.py:204: in _await_tool_turn_with_deferred_cancellation
+    return await asyncio.shield(task), deferred
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:2724: in _dispatch_and_persist_tool_turn
+    dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:337: in record
+    result = await dispatch(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:1690: in _dispatch_tool_batch
+    return await run_tool_batch(
+src/elspeth/web/composer/tool_batch.py:2247: in run_tool_batch
+    proposal = await _await_started_tool_stage(
+src/elspeth/web/composer/tool_batch.py:969: in _await_started_tool_stage
+    return await awaitable
+           ^^^^^^^^^^^^^^^
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:2391: in change_resource_then_create
+    return await api(**kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+tests/unit/web/sessions/session_test_authority.py:219: in _wrapped
+    return await parent(*args, session_operation_context=session_operation_context, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3174: in create_pipeline_composition_proposal
+    result = await self._create_pipeline_composition_proposal(
+src/elspeth/web/sessions/service.py:3377: in _create_pipeline_composition_proposal
+    await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_composer_sql(_sync)
+                                                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:9042: in _run_composer_sql
+    return await run_stream_read_in_worker(func)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:675: in run_stream_read_in_worker
+    return concurrent_future.result()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/required_executor.py:119: in invoke
+    return callable_()
+           ^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3349: in _sync
+    return transaction.composer.create_pipeline_composition_proposal(
+src/elspeth/web/sessions/mutation_capabilities.py:217: in create_pipeline_composition_proposal
+    validate_proposal_blob_references(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+conn = <sqlalchemy.engine.base.Connection object at 0x7f745b29a7b0>
+
+    def validate_proposal_blob_references(
+        conn: Connection,
+        *,
+        session_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> None:
+        """Require every authoritative proposal blob to be owned and ready."""
+        for blob_id in proposal_blob_reference_ids(tool_name, arguments):
+            row = conn.execute(select(blobs_table.c.session_id, blobs_table.c.status).where(blobs_table.c.id == blob_id)).first()
+            if row is None:
+                raise ValueError(f"Proposal references blob {blob_id!r}, but that blob does not exist")
+            if row.session_id != session_id:
+                raise ValueError(f"Proposal references blob {blob_id!r}, but it is not owned by this session")
+            if row.status != "ready":
+>               raise ValueError(f"Proposal references blob {blob_id!r}, but its status is {row.status!r}, not 'ready'")
+E               ValueError: Proposal references blob '4e8e7b5c-c8ad-4c15-83aa-26d4981fcc49', but its status is 'pending', not 'ready'
+
+src/elspeth/web/sessions/proposal_blob_refs.py:180: ValueError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:11:33 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:11:33 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:11:33 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 13:11:33 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=20.0 configured_turns=5 fundable_turns_estimate=1 planning_seconds_per_turn=15.0
+2026-11-09 13:11:33 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+=========================== short test summary info ============================
+FAILED tests/unit/web/sessions/test_proposal_blob_refs.py::test_final_reference_check_distinguishes_resource_refusal_from_owned_corruption[missing]
+FAILED tests/unit/web/sessions/test_proposal_blob_refs.py::test_final_reference_check_distinguishes_resource_refusal_from_owned_corruption[foreign]
+FAILED tests/unit/web/sessions/test_proposal_blob_refs.py::test_final_reference_check_distinguishes_resource_refusal_from_owned_corruption[pending]
+FAILED tests/unit/web/sessions/test_proposal_blob_refs.py::test_final_reference_check_distinguishes_resource_refusal_from_owned_corruption[error]
+FAILED tests/unit/web/sessions/test_proposal_blob_refs.py::test_final_reference_check_distinguishes_resource_refusal_from_owned_corruption[corrupt]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_publication_resource_race_refuses_once_then_allows_valid_repair[canonical]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_publication_resource_race_refuses_once_then_allows_valid_repair[ordinary]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_publication_resource_race_refuses_once_then_allows_valid_repair[promoted]
+================= 8 failed, 1 passed, 102 deselected in 7.86s ==================

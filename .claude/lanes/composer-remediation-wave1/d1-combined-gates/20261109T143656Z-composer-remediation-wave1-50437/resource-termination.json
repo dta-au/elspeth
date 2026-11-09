@@ -1,0 +1,196 @@
+{
+  "reason": "SIGINT inherited ignored by detached pytest; terminate only verified owned test subtree/group, preserving driver and freeze watcher",
+  "targets": [
+    {
+      "pid": 52915,
+      "ppid": 50670,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 52939,
+      "ppid": 52915,
+      "pgid": 50670,
+      "state": "R"
+    },
+    {
+      "pid": 52942,
+      "ppid": 52915,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 52960,
+      "ppid": 52915,
+      "pgid": 50670,
+      "state": "R"
+    },
+    {
+      "pid": 52963,
+      "ppid": 52915,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 52966,
+      "ppid": 52915,
+      "pgid": 50670,
+      "state": "R"
+    },
+    {
+      "pid": 55273,
+      "ppid": 52966,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 55274,
+      "ppid": 52966,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 55330,
+      "ppid": 52966,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 55780,
+      "ppid": 52915,
+      "pgid": 50670,
+      "state": "R"
+    },
+    {
+      "pid": 56174,
+      "ppid": 52939,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 56175,
+      "ppid": 52939,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 56319,
+      "ppid": 52939,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 56630,
+      "ppid": 52915,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 59629,
+      "ppid": 52915,
+      "pgid": 50670,
+      "state": "R"
+    },
+    {
+      "pid": 59632,
+      "ppid": 52915,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 59740,
+      "ppid": 52960,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 59842,
+      "ppid": 52963,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 65480,
+      "ppid": 56630,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 65481,
+      "ppid": 56630,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 65482,
+      "ppid": 52915,
+      "pgid": 50670,
+      "state": "R"
+    },
+    {
+      "pid": 65486,
+      "ppid": 52915,
+      "pgid": 50670,
+      "state": "R"
+    },
+    {
+      "pid": 65558,
+      "ppid": 56630,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 67873,
+      "ppid": 59632,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 67874,
+      "ppid": 59632,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 67903,
+      "ppid": 59632,
+      "pgid": 50670,
+      "state": "S"
+    },
+    {
+      "pid": 68000,
+      "ppid": 52942,
+      "pgid": 50670,
+      "state": "R"
+    },
+    {
+      "pid": 68107,
+      "ppid": 52963,
+      "pgid": 50670,
+      "state": "R"
+    },
+    {
+      "pid": 68129,
+      "ppid": 59632,
+      "pgid": 50670,
+      "state": "R"
+    },
+    {
+      "pid": 68134,
+      "ppid": 52915,
+      "pgid": 50670,
+      "state": "R"
+    },
+    {
+      "pid": 68185,
+      "ppid": 56630,
+      "pgid": 50670,
+      "state": "R"
+    }
+  ],
+  "preserved": [
+    50670,
+    52892,
+    68180
+  ]
+}

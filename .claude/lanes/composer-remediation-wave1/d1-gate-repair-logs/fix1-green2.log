@@ -1,0 +1,384 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0 -- /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1/.venv/bin/python
+cachedir: .pytest_cache
+hypothesis profile 'ci' -> deadline=None, phases=(Phase.explicit, Phase.reuse, Phase.generate, Phase.shrink)
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 6 items
+
+tests/unit/web/composer/test_compose_loop_persistence.py::test_explicit_approval_batch_caps_after_first_ten_admitted_publications[10] PASSED [ 16%]
+tests/unit/web/composer/test_compose_loop_persistence.py::test_explicit_approval_batch_caps_after_first_ten_admitted_publications[11] PASSED [ 33%]
+tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_cap_excludes_schema_errors_and_semantic_refusals PASSED [ 50%]
+tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[invalid-at-cap] FAILED [ 66%]
+tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[admitted-tenth] PASSED [ 83%]
+tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[admitted-eleventh] PASSED [100%]
+
+=================================== FAILURES ===================================
+_ test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[invalid-at-cap] _
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f68bc160ad0>
+result_session_id = '9ce590e0-f93c-4051-bf73-c44d2e71494b'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-181/test_proposal_attempt_cap_incl0')
+blob_case = 'invalid-at-cap'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f68bc2210d0>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("blob_case", ("invalid-at-cap", "admitted-tenth", "admitted-eleventh"))
+    async def test_proposal_attempt_cap_includes_approval_required_blob_only_mutation(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        tmp_path: Path,
+        blob_case: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from tests.helpers.session_fences import fenced_operation_context
+        from tests.unit.web.composer.test_service import _blob_mutation_resources_for_test
+    
+        sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+        monkeypatch.setattr(composer_service_with_real_sessions, "_session_engine", sessions_service._engine)
+        with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+            conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+    
+        arguments: dict[str, Any] = {}
+        if blob_case != "invalid-at-cap":
+            with fenced_operation_context(sessions_service._engine, result_session_id, operation_kind=SessionOperationKind.CREATE) as context:
+                blob = await BlobServiceImpl(sessions_service._engine, tmp_path).create_blob(
+                    UUID(result_session_id), "retained.txt", b"must remain untouched", "text/plain", session_operation_context=context
+                )
+            arguments = {"blob_id": str(blob.id)}
+        resources_before = _blob_mutation_resources_for_test(sessions_service._engine, tmp_path)
+        events = _record_real_batch_progress(monkeypatch)
+        change_count = 9 if blob_case == "admitted-tenth" else 10
+        model_feedback: list[dict[str, Any]] = []
+    
+        caught = await _capture_tool_batch_rejection(
+            composer_service_with_real_sessions,
+            session_id=result_session_id,
+            response=_tool_batch_response(
+                *(
+                    (f"call_blob_boundary_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}})
+                    for index in range(change_count)
+                ),
+                ("call_approval_required_blob_only", "delete_blob", arguments),
+            ),
+            model_feedback=model_feedback,
+        )
+    
+        expected_ids = {f"call_blob_boundary_proposal_{index}" for index in range(change_count)}
+        if blob_case == "admitted-eleventh":
+            assert type(caught) is ComposerConvergenceError
+            assert dict(caught.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
+            assert [inv.tool_call_id for inv in caught.tool_invocations] == [f"call_blob_boundary_proposal_{index}" for index in range(10)]
+            assert all(inv.version_before == inv.version_after == 1 for inv in caught.tool_invocations)
+        else:
+            assert caught is None
+            if blob_case == "admitted-tenth":
+                expected_ids.add("call_approval_required_blob_only")
+        with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+            assert (
+                set(
+                    conn.execute(
+                        select(composition_proposals_table.c.tool_call_id).where(composition_proposals_table.c.session_id == result_session_id)
+                    ).scalars()
+                )
+                == expected_ids
+            )
+            assert (
+                len(conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).all()) == 10
+            )
+            blob_feedback = conn.execute(
+                select(chat_messages_table.c.content).where(
+                    chat_messages_table.c.session_id == result_session_id,
+                    chat_messages_table.c.role == "tool",
+                    chat_messages_table.c.tool_call_id == "call_approval_required_blob_only",
+                )
+            ).all()
+        if blob_case == "admitted-eleventh":
+            assert blob_feedback == []
+        else:
+            assert len(blob_feedback) == 1
+            payload = json.loads(blob_feedback[0].content)
+            if blob_case == "invalid-at-cap":
+                assert payload["error_class"] == "ToolArgumentError"
+                assert payload["error_category"] == "missing_required_path"
+                assert model_feedback[-1]["tool_call_id"] == "call_approval_required_blob_only"
+>               assert model_feedback[-1]["payload"]["error_class"] == "ToolArgumentError"
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E               KeyError: 'error_class'
+
+BlobServiceImpl = <class 'elspeth.web.blobs.service.BlobServiceImpl'>
+_blob_mutation_resources_for_test = <function _blob_mutation_resources_for_test at 0x7f68bbeeb4c0>
+arguments  = {}
+blob_case  = 'invalid-at-cap'
+blob_feedback = [('{"_redaction_status":"arg_error","error_category":"missing_required_path","error_class":"ToolArgumentError","error_message":"<redacted-arg-error-message>"}',)]
+caught     = None
+change_count = 10
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f68bc160ad0>
+conn       = <sqlalchemy.engine.base.Connection object at 0x7f68bc114dd0>
+events     = [ComposerProgressEvent(phase='using_tools', headline='The model is updating the pipeline graph.', evidence=('A pipeline-editing tool was requested.',), likely_next='ELSPETH will validate the result before saving it.', reason=None)]
+expected_ids = {'call_blob_boundary_proposal_0',
+ 'call_blob_boundary_proposal_1',
+ 'call_blob_boundary_proposal_2',
+ 'call_blob_boundary_proposal_3',
+ 'call_blob_boundary_proposal_4',
+ 'call_blob_boundary_proposal_5',
+ 'call_blob_boundary_proposal_6',
+ 'call_blob_boundary_proposal_7',
+ 'call_blob_boundary_proposal_8',
+ 'call_blob_boundary_proposal_9'}
+fenced_operation_context = <function fenced_operation_context at 0x7f68c16dd9e0>
+model_feedback = [{'payload': {'affected_nodes': [],
+              'data': {'message': 'The requested pipeline change is pending '
+                                  'human approval and has not been applied.',
+                       'proposal_id': '1e539a95-5133-4443-873a-7ffb61b6d02e',
+                       'status': 'APPROVAL_REQUIRED',
+                       'summary': 'Apply composer tool set_metadata.',
+                       'tool_name': 'set_metadata'},
+              'success': True,
+              'validation': {'errors': [{'component': 'source',
+                                         'error_code': 'no_source_configured',
+                                         'message': 'No source configured.',
+                                         'severity': 'high'},
+                                        {'component': 'pipeline',
+                                         'error_code': 'no_sinks_configured',
+                                         'message': 'No sinks configured.',
+                                         'severity': 'high'}],
+                             'graph_repair_suggestions': [],
+                             'is_valid': False,
+                             'semantic_contracts': [],
+                             'suggestions': [],
+                             'warnings': []},
+              'version': 1},
+  'tool_call_id': 'call_blob_boundary_proposal_0'},
+ {'payload': {'affected_nodes': [],
+              'data': {'message': 'The requested pipeline change is pending '
+                                  'human approval and has not been applied.',
+                       'proposal_id': '7cf6d240-4836-4b16-942e-bad2b1e5524b',
+                       'status': 'APPROVAL_REQUIRED',
+                       'summary': 'Apply composer tool set_metadata.',
+                       'tool_name': 'set_metadata'},
+              'success': True,
+              'validation': {'errors': [{'component': 'source',
+                                         'error_code': 'no_source_configured',
+                                         'message': 'No source configured.',
+                                         'severity': 'high'},
+                                        {'component': 'pipeline',
+                                         'error_code': 'no_sinks_configured',
+                                         'message': 'No sinks configured.',
+                                         'severity': 'high'}],
+                             'graph_repair_suggestions': [],
+                             'is_valid': False,
+                             'semantic_contracts': [],
+                             'suggestions': [],
+                             'warnings': []},
+              'version': 1},
+  'tool_call_id': 'call_blob_boundary_proposal_1'},
+ {'payload': {'affected_nodes': [],
+              'data': {'message': 'The requested pipeline change is pending '
+                                  'human approval and has not been applied.',
+                       'proposal_id': '2b49932d-0882-44d9-8819-c03587492134',
+                       'status': 'APPROVAL_REQUIRED',
+                       'summary': 'Apply composer tool set_metadata.',
+                       'tool_name': 'set_metadata'},
+              'success': True,
+              'validation': {'errors': [{'component': 'source',
+                                         'error_code': 'no_source_configured',
+                                         'message': 'No source configured.',
+                                         'severity': 'high'},
+                                        {'component': 'pipeline',
+                                         'error_code': 'no_sinks_configured',
+                                         'message': 'No sinks configured.',
+                                         'severity': 'high'}],
+                             'graph_repair_suggestions': [],
+                             'is_valid': False,
+                             'semantic_contracts': [],
+                             'suggestions': [],
+                             'warnings': []},
+              'version': 1},
+  'tool_call_id': 'call_blob_boundary_proposal_2'},
+ {'payload': {'affected_nodes': [],
+              'data': {'message': 'The requested pipeline change is pending '
+                                  'human approval and has not been applied.',
+                       'proposal_id': 'a8de7c47-4778-4536-8b37-ede85cc8c9c4',
+                       'status': 'APPROVAL_REQUIRED',
+                       'summary': 'Apply composer tool set_metadata.',
+                       'tool_name': 'set_metadata'},
+              'success': True,
+              'validation': {'errors': [{'component': 'source',
+                                         'error_code': 'no_source_configured',
+                                         'message': 'No source configured.',
+                                         'severity': 'high'},
+                                        {'component': 'pipeline',
+                                         'error_code': 'no_sinks_configured',
+                                         'message': 'No sinks configured.',
+                                         'severity': 'high'}],
+                             'graph_repair_suggestions': [],
+                             'is_valid': False,
+                             'semantic_contracts': [],
+                             'suggestions': [],
+                             'warnings': []},
+              'version': 1},
+  'tool_call_id': 'call_blob_boundary_proposal_3'},
+ {'payload': {'affected_nodes': [],
+              'data': {'message': 'The requested pipeline change is pending '
+                                  'human approval and has not been applied.',
+                       'proposal_id': 'c946ade7-1ded-4ce9-82f7-c9867e34768e',
+                       'status': 'APPROVAL_REQUIRED',
+                       'summary': 'Apply composer tool set_metadata.',
+                       'tool_name': 'set_metadata'},
+              'success': True,
+              'validation': {'errors': [{'component': 'source',
+                                         'error_code': 'no_source_configured',
+                                         'message': 'No source configured.',
+                                         'severity': 'high'},
+                                        {'component': 'pipeline',
+                                         'error_code': 'no_sinks_configured',
+                                         'message': 'No sinks configured.',
+                                         'severity': 'high'}],
+                             'graph_repair_suggestions': [],
+                             'is_valid': False,
+                             'semantic_contracts': [],
+                             'suggestions': [],
+                             'warnings': []},
+              'version': 1},
+  'tool_call_id': 'call_blob_boundary_proposal_4'},
+ {'payload': {'affected_nodes': [],
+              'data': {'message': 'The requested pipeline change is pending '
+                                  'human approval and has not been applied.',
+                       'proposal_id': '61371681-4d83-4c82-91c3-7ab1b3746e7c',
+                       'status': 'APPROVAL_REQUIRED',
+                       'summary': 'Apply composer tool set_metadata.',
+                       'tool_name': 'set_metadata'},
+              'success': True,
+              'validation': {'errors': [{'component': 'source',
+                                         'error_code': 'no_source_configured',
+                                         'message': 'No source configured.',
+                                         'severity': 'high'},
+                                        {'component': 'pipeline',
+                                         'error_code': 'no_sinks_configured',
+                                         'message': 'No sinks configured.',
+                                         'severity': 'high'}],
+                             'graph_repair_suggestions': [],
+                             'is_valid': False,
+                             'semantic_contracts': [],
+                             'suggestions': [],
+                             'warnings': []},
+              'version': 1},
+  'tool_call_id': 'call_blob_boundary_proposal_5'},
+ {'payload': {'affected_nodes': [],
+              'data': {'message': 'The requested pipeline change is pending '
+                                  'human approval and has not been applied.',
+                       'proposal_id': '8b71b262-d347-4c87-b0eb-86ed1ae4e6cd',
+                       'status': 'APPROVAL_REQUIRED',
+                       'summary': 'Apply composer tool set_metadata.',
+                       'tool_name': 'set_metadata'},
+              'success': True,
+              'validation': {'errors': [{'component': 'source',
+                                         'error_code': 'no_source_configured',
+                                         'message': 'No source configured.',
+                                         'severity': 'high'},
+                                        {'component': 'pipeline',
+                                         'error_code': 'no_sinks_configured',
+                                         'message': 'No sinks configured.',
+                                         'severity': 'high'}],
+                             'graph_repair_suggestions': [],
+                             'is_valid': False,
+                             'semantic_contracts': [],
+                             'suggestions': [],
+                             'warnings': []},
+              'version': 1},
+  'tool_call_id': 'call_blob_boundary_proposal_6'},
+ {'payload': {'affected_nodes': [],
+              'data': {'message': 'The requested pipeline change is pending '
+                                  'human approval and has not been applied.',
+                       'proposal_id': '5f693e2a-e4af-42b1-980b-6f8cf3dafe45',
+                       'status': 'APPROVAL_REQUIRED',
+                       'summary': 'Apply composer tool set_metadata.',
+                       'tool_name': 'set_metadata'},
+              'success': True,
+              'validation': {'errors': [{'component': 'source',
+                                         'error_code': 'no_source_configured',
+                                         'message': 'No source configured.',
+                                         'severity': 'high'},
+                                        {'component': 'pipeline',
+                                         'error_code': 'no_sinks_configured',
+                                         'message': 'No sinks configured.',
+                                         'severity': 'high'}],
+                             'graph_repair_suggestions': [],
+                             'is_valid': False,
+                             'semantic_contracts': [],
+                             'suggestions': [],
+                             'warnings': []},
+              'version': 1},
+  'tool_call_id': 'call_blob_boundary_proposal_7'},
+ {'payload': {'affected_nodes': [],
+              'data': {'message': 'The requested pipeline change is pending '
+                                  'human approval and has not been applied.',
+                       'proposal_id': '908d9601-462d-448b-8bd6-dc72122cce26',
+                       'status': 'APPROVAL_REQUIRED',
+                       'summary': 'Apply composer tool set_metadata.',
+                       'tool_name': 'set_metadata'},
+              'success': True,
+              'validation': {'errors': [{'component': 'source',
+                                         'error_code': 'no_source_configured',
+                                         'message': 'No source configured.',
+                                         'severity': 'high'},
+                                        {'component': 'pipeline',
+                                         'error_code': 'no_sinks_configured',
+                                         'message': 'No sinks configured.',
+                                         'severity': 'high'}],
+                             'graph_repair_suggestions': [],
+                             'is_valid': False,
+                             'semantic_contracts': [],
+                             'suggestions': [],
+                             'warnings': []},
+              'version': 1},
+  'tool_call_id': 'call_blob_boundary_proposal_8'},
+ {'payload': {'affected_nodes': [],
+              'data': {'message': 'The requested pipeline change is pending '
+                                  'human approval and has not been applied.',
+                       'proposal_id': '6708c1c7-497b-4400-bea1-b96875fec616',
+                       'status': 'APPROVAL_REQUIRED',
+                       'summary': 'Apply composer tool set_metadata.',
+                       'tool_name': 'set_metadata'},
+              'success': True,
+              'validation': {'errors': [{'component': 'source',
+                                         'error_code': 'no_source_configured',
+                                         'message': 'No source configured.',
+                                         'severity': 'high'},
+                                        {'component': 'pipeline',
+                                         'error_code': 'no_sinks_configured',
+                                         'message': 'No sinks configured.',
+                                         'severity': 'high'}],
+                             'graph_repair_suggestions': [],
+                             'is_valid': False,
+                             'semantic_contracts': [],
+                             'suggestions': [],
+                             'warnings': []},
+              'version': 1},
+  'tool_call_id': 'call_blob_boundary_proposal_9'},
+ {'payload': {'error': "Tool 'delete_blob' missing required argument(s): "
+                       'blob_id'},
+  'tool_call_id': 'call_approval_required_blob_only'}]
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f68bc2210d0>
+payload    = {'_redaction_status': 'arg_error',
+ 'error_category': 'missing_required_path',
+ 'error_class': 'ToolArgumentError',
+ 'error_message': '<redacted-arg-error-message>'}
+resources_before = (((), (), (), (), ()), ())
+result_session_id = '9ce590e0-f93c-4051-bf73-c44d2e71494b'
+sessions_service = <tests.unit.web.sessions.session_test_authority.FencedSessionServiceHarness object at 0x7f68bc258650>
+tmp_path   = PosixPath('/tmp/pytest-of-agent/pytest-181/test_proposal_attempt_cap_incl0')
+
+tests/unit/web/composer/test_compose_loop_persistence.py:1646: KeyError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 17:04:31 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 17:04:31 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 17:04:31 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[invalid-at-cap] - KeyError: 'error_class'
+========================= 1 failed, 5 passed in 8.00s ==========================

@@ -1,0 +1,420 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 2 items
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py FF            [100%]
+
+=================================== FAILURES ===================================
+_ test_no_change_required_rejection_keeps_exact_cancellations_and_projects_actual_sql[before_sql] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-138/test_no_change_required_reject0/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7f024cdee930>, UUID('1794c3ba-0543-4841-83b5-debfb11e29ee'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-138/test_no_change_required_reject0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f024cebb560>
+boundary = 'before_sql'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("boundary", ["before_sql", "after_sql"])
+    async def test_no_change_required_rejection_keeps_exact_cancellations_and_projects_actual_sql(operation_store, tmp_path, monkeypatch, boundary):
+        from elspeth.web.sessions.service import SessionServiceImpl
+    
+        engine, repository, _authority, service, _sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        app = mounted_app(operation_store, tmp_path)
+        body = PipelineCommitError("pipeline proposal does not change the current composition", code="NO_CHANGE")
+    
+        async def no_change(**kwargs):
+            raise body
+    
+        monkeypatch.setattr(pipeline_settlement, "prepare_pipeline_proposal_commit", no_change)
+        parent = RequiredWorkCoordinator(RequiredWorkAuthority(
+            RequiredAuthorityKind.DURABLE_COMPOSE, running.session_operation_context, running.claim.operation_id, running.claim.attempt,
+        ))
+        binding = RequiredWorkBinding(parent, 9, 13, RequiredWorkRole.TURN, running)
+        entered, release = threading.Event(), threading.Event()
+        after_entered, after_release = asyncio.Event(), asyncio.Event()
+        deliveries = []
+        actual_shield = asyncio.shield
+    
+        def observe_shield(awaitable):
+            async def observe():
+                try:
+                    return await actual_shield(awaitable)
+                except asyncio.CancelledError as delivery:
+                    deliveries.append(delivery)
+                    raise
+            return observe()
+    
+        monkeypatch.setattr(asyncio, "shield", observe_shield)
+    
+        def park_sql(_conn, _cursor, statement, _parameters, _context, _many):
+            if boundary == "before_sql" and statement.startswith("UPDATE composition_proposals"):
+                entered.set()
+                assert release.wait(5)
+    
+        actual_finish = SessionServiceImpl.reject_pipeline_composition_proposal_finish_once
+    
+        async def park_return(self, **kwargs):
+            handoff = await actual_finish(self, **kwargs)
+            if boundary == "after_sql":
+                after_entered.set()
+                await after_release.wait()
+            return handoff
+    
+        monkeypatch.setattr(SessionServiceImpl, "reject_pipeline_composition_proposal_finish_once", park_return)
+        event.listen(engine, "before_cursor_execute", park_sql)
+        task = asyncio.create_task(pipeline_settlement.settle_pipeline_proposal_under_compose_lock(
+            services=composer_app_services(app), user_id="alice", authority=expected.authority, draft_hash=expected.authority.proposal.draft_hash,
+            session_operation_context=running.session_operation_context, commit_timeout_seconds=5, running=running,
+            required_work=parent, required_binding=binding,
+        ))
+        try:
+            async with asyncio.timeout(5):
+                if boundary == "after_sql":
+                    await after_entered.wait()
+                else:
+                    while not entered.is_set():
+                        await asyncio.sleep(0.01)
+            for index in range(2):
+                task.cancel(f"no-change-{boundary}-{index}")
+                async with asyncio.timeout(5):
+                    while not any(delivery.args == (f"no-change-{boundary}-{index}",) for delivery in deliveries):
+>                       await asyncio.sleep(0)
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:494: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/tasks.py:656: in sleep
+    await __sleep0()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    @types.coroutine
+    def __sleep0():
+        """Skip one event loop run cycle.
+    
+        This is a private helper for 'asyncio.sleep()', used
+        when the 'delay' is set to 0.  It uses a bare 'yield'
+        expression (which Task.__step knows how to handle)
+        instead of creating a Future object.
+        """
+>       yield
+E       asyncio.exceptions.CancelledError
+
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/tasks.py:650: CancelledError
+
+The above exception was the direct cause of the following exception:
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-138/test_no_change_required_reject0/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7f024cdee930>, UUID('1794c3ba-0543-4841-83b5-debfb11e29ee'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-138/test_no_change_required_reject0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f024cebb560>
+boundary = 'before_sql'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("boundary", ["before_sql", "after_sql"])
+    async def test_no_change_required_rejection_keeps_exact_cancellations_and_projects_actual_sql(operation_store, tmp_path, monkeypatch, boundary):
+        from elspeth.web.sessions.service import SessionServiceImpl
+    
+        engine, repository, _authority, service, _sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        app = mounted_app(operation_store, tmp_path)
+        body = PipelineCommitError("pipeline proposal does not change the current composition", code="NO_CHANGE")
+    
+        async def no_change(**kwargs):
+            raise body
+    
+        monkeypatch.setattr(pipeline_settlement, "prepare_pipeline_proposal_commit", no_change)
+        parent = RequiredWorkCoordinator(RequiredWorkAuthority(
+            RequiredAuthorityKind.DURABLE_COMPOSE, running.session_operation_context, running.claim.operation_id, running.claim.attempt,
+        ))
+        binding = RequiredWorkBinding(parent, 9, 13, RequiredWorkRole.TURN, running)
+        entered, release = threading.Event(), threading.Event()
+        after_entered, after_release = asyncio.Event(), asyncio.Event()
+        deliveries = []
+        actual_shield = asyncio.shield
+    
+        def observe_shield(awaitable):
+            async def observe():
+                try:
+                    return await actual_shield(awaitable)
+                except asyncio.CancelledError as delivery:
+                    deliveries.append(delivery)
+                    raise
+            return observe()
+    
+        monkeypatch.setattr(asyncio, "shield", observe_shield)
+    
+        def park_sql(_conn, _cursor, statement, _parameters, _context, _many):
+            if boundary == "before_sql" and statement.startswith("UPDATE composition_proposals"):
+                entered.set()
+                assert release.wait(5)
+    
+        actual_finish = SessionServiceImpl.reject_pipeline_composition_proposal_finish_once
+    
+        async def park_return(self, **kwargs):
+            handoff = await actual_finish(self, **kwargs)
+            if boundary == "after_sql":
+                after_entered.set()
+                await after_release.wait()
+            return handoff
+    
+        monkeypatch.setattr(SessionServiceImpl, "reject_pipeline_composition_proposal_finish_once", park_return)
+        event.listen(engine, "before_cursor_execute", park_sql)
+        task = asyncio.create_task(pipeline_settlement.settle_pipeline_proposal_under_compose_lock(
+            services=composer_app_services(app), user_id="alice", authority=expected.authority, draft_hash=expected.authority.proposal.draft_hash,
+            session_operation_context=running.session_operation_context, commit_timeout_seconds=5, running=running,
+            required_work=parent, required_binding=binding,
+        ))
+        try:
+            async with asyncio.timeout(5):
+                if boundary == "after_sql":
+                    await after_entered.wait()
+                else:
+                    while not entered.is_set():
+                        await asyncio.sleep(0.01)
+            for index in range(2):
+                task.cancel(f"no-change-{boundary}-{index}")
+>               async with asyncio.timeout(5):
+                           ^^^^^^^^^^^^^^^^^^
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:492: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <Timeout [expired]>
+exc_type = <class 'asyncio.exceptions.CancelledError'>
+exc_val = CancelledError(), exc_tb = <traceback object at 0x7f024b613400>
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> Optional[bool]:
+        assert self._state in (_State.ENTERED, _State.EXPIRING)
+    
+        if self._timeout_handler is not None:
+            self._timeout_handler.cancel()
+            self._timeout_handler = None
+    
+        if self._state is _State.EXPIRING:
+            self._state = _State.EXPIRED
+    
+            if self._task.uncancel() <= self._cancelling and exc_type is exceptions.CancelledError:
+                # Since there are no new cancel requests, we're
+                # handling this.
+>               raise TimeoutError from exc_val
+E               TimeoutError
+
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/timeouts.py:115: TimeoutError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:49:24 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:49:25 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:49:25 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+_ test_no_change_required_rejection_keeps_exact_cancellations_and_projects_actual_sql[after_sql] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-138/test_no_change_required_reject1/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7f024b1290d0>, UUID('57b1d10c-77a4-4e4d-8990-ddb8371f6925'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-138/test_no_change_required_reject1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f024b885670>
+boundary = 'after_sql'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("boundary", ["before_sql", "after_sql"])
+    async def test_no_change_required_rejection_keeps_exact_cancellations_and_projects_actual_sql(operation_store, tmp_path, monkeypatch, boundary):
+        from elspeth.web.sessions.service import SessionServiceImpl
+    
+        engine, repository, _authority, service, _sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        app = mounted_app(operation_store, tmp_path)
+        body = PipelineCommitError("pipeline proposal does not change the current composition", code="NO_CHANGE")
+    
+        async def no_change(**kwargs):
+            raise body
+    
+        monkeypatch.setattr(pipeline_settlement, "prepare_pipeline_proposal_commit", no_change)
+        parent = RequiredWorkCoordinator(RequiredWorkAuthority(
+            RequiredAuthorityKind.DURABLE_COMPOSE, running.session_operation_context, running.claim.operation_id, running.claim.attempt,
+        ))
+        binding = RequiredWorkBinding(parent, 9, 13, RequiredWorkRole.TURN, running)
+        entered, release = threading.Event(), threading.Event()
+        after_entered, after_release = asyncio.Event(), asyncio.Event()
+        deliveries = []
+        actual_shield = asyncio.shield
+    
+        def observe_shield(awaitable):
+            async def observe():
+                try:
+                    return await actual_shield(awaitable)
+                except asyncio.CancelledError as delivery:
+                    deliveries.append(delivery)
+                    raise
+            return observe()
+    
+        monkeypatch.setattr(asyncio, "shield", observe_shield)
+    
+        def park_sql(_conn, _cursor, statement, _parameters, _context, _many):
+            if boundary == "before_sql" and statement.startswith("UPDATE composition_proposals"):
+                entered.set()
+                assert release.wait(5)
+    
+        actual_finish = SessionServiceImpl.reject_pipeline_composition_proposal_finish_once
+    
+        async def park_return(self, **kwargs):
+            handoff = await actual_finish(self, **kwargs)
+            if boundary == "after_sql":
+                after_entered.set()
+                await after_release.wait()
+            return handoff
+    
+        monkeypatch.setattr(SessionServiceImpl, "reject_pipeline_composition_proposal_finish_once", park_return)
+        event.listen(engine, "before_cursor_execute", park_sql)
+        task = asyncio.create_task(pipeline_settlement.settle_pipeline_proposal_under_compose_lock(
+            services=composer_app_services(app), user_id="alice", authority=expected.authority, draft_hash=expected.authority.proposal.draft_hash,
+            session_operation_context=running.session_operation_context, commit_timeout_seconds=5, running=running,
+            required_work=parent, required_binding=binding,
+        ))
+        try:
+            async with asyncio.timeout(5):
+                if boundary == "after_sql":
+                    await after_entered.wait()
+                else:
+                    while not entered.is_set():
+                        await asyncio.sleep(0.01)
+            for index in range(2):
+                task.cancel(f"no-change-{boundary}-{index}")
+                async with asyncio.timeout(5):
+                    while not any(delivery.args == (f"no-change-{boundary}-{index}",) for delivery in deliveries):
+>                       await asyncio.sleep(0)
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:494: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/tasks.py:656: in sleep
+    await __sleep0()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    @types.coroutine
+    def __sleep0():
+        """Skip one event loop run cycle.
+    
+        This is a private helper for 'asyncio.sleep()', used
+        when the 'delay' is set to 0.  It uses a bare 'yield'
+        expression (which Task.__step knows how to handle)
+        instead of creating a Future object.
+        """
+>       yield
+E       asyncio.exceptions.CancelledError
+
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/tasks.py:650: CancelledError
+
+The above exception was the direct cause of the following exception:
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-138/test_no_change_required_reject1/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7f024b1290d0>, UUID('57b1d10c-77a4-4e4d-8990-ddb8371f6925'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-138/test_no_change_required_reject1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f024b885670>
+boundary = 'after_sql'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("boundary", ["before_sql", "after_sql"])
+    async def test_no_change_required_rejection_keeps_exact_cancellations_and_projects_actual_sql(operation_store, tmp_path, monkeypatch, boundary):
+        from elspeth.web.sessions.service import SessionServiceImpl
+    
+        engine, repository, _authority, service, _sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        app = mounted_app(operation_store, tmp_path)
+        body = PipelineCommitError("pipeline proposal does not change the current composition", code="NO_CHANGE")
+    
+        async def no_change(**kwargs):
+            raise body
+    
+        monkeypatch.setattr(pipeline_settlement, "prepare_pipeline_proposal_commit", no_change)
+        parent = RequiredWorkCoordinator(RequiredWorkAuthority(
+            RequiredAuthorityKind.DURABLE_COMPOSE, running.session_operation_context, running.claim.operation_id, running.claim.attempt,
+        ))
+        binding = RequiredWorkBinding(parent, 9, 13, RequiredWorkRole.TURN, running)
+        entered, release = threading.Event(), threading.Event()
+        after_entered, after_release = asyncio.Event(), asyncio.Event()
+        deliveries = []
+        actual_shield = asyncio.shield
+    
+        def observe_shield(awaitable):
+            async def observe():
+                try:
+                    return await actual_shield(awaitable)
+                except asyncio.CancelledError as delivery:
+                    deliveries.append(delivery)
+                    raise
+            return observe()
+    
+        monkeypatch.setattr(asyncio, "shield", observe_shield)
+    
+        def park_sql(_conn, _cursor, statement, _parameters, _context, _many):
+            if boundary == "before_sql" and statement.startswith("UPDATE composition_proposals"):
+                entered.set()
+                assert release.wait(5)
+    
+        actual_finish = SessionServiceImpl.reject_pipeline_composition_proposal_finish_once
+    
+        async def park_return(self, **kwargs):
+            handoff = await actual_finish(self, **kwargs)
+            if boundary == "after_sql":
+                after_entered.set()
+                await after_release.wait()
+            return handoff
+    
+        monkeypatch.setattr(SessionServiceImpl, "reject_pipeline_composition_proposal_finish_once", park_return)
+        event.listen(engine, "before_cursor_execute", park_sql)
+        task = asyncio.create_task(pipeline_settlement.settle_pipeline_proposal_under_compose_lock(
+            services=composer_app_services(app), user_id="alice", authority=expected.authority, draft_hash=expected.authority.proposal.draft_hash,
+            session_operation_context=running.session_operation_context, commit_timeout_seconds=5, running=running,
+            required_work=parent, required_binding=binding,
+        ))
+        try:
+            async with asyncio.timeout(5):
+                if boundary == "after_sql":
+                    await after_entered.wait()
+                else:
+                    while not entered.is_set():
+                        await asyncio.sleep(0.01)
+            for index in range(2):
+                task.cancel(f"no-change-{boundary}-{index}")
+>               async with asyncio.timeout(5):
+                           ^^^^^^^^^^^^^^^^^^
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:492: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <Timeout [expired]>
+exc_type = <class 'asyncio.exceptions.CancelledError'>
+exc_val = CancelledError(), exc_tb = <traceback object at 0x7f024ab1ae40>
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> Optional[bool]:
+        assert self._state in (_State.ENTERED, _State.EXPIRING)
+    
+        if self._timeout_handler is not None:
+            self._timeout_handler.cancel()
+            self._timeout_handler = None
+    
+        if self._state is _State.EXPIRING:
+            self._state = _State.EXPIRED
+    
+            if self._task.uncancel() <= self._cancelling and exc_type is exceptions.CancelledError:
+                # Since there are no new cancel requests, we're
+                # handling this.
+>               raise TimeoutError from exc_val
+E               TimeoutError
+
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/timeouts.py:115: TimeoutError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:49:31 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:49:31 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:49:32 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+=========================== short test summary info ============================
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_no_change_required_rejection_keeps_exact_cancellations_and_projects_actual_sql[before_sql]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_no_change_required_rejection_keeps_exact_cancellations_and_projects_actual_sql[after_sql]
+============================== 2 failed in 15.61s ==============================

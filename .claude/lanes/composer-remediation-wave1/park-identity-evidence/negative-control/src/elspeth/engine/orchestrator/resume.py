@@ -1,0 +1,1496 @@
+"""Resume-path execution for the orchestrator.
+
+This module contains the full resume code path:
+- setup_resume_context: rebuild GraphArtifacts from existing Landscape records
+  (the resume-path equivalent of graph node/edge registration)
+- run_resume_processing_loop: re-drive a resumed run's durable scheduler work
+  (no source row is ever re-derived), then run the end-of-input barrier
+  flushes unless the resume was interrupted
+- ResumeCoordinator: the resume orchestration that wires the two functions
+  above together (``reconstruct_resume_state``, ``resume``,
+  ``process_resumed_rows``)
+
+The two module-level functions operate on external state passed via parameters
+- they don't maintain internal state. This follows the same pattern as
+aggregation.py and outcomes.py: pure delegation targets.
+
+The module-level functions were extracted from ``Orchestrator`` (where they
+lived as ``_setup_resume_context`` and ``_run_resume_processing_loop``) to
+shrink ``core.py``; ``ResumeCoordinator`` completes that extraction by moving
+the resume orchestration off ``Orchestrator`` (which now delegates its public
+``resume()`` here).
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from collections.abc import Callable, Mapping
+from contextlib import ExitStack, nullcontext
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
+
+from elspeth.contracts import ResumePoint, RunMode, RunStatus, SourceRow
+from elspeth.contracts.checkpoint import ResumeRefusalCause
+from elspeth.contracts.config import RuntimeRetryConfig
+from elspeth.contracts.coordination import (
+    DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+    CoordinationToken,
+    mint_worker_id,
+)
+from elspeth.contracts.errors import (
+    AuditIntegrityError,
+    EmptyResumeStateError,
+    GracefulShutdownError,
+    IncompleteSourceResumeError,
+    OrchestrationInvariantError,
+)
+from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.runtime_val_manifest import build_runtime_val_manifest
+from elspeth.contracts.types import NodeID
+from elspeth.core.canonical import canonical_json
+from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
+from elspeth.core.checkpoint.recovery import (
+    GroupUnsatisfiableResumeError,
+    NonResumableRunError,
+    check_group_satisfiability_resumable,
+    check_http_effects_resumable,
+    check_run_status_resumable,
+    check_source_lifecycle_resumable,
+    group_binding_view_from_graph,
+)
+from elspeth.core.dag.group_bindings import CloserKind
+from elspeth.core.landscape.factory import RecorderFactory
+
+# The immutable-success family (COMPLETED / COMPLETED_WITH_FAILURES / EMPTY)
+# is deliberately imported from its single source of truth rather than
+# duplicated: the resume() entry guard refuses these statuses as "Run is
+# terminal" (the §H loser-after-winner contract), with the durable
+# immutable-success backstops retained beneath (the acquire_run_leadership
+# takeover CAS and the run_lifecycle conditional UPDATEs).
+from elspeth.core.landscape.run_lifecycle_repository import _IMMUTABLE_SUCCESS_RUN_STATUSES
+from elspeth.core.landscape.schema import SOURCE_COMPLETE_LIFECYCLE_STATES, rows_table
+from elspeth.engine._best_effort import best_effort
+from elspeth.engine.barrier_coordination import BarrierJournalRestoreContext
+from elspeth.engine.executors.replay_sink_effect import verify_virtual_sink_members
+from elspeth.engine.orchestrator.aggregation import check_aggregation_timeouts
+from elspeth.engine.orchestrator.authority_guard import CallerAuthorityGuard
+from elspeth.engine.orchestrator.bootstrap import prepare_for_run
+from elspeth.engine.orchestrator.cleanup import cleanup_plugins
+from elspeth.engine.orchestrator.graph_wiring import build_source_id_map, load_edge_map
+from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
+from elspeth.engine.orchestrator.implementation_compatibility import check_implementation_compatibility
+from elspeth.engine.orchestrator.leader_drain import run_end_of_input_barrier_flush
+from elspeth.engine.orchestrator.outcomes import (
+    accumulate_row_outcomes,
+    handle_coalesce_timeouts,
+    handle_row_union_timeouts,
+)
+from elspeth.engine.orchestrator.quarantine_router import QuarantineRouter
+from elspeth.engine.orchestrator.run_state import (
+    GraphArtifacts,
+    LoopContext,
+    ResumeState,
+    _RunFailedWithPartialResultError,
+)
+from elspeth.engine.orchestrator.run_status import (
+    assert_bound_groups_settled_from_audit,
+    cli_completion_for,
+    derive_resume_terminal_status_from_audit,
+)
+from elspeth.engine.orchestrator.runtime_preflight import run_transform_runtime_preflights
+from elspeth.engine.orchestrator.shutdown import shutdown_handler_context
+from elspeth.engine.orchestrator.source_snapshot import load_committed_source_snapshot
+from elspeth.engine.orchestrator.types import (
+    ExecutionCounters,
+)
+from elspeth.engine.orchestrator.validation import (
+    validate_pipeline_route_targets,
+)
+from elspeth.engine.retry import RetryManager
+
+if TYPE_CHECKING:
+    from elspeth.contracts.payload_store import PayloadStore
+    from elspeth.core.checkpoint import CheckpointManager
+    from elspeth.core.checkpoint.recovery import RecoveryManager
+    from elspeth.core.config import ElspethSettings
+    from elspeth.core.dag import ExecutionGraph
+    from elspeth.core.events import EventBusProtocol
+    from elspeth.core.landscape import LandscapeDB
+    from elspeth.core.landscape.execution_repository import ExecutionRepository
+    from elspeth.engine.orchestrator.ceremony import RunCeremony
+    from elspeth.engine.orchestrator.checkpointing import CheckpointCoordinator
+    from elspeth.engine.orchestrator.run_context_factory import RunContextFactory
+    from elspeth.engine.orchestrator.sink_flush import SinkFlushCoordinator
+    from elspeth.engine.orchestrator.types import PipelineConfig, RunResult
+    from elspeth.engine.spans import SpanFactory
+
+logger = logging.getLogger(__name__)
+
+
+def setup_resume_context(
+    factory: RecorderFactory,
+    run_id: str,
+    config: PipelineConfig,
+    graph: ExecutionGraph,
+) -> GraphArtifacts:
+    """Resume-path equivalent of _register_graph_nodes_and_edges().
+
+    Loads node ID maps and edge_map from database records instead of
+    registering new ones. The graph is the same as the original run,
+    but nodes/edges already exist in Landscape.
+
+    Returns:
+        GraphArtifacts populated from existing Landscape records.
+    """
+    # Get explicit node ID mappings from graph via the SAME loader the leader
+    # and follower use (elspeth-07b2031e41). Resume must preserve every
+    # source root from the original multi-source DAG; a singleton
+    # ``graph.get_source()`` lookup is intentionally single-source-only.
+    source_id_map = build_source_id_map(graph)
+    source_id = next(iter(source_id_map.values()))
+    sink_id_map = graph.get_sink_id_map()
+    transform_id_map = graph.get_transform_id_map()
+    config_gate_id_map = graph.get_config_gate_id_map()
+    coalesce_id_map = graph.get_coalesce_id_map()
+
+    # Load edge_map from database via the shared loader (real edge IDs
+    # registered in the original run — FK integrity for routing events).
+    edge_map = load_edge_map(factory.data_flow, run_id)
+
+    validate_pipeline_route_targets(
+        config=config,
+        route_resolution_map=graph.get_route_resolution_map(),
+        config_gate_id_map=config_gate_id_map,
+        closer_names=frozenset(graph.get_error_routable_closer_names()),
+    )
+
+    return GraphArtifacts(
+        edge_map=edge_map,
+        source_id=source_id,
+        source_id_map=source_id_map,
+        sink_id_map=sink_id_map,
+        transform_id_map=transform_id_map,
+        config_gate_id_map=config_gate_id_map,
+        coalesce_id_map=coalesce_id_map,
+    )
+
+
+def pending_source_snapshot_rows(
+    factory: RecorderFactory,
+    payload_store: PayloadStore,
+    db: LandscapeDB,
+    run_id: str,
+    config: PipelineConfig,
+    graph: ExecutionGraph,
+) -> tuple[tuple[tuple[str, NodeID, int, SourceRow], ...], int]:
+    """Verify the ingested prefix against sealed source emissions and return its suffix."""
+    source_id_map = build_source_id_map(graph)
+    pending: list[tuple[str, NodeID, int, SourceRow]] = []
+    with db.engine.connect() as conn:
+        next_ingest_sequence = conn.execute(
+            select(func.max(rows_table.c.ingest_sequence)).where(rows_table.c.run_id == run_id)
+        ).scalar_one()
+        for source_name, active_source in config.sources.items():
+            if active_source.config.get("snapshot_for_resume") is not True:
+                continue
+            source_id = source_id_map[source_name]
+            snapshot = load_committed_source_snapshot(
+                factory,
+                payload_store,
+                run_id=run_id,
+                source_id=source_id,
+                source_name=source_name,
+            )
+            ingested = conn.execute(
+                select(rows_table.c.row_index, rows_table.c.source_row_index)
+                .where(rows_table.c.run_id == run_id, rows_table.c.source_node_id == source_id)
+                .order_by(rows_table.c.row_index)
+            ).all()
+            if len(ingested) > len(snapshot) or any(
+                row_index != ordinal or source_row_index != snapshot[ordinal].source_row_index
+                for ordinal, (row_index, source_row_index) in enumerate(ingested)
+            ):
+                raise AuditIntegrityError(f"Source {source_name!r} ingested rows differ from its sealed snapshot prefix")
+            pending.extend((source_name, source_id, ordinal, row) for ordinal, row in enumerate(snapshot[len(ingested) :], len(ingested)))
+    return tuple(pending), 0 if next_ingest_sequence is None else next_ingest_sequence + 1
+
+
+def run_resume_processing_loop(
+    loop_ctx: LoopContext,
+    *,
+    shutdown_event: threading.Event | None = None,
+    source_snapshot_rows_processed: bool = False,
+    flush_end_of_input: bool = True,
+) -> bool:
+    """Re-drive a resumed run's durable scheduler work, then flush barriers at end of input.
+
+    Resume never re-derives a source row. Every row the run ingested was
+    handed to the scheduler in the same fenced transaction that recorded it
+    (valid ingest: a claimed READY item; source quarantine: a born-parked
+    PENDING_SINK item). A fork, expand or collect product gets
+    its item when its producing work completes; a crash between the child's
+    mint and that completion leaves the producer open, and re-driving it
+    reconciles the committed children and emits their items. The recovered
+    work is therefore exactly the run's non-terminal scheduler items (READY /
+    LEASED / BLOCKED / PENDING_SINK) plus the barrier buffers restored from
+    the journal at processor construction; each item's payload carries its
+    own row and contract, so no source schema is consulted.
+
+    End-of-input barrier flushes run only when the resume is not interrupted:
+    on graceful shutdown buffered state stays pending rather than being forced
+    through end-of-source semantics.
+
+    Returns:
+        True if interrupted by shutdown, False otherwise.
+    """
+    config = loop_ctx.config
+    ctx = loop_ctx.ctx
+    processor = loop_ctx.processor
+    counters = loop_ctx.counters
+    pending_tokens = loop_ctx.pending_tokens
+    coalesce_executor = loop_ctx.coalesce_executor
+    coalesce_node_map = dict(loop_ctx.coalesce_node_map)
+    row_union_executor = processor.row_union_executor
+
+    # A buffered-only resume carries restored aggregation/coalesce state. If
+    # shutdown is already requested, honor it before any end-of-source flush
+    # work so buffered state is checkpointed again instead of being flushed to
+    # sinks.
+    interrupted_by_shutdown = shutdown_event is not None and shutdown_event.is_set()
+
+    # elspeth-0bffbd1af1 / elspeth-321f335ff2: restored pending groups carry
+    # backdated arrival anchors, so a group whose timeout expired during
+    # downtime is already stale HERE — sweep it closed before the scheduler
+    # drain can supply its missing branch and complete it. Skipped on an
+    # already-requested shutdown so restored barrier state stays pending for
+    # the next checkpoint instead of being failed by the sweep. Coalesce
+    # before row_union: the same order as every other sweep boundary.
+    if not interrupted_by_shutdown and coalesce_executor is not None:
+        handle_coalesce_timeouts(
+            coalesce_executor=coalesce_executor,
+            coalesce_node_map=coalesce_node_map,
+            processor=processor,
+            ctx=ctx,
+            counters=counters,
+            pending_tokens=pending_tokens,
+        )
+
+    if not interrupted_by_shutdown and row_union_executor is not None:
+        handle_row_union_timeouts(
+            row_union_executor=row_union_executor,
+            processor=processor,
+            ctx=ctx,
+            counters=counters,
+        )
+
+    if not interrupted_by_shutdown and processor.has_scheduled_work():
+        # Freshly ingested snapshot rows already contributed their terminal
+        # results to pending_tokens. The durable PENDING_SINK rehydration sees
+        # those same tokens; retain only results not accumulated this pass.
+        already_pending = (
+            {token.token_id for bucket in pending_tokens.values() for token, _ in bucket} if source_snapshot_rows_processed else set()
+        )
+        results = processor.drain_scheduled_work(ctx)
+        newly_recovered = tuple(result for result in results if result.token.token_id not in already_pending)
+        counters.rows_processed += len({result.token.row_id for result in newly_recovered})
+        accumulate_row_outcomes(newly_recovered, counters, pending_tokens)
+
+    if not interrupted_by_shutdown and flush_end_of_input:
+        # CRITICAL: Flush remaining barriers only at true end-of-source.
+        # ADR-030 §D steps 2-3 (slice 3): journal-quiescence gate, then the
+        # intake -> trigger evaluation -> flush loop until no BLOCKED barrier
+        # holds remain (same helper as _post_source_iteration_work).
+        run_end_of_input_barrier_flush(
+            config=config,
+            processor=processor,
+            ctx=ctx,
+            counters=counters,
+            pending_tokens=pending_tokens,
+            coalesce_executor=coalesce_executor,
+            coalesce_node_map=coalesce_node_map,
+        )
+
+        if processor.has_unresolved_scheduler_work():
+            active_work = "; ".join(processor.summarize_unresolved_scheduler_work()) or "<unknown>"
+            raise OrchestrationInvariantError(
+                f"Resume for run '{processor.run_id}' left non-terminal scheduler work after end-of-source flush. "
+                "Blocked scheduler state must be recovered explicitly before run completion. "
+                f"Active scheduler work: {active_work}."
+            )
+
+    return interrupted_by_shutdown
+
+
+def refuse_unaccounted_resume(factory: RecorderFactory, coordination_token: CoordinationToken) -> None:
+    """Refuse a resume with an undecided token no scheduler work covers (the one resume coverage check).
+
+    ``verify_resume_coverage`` records the refusal as a value-free
+    ``resume_refused`` coordination event under this leader's seat before this
+    raises; the resume failure ceremony then stamps the run FAILED. Nothing is
+    re-driven, so the run stays resumable-but-refusing (lane ruling M2).
+
+    Raises:
+        AuditIntegrityError: A token is neither decided nor covered by
+            scheduler work.
+    """
+    refusal = factory.scheduler.leases.verify_resume_coverage(coordination_token=coordination_token)
+    if refusal is None:
+        return
+    raise AuditIntegrityError(
+        f"Resume of run {coordination_token.run_id!r} refused: {refusal.token_count} token(s) have no completed "
+        "outcome, no durable scheduler work item and no open producing item; resume re-drives only scheduler work "
+        "and never re-derives a "
+        f"row, so it cannot account for them. First token id(s): {', '.join(refusal.first_token_ids)}. "
+        "Recorded as a resume_refused coordination event; nothing was re-driven."
+    )
+
+
+def _resume_failure_result_from_baseline(
+    run_id: str,
+    *,
+    baseline: ExecutionCounters | None,
+    partial_result: RunResult,
+) -> RunResult:
+    """Build FAILED ceremony counters from pre-resume audit + resume-local partials."""
+    if baseline is None:
+        return partial_result
+
+    counters = ExecutionCounters(
+        rows_processed=baseline.rows_processed + partial_result.rows_processed,
+        rows_succeeded=baseline.rows_succeeded + partial_result.rows_succeeded,
+        rows_failed=baseline.rows_failed + partial_result.rows_failed,
+        rows_routed_success=baseline.rows_routed_success + partial_result.rows_routed_success,
+        rows_routed_failure=baseline.rows_routed_failure + partial_result.rows_routed_failure,
+        rows_quarantined=baseline.rows_quarantined + partial_result.rows_quarantined,
+        rows_forked=baseline.rows_forked + partial_result.rows_forked,
+        rows_coalesced=baseline.rows_coalesced + partial_result.rows_coalesced,
+        rows_coalesce_failed=baseline.rows_coalesce_failed + partial_result.rows_coalesce_failed,
+        collector_groups_failed=baseline.collector_groups_failed + partial_result.collector_groups_failed,
+        rows_expanded=baseline.rows_expanded + partial_result.rows_expanded,
+        rows_buffered=baseline.rows_buffered + partial_result.rows_buffered,
+        rows_diverted=baseline.rows_diverted + partial_result.rows_diverted,
+    )
+    counters.routed_destinations.update(baseline.routed_destinations)
+    counters.routed_destinations.update(partial_result.routed_destinations)
+    return counters.to_run_result(run_id, RunStatus.FAILED)
+
+
+def _derive_resume_failure_counter_baseline(factory: RecorderFactory, run_id: str) -> ExecutionCounters | None:
+    """Best-effort counter baseline for FAILED resume ceremony enrichment."""
+    try:
+        _terminal_status, counters = derive_resume_terminal_status_from_audit(factory, run_id)
+    except OperationalError:
+        # Transient DB contention while reading the audit-cumulative baseline:
+        # record the degradation, then degrade to resume-local partial counters
+        # (the caller treats None as partial-only). Corruption/invariant
+        # signals from the derive (AuditIntegrityError,
+        # OrchestrationInvariantError) must propagate — substituting partial
+        # counters for them would report a wrong-but-plausible FAILED result
+        # over an untrustworthy audit trail.
+        logger.warning(
+            "Resume failure-counter baseline read hit transient DB contention for run %r; "
+            "FAILED ceremony counters degrade to resume-local partials",
+            run_id,
+            exc_info=True,
+        )
+        return None
+    return counters
+
+
+@dataclass(frozen=True, slots=True)
+class _ResumeAuditSnapshot:
+    """READ-ONLY resume reconstruction results, assembled BEFORE the seat CAS.
+
+    ``reconstruct_resume_state`` used to interleave read-only reconstruction
+    (manifest drift, source-lifecycle completeness, per-source name/lifecycle
+    maps) with durable mutation (the leadership CAS and incomplete-batch
+    rewrite) in one method, so a reader could not tell read from write at the
+    boundary (elspeth-e4f1eb6038). This snapshot is the output of the read-only
+    stage: every field is derived from read-only audit/recovery queries and
+    NOTHING here has mutated durable state. The caller composes the durable
+    stages (``_acquire_resume_leadership``, ``_repair_resume_batches``, the
+    undecided-FAILED requeue) on top of it, in order.
+
+    Every field this snapshot carries is topology-stable — fixed at run start
+    and never mutated by row-level processing (the runtime-VAL manifest, the
+    per-source name/lifecycle maps) — so reading it before the seat CAS is
+    sound. The resume work itself (the run's non-terminal scheduler items) is
+    never read here: a competing resume leader mutates it, so it is read by the
+    processor under leadership exclusivity.
+    """
+
+    factory: RecorderFactory
+    recovery: RecoveryManager
+    run_id: str
+    worker_id: str
+    source_names_by_source: Mapping[NodeID, str]
+    source_lifecycle_by_source: Mapping[NodeID, str]
+
+    def __post_init__(self) -> None:
+        freeze_fields(
+            self,
+            "source_names_by_source",
+            "source_lifecycle_by_source",
+        )
+
+
+class ResumeCoordinator:
+    """Resume-path orchestration extracted from ``Orchestrator``.
+
+    Composes the module-level resume helpers (``setup_resume_context`` and
+    ``run_resume_processing_loop``) into the full resume flow: reconstruct
+    resume state from the audit trail, re-drive the run's durable scheduler
+    work, and finalize the run with audit-derived terminal status. The Orchestrator
+    delegates its public ``resume()`` here.
+    """
+
+    def __init__(
+        self,
+        *,
+        db: LandscapeDB,
+        events: EventBusProtocol,
+        ceremony: RunCeremony,
+        checkpoints: CheckpointCoordinator,
+        context_factory: RunContextFactory,
+        sink_flush: SinkFlushCoordinator,
+        span_factory: SpanFactory,
+        checkpoint_manager: CheckpointManager | None,
+    ) -> None:
+        self._db = db
+        self._events = events
+        self._ceremony = ceremony
+        self._checkpoints = checkpoints
+        self._context_factory = context_factory
+        self._sink_flush = sink_flush
+        self._span_factory = span_factory
+        self._checkpoint_manager = checkpoint_manager
+
+    def reconstruct_resume_state(
+        self,
+        resume_point: ResumePoint,
+        payload_store: PayloadStore,
+        *,
+        worker_id: str | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
+        on_resume_point_refreshed: Callable[[ResumePoint], None] | None = None,
+    ) -> ResumeState:
+        """Reconstruct state needed to process resumed rows.
+
+        Creates a fresh factory, validates resumability (read-only), then —
+        as the resume path's FIRST durable act (epoch 21, ADR-030 §B.4) —
+        executes the seat-acquisition CAS ``acquire_run_leadership``: one
+        BEGIN IMMEDIATE transaction carrying the seat takeover, the
+        FAILED/INTERRUPTED→RUNNING run-status flip, and the identity-eviction
+        of the deposed leader. A CAS loser is refused with
+        ``NonResumableRunError`` and ZERO mutation — this closes the
+        documented resume TOCTOU. Only after winning the seat does this
+        method rewrite incomplete batches. (Barrier state is NOT restored
+        here — that happens at processor construction, which rebuilds
+        executors from journal BLOCKED rows plus checkpoint scalars.)
+
+        Args:
+            resume_point: ResumePoint from RecoveryManager.get_resume_point()
+            payload_store: PayloadStore for retrieving row data
+            worker_id: §A.1 worker identity minted by ``resume()``;
+                self-minted when None (direct repository-level callers).
+
+        Returns:
+            ResumeState with all reconstruction results, including the
+            leader ``coordination_token`` minted by the takeover CAS.
+
+        Raises:
+            ValueError: If checkpoint_manager is not initialized.
+            OrchestrationInvariantError: If schema contract is missing from audit trail.
+            NonResumableRunError: If the resume checkpoint format is incompatible.
+            NonResumableRunError: If the seat CAS loses to a live leader.
+            AuditIntegrityError: If the run is terminally successful
+                (immutable-success durable backstop inside the CAS).
+        """
+        format_check = CheckpointCompatibilityValidator().validate_format_version(resume_point.checkpoint)
+        if not format_check.can_resume:
+            assert format_check.reason is not None
+            assert format_check.cause is not None
+            raise NonResumableRunError(resume_point.checkpoint.run_id, format_check.reason, cause=format_check.cause)
+
+        # Stage 1 — READ-ONLY reconstruction (no durable mutation).
+        snapshot = self._load_resume_audit_snapshot(resume_point, payload_store, worker_id=worker_id)
+
+        # Stage 2 — THE FIRST DURABLE ACT: the seat-acquisition CAS (epoch 21,
+        # ADR-030 §B.4 — TOCTOU closure). A CAS loser raises NonResumableRunError
+        # with zero mutation. See _acquire_resume_leadership.
+        reconstruction_start_time = time.perf_counter()
+        coordination_token = self._acquire_resume_leadership(snapshot)
+
+        if pre_effect_guard is not None:
+            try:
+                pre_effect_guard()
+            except BaseException:
+                snapshot.factory.run_coordination.release_seat(token=coordination_token)
+                raise
+
+        try:
+            # The previous leader may have advanced its checkpoint between
+            # our advisory read and the CAS. Refresh all source state under
+            # the winning authority, and restore scalars from that same point.
+            if self._checkpoint_manager is None:
+                raise OrchestrationInvariantError("CheckpointManager is required for resume")
+            latest = self._checkpoint_manager.get_latest_checkpoint(snapshot.run_id)
+            if latest is None:
+                raise NonResumableRunError(
+                    snapshot.run_id,
+                    "checkpoint disappeared before leadership acquisition",
+                    cause=ResumeRefusalCause.CHECKPOINT_MISSING,
+                )
+            if latest.checkpoint_id != resume_point.checkpoint.checkpoint_id:
+                format_check = CheckpointCompatibilityValidator().validate_format_version(latest)
+                if not format_check.can_resume:
+                    assert format_check.reason is not None
+                    assert format_check.cause is not None
+                    raise NonResumableRunError(snapshot.run_id, format_check.reason, cause=format_check.cause)
+                if latest.full_topology_hash != resume_point.checkpoint.full_topology_hash:
+                    raise NonResumableRunError(
+                        snapshot.run_id,
+                        "checkpoint topology changed before leadership acquisition",
+                        cause=ResumeRefusalCause.CHECKPOINT_TOPOLOGY_CHANGED,
+                    )
+                resume_point = ResumePoint(
+                    checkpoint=latest,
+                    sequence_number=latest.sequence_number,
+                    barrier_scalars=snapshot.recovery._restore_barrier_scalars(latest),
+                )
+            snapshot = self._load_resume_audit_snapshot(resume_point, payload_store, worker_id=snapshot.worker_id)
+            if on_resume_point_refreshed is not None:
+                on_resume_point_refreshed(resume_point)
+
+            # Stage 3 — only the seat winner may rewrite incomplete batches.
+            batch_id_remap, has_restored_barrier_work = self._repair_resume_batches(snapshot, coordination_token=coordination_token)
+            # Stage 3b — a claim that died on an exception mid-row left its item
+            # FAILED with no outcome. Return it to READY (a recorded
+            # resume_requeue_failed event) so the scheduler drain re-drives it
+            # at the collision-free claim base; decided FAILED items stay.
+            snapshot.factory.scheduler.leases.requeue_undecided_failed_work(coordination_token=coordination_token)
+
+            return ResumeState(
+                factory=snapshot.factory,
+                run_id=snapshot.run_id,
+                source_names_by_source=snapshot.source_names_by_source,
+                source_lifecycle_by_source=snapshot.source_lifecycle_by_source,
+                has_restored_barrier_work=has_restored_barrier_work,
+                batch_id_remap=batch_id_remap,
+                coordination_token=coordination_token,
+            )
+        except BaseException:
+            # resume() cannot own this cleanup: no ResumeState has returned to
+            # it yet. Direct reconstruction callers have the same obligation.
+            # No heartbeat or trace scope has started during reconstruction.
+            try:
+                with best_effort("Failure ceremony during resume reconstruction", run_id=snapshot.run_id):
+                    self._ceremony.emit_failed_ceremony(
+                        snapshot.run_id,
+                        snapshot.factory,
+                        reconstruction_start_time,
+                        coordination_token=coordination_token,
+                    )
+                    snapshot.factory.run_coordination.release_seat(token=coordination_token)
+            finally:
+                self._ceremony.safe_flush_telemetry()
+            raise
+
+    def _load_resume_audit_snapshot(
+        self, resume_point: ResumePoint, payload_store: PayloadStore, *, worker_id: str | None
+    ) -> _ResumeAuditSnapshot:
+        """READ-ONLY resume reconstruction (elspeth-e4f1eb6038 stage 1).
+
+        Create a fresh factory, verify resumability (runtime-VAL manifest drift
+        + source-lifecycle completeness), and reconstruct the per-source
+        name/lifecycle maps. Performs NO durable mutation — the seat CAS
+        (``_acquire_resume_leadership``) and batch repair
+        (``_repair_resume_batches``) run in the caller AFTER this returns. Incomplete-source refusal is
+        an operator-facing "start fresh" outcome (a leaderless run is then
+        finalized with ``elspeth abandon``, engine/orchestrator/abandon.py);
+        it must not strand the run as RUNNING or rewrite retry batches merely
+        because the operator probed resume.
+        """
+        run_id = resume_point.checkpoint.run_id
+        worker_id = worker_id or mint_worker_id(run_id)
+
+        # Create fresh factory (stateless, like run()); pass payload_store for
+        # external call payload persistence.
+        factory = RecorderFactory(self._db, payload_store=payload_store)
+
+        from elspeth.core.checkpoint import RecoveryManager
+
+        if self._checkpoint_manager is None:
+            raise OrchestrationInvariantError(
+                "CheckpointManager is required for resume - Orchestrator must be initialized with checkpoint_manager"
+            )
+        recovery = RecoveryManager(self._db, self._checkpoint_manager)
+
+        # Resume re-drives persisted scheduler payloads through NullSource rather
+        # than re-opening the original source plugin, so source-boundary evidence
+        # is inherited from the original run. That is only sound if the current
+        # declaration-contract and Tier-1 registries still exactly match the
+        # manifest captured at original run start.
+        recorded_runtime_val_manifest = factory.run_lifecycle.get_runtime_val_manifest(run_id)
+        current_runtime_val_manifest = canonical_json(build_runtime_val_manifest())
+        if current_runtime_val_manifest != recorded_runtime_val_manifest:
+            raise OrchestrationInvariantError(
+                f"Cannot resume run '{run_id}': runtime VAL manifest drift detected. "
+                "The current contract registry no longer matches the registry "
+                "captured in the original run header, so inherited source-boundary "
+                "evidence is no longer trustworthy. Resume requires identical "
+                "declaration-contract and Tier-1 registries."
+            )
+
+        # ADR-025 §3 Decision 5 (G6): schema contracts are plural-by-source and
+        # live exclusively in ``run_sources``. ``verify_contract_integrity``
+        # (called via ``can_resume`` → ``get_resume_point`` before this method
+        # runs) already raises ``EmptyResumeStateError`` when ``run_sources`` is
+        # empty, so by the time we land here every declared source has a contract
+        # record. We still assert the postcondition defensively against future
+        # call-path changes: an empty map at resume time is Tier-1 audit corruption.
+        # Source-lifecycle completeness runs through the SAME shared gate as
+        # the advisory can_resume() (elspeth-1f5b83cd28) so the two surfaces
+        # cannot drift; this enforcing arm turns the verdict into the
+        # operator-facing IncompleteSourceResumeError.
+        lifecycle_gate = check_source_lifecycle_resumable(self._db, run_id)
+        if not lifecycle_gate.lifecycle_by_source:
+            raise EmptyResumeStateError(run_id=run_id)
+        if lifecycle_gate.incomplete_sources:
+            raise IncompleteSourceResumeError(run_id, lifecycle_gate.incomplete_sources)
+
+        # Only topology-stable reconstruction (the name/lifecycle maps below)
+        # stays pre-CAS; the run's scheduler work is read under leadership.
+        source_records = factory.run_lifecycle.get_run_source_resume_records(run_id)
+        source_names_by_source: dict[NodeID, str] = {}
+        source_lifecycle_by_source: dict[NodeID, str] = {}
+        for raw_source_node_id, source_record in source_records.items():
+            source_node_id = NodeID(str(raw_source_node_id))
+            source_names_by_source[source_node_id] = str(source_record.source_name)
+            source_lifecycle_by_source[source_node_id] = str(source_record.lifecycle_state)
+
+        return _ResumeAuditSnapshot(
+            factory=factory,
+            recovery=recovery,
+            run_id=run_id,
+            worker_id=worker_id,
+            source_names_by_source=source_names_by_source,
+            source_lifecycle_by_source=source_lifecycle_by_source,
+        )
+
+    def _acquire_resume_leadership(self, snapshot: _ResumeAuditSnapshot) -> CoordinationToken:
+        """THE FIRST DURABLE ACT of resume (epoch 21, ADR-030 §B.4 — TOCTOU
+        closure): the seat-acquisition CAS. One BEGIN IMMEDIATE transaction =
+        seat takeover (leader_epoch+1) + the FAILED/INTERRUPTED→RUNNING
+        run-status flip (which subsumed the old update_run_status(RUNNING)
+        first-durable-write) + identity-eviction of the deposed leader +
+        leader_acquire/worker_register/worker_evict events. A CAS loser raises
+        NonResumableRunError with zero mutation; a terminally-successful run is
+        refused by the immutable-success durable backstop (AuditIntegrityError);
+        a held WAL write lock surfaces as the operator-actionable
+        WriteLockHeldError carrying structured registered-worker forensics.
+        """
+        return snapshot.factory.run_coordination.acquire_run_leadership(
+            run_id=snapshot.run_id,
+            worker_id=snapshot.worker_id,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            entry_point="resume",
+        )
+
+    def _repair_resume_batches(
+        self, snapshot: _ResumeAuditSnapshot, *, coordination_token: CoordinationToken
+    ) -> tuple[Mapping[str, str], bool]:
+        """Durable post-CAS repair — runs strictly AFTER
+        ``_acquire_resume_leadership`` (only the seat winner may rewrite retry
+        batches).
+
+        Rewrites incomplete batches — the returned old→retry batch_id mapping
+        feeds the processor's journal-based barrier restore (BUFFERED
+        token_outcomes still carry the dead original batch ids after a
+        flush-interrupting crash) — and reports whether the scheduler journal
+        carries BLOCKED barrier rows. (F1: barrier restore itself runs in
+        PROCESSOR CONSTRUCTION; a run whose remaining work all sits at barriers
+        must still run the processing path so the restored buffers flush, so the
+        resume quiescence gate consults this flag.)
+        """
+        batch_id_remap = handle_incomplete_batches(snapshot.factory.execution, coordination_token=coordination_token)
+        has_restored_barrier_work = snapshot.recovery.count_blocked_barrier_items(snapshot.run_id) > 0
+        return batch_id_remap, has_restored_barrier_work
+
+    def _finalize_successful_resume(
+        self,
+        *,
+        factory: RecorderFactory,
+        run_id: str,
+        graph: ExecutionGraph,
+        coordination_token: CoordinationToken,
+        heartbeat: RunHeartbeatThread,
+        duration_seconds: float,
+    ) -> RunResult:
+        """Complete the shared successful-resume ceremony."""
+        # Durable post-condition, same as the fresh-run path
+        # (elspeth-76e936568e): no bound group converged unsettled. Raises
+        # before the terminal status is derived, so it takes the resume
+        # failure ceremony like sweep_deferred_invariants_or_crash.
+        assert_bound_groups_settled_from_audit(self._db, run_id, graph)
+        terminal_status, audit_counters = derive_resume_terminal_status_from_audit(factory, run_id)
+        factory.run_lifecycle.finalize_run(terminal_status, coordination_token=coordination_token)
+        result = audit_counters.to_run_result(run_id, terminal_status)
+
+        # Delete checkpoints on successful completion. LEADER WORK: the
+        # delete is epoch-fenced (ADR-030 §C.4 row 5) and must run BEFORE
+        # the seat release vacates the fence's CAS target.
+        self._checkpoints.delete_checkpoints(coordination_token=coordination_token)
+
+        # ADR-030 §A.3: stop the heartbeat thread BEFORE releasing the
+        # seat — the thread must not beat the seat after it is vacated.
+        heartbeat.stop()
+
+        # Seat hygiene (ADR-030 §D): release the seat AFTER the terminal
+        # finalize succeeded. Best-effort.
+        with best_effort("Seat release after resume finalize", run_id=run_id):
+            factory.run_coordination.release_seat(token=coordination_token)
+
+        heartbeat.raise_fatal_failure()
+
+        self._ceremony.emit_run_finished(
+            run_id=run_id,
+            status=terminal_status,
+            row_count=result.rows_processed,
+            duration_seconds=duration_seconds,
+        )
+
+        cli_status, exit_code = cli_completion_for(terminal_status)
+        self._ceremony.emit_run_summary(
+            run_id=run_id,
+            status=cli_status,
+            rows_processed=result.rows_processed,
+            rows_succeeded=result.rows_succeeded,
+            rows_failed=result.rows_failed,
+            rows_quarantined=result.rows_quarantined,
+            duration_seconds=duration_seconds,
+            exit_code=exit_code,
+            rows_routed_success=result.rows_routed_success,
+            rows_routed_failure=result.rows_routed_failure,
+            routed_destinations=result.routed_destinations,
+            collector_groups_failed=result.collector_groups_failed,
+        )
+
+        return result
+
+    def resume(
+        self,
+        resume_point: ResumePoint,
+        config: PipelineConfig,
+        graph: ExecutionGraph,
+        *,
+        payload_store: PayloadStore,
+        settings: ElspethSettings | None = None,
+        shutdown_event: threading.Event | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
+        check_coordination_latch: Callable[[], None] | None = None,
+    ) -> RunResult:
+        """Resume a failed run from a checkpoint.
+
+        STATELESS: Like run(), creates fresh factory and processor internally.
+        This mirrors the reality that recovery happens in a new process.
+
+        Args:
+            resume_point: ResumePoint from RecoveryManager.get_resume_point()
+            config: Same PipelineConfig used for original run()
+            graph: Same ExecutionGraph used for original run()
+            payload_store: PayloadStore for retrieving row data (required)
+            settings: Full settings (optional, for retry config etc.)
+
+        Returns:
+            RunResult with recovery outcome
+
+        Raises:
+            ValueError: If payload_store is not provided
+        """
+        if payload_store is None:
+            raise OrchestrationInvariantError("payload_store is required for resume - row data must be retrieved from stored payloads")
+
+        # ---- resume() entry guard (elspeth-2f23292372, operator option b) ----
+        # resume() historically trusted callers to honor the ADVISORY
+        # RecoveryManager.can_resume() and never re-checked run status itself,
+        # so a competing resume against a RUNNING run was ADMITTED. Re-check
+        # here via the SAME shared implementation can_resume() uses, BEFORE
+        # the first mutation. The RUNNING arm's live-seat precision (§B.3:
+        # naming the incumbent + `elspeth join` direction) lives INSIDE
+        # check_run_status_resumable so the advisory and enforcing surfaces
+        # never drift.
+        #
+        # Terminal-run arm (epoch 21, ADR-030 §H test #1 flip): the
+        # immutable-success family (COMPLETED / COMPLETED_WITH_FAILURES /
+        # EMPTY) is now refused HERE, at the entry guard, with a "Run is
+        # terminal" NonResumableRunError — the designed loser-after-winner
+        # contract. The durable immutability guards stay BENEATH as the
+        # backstop (the immutable-success arm inside the
+        # acquire_run_leadership takeover CAS, and update_run_status /
+        # complete_run's conditional UPDATEs — independently pinned in
+        # tests/unit/core/landscape/), so a caller that skips this guard
+        # still cannot mutate a successful terminal run.
+        #
+        # The old TOCTOU residual (two resumes both observing FAILED here) is
+        # CLOSED at epoch 21: the first durable act of resume() is the
+        # seat-acquisition CAS in reconstruct_resume_state — exactly one of
+        # two racing resumes commits it; the loser is refused with zero
+        # mutation. Check-then-act at THIS guard is therefore acceptable —
+        # the leadership CAS is the arbiter (design §B.3).
+        guarded_run_id = resume_point.checkpoint.run_id
+        run_status, status_check = check_run_status_resumable(self._db, guarded_run_id)
+        if not status_check.can_resume:
+            assert status_check.reason is not None and status_check.cause is not None
+            if run_status is not None and run_status in _IMMUTABLE_SUCCESS_RUN_STATUSES:
+                refusal_reason = f"Run is terminal (status {run_status.value!r}); successful terminal runs are immutable"
+            else:
+                refusal_reason = status_check.reason
+            raise NonResumableRunError(guarded_run_id, refusal_reason, cause=status_check.cause)
+
+        # ---- resume() entry guard, part 2: checkpoint currency + topology ----
+        # (elspeth-5129406607) RecoveryManager.get_resume_point() is ADVISORY
+        # like can_resume() — a caller may hand-build a ResumePoint — so
+        # re-verify at the enforcing boundary that (a) the supplied checkpoint
+        # is the run's LATEST resume baseline (resuming a superseded one would
+        # replay work the run has already progressed past) and (b) the stored
+        # latest checkpoint's recorded topology matches the graph this resume
+        # runs under (one run_id = one configuration). The topology check must
+        # use the database-loaded latest checkpoint, not caller-supplied
+        # checkpoint fields from a hand-built ResumePoint. Both are READ-ONLY
+        # refusals fired before the first mutation (prepare_for_run /
+        # rebase_sequence / the seat CAS in reconstruct_resume_state),
+        # mirroring the status guard above. Format incompatibility is refused
+        # by the validator below; corrupt persisted checkpoint data propagates.
+        if self._checkpoint_manager is None:
+            raise OrchestrationInvariantError(
+                "CheckpointManager is required for resume - Orchestrator must be initialized with checkpoint_manager"
+            )
+        latest_checkpoint = self._checkpoint_manager.get_latest_checkpoint(guarded_run_id)
+        if latest_checkpoint is None:
+            raise NonResumableRunError(
+                guarded_run_id,
+                "run has no checkpoint rows; the supplied resume point cannot be validated as the run's resume baseline",
+                cause=ResumeRefusalCause.CHECKPOINT_MISSING,
+            )
+        if (
+            latest_checkpoint.checkpoint_id != resume_point.checkpoint.checkpoint_id
+            or latest_checkpoint.sequence_number != resume_point.sequence_number
+        ):
+            raise NonResumableRunError(
+                guarded_run_id,
+                f"supplied checkpoint '{resume_point.checkpoint.checkpoint_id}' (sequence {resume_point.sequence_number}) "
+                f"is not the run's latest resume point '{latest_checkpoint.checkpoint_id}' "
+                f"(sequence {latest_checkpoint.sequence_number})",
+                cause=ResumeRefusalCause.CHECKPOINT_NOT_LATEST,
+            )
+        topology_check = CheckpointCompatibilityValidator().validate(latest_checkpoint, graph)
+        if not topology_check.can_resume:
+            assert topology_check.reason is not None and topology_check.cause is not None
+            raise NonResumableRunError(
+                guarded_run_id,
+                topology_check.reason,
+                cause=topology_check.cause,
+            )
+
+        implementation_check = check_implementation_compatibility(
+            RecorderFactory(self._db, payload_store=payload_store), guarded_run_id, config, graph
+        )
+        if not implementation_check.can_resume:
+            assert implementation_check.reason is not None
+            assert implementation_check.cause is not None
+            raise NonResumableRunError(guarded_run_id, implementation_check.reason, cause=implementation_check.cause)
+
+        effect_check = check_http_effects_resumable(graph)
+        if not effect_check.can_resume:
+            assert effect_check.reason is not None and effect_check.cause is not None
+            raise NonResumableRunError(guarded_run_id, effect_check.reason, cause=effect_check.cause)
+
+        # ---- resume() entry guard, part 3: group satisfiability (spec §8) ----
+        # SAME shared implementation as the advisory can_resume() — the
+        # check_source_lifecycle_resumable two-surface precedent
+        # (elspeth-1f5b83cd28). READ-ONLY refusal before the first mutation
+        # (prepare_for_run / rebase_sequence / the seat CAS): a bound-group
+        # member that is terminal without settlement can never settle, so the
+        # resumed run would wedge at its closer forever (ADR-042 D4).
+        group_gate = check_group_satisfiability_resumable(self._db, guarded_run_id, group_binding_view_from_graph(graph))
+        if not group_gate.check.can_resume:
+            raise GroupUnsatisfiableResumeError(guarded_run_id, group_gate.unsatisfiable_members)
+
+        # ADR-010 §Decision 3: freeze both registries at bootstrap, mirroring
+        # run(). Recovery happens in a new process — the module import chain
+        # registers PassThroughDeclarationContract, but without this call the
+        # registries are never frozen, leaving a window where
+        # register_declaration_contract() could succeed post-bootstrap on the
+        # resume path.
+        prepare_for_run()
+
+        self._checkpoints.rebase_sequence(resume_point.sequence_number)
+        # §A.1: mint this process's single-use worker identity; the takeover
+        # CAS inside reconstruct_resume_state registers it as the new leader
+        # and returns the fencing token on ResumeState.
+        resume_worker_id = mint_worker_id(resume_point.checkpoint.run_id)
+
+        def accept_current_resume_point(current: ResumePoint) -> None:
+            nonlocal resume_point
+            resume_point = current
+            self._checkpoints.rebase_sequence(current.sequence_number)
+
+        state = self.reconstruct_resume_state(
+            resume_point,
+            payload_store,
+            worker_id=resume_worker_id,
+            pre_effect_guard=pre_effect_guard,
+            on_resume_point_refreshed=accept_current_resume_point,
+        )
+        run_id = state.run_id
+        factory = state.factory
+        coordination_token = state.coordination_token
+        # acquire_run_leadership always returns a token (or raises), so
+        # coordination_token is never None at this point.  Assert here to
+        # narrow the type for the heartbeat thread constructor (which requires
+        # a non-optional CoordinationToken) and to surface bugs early.
+        if coordination_token is None:
+            raise OrchestrationInvariantError(
+                f"Resume for run '{state.run_id}': coordination_token is None after "
+                "reconstruct_resume_state — acquire_run_leadership must always return "
+                "a token or raise; a None result is an orchestration invariant violation."
+            )
+        resume_start_time = time.perf_counter()
+        _heartbeat: RunHeartbeatThread | None = None
+        resume_failure_counter_baseline: ExecutionCounters | None = None
+        trace_stack = ExitStack()
+        caller_authority = CallerAuthorityGuard(check_coordination_latch)
+
+        try:
+            # Startup belongs to the cleanup boundary too: construction or
+            # Thread.start() can fail after the resume has acquired its seat.
+            _heartbeat = RunHeartbeatThread(factory.run_coordination, member_token=coordination_token.membership)
+            _heartbeat.start()
+
+            def check_combined_coordination_latch() -> None:
+                assert _heartbeat is not None
+                _heartbeat.check_and_raise()
+                caller_authority.check()
+
+            check_combined_coordination_latch()
+            # The token reaches each fenced collaborator by value (ADR-048 §3).
+            resume_checkpoint_id = resume_point.checkpoint.checkpoint_id
+            shutdown_ctx = nullcontext(shutdown_event) if shutdown_event is not None else shutdown_handler_context()
+
+            durable_run = factory.run_lifecycle.get_run(run_id)
+            if durable_run is None:
+                raise AuditIntegrityError(f"Cannot resume run {run_id!r}: durable run record is missing")
+            trace_stack.enter_context(self._span_factory.trace_scope(run_id, durable_run.started_at))
+            incomplete_sources = {
+                state.source_names_by_source[source_node_id]: lifecycle_state
+                for source_node_id, lifecycle_state in state.source_lifecycle_by_source.items()
+                if lifecycle_state not in SOURCE_COMPLETE_LIFECYCLE_STATES
+            }
+            if incomplete_sources:
+                raise IncompleteSourceResumeError(run_id, incomplete_sources)
+
+            snapshot_rows, next_ingest_sequence = pending_source_snapshot_rows(
+                factory,
+                payload_store,
+                self._db,
+                run_id,
+                config,
+                graph,
+            )
+
+            if state.has_restored_barrier_work:
+                resume_failure_counter_baseline = _derive_resume_failure_counter_baseline(factory, run_id)
+
+            # F1 QUIESCENCE GATE: the resume's work is the run's durable
+            # scheduler work — journal BLOCKED barrier rows (RESTORED into
+            # executor buffers at processor construction), READY/LEASED items,
+            # and PENDING_SINK items (which the processor must reclaim to
+            # reconcile the durable sink effect even when every leaf already
+            # has a terminal outcome). Early-completing while any of it exists
+            # would finalize the run and delete checkpoints WITHOUT
+            # constructing the recovery processor. The no-work arm therefore
+            # requires restored barrier work, the complete scheduler journal,
+            # and any leader-pending zero-member collector groups to be
+            # quiescent. Those groups have no child journal rows to inspect.
+            # Only consult the journal when restored barriers are absent: once
+            # they are present the processing path is already mandatory, so an
+            # additional database query cannot change the branch decision.
+            has_active_scheduler_work = not state.has_restored_barrier_work and factory.scheduler.count_active_work(run_id=run_id) > 0
+            pending_empty_collector_groups: tuple[tuple[str, str], ...] = ()
+            if not state.has_restored_barrier_work and not has_active_scheduler_work:
+                require_all_opener_node_ids = tuple(
+                    str(node_id)
+                    for node_id, binding in graph.get_group_bindings().by_opener_node().items()
+                    if binding.closer_kind is CloserKind.COLLECTOR and binding.policy == "require_all"
+                )
+                pending_empty_collector_groups = factory.barrier_restore.pending_empty_expansion_groups(
+                    run_id=run_id,
+                    opener_node_ids=require_all_opener_node_ids,
+                )
+            if has_active_scheduler_work or pending_empty_collector_groups or snapshot_rows:
+                resume_failure_counter_baseline = _derive_resume_failure_counter_baseline(factory, run_id)
+            if (
+                not state.has_restored_barrier_work
+                and not has_active_scheduler_work
+                and not pending_empty_collector_groups
+                and not snapshot_rows
+            ):
+                check_combined_coordination_latch()
+                # No work and no restored barrier holds: nothing remains for a
+                # journal restore to mint, so the coverage check is complete here.
+                refuse_unaccounted_resume(factory, coordination_token)
+                factory.data_flow.sweep_deferred_invariants_or_crash(run_id)
+
+                # No scheduler work remains - complete the run.
+                #
+                # Phase 2.2 (elspeth-0de989c56d): the resume's local counters
+                # are 0 here because nothing was reprocessed, but the audit DB
+                # carries the truth.  Aggregate token_outcomes to derive the
+                # correct four-value terminal status and feed it to both the
+                # Landscape finalize and the local RunResult.
+                return self._finalize_successful_resume(
+                    factory=factory,
+                    run_id=run_id,
+                    graph=graph,
+                    coordination_token=coordination_token,
+                    heartbeat=_heartbeat,
+                    duration_seconds=0.0,
+                )
+
+            with shutdown_ctx as active_event:
+                check_combined_coordination_latch()
+                # F1: bundle the journal-restore inputs (checkpoint scalars +
+                # batch remap) for the processor's construction-time restore
+                # sweep (BarrierRecoveryCoordinator.restore_from_journal).
+                barrier_restore = BarrierJournalRestoreContext(
+                    resume_checkpoint_id=resume_checkpoint_id,
+                    barrier_scalars=resume_point.barrier_scalars,
+                    batch_id_remap=state.batch_id_remap,
+                )
+                # Return value (the loop's resume-local counters) is deliberately
+                # unused: finalization derives everything from the audit trail
+                # below (single bookkeeper, elspeth-7294de558e).
+                self.process_resumed_rows(
+                    factory=factory,
+                    run_id=run_id,
+                    config=config,
+                    graph=graph,
+                    barrier_restore=barrier_restore,
+                    settings=settings,
+                    payload_store=payload_store,
+                    shutdown_event=active_event,
+                    coordination_token=coordination_token,
+                    check_coordination_latch=check_combined_coordination_latch,
+                    source_snapshot_rows=snapshot_rows,
+                    next_ingest_sequence=next_ingest_sequence,
+                )
+
+            check_combined_coordination_latch()
+            # 6. Complete the run with reproducibility grade
+            # SUCCESS PATH: Must be inside try block so RunFinished is emitted
+            # BEFORE the finally block flushes telemetry to exporters.
+            # Fix: elspeth-rapid-sg0q — previously this was after the finally block,
+            # meaning RunFinished was emitted after telemetry flush (never exported).
+            #
+            # F2 (resume-fork-reemit) — UNIFY both resume branches on the audit
+            # trail.  This processing branch previously derived its
+            # terminal status + counters from the resume loop's *local* counters
+            # (only what THIS resume call reprocessed), so a resumed run's
+            # RunResult disagreed field-for-field with an uninterrupted run
+            # (e.g. a resumed 1-row 2-branch fork reported rows_succeeded=1,
+            # rows_forked=0 instead of the cumulative 2, 1) — while the
+            # no-work branch already reconstructed cumulative
+            # counters from token_outcomes.  Both branches now finalize from the
+            # SAME audit-derived cumulative (status, counters).
+            #
+            # ORDERING: this runs AFTER _process_resumed_rows returned, i.e.
+            # after run_resume_processing_loop's end-of-source aggregation /
+            # coalesce flushes, after flush_and_write_sinks recorded sink
+            # diversions, and after sweep_deferred_invariants_or_crash — so every
+            # outcome this resume wrote is committed and visible to the derive
+            # query.  Deriving before those flushes commit would undercount.
+            #
+            # SINGLE BOOKKEEPER (elspeth-7294de558e): every counter field —
+            # including rows_coalesce_failed — is now derived from the durable
+            # audit trail. rows_coalesce_failed historically had no audit arm
+            # (the coalesce-operation roll-up went to telemetry only) and was
+            # GRAFTED here from the resume loop's live `result` counter, which
+            # only saw failures during THIS resume's re-drive and forgot run-1
+            # failures consumed before the interrupt. derive() now reconstructs
+            # it cumulatively from the FAILED node_states _fail_pending writes
+            # at the run's coalesce nodes (one barrier == one DISTINCT
+            # (node, row) pair; see QueryRepository.count_failed_coalesce_
+            # barrier_rows), so the audit-derived value IS the final value and
+            # the terminal status is already a pure function of the final
+            # counters — same construction as the uninterrupted path. Parity
+            # pin: test_adr_019_resume_counter_parity.py::
+            # test_resume_derives_rows_coalesce_failed_from_durable_audit
+            # (resumed run_B == uninterrupted oracle run_A).
+            return self._finalize_successful_resume(
+                factory=factory,
+                run_id=run_id,
+                graph=graph,
+                coordination_token=coordination_token,
+                heartbeat=_heartbeat,
+                duration_seconds=time.perf_counter() - resume_start_time,
+            )
+        except GracefulShutdownError as shutdown_exc:
+            # ADR-030 §A.3: stop the heartbeat thread before the seat is released.
+            if _heartbeat is not None:
+                _heartbeat.stop()
+            caller_authority.release_on_loss(lambda: factory.run_coordination.release_seat(token=coordination_token))
+            with best_effort("Interrupted ceremony on resume graceful shutdown", run_id=run_id):
+                self._ceremony.emit_interrupted_ceremony(
+                    run_id, factory, shutdown_exc, resume_start_time, coordination_token=coordination_token
+                )
+                # Seat hygiene: only AFTER the INTERRUPTED finalize succeeded
+                # (same best_effort block); without this a failed resume's
+                # seat wedges retries for the liveness window.
+                if coordination_token is not None:
+                    factory.run_coordination.release_seat(token=coordination_token)
+            raise  # Propagate to CLI
+        except _RunFailedWithPartialResultError as failed_exc:
+            # ADR-030 §A.3: stop the heartbeat thread before the seat is released.
+            if _heartbeat is not None:
+                _heartbeat.stop()
+            caller_authority.release_on_loss(lambda: factory.run_coordination.release_seat(token=coordination_token))
+            failed_result = _resume_failure_result_from_baseline(
+                run_id,
+                baseline=resume_failure_counter_baseline,
+                partial_result=failed_exc.partial_result,
+            )
+            with best_effort("Partial-result failure ceremony on resume", run_id=run_id):
+                self._ceremony.emit_failed_ceremony(
+                    run_id,
+                    factory,
+                    resume_start_time,
+                    failed_result,
+                    coordination_token=coordination_token,
+                )
+                # Seat hygiene: after the FAILED finalize succeeded.
+                if coordination_token is not None:
+                    factory.run_coordination.release_seat(token=coordination_token)
+            raise failed_exc.original_error.with_traceback(failed_exc.original_traceback) from None
+        except BaseException:
+            # Finalize as FAILED to prevent the run from being stuck in RUNNING
+            # permanently (which blocks future resume attempts). The outer broad-except
+            # is justified — any unhandled exception during resume needs ceremony.
+            # ADR-030 §A.3: stop the heartbeat thread before the seat is released.
+            if _heartbeat is not None:
+                _heartbeat.stop()
+            caller_authority.release_on_loss(lambda: factory.run_coordination.release_seat(token=coordination_token))
+            with best_effort("Generic failure ceremony on resume", run_id=run_id):
+                self._ceremony.emit_failed_ceremony(run_id, factory, resume_start_time, coordination_token=coordination_token)
+                # Seat hygiene: after the FAILED finalize succeeded.
+                if coordination_token is not None:
+                    factory.run_coordination.release_seat(token=coordination_token)
+            raise
+        finally:
+            # ADR-030 §A.3: safety-net stop (idempotent) — covers any exit
+            # path that did not already stop the thread (e.g. an exception
+            # raised before any except handler ran release_seat).
+            try:
+                if _heartbeat is not None:
+                    _heartbeat.stop()
+            finally:
+                try:
+                    self._ceremony.safe_flush_telemetry()
+                finally:
+                    try:
+                        trace_stack.close()
+                    finally:
+                        if _heartbeat is not None:
+                            _heartbeat.raise_fatal_failure()
+
+    def process_resumed_rows(
+        self,
+        factory: RecorderFactory,
+        run_id: str,
+        config: PipelineConfig,
+        graph: ExecutionGraph,
+        barrier_restore: BarrierJournalRestoreContext | None,
+        settings: ElspethSettings | None = None,
+        *,
+        payload_store: PayloadStore,
+        shutdown_event: threading.Event | None = None,
+        coordination_token: CoordinationToken,
+        check_coordination_latch: Callable[[], None] | None = None,
+        source_snapshot_rows: tuple[tuple[str, NodeID, int, SourceRow], ...] = (),
+        next_ingest_sequence: int = 0,
+    ) -> RunResult:
+        """Re-drive a resumed run's durable scheduler work and restored barriers.
+
+        ``coordination_token`` is the seat the resume takeover CAS returned;
+        it reaches every checkpoint write as a parameter, by value
+        (ADR-048 §3) — resume is leader-only, so there is no tokenless arm.
+
+        Mirrors _execute_run() structure but with resume-specific divergences
+        documented in the accounting block below. Returns RunStatus.RUNNING —
+        the public resume() wrapper transitions to COMPLETED after finalize_run().
+        """
+        # ─────────────────────────────────────────────────────────────────
+        # Divergence accounting: _process_resumed_rows vs _execute_run
+        #
+        # Source on_start():       Skipped (include_source_on_start=False)
+        # Graph registration:     Loads from DB (setup_resume_context)
+        # Row intake:             None — no source row is re-derived; every
+        #                         ingested row (valid or quarantined) is
+        #                         already durable scheduler work
+        # Field resolution:       Skipped (loaded from DB in original run)
+        # Schema contract:        Skipped (each work item's payload carries its own)
+        # operation_id lifecycle: Not applicable (no source track_operation)
+        # Progress emission:      None (known gap — T24 follow-up)
+        # Checkpointing:          Same post-sink + shutdown semantics as run()
+        # ─────────────────────────────────────────────────────────────────
+
+        self._checkpoints.set_active_graph(graph)
+        try:
+            # 1. Setup (loads graph artifacts from original run's DB records)
+            artifacts = setup_resume_context(factory, run_id, config, graph)
+
+            # 2. Initialize context + processor (source on_start skipped)
+            run_ctx = self._context_factory.initialize_run_context(
+                factory,
+                run_id,
+                config,
+                graph,
+                settings,
+                artifacts,
+                payload_store,
+                include_source_on_start=False,
+                barrier_restore=barrier_restore,
+                shutdown_event=shutdown_event,
+                coordination_token=coordination_token,
+            )
+
+            preflight_retry_manager = RetryManager(RuntimeRetryConfig.from_settings(settings.retry)) if settings is not None else None
+            try:
+                # The processor is built and the barrier journal restored (which
+                # mints the work of committed coalesce/aggregation residuals):
+                # every token must now be decided or covered before anything is
+                # re-driven or written to a sink.
+                refuse_unaccounted_resume(factory, coordination_token)
+                run_transform_runtime_preflights(
+                    factory,
+                    run_id,
+                    config,
+                    run_ctx.ctx,
+                    retry_manager=preflight_retry_manager,
+                    shutdown_event=shutdown_event,
+                )
+            except BaseException as pending_exc:
+                cleanup_plugins(config, run_ctx.ctx, include_source=False, pending_exc=pending_exc)
+                raise
+
+            loop_ctx = LoopContext(
+                counters=ExecutionCounters(),
+                pending_tokens={name: [] for name in config.sinks},
+                processor=run_ctx.processor,
+                ctx=run_ctx.ctx,
+                config=config,
+                agg_transform_lookup=run_ctx.agg_transform_lookup,
+                coalesce_executor=run_ctx.coalesce_executor,
+                coalesce_node_map=run_ctx.coalesce_node_map,
+            )
+
+            cleanup_pending_exc: BaseException | None = None
+            try:
+                # 3. Process loop (resume path)
+                if source_snapshot_rows:
+                    # Existing scheduler/barrier work, including expired
+                    # downtime deadlines, settles before any new source row
+                    # may supply a missing member. EOF waits for the suffix.
+                    run_resume_processing_loop(
+                        loop_ctx,
+                        shutdown_event=shutdown_event,
+                        flush_end_of_input=False,
+                    )
+                quarantine_router = QuarantineRouter(ceremony=self._ceremony)
+                for source_name, source_id, row_index, source_row in source_snapshot_rows:
+                    if shutdown_event is not None and shutdown_event.is_set():
+                        break
+                    if check_coordination_latch is not None:
+                        check_coordination_latch()
+                    active_source = config.sources[source_name]
+                    run_ctx.ctx.node_id = source_id
+                    run_ctx.ctx.operation_id = None
+                    if source_row.source_row_index is None:
+                        raise AuditIntegrityError("Admitted source snapshot row has no source identity")
+                    if source_row.is_quarantined:
+                        result = quarantine_router.route(
+                            run_id,
+                            source_id,
+                            source_row,
+                            row_index,
+                            source_row.source_row_index,
+                            next_ingest_sequence,
+                            artifacts.edge_map,
+                            loop_ctx,
+                            active_source=active_source,
+                        )
+                        results = [result]
+                    else:
+                        timeout_result = check_aggregation_timeouts(
+                            config=config,
+                            processor=run_ctx.processor,
+                            ctx=run_ctx.ctx,
+                            pending_tokens=loop_ctx.pending_tokens,
+                            agg_transform_lookup=dict(run_ctx.agg_transform_lookup),
+                        )
+                        loop_ctx.counters.accumulate_flush_result(timeout_result)
+                        results = run_ctx.processor.process_row(
+                            row_index=row_index,
+                            source_row=source_row,
+                            transforms=config.transforms,
+                            ctx=run_ctx.ctx,
+                            source_node_id=source_id,
+                            source_plugin=active_source,
+                            source_on_success=active_source.on_success,
+                            source_row_index=source_row.source_row_index,
+                            ingest_sequence=next_ingest_sequence,
+                        )
+                    next_ingest_sequence += 1
+                    loop_ctx.counters.rows_processed += 1
+                    accumulate_row_outcomes(results, loop_ctx.counters, loop_ctx.pending_tokens)
+                    if source_row.is_quarantined:
+                        timeout_result = check_aggregation_timeouts(
+                            config=config,
+                            processor=run_ctx.processor,
+                            ctx=run_ctx.ctx,
+                            pending_tokens=loop_ctx.pending_tokens,
+                            agg_transform_lookup=dict(run_ctx.agg_transform_lookup),
+                        )
+                        loop_ctx.counters.accumulate_flush_result(timeout_result)
+                    if run_ctx.coalesce_executor is not None:
+                        handle_coalesce_timeouts(
+                            coalesce_executor=run_ctx.coalesce_executor,
+                            coalesce_node_map=dict(run_ctx.coalesce_node_map),
+                            processor=run_ctx.processor,
+                            ctx=run_ctx.ctx,
+                            counters=loop_ctx.counters,
+                            pending_tokens=loop_ctx.pending_tokens,
+                        )
+                    if run_ctx.processor.row_union_executor is not None:
+                        handle_row_union_timeouts(
+                            row_union_executor=run_ctx.processor.row_union_executor,
+                            processor=run_ctx.processor,
+                            ctx=run_ctx.ctx,
+                            counters=loop_ctx.counters,
+                        )
+                interrupted = run_resume_processing_loop(
+                    loop_ctx,
+                    shutdown_event=shutdown_event,
+                    source_snapshot_rows_processed=bool(source_snapshot_rows),
+                )
+
+                # 4. Flush + write sinks with checkpoint advancement
+                self._sink_flush.flush_and_write_sinks(
+                    factory,
+                    run_id,
+                    loop_ctx,
+                    artifacts.sink_id_map,
+                    artifacts.edge_map,
+                    interrupted,
+                    on_token_written_factory=self._checkpoints.make_checkpoint_after_sink_factory(
+                        run_ctx.processor, coordination_token=coordination_token
+                    ),
+                    scheduler_terminalizer=run_ctx.processor,
+                    check_coordination_latch=check_coordination_latch,
+                    coordination_token=coordination_token,
+                )
+
+                if not interrupted and loop_ctx.ctx.run_mode is not RunMode.LIVE:
+                    source_run_id = loop_ctx.ctx.replay_from
+                    if source_run_id is None:
+                        raise OrchestrationInvariantError("replay sink verification requires a source run")
+                    verify_virtual_sink_members(factory, source_run_id=source_run_id, current_run_id=run_id, mode=loop_ctx.ctx.run_mode)
+                    if loop_ctx.ctx.call_mode_session is None:
+                        raise OrchestrationInvariantError("replay/verify call session is missing at run completion")
+                    loop_ctx.ctx.call_mode_session.assert_complete()
+
+                # ADR-019 Phase 4: resumed row processing reaches stable I1a/I1b
+                # postconditions only after resume sink writes finish.
+                factory.data_flow.sweep_deferred_invariants_or_crash(run_id)
+            except GracefulShutdownError as exc:
+                cleanup_pending_exc = exc
+                raise
+            except Exception as exc:
+                outgoing_exc = _RunFailedWithPartialResultError(
+                    original_error=exc,
+                    partial_result=loop_ctx.counters.to_run_result(run_id, status=RunStatus.FAILED),
+                )
+                cleanup_pending_exc = outgoing_exc
+                raise outgoing_exc from exc
+            except BaseException as exc:
+                cleanup_pending_exc = exc
+                raise
+
+            finally:
+                cleanup_plugins(config, run_ctx.ctx, include_source=False, pending_exc=cleanup_pending_exc)
+
+            return loop_ctx.counters.to_run_result(run_id, status=RunStatus.RUNNING)
+        finally:
+            self._checkpoints.set_active_graph(None)
+
+
+def handle_incomplete_batches(
+    execution: ExecutionRepository,
+    *,
+    coordination_token: CoordinationToken,
+) -> dict[str, str]:
+    """Find and handle incomplete batches for recovery.
+
+    - EXECUTING batches: Mark as failed (crash interrupted), then retry
+    - FAILED batches without a recorded verdict (the flush died before
+      recording one): Retry with incremented attempt
+    - DRAFT batches: Leave as-is (collection continues)
+
+    A FAILED batch whose verdict was recorded
+    (``ExecutionRepository.complete_aggregation_failure``) never reaches
+    here: ``get_incomplete_batches`` excludes it because the verdict is
+    final, and the journal restore completes its disposition instead.
+
+    Args:
+        execution: ExecutionRepository for database operations
+        coordination_token: Acquired leadership of the run being recovered
+
+    Returns:
+        Mapping of old_batch_id to new_batch_id for retried batches: one
+        retry hop per entry. ``retry_batch`` is idempotent, so a batch that
+        an earlier resume already retried maps to that same retry; when the
+        retry itself failed, it has its own entry and the edges chain
+        (``{A: B, B: C}``). The journal restore reads the chain through
+        ``barrier_coordination.resolve_retry_chain`` to reach the batch the
+        buffered members must flush in — never with a single lookup.
+    """
+    from elspeth.contracts.enums import BatchStatus
+
+    incomplete = execution.get_incomplete_batches(coordination_token.run_id)
+    batch_id_mapping: dict[str, str] = {}
+
+    for batch in incomplete:
+        if batch.status == BatchStatus.EXECUTING:
+            # Crash interrupted mid-execution, mark failed then retry
+            execution.complete_batch(
+                batch.batch_id,
+                BatchStatus.FAILED,
+                trigger_type=batch.trigger_type,
+                trigger_reason=batch.trigger_reason,
+                state_id=batch.aggregation_state_id,
+                coordination_token=coordination_token,
+            )
+            retry = execution.retry_batch(batch.batch_id, coordination_token=coordination_token)
+            batch_id_mapping[batch.batch_id] = retry.batch_id
+        elif batch.status == BatchStatus.FAILED:
+            # Previous failure, retry
+            retry = execution.retry_batch(batch.batch_id, coordination_token=coordination_token)
+            batch_id_mapping[batch.batch_id] = retry.batch_id
+        # DRAFT batches continue normally (collection resumes)
+
+    return batch_id_mapping

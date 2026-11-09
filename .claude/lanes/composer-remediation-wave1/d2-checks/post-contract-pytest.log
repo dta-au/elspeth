@@ -1,0 +1,37 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-d2
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 579 items
+
+tests/unit/composer_mcp/test_audit.py ............                       [  2%]
+tests/unit/composer_mcp/test_call_tool_audit.py ........................ [  6%]
+......                                                                   [  7%]
+tests/unit/composer_mcp/test_checkout_diagnostics.py ....                [  7%]
+tests/unit/composer_mcp/test_configured_root_admission.py .............. [ 10%]
+........................................................................ [ 22%]
+........................................................................ [ 35%]
+.                                                                        [ 35%]
+tests/unit/composer_mcp/test_server.py ................................. [ 41%]
+................                                                         [ 43%]
+tests/unit/composer_mcp/test_session.py ................................ [ 49%]
+.................................                                        [ 55%]
+tests/unit/web/test_paths.py ........................................... [ 62%]
+...............                                                          [ 65%]
+tests/unit/web/composer/test_set_pipeline_candidate.py ..                [ 65%]
+tests/unit/web/execution/test_validation_authoring.py .................. [ 68%]
+......................................                                   [ 75%]
+tests/unit/web/execution/test_validation_materialization.py ............ [ 77%]
+.......................................................................  [ 89%]
+tests/unit/web/execution/test_validation_identity_document.py ...        [ 89%]
+tests/unit/web/execution/test_validation.py .                            [ 90%]
+tests/unit/web/execution/test_preflight_side_effects.py ................ [ 92%]
+..............                                                           [ 95%]
+tests/unit/web/execution/test_service.py ..................              [ 98%]
+tests/unit/contracts/test_leaf_boundary.py ....                          [ 99%]
+tests/unit/web/test_sessions_composer_attribute_contracts.py .....       [100%]
+
+======================== 579 passed in 69.84s (0:01:09) ========================

@@ -1,0 +1,2 @@
+pyproject.toml: note: unused section(s): module = ['azure.*', 'boto3.*', 'botocore.*', 'claude_agent_sdk', 'claude_agent_sdk.*', 'ddtrace.*', 'dynaconf', 'dynaconf.*', 'elspeth.tui.*', 'examples.*', 'ijson.*', 'opentelemetry.*', 'pypdfium2', 'pypdfium2.*', 'pypdfium2_raw', 'pypdfium2_raw.*', 'scripts.*', 'sqlcipher3.*', 'tests.*']
+Success: no issues found in 7 source files

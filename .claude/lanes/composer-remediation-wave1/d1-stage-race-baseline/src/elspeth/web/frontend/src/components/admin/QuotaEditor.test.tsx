@@ -1,0 +1,119 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import * as workflow from "@/api/workflow";
+import type { IdentityQuota } from "@/types/workflow";
+import { QuotaEditor } from "./QuotaEditor";
+
+vi.mock("@/api/workflow", () => ({ fetchIdentityQuota: vi.fn(), setIdentityQuota: vi.fn(), revokeIdentityQuota: vi.fn() }));
+
+const quota: IdentityQuota = {
+  identity_id: "member",
+  tokens_per_day: "500",
+  storage_bytes: "2048",
+  container_tokens_per_day: "9000",
+  container_storage_bytes: null,
+  tokens_used_today: "160",
+  storage_bytes_used: "1024",
+  policy_state: "active",
+  can_edit: true,
+  container_tokens_used_today: "8000",
+  container_storage_bytes_used: "12345",
+};
+
+describe("QuotaEditor", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(workflow.fetchIdentityQuota).mockResolvedValue(quota);
+  });
+
+  it("shows identity caps, usage and container ceilings", async () => {
+    render(<QuotaEditor identityId="member" personName="Jane Doe" capsEnabled />);
+    expect(await screen.findByText("Tokens per day: 500 (160 used today; container ceiling 9000)")).toBeInTheDocument();
+    expect(screen.getByText("Storage: 2.0 KB (1.0 KB used; no container ceiling)")).toBeInTheDocument();
+  });
+
+  it("edits exactly one selected dimension and shows the refreshed result", async () => {
+    vi.mocked(workflow.setIdentityQuota).mockResolvedValue({ ...quota, storage_bytes: "3000" });
+    render(<QuotaEditor identityId="member" personName="Jane Doe" capsEnabled />);
+    await screen.findByText(/Tokens per day: 500/);
+    await userEvent.selectOptions(screen.getByLabelText("Dimension"), "storage");
+    await userEvent.type(screen.getByLabelText("New cap"), "3000");
+    await userEvent.click(screen.getByRole("button", { name: "Save cap" }));
+    await waitFor(() => expect(workflow.setIdentityQuota).toHaveBeenCalledWith("member", "storage", "3000"));
+    expect(await screen.findByText(/Storage: 2.9 KB/)).toBeInTheDocument();
+  });
+
+  it("clears the typed cap when the dimension changes, so 50000 tokens cannot become 50000 bytes", async () => {
+    render(<QuotaEditor identityId="member" personName="Jane Doe" capsEnabled />);
+    await screen.findByText(/Tokens per day: 500/);
+    await userEvent.type(screen.getByLabelText("New cap"), "50000");
+    await userEvent.selectOptions(screen.getByLabelText("Dimension"), "storage");
+    expect(screen.getByLabelText("New cap")).toHaveValue("");
+  });
+
+  it("shows usage but offers no cap form when the deployment has quotas off", async () => {
+    vi.mocked(workflow.fetchIdentityQuota).mockResolvedValue({ ...quota, can_edit: false, policy_state: "never_issued" });
+    render(<QuotaEditor identityId="member" personName="Jane Doe" capsEnabled={false} />);
+    await screen.findByText(/Tokens per day: 500/);
+    expect(screen.getByText(/Personal caps are not enabled on this deployment/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Save cap" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("New cap")).not.toBeInTheDocument();
+  });
+
+  it("reports the saved quota to the parent row", async () => {
+    const updated = { ...quota, tokens_per_day: "750" };
+    const onSaved = vi.fn();
+    vi.mocked(workflow.setIdentityQuota).mockResolvedValue(updated);
+    render(<QuotaEditor identityId="member" personName="Jane Doe" capsEnabled onSaved={onSaved} />);
+    await screen.findByText(/Tokens per day: 500/);
+    await userEvent.type(screen.getByLabelText("New cap"), "750");
+    await userEvent.click(screen.getByRole("button", { name: "Save cap" }));
+    await waitFor(() => expect(onSaved).toHaveBeenCalledExactlyOnceWith(updated));
+  });
+
+  it("rejects noninteger and out-of-range values before calling the API", async () => {
+    render(<QuotaEditor identityId="member" personName="Jane Doe" capsEnabled />);
+    await screen.findByText(/Tokens per day: 500/);
+    const value = screen.getByLabelText("New cap");
+    const save = screen.getByRole("button", { name: "Save cap" });
+    for (const invalid of ["0", "2.5", "9223372036854775808", "-1"]) {
+      await userEvent.clear(value);
+      await userEvent.type(value, invalid);
+      expect(save).toBeDisabled();
+    }
+    expect(workflow.setIdentityQuota).not.toHaveBeenCalled();
+  });
+
+  it("edits persisted policies with defaults off and preserves the full integer range", async () => {
+    vi.mocked(workflow.setIdentityQuota).mockResolvedValue({ ...quota, storage_bytes: "9223372036854775807" });
+    render(<QuotaEditor identityId="member" personName="Jane Doe" capsEnabled={false} />);
+    await screen.findByText(/Tokens per day: 500/);
+    expect(screen.getByText(/Shared usage: 8000 tokens today/)).toBeInTheDocument();
+    await userEvent.selectOptions(screen.getByLabelText("Dimension"), "storage");
+    await userEvent.type(screen.getByLabelText("New cap"), "9223372036854775807");
+    await userEvent.click(screen.getByRole("button", { name: "Save cap" }));
+    await waitFor(() => expect(workflow.setIdentityQuota).toHaveBeenCalledWith("member", "storage", "9223372036854775807"));
+  });
+
+  it("exposes suspension and a restore action rather than reporting no cap", async () => {
+    vi.mocked(workflow.revokeIdentityQuota).mockResolvedValue({ ...quota, policy_state: "suspended", tokens_per_day: null, storage_bytes: null });
+    render(<QuotaEditor identityId="member" personName="Jane Doe" capsEnabled />);
+    await screen.findByText(/Tokens per day: 500/);
+    await userEvent.click(screen.getByRole("button", { name: "Suspend quota policy" }));
+    expect(await screen.findByText(/Quota policy suspended: provider calls/)).toBeInTheDocument();
+    expect(screen.getByText(/Tokens per day: suspended/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save cap" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Suspend quota policy" })).not.toBeInTheDocument();
+  });
+
+  it("shows a backend refusal and preserves the entered value", async () => {
+    vi.mocked(workflow.setIdentityQuota).mockRejectedValue({ error_type: "quota_default_missing", detail: "No container default for storage" });
+    render(<QuotaEditor identityId="member" personName="Jane Doe" capsEnabled />);
+    await screen.findByText(/Tokens per day: 500/);
+    await userEvent.type(screen.getByLabelText("New cap"), "42");
+    await userEvent.click(screen.getByRole("button", { name: "Save cap" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("No container default for storage");
+    expect(screen.getByLabelText("New cap")).toHaveValue("42");
+  });
+});

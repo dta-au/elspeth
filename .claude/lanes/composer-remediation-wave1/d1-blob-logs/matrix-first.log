@@ -1,0 +1,104 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 150 items
+
+tests/unit/web/blobs/test_mutation_admission.py ........................ [ 16%]
+...........................................F
+
+=================================== FAILURES ===================================
+_ test_admission_requires_exact_live_mutation_authority_before_reading_files[blob_read-update_blob] _
+
+blob_service = <elspeth.web.blobs.service.BlobServiceImpl object at 0x7fbbd4d72360>
+db_engine = Engine(sqlite:///:memory:)
+session_id = UUID('3beb8aa2-dada-4124-a319-b69be607252a')
+compose_context = SessionOperationContext(fence=SessionOperationFence(session_id='3beb8aa2-dada-4124-a319-b69be607252a', operation_id='d...token='20b50c070a4f494a8983b1ac6f75ab73', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>)
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-71/test_admission_requires_exact_2')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fbbd43c7500>
+tool_name = 'update_blob', fence = 'blob_read'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_name", ["update_blob", "delete_blob"])
+    @pytest.mark.parametrize("fence", ["create", "blob_read", "execute", "session_fork", "expired", "released", "forged", "foreign"])
+    async def test_admission_requires_exact_live_mutation_authority_before_reading_files(blob_service, db_engine, session_id, compose_context, tmp_path, monkeypatch, tool_name, fence):
+        record = await blob_service.create_blob(session_id, "authority.csv", b"old", "text/csv", session_operation_context=compose_context)
+        authority = blob_service._session_operation_authority
+        operation = compose_context
+        if fence in {"create", "blob_read", "execute", "session_fork"}:
+            operation = seed_live_operation_context(db_engine, session_id, operation_kind=SessionOperationKind(fence))
+        elif fence == "released":
+            authority.release(operation)
+        elif fence == "expired":
+            with db_engine.begin() as connection:
+                connection.execute(update(session_operation_fences_table).values(lease_expires_at=datetime.now(UTC) - timedelta(hours=1)))
+        elif fence == "forged":
+            operation = replace(operation, fence=replace(operation.fence, lease_token="forged-token"))
+        context = _context(blob_service, db_engine, operation, tmp_path)
+        if fence == "foreign":
+            context = replace(context, session_id=str(uuid4()))
+        before = _resources(db_engine, tmp_path)
+        def forbidden_read(*args, **kwargs):
+            pytest.fail("invalid authority reached filesystem content")
+        with monkeypatch.context() as guards:
+            guards.setattr(BlobReplacementCoordinator, "_read_bytes", forbidden_read)
+            guards.setattr(BlobServiceImpl, "_read_deletion_content", forbidden_read)
+            with pytest.raises(SessionOperationFenceLost if fence in {"expired", "released", "forged"} else AuditIntegrityError):
+>               blobs.admit_blob_mutation(tool_name, {"blob_id": str(record.id), **({"content": "new"} if tool_name == "update_blob" else {})}, _empty_state(), context)
+
+tests/unit/web/blobs/test_mutation_admission.py:349: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/composer/tools/blobs.py:1754: in admit_blob_mutation
+    authority, operation = _require_blob_tool_authority(context)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/tools/blobs.py:1494: in _require_blob_tool_authority
+    authority.compare_and_swap(operation)
+src/elspeth/web/coordination/repository.py:5409: in compare_and_swap
+    self.mutate(context, _composer_liveness_proof)
+src/elspeth/web/coordination/repository.py:5576: in mutate
+    self._compare_and_swap_on_connection(conn, context, database_now=database_now)
+src/elspeth/web/coordination/repository.py:5318: in _compare_and_swap_on_connection
+    self._prove_read_admission(conn, context, database_now=database_now)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+conn = <sqlalchemy.engine.base.Connection object at 0x7fbbd4af0a10>
+context = SessionOperationContext(fence=SessionOperationFence(session_id='3beb8aa2-dada-4124-a319-b69be607252a', operation_id='c...n='04fa608c1a1448f78ddf476b96a8f593', operation_epoch=2), operation_kind=<SessionOperationKind.BLOB_READ: 'blob_read'>)
+
+    @staticmethod
+    def _prove_read_admission(
+        conn: Connection,
+        context: SessionOperationContext,
+        *,
+        database_now: datetime,
+    ) -> None:
+        """Refuse a read context whose admission row is gone, foreign, or expired.
+    
+        Runs AFTER the custody proof (session present, not archived, fence
+        row present), so a deleted session still reads MISSING. The row is
+        selected by ``(session_id, operation_id)``: absent means the admission
+        was RELEASED (release deletes its row); a lease token that does not
+        match is TOKEN_MISMATCH; an expiry at or before the database clock is
+        LEASE_EXPIRED. The recorded ``operation_epoch`` is informational and
+        deliberately NOT compared: a writer's epoch advance must not
+        invalidate a shareable read (the validate route holds a read while
+        its repair pass takes its own COMPOSE inside it).
+        """
+        fence = context.fence
+        row = conn.execute(
+            select(session_read_admissions_table.c.lease_token, session_read_admissions_table.c.expires_at).where(
+                session_read_admissions_table.c.session_id == fence.session_id,
+                session_read_admissions_table.c.operation_id == fence.operation_id,
+            )
+        ).one_or_none()
+        if row is None:
+>           raise SessionOperationFenceLost(FenceLossReason.RELEASED)
+E           elspeth.web.coordination.contracts.SessionOperationFenceLost: session operation authority lost: released
+
+src/elspeth/web/coordination/repository.py:5250: SessionOperationFenceLost
+=========================== short test summary info ============================
+FAILED tests/unit/web/blobs/test_mutation_admission.py::test_admission_requires_exact_live_mutation_authority_before_reading_files[blob_read-update_blob]
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+======================== 1 failed, 67 passed in 17.69s =========================

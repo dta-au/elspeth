@@ -1,0 +1,7 @@
+{
+  "comparison": "full emitted finding objects except line/column positions",
+  "baseline_findings": 5224,
+  "candidate_findings": 5224,
+  "added": [],
+  "removed": []
+}

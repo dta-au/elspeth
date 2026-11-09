@@ -1,0 +1,192 @@
+{
+  "component": "source",
+  "key": "path",
+  "escape_link": false,
+  "root": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s0/data",
+  "outside": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s0/outside.csv",
+  "reached": [
+    {
+      "phase": "materialization",
+      "yaml": "sinks:\n  result:\n    on_write_failure: discard\n    options:\n      collision_policy: auto_increment\n      mode: write\n      path: /workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s0/data/outputs/report.csv\n      schema:\n        mode: observed\n    plugin: json\nsources:\n  source:\n    on_success: result\n    options:\n      on_validation_failure: discard\n      path: /workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s0/data/None\n      schema:\n        mode: observed\n    plugin: csv\n"
+    },
+    {
+      "phase": "plugin_setup"
+    }
+  ],
+  "preflight": {
+    "is_valid": true,
+    "checks": [
+      {
+        "name": "plugin_enablement",
+        "passed": true,
+        "detail": "plugin_enablement passed.",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "operator_profile_options",
+        "passed": true,
+        "detail": "operator_profile_options passed.",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "required_control_availability",
+        "passed": true,
+        "detail": "required_control_availability passed.",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "required_control_coverage",
+        "passed": true,
+        "detail": "required_control_coverage passed.",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "path_allowlist",
+        "passed": true,
+        "detail": "All paths within allowed directories",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "web_scrape_network_policy",
+        "passed": true,
+        "detail": "Local trained-operator validation is exempt from the web fetch private-network policy",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "web_fetch_resource_policy",
+        "passed": true,
+        "detail": "Local trained-operator validation is exempt from the web HTTP-fetch resource policy",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "secret_refs",
+        "passed": true,
+        "detail": "No secret service \u2014 check skipped",
+        "affected_nodes": [],
+        "outcome_code": "secret_refs.skipped_no_service"
+      },
+      {
+        "name": "semantic_contracts",
+        "passed": true,
+        "detail": "No semantic contracts to check",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "batch_transform_options",
+        "passed": true,
+        "detail": "Batch-aware transform options are compatible with ADR-013",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "interpretation_review",
+        "passed": true,
+        "detail": "No pending interpretation review",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "blob_inline_refs",
+        "passed": true,
+        "detail": "No inline-content blob references found",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "llm_retry_budget_policy",
+        "passed": true,
+        "detail": "No unsafe web-authored sequential multi-query LLM retry budget",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "llm_base_url_policy",
+        "passed": true,
+        "detail": "No web-authored OpenRouter base_url override",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "llm_tracing_policy",
+        "passed": true,
+        "detail": "No web-authored LLM tracing configuration",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "aws_s3_endpoint_url_policy",
+        "passed": true,
+        "detail": "Local trained-operator validation is exempt from the web aws_s3 endpoint_url policy",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "aws_s3_source_policy",
+        "passed": true,
+        "detail": "Local trained-operator validation is exempt from the web aws_s3 source policy",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "settings_load",
+        "passed": true,
+        "detail": "Settings loaded successfully",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "plugin_instantiation",
+        "passed": true,
+        "detail": "All plugins instantiated",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "value_source_compliance",
+        "passed": true,
+        "detail": "All declared value sources satisfied",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "graph_structure",
+        "passed": true,
+        "detail": "Graph structure is valid",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "route_target_resolution",
+        "passed": true,
+        "detail": "All route targets resolve to existing sinks",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "schema_compatibility",
+        "passed": true,
+        "detail": "All edge schemas compatible",
+        "affected_nodes": [],
+        "outcome_code": null
+      }
+    ],
+    "errors": [],
+    "warnings": [],
+    "readiness": {
+      "authoring_valid": true,
+      "execution_ready": true,
+      "completion_ready": true,
+      "blockers": []
+    },
+    "semantic_contracts": []
+  },
+  "outside_bytes_unchanged": true
+}

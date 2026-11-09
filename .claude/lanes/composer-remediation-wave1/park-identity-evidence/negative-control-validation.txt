@@ -1,0 +1,3 @@
+JUnit outcomes: {'constructor_failed': 6, 'constructor_passed': 1, 'persistence_failed': 6, 'persistence_passed': 1, 'provider_failed': 36, 'provider_passed': 6}
+All eight canonical controls passed; all 48 alias cases failed. All 36 provider alias failures contain the actual target-unavailable recovery notice.
+Tracked source differences between mutant and final candidate: ['src/elspeth/web/composer/graph_recovery.py']

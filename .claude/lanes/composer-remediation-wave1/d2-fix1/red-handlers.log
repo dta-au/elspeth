@@ -1,0 +1,624 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-d2
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 175 items / 165 deselected / 10 selected
+
+tests/unit/composer_mcp/test_configured_root_admission.py FFFFFFFFFF     [100%]
+
+=================================== FAILURES ===================================
+_ test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[False-source-path] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s0')
+component = 'source', key = 'path', escape_link = False
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fcc7d7f0ef0>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("component", "key"), _SOURCE_SINK_PATH_KEYS)
+    @pytest.mark.parametrize("escape_link", [False, True])
+    async def test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup(
+        tmp_path: Path, component: str, key: str, escape_link: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A present null must fail the path gate before any scalar-to-path rewrite."""
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "input.csv").write_text("text\ninside\n")
+        outside = tmp_path / "outside.csv"
+        outside.write_text("text\noutside\n")
+        if escape_link:
+            (root / "None").symlink_to(outside)
+        payload = _preview_state().to_dict()
+        options = payload["sources"]["source"]["options"] if component == "source" else payload["outputs"][0]["options"]
+        options[key] = None
+        live = await _live_mcp(tmp_path, root, state=CompositionState.from_dict(payload))
+        before, saved = live.private_state, live.saved_bytes
+        before_public = await live.call("get_pipeline_state", {})
+        outside_bytes = outside.read_bytes()
+        reached: list[dict[str, Any]] = []
+        materialize = execution_validation.materialize_validation_yaml
+        instantiate = execution_validation.instantiate_runtime_plugins
+    
+        def observe_materialization(*args: Any, **kwargs: Any) -> Any:
+            result = materialize(*args, **kwargs)
+            reached.append({"phase": "materialization", "yaml": result.artifact.pipeline_yaml if isinstance(result, PhaseReport) else None})
+            return result
+    
+        def observe_plugin_setup(*args: Any, **kwargs: Any) -> Any:
+            reached.append({"phase": "plugin_setup"})
+            return instantiate(*args, **kwargs)
+    
+        monkeypatch.setattr(execution_validation, "materialize_validation_yaml", observe_materialization)
+        monkeypatch.setattr(execution_validation, "instantiate_runtime_plugins", observe_plugin_setup)
+        preview = await live.call("preview_pipeline", {})
+        preflight = preview["runtime_preflight"]
+        (tmp_path / "observed-null-preview.json").write_text(json.dumps({
+            "component": component, "key": key, "escape_link": escape_link,
+            "root": str(root), "outside": str(outside), "reached": reached, "preflight": preflight,
+            "outside_bytes_unchanged": outside.read_bytes() == outside_bytes,
+        }, indent=2))
+        path_checks = [check for check in preflight["checks"] if check["name"] == "path_allowlist"]
+        assert len(path_checks) == 1
+>       assert path_checks[0]["passed"] is False, {"preflight": preflight, "reached": reached}
+E       AssertionError: {'preflight': {'checks': [{'affected_nodes': [], 'detail': 'plugin_enablement passed.', 'name': 'plugin_enablement', '..._legacy_null_path_s0/data/None
+E               schema:
+E                 mode: observed
+E             plugin: csv
+E         '}, {'phase': 'plugin_setup'}]}
+E       assert True is False
+
+tests/unit/composer_mcp/test_configured_root_admission.py:511: AssertionError
+_ test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[False-source-file] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s1')
+component = 'source', key = 'file', escape_link = False
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fcc7a6baf00>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("component", "key"), _SOURCE_SINK_PATH_KEYS)
+    @pytest.mark.parametrize("escape_link", [False, True])
+    async def test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup(
+        tmp_path: Path, component: str, key: str, escape_link: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A present null must fail the path gate before any scalar-to-path rewrite."""
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "input.csv").write_text("text\ninside\n")
+        outside = tmp_path / "outside.csv"
+        outside.write_text("text\noutside\n")
+        if escape_link:
+            (root / "None").symlink_to(outside)
+        payload = _preview_state().to_dict()
+        options = payload["sources"]["source"]["options"] if component == "source" else payload["outputs"][0]["options"]
+        options[key] = None
+        live = await _live_mcp(tmp_path, root, state=CompositionState.from_dict(payload))
+        before, saved = live.private_state, live.saved_bytes
+        before_public = await live.call("get_pipeline_state", {})
+        outside_bytes = outside.read_bytes()
+        reached: list[dict[str, Any]] = []
+        materialize = execution_validation.materialize_validation_yaml
+        instantiate = execution_validation.instantiate_runtime_plugins
+    
+        def observe_materialization(*args: Any, **kwargs: Any) -> Any:
+            result = materialize(*args, **kwargs)
+            reached.append({"phase": "materialization", "yaml": result.artifact.pipeline_yaml if isinstance(result, PhaseReport) else None})
+            return result
+    
+        def observe_plugin_setup(*args: Any, **kwargs: Any) -> Any:
+            reached.append({"phase": "plugin_setup"})
+            return instantiate(*args, **kwargs)
+    
+        monkeypatch.setattr(execution_validation, "materialize_validation_yaml", observe_materialization)
+        monkeypatch.setattr(execution_validation, "instantiate_runtime_plugins", observe_plugin_setup)
+        preview = await live.call("preview_pipeline", {})
+        preflight = preview["runtime_preflight"]
+        (tmp_path / "observed-null-preview.json").write_text(json.dumps({
+            "component": component, "key": key, "escape_link": escape_link,
+            "root": str(root), "outside": str(outside), "reached": reached, "preflight": preflight,
+            "outside_bytes_unchanged": outside.read_bytes() == outside_bytes,
+        }, indent=2))
+        path_checks = [check for check in preflight["checks"] if check["name"] == "path_allowlist"]
+        assert len(path_checks) == 1
+>       assert path_checks[0]["passed"] is False, {"preflight": preflight, "reached": reached}
+E       AssertionError: {'preflight': {'checks': [{'affected_nodes': [], 'detail': 'plugin_enablement passed.', 'name': 'plugin_enablement', '...cy_null_path_s1/data/input.csv
+E               schema:
+E                 mode: observed
+E             plugin: csv
+E         '}, {'phase': 'plugin_setup'}]}
+E       assert True is False
+
+tests/unit/composer_mcp/test_configured_root_admission.py:511: AssertionError
+_ test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[False-sink-path] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s2')
+component = 'output', key = 'path', escape_link = False
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fcc72aad820>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("component", "key"), _SOURCE_SINK_PATH_KEYS)
+    @pytest.mark.parametrize("escape_link", [False, True])
+    async def test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup(
+        tmp_path: Path, component: str, key: str, escape_link: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A present null must fail the path gate before any scalar-to-path rewrite."""
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "input.csv").write_text("text\ninside\n")
+        outside = tmp_path / "outside.csv"
+        outside.write_text("text\noutside\n")
+        if escape_link:
+            (root / "None").symlink_to(outside)
+        payload = _preview_state().to_dict()
+        options = payload["sources"]["source"]["options"] if component == "source" else payload["outputs"][0]["options"]
+        options[key] = None
+        live = await _live_mcp(tmp_path, root, state=CompositionState.from_dict(payload))
+        before, saved = live.private_state, live.saved_bytes
+        before_public = await live.call("get_pipeline_state", {})
+        outside_bytes = outside.read_bytes()
+        reached: list[dict[str, Any]] = []
+        materialize = execution_validation.materialize_validation_yaml
+        instantiate = execution_validation.instantiate_runtime_plugins
+    
+        def observe_materialization(*args: Any, **kwargs: Any) -> Any:
+            result = materialize(*args, **kwargs)
+            reached.append({"phase": "materialization", "yaml": result.artifact.pipeline_yaml if isinstance(result, PhaseReport) else None})
+            return result
+    
+        def observe_plugin_setup(*args: Any, **kwargs: Any) -> Any:
+            reached.append({"phase": "plugin_setup"})
+            return instantiate(*args, **kwargs)
+    
+        monkeypatch.setattr(execution_validation, "materialize_validation_yaml", observe_materialization)
+        monkeypatch.setattr(execution_validation, "instantiate_runtime_plugins", observe_plugin_setup)
+        preview = await live.call("preview_pipeline", {})
+        preflight = preview["runtime_preflight"]
+        (tmp_path / "observed-null-preview.json").write_text(json.dumps({
+            "component": component, "key": key, "escape_link": escape_link,
+            "root": str(root), "outside": str(outside), "reached": reached, "preflight": preflight,
+            "outside_bytes_unchanged": outside.read_bytes() == outside_bytes,
+        }, indent=2))
+        path_checks = [check for check in preflight["checks"] if check["name"] == "path_allowlist"]
+        assert len(path_checks) == 1
+>       assert path_checks[0]["passed"] is False, {"preflight": preflight, "reached": reached}
+E       AssertionError: {'preflight': {'checks': [{'affected_nodes': [], 'detail': 'plugin_enablement passed.', 'name': 'plugin_enablement', '...cy_null_path_s2/data/input.csv
+E               schema:
+E                 mode: observed
+E             plugin: csv
+E         '}, {'phase': 'plugin_setup'}]}
+E       assert True is False
+
+tests/unit/composer_mcp/test_configured_root_admission.py:511: AssertionError
+_ test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[False-sink-file] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s3')
+component = 'output', key = 'file', escape_link = False
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fcc72aad7f0>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("component", "key"), _SOURCE_SINK_PATH_KEYS)
+    @pytest.mark.parametrize("escape_link", [False, True])
+    async def test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup(
+        tmp_path: Path, component: str, key: str, escape_link: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A present null must fail the path gate before any scalar-to-path rewrite."""
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "input.csv").write_text("text\ninside\n")
+        outside = tmp_path / "outside.csv"
+        outside.write_text("text\noutside\n")
+        if escape_link:
+            (root / "None").symlink_to(outside)
+        payload = _preview_state().to_dict()
+        options = payload["sources"]["source"]["options"] if component == "source" else payload["outputs"][0]["options"]
+        options[key] = None
+        live = await _live_mcp(tmp_path, root, state=CompositionState.from_dict(payload))
+        before, saved = live.private_state, live.saved_bytes
+        before_public = await live.call("get_pipeline_state", {})
+        outside_bytes = outside.read_bytes()
+        reached: list[dict[str, Any]] = []
+        materialize = execution_validation.materialize_validation_yaml
+        instantiate = execution_validation.instantiate_runtime_plugins
+    
+        def observe_materialization(*args: Any, **kwargs: Any) -> Any:
+            result = materialize(*args, **kwargs)
+            reached.append({"phase": "materialization", "yaml": result.artifact.pipeline_yaml if isinstance(result, PhaseReport) else None})
+            return result
+    
+        def observe_plugin_setup(*args: Any, **kwargs: Any) -> Any:
+            reached.append({"phase": "plugin_setup"})
+            return instantiate(*args, **kwargs)
+    
+        monkeypatch.setattr(execution_validation, "materialize_validation_yaml", observe_materialization)
+        monkeypatch.setattr(execution_validation, "instantiate_runtime_plugins", observe_plugin_setup)
+        preview = await live.call("preview_pipeline", {})
+        preflight = preview["runtime_preflight"]
+        (tmp_path / "observed-null-preview.json").write_text(json.dumps({
+            "component": component, "key": key, "escape_link": escape_link,
+            "root": str(root), "outside": str(outside), "reached": reached, "preflight": preflight,
+            "outside_bytes_unchanged": outside.read_bytes() == outside_bytes,
+        }, indent=2))
+        path_checks = [check for check in preflight["checks"] if check["name"] == "path_allowlist"]
+        assert len(path_checks) == 1
+>       assert path_checks[0]["passed"] is False, {"preflight": preflight, "reached": reached}
+E       AssertionError: {'preflight': {'checks': [{'affected_nodes': [], 'detail': 'plugin_enablement passed.', 'name': 'plugin_enablement', '...cy_null_path_s3/data/input.csv
+E               schema:
+E                 mode: observed
+E             plugin: csv
+E         '}, {'phase': 'plugin_setup'}]}
+E       assert True is False
+
+tests/unit/composer_mcp/test_configured_root_admission.py:511: AssertionError
+_ test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[False-sink-persist-directory] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s4')
+component = 'output', key = 'persist_directory', escape_link = False
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fcc719af200>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("component", "key"), _SOURCE_SINK_PATH_KEYS)
+    @pytest.mark.parametrize("escape_link", [False, True])
+    async def test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup(
+        tmp_path: Path, component: str, key: str, escape_link: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A present null must fail the path gate before any scalar-to-path rewrite."""
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "input.csv").write_text("text\ninside\n")
+        outside = tmp_path / "outside.csv"
+        outside.write_text("text\noutside\n")
+        if escape_link:
+            (root / "None").symlink_to(outside)
+        payload = _preview_state().to_dict()
+        options = payload["sources"]["source"]["options"] if component == "source" else payload["outputs"][0]["options"]
+        options[key] = None
+        live = await _live_mcp(tmp_path, root, state=CompositionState.from_dict(payload))
+        before, saved = live.private_state, live.saved_bytes
+        before_public = await live.call("get_pipeline_state", {})
+        outside_bytes = outside.read_bytes()
+        reached: list[dict[str, Any]] = []
+        materialize = execution_validation.materialize_validation_yaml
+        instantiate = execution_validation.instantiate_runtime_plugins
+    
+        def observe_materialization(*args: Any, **kwargs: Any) -> Any:
+            result = materialize(*args, **kwargs)
+            reached.append({"phase": "materialization", "yaml": result.artifact.pipeline_yaml if isinstance(result, PhaseReport) else None})
+            return result
+    
+        def observe_plugin_setup(*args: Any, **kwargs: Any) -> Any:
+            reached.append({"phase": "plugin_setup"})
+            return instantiate(*args, **kwargs)
+    
+        monkeypatch.setattr(execution_validation, "materialize_validation_yaml", observe_materialization)
+        monkeypatch.setattr(execution_validation, "instantiate_runtime_plugins", observe_plugin_setup)
+        preview = await live.call("preview_pipeline", {})
+        preflight = preview["runtime_preflight"]
+        (tmp_path / "observed-null-preview.json").write_text(json.dumps({
+            "component": component, "key": key, "escape_link": escape_link,
+            "root": str(root), "outside": str(outside), "reached": reached, "preflight": preflight,
+            "outside_bytes_unchanged": outside.read_bytes() == outside_bytes,
+        }, indent=2))
+        path_checks = [check for check in preflight["checks"] if check["name"] == "path_allowlist"]
+        assert len(path_checks) == 1
+>       assert path_checks[0]["passed"] is False, {"preflight": preflight, "reached": reached}
+E       AssertionError: {'preflight': {'checks': [{'affected_nodes': [], 'detail': 'plugin_enablement passed.', 'name': 'plugin_enablement', '...cy_null_path_s4/data/input.csv
+E               schema:
+E                 mode: observed
+E             plugin: csv
+E         '}, {'phase': 'plugin_setup'}]}
+E       assert True is False
+
+tests/unit/composer_mcp/test_configured_root_admission.py:511: AssertionError
+_ test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[True-source-path] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s5')
+component = 'source', key = 'path', escape_link = True
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fcc71f93e90>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("component", "key"), _SOURCE_SINK_PATH_KEYS)
+    @pytest.mark.parametrize("escape_link", [False, True])
+    async def test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup(
+        tmp_path: Path, component: str, key: str, escape_link: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A present null must fail the path gate before any scalar-to-path rewrite."""
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "input.csv").write_text("text\ninside\n")
+        outside = tmp_path / "outside.csv"
+        outside.write_text("text\noutside\n")
+        if escape_link:
+            (root / "None").symlink_to(outside)
+        payload = _preview_state().to_dict()
+        options = payload["sources"]["source"]["options"] if component == "source" else payload["outputs"][0]["options"]
+        options[key] = None
+        live = await _live_mcp(tmp_path, root, state=CompositionState.from_dict(payload))
+        before, saved = live.private_state, live.saved_bytes
+        before_public = await live.call("get_pipeline_state", {})
+        outside_bytes = outside.read_bytes()
+        reached: list[dict[str, Any]] = []
+        materialize = execution_validation.materialize_validation_yaml
+        instantiate = execution_validation.instantiate_runtime_plugins
+    
+        def observe_materialization(*args: Any, **kwargs: Any) -> Any:
+            result = materialize(*args, **kwargs)
+            reached.append({"phase": "materialization", "yaml": result.artifact.pipeline_yaml if isinstance(result, PhaseReport) else None})
+            return result
+    
+        def observe_plugin_setup(*args: Any, **kwargs: Any) -> Any:
+            reached.append({"phase": "plugin_setup"})
+            return instantiate(*args, **kwargs)
+    
+        monkeypatch.setattr(execution_validation, "materialize_validation_yaml", observe_materialization)
+        monkeypatch.setattr(execution_validation, "instantiate_runtime_plugins", observe_plugin_setup)
+        preview = await live.call("preview_pipeline", {})
+        preflight = preview["runtime_preflight"]
+        (tmp_path / "observed-null-preview.json").write_text(json.dumps({
+            "component": component, "key": key, "escape_link": escape_link,
+            "root": str(root), "outside": str(outside), "reached": reached, "preflight": preflight,
+            "outside_bytes_unchanged": outside.read_bytes() == outside_bytes,
+        }, indent=2))
+        path_checks = [check for check in preflight["checks"] if check["name"] == "path_allowlist"]
+        assert len(path_checks) == 1
+>       assert path_checks[0]["passed"] is False, {"preflight": preflight, "reached": reached}
+E       AssertionError: {'preflight': {'checks': [{'affected_nodes': [], 'detail': 'plugin_enablement passed.', 'name': 'plugin_enablement', '...egacy_null_path_s5/outside.csv
+E               schema:
+E                 mode: observed
+E             plugin: csv
+E         '}, {'phase': 'plugin_setup'}]}
+E       assert True is False
+
+tests/unit/composer_mcp/test_configured_root_admission.py:511: AssertionError
+_ test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[True-source-file] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s6')
+component = 'source', key = 'file', escape_link = True
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fcc71f902f0>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("component", "key"), _SOURCE_SINK_PATH_KEYS)
+    @pytest.mark.parametrize("escape_link", [False, True])
+    async def test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup(
+        tmp_path: Path, component: str, key: str, escape_link: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A present null must fail the path gate before any scalar-to-path rewrite."""
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "input.csv").write_text("text\ninside\n")
+        outside = tmp_path / "outside.csv"
+        outside.write_text("text\noutside\n")
+        if escape_link:
+            (root / "None").symlink_to(outside)
+        payload = _preview_state().to_dict()
+        options = payload["sources"]["source"]["options"] if component == "source" else payload["outputs"][0]["options"]
+        options[key] = None
+        live = await _live_mcp(tmp_path, root, state=CompositionState.from_dict(payload))
+        before, saved = live.private_state, live.saved_bytes
+        before_public = await live.call("get_pipeline_state", {})
+        outside_bytes = outside.read_bytes()
+        reached: list[dict[str, Any]] = []
+        materialize = execution_validation.materialize_validation_yaml
+        instantiate = execution_validation.instantiate_runtime_plugins
+    
+        def observe_materialization(*args: Any, **kwargs: Any) -> Any:
+            result = materialize(*args, **kwargs)
+            reached.append({"phase": "materialization", "yaml": result.artifact.pipeline_yaml if isinstance(result, PhaseReport) else None})
+            return result
+    
+        def observe_plugin_setup(*args: Any, **kwargs: Any) -> Any:
+            reached.append({"phase": "plugin_setup"})
+            return instantiate(*args, **kwargs)
+    
+        monkeypatch.setattr(execution_validation, "materialize_validation_yaml", observe_materialization)
+        monkeypatch.setattr(execution_validation, "instantiate_runtime_plugins", observe_plugin_setup)
+        preview = await live.call("preview_pipeline", {})
+        preflight = preview["runtime_preflight"]
+        (tmp_path / "observed-null-preview.json").write_text(json.dumps({
+            "component": component, "key": key, "escape_link": escape_link,
+            "root": str(root), "outside": str(outside), "reached": reached, "preflight": preflight,
+            "outside_bytes_unchanged": outside.read_bytes() == outside_bytes,
+        }, indent=2))
+        path_checks = [check for check in preflight["checks"] if check["name"] == "path_allowlist"]
+        assert len(path_checks) == 1
+>       assert path_checks[0]["passed"] is False, {"preflight": preflight, "reached": reached}
+E       AssertionError: {'preflight': {'checks': [{'affected_nodes': [], 'detail': 'plugin_enablement passed.', 'name': 'plugin_enablement', '...cy_null_path_s6/data/input.csv
+E               schema:
+E                 mode: observed
+E             plugin: csv
+E         '}, {'phase': 'plugin_setup'}]}
+E       assert True is False
+
+tests/unit/composer_mcp/test_configured_root_admission.py:511: AssertionError
+_ test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[True-sink-path] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s7')
+component = 'output', key = 'path', escape_link = True
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fcc71fa96a0>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("component", "key"), _SOURCE_SINK_PATH_KEYS)
+    @pytest.mark.parametrize("escape_link", [False, True])
+    async def test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup(
+        tmp_path: Path, component: str, key: str, escape_link: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A present null must fail the path gate before any scalar-to-path rewrite."""
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "input.csv").write_text("text\ninside\n")
+        outside = tmp_path / "outside.csv"
+        outside.write_text("text\noutside\n")
+        if escape_link:
+            (root / "None").symlink_to(outside)
+        payload = _preview_state().to_dict()
+        options = payload["sources"]["source"]["options"] if component == "source" else payload["outputs"][0]["options"]
+        options[key] = None
+        live = await _live_mcp(tmp_path, root, state=CompositionState.from_dict(payload))
+        before, saved = live.private_state, live.saved_bytes
+        before_public = await live.call("get_pipeline_state", {})
+        outside_bytes = outside.read_bytes()
+        reached: list[dict[str, Any]] = []
+        materialize = execution_validation.materialize_validation_yaml
+        instantiate = execution_validation.instantiate_runtime_plugins
+    
+        def observe_materialization(*args: Any, **kwargs: Any) -> Any:
+            result = materialize(*args, **kwargs)
+            reached.append({"phase": "materialization", "yaml": result.artifact.pipeline_yaml if isinstance(result, PhaseReport) else None})
+            return result
+    
+        def observe_plugin_setup(*args: Any, **kwargs: Any) -> Any:
+            reached.append({"phase": "plugin_setup"})
+            return instantiate(*args, **kwargs)
+    
+        monkeypatch.setattr(execution_validation, "materialize_validation_yaml", observe_materialization)
+        monkeypatch.setattr(execution_validation, "instantiate_runtime_plugins", observe_plugin_setup)
+        preview = await live.call("preview_pipeline", {})
+        preflight = preview["runtime_preflight"]
+        (tmp_path / "observed-null-preview.json").write_text(json.dumps({
+            "component": component, "key": key, "escape_link": escape_link,
+            "root": str(root), "outside": str(outside), "reached": reached, "preflight": preflight,
+            "outside_bytes_unchanged": outside.read_bytes() == outside_bytes,
+        }, indent=2))
+        path_checks = [check for check in preflight["checks"] if check["name"] == "path_allowlist"]
+        assert len(path_checks) == 1
+>       assert path_checks[0]["passed"] is False, {"preflight": preflight, "reached": reached}
+E       AssertionError: {'preflight': {'checks': [{'affected_nodes': [], 'detail': 'plugin_enablement passed.', 'name': 'plugin_enablement', '...cy_null_path_s7/data/input.csv
+E               schema:
+E                 mode: observed
+E             plugin: csv
+E         '}, {'phase': 'plugin_setup'}]}
+E       assert True is False
+
+tests/unit/composer_mcp/test_configured_root_admission.py:511: AssertionError
+_ test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[True-sink-file] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s8')
+component = 'output', key = 'file', escape_link = True
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fcc71fa0d70>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("component", "key"), _SOURCE_SINK_PATH_KEYS)
+    @pytest.mark.parametrize("escape_link", [False, True])
+    async def test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup(
+        tmp_path: Path, component: str, key: str, escape_link: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A present null must fail the path gate before any scalar-to-path rewrite."""
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "input.csv").write_text("text\ninside\n")
+        outside = tmp_path / "outside.csv"
+        outside.write_text("text\noutside\n")
+        if escape_link:
+            (root / "None").symlink_to(outside)
+        payload = _preview_state().to_dict()
+        options = payload["sources"]["source"]["options"] if component == "source" else payload["outputs"][0]["options"]
+        options[key] = None
+        live = await _live_mcp(tmp_path, root, state=CompositionState.from_dict(payload))
+        before, saved = live.private_state, live.saved_bytes
+        before_public = await live.call("get_pipeline_state", {})
+        outside_bytes = outside.read_bytes()
+        reached: list[dict[str, Any]] = []
+        materialize = execution_validation.materialize_validation_yaml
+        instantiate = execution_validation.instantiate_runtime_plugins
+    
+        def observe_materialization(*args: Any, **kwargs: Any) -> Any:
+            result = materialize(*args, **kwargs)
+            reached.append({"phase": "materialization", "yaml": result.artifact.pipeline_yaml if isinstance(result, PhaseReport) else None})
+            return result
+    
+        def observe_plugin_setup(*args: Any, **kwargs: Any) -> Any:
+            reached.append({"phase": "plugin_setup"})
+            return instantiate(*args, **kwargs)
+    
+        monkeypatch.setattr(execution_validation, "materialize_validation_yaml", observe_materialization)
+        monkeypatch.setattr(execution_validation, "instantiate_runtime_plugins", observe_plugin_setup)
+        preview = await live.call("preview_pipeline", {})
+        preflight = preview["runtime_preflight"]
+        (tmp_path / "observed-null-preview.json").write_text(json.dumps({
+            "component": component, "key": key, "escape_link": escape_link,
+            "root": str(root), "outside": str(outside), "reached": reached, "preflight": preflight,
+            "outside_bytes_unchanged": outside.read_bytes() == outside_bytes,
+        }, indent=2))
+        path_checks = [check for check in preflight["checks"] if check["name"] == "path_allowlist"]
+        assert len(path_checks) == 1
+>       assert path_checks[0]["passed"] is False, {"preflight": preflight, "reached": reached}
+E       AssertionError: {'preflight': {'checks': [{'affected_nodes': [], 'detail': 'plugin_enablement passed.', 'name': 'plugin_enablement', '...cy_null_path_s8/data/input.csv
+E               schema:
+E                 mode: observed
+E             plugin: csv
+E         '}, {'phase': 'plugin_setup'}]}
+E       assert True is False
+
+tests/unit/composer_mcp/test_configured_root_admission.py:511: AssertionError
+_ test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[True-sink-persist-directory] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s9')
+component = 'output', key = 'persist_directory', escape_link = True
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fcc71fa3ad0>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("component", "key"), _SOURCE_SINK_PATH_KEYS)
+    @pytest.mark.parametrize("escape_link", [False, True])
+    async def test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup(
+        tmp_path: Path, component: str, key: str, escape_link: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A present null must fail the path gate before any scalar-to-path rewrite."""
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "input.csv").write_text("text\ninside\n")
+        outside = tmp_path / "outside.csv"
+        outside.write_text("text\noutside\n")
+        if escape_link:
+            (root / "None").symlink_to(outside)
+        payload = _preview_state().to_dict()
+        options = payload["sources"]["source"]["options"] if component == "source" else payload["outputs"][0]["options"]
+        options[key] = None
+        live = await _live_mcp(tmp_path, root, state=CompositionState.from_dict(payload))
+        before, saved = live.private_state, live.saved_bytes
+        before_public = await live.call("get_pipeline_state", {})
+        outside_bytes = outside.read_bytes()
+        reached: list[dict[str, Any]] = []
+        materialize = execution_validation.materialize_validation_yaml
+        instantiate = execution_validation.instantiate_runtime_plugins
+    
+        def observe_materialization(*args: Any, **kwargs: Any) -> Any:
+            result = materialize(*args, **kwargs)
+            reached.append({"phase": "materialization", "yaml": result.artifact.pipeline_yaml if isinstance(result, PhaseReport) else None})
+            return result
+    
+        def observe_plugin_setup(*args: Any, **kwargs: Any) -> Any:
+            reached.append({"phase": "plugin_setup"})
+            return instantiate(*args, **kwargs)
+    
+        monkeypatch.setattr(execution_validation, "materialize_validation_yaml", observe_materialization)
+        monkeypatch.setattr(execution_validation, "instantiate_runtime_plugins", observe_plugin_setup)
+        preview = await live.call("preview_pipeline", {})
+        preflight = preview["runtime_preflight"]
+        (tmp_path / "observed-null-preview.json").write_text(json.dumps({
+            "component": component, "key": key, "escape_link": escape_link,
+            "root": str(root), "outside": str(outside), "reached": reached, "preflight": preflight,
+            "outside_bytes_unchanged": outside.read_bytes() == outside_bytes,
+        }, indent=2))
+        path_checks = [check for check in preflight["checks"] if check["name"] == "path_allowlist"]
+        assert len(path_checks) == 1
+>       assert path_checks[0]["passed"] is False, {"preflight": preflight, "reached": reached}
+E       AssertionError: {'preflight': {'checks': [{'affected_nodes': [], 'detail': 'plugin_enablement passed.', 'name': 'plugin_enablement', '...cy_null_path_s9/data/input.csv
+E               schema:
+E                 mode: observed
+E             plugin: csv
+E         '}, {'phase': 'plugin_setup'}]}
+E       assert True is False
+
+tests/unit/composer_mcp/test_configured_root_admission.py:511: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[False-source-path]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[False-source-file]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[False-sink-path]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[False-sink-file]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[False-sink-persist-directory]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[True-source-path]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[True-source-file]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[True-sink-path]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[True-sink-file]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup[True-sink-persist-directory]
+====================== 10 failed, 165 deselected in 6.61s ======================

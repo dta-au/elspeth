@@ -1,0 +1,247 @@
+import { type JSX, useCallback, useEffect, useRef } from "react";
+import { capturePreferenceOwner, requirePreferenceOwner, PreferencesRequestSuperseded, usePreferencesStore } from "@/stores/preferencesStore";
+import { useFocusTrap } from "@/hooks/useFocusTrap";
+import { useTheme, type Theme } from "@/hooks/useTheme";
+import { Button, Input } from "@/components/ui";
+
+/**
+ * Inner preferences form. Exported standalone so component tests can render
+ * it without the modal chrome; the full panel embeds it.
+ *
+ * Surfaces a role="alert" region (Panel a11y F2) for failed PATCH results
+ * so the write failure is announced rather than silently logging to
+ * console only.
+ */
+interface ComposerPreferencesFormProps {
+  onClose?: () => void;
+  onResetTutorialComplete?: () => void;
+}
+
+export function ComposerPreferencesForm({
+  onClose,
+  onResetTutorialComplete,
+}: ComposerPreferencesFormProps = {}): JSX.Element | null {
+  const loaded = usePreferencesStore((s) => s.loaded);
+  const writing = usePreferencesStore((s) => s.writing);
+  const writeError = usePreferencesStore((s) => s.writeError);
+  const resetTutorial = usePreferencesStore((s) => s.resetTutorial);
+  const showAdvanced = usePreferencesStore((s) => s.showAdvanced);
+  const setShowAdvanced = usePreferencesStore((s) => s.setShowAdvanced);
+  const { theme, setTheme } = useTheme();
+
+  const activeRef = useRef(false);
+  const ownsMountRef = useRef(capturePreferenceOwner());
+  useEffect(() => {
+    activeRef.current = true;
+    return () => { activeRef.current = false; };
+  }, []);
+
+  // TODO(hidden-jobs-settings): Add a user-settings view for hidden jobs
+  // (run-bearing sessions archived from the switcher). The session switcher
+  // can hide/show archived rows locally, but settings should become the
+  // durable management surface for review/restore/delete policy.
+
+  const onResetTutorial = useCallback(async () => {
+    const owns = ownsMountRef.current;
+    try {
+      requirePreferenceOwner(owns);
+      const receipt = await resetTutorial();
+      receipt.assertCurrent();
+      if (activeRef.current && owns()) onResetTutorialComplete?.();
+    } catch (err) {
+      if (!activeRef.current || !owns() || err instanceof PreferencesRequestSuperseded) return;
+      console.error("[preferences] resetTutorial failed:", err);
+    }
+  }, [onResetTutorialComplete, resetTutorial]);
+
+  const onThemeChange = useCallback(
+    (nextTheme: Theme) => {
+      setTheme(nextTheme);
+    },
+    [setTheme],
+  );
+
+  const onDetailLevelChange = useCallback(
+    async (value: boolean) => {
+      const owns = ownsMountRef.current;
+      try {
+        requirePreferenceOwner(owns);
+        await setShowAdvanced(value);
+      } catch (err) {
+        if (!activeRef.current || !owns() || err instanceof PreferencesRequestSuperseded) return;
+        // Surfaced via writeError -> role="alert" region below.
+        console.error("[preferences] setShowAdvanced failed:", err);
+      }
+    },
+    [setShowAdvanced],
+  );
+
+  if (!loaded) return null;
+
+  return (
+    <>
+      <fieldset className="composer-preferences-fieldset">
+        <legend className="composer-preferences-legend">Theme</legend>
+        <label className="composer-preferences-option">
+          <Input
+            type="radio"
+            name="composer-theme"
+            value="system"
+            checked={theme === "system"}
+            onChange={() => onThemeChange("system")}
+          />
+          <span>System</span>
+        </label>
+        <label className="composer-preferences-option">
+          <Input
+            type="radio"
+            name="composer-theme"
+            value="light"
+            checked={theme === "light"}
+            onChange={() => onThemeChange("light")}
+          />
+          <span>Light</span>
+        </label>
+        <label className="composer-preferences-option">
+          <Input
+            type="radio"
+            name="composer-theme"
+            value="dark"
+            checked={theme === "dark"}
+            onChange={() => onThemeChange("dark")}
+          />
+          <span>Dark</span>
+        </label>
+      </fieldset>
+      <fieldset
+        disabled={writing}
+        aria-busy={writing}
+        className="composer-preferences-fieldset"
+      >
+        <legend className="composer-preferences-legend">Detail level</legend>
+        <label className="composer-preferences-option">
+          <Input
+            type="radio"
+            name="composer-detail-level"
+            value="standard"
+            checked={!showAdvanced}
+            disabled={writing}
+            onChange={() => void onDetailLevelChange(false)}
+          />
+          <span>Standard (recommended)</span>
+        </label>
+        <label className="composer-preferences-option">
+          <Input
+            type="radio"
+            name="composer-detail-level"
+            value="technical"
+            checked={showAdvanced}
+            disabled={writing}
+            onChange={() => void onDetailLevelChange(true)}
+          />
+          <span>Show technical detail</span>
+        </label>
+        <p className="composer-preferences-hint">
+          Technical detail shows raw plugin settings, every validation check, and advanced options. The audit trail is always shown.
+        </p>
+      </fieldset>
+      {writeError !== null && (
+        <div role="alert" className="composer-preferences-error">
+          {writeError}
+        </div>
+      )}
+      {/* ALWAYS offered (operator requirement: restart the tutorial from
+          preferences at any time). The button was originally gated on
+          tutorialCompleted, which hid it from mid-tutorial users (the wedged-
+          resume escape-hatch case) and from fresh/reset users — reading as
+          "the button disappeared". resetTutorial clears completion AND the
+          resume fields server-side, so the next load starts a fresh Welcome;
+          for a user who never started, it is a harmless no-op PATCH. */}
+      <div className="composer-preferences-actions">
+        {onClose !== undefined && (
+          <Button compact variant="primary" onClick={onClose}>
+            OK
+          </Button>
+        )}
+        <Button
+          compact
+          className="composer-preferences-reset"
+          disabled={writing}
+          onClick={() => void onResetTutorial()}
+        >
+          Reset tutorial
+        </Button>
+      </div>
+    </>
+  );
+}
+
+interface ComposerPreferencesPanelProps {
+  onClose: () => void;
+  onResetTutorialComplete?: () => void;
+}
+
+/**
+ * Modal wrapper around ComposerPreferencesForm. Backdrop + focus-trap +
+ * Escape-close + role=dialog/aria-modal, matching the SecretsPanel pattern
+ * in this codebase (src/components/settings/SecretsPanel.tsx). The project
+ * does not have a generic Dialog component — this layout is the convention.
+ */
+export function ComposerPreferencesPanel({
+  onClose,
+  onResetTutorialComplete,
+}: ComposerPreferencesPanelProps): JSX.Element {
+  const modalRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(
+    modalRef,
+    true,
+    "input[name='composer-theme']",
+  );
+
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  return (
+    <>
+      {/* Backdrop */}
+      <div
+        role="presentation"
+        onClick={onClose}
+        className="app-dialog-backdrop"
+      />
+      {/* Modal */}
+      <div
+        ref={modalRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="composer-preferences-title"
+        className="app-dialog settings-dialog"
+      >
+        <div className="secrets-panel-header">
+          <h2 id="composer-preferences-title" className="secrets-panel-title">
+            Composer preferences
+          </h2>
+          <Button
+            variant="bare"
+            onClick={onClose}
+            aria-label="Close composer preferences panel"
+            className="dialog-close"
+          >
+            ×
+          </Button>
+        </div>
+        <div className="secrets-panel-body">
+          <ComposerPreferencesForm
+            onClose={onClose}
+            onResetTutorialComplete={onResetTutorialComplete ?? onClose}
+          />
+        </div>
+      </div>
+    </>
+  );
+}

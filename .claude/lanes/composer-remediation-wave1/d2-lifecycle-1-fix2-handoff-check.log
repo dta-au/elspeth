@@ -1,0 +1,9 @@
+{"head": "f9c23c59c63bbd3099029e995a778bade594f6c8", "inputs": 6205, "sha256": "adf50234d227498f699f19624c38e89f7457125a959023a5117dc3a7b7e764b3"}
+Fix2 source/test freeze unchanged; review diff matches tested candidate.
+Original/fix1 artifacts preserved; all final scoped receipts exit0; no new files.
+ M src/elspeth/web/execution/runtime_preflight.py
+ M src/elspeth/web/process_recovery.py
+ M src/elspeth/web/process_watchdog.py
+ M tests/fixtures/process_watchdog.py
+ M tests/unit/web/execution/test_runtime_preflight_coordinator.py
+ M tests/unit/web/test_process_watchdog.py

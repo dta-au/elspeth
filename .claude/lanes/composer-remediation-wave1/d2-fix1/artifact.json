@@ -1,0 +1,22 @@
+{
+  "head": "f9c23c59c63bbd3099029e995a778bade594f6c8",
+  "changed_vs_original": [
+    "src/elspeth/web/execution/_validation_authoring.py",
+    "src/elspeth/web/execution/preflight.py",
+    "tests/unit/composer_mcp/test_configured_root_admission.py",
+    "tests/unit/web/execution/test_preflight_side_effects.py",
+    "tests/unit/web/execution/test_validation_authoring.py"
+  ],
+  "freeze_inputs": 6207,
+  "freeze_sha256": "991db7b0c8f38cacf2694421fc8785300455cf7ca1adbe14bf0d6852d536baf1",
+  "incremental_diff": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-path-admission-fix1.diff",
+  "incremental_sha256": "1f59ef6e606bcc8ec1c7027de99faa4e25a78afc4ee69fabbf59e19f79e5cd95",
+  "fullreview_diff": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-path-admission-fullreview-fix1.diff",
+  "fullreview_sha256": "9796d6dbc518b1c67deeb27b68378d2dde96f641fd8d43d45ca76613c77c0d46",
+  "original_diff_preserved": true,
+  "reverse_checks": {
+    "incremental": 0,
+    "fullreview": 0
+  },
+  "whitespace_exit": 0
+}

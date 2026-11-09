@@ -1,0 +1,1869 @@
+diff --git a/src/elspeth/composer_mcp/__init__.py b/src/elspeth/composer_mcp/__init__.py
+index 417307096..5a1fadf49 100644
+--- a/src/elspeth/composer_mcp/__init__.py
++++ b/src/elspeth/composer_mcp/__init__.py
+@@ -13,11 +13,22 @@ def create_server(*args, **kwargs):  # type: ignore[no-untyped-def]
+     return _create_server(*args, **kwargs)
+ 
+ 
+-def main(*args, **kwargs):  # type: ignore[no-untyped-def]
+-    """Run the composer MCP server. Requires the [mcp] extra."""
+-    from elspeth.composer_mcp.server import main as _main
+-
+-    return _main(*args, **kwargs)
++def main() -> None:
++    """Process-owning console entry; execute the dedicated stdlib supervisor.
++
++    This entry requires a fresh console interpreter. Embedded hosts construct
++    create_server instead, retaining their own process and executor lifecycle.
++    """
++    import runpy
++    import sys
++    from pathlib import Path
++
++    directory = Path(__file__).resolve().parent
++    supervisor = str(directory / "portable_supervisor.py")
++    sys.argv = [supervisor, sys.executable, str(directory / "runner.py"), *sys.argv[1:]]
++    # A Windows CRT exec overlay can change the observed process lifetime.
++    # Execute the same file in this already-fresh console process on every OS.
++    runpy.run_path(supervisor, run_name="__main__")
+ 
+ 
+ __all__ = ["create_server", "main"]
+diff --git a/src/elspeth/composer_mcp/portable_supervisor.py b/src/elspeth/composer_mcp/portable_supervisor.py
+index b0f4a0c47..e145451e6 100644
+--- a/src/elspeth/composer_mcp/portable_supervisor.py
++++ b/src/elspeth/composer_mcp/portable_supervisor.py
+@@ -1,9 +1,9 @@
+ """Private, dedicated Popen lifetime owner. Requires IPv4 loopback binding.
+ 
+-Execute this file directly to keep the supervisor stdlib-only. It must not be
+-embedded in a host with competing child reapers. Stdio belongs directly to the
+-runner; this owner never reads stdin or writes stdout. There is no public entry
+-point until the Composer lifespan is integrated.
++Execute this file in a fresh console interpreter to keep it stdlib-only. It
++must not be embedded in a host with competing child reapers. Stdio belongs to the
++runner; this owner never reads stdin or writes stdout. The public launcher
++executes this file, which launches exactly one authenticated private runner.
+ """
+ 
+ from __future__ import annotations
+@@ -51,10 +51,28 @@ class SupervisorFailure(RuntimeError):
+     """The owned child could not be terminated/reaped truthfully."""
+ 
+ 
++def _install_controller_death_guard(expected_parent: int, *, linux: bool = sys.platform == "linux") -> bool:
++    """Preserve Linux controller-death protection without bypassing cleanup.
++
++    The recorded parent is an observation for detecting reparenting, never a
++    signal target. Other platforms retain the shared portable supervision path.
++    Only the dedicated console entry may install this process-wide kernel state.
++    """
++    if not linux:
++        return False
++    import ctypes
++
++    libc = ctypes.CDLL(None, use_errno=True)
++    if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
++        error = ctypes.get_errno()
++        raise OSError(error, f"Composer controller-death guard failed: {os.strerror(error)}")
++    return expected_parent == 1 or os.getppid() != expected_parent
++
++
+ class _Supervisor:
+     """Single-threaded owner. The clock seam is private subprocess-test support."""
+ 
+-    def __init__(self, command: Sequence[str], *, _clock_ns: Callable[[], int] = time.monotonic_ns) -> None:
++    def __init__(self, command: Sequence[str], *, _clock_ns: Callable[[], int] = time.monotonic_ns, dedicated_cli: bool = False) -> None:
+         self.command = command
+         self.clock = _clock_ns
+         self.child: subprocess.Popen[bytes] | None = None
+@@ -63,6 +81,8 @@ class _Supervisor:
+         self.deadline: int | None = None
+         self.failed = False
+         self.completed = False
++        self.dedicated_cli = dedicated_cli
++        self._controller_parent = os.getppid()
+ 
+     def _stop(self, signum: int, frame: object) -> None:
+         # No socket, signal or wait operations in a signal handler.
+@@ -97,6 +117,8 @@ class _Supervisor:
+         for sig in previous:
+             signal.signal(sig, self._stop)
+         try:
++            if self.dedicated_cli and _install_controller_death_guard(self._controller_parent):
++                self.stop_requested = True
+             return self._run_owned()
+         finally:
+             for sig, handler in previous.items():
+@@ -147,6 +169,17 @@ class _Supervisor:
+                 selector.modify(control, selectors.EVENT_READ | selectors.EVENT_WRITE)
+ 
+             try:
++                if self.dedicated_cli:
++                    # Popen already inherited the original handles. The owner
++                    # must not independently keep client input/output alive.
++                    # Flush/close wrappers before releasing the descriptors:
++                    # CPython's original standard streams use closefd=False.
++                    # os.close also releases their CRT-owned handles on Windows.
++                    # Stderr remains available for custody diagnostics.
++                    sys.stdin.close()
++                    sys.stdout.close()
++                    os.close(0)
++                    os.close(1)
+                 while True:
+                     status = self.child.poll()
+                     if status is not None:
+@@ -259,7 +292,7 @@ def main() -> int:
+         sys.stderr.write("Private Composer supervisor requires an owned runner command\n")
+         return 2
+     try:
+-        return _Supervisor(sys.argv[1:]).run()
++        return _Supervisor(sys.argv[1:], dedicated_cli=True).run()
+     except (OSError, SupervisorFailure):
+         sys.stderr.write("Private Composer supervisor startup or process custody failed\n")
+         return 2
+diff --git a/src/elspeth/composer_mcp/server.py b/src/elspeth/composer_mcp/server.py
+index a31751374..013746f76 100644
+--- a/src/elspeth/composer_mcp/server.py
++++ b/src/elspeth/composer_mcp/server.py
+@@ -1037,7 +1037,13 @@ class _StdioValidationSettings:
+     data_dir: Path
+ 
+ 
+-def _build_stdio_server(catalog: CatalogService, scratch_dir: Path, data_dir: Path) -> Server:
++def _build_stdio_server(
++    catalog: CatalogService,
++    scratch_dir: Path,
++    data_dir: Path,
++    *,
++    runtime_preflight_coordinator: RuntimePreflightCoordinator | None = None,
++) -> Server:
+     """Build the stdio server with a runtime-equivalent preflight wired in.
+ 
+     Factored out of ``run_server`` so the construction the shipped transport
+@@ -1066,6 +1072,7 @@ def _build_stdio_server(catalog: CatalogService, scratch_dir: Path, data_dir: Pa
+         catalog,
+         scratch_dir,
+         runtime_preflight=stdio_runtime_preflight,
++        runtime_preflight_coordinator=runtime_preflight_coordinator,
+         mcp_root_authority=authority,
+         # Both extras change the verdict for one data_dir, so both belong in
+         # the key: a coordinator shared with an in-process web server would
+@@ -1074,99 +1081,34 @@ def _build_stdio_server(catalog: CatalogService, scratch_dir: Path, data_dir: Pa
+     )
+ 
+ 
+-async def run_server(catalog: CatalogService, scratch_dir: Path, data_dir: Path) -> None:
+-    """Run the MCP server with stdio transport."""
+-    server = _build_stdio_server(catalog, scratch_dir, data_dir)
+-    async with stdio_server() as (read_stream, write_stream):
+-        await server.run(read_stream, write_stream, server.create_initialization_options())
+-
++async def run_server(
++    catalog: CatalogService,
++    scratch_dir: Path,
++    data_dir: Path,
++    *,
++    runtime_preflight_coordinator: RuntimePreflightCoordinator | None = None,
++) -> None:
++    """Serve transport under the embedding host's executor lifecycle.
+ 
+-# ---------------------------------------------------------------------------
+-# WORKAROUND — Linux-only kernel guard against orphan busy-spin.
+-# Tracked by archived issue elspeth-7f99eba6ef. See _install_parent_death_signal_workaround
+-# docstring for full diagnosis and deletion criteria.
+-# ---------------------------------------------------------------------------
+-def _install_parent_death_signal_workaround() -> None:
+-    """Kernel-level guarantee that this process dies when its parent dies.
+-
+-    WORKAROUND for an upstream bug in ``mcp.server.stdio.stdio_server`` (the
+-    official MCP Python SDK). When the controlling Claude Code session
+-    terminates abnormally (crash, SIGKILL, suspend-without-resume), the
+-    SDK's stdio read coroutine fails to detect parent-pipe EOF and instead
+-    busy-spins on empty reads. Observed in production: a single orphaned
+-    pair burned ~120% CPU for 9 days before discovery (~10.8 core-days of
+-    waste). Diagnosis trace: ``~/.claude/plans/can-you-investigate-why-mighty-sphinx.md``.
+-
+-    This function uses Linux's ``prctl(PR_SET_PDEATHSIG, SIGTERM)`` so the
+-    kernel sends SIGTERM to this process when its parent dies, regardless
+-    of what the SDK's read loop does. The follow-up ``getppid() == 1``
+-    check covers the race window between process start and the prctl call:
+-    if the parent died before we registered, PDEATHSIG cannot fire (it
+-    requires a parent transition we already missed), so we exit immediately.
+-
+-    NOT A FIX — this is belt-and-braces only. The underlying SDK bug
+-    affects every platform; this guard only protects Linux. Non-Linux
+-    platforms (macOS, Windows, BSD) remain vulnerable and need either an
+-    SDK upgrade or a portable watchdog (e.g. periodic ``getppid()`` poll).
+-
+-    REVIEW SCHEDULE — archived issue ``elspeth-7f99eba6ef`` tracks the
+-    deletion criteria. Re-evaluate at every MCP SDK upgrade. Delete this
+-    function and its caller in ``main()`` when:
+-
+-    1. The pinned MCP SDK version handles stdin EOF correctly in
+-       ``stdio_server()``.
+-    2. A behavioural test confirms unclean parent-kill produces clean
+-       child exit *without* this workaround.
+-
+-    Sibling vulnerability: the retired issue tracker MCP server (same SDK)
+-    has the identical bug and needs its own fix; this workaround does not
+-    cover it.
++    Standalone callers enter through the authenticated private runner, which
++    supplies and joins its coordinator. Embedded hosts retain their own owner.
+     """
+-    import ctypes
+-    import ctypes.util
+-    import os
+-    import signal
+-    import sys
+-
+-    if sys.platform != "linux":
+-        return  # Non-Linux: no portable equivalent here. See review issue.
+-
+-    libc_name = ctypes.util.find_library("c")
+-    if libc_name is None:
+-        # No discoverable libc on a Linux system — exotic/embedded build.
+-        # Skip the guard rather than crash; the workaround is non-essential.
+-        return
+-    libc = ctypes.CDLL(libc_name, use_errno=True)
+-
+-    # PR_SET_PDEATHSIG: see ``man 2 prctl``. Constant is stable kernel ABI.
+-    pr_set_pdeathsig = 1
+-    rc = libc.prctl(pr_set_pdeathsig, signal.SIGTERM, 0, 0, 0)
+-    if rc != 0:
+-        # prctl(PR_SET_PDEATHSIG, ...) is documented as never failing for
+-        # valid arguments. A non-zero return here means we passed something
+-        # the kernel rejected — that's a bug in this function, not a runtime
+-        # condition to absorb. Crash with the errno preserved.
+-        errno = ctypes.get_errno()
+-        raise OSError(
+-            errno,
+-            f"prctl(PR_SET_PDEATHSIG, SIGTERM) failed: {os.strerror(errno)}",
+-        )
+-
+-    # Race-window cleanup: if the parent died between fork/exec and the
+-    # prctl call above, PDEATHSIG will not fire because the parent
+-    # transition already happened. Exit immediately rather than wait for
+-    # a signal that will never arrive.
+-    if os.getppid() == 1:
+-        sys.exit(0)
++    server = _build_stdio_server(catalog, scratch_dir, data_dir, runtime_preflight_coordinator=runtime_preflight_coordinator)
++    async with stdio_server() as (read_stream, write_stream):
++        await server.run(read_stream, write_stream, server.create_initialization_options())
+ 
+ 
+ def main() -> None:
+     """CLI entry point for elspeth-composer MCP server."""
+-    # WORKAROUND first — see _install_parent_death_signal_workaround
+-    # docstring and archived issue elspeth-7f99eba6ef.
+-    _install_parent_death_signal_workaround()
++    from elspeth.composer_mcp import main as launch
++
++    launch()
+ 
++
++def _parse_arguments() -> argparse.Namespace:
++    """Parse the unchanged public arguments inside the authenticated runner."""
+     parser = argparse.ArgumentParser(
++        prog="elspeth-composer",
+         description="ELSPETH Composer MCP Server",
+     )
+     parser.add_argument(
+@@ -1183,13 +1125,4 @@ def main() -> None:
+             "Configured root for local source, sink and provider authoring and preview checks (default: data). Paths escaping this directory are refused."
+         ),
+     )
+-    args = parser.parse_args()
+-
+-    # Lazy import to avoid pulling in the full catalog at module level.
+-    from elspeth.web.dependencies import create_catalog_service
+-
+-    catalog = create_catalog_service()
+-
+-    import asyncio
+-
+-    asyncio.run(run_server(catalog, args.scratch_dir, args.data_dir))
++    return parser.parse_args()
+diff --git a/src/elspeth/web/async_workers.py b/src/elspeth/web/async_workers.py
+index bada1a35e..417ad323b 100644
+--- a/src/elspeth/web/async_workers.py
++++ b/src/elspeth/web/async_workers.py
+@@ -58,6 +58,8 @@ _OUTSTANDING_ADMISSIONS = 0
+ _SHARED_SHUTDOWN_STARTED = False
+ _GENERATION_COUNTER = 0
+ _GENERATION_CUSTODIAN: RequiredExecutorGenerationCustodian | None = None
++# Only outstanding recovery ownership, never a completed-generation archive.
++_RECOVERING_GENERATIONS: set[RequiredExecutorGenerationCustodian] = set()
+ _GENERATION_UNAVAILABLE = threading.Event()
+ _INSTANCE_DRAINING = threading.Event()
+ _APPLICATION_FINALIZER_OWNER: ApplicationFinalizerOwner | None = None
+@@ -98,6 +100,35 @@ def configure_required_executor_recovery(
+     _CAPTURED_DRAIN_SECONDS = drain_seconds
+ 
+ 
++def configure_standalone_executor_recovery(
++    *,
++    drain_seconds: float,
++    instance_draining: threading.Event,
++    generation_unavailable: threading.Event,
++    recovery_callback: Callable[[RequiredGenerationDrainExpired], None],
++) -> None:
++    """Fresh-process registration; an embedding host's owner cannot be replaced."""
++    if _RECOVERY_CALLBACK is not None or _SHARED_EXECUTOR is not None or _GENERATION_CUSTODIAN is not None:
++        raise RequiredGenerationUnavailable("Standalone executor requires an unowned process")
++    configure_required_executor_recovery(
++        drain_seconds=drain_seconds,
++        instance_draining=instance_draining,
++        generation_unavailable=generation_unavailable,
++        recovery_callback=recovery_callback,
++    )
++
++
++def _retain_generation_recovery(generation: RequiredExecutorGenerationCustodian) -> None:
++    _RECOVERING_GENERATIONS.add(generation)
++
++
++def _release_generation_recovery(generation: RequiredExecutorGenerationCustodian) -> None:
++    # The callback runs after the drain thread has physically exited and the
++    # observer outcome is retrieved. Failed ownership remains for shutdown.
++    if generation.observer_error is None and generation.drain_error is None and not generation.escalated:
++        _RECOVERING_GENERATIONS.discard(generation)
++
++
+ def _assert_recovery_registered() -> None:
+     if _RECOVERY_CALLBACK is None:
+         raise AuditIntegrityError("Shared executor recovery callback absent")
+@@ -147,6 +178,8 @@ def _generation_for(
+                 recovery_callback=callback,
+                 replacement_factory=lambda: ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="async-worker"),
+                 install_replacement=_install_replacement,
++                retain_recovery=_retain_generation_recovery,
++                release_recovery=_release_generation_recovery,
+             )
+         return _GENERATION_CUSTODIAN
+ 
+@@ -566,6 +599,35 @@ async def shutdown_async_workers() -> None:
+                 shutdown_pool.shutdown(wait=True, cancel_futures=False)
+             except BaseException as original:
+                 failures.append(original)
++    # The replaced generation may no longer be _GENERATION_CUSTODIAN. Its
++    # observer and physical drain thread remain owned until this settlement.
++    for recovering in tuple(_RECOVERING_GENERATIONS):
++        observer = recovering.observer
++        assert observer is not None
++        while not observer.done():
++            try:
++                await asyncio.shield(observer)
++            except asyncio.CancelledError as original:
++                _retain_cancellation(cancellations, original)
++            except BaseException:
++                break
++        try:
++            observer.result()
++        except BaseException as original:
++            failures.append(original)
++        thread = recovering.drain_thread
++        assert thread is not None
++        while thread.is_alive():
++            try:
++                await asyncio.sleep(0.01)
++            except asyncio.CancelledError as original:
++                _retain_cancellation(cancellations, original)
++        thread.join()
++        if recovering.drain_error is not None and all(recovering.drain_error is not failure for failure in failures):
++            failures.append(recovering.drain_error)
++        if recovering.escalated:
++            failures.append(RequiredGenerationUnavailable("Required generation recovery escalated"))
++        _RECOVERING_GENERATIONS.discard(recovering)
+     if shared_joined and not failures:
+         _SHARED_EXECUTOR = None
+         if not _INSTANCE_DRAINING.is_set():
+diff --git a/src/elspeth/web/required_executor.py b/src/elspeth/web/required_executor.py
+index da962024d..8ae2fabd4 100644
+--- a/src/elspeth/web/required_executor.py
++++ b/src/elspeth/web/required_executor.py
+@@ -209,6 +209,8 @@ class RequiredExecutorGenerationCustodian:
+         recovery_callback: Callable[[RequiredGenerationDrainExpired], None],
+         replacement_factory: Callable[[], ThreadPoolExecutor],
+         install_replacement: Callable[[ThreadPoolExecutor], None],
++        retain_recovery: Callable[[RequiredExecutorGenerationCustodian], None] | None = None,
++        release_recovery: Callable[[RequiredExecutorGenerationCustodian], None] | None = None,
+     ) -> None:
+         self.executor = executor
+         self.identity = generation_identity
+@@ -219,6 +221,8 @@ class RequiredExecutorGenerationCustodian:
+         self._budget = min(drain_seconds, 30.0)
+         self._replacement_factory = replacement_factory
+         self._install_replacement = install_replacement
++        self._retain_recovery = retain_recovery
++        self._release_recovery = release_recovery
+         self.state = "active"
+         self.reservations: dict[str, InvocationReservation] = {}
+         self.deadline: float | None = None
+@@ -262,6 +266,8 @@ class RequiredExecutorGenerationCustodian:
+         self.state = "quarantined"
+         self.generation_unavailable.set()
+         self.deadline = time.monotonic() + self._budget
++        if self._retain_recovery is not None:
++            self._retain_recovery(self)
+         self.drain_thread = threading.Thread(target=self._drain, name="required-generation-drain", daemon=True)
+         self.drain_thread.start()
+         self.observer = asyncio.create_task(self._observe(), name="required-generation-observer")
+@@ -293,6 +299,9 @@ class RequiredExecutorGenerationCustodian:
+             self.observer_error = asyncio.CancelledError()
+         else:
+             self.observer_error = task.exception()
++        if self.drain_thread is not None and not self.drain_thread.is_alive() and self._release_recovery is not None:
++            self.drain_thread.join()
++            self._release_recovery(self)
+ 
+     async def _observe(self) -> None:
+         try:
+@@ -323,6 +332,12 @@ class RequiredExecutorGenerationCustodian:
+                         )
+                         return
+                 await asyncio.sleep(0.01)
++            # recovery_finished is published by the worker thread just before
++            # its return. Observe actual thread exit before releasing custody.
++            assert self.drain_thread is not None
++            while self.drain_thread.is_alive():
++                await asyncio.sleep(0.01)
++            self.drain_thread.join()
+         except BaseException as exc:
+             self.observer_error = exc
+             raise
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 4420d29a9..975f72a2c 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -684,15 +684,20 @@ def explicit_required_executor_recovery(monkeypatch: pytest.MonkeyPatch) -> Iter
+     from tests.fixtures.required_executor import RecordingRequiredGenerationRecovery, assert_owned_executor_fixture_settled
+ 
+     assert_owned_executor_fixture_settled(async_workers._GENERATION_CUSTODIAN)
++    for recovering in async_workers._RECOVERING_GENERATIONS:
++        assert_owned_executor_fixture_settled(recovering)
+     monkeypatch.setattr(async_workers, "_APPLICATION_FINALIZER_OWNER", None)
+     monkeypatch.setattr(async_workers, "_SHARED_SHUTDOWN_STARTED", False)
+     monkeypatch.setattr(async_workers, "_GENERATION_CUSTODIAN", None)
++    monkeypatch.setattr(async_workers, "_RECOVERING_GENERATIONS", set())
+     monkeypatch.setattr(async_workers, "_RECOVERY_CALLBACK", RecordingRequiredGenerationRecovery())
+     monkeypatch.setattr(async_workers, "_GENERATION_UNAVAILABLE", threading.Event())
+     monkeypatch.setattr(async_workers, "_INSTANCE_DRAINING", threading.Event())
+     monkeypatch.setattr(async_workers, "_CAPTURED_DRAIN_SECONDS", 10.0)
+     yield
+     assert_owned_executor_fixture_settled(async_workers._GENERATION_CUSTODIAN)
++    for recovering in async_workers._RECOVERING_GENERATIONS:
++        assert_owned_executor_fixture_settled(recovering)
+ 
+ 
+ @pytest.fixture(autouse=True)
+diff --git a/tests/fixtures/required_executor.py b/tests/fixtures/required_executor.py
+index 7d3d273d0..1332bdaf4 100644
+--- a/tests/fixtures/required_executor.py
++++ b/tests/fixtures/required_executor.py
+@@ -21,6 +21,10 @@ def assert_owned_executor_fixture_settled(generation: RequiredExecutorGeneration
+         return
+     failures: list[BaseException] = []
+     with generation.submission_lock:
++        if generation.observer is not None and not generation.observer.done():
++            failures.append(AssertionError("Executor fixture retained unfinished recovery observer"))
++        if generation.drain_thread is not None and generation.drain_thread.is_alive():
++            failures.append(AssertionError("Executor fixture retained live physical drain thread"))
+         for reservation in generation.reservations.values():
+             if reservation.held and not reservation.released:
+                 failures.append(AssertionError("Executor fixture retained charged invocation"))
+diff --git a/tests/unit/composer_mcp/test_server.py b/tests/unit/composer_mcp/test_server.py
+index 81e57ce03..460f04ab6 100644
+--- a/tests/unit/composer_mcp/test_server.py
++++ b/tests/unit/composer_mcp/test_server.py
+@@ -1444,10 +1444,12 @@ class TestStdioServerConstruction:
+             received.append((scratch_dir, data_dir))
+ 
+         monkeypatch.setattr(server_module, "run_server", capture_run_server)
+-        monkeypatch.setattr(server_module, "_install_parent_death_signal_workaround", lambda: None)
+         monkeypatch.setattr("elspeth.web.dependencies.create_catalog_service", _mock_catalog)
+         monkeypatch.setattr("sys.argv", ["elspeth-composer", *argv])
+-        server_module.main()
++        args = server_module._parse_arguments()
++        import asyncio
++
++        asyncio.run(server_module.run_server(_mock_catalog(), args.scratch_dir, args.data_dir))
+         return received
+ 
+     def test_main_threads_data_dir_into_run_server(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+diff --git a/docs/guides/composer-mcp-lifecycle.md b/docs/guides/composer-mcp-lifecycle.md
+new file mode 100644
+index 000000000..aae3953fa
+--- /dev/null
++++ b/docs/guides/composer-mcp-lifecycle.md
+@@ -0,0 +1,40 @@
++# Composer MCP process lifecycle
++
++`elspeth-composer` retains its stdio protocol and `--scratch-dir` / `--data-dir`
++arguments. In its fresh console interpreter, the command executes the dedicated
++standard-library supervisor file, which
++owns exactly one private runner. The runner inherits the original stdin,
++stdout, stderr, working directory and ordinary environment. The supervisor
++neither parses nor relays MCP messages and writes diagnostics only to stderr.
++
++Startup requires binding an ephemeral IPv4 socket on `127.0.0.1`. A fresh nonce
++authenticates the bounded private control connection; the runner consumes its
++bootstrap environment before importing the application or providers. Loopback
++denial fails startup. This private socket does not serve tools or HTTP. Same-user
++processes able to inspect or manipulate another process's environment are
++outside the nonce's isolation claim.
++
++Before serving tools, the runner registers its real process recovery owner and
++executor events. On EOF or catchable shutdown it arms independent supervision,
++seals and joins its retained preflight coordinator, joins worker execution and
++quarantine observers, and acknowledges completion only after settlement. The
++supervisor retains process custody until actual exit. Unresolved work is forced
++to exit after the fixed recovery grace; a forced exit is a failure. Embedded
++`create_server` / `_build_stdio_server` construction uses the embedding host's
++executor owner and does not launch or shut down a process lifecycle.
++`main` owns the console process and must not be invoked inside an existing host.
++
++The existing Linux parent-death guard now belongs to the supervisor. Controller
++death sends SIGTERM to its stop-intent handler, which arms supervision and asks
++the runner to settle cooperatively. Registration detects reparenting against its
++recorded parent identity. This extra kernel protection does not run in embedded
++hosts. On other platforms, controller loss relies on stdio EOF; the shared
++portable supervisor still handles catchable shutdown and runner recovery.
++A healthy runner force-exits if its authenticated supervisor channel is lost.
++Simultaneously destroying the supervisor and an already unresponsive runner
++cannot be made recoverable by this portable user-space mechanism.
++
++The same production supervision path runs on Linux, Windows, macOS and BSD;
++platform support has not been narrowed. Linux process/stdio and cleanup controls
++have been exercised. Native Windows handle/console and macOS/BSD qualification
++remain outstanding; Linux adapter tests do not establish native qualification.
+diff --git a/src/elspeth/composer_mcp/runner.py b/src/elspeth/composer_mcp/runner.py
+new file mode 100644
+index 000000000..9003603a1
+--- /dev/null
++++ b/src/elspeth/composer_mcp/runner.py
+@@ -0,0 +1,62 @@
++"""Private executable: authenticate before loading the Composer runtime."""
++
++from __future__ import annotations
++
++import importlib.util
++import sys
++from pathlib import Path
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from elspeth.composer_mcp.portable_bootstrap import AuthenticatedSupervisor
++
++
++def _authenticate_supervisor() -> AuthenticatedSupervisor:
++    # Loading this one stdlib-only file avoids executing contracts' eager
++    # application re-exports before authentication. Runtime imports subsequently
++    # use this same canonical module and the same nominal wire classes.
++    name = "elspeth.contracts.process_watchdog_wire"
++    if name in sys.modules:
++        raise RuntimeError("Private Composer runner requires a fresh interpreter")
++    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[1] / "contracts/process_watchdog_wire.py")
++    if spec is None or spec.loader is None:
++        raise RuntimeError("Composer wire contract is unavailable")
++    wire = importlib.util.module_from_spec(spec)
++    sys.modules[name] = wire
++    spec.loader.exec_module(wire)
++
++    from elspeth.composer_mcp.portable_bootstrap import connect_supervisor
++
++    return connect_supervisor()
++
++
++def main() -> None:
++    connection = _authenticate_supervisor()
++
++    import threading
++
++    from elspeth.composer_mcp.portable_control import PortableProcessWatchdog
++    from elspeth.contracts.process_watchdog_wire import BootstrapCompletionWitness, RecoveryReason
++
++    draining = threading.Event()
++    watchdog = PortableProcessWatchdog(connection, draining)
++    try:
++        from elspeth.composer_mcp.server import _parse_arguments
++
++        args = _parse_arguments()
++    except SystemExit:
++        watchdog.complete_bootstrap(BootstrapCompletionWitness(watchdog.target))
++        raise
++    except BaseException:
++        watchdog.abort_bootstrap(RecoveryReason.FAILED_STARTUP)
++        raise
++
++    import asyncio
++
++    from elspeth.composer_mcp.standalone import run_standalone
++
++    asyncio.run(run_standalone(watchdog, draining, args.scratch_dir, args.data_dir))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/elspeth/composer_mcp/standalone.py b/src/elspeth/composer_mcp/standalone.py
+new file mode 100644
+index 000000000..afb92f53c
+--- /dev/null
++++ b/src/elspeth/composer_mcp/standalone.py
+@@ -0,0 +1,78 @@
++"""Actual standalone root, executor ownership and truthful completion."""
++
++from __future__ import annotations
++
++import asyncio
++import threading
++from collections.abc import Awaitable, Callable
++from pathlib import Path
++
++from elspeth.composer_mcp.portable_control import PortableProcessWatchdog
++from elspeth.composer_mcp.server import run_server
++from elspeth.contracts.process_watchdog_wire import ProcessCompletionWitness
++from elspeth.web.async_workers import configure_standalone_executor_recovery, shutdown_async_workers
++from elspeth.web.dependencies import create_catalog_service
++from elspeth.web.execution.runtime_preflight import RuntimePreflightCoordinator
++from elspeth.web.process_recovery import ProcessRecovery
++
++
++async def run_standalone(watchdog: PortableProcessWatchdog, draining: threading.Event, scratch_dir: Path, data_dir: Path) -> None:
++    """Own exactly this process's serving root; never adopt a host registration."""
++    root = asyncio.current_task()
++    assert root is not None
++    watchdog.bind_root_task(root)
++    recovery = ProcessRecovery(watchdog=watchdog, instance_draining=draining)
++    recovery.start_monitor()
++    coordinator = RuntimePreflightCoordinator()
++    owned = False
++    originals: list[BaseException] = []
++    cleanup_failed = False
++    try:
++        configure_standalone_executor_recovery(
++            drain_seconds=10.0,
++            instance_draining=draining,
++            generation_unavailable=threading.Event(),
++            recovery_callback=recovery.required_generation_expired,
++        )
++        owned = True
++        catalog = create_catalog_service()
++        await run_server(catalog, scratch_dir, data_dir, runtime_preflight_coordinator=coordinator)
++    except BaseException as original:
++        originals.append(original)
++    finally:
++        # The independent grace is armed before any possibly blocked join.
++        recovery.begin_shutdown()
++
++        async def settle(action: Callable[[], Awaitable[None]]) -> None:
++            nonlocal cleanup_failed
++            # Retain each action across repeated cancellation, then continue to
++            # later actions. Cancellation is an outcome, never proof of a join.
++            task = asyncio.ensure_future(action())
++            while not task.done():
++                try:
++                    await asyncio.shield(task)
++                except asyncio.CancelledError as cancellation:
++                    originals.append(cancellation)
++                except BaseException:
++                    break
++            try:
++                task.result()
++            except BaseException as failure:
++                cleanup_failed = True
++                originals.append(failure)
++
++        await settle(recovery.join_escalation)
++        await settle(coordinator.seal_and_join)
++        if owned:
++            await settle(shutdown_async_workers)
++        # A failed join cannot issue the nominal completion assertion. An
++        # unresolved join remains awaited under the independent deadline.
++        if owned and not cleanup_failed:
++            await settle(lambda: watchdog.complete(ProcessCompletionWitness(watchdog.target)))
++            if not cleanup_failed:
++                await settle(recovery.join_monitor_after_completion)
++
++    if len(originals) == 1:
++        raise originals[0]
++    if originals:
++        raise BaseExceptionGroup("Composer serving and cleanup outcomes", originals)
+diff --git a/tests/helpers/composer_lifecycle_probe.py b/tests/helpers/composer_lifecycle_probe.py
+new file mode 100644
+index 000000000..948acfac1
+--- /dev/null
++++ b/tests/helpers/composer_lifecycle_probe.py
+@@ -0,0 +1,239 @@
++"""Precise faults around the actual standalone lifecycle and supervisor."""
++
++from __future__ import annotations
++
++import json
++import os
++import sys
++from pathlib import Path
++
++
++async def embedded_calls(directory: Path, coordinator):
++    from mcp.types import CallToolRequest, CallToolRequestParams
++
++    from elspeth.composer_mcp.server import _build_stdio_server
++    from elspeth.web.dependencies import create_catalog_service
++
++    server = _build_stdio_server(
++        create_catalog_service(), directory / "scratch", directory / "data", runtime_preflight_coordinator=coordinator
++    )
++
++    async def call(name, arguments):
++        response = await server.request_handlers[CallToolRequest](
++            CallToolRequest(method="tools/call", params=CallToolRequestParams(name=name, arguments=arguments))
++        )
++        result = response.root
++        return {"transport_error": result.content[0].text} if result.isError else json.loads(result.content[0].text)
++
++    source = await call(
++        "set_source",
++        {"plugin": "null", "on_success": "result", "options": {"schema": {"mode": "observed"}}, "on_validation_failure": "discard"},
++    )
++    output = await call(
++        "set_output",
++        {
++            "sink_name": "result",
++            "plugin": "csv",
++            "options": {"path": "output.csv", "schema": {"mode": "observed"}, "mode": "write", "collision_policy": "auto_increment"},
++            "on_write_failure": "discard",
++        },
++    )
++    assert source["success"] and output["success"]
++    return await call("preview_pipeline", {})
++
++
++def embedded_without_owner(directory: Path) -> None:
++    import asyncio
++
++    from elspeth.web import async_workers
++    from elspeth.web.execution.runtime_preflight import RuntimePreflightCoordinator
++
++    async def run():
++        assert async_workers._RECOVERY_CALLBACK is None
++        coordinator = RuntimePreflightCoordinator()
++        preview = await embedded_calls(directory, coordinator)
++        assert preview == {"transport_error": "Tool error: AuditIntegrityError"}, preview
++        assert async_workers._RECOVERY_CALLBACK is None and async_workers._SHARED_EXECUTOR is None
++        await coordinator.seal_and_join()
++        (directory / "embedded.json").write_text(json.dumps(preview))
++
++    asyncio.run(run())
++
++
++def child(directory: Path, mode: str) -> None:
++    from elspeth.composer_mcp.runner import _authenticate_supervisor
++
++    assert "elspeth.contracts" not in sys.modules
++    assert "elspeth.composer_mcp.server" not in sys.modules
++    nonce = os.environ["_ELSPETH_COMPOSER_CONTROL_NONCE"]
++    connection = _authenticate_supervisor()
++    assert "elspeth.contracts" not in sys.modules
++    assert "elspeth.composer_mcp.server" not in sys.modules
++    assert not any(name.startswith("elspeth.plugins") for name in sys.modules)
++    assert "_ELSPETH_COMPOSER_CONTROL_NONCE" not in os.environ
++    assert "_ELSPETH_COMPOSER_CONTROL_PORT" not in os.environ
++    wire = sys.modules["elspeth.contracts.process_watchdog_wire"]
++
++    import asyncio
++    import subprocess
++    import threading
++    import time
++    from contextlib import asynccontextmanager
++
++    from elspeth.composer_mcp import server, standalone
++    from elspeth.composer_mcp.portable_control import PortableProcessWatchdog
++    from elspeth.contracts import process_watchdog_wire
++    from elspeth.web import async_workers
++
++    descendant = subprocess.check_output([sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"])
++    assert nonce.encode() not in descendant
++    assert b"_ELSPETH_COMPOSER_CONTROL_" not in descendant
++
++    assert wire is process_watchdog_wire
++    assert wire.ProcessWatchdogTarget is process_watchdog_wire.ProcessWatchdogTarget
++    assert wire.ProcessCompletionWitness is process_watchdog_wire.ProcessCompletionWitness
++    (directory / "authenticated.json").write_text(
++        json.dumps({"pid": os.getpid(), "canonical_wire": True, "bootstrap_consumed": True, "descendant_bootstrap_absent": True})
++    )
++    draining = threading.Event()
++    watchdog = PortableProcessWatchdog(connection, draining)
++    begin = watchdog.begin_recovery
++    complete = watchdog.complete
++
++    async def observed_begin(reason):
++        receipt = await begin(reason)
++        (directory / "draining.json").write_text(json.dumps({"admissions": async_workers.outstanding_admissions()}))
++        return receipt
++
++    async def observed_complete(witness):
++        assert async_workers.outstanding_admissions() == 0
++        assert not async_workers._RECOVERING_GENERATIONS
++        assert async_workers._SHARED_EXECUTOR is None
++        (directory / "completion").write_text("settled")
++        await complete(witness)
++
++    watchdog.begin_recovery = observed_begin
++    watchdog.complete = observed_complete
++    if mode.startswith("blocked"):
++        validate = server.validate_pipeline
++
++        def held_validation(*args, **kwargs):
++            (directory / "worker").write_text("entered")
++            while not (directory / "release").exists():
++                time.sleep(0.01)
++            return validate(*args, **kwargs)
++
++        server.validate_pipeline = held_validation
++    if mode == "quarantine":
++        from concurrent.futures import ThreadPoolExecutor
++
++        from elspeth.web.process_recovery import ProcessRecovery
++
++        catalog_factory = standalone.create_catalog_service
++        expired = ProcessRecovery.required_generation_expired
++
++        def observed_expiry(recovery, observation):
++            expired(recovery, observation)
++            (directory / "expired").write_text("actual required generation expiry")
++
++        ProcessRecovery.required_generation_expired = observed_expiry
++
++        class QueueThenRaiseExecutor(ThreadPoolExecutor):
++            def submit(self, fn, /, *args, **kwargs):
++                super().submit(fn, *args, **kwargs)
++                (directory / "worker").write_text("actual queued submission fault")
++                raise RuntimeError("submit failed after queueing")
++
++        def quarantining_catalog():
++            catalog = catalog_factory()
++            executor = QueueThenRaiseExecutor(max_workers=1)
++
++            def physical_blocker():
++                while not (directory / "release").exists():
++                    time.sleep(0.01)
++
++            ThreadPoolExecutor.submit(executor, physical_blocker)
++            async_workers._SHARED_EXECUTOR = executor
++            return catalog
++
++        standalone.create_catalog_service = quarantining_catalog
++    if mode == "startup-failure":
++
++        def failed_catalog():
++            raise LookupError("startup fault")
++
++        standalone.create_catalog_service = failed_catalog
++    if mode in ("transport-failure", "cleanup-failure"):
++        transport = server.stdio_server
++
++        @asynccontextmanager
++        async def failing_transport():
++            async with transport() as streams:
++                yield streams
++            raise OSError("transport fault")
++
++        server.stdio_server = failing_transport
++    if mode == "cleanup-failure":
++        shutdown = standalone.shutdown_async_workers
++
++        async def failed_shutdown():
++            await shutdown()
++            (directory / "workers-joined").write_text("settled")
++            raise ArithmeticError("cleanup fault")
++
++        standalone.shutdown_async_workers = failed_shutdown
++
++    async def run():
++        try:
++            if mode == "embedded-owned":
++                from elspeth.contracts.process_watchdog_wire import ProcessCompletionWitness
++                from elspeth.web.execution.runtime_preflight import RuntimePreflightCoordinator
++                from elspeth.web.process_recovery import ProcessRecovery
++
++                root = asyncio.current_task()
++                assert root is not None
++                watchdog.bind_root_task(root)
++                recovery = ProcessRecovery(watchdog=watchdog, instance_draining=draining)
++                recovery.start_monitor()
++                unavailable = threading.Event()
++                callback = recovery.required_generation_expired
++                async_workers.configure_required_executor_recovery(
++                    drain_seconds=10, instance_draining=draining, generation_unavailable=unavailable, recovery_callback=callback
++                )
++                coordinator = RuntimePreflightCoordinator()
++                preview = await embedded_calls(directory, coordinator)
++                assert preview["data"]["preview_is_valid"], preview
++                assert async_workers._RECOVERY_CALLBACK is callback
++                assert async_workers._INSTANCE_DRAINING is draining and not draining.is_set()
++                assert async_workers._GENERATION_UNAVAILABLE is unavailable
++                assert async_workers._SHARED_EXECUTOR is not None
++                assert not async_workers._SHARED_SHUTDOWN_STARTED and not coordinator._sealed
++                (directory / "embedded.json").write_text(
++                    json.dumps({"preview_valid": True, "host_owner_preserved": True, "host_coordinator_open": True})
++                )
++                recovery.begin_shutdown()
++                await recovery.join_escalation()
++                await coordinator.seal_and_join()
++                await async_workers.shutdown_async_workers()
++                await watchdog.complete(ProcessCompletionWitness(watchdog.target))
++                await recovery.join_monitor_after_completion()
++            else:
++                await standalone.run_standalone(watchdog, draining, directory / "scratch", directory / "data")
++        except BaseException as error:
++
++            def classes(exc):
++                if isinstance(exc, BaseExceptionGroup):
++                    return [item for child_error in exc.exceptions for item in classes(child_error)]
++                return [type(exc).__name__]
++
++            (directory / "outcomes.json").write_text(json.dumps(classes(error)))
++            raise
++
++    asyncio.run(run())
++
++
++if __name__ == "__main__":
++    if sys.argv[2] == "embedded-unowned":
++        embedded_without_owner(Path(sys.argv[1]))
++    else:
++        child(Path(sys.argv[1]), sys.argv[2])
+diff --git a/tests/helpers/composer_parent_death_probe.py b/tests/helpers/composer_parent_death_probe.py
+new file mode 100644
+index 000000000..d3ecd4cf9
+--- /dev/null
++++ b/tests/helpers/composer_parent_death_probe.py
+@@ -0,0 +1,143 @@
++"""Isolated Linux subreaper observes only this test's retained descendants."""
++
++from __future__ import annotations
++
++import asyncio
++import ctypes
++import json
++import os
++import signal
++import subprocess
++import sys
++import time
++from pathlib import Path
++from unittest.mock import patch
++
++from composer_stdio_probe import linux_owned_children
++from mcp import ClientSession, StdioServerParameters
++from mcp.client import stdio
++
++
++async def controller(directory: Path, *, channel_loss: bool) -> None:
++    processes = []
++    create = stdio._create_platform_compatible_process
++
++    async def observe(*args, **kwargs):
++        process = await create(*args, **kwargs)
++        processes.append(process)
++        return process
++
++    parameters = StdioServerParameters(
++        command=str(Path(sys.executable).parent / "elspeth-composer"),
++        args=["--scratch-dir", str(directory / "scratch"), "--data-dir", str(directory / "data")],
++        env=dict(os.environ),
++    )
++    with (directory / "runner-stderr.log").open("w") as errors, patch.object(stdio, "_create_platform_compatible_process", observe):
++        async with stdio.stdio_client(parameters, errlog=errors) as streams, ClientSession(*streams) as session:
++            await session.initialize()
++            supervisor = processes[0].pid
++            children = linux_owned_children(supervisor)
++            assert len(children) == 1
++            (directory / "ready.json").write_text(json.dumps({"supervisor": supervisor, "runner": children[0]}))
++            if channel_loss:
++                while not (directory / "kill-supervisor").exists():
++                    await asyncio.sleep(0.01)
++                processes[0].kill()  # Exact SDK-owned process handle.
++                assert await processes[0].wait() == -signal.SIGKILL
++                (directory / "supervisor-killed").write_text("observed and reaped")
++            else:
++                await asyncio.Event().wait()
++
++
++def subreaper(directory: Path, *, channel_loss: bool) -> None:
++    # This state affects only this isolated harness. No competing wildcard
++    # reaper, parent pytest syscall, or PID-discovered signal target is used.
++    libc = ctypes.CDLL(None, use_errno=True)
++    assert libc.prctl(36, 1, 0, 0, 0) == 0  # PR_SET_CHILD_SUBREAPER
++    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
++    owned = None
++    with (directory / "controller-stderr.log").open("w") as errors:
++        process = subprocess.Popen(
++            [sys.executable, str(Path(__file__)), "controller-loss" if channel_loss else "controller", str(directory)],
++            stdin=subprocess.DEVNULL,
++            stdout=subprocess.DEVNULL,
++            stderr=errors,
++        )
++        try:
++            deadline = time.monotonic() + 12
++            while not (directory / "ready.json").exists():
++                assert process.poll() is None, "controller exited before public initialization"
++                if time.monotonic() >= deadline:
++                    raise TimeoutError("controller startup expired")
++                time.sleep(0.01)
++            owned = json.loads((directory / "ready.json").read_text())
++            if channel_loss:
++                (directory / "kill-supervisor").write_text("kill exact controller-owned supervisor")
++                deadline = time.monotonic() + 12
++                while not (directory / "supervisor-killed").exists():
++                    if time.monotonic() >= deadline:
++                        raise TimeoutError("controller did not reap its killed supervisor")
++                    time.sleep(0.01)
++                target = owned["runner"]
++            else:
++                process.kill()  # Exact retained Popen, deliberately uncatchable.
++                assert process.wait(timeout=5) == -signal.SIGKILL
++                target = owned["supervisor"]
++            deadline = time.monotonic() + 12
++            while True:
++                # The reaped parent exit transfers this exact descendant to
++                # the subreaper. waitpid confirms actual child custody.
++                observed, status = os.waitpid(target, os.WNOHANG)
++                if observed:
++                    break
++                if time.monotonic() >= deadline:
++                    raise TimeoutError("public supervisor did not settle on controller death")
++                time.sleep(0.01)
++            if channel_loss:
++                assert os.waitstatus_to_exitcode(status) == 70
++                assert process.wait(timeout=5) == 0
++                (directory / "channel-loss.json").write_text(
++                    json.dumps(
++                        {
++                            "supervisor_returncode": -signal.SIGKILL,
++                            "runner_returncode": 70,
++                            "runner_reaped_by_subreaper": True,
++                            "controller_returncode": 0,
++                        }
++                    )
++                )
++            else:
++                assert os.waitstatus_to_exitcode(status) == 1
++                assert not Path(f"/proc/{owned['runner']}").exists(), "real supervisor must reap its runner"
++                (directory / "parent-death.json").write_text(
++                    json.dumps(
++                        {
++                            "controller_returncode": process.returncode,
++                            "supervisor_returncode": os.waitstatus_to_exitcode(status),
++                            "supervisor_reaped": True,
++                            "runner_reaped_by_supervisor": True,
++                        }
++                    )
++                )
++        finally:
++            if process.poll() is None:
++                process.kill()
++                process.wait(timeout=5)
++            if owned is not None:
++                for pid in (owned["supervisor"], owned["runner"]):
++                    try:
++                        observed, _ = os.waitpid(pid, os.WNOHANG)
++                    except ChildProcessError:
++                        continue
++                    if not observed:
++                        # A zero wait result proves an unreaped owned child;
++                        # only this harness can reap it or signal it now.
++                        os.kill(pid, signal.SIGKILL)
++                        os.waitpid(pid, 0)
++
++
++if __name__ == "__main__":
++    if sys.argv[1].startswith("controller"):
++        asyncio.run(controller(Path(sys.argv[2]), channel_loss=sys.argv[1] == "controller-loss"))
++    else:
++        subreaper(Path(sys.argv[2]), channel_loss=sys.argv[1] == "subreaper-channel-loss")
+diff --git a/tests/helpers/composer_stdio_ownership_probe.py b/tests/helpers/composer_stdio_ownership_probe.py
+new file mode 100644
+index 000000000..701948c19
+--- /dev/null
++++ b/tests/helpers/composer_stdio_ownership_probe.py
+@@ -0,0 +1,128 @@
++"""Observe actual stdio pipe ownership through the dedicated production owner."""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++import threading
++import time
++from contextlib import suppress
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++def runner(directory: Path) -> None:
++    from elspeth.composer_mcp.runner import _authenticate_supervisor
++
++    connection = _authenticate_supervisor()
++
++    from elspeth.composer_mcp.portable_control import PortableProcessWatchdog
++    from elspeth.contracts.process_watchdog_wire import BootstrapCompletionWitness
++
++    owner = PortableProcessWatchdog(connection, threading.Event())
++    token = b""
++    while len(token) < 4:
++        chunk = os.read(0, 4 - len(token))
++        if not chunk:
++            raise RuntimeError("Inherited runner input closed before positive control")
++        token += chunk
++    assert token == b"ping"
++    os.write(1, b"pong")
++    os.write(2, b"runner-inherited-stderr\n")
++    # These are the runner's own copies. Keep its authenticated connection and
++    # process alive after releasing both transport ends.
++    sys.stdin.close()
++    sys.stdout.close()
++    os.close(0)
++    os.close(1)
++    (directory / "runner-closed.json").write_text(json.dumps({"pid": os.getpid()}))
++    deadline = time.monotonic() + 12
++    while not (directory / "release").exists():
++        if time.monotonic() >= deadline:
++            raise TimeoutError("Outer stdio ownership probe did not release runner")
++        time.sleep(0.01)
++    os.write(2, b"runner-stderr-after-transport-close\n")
++    owner.complete_bootstrap(BootstrapCompletionWitness(owner.target))
++
++
++def probe(directory: Path) -> None:
++    command = [
++        sys.executable,
++        str(ROOT / "src/elspeth/composer_mcp/portable_supervisor.py"),
++        sys.executable,
++        str(Path(__file__)),
++        "runner",
++        str(directory),
++    ]
++    with (directory / "stderr.log").open("wb") as errors:
++        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
++        assert process.stdin is not None and process.stdout is not None
++        echoed = threading.Event()
++        eof = threading.Event()
++        output: list[bytes] = []
++
++        def read_output() -> None:
++            output.append(process.stdout.read(4))
++            echoed.set()
++            output.append(process.stdout.read(1))
++            eof.set()
++
++        reader = threading.Thread(target=read_output, name="owned-stdio-probe-reader", daemon=True)
++        reader.start()
++        try:
++            process.stdin.write(b"ping")
++            process.stdin.flush()
++            deadline = time.monotonic() + 10
++            while not (directory / "runner-closed.json").exists():
++                assert process.poll() is None, "supervisor exited before ownership observation"
++                if time.monotonic() >= deadline:
++                    raise TimeoutError("Runner did not close inherited transport")
++                time.sleep(0.01)
++            assert echoed.wait(1) and output[0] == b"pong"
++            before = process.poll()
++            output_eof = eof.wait(0.5) and output[1] == b""
++            try:
++                os.write(process.stdin.fileno(), b"reader-probe")
++            except BrokenPipeError:
++                input_reader_gone = True
++            else:
++                input_reader_gone = False
++            after = process.poll()
++            observation = {
++                "supervisor_alive_before": before is None,
++                "supervisor_alive_after": after is None,
++                "stdout_eof_while_alive": output_eof,
++                "stdin_reader_gone_while_alive": input_reader_gone,
++                "inherited_echo": output[0].decode(),
++            }
++            (directory / "observation.json").write_text(json.dumps(observation, indent=2))
++            assert observation == {
++                "supervisor_alive_before": True,
++                "supervisor_alive_after": True,
++                "stdout_eof_while_alive": True,
++                "stdin_reader_gone_while_alive": True,
++                "inherited_echo": "pong",
++            }, observation
++        finally:
++            (directory / "release").write_text("settle the exact owned runner")
++            # Closing a buffered writer after the successful loss-of-reader
++            # observation can itself report the same expected broken pipe.
++            with suppress(BrokenPipeError):
++                process.stdin.close()
++            status = process.wait(timeout=8)
++            reader.join(timeout=2)
++            assert not reader.is_alive()
++            process.stdout.close()
++            (directory / "status.json").write_text(json.dumps({"returncode": status}))
++            assert status == 0
++        assert (directory / "stderr.log").read_bytes() == b"runner-inherited-stderr\nrunner-stderr-after-transport-close\n"
++
++
++if __name__ == "__main__":
++    if sys.argv[1] == "runner":
++        runner(Path(sys.argv[2]))
++    else:
++        probe(Path(sys.argv[2]))
+diff --git a/tests/helpers/composer_stdio_probe.py b/tests/helpers/composer_stdio_probe.py
+new file mode 100644
+index 000000000..36daf7a48
+--- /dev/null
++++ b/tests/helpers/composer_stdio_probe.py
+@@ -0,0 +1,187 @@
++"""Fresh public SDK client; no application imports or child recovery injection."""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++import sys
++from pathlib import Path
++from unittest.mock import patch
++
++from mcp import ClientSession, StdioServerParameters
++from mcp.client import stdio
++
++
++def linux_owned_children(parent_pid: int) -> list[int]:
++    """Measure direct children using PPid; this kernel omits task/children."""
++    children = []
++    for entry in Path("/proc").iterdir():
++        if not entry.name.isdecimal():
++            continue
++        try:
++            status = (entry / "status").read_text()
++        except (FileNotFoundError, ProcessLookupError):
++            continue
++        parent = next(line.split()[1] for line in status.splitlines() if line.startswith("PPid:"))
++        if int(parent) == parent_pid:
++            children.append(int(entry.name))
++    return sorted(children)
++
++
++async def probe(directory: Path) -> dict:
++    directory.mkdir(parents=True, exist_ok=True)
++    root = directory / "data"
++    root.mkdir(exist_ok=True)
++    (root / "input.csv").write_text("text\nhello\n")
++    processes = []
++    create = stdio._create_platform_compatible_process
++
++    async def observe(*args, **kwargs):
++        process = await create(*args, **kwargs)
++        processes.append(process)
++        return process
++
++    receipt = {}
++    parameters = StdioServerParameters(
++        command=str(Path(sys.executable).parent / "elspeth-composer"),
++        args=["--scratch-dir", str(directory / "scratch"), "--data-dir", str(root)],
++        env=dict(os.environ),
++    )
++    with (directory / "stderr.log").open("w") as errors, patch.object(stdio, "_create_platform_compatible_process", observe):
++        async with stdio.stdio_client(parameters, errlog=errors) as streams, ClientSession(*streams) as session:
++            await session.initialize()
++            if sys.platform == "linux":
++                launcher = processes[0].pid
++                children = linux_owned_children(launcher)
++                assert len(children) == 1, children
++                receipt["topology"] = {"supervisor": launcher, "runner": int(children[0])}
++
++            async def call(name, arguments):
++                result = await session.call_tool(name, arguments)
++                assert len(result.content) == 1
++                return json.loads(result.content[0].text) if not result.isError else {"transport_error": result.content[0].text}
++
++            receipt["new"] = await call("new_session", {})
++            source = {
++                "plugin": "null",
++                "on_success": "result",
++                "options": {"schema": {"mode": "observed"}},
++                "on_validation_failure": "discard",
++            }
++            output = {
++                "sink_name": "result",
++                "plugin": "csv",
++                "options": {"path": "output.csv", "schema": {"mode": "observed"}, "mode": "write", "collision_policy": "auto_increment"},
++                "on_write_failure": "discard",
++            }
++            receipt["source"] = await call("set_source", source)
++            receipt["output"] = await call("set_output", output)
++            receipt["preview"] = await call("preview_pipeline", {})
++            if "transport_error" not in receipt["preview"]:
++                source.update(plugin="csv", options={"path": "input.csv", "schema": {"mode": "observed"}})
++                receipt["file_source"] = await call("set_source", source)
++                for form in ("source", "sources"):
++                    pipeline = {form: source if form == "source" else {"orders": source}, "nodes": [], "edges": [], "outputs": [output]}
++                    receipt[form + "_pipeline"] = await call("set_pipeline", pipeline)
++                    receipt[form + "_preview"] = await call("preview_pipeline", {})
++                    assert receipt[form + "_pipeline"]["success"], receipt[form + "_pipeline"]
++                    verdict = receipt[form + "_preview"]
++                    assert verdict["data"]["preview_is_valid"], verdict
++                    assert {"path_allowlist", "plugin_instantiation", "graph_structure", "schema_compatibility"} <= {
++                        check["name"] for check in verdict["runtime_preflight"]["checks"] if check["passed"]
++                    }
++                receipt["patch"] = await call("patch_output_options", {"sink_name": "result", "patch": {"path": "patched.csv"}})
++                assert receipt["patch"]["success"], receipt["patch"]
++                sid = receipt["new"]["data"]["session_id"]
++                await call("save_session", {"session_id": sid})
++                saved_path = directory / "scratch" / f"{sid}.json"
++                saved = saved_path.read_bytes()
++                outside = directory / "outside.csv"
++                outside.write_text("text\nprivate\n")
++                (root / "escape.csv").symlink_to(outside)
++                for value in (str(outside), "../outside.csv", "escape.csv"):
++                    refusal = await call("patch_source_options", {"source_name": "orders", "patch": {"path": value}})
++                    assert not refusal["success"] and refusal["validation"]["errors"][0]["error_code"] == "source_path_policy_invalid", (
++                        refusal
++                    )
++                    await call("save_session", {"session_id": sid})
++                    assert saved_path.read_bytes() == saved
++                receipt["export"] = await call("generate_yaml", {})
++                assert receipt["export"]["success"], receipt["export"]
++                assert "input.csv" not in json.dumps(receipt["export"])
++                assert "patched.csv" not in json.dumps(receipt["export"])
++                await call("save_session", {"session_id": sid})
++                assert saved_path.read_bytes() == saved
++                receipt["private"] = json.loads(saved)
++                legacy = json.loads(saved)
++                legacy["sources"]["orders"]["options"]["path"] = str(outside)
++                legacy["version"] += 1
++                saved_path.write_text(json.dumps(legacy))
++                escaped = saved_path.read_bytes()
++                receipt["legacy_load"] = await call("load_session", {"session_id": sid})
++                receipt["legacy_preview"] = await call("preview_pipeline", {})
++                assert receipt["legacy_load"]["success"], receipt["legacy_load"]
++                verdict = receipt["legacy_preview"]
++                assert not verdict["data"]["preview_is_valid"]
++                assert any(check["name"] == "path_allowlist" and not check["passed"] for check in verdict["runtime_preflight"]["checks"]), (
++                    verdict
++                )
++                await call("save_session", {"session_id": sid})
++                # Loading retains private options; a save canonicalizes JSON.
++                assert json.loads(saved_path.read_bytes()) == json.loads(escaped)
++                provider_source = {
++                    **source,
++                    "on_success": "rows",
++                    "options": {"path": "PRIVATE-SOURCE.csv", "schema": {"mode": "observed"}},
++                }
++                provider_output = {**output, "options": {**output["options"], "path": "PRIVATE-OUTPUT.csv"}}
++                provider_node = {
++                    "id": "retrieval",
++                    "node_type": "transform",
++                    "plugin": "rag_retrieval",
++                    "input": "rows",
++                    "on_success": "result",
++                    "on_error": "discard",
++                    "options": {
++                        "provider": "chroma",
++                        "provider_config": {"collection": "docs", "persist_directory": "PRIVATE-PROVIDER"},
++                        "schema": {"mode": "flexible", "fields": ["text: str"]},
++                        "output_prefix": "rag_",
++                        "query_field": "text",
++                    },
++                }
++                receipt["provider_author"] = await call(
++                    "set_pipeline",
++                    {"sources": {"orders": provider_source}, "nodes": [provider_node], "edges": [], "outputs": [provider_output]},
++                )
++                assert receipt["provider_author"]["success"], receipt["provider_author"]
++                # Authoring/export never invokes the provider or a preview.
++                receipt["provider_export"] = await call("generate_yaml", {})
++                assert receipt["provider_export"]["success"], receipt["provider_export"]
++                for private_path in ("PRIVATE-SOURCE.csv", "PRIVATE-OUTPUT.csv", "PRIVATE-PROVIDER"):
++                    assert private_path not in json.dumps(receipt["provider_export"])
++                await call("save_session", {"session_id": sid})
++                provider_saved = saved_path.read_bytes()
++                provider_private = json.loads(provider_saved)
++                assert provider_private["sources"]["orders"]["options"]["path"] == "PRIVATE-SOURCE.csv"
++                assert provider_private["outputs"][0]["options"]["path"] == "outputs/PRIVATE-OUTPUT.csv"
++                assert provider_private["nodes"][0]["options"]["provider_config"]["persist_directory"] == "PRIVATE-PROVIDER"
++                await call("generate_yaml", {})
++                await call("save_session", {"session_id": sid})
++                assert saved_path.read_bytes() == provider_saved
++                receipt["provider_private"] = provider_private
++    receipt["returncode"] = processes[0].returncode
++    if sys.platform == "linux":
++        assert not Path(f"/proc/{receipt['topology']['supervisor']}").exists()
++        assert not Path(f"/proc/{receipt['topology']['runner']}").exists()
++    (directory / "receipt.json").write_text(json.dumps(receipt, indent=2))
++    assert receipt["source"]["success"] and receipt["output"]["success"], receipt
++    assert "transport_error" not in receipt["preview"], receipt["preview"]
++    assert receipt["preview"]["data"]["preview_is_valid"], receipt["preview"]
++    assert receipt["returncode"] == 0, receipt["returncode"]
++    return receipt
++
++
++if __name__ == "__main__":
++    asyncio.run(probe(Path(sys.argv[1])))
+diff --git a/tests/unit/composer_mcp/test_standalone_lifecycle.py b/tests/unit/composer_mcp/test_standalone_lifecycle.py
+new file mode 100644
+index 000000000..ac48a7b47
+--- /dev/null
++++ b/tests/unit/composer_mcp/test_standalone_lifecycle.py
+@@ -0,0 +1,373 @@
++"""Fresh processes prove the actual standalone root and public CLI ownership."""
++
++from __future__ import annotations
++
++import asyncio
++import errno
++import json
++import os
++import signal
++import subprocess
++import sys
++import time
++from pathlib import Path
++from unittest.mock import patch
++
++import pytest
++from mcp import ClientSession, StdioServerParameters
++from mcp.client import stdio
++
++from tests.helpers.composer_stdio_probe import linux_owned_children, probe
++
++ROOT = Path(__file__).resolve().parents[3]
++SUPERVISOR = ROOT / "src/elspeth/composer_mcp/portable_supervisor.py"
++CHILD = ROOT / "tests/helpers/composer_lifecycle_probe.py"
++
++
++def test_dedicated_supervisor_releases_actual_transport_ends_while_alive(tmp_path: Path) -> None:
++    helper = ROOT / "tests/helpers/composer_stdio_ownership_probe.py"
++    result = subprocess.run([sys.executable, str(helper), "probe", str(tmp_path)], capture_output=True, timeout=25)
++    assert result.returncode == 0 and result.stdout == b"", result.stderr.decode()
++    assert json.loads((tmp_path / "observation.json").read_text()) == {
++        "supervisor_alive_before": True,
++        "supervisor_alive_after": True,
++        "stdout_eof_while_alive": True,
++        "stdin_reader_gone_while_alive": True,
++        "inherited_echo": "pong",
++    }
++    assert json.loads((tmp_path / "status.json").read_text()) == {"returncode": 0}
++
++
++@pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc measurement controls")
++def test_child_inventory_finds_owned_positive_and_empty_negative() -> None:
++    process = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"], stdin=subprocess.PIPE)
++    try:
++        assert process.pid in linux_owned_children(os.getpid())
++        assert linux_owned_children(process.pid) == []
++        process.communicate(timeout=5)
++        assert process.returncode == 0
++        assert process.pid not in linux_owned_children(os.getpid())
++    finally:
++        if process.poll() is None:
++            process.kill()
++            process.wait(timeout=5)
++
++
++@pytest.mark.skipif(sys.platform != "linux", reason="actual Linux controller-death and subreaper custody")
++def test_actual_controller_death_stops_public_owner_and_reaps_runner(tmp_path: Path) -> None:
++    helper = ROOT / "tests/helpers/composer_parent_death_probe.py"
++    result = subprocess.run([sys.executable, str(helper), "subreaper", str(tmp_path)], capture_output=True, timeout=40)
++    assert result.returncode == 0 and result.stdout == b"", result.stderr.decode()
++    assert json.loads((tmp_path / "parent-death.json").read_text()) == {
++        "controller_returncode": -signal.SIGKILL,
++        "supervisor_returncode": 1,
++        "supervisor_reaped": True,
++        "runner_reaped_by_supervisor": True,
++    }
++
++
++@pytest.mark.skipif(sys.platform != "linux", reason="actual Linux adopted-child custody after supervisor loss")
++def test_supervisor_loss_forces_actual_public_runner_and_reaps_it(tmp_path: Path) -> None:
++    helper = ROOT / "tests/helpers/composer_parent_death_probe.py"
++    result = subprocess.run([sys.executable, str(helper), "subreaper-channel-loss", str(tmp_path)], capture_output=True, timeout=40)
++    assert result.returncode == 0 and result.stdout == b"", result.stderr.decode()
++    assert json.loads((tmp_path / "channel-loss.json").read_text()) == {
++        "supervisor_returncode": -signal.SIGKILL,
++        "runner_returncode": 70,
++        "runner_reaped_by_subreaper": True,
++        "controller_returncode": 0,
++    }
++
++
++@pytest.mark.parametrize("parent_changed", [False, True])
++def test_guard_registration_detects_reparenting_without_pid_one(monkeypatch, parent_changed: bool) -> None:
++    import ctypes
++
++    from elspeth.composer_mcp import portable_supervisor as production
++
++    calls = []
++
++    class Libc:
++        def prctl(self, *args):
++            calls.append(args)
++            return 0
++
++    monkeypatch.setattr(ctypes, "CDLL", lambda *args, **kwargs: Libc())
++    monkeypatch.setattr(production.os, "getppid", lambda: 902 if parent_changed else 901)
++    assert production._install_controller_death_guard(901, linux=True) is parent_changed
++    assert calls == [(1, signal.SIGTERM, 0, 0, 0)]
++
++
++def test_non_linux_guard_branch_does_not_touch_process_state(monkeypatch) -> None:
++    import ctypes
++
++    from elspeth.composer_mcp import portable_supervisor as production
++
++    def forbidden(*args, **kwargs):
++        raise AssertionError("non-Linux adapter must not load libc")
++
++    monkeypatch.setattr(ctypes, "CDLL", forbidden)
++    assert production._install_controller_death_guard(901, linux=False) is False
++
++
++def test_guard_syscall_failure_is_visible(monkeypatch) -> None:
++    import ctypes
++
++    from elspeth.composer_mcp import portable_supervisor as production
++
++    class Libc:
++        def prctl(self, *args):
++            return -1
++
++    monkeypatch.setattr(ctypes, "CDLL", lambda *args, **kwargs: Libc())
++    monkeypatch.setattr(ctypes, "get_errno", lambda: errno.EPERM)
++    with pytest.raises(OSError) as raised:
++        production._install_controller_death_guard(901, linux=True)
++    assert raised.value.errno == errno.EPERM
++
++
++@pytest.mark.asyncio
++async def test_public_executable_real_preview_paths_and_eof(tmp_path: Path) -> None:
++    receipt = await probe(tmp_path)
++    assert receipt["returncode"] == 0
++    assert receipt["private"]["sources"]["orders"]["options"]["path"] == "input.csv"
++    assert receipt["private"]["outputs"][0]["options"]["path"] == "patched.csv"
++
++
++@pytest.mark.parametrize("arguments,status,text", [(["--help"], 0, "--data-dir"), (["--unknown"], 2, "unrecognized arguments")])
++def test_public_help_and_parse_status(arguments, status, text) -> None:
++    result = subprocess.run([str(Path(sys.executable).parent / "elspeth-composer"), *arguments], capture_output=True, timeout=12)
++    assert result.returncode == status
++    assert text in (result.stdout + result.stderr).decode()
++    assert "usage: elspeth-composer" in (result.stdout + result.stderr).decode()
++    if status:
++        assert not result.stdout
++
++
++def test_private_runner_refuses_before_application_imports(tmp_path: Path) -> None:
++    # A fresh interpreter records imports without changing the child runtime.
++    result = subprocess.run(
++        [sys.executable, "-v", str(ROOT / "src/elspeth/composer_mcp/runner.py")],
++        capture_output=True,
++        timeout=8,
++        env={key: value for key, value in os.environ.items() if not key.startswith("_ELSPETH_COMPOSER_CONTROL_")},
++    )
++    assert result.returncode != 0 and result.stdout == b""
++    assert b"Private Composer bootstrap is required" in result.stderr
++    assert b"import 'elspeth.composer_mcp.server'" not in result.stderr
++    assert b"import 'elspeth.contracts'" not in result.stderr
++    assert b"import 'elspeth.plugins" not in result.stderr
++    (tmp_path / "imports.log").write_bytes(result.stderr)
++
++
++def test_public_console_executes_stdlib_owner_in_original_process(tmp_path: Path) -> None:
++    # An audit hook observes the actual installed console script immediately
++    # before Popen. It cannot supply ownership or alter the launched child.
++    script = str(Path(sys.executable).parent / "elspeth-composer")
++    code = """
++import json, os, pathlib, runpy, sys
++script, marker = sys.argv[1:3]
++sys.argv = [script, '--help']
++def observe(event, args):
++    if event == 'subprocess.Popen':
++        forbidden = ('elspeth.web', 'elspeth.plugins', 'elspeth.contracts', 'mcp', 'sqlalchemy', 'pydantic')
++        assert not any(name == prefix or name.startswith(prefix + '.') for name in sys.modules for prefix in forbidden)
++        assert not pathlib.Path(marker).exists(), 'more than one child spawn'
++        pathlib.Path(marker).write_text(json.dumps({'pid': os.getpid(), 'command': args[1]}))
++sys.addaudithook(observe)
++runpy.run_path(script, run_name='__main__')
++"""
++    process = subprocess.Popen(
++        [sys.executable, "-c", code, script, str(tmp_path / "before-spawn.json")], stdout=subprocess.PIPE, stderr=subprocess.PIPE
++    )
++    stdout, stderr = process.communicate(timeout=12)
++    assert process.returncode == 0, stderr.decode()
++    assert b"--data-dir" in stdout and not stderr
++    observed = json.loads((tmp_path / "before-spawn.json").read_text())
++    assert observed["pid"] == process.pid
++    assert observed["command"] == [sys.executable, str(ROOT / "src/elspeth/composer_mcp/runner.py"), "--help"]
++
++
++@pytest.mark.parametrize(
++    "mode,expected,complete",
++    [("normal", 0, True), ("startup-failure", 1, True), ("transport-failure", 1, True), ("cleanup-failure", 70, False)],
++)
++def test_real_partial_startup_transport_and_cleanup_outcomes(tmp_path: Path, mode, expected, complete) -> None:
++    result = subprocess.run(
++        [sys.executable, str(SUPERVISOR), sys.executable, str(CHILD), str(tmp_path), mode], input=b"", capture_output=True, timeout=12
++    )
++    (tmp_path / "stderr.log").write_bytes(result.stderr)
++    (tmp_path / "status.json").write_text(json.dumps({"returncode": result.returncode}))
++    assert result.returncode == expected, result.stderr.decode()
++    assert result.stdout == b""
++    authenticated = json.loads((tmp_path / "authenticated.json").read_text())
++    assert authenticated["canonical_wire"] and authenticated["bootstrap_consumed"] and authenticated["descendant_bootstrap_absent"]
++    if sys.platform == "linux":
++        assert not Path(f"/proc/{authenticated['pid']}").exists()
++    assert (tmp_path / "completion").exists() is complete
++    if mode == "startup-failure":
++        assert json.loads((tmp_path / "outcomes.json").read_text()) == ["LookupError"]
++    if mode == "transport-failure":
++        assert json.loads((tmp_path / "outcomes.json").read_text()) == ["OSError"]
++    if mode == "cleanup-failure":
++        assert (tmp_path / "workers-joined").exists()
++        assert json.loads((tmp_path / "outcomes.json").read_text()) == ["OSError", "ArithmeticError"]
++
++
++async def _file(path: Path, seconds: float = 8.0) -> None:
++    async with asyncio.timeout(seconds):
++        while not path.exists():
++            await asyncio.sleep(0.01)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "mode,release",
++    [("blocked", True), ("blocked", False), ("quarantine", True)],
++    ids=["release-joins", "real-deadline-kills", "real-generation-expiry"],
++)
++async def test_blocked_actual_preflight_retains_admission_until_join_or_deadline(
++    tmp_path: Path, monkeypatch, mode: str, release: bool
++) -> None:
++    processes = []
++    create = stdio._create_platform_compatible_process
++
++    async def observe(*args, **kwargs):
++        process = await create(*args, **kwargs)
++        processes.append(process)
++        return process
++
++    # Keep the SDK's own fallback kill outside the production 30-second grace.
++    monkeypatch.setattr(stdio, "PROCESS_TERMINATION_TIMEOUT", 40.0)
++    parameters = StdioServerParameters(
++        command=sys.executable, args=[str(SUPERVISOR), sys.executable, str(CHILD), str(tmp_path), mode], env=dict(os.environ)
++    )
++    with (tmp_path / "stderr.log").open("w") as errors, patch.object(stdio, "_create_platform_compatible_process", observe):
++        async with stdio.stdio_client(parameters, errlog=errors) as streams, ClientSession(*streams) as session:
++            await session.initialize()
++            configured = await session.call_tool(
++                "set_pipeline",
++                {
++                    "source": {
++                        "plugin": "null",
++                        "on_success": "result",
++                        "options": {"schema": {"mode": "observed"}},
++                        "on_validation_failure": "discard",
++                    },
++                    "nodes": [],
++                    "edges": [],
++                    "outputs": [
++                        {
++                            "sink_name": "result",
++                            "plugin": "csv",
++                            "options": {
++                                "path": "output.csv",
++                                "schema": {"mode": "observed"},
++                                "mode": "write",
++                                "collision_policy": "auto_increment",
++                            },
++                            "on_write_failure": "discard",
++                        }
++                    ],
++                },
++            )
++            assert not configured.isError and json.loads(configured.content[0].text)["success"]
++            pending = asyncio.create_task(session.call_tool("preview_pipeline", {}))
++            await _file(tmp_path / "worker")
++            caller_timeout_observed = mode == "blocked" and release
++            if caller_timeout_observed:
++                timed_out = await asyncio.wait_for(pending, timeout=8)
++                assert timed_out.isError and timed_out.content[0].text == "Tool error: TimeoutError"
++                pending = asyncio.create_task(session.call_tool("preview_pipeline", {}))
++                await asyncio.sleep(0.05)
++            pending.cancel()
++            with pytest.raises(asyncio.CancelledError):
++                await pending
++            # A second cancelled caller must join the same admitted preflight.
++            pending = asyncio.create_task(session.call_tool("preview_pipeline", {}))
++            await asyncio.sleep(0.05)
++            pending.cancel()
++            with pytest.raises(asyncio.CancelledError):
++                await pending
++            process = processes[0]
++            assert process.stdin is not None
++            await process.stdin.aclose()
++            await _file(tmp_path / "draining.json")
++            assert json.loads((tmp_path / "draining.json").read_text())["admissions"] == 1
++            if os.name != "nt":
++                process.send_signal(signal.SIGTERM)
++                process.send_signal(signal.SIGTERM)
++            await asyncio.sleep(0.15)
++            assert process.returncode is None
++            assert not (tmp_path / "completion").exists()
++            if mode == "quarantine":
++                await _file(tmp_path / "expired", seconds=12)
++                assert process.returncode is None and not (tmp_path / "completion").exists()
++            started = time.monotonic()
++            if release:
++                (tmp_path / "release").write_text("release actual worker")
++            async with asyncio.timeout(35):
++                status = await process.wait()
++            elapsed = time.monotonic() - started
++            (tmp_path / "status.json").write_text(
++                json.dumps({"returncode": status, "wait_seconds": elapsed, "caller_timeout_observed": caller_timeout_observed})
++            )
++            assert (tmp_path / "completion").exists() is (release and mode != "quarantine")
++            if mode == "quarantine":
++                assert status == 70
++                outcomes = json.loads((tmp_path / "outcomes.json").read_text())
++                assert "RequiredGenerationUnavailable" in outcomes
++            elif release:
++                assert status in (0, 1), (status, (tmp_path / "stderr.log").read_text())
++            elif os.name != "nt":
++                assert status == -signal.SIGKILL and elapsed >= 28
++            else:
++                assert status != 0 and elapsed >= 28
++            child_pid = json.loads((tmp_path / "authenticated.json").read_text())["pid"]
++            if sys.platform == "linux":
++                assert not Path(f"/proc/{child_pid}").exists()
++
++
++@pytest.mark.asyncio
++async def test_embedded_construction_preserves_live_host_owner_and_coordinator(tmp_path: Path) -> None:
++    from elspeth.composer_mcp.server import _build_stdio_server
++    from elspeth.web import async_workers
++    from elspeth.web.dependencies import create_catalog_service
++    from elspeth.web.execution.runtime_preflight import RuntimePreflightCoordinator
++    from elspeth.web.required_executor import RequiredGenerationUnavailable
++
++    owner = async_workers._RECOVERY_CALLBACK
++    draining = async_workers._INSTANCE_DRAINING
++    coordinator = RuntimePreflightCoordinator()
++    _build_stdio_server(create_catalog_service(), tmp_path / "scratch", tmp_path / "data", runtime_preflight_coordinator=coordinator)
++    assert async_workers._RECOVERY_CALLBACK is owner
++    assert async_workers._INSTANCE_DRAINING is draining and not draining.is_set()
++    with pytest.raises(RequiredGenerationUnavailable, match="unowned process"):
++        async_workers.configure_standalone_executor_recovery(
++            drain_seconds=10,
++            instance_draining=draining,
++            generation_unavailable=async_workers._GENERATION_UNAVAILABLE,
++            recovery_callback=owner,
++        )
++    assert async_workers._RECOVERY_CALLBACK is owner
++    assert await async_workers.run_sync_in_worker(lambda: 7) == 7
++    await coordinator.seal_and_join()
++    await async_workers.shutdown_async_workers()
++
++
++@pytest.mark.parametrize("owned", [False, True])
++def test_fresh_embedded_real_host_owner_and_missing_owner(tmp_path: Path, owned: bool) -> None:
++    command = (
++        [sys.executable, str(SUPERVISOR), sys.executable, str(CHILD), str(tmp_path), "embedded-owned"]
++        if owned
++        else [sys.executable, str(CHILD), str(tmp_path), "embedded-unowned"]
++    )
++    result = subprocess.run(command, input=b"", capture_output=True, timeout=12)
++    assert result.returncode == 0 and result.stdout == b"", result.stderr.decode()
++    evidence = json.loads((tmp_path / "embedded.json").read_text())
++    if owned:
++        assert evidence == {"preview_valid": True, "host_owner_preserved": True, "host_coordinator_open": True}
++        assert (tmp_path / "completion").exists()
++    else:
++        assert evidence == {"transport_error": "Tool error: AuditIntegrityError"}
++        assert not (tmp_path / "authenticated.json").exists()
+diff --git a/tests/unit/web/test_async_worker_settlement.py b/tests/unit/web/test_async_worker_settlement.py
+new file mode 100644
+index 000000000..8612d9ce0
+--- /dev/null
++++ b/tests/unit/web/test_async_worker_settlement.py
+@@ -0,0 +1,71 @@
++"""Replacement cannot discard the old generation's unfinished observer."""
++
++from __future__ import annotations
++
++import asyncio
++
++import pytest
++
++from elspeth.web import async_workers
++from elspeth.web.required_executor import RequiredExecutorGenerationCustodian
++from tests.unit.web.test_required_executor_custody import QueueThenRaiseExecutor
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("observer_fails", [False, True])
++async def test_shutdown_joins_replaced_generation_observer_with_original_cancellations(monkeypatch, observer_fails: bool) -> None:
++    original_observe = RequiredExecutorGenerationCustodian._observe
++    retained = asyncio.Event()
++    release = asyncio.Event()
++    failure = LookupError("old generation observer fault")
++
++    async def held_observe(generation):
++        await original_observe(generation)
++        retained.set()
++        await release.wait()
++        if observer_fails:
++            raise failure
++
++    monkeypatch.setattr(RequiredExecutorGenerationCustodian, "_observe", held_observe)
++    executor = QueueThenRaiseExecutor(max_workers=1)
++    monkeypatch.setattr(async_workers, "_SHARED_EXECUTOR", executor)
++    with pytest.raises(RuntimeError, match="submit failed after queueing"):
++        await async_workers.run_sync_in_worker(lambda: pytest.fail("aborted worker executed"))
++    old = async_workers._GENERATION_CUSTODIAN
++    assert old is not None
++    await retained.wait()
++    assert old.joined.is_set() and old.drain_thread is not None and not old.drain_thread.is_alive()
++    assert old.observer is not None and not old.observer.done()
++    assert await async_workers.run_sync_in_worker(lambda: 7) == 7
++    assert async_workers._GENERATION_CUSTODIAN is not old
++    shutdown = asyncio.create_task(async_workers.shutdown_async_workers())
++    try:
++        await asyncio.sleep(0.05)
++        assert not shutdown.done(), "executor futures joined but old recovery observer is still owned"
++        shutdown.cancel("first caller cancellation")
++        await asyncio.sleep(0.02)
++        shutdown.cancel("second caller cancellation")
++        await asyncio.sleep(0.02)
++        assert not shutdown.done()
++        release.set()
++        with pytest.raises(BaseException) as raised:
++            await shutdown
++
++        def originals(error):
++            if isinstance(error, BaseExceptionGroup):
++                return [item for nested in error.exceptions for item in originals(nested)]
++            return [error]
++
++        outcomes = originals(raised.value)
++        assert [str(error) for error in outcomes if isinstance(error, asyncio.CancelledError)] == [
++            "first caller cancellation",
++            "second caller cancellation",
++        ]
++        assert (failure in outcomes) is observer_fails
++        assert old.observer.done() and not old.drain_thread.is_alive()
++        assert not async_workers._RECOVERING_GENERATIONS
++    finally:
++        release.set()
++        await asyncio.gather(old.observer, return_exceptions=True)
++        if not shutdown.done():
++            await shutdown

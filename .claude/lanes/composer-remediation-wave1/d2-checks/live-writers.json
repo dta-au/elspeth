@@ -1,0 +1,14 @@
+{
+  "live_nominated_path_writers": [
+    "patch_node_options",
+    "patch_output_options",
+    "patch_source_options",
+    "set_output",
+    "set_pipeline",
+    "set_source",
+    "splice_transform",
+    "upsert_node"
+  ],
+  "count": 8,
+  "authority_module": "elspeth.contracts.composer_paths"
+}

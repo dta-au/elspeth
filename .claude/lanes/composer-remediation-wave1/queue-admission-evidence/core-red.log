@@ -1,0 +1,2346 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 100 items
+
+tests/unit/web/composer/test_queue_scope_admission.py FFFFFFFFFFFFFFFFFF [ 18%]
+FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF........FF [ 90%]
+FFFFFFFFF.                                                               [100%]
+
+=================================== FAILURES ===================================
+_ test_scope_refusal_preserves_full_private_saved_state[override0-False-handler] _
+
+surface = 'handler', existing_queue = False
+override = {'scope_name': 'document_pages'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override0-False-dispatch] _
+
+surface = 'dispatch', existing_queue = False
+override = {'scope_name': 'document_pages'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override0-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': 'document_pages'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override0-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': 'document_pages'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override1-False-handler] _
+
+surface = 'handler', existing_queue = False
+override = {'scope_opener': 'expand_rows'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override1-False-dispatch] _
+
+surface = 'dispatch', existing_queue = False
+override = {'scope_opener': 'expand_rows'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override1-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_opener': 'expand_rows'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override1-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_opener': 'expand_rows'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override2-False-handler] _
+
+surface = 'handler', existing_queue = False
+override = {'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override2-False-dispatch] _
+
+surface = 'dispatch', existing_queue = False
+override = {'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override2-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override2-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override3-False-handler] _
+
+surface = 'handler', existing_queue = False
+override = {'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override3-False-dispatch] _
+
+surface = 'dispatch', existing_queue = False
+override = {'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override3-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override3-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override4-False-handler] _
+
+surface = 'handler', existing_queue = False
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override4-False-dispatch] _
+
+surface = 'dispatch', existing_queue = False
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override4-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override4-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override5-False-handler] _
+
+surface = 'handler', existing_queue = False
+override = {'scope_name': 'document_pages', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override5-False-dispatch] _
+
+surface = 'dispatch', existing_queue = False
+override = {'scope_name': 'document_pages', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override5-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override5-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override6-False-handler] _
+
+surface = 'handler', existing_queue = False
+override = {'scope_name': 'document_pages', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override6-False-dispatch] _
+
+surface = 'dispatch', existing_queue = False
+override = {'scope_name': 'document_pages', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override6-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override6-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override7-False-handler] _
+
+surface = 'handler', existing_queue = False
+override = {'scope_opener': 'expand_rows', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override7-False-dispatch] _
+
+surface = 'dispatch', existing_queue = False
+override = {'scope_opener': 'expand_rows', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override7-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_opener': 'expand_rows', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override7-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_opener': 'expand_rows', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override8-False-handler] _
+
+surface = 'handler', existing_queue = False
+override = {'scope_opener': 'expand_rows', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override8-False-dispatch] _
+
+surface = 'dispatch', existing_queue = False
+override = {'scope_opener': 'expand_rows', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override8-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_opener': 'expand_rows', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override8-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_opener': 'expand_rows', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override9-False-handler] _
+
+surface = 'handler', existing_queue = False
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override9-False-dispatch] _
+
+surface = 'dispatch', existing_queue = False
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override9-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override9-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override10-False-handler] _
+
+surface = 'handler', existing_queue = False
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override10-False-dispatch] _
+
+surface = 'dispatch', existing_queue = False
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override10-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override10-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override11-False-handler] _
+
+surface = 'handler', existing_queue = False
+override = {'scope_name': 'document_pages', 'scope_opener': None, 'scope_policy': None}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override11-False-dispatch] _
+
+surface = 'dispatch', existing_queue = False
+override = {'scope_name': 'document_pages', 'scope_opener': None, 'scope_policy': None}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override11-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_opener': None, 'scope_policy': None}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override11-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_opener': None, 'scope_policy': None}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override12-False-handler] _
+
+surface = 'handler', existing_queue = False
+override = {'scope_name': None, 'scope_opener': 'expand_rows', 'scope_policy': None}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override12-False-dispatch] _
+
+surface = 'dispatch', existing_queue = False
+override = {'scope_name': None, 'scope_opener': 'expand_rows', 'scope_policy': None}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override12-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': None, 'scope_opener': 'expand_rows', 'scope_policy': None}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override12-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': None, 'scope_opener': 'expand_rows', 'scope_policy': None}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override13-False-handler] _
+
+surface = 'handler', existing_queue = False
+override = {'scope_name': None, 'scope_opener': None, 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override13-False-dispatch] _
+
+surface = 'dispatch', existing_queue = False
+override = {'scope_name': None, 'scope_opener': None, 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override13-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': None, 'scope_opener': None, 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override13-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': None, 'scope_opener': None, 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override14-False-handler] _
+
+surface = 'handler', existing_queue = False, override = {'scope_name': ''}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override14-False-dispatch] _
+
+surface = 'dispatch', existing_queue = False, override = {'scope_name': ''}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override14-True-handler] _
+
+surface = 'handler', existing_queue = True, override = {'scope_name': ''}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override14-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True, override = {'scope_name': ''}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override15-False-handler] _
+
+surface = 'handler', existing_queue = False, override = {'scope_opener': ''}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override15-False-dispatch] _
+
+surface = 'dispatch', existing_queue = False, override = {'scope_opener': ''}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+            state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+        context = _trained_context()
+        before = private_snapshot(state)
+        standing = state.validate()
+        args = {**QUEUE, "description": "Must not replace", **override}
+        result = (transforms._handle_upsert_node(args, state, context) if surface == "handler"
+                  else dispatch("upsert_node", args, state, context))
+>       _assert_refusal(result, state, "queue_config_invalid", "node:inbound", standing)
+
+tests/unit/web/composer/test_queue_scope_admission.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+result = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)}))
+state = CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='web_scrape', input='scrape_in', on_succes...': mappingproxy({'mode': 'fixed', 'fields': ('url: str',)})}), on_validation_failure='quarantine', description=None)}))
+code = 'queue_config_invalid', subject = 'node:inbound'
+standing = ValidationSummary(is_valid=False, errors=(ValidationEntry(component='node:scrape', message="web_scrape.http.abuse_cont...knownSemanticPolicy.WARN: 'warn'>, configured_by=('source_field',)), outcome=<SemanticOutcome.CONFLICT: 'conflict'>),))
+
+    def _assert_refusal(result: ToolResult, state: CompositionState, code: str, subject: str | None, standing: ValidationSummary) -> None:
+>       assert not result.success and result.updated_state is state
+E       AssertionError: assert (not True)
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='scrape', node_type='transform', plugin='we...econds': None, 'description': 'Must not replace', 'scope_name': None, 'scope_opener': None, 'scope_policy': None}),)})).success
+
+tests/unit/web/composer/test_transform_rejection_contracts.py:112: AssertionError
+_ test_scope_refusal_preserves_full_private_saved_state[override15-True-handler] _
+
+surface = 'handler', existing_queue = True, override = {'scope_opener': ''}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override15-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True, override = {'scope_opener': ''}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"], existing_queue: bool, override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:81: TypeError
+_______ test_complete_real_routes_agree_on_intrinsic_refusal[override0] ________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_complete_real_routes_agre0')
+override = {'scope_name': 'document_pages'}
+
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_complete_real_routes_agree_on_intrinsic_refusal(tmp_path: Path, override: dict[str, Any]) -> None:
+        args, state, context = complete_queue(tmp_path)
+        before = private_snapshot(state)
+        args["nodes"][0].update(override)
+        incremental = dispatch("upsert_node", args["nodes"][0], state, context)
+        bulk = dispatch("set_pipeline", args, state, context)
+        for result in (incremental, bulk):
+>           assert not result.success and result.updated_state is state
+E           AssertionError: assert (not True)
+E            +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='inbound', node_type='queue', plugin=None, ...()), runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).success
+
+tests/unit/web/composer/test_queue_scope_admission.py:103: AssertionError
+_______ test_complete_real_routes_agree_on_intrinsic_refusal[override1] ________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_complete_real_routes_agre1')
+override = {'scope_opener': 'expand_rows'}
+
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_complete_real_routes_agree_on_intrinsic_refusal(tmp_path: Path, override: dict[str, Any]) -> None:
+        args, state, context = complete_queue(tmp_path)
+        before = private_snapshot(state)
+        args["nodes"][0].update(override)
+        incremental = dispatch("upsert_node", args["nodes"][0], state, context)
+        bulk = dispatch("set_pipeline", args, state, context)
+        for result in (incremental, bulk):
+>           assert not result.success and result.updated_state is state
+E           AssertionError: assert (not True)
+E            +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='inbound', node_type='queue', plugin=None, ...()), runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).success
+
+tests/unit/web/composer/test_queue_scope_admission.py:103: AssertionError
+_______ test_complete_real_routes_agree_on_intrinsic_refusal[override2] ________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_complete_real_routes_agre2')
+override = {'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_complete_real_routes_agree_on_intrinsic_refusal(tmp_path: Path, override: dict[str, Any]) -> None:
+        args, state, context = complete_queue(tmp_path)
+        before = private_snapshot(state)
+        args["nodes"][0].update(override)
+        incremental = dispatch("upsert_node", args["nodes"][0], state, context)
+        bulk = dispatch("set_pipeline", args, state, context)
+        for result in (incremental, bulk):
+>           assert not result.success and result.updated_state is state
+E           AssertionError: assert (not True)
+E            +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='inbound', node_type='queue', plugin=None, ...()), runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).success
+
+tests/unit/web/composer/test_queue_scope_admission.py:103: AssertionError
+_______ test_complete_real_routes_agree_on_intrinsic_refusal[override3] ________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_complete_real_routes_agre3')
+override = {'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_complete_real_routes_agree_on_intrinsic_refusal(tmp_path: Path, override: dict[str, Any]) -> None:
+        args, state, context = complete_queue(tmp_path)
+        before = private_snapshot(state)
+        args["nodes"][0].update(override)
+        incremental = dispatch("upsert_node", args["nodes"][0], state, context)
+        bulk = dispatch("set_pipeline", args, state, context)
+        for result in (incremental, bulk):
+>           assert not result.success and result.updated_state is state
+E           AssertionError: assert (not True)
+E            +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='inbound', node_type='queue', plugin=None, ...()), runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).success
+
+tests/unit/web/composer/test_queue_scope_admission.py:103: AssertionError
+_______ test_complete_real_routes_agree_on_intrinsic_refusal[override4] ________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_complete_real_routes_agre4')
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows'}
+
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_complete_real_routes_agree_on_intrinsic_refusal(tmp_path: Path, override: dict[str, Any]) -> None:
+        args, state, context = complete_queue(tmp_path)
+        before = private_snapshot(state)
+        args["nodes"][0].update(override)
+        incremental = dispatch("upsert_node", args["nodes"][0], state, context)
+        bulk = dispatch("set_pipeline", args, state, context)
+        for result in (incremental, bulk):
+>           assert not result.success and result.updated_state is state
+E           AssertionError: assert (not True)
+E            +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='inbound', node_type='queue', plugin=None, ...()), runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).success
+
+tests/unit/web/composer/test_queue_scope_admission.py:103: AssertionError
+_______ test_complete_real_routes_agree_on_intrinsic_refusal[override5] ________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_complete_real_routes_agre5')
+override = {'scope_name': 'document_pages', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_complete_real_routes_agree_on_intrinsic_refusal(tmp_path: Path, override: dict[str, Any]) -> None:
+        args, state, context = complete_queue(tmp_path)
+        before = private_snapshot(state)
+        args["nodes"][0].update(override)
+        incremental = dispatch("upsert_node", args["nodes"][0], state, context)
+        bulk = dispatch("set_pipeline", args, state, context)
+        for result in (incremental, bulk):
+>           assert not result.success and result.updated_state is state
+E           AssertionError: assert (not True)
+E            +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='inbound', node_type='queue', plugin=None, ...()), runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).success
+
+tests/unit/web/composer/test_queue_scope_admission.py:103: AssertionError
+_______ test_complete_real_routes_agree_on_intrinsic_refusal[override6] ________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_complete_real_routes_agre6')
+override = {'scope_name': 'document_pages', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_complete_real_routes_agree_on_intrinsic_refusal(tmp_path: Path, override: dict[str, Any]) -> None:
+        args, state, context = complete_queue(tmp_path)
+        before = private_snapshot(state)
+        args["nodes"][0].update(override)
+        incremental = dispatch("upsert_node", args["nodes"][0], state, context)
+        bulk = dispatch("set_pipeline", args, state, context)
+        for result in (incremental, bulk):
+>           assert not result.success and result.updated_state is state
+E           AssertionError: assert (not True)
+E            +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='inbound', node_type='queue', plugin=None, ...()), runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).success
+
+tests/unit/web/composer/test_queue_scope_admission.py:103: AssertionError
+_______ test_complete_real_routes_agree_on_intrinsic_refusal[override7] ________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_complete_real_routes_agre7')
+override = {'scope_opener': 'expand_rows', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_complete_real_routes_agree_on_intrinsic_refusal(tmp_path: Path, override: dict[str, Any]) -> None:
+        args, state, context = complete_queue(tmp_path)
+        before = private_snapshot(state)
+        args["nodes"][0].update(override)
+        incremental = dispatch("upsert_node", args["nodes"][0], state, context)
+        bulk = dispatch("set_pipeline", args, state, context)
+        for result in (incremental, bulk):
+>           assert not result.success and result.updated_state is state
+E           AssertionError: assert (not True)
+E            +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='inbound', node_type='queue', plugin=None, ...()), runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).success
+
+tests/unit/web/composer/test_queue_scope_admission.py:103: AssertionError
+_______ test_complete_real_routes_agree_on_intrinsic_refusal[override8] ________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_complete_real_routes_agre8')
+override = {'scope_opener': 'expand_rows', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_complete_real_routes_agree_on_intrinsic_refusal(tmp_path: Path, override: dict[str, Any]) -> None:
+        args, state, context = complete_queue(tmp_path)
+        before = private_snapshot(state)
+        args["nodes"][0].update(override)
+        incremental = dispatch("upsert_node", args["nodes"][0], state, context)
+        bulk = dispatch("set_pipeline", args, state, context)
+        for result in (incremental, bulk):
+>           assert not result.success and result.updated_state is state
+E           AssertionError: assert (not True)
+E            +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='inbound', node_type='queue', plugin=None, ...()), runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).success
+
+tests/unit/web/composer/test_queue_scope_admission.py:103: AssertionError
+_______ test_complete_real_routes_agree_on_intrinsic_refusal[override9] ________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_complete_real_routes_agre9')
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_complete_real_routes_agree_on_intrinsic_refusal(tmp_path: Path, override: dict[str, Any]) -> None:
+        args, state, context = complete_queue(tmp_path)
+        before = private_snapshot(state)
+        args["nodes"][0].update(override)
+        incremental = dispatch("upsert_node", args["nodes"][0], state, context)
+        bulk = dispatch("set_pipeline", args, state, context)
+        for result in (incremental, bulk):
+>           assert not result.success and result.updated_state is state
+E           AssertionError: assert (not True)
+E            +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='inbound', node_type='queue', plugin=None, ...()), runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).success
+
+tests/unit/web/composer/test_queue_scope_admission.py:103: AssertionError
+_______ test_complete_real_routes_agree_on_intrinsic_refusal[override10] _______
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_complete_real_routes_agre10')
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_complete_real_routes_agree_on_intrinsic_refusal(tmp_path: Path, override: dict[str, Any]) -> None:
+        args, state, context = complete_queue(tmp_path)
+        before = private_snapshot(state)
+        args["nodes"][0].update(override)
+        incremental = dispatch("upsert_node", args["nodes"][0], state, context)
+        bulk = dispatch("set_pipeline", args, state, context)
+        for result in (incremental, bulk):
+>           assert not result.success and result.updated_state is state
+E           AssertionError: assert (not True)
+E            +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='inbound', node_type='queue', plugin=None, ...()), runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).success
+
+tests/unit/web/composer/test_queue_scope_admission.py:103: AssertionError
+_______ test_complete_real_routes_agree_on_intrinsic_refusal[override11] _______
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_complete_real_routes_agre11')
+override = {'scope_name': 'document_pages', 'scope_opener': None, 'scope_policy': None}
+
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_complete_real_routes_agree_on_intrinsic_refusal(tmp_path: Path, override: dict[str, Any]) -> None:
+        args, state, context = complete_queue(tmp_path)
+        before = private_snapshot(state)
+        args["nodes"][0].update(override)
+        incremental = dispatch("upsert_node", args["nodes"][0], state, context)
+        bulk = dispatch("set_pipeline", args, state, context)
+        for result in (incremental, bulk):
+>           assert not result.success and result.updated_state is state
+E           AssertionError: assert (not True)
+E            +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='inbound', node_type='queue', plugin=None, ...()), runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).success
+
+tests/unit/web/composer/test_queue_scope_admission.py:103: AssertionError
+_______ test_complete_real_routes_agree_on_intrinsic_refusal[override12] _______
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_complete_real_routes_agre12')
+override = {'scope_name': None, 'scope_opener': 'expand_rows', 'scope_policy': None}
+
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_complete_real_routes_agree_on_intrinsic_refusal(tmp_path: Path, override: dict[str, Any]) -> None:
+        args, state, context = complete_queue(tmp_path)
+        before = private_snapshot(state)
+        args["nodes"][0].update(override)
+        incremental = dispatch("upsert_node", args["nodes"][0], state, context)
+        bulk = dispatch("set_pipeline", args, state, context)
+        for result in (incremental, bulk):
+>           assert not result.success and result.updated_state is state
+E           AssertionError: assert (not True)
+E            +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='inbound', node_type='queue', plugin=None, ...()), runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).success
+
+tests/unit/web/composer/test_queue_scope_admission.py:103: AssertionError
+_______ test_complete_real_routes_agree_on_intrinsic_refusal[override13] _______
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_complete_real_routes_agre13')
+override = {'scope_name': None, 'scope_opener': None, 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_complete_real_routes_agree_on_intrinsic_refusal(tmp_path: Path, override: dict[str, Any]) -> None:
+        args, state, context = complete_queue(tmp_path)
+        before = private_snapshot(state)
+        args["nodes"][0].update(override)
+        incremental = dispatch("upsert_node", args["nodes"][0], state, context)
+        bulk = dispatch("set_pipeline", args, state, context)
+        for result in (incremental, bulk):
+>           assert not result.success and result.updated_state is state
+E           AssertionError: assert (not True)
+E            +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='inbound', node_type='queue', plugin=None, ...()), runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).success
+
+tests/unit/web/composer/test_queue_scope_admission.py:103: AssertionError
+_______ test_complete_real_routes_agree_on_intrinsic_refusal[override14] _______
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_complete_real_routes_agre14')
+override = {'scope_name': ''}
+
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_complete_real_routes_agree_on_intrinsic_refusal(tmp_path: Path, override: dict[str, Any]) -> None:
+        args, state, context = complete_queue(tmp_path)
+        before = private_snapshot(state)
+        args["nodes"][0].update(override)
+        incremental = dispatch("upsert_node", args["nodes"][0], state, context)
+        bulk = dispatch("set_pipeline", args, state, context)
+        for result in (incremental, bulk):
+>           assert not result.success and result.updated_state is state
+E           AssertionError: assert (not True)
+E            +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='inbound', node_type='queue', plugin=None, ...()), runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).success
+
+tests/unit/web/composer/test_queue_scope_admission.py:103: AssertionError
+_______ test_complete_real_routes_agree_on_intrinsic_refusal[override15] _______
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_complete_real_routes_agre15')
+override = {'scope_opener': ''}
+
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_complete_real_routes_agree_on_intrinsic_refusal(tmp_path: Path, override: dict[str, Any]) -> None:
+        args, state, context = complete_queue(tmp_path)
+        before = private_snapshot(state)
+        args["nodes"][0].update(override)
+        incremental = dispatch("upsert_node", args["nodes"][0], state, context)
+        bulk = dispatch("set_pipeline", args, state, context)
+        for result in (incremental, bulk):
+>           assert not result.success and result.updated_state is state
+E           AssertionError: assert (not True)
+E            +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='inbound', node_type='queue', plugin=None, ...()), runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).success
+
+tests/unit/web/composer/test_queue_scope_admission.py:103: AssertionError
+______ test_malformed_scope_retains_existing_argument_channels[override0] ______
+
+override = {'scope_name': 42}
+
+    @pytest.mark.parametrize("override", MALFORMED_SCOPE_CASES)
+    def test_malformed_scope_retains_existing_argument_channels(override: dict[str, Any]) -> None:
+        state, context = _saved_state(), _trained_context()
+        before = private_snapshot(state)
+        args = {**QUEUE, **override}
+        with pytest.raises(ToolArgumentError) as caught:
+            transforms._handle_upsert_node(args, state, context)
+        assert caught.value.category == ToolArgumentErrorCategory.MODEL_VALIDATION
+        ordinary = dispatch("upsert_node", args, state, context)
+        assert not ordinary.success and ordinary.updated_state is state
+        with pytest.raises(ToolArgumentError) as caught:
+            dispatch("upsert_node", args, state, context, raise_schema_argument_errors=True)
+>       assert caught.value.category == ToolArgumentErrorCategory.SCHEMA_VALIDATION
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: type object 'ToolArgumentErrorCategory' has no attribute 'SCHEMA_VALIDATION'. Did you mean: 'MODEL_VALIDATION'?
+
+tests/unit/web/composer/test_queue_scope_admission.py:150: AttributeError
+______ test_malformed_scope_retains_existing_argument_channels[override1] ______
+
+override = {'scope_name': []}
+
+    @pytest.mark.parametrize("override", MALFORMED_SCOPE_CASES)
+    def test_malformed_scope_retains_existing_argument_channels(override: dict[str, Any]) -> None:
+        state, context = _saved_state(), _trained_context()
+        before = private_snapshot(state)
+        args = {**QUEUE, **override}
+        with pytest.raises(ToolArgumentError) as caught:
+            transforms._handle_upsert_node(args, state, context)
+        assert caught.value.category == ToolArgumentErrorCategory.MODEL_VALIDATION
+        ordinary = dispatch("upsert_node", args, state, context)
+        assert not ordinary.success and ordinary.updated_state is state
+        with pytest.raises(ToolArgumentError) as caught:
+            dispatch("upsert_node", args, state, context, raise_schema_argument_errors=True)
+>       assert caught.value.category == ToolArgumentErrorCategory.SCHEMA_VALIDATION
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: type object 'ToolArgumentErrorCategory' has no attribute 'SCHEMA_VALIDATION'. Did you mean: 'MODEL_VALIDATION'?
+
+tests/unit/web/composer/test_queue_scope_admission.py:150: AttributeError
+______ test_malformed_scope_retains_existing_argument_channels[override2] ______
+
+override = {'scope_name': {}}
+
+    @pytest.mark.parametrize("override", MALFORMED_SCOPE_CASES)
+    def test_malformed_scope_retains_existing_argument_channels(override: dict[str, Any]) -> None:
+        state, context = _saved_state(), _trained_context()
+        before = private_snapshot(state)
+        args = {**QUEUE, **override}
+        with pytest.raises(ToolArgumentError) as caught:
+            transforms._handle_upsert_node(args, state, context)
+        assert caught.value.category == ToolArgumentErrorCategory.MODEL_VALIDATION
+        ordinary = dispatch("upsert_node", args, state, context)
+        assert not ordinary.success and ordinary.updated_state is state
+        with pytest.raises(ToolArgumentError) as caught:
+            dispatch("upsert_node", args, state, context, raise_schema_argument_errors=True)
+>       assert caught.value.category == ToolArgumentErrorCategory.SCHEMA_VALIDATION
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: type object 'ToolArgumentErrorCategory' has no attribute 'SCHEMA_VALIDATION'. Did you mean: 'MODEL_VALIDATION'?
+
+tests/unit/web/composer/test_queue_scope_admission.py:150: AttributeError
+______ test_malformed_scope_retains_existing_argument_channels[override3] ______
+
+override = {'scope_opener': 42}
+
+    @pytest.mark.parametrize("override", MALFORMED_SCOPE_CASES)
+    def test_malformed_scope_retains_existing_argument_channels(override: dict[str, Any]) -> None:
+        state, context = _saved_state(), _trained_context()
+        before = private_snapshot(state)
+        args = {**QUEUE, **override}
+        with pytest.raises(ToolArgumentError) as caught:
+            transforms._handle_upsert_node(args, state, context)
+        assert caught.value.category == ToolArgumentErrorCategory.MODEL_VALIDATION
+        ordinary = dispatch("upsert_node", args, state, context)
+        assert not ordinary.success and ordinary.updated_state is state
+        with pytest.raises(ToolArgumentError) as caught:
+            dispatch("upsert_node", args, state, context, raise_schema_argument_errors=True)
+>       assert caught.value.category == ToolArgumentErrorCategory.SCHEMA_VALIDATION
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: type object 'ToolArgumentErrorCategory' has no attribute 'SCHEMA_VALIDATION'. Did you mean: 'MODEL_VALIDATION'?
+
+tests/unit/web/composer/test_queue_scope_admission.py:150: AttributeError
+______ test_malformed_scope_retains_existing_argument_channels[override4] ______
+
+override = {'scope_opener': []}
+
+    @pytest.mark.parametrize("override", MALFORMED_SCOPE_CASES)
+    def test_malformed_scope_retains_existing_argument_channels(override: dict[str, Any]) -> None:
+        state, context = _saved_state(), _trained_context()
+        before = private_snapshot(state)
+        args = {**QUEUE, **override}
+        with pytest.raises(ToolArgumentError) as caught:
+            transforms._handle_upsert_node(args, state, context)
+        assert caught.value.category == ToolArgumentErrorCategory.MODEL_VALIDATION
+        ordinary = dispatch("upsert_node", args, state, context)
+        assert not ordinary.success and ordinary.updated_state is state
+        with pytest.raises(ToolArgumentError) as caught:
+            dispatch("upsert_node", args, state, context, raise_schema_argument_errors=True)
+>       assert caught.value.category == ToolArgumentErrorCategory.SCHEMA_VALIDATION
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: type object 'ToolArgumentErrorCategory' has no attribute 'SCHEMA_VALIDATION'. Did you mean: 'MODEL_VALIDATION'?
+
+tests/unit/web/composer/test_queue_scope_admission.py:150: AttributeError
+______ test_malformed_scope_retains_existing_argument_channels[override5] ______
+
+override = {'scope_opener': {}}
+
+    @pytest.mark.parametrize("override", MALFORMED_SCOPE_CASES)
+    def test_malformed_scope_retains_existing_argument_channels(override: dict[str, Any]) -> None:
+        state, context = _saved_state(), _trained_context()
+        before = private_snapshot(state)
+        args = {**QUEUE, **override}
+        with pytest.raises(ToolArgumentError) as caught:
+            transforms._handle_upsert_node(args, state, context)
+        assert caught.value.category == ToolArgumentErrorCategory.MODEL_VALIDATION
+        ordinary = dispatch("upsert_node", args, state, context)
+        assert not ordinary.success and ordinary.updated_state is state
+        with pytest.raises(ToolArgumentError) as caught:
+            dispatch("upsert_node", args, state, context, raise_schema_argument_errors=True)
+>       assert caught.value.category == ToolArgumentErrorCategory.SCHEMA_VALIDATION
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: type object 'ToolArgumentErrorCategory' has no attribute 'SCHEMA_VALIDATION'. Did you mean: 'MODEL_VALIDATION'?
+
+tests/unit/web/composer/test_queue_scope_admission.py:150: AttributeError
+______ test_malformed_scope_retains_existing_argument_channels[override6] ______
+
+override = {'scope_policy': 42}
+
+    @pytest.mark.parametrize("override", MALFORMED_SCOPE_CASES)
+    def test_malformed_scope_retains_existing_argument_channels(override: dict[str, Any]) -> None:
+        state, context = _saved_state(), _trained_context()
+        before = private_snapshot(state)
+        args = {**QUEUE, **override}
+        with pytest.raises(ToolArgumentError) as caught:
+            transforms._handle_upsert_node(args, state, context)
+        assert caught.value.category == ToolArgumentErrorCategory.MODEL_VALIDATION
+        ordinary = dispatch("upsert_node", args, state, context)
+        assert not ordinary.success and ordinary.updated_state is state
+        with pytest.raises(ToolArgumentError) as caught:
+            dispatch("upsert_node", args, state, context, raise_schema_argument_errors=True)
+>       assert caught.value.category == ToolArgumentErrorCategory.SCHEMA_VALIDATION
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: type object 'ToolArgumentErrorCategory' has no attribute 'SCHEMA_VALIDATION'. Did you mean: 'MODEL_VALIDATION'?
+
+tests/unit/web/composer/test_queue_scope_admission.py:150: AttributeError
+______ test_malformed_scope_retains_existing_argument_channels[override7] ______
+
+override = {'scope_policy': []}
+
+    @pytest.mark.parametrize("override", MALFORMED_SCOPE_CASES)
+    def test_malformed_scope_retains_existing_argument_channels(override: dict[str, Any]) -> None:
+        state, context = _saved_state(), _trained_context()
+        before = private_snapshot(state)
+        args = {**QUEUE, **override}
+        with pytest.raises(ToolArgumentError) as caught:
+            transforms._handle_upsert_node(args, state, context)
+        assert caught.value.category == ToolArgumentErrorCategory.MODEL_VALIDATION
+        ordinary = dispatch("upsert_node", args, state, context)
+        assert not ordinary.success and ordinary.updated_state is state
+        with pytest.raises(ToolArgumentError) as caught:
+            dispatch("upsert_node", args, state, context, raise_schema_argument_errors=True)
+>       assert caught.value.category == ToolArgumentErrorCategory.SCHEMA_VALIDATION
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: type object 'ToolArgumentErrorCategory' has no attribute 'SCHEMA_VALIDATION'. Did you mean: 'MODEL_VALIDATION'?
+
+tests/unit/web/composer/test_queue_scope_admission.py:150: AttributeError
+______ test_malformed_scope_retains_existing_argument_channels[override8] ______
+
+override = {'scope_policy': {}}
+
+    @pytest.mark.parametrize("override", MALFORMED_SCOPE_CASES)
+    def test_malformed_scope_retains_existing_argument_channels(override: dict[str, Any]) -> None:
+        state, context = _saved_state(), _trained_context()
+        before = private_snapshot(state)
+        args = {**QUEUE, **override}
+        with pytest.raises(ToolArgumentError) as caught:
+            transforms._handle_upsert_node(args, state, context)
+        assert caught.value.category == ToolArgumentErrorCategory.MODEL_VALIDATION
+        ordinary = dispatch("upsert_node", args, state, context)
+        assert not ordinary.success and ordinary.updated_state is state
+        with pytest.raises(ToolArgumentError) as caught:
+            dispatch("upsert_node", args, state, context, raise_schema_argument_errors=True)
+>       assert caught.value.category == ToolArgumentErrorCategory.SCHEMA_VALIDATION
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: type object 'ToolArgumentErrorCategory' has no attribute 'SCHEMA_VALIDATION'. Did you mean: 'MODEL_VALIDATION'?
+
+tests/unit/web/composer/test_queue_scope_admission.py:150: AttributeError
+______ test_malformed_scope_retains_existing_argument_channels[override9] ______
+
+override = {'scope_policy': 'all'}
+
+    @pytest.mark.parametrize("override", MALFORMED_SCOPE_CASES)
+    def test_malformed_scope_retains_existing_argument_channels(override: dict[str, Any]) -> None:
+        state, context = _saved_state(), _trained_context()
+        before = private_snapshot(state)
+        args = {**QUEUE, **override}
+        with pytest.raises(ToolArgumentError) as caught:
+            transforms._handle_upsert_node(args, state, context)
+        assert caught.value.category == ToolArgumentErrorCategory.MODEL_VALIDATION
+        ordinary = dispatch("upsert_node", args, state, context)
+        assert not ordinary.success and ordinary.updated_state is state
+        with pytest.raises(ToolArgumentError) as caught:
+            dispatch("upsert_node", args, state, context, raise_schema_argument_errors=True)
+>       assert caught.value.category == ToolArgumentErrorCategory.SCHEMA_VALIDATION
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: type object 'ToolArgumentErrorCategory' has no attribute 'SCHEMA_VALIDATION'. Did you mean: 'MODEL_VALIDATION'?
+
+tests/unit/web/composer/test_queue_scope_admission.py:150: AttributeError
+_____ test_malformed_scope_retains_existing_argument_channels[override10] ______
+
+override = {'unknown_scope': 'document_pages'}
+
+    @pytest.mark.parametrize("override", MALFORMED_SCOPE_CASES)
+    def test_malformed_scope_retains_existing_argument_channels(override: dict[str, Any]) -> None:
+        state, context = _saved_state(), _trained_context()
+        before = private_snapshot(state)
+        args = {**QUEUE, **override}
+        with pytest.raises(ToolArgumentError) as caught:
+            transforms._handle_upsert_node(args, state, context)
+        assert caught.value.category == ToolArgumentErrorCategory.MODEL_VALIDATION
+        ordinary = dispatch("upsert_node", args, state, context)
+        assert not ordinary.success and ordinary.updated_state is state
+        with pytest.raises(ToolArgumentError) as caught:
+            dispatch("upsert_node", args, state, context, raise_schema_argument_errors=True)
+>       assert caught.value.category == ToolArgumentErrorCategory.SCHEMA_VALIDATION
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: type object 'ToolArgumentErrorCategory' has no attribute 'SCHEMA_VALIDATION'. Did you mean: 'MODEL_VALIDATION'?
+
+tests/unit/web/composer/test_queue_scope_admission.py:150: AttributeError
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override0-False-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override0-False-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override0-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override0-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override1-False-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override1-False-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override1-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override1-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override2-False-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override2-False-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override2-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override2-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override3-False-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override3-False-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override3-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override3-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override4-False-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override4-False-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override4-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override4-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override5-False-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override5-False-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override5-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override5-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override6-False-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override6-False-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override6-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override6-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override7-False-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override7-False-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override7-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override7-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override8-False-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override8-False-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override8-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override8-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override9-False-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override9-False-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override9-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override9-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override10-False-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override10-False-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override10-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override10-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override11-False-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override11-False-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override11-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override11-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override12-False-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override12-False-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override12-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override12-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override13-False-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override13-False-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override13-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override13-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override14-False-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override14-False-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override14-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override14-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override15-False-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override15-False-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override15-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override15-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_complete_real_routes_agree_on_intrinsic_refusal[override0]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_complete_real_routes_agree_on_intrinsic_refusal[override1]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_complete_real_routes_agree_on_intrinsic_refusal[override2]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_complete_real_routes_agree_on_intrinsic_refusal[override3]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_complete_real_routes_agree_on_intrinsic_refusal[override4]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_complete_real_routes_agree_on_intrinsic_refusal[override5]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_complete_real_routes_agree_on_intrinsic_refusal[override6]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_complete_real_routes_agree_on_intrinsic_refusal[override7]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_complete_real_routes_agree_on_intrinsic_refusal[override8]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_complete_real_routes_agree_on_intrinsic_refusal[override9]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_complete_real_routes_agree_on_intrinsic_refusal[override10]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_complete_real_routes_agree_on_intrinsic_refusal[override11]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_complete_real_routes_agree_on_intrinsic_refusal[override12]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_complete_real_routes_agree_on_intrinsic_refusal[override13]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_complete_real_routes_agree_on_intrinsic_refusal[override14]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_complete_real_routes_agree_on_intrinsic_refusal[override15]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_malformed_scope_retains_existing_argument_channels[override0]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_malformed_scope_retains_existing_argument_channels[override1]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_malformed_scope_retains_existing_argument_channels[override2]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_malformed_scope_retains_existing_argument_channels[override3]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_malformed_scope_retains_existing_argument_channels[override4]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_malformed_scope_retains_existing_argument_channels[override5]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_malformed_scope_retains_existing_argument_channels[override6]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_malformed_scope_retains_existing_argument_channels[override7]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_malformed_scope_retains_existing_argument_channels[override8]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_malformed_scope_retains_existing_argument_channels[override9]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_malformed_scope_retains_existing_argument_channels[override10]
+======================== 91 failed, 9 passed in 20.32s =========================

@@ -1,0 +1,5 @@
+src/elspeth/web/composer/tools/transforms.py: OK
+tests/unit/web/composer/test_queue_scope_admission.py: OK
+tests/unit/web/composer/test_queue_scope_approval.py: OK
+tests/unit/composer_mcp/test_queue_scope_admission.py: OK
+tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py: OK

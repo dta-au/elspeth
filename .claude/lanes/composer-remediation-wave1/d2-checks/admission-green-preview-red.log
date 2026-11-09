@@ -1,0 +1,249 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-d2
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 95 items
+
+tests/unit/composer_mcp/test_configured_root_admission.py ......F....... [ 14%]
+...F.................................................................... [ 90%]
+..FFFF.F.                                                                [100%]
+
+=================================== FAILURES ===================================
+_____ test_configured_root_admits_file_authoring[relative-splice-provider] _____
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-200/test_configured_root_admits_fi6')
+writer = 'splice_transform', code = 'provider_config_path_policy_invalid'
+component = 'node:inserted', spelling = 'relative'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("writer", "code", "component"), _WRITERS)
+    @pytest.mark.parametrize("spelling", ["relative", "absolute"])
+    async def test_configured_root_admits_file_authoring(
+        tmp_path: Path, writer: str, code: str, component: str, spelling: str
+    ) -> None:
+        """Removing root authority from any writer must break its positive control."""
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "admitted.csv").write_text("text\nhello\n")
+        live = await _live_mcp(tmp_path, root)
+        path = "admitted.csv" if spelling == "relative" else str(root / "admitted.csv")
+        tool, arguments = _mutation(writer, path)
+        result = await live.call(tool, arguments)
+>       assert result["success"] is True, result
+E       AssertionError: {'affected_nodes': [], 'state': {'edges': [{'edge_type': 'on_success', 'from_node': 'source', 'id': 'source-before', '...pper before this node.", ...}], 'graph_repair_suggestions': [], 'is_valid': False, 'semantic_contracts': [], ...}, ...}
+E       assert False is True
+
+tests/unit/composer_mcp/test_configured_root_admission.py:233: AssertionError
+_____ test_configured_root_admits_file_authoring[absolute-splice-provider] _____
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-200/test_configured_root_admits_fi17')
+writer = 'splice_transform', code = 'provider_config_path_policy_invalid'
+component = 'node:inserted', spelling = 'absolute'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("writer", "code", "component"), _WRITERS)
+    @pytest.mark.parametrize("spelling", ["relative", "absolute"])
+    async def test_configured_root_admits_file_authoring(
+        tmp_path: Path, writer: str, code: str, component: str, spelling: str
+    ) -> None:
+        """Removing root authority from any writer must break its positive control."""
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "admitted.csv").write_text("text\nhello\n")
+        live = await _live_mcp(tmp_path, root)
+        path = "admitted.csv" if spelling == "relative" else str(root / "admitted.csv")
+        tool, arguments = _mutation(writer, path)
+        result = await live.call(tool, arguments)
+>       assert result["success"] is True, result
+E       AssertionError: {'affected_nodes': [], 'state': {'edges': [{'edge_type': 'on_success', 'from_node': 'source', 'id': 'source-before', '...pper before this node.", ...}], 'graph_repair_suggestions': [], 'is_valid': False, 'semantic_contracts': [], ...}, ...}
+E       assert False is True
+
+tests/unit/composer_mcp/test_configured_root_admission.py:233: AssertionError
+_______ test_in_root_file_preview_reaches_actual_plugin_and_graph_checks _______
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-200/test_in_root_file_preview_reac0')
+
+    @pytest.mark.asyncio
+    async def test_in_root_file_preview_reaches_actual_plugin_and_graph_checks(tmp_path: Path) -> None:
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "input.csv").write_text("text\nhello\n")
+        live = await _live_mcp(tmp_path, root, state=_preview_state())
+        assert (await live.call("set_source", {**_source(), "on_success": "result"}))["success"] is True
+>       preview = await live.call("preview_pipeline", {})
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/composer_mcp/test_configured_root_admission.py:384: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = _LiveMcp(server=<mcp.server.lowlevel.server.Server object at 0x7fc1f707dc40>, scratch=PosixPath('/tmp/pytest-of-agent/pytest-200/test_in_root_file_preview_reac0/scratch'), session_id='fbeed9cedb4f')
+name = 'preview_pipeline', arguments = {}
+
+    async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        response = await self.raw_call(name, arguments)
+>       assert not response.isError, response
+E       AssertionError: CallToolResult(meta=None, content=[TextContent(type='text', text='Tool error: TypeError', annotations=None, meta=None)], structuredContent=None, isError=True)
+E       assert not True
+E        +  where True = CallToolResult(meta=None, content=[TextContent(type='text', text='Tool error: TypeError', annotations=None, meta=None)], structuredContent=None, isError=True).isError
+
+tests/unit/composer_mcp/test_configured_root_admission.py:156: AssertionError
+____ test_loaded_legacy_escape_is_preserved_and_refused_by_preview[source] _____
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-200/test_loaded_legacy_escape_is_p0')
+component = 'source'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("component", ["source", "output", "provider"])
+    async def test_loaded_legacy_escape_is_preserved_and_refused_by_preview(tmp_path: Path, component: str) -> None:
+        root = tmp_path / "data"
+        root.mkdir()
+        payload = _preview_state().to_dict()
+        escaped = str(tmp_path / "PRIVATE-LEGACY-PATH")
+        if component == "source":
+            payload["sources"]["source"]["options"]["path"] = escaped
+        elif component == "output":
+            payload["outputs"][0]["options"]["path"] = escaped
+        else:
+            payload = _seed_state().to_dict()
+            payload["nodes"][1]["options"]["provider_config"]["persist_directory"] = escaped
+        live = await _live_mcp(tmp_path, root, state=CompositionState.from_dict(payload))
+        before, saved = live.private_state.to_dict(), live.saved_bytes
+>       preview = await live.call("preview_pipeline", {})
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/composer_mcp/test_configured_root_admission.py:409: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = _LiveMcp(server=<mcp.server.lowlevel.server.Server object at 0x7fc1f6920860>, scratch=PosixPath('/tmp/pytest-of-agent/pytest-200/test_loaded_legacy_escape_is_p0/scratch'), session_id='ee679fce08a6')
+name = 'preview_pipeline', arguments = {}
+
+    async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        response = await self.raw_call(name, arguments)
+>       assert not response.isError, response
+E       AssertionError: CallToolResult(meta=None, content=[TextContent(type='text', text='Tool error: TypeError', annotations=None, meta=None)], structuredContent=None, isError=True)
+E       assert not True
+E        +  where True = CallToolResult(meta=None, content=[TextContent(type='text', text='Tool error: TypeError', annotations=None, meta=None)], structuredContent=None, isError=True).isError
+
+tests/unit/composer_mcp/test_configured_root_admission.py:156: AssertionError
+____ test_loaded_legacy_escape_is_preserved_and_refused_by_preview[output] _____
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-200/test_loaded_legacy_escape_is_p1')
+component = 'output'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("component", ["source", "output", "provider"])
+    async def test_loaded_legacy_escape_is_preserved_and_refused_by_preview(tmp_path: Path, component: str) -> None:
+        root = tmp_path / "data"
+        root.mkdir()
+        payload = _preview_state().to_dict()
+        escaped = str(tmp_path / "PRIVATE-LEGACY-PATH")
+        if component == "source":
+            payload["sources"]["source"]["options"]["path"] = escaped
+        elif component == "output":
+            payload["outputs"][0]["options"]["path"] = escaped
+        else:
+            payload = _seed_state().to_dict()
+            payload["nodes"][1]["options"]["provider_config"]["persist_directory"] = escaped
+        live = await _live_mcp(tmp_path, root, state=CompositionState.from_dict(payload))
+        before, saved = live.private_state.to_dict(), live.saved_bytes
+>       preview = await live.call("preview_pipeline", {})
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/composer_mcp/test_configured_root_admission.py:409: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = _LiveMcp(server=<mcp.server.lowlevel.server.Server object at 0x7fc1f6ead220>, scratch=PosixPath('/tmp/pytest-of-agent/pytest-200/test_loaded_legacy_escape_is_p1/scratch'), session_id='e3b54b8a277c')
+name = 'preview_pipeline', arguments = {}
+
+    async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        response = await self.raw_call(name, arguments)
+>       assert not response.isError, response
+E       AssertionError: CallToolResult(meta=None, content=[TextContent(type='text', text='Tool error: TypeError', annotations=None, meta=None)], structuredContent=None, isError=True)
+E       assert not True
+E        +  where True = CallToolResult(meta=None, content=[TextContent(type='text', text='Tool error: TypeError', annotations=None, meta=None)], structuredContent=None, isError=True).isError
+
+tests/unit/composer_mcp/test_configured_root_admission.py:156: AssertionError
+___ test_loaded_legacy_escape_is_preserved_and_refused_by_preview[provider] ____
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-200/test_loaded_legacy_escape_is_p2')
+component = 'provider'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("component", ["source", "output", "provider"])
+    async def test_loaded_legacy_escape_is_preserved_and_refused_by_preview(tmp_path: Path, component: str) -> None:
+        root = tmp_path / "data"
+        root.mkdir()
+        payload = _preview_state().to_dict()
+        escaped = str(tmp_path / "PRIVATE-LEGACY-PATH")
+        if component == "source":
+            payload["sources"]["source"]["options"]["path"] = escaped
+        elif component == "output":
+            payload["outputs"][0]["options"]["path"] = escaped
+        else:
+            payload = _seed_state().to_dict()
+            payload["nodes"][1]["options"]["provider_config"]["persist_directory"] = escaped
+        live = await _live_mcp(tmp_path, root, state=CompositionState.from_dict(payload))
+        before, saved = live.private_state.to_dict(), live.saved_bytes
+>       preview = await live.call("preview_pipeline", {})
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/composer_mcp/test_configured_root_admission.py:409: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = _LiveMcp(server=<mcp.server.lowlevel.server.Server object at 0x7fc1f5c7c860>, scratch=PosixPath('/tmp/pytest-of-agent/pytest-200/test_loaded_legacy_escape_is_p2/scratch'), session_id='fe393e9ba83e')
+name = 'preview_pipeline', arguments = {}
+
+    async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        response = await self.raw_call(name, arguments)
+>       assert not response.isError, response
+E       AssertionError: CallToolResult(meta=None, content=[TextContent(type='text', text='Tool error: TypeError', annotations=None, meta=None)], structuredContent=None, isError=True)
+E       assert not True
+E        +  where True = CallToolResult(meta=None, content=[TextContent(type='text', text='Tool error: TypeError', annotations=None, meta=None)], structuredContent=None, isError=True).isError
+
+tests/unit/composer_mcp/test_configured_root_admission.py:156: AssertionError
+___________ test_preview_rechecks_a_symlink_changed_since_admission ____________
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-200/test_preview_rechecks_a_symlin0')
+
+    @pytest.mark.asyncio
+    async def test_preview_rechecks_a_symlink_changed_since_admission(tmp_path: Path) -> None:
+        root = tmp_path / "data"
+        root.mkdir()
+        target = root / "input.csv"
+        target.write_text("text\nhello\n")
+        link = root / "alias.csv"
+        link.symlink_to(target)
+        live = await _live_mcp(tmp_path, root, state=_preview_state())
+        assert (await live.call("set_source", {**_source("alias.csv"), "on_success": "result"}))["success"] is True
+        # Admission was valid; a different later resolution must not inherit it.
+        link.unlink()
+        link.symlink_to(tmp_path / "private.csv")
+>       preview = await live.call("preview_pipeline", {})
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/composer_mcp/test_configured_root_admission.py:444: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = _LiveMcp(server=<mcp.server.lowlevel.server.Server object at 0x7fc1f6ce6180>, scratch=PosixPath('/tmp/pytest-of-agent/pytest-200/test_preview_rechecks_a_symlin0/scratch'), session_id='109e90f698d7')
+name = 'preview_pipeline', arguments = {}
+
+    async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        response = await self.raw_call(name, arguments)
+>       assert not response.isError, response
+E       AssertionError: CallToolResult(meta=None, content=[TextContent(type='text', text='Tool error: TypeError', annotations=None, meta=None)], structuredContent=None, isError=True)
+E       assert not True
+E        +  where True = CallToolResult(meta=None, content=[TextContent(type='text', text='Tool error: TypeError', annotations=None, meta=None)], structuredContent=None, isError=True).isError
+
+tests/unit/composer_mcp/test_configured_root_admission.py:156: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_configured_root_admits_file_authoring[relative-splice-provider]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_configured_root_admits_file_authoring[absolute-splice-provider]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_in_root_file_preview_reaches_actual_plugin_and_graph_checks
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_loaded_legacy_escape_is_preserved_and_refused_by_preview[source]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_loaded_legacy_escape_is_preserved_and_refused_by_preview[output]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_loaded_legacy_escape_is_preserved_and_refused_by_preview[provider]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_preview_rechecks_a_symlink_changed_since_admission
+======================== 7 failed, 88 passed in 28.04s =========================

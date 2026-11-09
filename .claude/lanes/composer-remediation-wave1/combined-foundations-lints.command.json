@@ -1,0 +1,16 @@
+{
+  "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata",
+  "argv": [
+    "/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv/bin/python",
+    "-m",
+    "elspeth_lints.core.cli",
+    "check",
+    "--rules",
+    "all",
+    "--root",
+    "src/elspeth",
+    "--format",
+    "json"
+  ],
+  "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/src:/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/elspeth-lints/src"
+}

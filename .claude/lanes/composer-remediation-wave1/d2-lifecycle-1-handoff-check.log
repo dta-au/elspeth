@@ -1,0 +1,9 @@
+{"head": "f9c23c59c63bbd3099029e995a778bade594f6c8", "inputs": 6205, "sha256": "290e6a24c3aba8ab5d31b9e88f869e630a02f01455bd288d4bbc0c8f37bb490f"}
+Final source/test freeze unchanged; review diff matches tested candidate.
+Review diff SHA256: 090f1758577b194354e3521979e48610a8501eb6d8131b418026a33e90c7ee6f
+ M src/elspeth/web/execution/runtime_preflight.py
+ M src/elspeth/web/process_recovery.py
+ M src/elspeth/web/process_watchdog.py
+ M tests/fixtures/process_watchdog.py
+ M tests/unit/web/execution/test_runtime_preflight_coordinator.py
+ M tests/unit/web/test_process_watchdog.py

@@ -1,0 +1,19 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0 -- /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1/.venv/bin/python
+cachedir: .pytest_cache
+hypothesis profile 'ci' -> deadline=None, phases=(Phase.explicit, Phase.reuse, Phase.generate, Phase.shrink)
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 6 items
+
+tests/unit/web/composer/test_compose_loop_persistence.py::test_explicit_approval_batch_caps_after_first_ten_admitted_publications[10] PASSED [ 16%]
+tests/unit/web/composer/test_compose_loop_persistence.py::test_explicit_approval_batch_caps_after_first_ten_admitted_publications[11] PASSED [ 33%]
+tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_cap_excludes_schema_errors_and_semantic_refusals PASSED [ 50%]
+tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[invalid-at-cap] PASSED [ 66%]
+tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[admitted-tenth] PASSED [ 83%]
+tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[admitted-eleventh] PASSED [100%]
+
+============================== 6 passed in 7.06s ===============================

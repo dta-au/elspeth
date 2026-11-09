@@ -1,0 +1,170 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 59 items / 28 deselected / 31 selected
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py ............. [ 41%]
+................F                                                        [ 96%]
+tests/unit/web/composer/test_audit_cohort_settlement.py .                [100%]
+
+=================================== FAILURES ===================================
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes29-False-telemetry] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-119/test_actual_planner_resource_r29/operations.db), <elspeth.web.coordi...lspeth.web.sessions.service.SessionServiceImpl object at 0x7f5009694ef0>, UUID('ae8e124f-cc59-4cd3-9f2a-0ec805d6be5a'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-119/test_actual_planner_resource_r29')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f5008a10e90>
+required = True, trust_modes = ('auto_commit', 'auto_commit')
+cancel_creation = False, fault = 'telemetry'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "required,trust_modes,cancel_creation,fault",
+        [
+            (required, modes, cancel, "pending")
+            for required in (False, True)
+            for modes in (
+                ("explicit_approve", "explicit_approve"),
+                ("auto_commit", "auto_commit"),
+                ("auto_commit", "explicit_approve"),
+                ("explicit_approve", "auto_commit"),
+            )
+            for cancel in (False, True)
+        ]
+        + [
+            (required, ("auto_commit", "auto_commit"), False, fault)
+            for required in (False, True)
+            for fault in ("missing", "error", "corrupt", "ValueError", "SQL", "group", "telemetry")
+        ],
+    )
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation, fault
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import delete, update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness, _valid_pipeline_args
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+        planner._sessions_service_optional = service
+        blob = await BlobServiceImpl(engine, tmp_path).create_blob(
+            sid, "input.csv", b"value\n1\n", "text/csv", session_operation_context=running.session_operation_context
+        )
+        pipeline = _valid_pipeline_args(tmp_path)
+        pipeline["source"]["blob_id"] = str(blob.id)
+        proposal = PipelineProposal.create(pipeline=pipeline, base=expected.authority.proposal.base, repair_count=0, skill_hash="a" * 64)
+        plan = PipelinePlanResult(
+            proposal=proposal,
+            tool_call_id="raced-planner",
+            custody_result="not_required",
+            model_identifier="model",
+            model_version="version",
+            provider="test",
+        )
+        # The same authority passed admission; the resource changes only afterward.
+        from elspeth.web.sessions.proposal_blob_refs import validate_proposal_blob_references
+    
+        with engine.begin() as conn:
+            validate_proposal_blob_references(conn, session_id=str(sid), tool_name="set_pipeline", arguments=pipeline)
+            if fault == "missing":
+                conn.execute(delete(blobs_table).where(blobs_table.c.id == str(blob.id)))
+            elif fault in {"pending", "error", "corrupt"}:
+                if fault == "corrupt":
+                    conn.exec_driver_sql("PRAGMA ignore_check_constraints=ON")
+                conn.execute(
+                    update(blobs_table).where(blobs_table.c.id == str(blob.id)).values(status="unknown" if fault == "corrupt" else fault)
+                )
+                if fault == "corrupt":
+                    conn.exec_driver_sql("PRAGMA ignore_check_constraints=OFF")
+            conn.execute(update(sessions_table).where(sessions_table.c.id == str(sid)).values(trust_mode=trust_modes[1]))
+        preferences = replace(await service.get_composer_preferences(sid), trust_mode=trust_modes[0])
+        parent = RequiredWorkCoordinator(
+            RequiredWorkAuthority(
+                RequiredAuthorityKind.DURABLE_COMPOSE, running.session_operation_context, running.claim.operation_id, running.claim.attempt
+            )
+        )
+        binding = RequiredWorkBinding(parent, 7, 12, RequiredWorkRole.TURN, running) if required else None
+        entered, release = threading.Event(), threading.Event()
+        deliveries = []
+        actual_shield = asyncio.shield
+        injected = {
+            "ValueError": ValueError("private parser detail"),
+            "SQL": OperationalError("private SQL detail", {}, RuntimeError("driver detail")),
+            "group": ExceptionGroup("private grouped failures", [ValueError("parser"), RuntimeError("other")]),
+            "telemetry": RuntimeError("post-SQL telemetry detail"),
+        }
+        if fault == "telemetry":
+            from elspeth.web.sessions import service as service_module
+    
+            class FailedCounter:
+                def add(self, amount, attributes):
+                    raise injected["telemetry"]
+    
+            monkeypatch.setattr(service_module, "_PIPELINE_PLANNER_COUNTER", FailedCounter())
+    
+        async def observe_shield(awaitable):
+            try:
+                return await actual_shield(awaitable)
+            except asyncio.CancelledError as delivery:
+                deliveries.append(delivery)
+                raise
+    
+        from elspeth.web import async_workers
+    
+        actual_retain = async_workers._retain_cancellation
+    
+        def observe_retain(cancellations, cancellation):
+            deliveries.append(cancellation)
+            actual_retain(cancellations, cancellation)
+    
+        def park_validator(_conn, _cursor, statement, _parameters, _context, _many):
+            if statement.startswith("SELECT blobs.session_id, blobs.status"):
+                entered.set()
+                assert release.wait(5)
+                if fault in {"ValueError", "SQL", "group"}:
+                    raise injected[fault]
+    
+        monkeypatch.setattr(asyncio, "shield", observe_shield)
+        monkeypatch.setattr(async_workers, "_retain_cancellation", observe_retain)
+        event.listen(engine, "before_cursor_execute", park_validator)
+        state = _initial_composition_state()
+        task = asyncio.create_task(
+            planner._stage_pipeline_plan(
+                plan=plan,
+                state=state,
+                session_id=sid,
+                current_state_id=None,
+                user_message_id=expected.authority.row.user_message_id,
+                user_id="alice",
+                session_operation_context=running.session_operation_context,
+                preferences=preferences,
+                recorder=BufferingRecorder(),
+                planner_llm_calls=(),
+>               planner_private_candidates=(),
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                planner_attempts=(),
+                planner_invocations=(),
+                planner_withheld_replies=(),
+                required_work=binding,
+            )
+        )
+E       AssertionError: assert ExceptionGroup('Planner actual creation and rejection original outcomes', [ComposerOwnedSettlementFailure('Composer owned settlement did not complete'), RuntimeError('post-SQL telemetry detail')]) is RuntimeError('post-SQL telemetry detail')
+E        +  where ExceptionGroup('Planner actual creation and rejection original outcomes', [ComposerOwnedSettlementFailure('Composer owned settlement did not complete'), RuntimeError('post-SQL telemetry detail')]) = <ExceptionInfo ExceptionGroup('Planner actual creation and rejection original outcomes', [ComposerOwnedSettlementFailure('Composer owned settlement did not complete'), RuntimeError('post-SQL telemetry detail')]) tblen=2>.value
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:587: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:19:31 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:19:31 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:19:31 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+=========================== short test summary info ============================
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes29-False-telemetry]
+================= 1 failed, 30 passed, 28 deselected in 26.54s =================

@@ -1,0 +1,10 @@
+--- candidate/src/elspeth/web/sessions/service.py
++++ mutant/src/elspeth/web/sessions/service.py
+@@ -9298,6 +9298,7 @@
+             notice = (
+                 "Graph recovery did not complete: the requested draft could not be preserved or restored. The current graph is unchanged."
+             )
++            notice += f" Requested selector: {{{recovery.intent.park_id}}}."
+         elif recovery.intent.action == "park":
+             notice = f"Draft parked as {recovery.park_id}. The graph remains visible."
+         elif recovery.empty_fallback:

@@ -1,6 +1,6 @@
 # Composer remediation pickup notes
 
-Work is deliberately paused at the user's request. The user then requested a durable remote checkpoint. Resume remediation only when asked; do not interpret this document as an instruction to launch background work during the pause.
+Work is deliberately paused at the user's request. The user then requested a durable remote checkpoint. Resume remediation only when asked; do not interpret this document as an instruction to launch background work during the pause. **Recovery update, 10 November 2026:** the user subsequently requested publication of the original root lane files and runtime assets. See [remote recovery instructions](../../../.claude/lanes/composer-remediation-wave1/REMOTE-RECOVERY.md) for Git LFS setup, credential exclusions and source-worktree reconstruction. Statements below that root-lane evidence is local-only describe the initial checkpoint and are superseded by that publication; excluded files and separate worktree-local lanes remain unavailable in a fresh clone.
 
 The checkpoint branch is `fix/composer-tool-remediation` on `origin` (`dta-au/elspeth`). The implementation checkpoint is **`dd3b3524ccd2a1910db98f77eb35f9d7ce69a249`**. The documentation commit containing these notes follows that checkpoint. This branch is a work-in-progress backup, **not a declaration that the whole audit is complete or ready to merge**. No merge to `main`, PR or release is part of the pause operation.
 

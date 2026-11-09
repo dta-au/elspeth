@@ -1,0 +1,1296 @@
+"""Lease lifecycle for scheduler work items: claim, heartbeat, recovery.
+
+The CAS claim verbs (READY and PENDING_SINK), the single-timestamp lease
+heartbeat, the liveness-aware expired-lease recovery sweep, and the
+peer-lease probe. Extracted from ``TokenSchedulerRepository``
+(archived issue elspeth-ef9c36d767).
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+
+from sqlalchemy import ColumnElement, and_, bindparam, func, or_, select, update
+from sqlalchemy.engine import Connection, RowMapping
+
+from elspeth.contracts.coordination import (
+    DEFAULT_ITEM_STALL_BUDGET_SECONDS,
+    DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+    CoordinationToken,
+    WorkerMembershipToken,
+)
+from elspeth.contracts.enums import TerminalPath
+from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError, SchedulerLeaseLostError
+from elspeth.contracts.scheduler import (
+    RESUME_REFUSAL_TOKEN_ID_LIMIT,
+    ResumeCoverageRefusal,
+    SchedulerEventType,
+    TokenWorkItem,
+    TokenWorkStatus,
+)
+from elspeth.core.landscape.bind_budget import bind_budget_chunks
+from elspeth.core.landscape.database import Tier1Engine
+from elspeth.core.landscape.database_clock import read_landscape_decision_time
+from elspeth.core.landscape.lease_deadlines import DeadlineKey, DeadlineKind, record_issued_deadline
+from elspeth.core.landscape.run_coordination_repository import (
+    CoordinationEventRow,
+    fenced_member_transaction,
+    record_coordination_event,
+    record_coordination_events,
+)
+from elspeth.core.landscape.scheduler.events import SchedulerEventRecord, SchedulerEventStore
+from elspeth.core.landscape.scheduler.fencing import (
+    fenced_write,
+    require_coordination_token,
+)
+from elspeth.core.landscape.scheduler.payload_codec import scrubbed_row_payload_json
+from elspeth.core.landscape.scheduler.work_items import item_from_mapping, work_item_id
+from elspeth.core.landscape.schema import (
+    active_worker_fence_clause,
+    claim_verb_fence_clause,
+    group_losses_table,
+    pending_sink_bundle_clause,
+    run_workers_table,
+    token_outcomes_table,
+    token_parents_table,
+    token_work_items_table,
+    tokens_table,
+    undecided_failed_work_clause,
+)
+
+
+def lock_worker_membership_row(conn: Connection, *, worker_id: str, run_id: str) -> None:
+    """Serialize membership fencing with worker eviction (elspeth-6903f82511).
+
+    The membership fence rides the claim/heartbeat CAS UPDATE as an EXISTS
+    predicate over ``run_workers``.  MVCC predicate reads take no row locks,
+    so a fence evaluated while an eviction transaction holds the worker's
+    ``run_workers`` row uncommitted-updated passes on the pre-eviction
+    snapshot and hands an evicted worker a new (or renewed) lease.  Taking a
+    shared row lock first blocks behind the eviction UPDATE and observes the
+    committed status once it clears, so the CAS fence (and its re-probe
+    classification) sees the eviction and fails closed.
+
+    ``FOR SHARE`` (not ``FOR UPDATE``) so fenced verbs of live workers do not
+    serialize against each other — only against eviction, whose row UPDATE
+    conflicts with any shared lock.  ``evict_worker`` mirrors this seam from
+    the other side: it locks the target's row FOR UPDATE *before* its
+    no-unexpired-leases precondition, so every in-flight fenced lease write is
+    committed-and-visible or blocked when eviction reads the lease table.
+
+    An absent row locks nothing — absence semantics stay owned by the fence
+    clause on the CAS UPDATE (strict: refused; lenient: N=0 arm).  SQLite
+    ignores ``FOR SHARE``: ``BEGIN IMMEDIATE`` already owns the whole write
+    slot for the transaction, which is the same serialization this lock buys
+    on PostgreSQL.
+    """
+    conn.execute(
+        select(run_workers_table.c.worker_id)
+        .where(
+            run_workers_table.c.worker_id == worker_id,
+            run_workers_table.c.run_id == run_id,
+        )
+        .with_for_update(read=True, of=run_workers_table)
+    ).fetchall()
+
+
+def _incomplete_pending_sink_bundle_error(*, run_id: str, work_item_id: str) -> AuditIntegrityError:
+    return AuditIntegrityError(
+        f"Scheduler claim_pending_sink refused run_id={run_id!r} work_item_id={work_item_id!r}: "
+        "PENDING_SINK row does not carry a complete durable sink bundle. Required: non-empty row payload and sink name; "
+        "a legal pending_outcome/pending_path sink pair; no pending_error_hash/pending_error_message for successful paths; "
+        "both pending_error_hash and pending_error_message for ON_ERROR_ROUTED; "
+        "and join_group_id for COALESCED (the kept merge-event column)."
+    )
+
+
+class SchedulerLeaseRepository:
+    """Claiming, heartbeating and recovering leases on token work items."""
+
+    def __init__(self, engine: Tier1Engine, *, events: SchedulerEventStore) -> None:
+        self._engine = engine
+        self._events = events
+
+    def claim_ready(
+        self,
+        *,
+        member_token: WorkerMembershipToken,
+        lease_owner: str,
+        lease_seconds: int,
+    ) -> TokenWorkItem | None:
+        """Claim the next available READY work item for a bounded lease.
+
+        Availability and the lease deadline are both decided on Landscape
+        database time (ADR-047). Discovery may conservatively defer work that
+        becomes available later. ``claim_ready_row`` locks the candidate and
+        samples again for the authoritative availability and issuance decision.
+        """
+        run_id = member_token.run_id
+        if lease_owner != member_token.worker_id:
+            raise ValueError("lease owner must match authority token")
+        with fenced_member_transaction(self._engine, member_token=member_token, verb="claim_ready") as conn:
+            database_now = read_landscape_decision_time(conn)
+            row = (
+                conn.execute(
+                    select(token_work_items_table)
+                    .where(token_work_items_table.c.run_id == run_id)
+                    .where(token_work_items_table.c.status == TokenWorkStatus.READY.value)
+                    .where(token_work_items_table.c.available_at <= database_now)
+                    .order_by(
+                        token_work_items_table.c.ingest_sequence,
+                        token_work_items_table.c.step_index,
+                        token_work_items_table.c.created_at,
+                        # Stable last-resort tiebreaker for cross-source same-tick
+                        # collisions where ingest_sequence/step_index/created_at
+                        # are not jointly disambiguating (archived issue elspeth-6cb89db535,
+                        # G3 determinism-reviewer M1).
+                        token_work_items_table.c.work_item_id,
+                    )
+                    .limit(1)
+                )
+                .mappings()
+                .first()
+            )
+            if row is None:
+                return None
+            claimed = self.claim_ready_row(
+                conn,
+                row=row,
+                run_id=run_id,
+                lease_owner=lease_owner,
+                lease_seconds=lease_seconds,
+                # Membership fence: the public claim_ready verb applies the
+                # claim_verb_fence_clause so an evicted/departed claimant
+                # is refused with RunWorkerEvictedError (ADR-030 §G, slice 4).
+                membership_fenced=True,
+            )
+            if claimed is None:
+                return None
+        return item_from_mapping(claimed)
+
+    def claim_ready_row(
+        self,
+        conn: Connection,
+        *,
+        row: RowMapping,
+        run_id: str,
+        lease_owner: str,
+        lease_seconds: int,
+        membership_fenced: bool = False,
+        strict_membership_fenced: bool = False,
+    ) -> RowMapping | None:
+        """CAS update to claim a READY row under a lease.
+
+        Reads the Landscape database clock on the caller's ``conn`` (ADR-047):
+        after acquiring membership and item locks: availability, the lease
+        deadline and ``updated_at`` share one fresh instant. The caller owns
+        completion; its commit guard refuses an overlong transaction tail
+        without changing the returned snapshot or recorded event deadline.
+
+        ``membership_fenced=True`` (set only by the public ``claim_ready``
+        verb) adds the ``claim_verb_fence_clause`` to the UPDATE WHERE.
+        That clause passes when this worker is active OR when no workers are
+        registered for the run at all (N=0/unit-test mode). When workers ARE
+        registered, an absent caller gets rowcount=0 with zero mutation and an
+        evicted/departed caller gets rowcount=0 plus the re-probe below raises
+        ``RunWorkerEvictedError``.
+
+        ``strict_membership_fenced=True`` is reserved for the standalone
+        production enqueue-and-claim path. It uses the strict
+        ``active_worker_fence_clause`` with no N=0 arm, so membership removal
+        between that verb's entry guard and this UPDATE is refused and rolls
+        back the whole transaction. Other internal callers pass both defaults
+        as ``False`` because they are explicitly legacy or operate inside a
+        broader leader-fenced transaction.
+        """
+        if strict_membership_fenced or membership_fenced:
+            # Serialize the fence with worker eviction BEFORE the CAS UPDATE:
+            # the EXISTS predicate below is an unlocked MVCC read and would
+            # otherwise pass on still-active membership while an eviction that
+            # already observed no live lease sits uncommitted
+            # (elspeth-6903f82511).
+            lock_worker_membership_row(conn, worker_id=lease_owner, run_id=run_id)
+        locked_row = (
+            conn.execute(
+                select(token_work_items_table)
+                .where(token_work_items_table.c.work_item_id == row["work_item_id"], token_work_items_table.c.run_id == run_id)
+                .with_for_update(of=token_work_items_table)
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if locked_row is None:
+            return None
+        row = locked_row
+        database_now = read_landscape_decision_time(conn)
+        lease_expires_at = database_now + timedelta(seconds=lease_seconds)
+        where_clauses = and_(
+            token_work_items_table.c.work_item_id == row["work_item_id"],
+            token_work_items_table.c.run_id == run_id,
+            token_work_items_table.c.status == TokenWorkStatus.READY.value,
+            token_work_items_table.c.available_at <= database_now,
+        )
+        if strict_membership_fenced:
+            where_clauses = and_(
+                where_clauses,
+                active_worker_fence_clause(worker_id=lease_owner, run_id=run_id),
+            )
+        elif membership_fenced:
+            # Membership fence (ADR-030 §G, slice 4): the claimant must hold
+            # an active run_workers row OR the run has no registered workers
+            # at all (N=0 / unit-test mode — see claim_verb_fence_clause).
+            # An absent caller is refused once any worker has registered for
+            # the run; an evicted/departed caller is re-probed below and raises
+            # RunWorkerEvictedError.
+            where_clauses = and_(
+                where_clauses,
+                claim_verb_fence_clause(worker_id=lease_owner, run_id=run_id),
+            )
+        result = conn.execute(
+            update(token_work_items_table)
+            .where(where_clauses)
+            .values(
+                status=TokenWorkStatus.LEASED.value,
+                lease_owner=lease_owner,
+                lease_expires_at=lease_expires_at,
+                updated_at=database_now,
+            )
+        )
+        if result.rowcount == 0:
+            if strict_membership_fenced or membership_fenced:
+                # Distinguish "empty queue" (row raced away — legitimate None)
+                # from "membership fence failed" (this worker is no longer active).
+                # The SELECT above found the row; re-probe the fence only.
+                still_ready = conn.execute(
+                    select(token_work_items_table.c.work_item_id)
+                    .where(token_work_items_table.c.work_item_id == row["work_item_id"])
+                    .where(token_work_items_table.c.run_id == run_id)
+                    .where(token_work_items_table.c.status == TokenWorkStatus.READY.value)
+                ).first()
+                if still_ready is not None:
+                    if strict_membership_fenced:
+                        worker_active = conn.execute(select(active_worker_fence_clause(worker_id=lease_owner, run_id=run_id))).scalar()
+                        if not worker_active:
+                            raise RunWorkerEvictedError(worker_id=lease_owner, run_id=run_id)
+                        return None
+                    # Row is still READY but the UPDATE matched 0 rows.  Two cases:
+                    #
+                    # (a) Worker EXISTS with status != 'active' (evicted/departed):
+                    #     the worker was registered, then evicted — raise
+                    #     RunWorkerEvictedError (the canonical multi-worker signal).
+                    #
+                    # (b) Worker is ABSENT while this run has registered workers:
+                    #     in production every worker registers before claiming;
+                    #     an absent worker means the caller bypassed registration.
+                    #     Return None rather than raising; the fence clause in
+                    #     the UPDATE WHERE prevents any data mutation.
+                    worker_status = conn.execute(
+                        select(run_workers_table.c.status)
+                        .where(run_workers_table.c.worker_id == lease_owner)
+                        .where(run_workers_table.c.run_id == run_id)
+                    ).scalar()
+                    if worker_status is not None and str(worker_status) != "active":
+                        raise RunWorkerEvictedError(worker_id=lease_owner, run_id=run_id)
+            return None
+        if result.rowcount != 1:
+            raise AuditIntegrityError(
+                f"Scheduler claim_ready lost race on run_id={run_id!r} "
+                f"work_item_id={row['work_item_id']!r}: SELECT saw READY but UPDATE matched "
+                f"{result.rowcount} rows for lease_owner={lease_owner!r}. Concurrent claim by another worker."
+            )
+        record_issued_deadline(
+            conn,
+            key=DeadlineKey(DeadlineKind.ITEM, (row["work_item_id"],)),
+            expires_at=lease_expires_at,
+            window_seconds=lease_seconds,
+        )
+        self._events.record(
+            conn,
+            event_type=SchedulerEventType.CLAIM_READY,
+            run_id=run_id,
+            token_id=row["token_id"],
+            work_item_id=row["work_item_id"],
+            node_id=row["node_id"],
+            from_status=TokenWorkStatus.READY,
+            to_status=TokenWorkStatus.LEASED,
+            from_lease_owner=row["lease_owner"],
+            to_lease_owner=lease_owner,
+            from_attempt=row["attempt"],
+            to_attempt=row["attempt"],
+            recorded_at=database_now,
+            from_lease_expires_at=row["lease_expires_at"],
+            to_lease_expires_at=lease_expires_at,
+            caller_owner=lease_owner,
+        )
+        claimed = (
+            conn.execute(
+                select(token_work_items_table)
+                .where(token_work_items_table.c.work_item_id == row["work_item_id"])
+                .where(token_work_items_table.c.run_id == run_id)
+                .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+                .where(token_work_items_table.c.lease_owner == lease_owner)
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if claimed is None:
+            raise AuditIntegrityError(
+                f"Scheduler claim invariant violated for work_item_id={row['work_item_id']!r}: leased row was not owned by the claimant"
+            )
+        return claimed
+
+    def claim_pending_sink(
+        self,
+        *,
+        coordination_token: CoordinationToken,
+        lease_owner: str,
+        lease_seconds: int,
+    ) -> TokenWorkItem | None:
+        """Claim a sink-bound token whose transform work is already durable.
+
+        The lease deadline is database time + ``lease_seconds``, read once
+        after the membership and item locks in this verb's write transaction
+        (ADR-047). An overlong completion tail is refused before commit.
+        """
+        complete_bundle = pending_sink_bundle_clause()
+        run_id = coordination_token.run_id
+        if lease_owner != coordination_token.worker_id:
+            raise ValueError("lease owner must match authority token")
+        with fenced_write(self._engine, coordination_token=coordination_token, verb="claim_pending_sink") as conn:
+            row = (
+                conn.execute(
+                    select(token_work_items_table, complete_bundle.label("_pending_sink_bundle_complete"))
+                    .where(token_work_items_table.c.run_id == coordination_token.run_id)
+                    .where(token_work_items_table.c.status == TokenWorkStatus.PENDING_SINK.value)
+                    .order_by(
+                        token_work_items_table.c.ingest_sequence,
+                        token_work_items_table.c.step_index,
+                        token_work_items_table.c.created_at,
+                        # Stable last-resort tiebreaker for cross-source same-tick
+                        # collisions (archived issue elspeth-6cb89db535, G3 M1).
+                        token_work_items_table.c.work_item_id,
+                    )
+                    .limit(1)
+                )
+                .mappings()
+                .first()
+            )
+            if row is None:
+                return None
+            if not row["_pending_sink_bundle_complete"]:
+                raise _incomplete_pending_sink_bundle_error(run_id=coordination_token.run_id, work_item_id=row["work_item_id"])
+            # Serialize the membership fence with worker eviction before the
+            # CAS UPDATE (elspeth-6903f82511) — same seam as claim_ready_row.
+            lock_worker_membership_row(conn, worker_id=lease_owner, run_id=coordination_token.run_id)
+            locked_row = (
+                conn.execute(
+                    select(token_work_items_table, complete_bundle.label("_pending_sink_bundle_complete"))
+                    .where(token_work_items_table.c.work_item_id == row["work_item_id"], token_work_items_table.c.run_id == run_id)
+                    .with_for_update(of=token_work_items_table)
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if locked_row is None:
+                return None
+            row = locked_row
+            database_now = read_landscape_decision_time(conn)
+            lease_expires_at = database_now + timedelta(seconds=lease_seconds)
+            result = conn.execute(
+                update(token_work_items_table)
+                .where(
+                    and_(
+                        token_work_items_table.c.work_item_id == row["work_item_id"],
+                        token_work_items_table.c.run_id == coordination_token.run_id,
+                        token_work_items_table.c.status == TokenWorkStatus.PENDING_SINK.value,
+                        # Admission is repeated inside the CAS.  A peer that
+                        # corrupts the bundle after the diagnostic SELECT but
+                        # before this UPDATE cannot turn malformed work into a
+                        # leased redrive or emit a claim event.
+                        complete_bundle,
+                        # Membership fence (ADR-030 §G, slice 4): same discipline
+                        # as claim_ready — absent claimants are refused once the
+                        # run has any registered worker; evicted/departed claimants
+                        # are re-probed below and raise RunWorkerEvictedError.
+                        # Uses the lenient variant (passes only in N=0/unit-test mode).
+                        claim_verb_fence_clause(worker_id=lease_owner, run_id=coordination_token.run_id),
+                    )
+                )
+                .values(
+                    status=TokenWorkStatus.LEASED.value,
+                    lease_owner=lease_owner,
+                    lease_expires_at=lease_expires_at,
+                    updated_at=database_now,
+                )
+            )
+            if result.rowcount == 0:
+                # Distinguish "row raced away" from "membership fence failed".
+                # Same absent-vs-evicted logic as _claim_ready_row: absent
+                # unregistered claimants return None with zero mutation, while
+                # registered-then-evicted claimants raise the multi-worker signal.
+                still_pending = (
+                    conn.execute(
+                        select(token_work_items_table, complete_bundle.label("_pending_sink_bundle_complete"))
+                        .where(token_work_items_table.c.work_item_id == row["work_item_id"])
+                        .where(token_work_items_table.c.run_id == coordination_token.run_id)
+                        .where(token_work_items_table.c.status == TokenWorkStatus.PENDING_SINK.value)
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if still_pending is not None:
+                    if not still_pending["_pending_sink_bundle_complete"]:
+                        raise _incomplete_pending_sink_bundle_error(run_id=coordination_token.run_id, work_item_id=row["work_item_id"])
+                    worker_status = conn.execute(
+                        select(run_workers_table.c.status)
+                        .where(run_workers_table.c.worker_id == lease_owner)
+                        .where(run_workers_table.c.run_id == coordination_token.run_id)
+                    ).scalar()
+                    if worker_status is not None and str(worker_status) != "active":
+                        raise RunWorkerEvictedError(worker_id=lease_owner, run_id=coordination_token.run_id)
+                return None
+            if result.rowcount != 1:
+                raise AuditIntegrityError(
+                    f"Scheduler claim_pending_sink lost race on run_id={run_id!r} work_item_id={row['work_item_id']!r}: "
+                    f"UPDATE matched {result.rowcount} rows for lease_owner={lease_owner!r}."
+                )
+            record_issued_deadline(
+                conn,
+                key=DeadlineKey(DeadlineKind.ITEM, (row["work_item_id"],)),
+                expires_at=lease_expires_at,
+                window_seconds=lease_seconds,
+            )
+            self._events.record(
+                conn,
+                event_type=SchedulerEventType.CLAIM_PENDING_SINK,
+                run_id=coordination_token.run_id,
+                token_id=row["token_id"],
+                work_item_id=row["work_item_id"],
+                node_id=row["node_id"],
+                from_status=TokenWorkStatus.PENDING_SINK,
+                to_status=TokenWorkStatus.LEASED,
+                from_lease_owner=row["lease_owner"],
+                to_lease_owner=lease_owner,
+                from_attempt=row["attempt"],
+                to_attempt=row["attempt"],
+                recorded_at=database_now,
+                from_lease_expires_at=row["lease_expires_at"],
+                to_lease_expires_at=lease_expires_at,
+                caller_owner=lease_owner,
+            )
+            claimed = (
+                conn.execute(
+                    select(token_work_items_table)
+                    .where(token_work_items_table.c.work_item_id == row["work_item_id"])
+                    .where(token_work_items_table.c.run_id == coordination_token.run_id)
+                    .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+                    .where(token_work_items_table.c.lease_owner == lease_owner)
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if claimed is None:
+                raise AuditIntegrityError(
+                    f"Scheduler pending-sink claim invariant violated for work_item_id={row['work_item_id']!r}: "
+                    "leased row was not owned by the claimant"
+                )
+        return item_from_mapping(claimed)
+
+    def recover_expired_leases(
+        self,
+        *,
+        coordination_token: CoordinationToken,
+        grace_seconds: float = DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+        stall_budget_seconds: float = DEFAULT_ITEM_STALL_BUDGET_SECONDS,
+    ) -> int:
+        """Return expired LEASED work to READY under current leader authority.
+
+        ``coordination_token`` (ADR-030 §C.4 row 8): the repair sweep is a
+        LEADER verb — the verify-and-extend epoch fence runs as the first
+        statement of the transaction so a deposed leader cannot rotate
+        attempts under the new one.
+
+        **Liveness-aware reap (slice 4, §A.5/§C.1):** An expired item lease is
+        reapable ONLY under one of two conditions:
+
+        1. ``owner_registry_dead`` — the ``run_workers`` row for the lease
+           owner is ABSENT, has status IN ('evicted','departed'), or has
+           ``status='active'`` AND ``heartbeat_expires_at`` older than
+           database time minus ``grace_seconds``.
+           All three arms collapse into a single NOT EXISTS predicate so
+           absent, non-active, and active-but-stale rows all match (no row
+           → no EXISTS match → dead). This is the primary protection: a
+           registered-live owner's expired item lease is LEFT LEASED so the
+           owner's next ``heartbeat_lease`` revives it. Long LLM calls no
+           longer become reap targets on every maintenance sweep.
+
+        2. ``lease_stalled`` — the owner IS registry-live BUT the lease has
+           been expired for longer than ``stall_budget_seconds`` (default
+           2x scheduler_lease). A genuinely wedged worker (heartbeat thread
+           alive, drain loop stuck) triggers this arm. The rotation emits a
+           ``worker_stalled`` coordination event in the SAME transaction,
+           naming the owner and the reaped item (§A.5 :145).
+
+        **N=1 IMPROVEMENT (re-pin):** a single live leader beating its own
+        seat+row keeps ``owner_registry_dead`` FALSE for its own in-flight
+        items, so a long LLM call's expired item lease is NO LONGER reapable
+        by a racing recover sweep. The self-sweep guard (lease_owner_not_caller)
+        is unchanged; the NEW protection is against a peer/successor sweep
+        reaping a registered-live owner.
+
+        Recovery advances the durable scheduler attempt so any node state
+        created before the crashed worker lost its lease is not replayed under
+        the same ``(token_id, node_id, attempt)`` audit identity.
+
+        Run scope and caller identity are derived from ``coordination_token``;
+        strict callers cannot redirect a valid leader seat at another run or
+        attribute the sweep to a different worker. Leases owned by the leader
+        are skipped: a worker must never reap its own still-running lease.
+        Any token processing step that exceeds the lease window (LLM/HTTP
+        pipelines exceed the default with regularity) would otherwise have its
+        in-flight lease silently transitioned back to READY by the next
+        iteration of the same worker's drain loop, leaving the worker holding
+        a stale ``expected_lease_owner`` that fails CAS on the subsequent
+        ``mark_terminal`` / ``mark_pending_sink`` / ``mark_blocked`` write and
+        kills the run. The function's job is to reap leases held by *other*
+        workers (a previous crashed RowProcessor with a different uuid; in
+        future a peer worker), not the caller's own work. See
+        archived issue elspeth-941f1508f5.
+        """
+        require_coordination_token(coordination_token, verb="recover_expired_leases")
+        with fenced_write(self._engine, coordination_token=coordination_token, verb="recover_expired_leases") as conn:
+            return self._rotate_expired_leases(
+                conn,
+                coordination_token=coordination_token,
+                grace_seconds=grace_seconds,
+                stall_budget_seconds=stall_budget_seconds,
+            )
+
+    def _rotate_expired_leases(
+        self,
+        conn: Connection,
+        *,
+        coordination_token: CoordinationToken,
+        grace_seconds: float,
+        stall_budget_seconds: float,
+    ) -> int:
+        """Rotate expired peer leases within the caller's leader transaction."""
+        run_id = coordination_token.run_id
+        caller_owner = coordination_token.worker_id
+        leader_epoch = coordination_token.leader_epoch
+        # Predicate symmetric across the SELECT and UPDATE to close two
+        # multi-worker race classes (archived issue elspeth-28aaa36a62, G1 P2):
+        #
+        # 1. PENDING_SINK ABA window. ``next_work_item_id`` for the
+        #    PENDING_SINK-recovery branch is the row's existing
+        #    ``work_item_id`` (see below — a complete sink-redrive bundle keeps
+        #    the work-item identity stable). Between this SELECT and
+        #    the per-row UPDATE, a peer reaper may have already returned the
+        #    row to PENDING_SINK and a peer claimant may have leased it
+        #    again with a fresh ``lease_expires_at``. Without the
+        #    ``lease_expires_at < database_now`` predicate on the UPDATE, the caller
+        #    would clobber the peer's live lease. The READY-recovery branch
+        #    is incidentally protected by ``work_item_id`` rotation at the
+        #    next-attempt bump, but symmetry costs nothing and survives the
+        #    G27 connection-fan-out transition.
+        #
+        # 2. ``lease_owner`` NULL-blindness. SQLite three-valued logic
+        #    makes ``NULL != caller_owner`` evaluate to NULL (not TRUE),
+        #    so a row wedged with ``status=LEASED`` and ``lease_owner=NULL``
+        #    (a Tier-1 invariant violation we want to recover from, not
+        #    leak) would be invisible to the sweep. ``(lease_owner IS NULL
+        #    OR lease_owner != caller_owner)`` recovers those rows while
+        #    still excluding the caller's own active leases.
+        #
+        # 3. Liveness-aware gate (slice 4, §A.5/§C.1): only reap when the
+        #    owner is registry-DEAD or far past the stall budget.
+        #    NOT EXISTS(active + fresh heartbeat row) folds ABSENT/non-active/
+        #    stale into a single correlated subquery — portable and keeps the
+        #    per-row CAS shape unchanged.
+        lease_owner_not_caller = or_(
+            token_work_items_table.c.lease_owner.is_(None),
+            token_work_items_table.c.lease_owner != caller_owner,
+        )
+        sink_redrive_shaped = or_(
+            token_work_items_table.c.pending_sink_name.is_not(None),
+            token_work_items_table.c.pending_outcome.is_not(None),
+            token_work_items_table.c.pending_path.is_not(None),
+            token_work_items_table.c.pending_error_hash.is_not(None),
+            token_work_items_table.c.pending_error_message.is_not(None),
+        )
+        complete_pending_sink_bundle = pending_sink_bundle_clause()
+
+        # Discovery only bounds this sweep's candidates. Rows that expire
+        # after discovery are left to the next sweep. Owner liveness is not
+        # filtered here: it may expire while this transaction waits for locks.
+        discovery_now = read_landscape_decision_time(conn)
+        candidates = (
+            conn.execute(
+                select(token_work_items_table.c.work_item_id, token_work_items_table.c.lease_owner)
+                .where(token_work_items_table.c.run_id == run_id)
+                .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+                .where(token_work_items_table.c.lease_expires_at < discovery_now)
+                .where(lease_owner_not_caller)
+            )
+            .mappings()
+            .all()
+        )
+        if not candidates:
+            return 0
+        candidate_ids = sorted(row["work_item_id"] for row in candidates)
+        owner_ids = sorted({row["lease_owner"] for row in candidates if row["lease_owner"] is not None})
+        # All membership locks precede item locks, matching claim/heartbeat
+        # and eviction. Stable ordering also protects composed batch callers.
+        conn.execute(
+            select(run_workers_table.c.worker_id)
+            .where(run_workers_table.c.run_id == run_id, run_workers_table.c.worker_id.in_(owner_ids))
+            .order_by(run_workers_table.c.worker_id)
+            .with_for_update(read=True, of=run_workers_table)
+        ).fetchall()
+        # A lost owner can hold a whole sink write's items, so the item lock
+        # read runs in ascending chunks of the shared bind budget: every id in
+        # one chunk sorts before the next chunk's, keeping the lock order.
+        for chunk in bind_budget_chunks(candidate_ids):
+            conn.execute(
+                select(token_work_items_table.c.work_item_id)
+                .where(token_work_items_table.c.run_id == run_id, token_work_items_table.c.work_item_id.in_(chunk))
+                .order_by(token_work_items_table.c.work_item_id)
+                .with_for_update(of=token_work_items_table)
+            ).fetchall()
+        database_now = read_landscape_decision_time(conn)
+        grace_threshold = database_now - timedelta(seconds=grace_seconds)
+        owner_registry_dead = ~(
+            select(run_workers_table.c.worker_id)
+            .where(
+                run_workers_table.c.worker_id == token_work_items_table.c.lease_owner,
+                run_workers_table.c.status == "active",
+                run_workers_table.c.heartbeat_expires_at >= grace_threshold,
+            )
+            .exists()
+        )
+        stall_threshold = database_now - timedelta(seconds=stall_budget_seconds)
+        lease_stalled: ColumnElement[bool] = token_work_items_table.c.lease_expires_at < stall_threshold
+        reap_eligible = or_(owner_registry_dead, lease_stalled)
+
+        # Chunked like the lock read, then ordered by (ingest_sequence,
+        # step_index, work_item_id); work_item_id is the stable last-resort
+        # tiebreaker for cross-source same-tick collisions (archived issue
+        # elspeth-6cb89db535, G3 M1). Every chunk is materialised before the
+        # UPDATEs below run on the same connection.
+        expired = sorted(
+            (
+                row
+                for chunk in bind_budget_chunks(candidate_ids)
+                for row in conn.execute(
+                    select(
+                        token_work_items_table,
+                        owner_registry_dead.label("owner_is_dead"),
+                        sink_redrive_shaped.label("_sink_redrive_shaped"),
+                        complete_pending_sink_bundle.label("_pending_sink_bundle_complete"),
+                    )
+                    .where(token_work_items_table.c.run_id == coordination_token.run_id)
+                    .where(token_work_items_table.c.work_item_id.in_(chunk))
+                    .where(or_(token_work_items_table.c.lease_owner.is_(None), token_work_items_table.c.lease_owner.in_(owner_ids)))
+                    .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+                    .where(token_work_items_table.c.lease_expires_at < database_now)
+                    .where(lease_owner_not_caller)
+                    .where(reap_eligible)
+                )
+                .mappings()
+                .all()
+            ),
+            key=lambda row: (row["ingest_sequence"], row["step_index"], row["work_item_id"]),
+        )
+
+        if not expired:
+            return 0
+        next_ids: dict[str, str] = {}
+        next_attempts: dict[str, int] = {}
+        next_statuses: dict[str, str] = {}
+        sink_ids: list[str] = []
+        transform_ids: list[str] = []
+        for row in expired:
+            prior_id = row["work_item_id"]
+            is_sink_redrive = bool(row["_sink_redrive_shaped"])
+            if is_sink_redrive and not row["_pending_sink_bundle_complete"]:
+                raise _incomplete_pending_sink_bundle_error(run_id=coordination_token.run_id, work_item_id=prior_id)
+            next_attempt = row["attempt"] if is_sink_redrive else row["attempt"] + 1
+            next_ids[prior_id] = prior_id if is_sink_redrive else work_item_id(run_id, row["token_id"], row["node_id"], next_attempt)
+            next_attempts[prior_id] = next_attempt
+            next_statuses[prior_id] = TokenWorkStatus.PENDING_SINK.value if is_sink_redrive else TokenWorkStatus.READY.value
+            (sink_ids if is_sink_redrive else transform_ids).append(prior_id)
+        # The two item kinds rotate in two statements, each binding a count
+        # that does not grow with a sink write. A sink-redrive item keeps its
+        # identity and attempt, so its UPDATE needs no per-item value: it
+        # re-selects by the discovery predicates (lease_expires_at <
+        # discovery_now bounds the sweep to the discovered candidates, and the
+        # owner set is worker-sized) and RETURNING names exactly the rows it
+        # changed; a lost owner can hold a whole sink write's items, so no
+        # per-item list is bound. A transform item takes a fresh identity per
+        # item, so its rotation is one executemany of a fixed-size statement
+        # (core/landscape/bind_budget.py); the rows it changed are the fresh
+        # identities now present, read back in chunks, since no other
+        # transaction can rotate an item this one holds locked.
+        rotation_filters = (
+            token_work_items_table.c.run_id == coordination_token.run_id,
+            token_work_items_table.c.status == TokenWorkStatus.LEASED.value,
+            token_work_items_table.c.lease_expires_at < database_now,
+            lease_owner_not_caller,
+            reap_eligible,
+        )
+        # Runs even when no sink-redrive item was selected: the same predicates
+        # then match nothing, and any row they do match is refused below.
+        sink_changed = frozenset(
+            conn.execute(
+                update(token_work_items_table)
+                .where(*rotation_filters)
+                .where(token_work_items_table.c.lease_expires_at < discovery_now)
+                .where(or_(token_work_items_table.c.lease_owner.is_(None), token_work_items_table.c.lease_owner.in_(owner_ids)))
+                .where(sink_redrive_shaped)
+                .where(complete_pending_sink_bundle)
+                .values(
+                    status=TokenWorkStatus.PENDING_SINK.value,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    updated_at=database_now,
+                )
+                .returning(token_work_items_table.c.work_item_id)
+            )
+            .scalars()
+            .all()
+        )
+        if not sink_changed.issubset(sink_ids):
+            raise AuditIntegrityError(
+                f"Lease recovery for run {coordination_token.run_id!r} rotated a pending-sink item it had not "
+                "selected; the leader-fenced transaction must hold every row it rotates."
+            )
+        transform_changed: frozenset[str] = frozenset()
+        if transform_ids:
+            rotated = conn.execute(
+                update(token_work_items_table)
+                .where(*rotation_filters)
+                .where(token_work_items_table.c.work_item_id == bindparam("b_prior_work_item_id"))
+                .where(~sink_redrive_shaped)
+                .values(
+                    work_item_id=bindparam("b_next_work_item_id"),
+                    attempt=bindparam("b_next_attempt"),
+                    status=TokenWorkStatus.READY.value,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    updated_at=database_now,
+                ),
+                [
+                    {"b_prior_work_item_id": prior_id, "b_next_work_item_id": next_ids[prior_id], "b_next_attempt": next_attempts[prior_id]}
+                    for prior_id in transform_ids
+                ],
+            ).rowcount
+            transform_changed = frozenset(
+                work_item
+                for chunk in bind_budget_chunks(sorted(next_ids[prior_id] for prior_id in transform_ids))
+                for work_item in conn.execute(
+                    select(token_work_items_table.c.work_item_id).where(
+                        token_work_items_table.c.run_id == coordination_token.run_id,
+                        token_work_items_table.c.work_item_id.in_(chunk),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if len(transform_changed) != rotated:
+                raise AuditIntegrityError(
+                    f"Lease recovery for run {coordination_token.run_id!r} rotated {rotated} transform items but "
+                    f"{len(transform_changed)} fresh identities are present; the leader-fenced transaction holds every row it rotates."
+                )
+        changed_ids = sink_changed | transform_changed
+        missed = [row for row in expired if next_ids[row["work_item_id"]] not in changed_ids]
+        current_rows = [
+            row
+            for chunk in bind_budget_chunks(tuple(row["work_item_id"] for row in missed))
+            for row in conn.execute(
+                select(
+                    token_work_items_table.c.work_item_id,
+                    token_work_items_table.c.status,
+                    sink_redrive_shaped.label("_sink_redrive_shaped"),
+                    complete_pending_sink_bundle.label("_pending_sink_bundle_complete"),
+                ).where(
+                    token_work_items_table.c.run_id == coordination_token.run_id,
+                    token_work_items_table.c.work_item_id.in_(chunk),
+                )
+            )
+            .mappings()
+            .all()
+        ]
+        current_by_id = {row["work_item_id"]: row for row in current_rows}
+        for row in missed:
+            prior_id = row["work_item_id"]
+            if prior_id not in current_by_id:
+                continue
+            current = current_by_id[prior_id]
+            if (
+                current["status"] == TokenWorkStatus.LEASED.value
+                and not current["_pending_sink_bundle_complete"]
+                and (row["_sink_redrive_shaped"] or current["_sink_redrive_shaped"])
+            ):
+                raise _incomplete_pending_sink_bundle_error(run_id=coordination_token.run_id, work_item_id=prior_id)
+        recovered_rows = [row for row in expired if next_ids[row["work_item_id"]] in changed_ids]
+        self._events.record_many(
+            conn,
+            records=[
+                SchedulerEventRecord(
+                    event_type=SchedulerEventType.RECOVER_EXPIRED_LEASE,
+                    run_id=coordination_token.run_id,
+                    token_id=row["token_id"],
+                    work_item_id=next_ids[row["work_item_id"]],
+                    node_id=row["node_id"],
+                    from_status=TokenWorkStatus.LEASED,
+                    to_status=TokenWorkStatus(next_statuses[row["work_item_id"]]),
+                    from_lease_owner=row["lease_owner"],
+                    to_lease_owner=None,
+                    from_attempt=row["attempt"],
+                    to_attempt=next_attempts[row["work_item_id"]],
+                    recorded_at=database_now,
+                    from_lease_expires_at=row["lease_expires_at"],
+                    to_lease_expires_at=None,
+                    caller_owner=caller_owner,
+                    context={"previous_work_item_id": row["work_item_id"]}
+                    if next_ids[row["work_item_id"]] != row["work_item_id"]
+                    else None,
+                )
+                for row in recovered_rows
+            ],
+        )
+        record_coordination_events(
+            conn,
+            run_id=coordination_token.run_id,
+            events=[
+                CoordinationEventRow(
+                    event_type="worker_stalled",
+                    worker_id=row["lease_owner"],
+                    leader_epoch=leader_epoch,
+                    recorded_at=database_now,
+                    context={
+                        "reaped_work_item_id": row["work_item_id"],
+                        "previous_work_item_id": row["work_item_id"],
+                        "reason": "item_stall_budget",
+                    },
+                )
+                for row in recovered_rows
+                if leader_epoch is not None and not row["owner_is_dead"] and row["lease_owner"] is not None
+            ],
+        )
+        return len(changed_ids)
+
+    def requeue_undecided_failed_work(self, *, coordination_token: CoordinationToken) -> int:
+        """Return every FAILED item whose token has no completed outcome to READY (resume only).
+
+        A claim that raises out of its traversal is marked FAILED by the
+        drain's exception arm and the worker exits; nothing decides the row.
+        The live drain keeps that disposition. Resume is the operator's "cause
+        fixed, continue" step, so it re-drives these rows exactly as it
+        re-drives a hard-killed worker's expired lease: crash timing must not
+        change a row's outcome. The re-drive is at-least-once, the takeover
+        contract ADR-030 already states: an external effect the crashed
+        attempt made may be replayed. A FAILED item whose token HAS a
+        completed outcome is decided and is never touched.
+
+        Each item rotates like a lease recovery: ``attempt + 1`` and a fresh
+        ``work_item_id``, so the re-claim takes the collision-free claim base
+        (``SchedulerDrainCoordinator.claim_attempt_offset``, gated on
+        ``attempt > 1``) and the crashed claim's node_states are never
+        re-inserted. Each rotation records a ``resume_requeue_failed`` event
+        naming the previous work item.
+
+        LEADER verb under the epoch fence. Refuses (Tier-1) an undecided item
+        whose row payload was purged or whose token a group-loss record
+        already names: either would re-drive a row the record says is gone.
+        """
+        require_coordination_token(coordination_token, verb="requeue_undecided_failed_work")
+        run_id = coordination_token.run_id
+        with fenced_write(self._engine, coordination_token=coordination_token, verb="requeue_undecided_failed_work") as conn:
+            undecided = (
+                conn.execute(
+                    select(token_work_items_table)
+                    .where(token_work_items_table.c.run_id == run_id)
+                    .where(undecided_failed_work_clause())
+                    .order_by(
+                        token_work_items_table.c.ingest_sequence,
+                        token_work_items_table.c.step_index,
+                        token_work_items_table.c.work_item_id,
+                    )
+                    .with_for_update(of=token_work_items_table)
+                )
+                .mappings()
+                .all()
+            )
+            if not undecided:
+                return 0
+            purged = sorted(
+                row["token_id"] for row in undecided if row["row_payload_json"] == scrubbed_row_payload_json(row["work_item_id"])
+            )
+            if purged:
+                raise AuditIntegrityError(
+                    f"Resume cannot re-drive FAILED scheduler work for run {run_id!r}: token(s) {purged!r} have no "
+                    "completed outcome but their row payload was purged. A FAILED item keeps its payload until its "
+                    "token is decided."
+                )
+            # Every FAILED item of the run can be undecided at once, so the
+            # group-loss read runs in chunks of the shared bind budget.
+            token_ids = tuple(sorted({row["token_id"] for row in undecided}))
+            lost = sorted(
+                {
+                    token_id
+                    for chunk in bind_budget_chunks(token_ids)
+                    for token_id in conn.execute(
+                        select(group_losses_table.c.token_id)
+                        .where(group_losses_table.c.run_id == run_id)
+                        .where(group_losses_table.c.token_id.in_(chunk))
+                        .distinct()
+                    )
+                    .scalars()
+                    .all()
+                }
+            )
+            if lost:
+                raise AuditIntegrityError(
+                    f"Resume cannot re-drive FAILED scheduler work for run {run_id!r}: token(s) {lost!r} have no "
+                    "completed outcome but a group-loss record already names them."
+                )
+            database_now = read_landscape_decision_time(conn)
+            next_ids = {row["work_item_id"]: work_item_id(run_id, row["token_id"], row["node_id"], row["attempt"] + 1) for row in undecided}
+            # One rotation per item, executed as one executemany of a fixed-size
+            # statement (core/landscape/bind_budget.py): its bind count does not
+            # grow with the number of FAILED items, and both dialects report
+            # the summed rowcount.
+            changed = conn.execute(
+                update(token_work_items_table)
+                .where(token_work_items_table.c.run_id == run_id)
+                .where(token_work_items_table.c.work_item_id == bindparam("b_prior_work_item_id"))
+                .where(undecided_failed_work_clause())
+                .values(
+                    work_item_id=bindparam("b_next_work_item_id"),
+                    attempt=token_work_items_table.c.attempt + 1,
+                    status=TokenWorkStatus.READY.value,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    updated_at=database_now,
+                ),
+                [{"b_prior_work_item_id": prior_id, "b_next_work_item_id": next_id} for prior_id, next_id in next_ids.items()],
+            ).rowcount
+            if changed != len(next_ids):
+                raise AuditIntegrityError(
+                    f"Resume re-drive of FAILED scheduler work for run {run_id!r} rotated {changed} of "
+                    f"{len(next_ids)} locked items; the leader-fenced transaction held every row it selected."
+                )
+            self._events.record_many(
+                conn,
+                records=[
+                    SchedulerEventRecord(
+                        event_type=SchedulerEventType.RESUME_REQUEUE_FAILED,
+                        run_id=run_id,
+                        token_id=row["token_id"],
+                        work_item_id=next_ids[row["work_item_id"]],
+                        node_id=row["node_id"],
+                        from_status=TokenWorkStatus.FAILED,
+                        to_status=TokenWorkStatus.READY,
+                        from_lease_owner=None,
+                        to_lease_owner=None,
+                        from_attempt=row["attempt"],
+                        to_attempt=row["attempt"] + 1,
+                        recorded_at=database_now,
+                        from_lease_expires_at=None,
+                        to_lease_expires_at=None,
+                        caller_owner=coordination_token.worker_id,
+                        context={"previous_work_item_id": row["work_item_id"]},
+                    )
+                    for row in undecided
+                ],
+            )
+        return len(undecided)
+
+    def verify_resume_coverage(self, *, coordination_token: CoordinationToken) -> ResumeCoverageRefusal | None:
+        """Resume's one coverage check: every token is decided or covered by scheduler work (resume only).
+
+        Resume re-drives only durable scheduler work and never re-derives a
+        row, so a resumable run must account for every token: a completed
+        outcome, a READY / LEASED / BLOCKED / PENDING_SINK work item of its
+        own, or a parent (``token_parents``) whose READY / LEASED / BLOCKED
+        item has not completed. The last arm is the mint window: fork, expand
+        and collect commit their product tokens before the producing
+        work completes, and that completion (or barrier release) emits the
+        products' items atomically; a crash between the two commits leaves
+        products with no item of their own while their producer is still open
+        work, and re-driving it reconciles the committed products
+        (``_reconcile_*_replay``) and emits their items. A parent whose item
+        is PENDING_SINK, TERMINAL or FAILED has finished processing, so it
+        covers nothing. One level suffices: no product is processed before it
+        holds an item of its own. Run
+        under the resuming leader's seat after ``requeue_undecided_failed_work``
+        (a FAILED item left after it belongs to a decided token) and after the
+        barrier-journal restore (which mints the work of committed barrier
+        residuals), before anything is re-driven or written to a sink.
+
+        ABANDONED tokens are not counted here: ADR-038 declares them
+        non-resumable, and the status derive's ABANDONED belt refuses them on
+        every resume branch before any re-drive.
+
+        Returns ``None`` when every token is accounted for. Otherwise records
+        ONE value-free ``resume_refused`` coordination event (the count and the
+        sorted head of the token ids — ELSPETH identifiers, never row values)
+        in the same leader-fenced transaction, commits it, and returns the
+        refusal for the caller to raise. The run stays resumable-but-refusing
+        (lane ruling M2): nothing is swept or abandoned here.
+        """
+        require_coordination_token(coordination_token, verb="verify_resume_coverage")
+        run_id = coordination_token.run_id
+        tokens = tokens_table
+        outcomes = token_outcomes_table
+        decided_or_abandoned = (
+            select(outcomes.c.outcome_id)
+            .where(outcomes.c.run_id == tokens.c.run_id)
+            .where(outcomes.c.token_id == tokens.c.token_id)
+            .where(or_(outcomes.c.completed == 1, outcomes.c.path == TerminalPath.ABANDONED.value))
+            .exists()
+        )
+        covered = (
+            select(token_work_items_table.c.work_item_id)
+            .where(token_work_items_table.c.run_id == tokens.c.run_id)
+            .where(token_work_items_table.c.token_id == tokens.c.token_id)
+            .where(
+                token_work_items_table.c.status.in_(
+                    (
+                        TokenWorkStatus.READY.value,
+                        TokenWorkStatus.LEASED.value,
+                        TokenWorkStatus.BLOCKED.value,
+                        TokenWorkStatus.PENDING_SINK.value,
+                    )
+                )
+            )
+            .exists()
+        )
+        producer_open = (
+            select(token_parents_table.c.parent_token_id)
+            .where(token_parents_table.c.run_id == tokens.c.run_id)
+            .where(token_parents_table.c.token_id == tokens.c.token_id)
+            .where(
+                select(token_work_items_table.c.work_item_id)
+                .where(token_work_items_table.c.run_id == token_parents_table.c.run_id)
+                .where(token_work_items_table.c.token_id == token_parents_table.c.parent_token_id)
+                .where(
+                    token_work_items_table.c.status.in_(
+                        (
+                            TokenWorkStatus.READY.value,
+                            TokenWorkStatus.LEASED.value,
+                            TokenWorkStatus.BLOCKED.value,
+                        )
+                    )
+                )
+                .exists()
+            )
+            .exists()
+        )
+        uncovered = (
+            select(tokens.c.token_id).where(tokens.c.run_id == run_id).where(~decided_or_abandoned).where(~covered).where(~producer_open)
+        )
+        with fenced_write(self._engine, coordination_token=coordination_token, verb="verify_resume_coverage") as conn:
+            token_count = conn.execute(select(func.count()).select_from(uncovered.subquery())).scalar_one()
+            if token_count == 0:
+                return None
+            first_token_ids = tuple(
+                conn.execute(uncovered.order_by(tokens.c.token_id).limit(RESUME_REFUSAL_TOKEN_ID_LIMIT)).scalars().all()
+            )
+            refusal = ResumeCoverageRefusal(token_count=token_count, first_token_ids=first_token_ids)
+            record_coordination_event(
+                conn,
+                run_id=coordination_token.run_id,
+                event_type="resume_refused",
+                worker_id=coordination_token.worker_id,
+                leader_epoch=coordination_token.leader_epoch,
+                recorded_at=read_landscape_decision_time(conn),
+                context={
+                    "cause": "uncovered_undecided_tokens",
+                    "token_count": refusal.token_count,
+                    "first_token_ids": list(refusal.first_token_ids),
+                },
+            )
+        return refusal
+
+    def heartbeat_lease(
+        self,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item_id: str,
+        lease_owner: str,
+        lease_seconds: int,
+    ) -> datetime:
+        """Extend a held lease's ``lease_expires_at`` by ``lease_seconds``.
+
+        The new deadline is Landscape database time + ``lease_seconds``, read
+        after acquiring the item lock inside this heartbeat's transaction (ADR-047), so a
+        worker whose process clock has drifted forward cannot buy itself a
+        longer lease than the reaper will honour: the reaper compares against
+        the same database clock.
+
+        Single-timestamp heartbeat for ADR-026 RC6 multi-worker (archived issue
+        elspeth-ddde8144b6). A worker mid-processing calls this periodically
+        from inside the slow work loop so a peer's ``recover_expired_leases``
+        sweep does NOT reap an alive-but-slow worker. ``peer_active_leases``
+        already filters on ``lease_expires_at`` against database time, so extending that
+        timestamp is sufficient — no second clock and no inconsistency window
+        between heartbeat-fresh-but-lease-expired vs reaper semantics.
+
+        Membership is required on every heartbeat. The item UPDATE also
+        matches run, work item, LEASED status and exact lease owner.
+        A lease miss commits its LEASE_LOST event before raising.
+
+        Returns the new ``lease_expires_at`` so the caller can update its
+        local last-heartbeat-attempt clock without re-reading the row.
+        """
+        lease_lost = False
+        lease_lost_event: SchedulerEventRecord | None = None
+        run_id = member_token.run_id
+        if lease_owner != member_token.worker_id:
+            raise ValueError("lease owner must match authority token")
+        with fenced_member_transaction(self._engine, member_token=member_token, verb="heartbeat_lease") as conn:
+            conn.execute(
+                select(token_work_items_table.c.work_item_id)
+                .where(token_work_items_table.c.work_item_id == work_item_id, token_work_items_table.c.run_id == run_id)
+                .with_for_update(of=token_work_items_table)
+            ).fetchall()
+            database_now = read_landscape_decision_time(conn)
+            new_expires_at = database_now + timedelta(seconds=lease_seconds)
+            where_clauses = and_(
+                token_work_items_table.c.work_item_id == work_item_id,
+                token_work_items_table.c.run_id == run_id,
+                token_work_items_table.c.status == TokenWorkStatus.LEASED.value,
+                token_work_items_table.c.lease_owner == lease_owner,
+            )
+            result = conn.execute(
+                update(token_work_items_table)
+                .where(where_clauses)
+                .values(
+                    lease_expires_at=new_expires_at,
+                    updated_at=database_now,
+                )
+            )
+            if result.rowcount != 1:
+                current = (
+                    conn.execute(
+                        select(token_work_items_table)
+                        .where(token_work_items_table.c.run_id == run_id)
+                        .where(token_work_items_table.c.work_item_id == work_item_id)
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if current is not None:
+                    lease_lost_event = SchedulerEventRecord(
+                        event_type=SchedulerEventType.LEASE_LOST,
+                        run_id=run_id,
+                        token_id=current["token_id"],
+                        work_item_id=work_item_id,
+                        node_id=current["node_id"],
+                        from_status=TokenWorkStatus.LEASED,
+                        to_status=TokenWorkStatus(current["status"]),
+                        from_lease_owner=lease_owner,
+                        to_lease_owner=current["lease_owner"],
+                        from_attempt=current["attempt"],
+                        to_attempt=current["attempt"],
+                        recorded_at=database_now,
+                        from_lease_expires_at=None,
+                        to_lease_expires_at=current["lease_expires_at"],
+                        caller_owner=lease_owner,
+                        context={"reason": "heartbeat_cas_miss"},
+                    )
+                else:
+                    recovery_event = self._events.recovery_event_for_previous_work_item(
+                        conn,
+                        run_id=run_id,
+                        previous_work_item_id=work_item_id,
+                    )
+                    if recovery_event is not None:
+                        lease_lost_event = SchedulerEventRecord(
+                            event_type=SchedulerEventType.LEASE_LOST,
+                            run_id=run_id,
+                            token_id=recovery_event["token_id"],
+                            work_item_id=work_item_id,
+                            node_id=recovery_event["node_id"],
+                            from_status=TokenWorkStatus.LEASED,
+                            to_status=TokenWorkStatus(recovery_event["to_status"]),
+                            from_lease_owner=lease_owner,
+                            to_lease_owner=recovery_event["to_lease_owner"],
+                            from_attempt=recovery_event["from_attempt"],
+                            to_attempt=recovery_event["to_attempt"],
+                            recorded_at=database_now,
+                            from_lease_expires_at=recovery_event["from_lease_expires_at"],
+                            to_lease_expires_at=recovery_event["to_lease_expires_at"],
+                            caller_owner=lease_owner,
+                            context={
+                                "reason": "heartbeat_cas_miss_after_recovery",
+                                "recovered_work_item_id": recovery_event["work_item_id"],
+                                "recovery_event_id": recovery_event["event_id"],
+                            },
+                        )
+                lease_lost = True
+            if not lease_lost:
+                record_issued_deadline(
+                    conn,
+                    key=DeadlineKey(DeadlineKind.ITEM, (work_item_id,)),
+                    expires_at=new_expires_at,
+                    window_seconds=lease_seconds,
+                )
+            self._events.record_many(conn, records=() if lease_lost_event is None else (lease_lost_event,))
+        if lease_lost:
+            raise SchedulerLeaseLostError(
+                work_item_id=work_item_id,
+                lease_owner=lease_owner,
+                run_id=run_id,
+            )
+        return new_expires_at
+
+    def peer_active_leases(
+        self,
+        *,
+        run_id: str,
+        caller_owner: str,
+    ) -> tuple[str, ...]:
+        """Return distinct lease_owners of unexpired LEASED rows held by peers.
+
+        A "peer" is any ``lease_owner`` other than ``caller_owner``. A lease is
+        "active" if ``lease_expires_at`` is later than Landscape database time,
+        read on this probe's own connection (ADR-047). Recovery uses the same
+        clock authority at its own decision boundary. Rows whose lease
+        has expired are recoverable via ``recover_expired_leases`` and do not
+        contribute to the peer set.
+
+        This is the single-active-resume precondition surface for
+        ``drain_scheduled_work``: a resume drain run while a peer holds an
+        unexpired lease on the same ``run_id`` would race against the peer's
+        sink-bound RowResult emission (PENDING_SINK can transition to LEASED
+        under the peer's identity and the helper would re-emit a duplicate
+        RowResult on a later iteration once the lease expires). See
+        archived issue elspeth-66be4216cd (G3 single-active-resume invariant).
+
+        Under ADR-026 Precondition #9 (multi-worker deployment-shape ADR not
+        yet authored), no code path exists today that spawns concurrent
+        ``RowProcessor`` instances on the same ``run_id``; this method returns
+        ``()`` for every supported deployment. The check exists as an offensive
+        guard so that any future code that violates the precondition crashes
+        with a Tier-1 audit-integrity error instead of silently emitting
+        duplicate RowResults into the audit trail.
+        """
+        with self._engine.connect() as conn:
+            database_now = read_landscape_decision_time(conn)
+            owners = (
+                conn.execute(
+                    select(token_work_items_table.c.lease_owner)
+                    .distinct()
+                    .where(token_work_items_table.c.run_id == run_id)
+                    .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+                    .where(token_work_items_table.c.lease_owner != caller_owner)
+                    .where(token_work_items_table.c.lease_expires_at > database_now)
+                    .order_by(token_work_items_table.c.lease_owner)
+                )
+                .scalars()
+                .all()
+            )
+        return tuple(owner for owner in owners if owner is not None)

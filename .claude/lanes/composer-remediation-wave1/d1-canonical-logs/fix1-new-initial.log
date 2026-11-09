@@ -1,0 +1,243 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 3 items
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py F [ 33%]
+F.                                                                       [100%]
+
+=================================== FAILURES ===================================
+_ test_complete_auto_raw_equality_still_applies_required_control_and_review_finalization _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-151/test_complete_auto_raw_equalit0')
+
+    @pytest.mark.asyncio
+    async def test_complete_auto_raw_equality_still_applies_required_control_and_review_finalization(tmp_path: Path) -> None:
+        from elspeth.web.composer.pipeline_proposal import composition_content_hash
+        from elspeth.web.composer.required_controls import wire_required_controls
+        from elspeth.web.composer.tools._common import _serialize_set_pipeline_arguments
+        from tests.integration.web.composer.test_freeform_required_controls import (
+            _assert_required_control_disclosures,
+            _incremental_textract_state,
+            _required_textract_policy,
+        )
+    
+        harness = _harness(tmp_path)
+        view, snapshot = _required_textract_policy(tmp_path)
+        incomplete, output = await _incremental_textract_state(tmp_path, harness=harness, view=view, snapshot=snapshot)
+        completed = real_execute_tool(
+            "set_output",
+            output,
+            incomplete,
+            view,
+            plugin_snapshot=snapshot,
+            data_dir=str(tmp_path),
+            session_engine=harness.engine,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            validate_arguments=True,
+            require_data_dir_for_paths=True,
+            raise_schema_argument_errors=True,
+        )
+        assert completed.success and completed.validation.is_valid
+        current = completed.updated_state
+        assert current.sources and current.outputs
+        assert not any(node.plugin.startswith("aws_bedrock_") for node in current.nodes)
+        arguments, error = _serialize_set_pipeline_arguments(current)
+        assert error is None and arguments is not None
+        authored = deepcopy(arguments)
+        await harness.sessions.update_composer_preferences(
+            UUID(harness.session_id),
+            trust_mode="auto_commit",
+            density_default="high",
+            actor="user:proposal-prevalidation-user",
+        )
+        candidates = []
+    
+        def observe_candidate(*args: Any, **kwargs: Any) -> Any:
+            candidate = real_build_set_pipeline_candidate(*args, **kwargs)
+            candidates.append(candidate)
+            return candidate
+    
+        llm = _ScriptedLLM(_tool_turn("call_complete_equal_controls", "set_pipeline", arguments))
+        with (
+            patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            patch("elspeth.web.composer.tool_batch.build_set_pipeline_candidate", side_effect=observe_candidate),
+            patch("elspeth.web.composer.tool_batch.wire_required_controls", wraps=wire_required_controls) as finalizer,
+            patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as executor,
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Keep this complete pipeline and apply current required controls.",
+                [],
+                current,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                user_message_id=harness.user_message_id,
+            )
+        assert candidates[0].acceptable
+        assert composition_content_hash(candidates[0].result.updated_state) == composition_content_hash(current)
+        assert composition_content_hash(candidates[-1].result.updated_state) != composition_content_hash(current)
+        finalizer.assert_called_once()
+        executor.assert_called_once()
+        assert result.state.version == current.version + 1
+        assert composition_content_hash(result.state) != composition_content_hash(current)
+        _assert_required_control_disclosures(result.state.to_dict())
+        assert {node.plugin for node in result.state.nodes} >= {"aws_bedrock_prompt_shield", "aws_bedrock_content_safety"}
+        assert len(result.tool_invocations) == 1
+        invocation = result.tool_invocations[0]
+        assert invocation.status is ComposerToolStatus.SUCCESS
+        _assert_required_control_disclosures(json.loads(invocation.arguments_canonical))
+        response = batches[0][0].response
+        assert response.updated_state is result.state
+        assert response.affected_nodes
+        assert not any("unchanged" in hint for hint in response.post_call_hints)
+        feedback = json.loads(_persisted_tool_content(harness, invocation.tool_call_id))
+        assert feedback["version"] == current.version + 1
+        assert not any("unchanged" in hint for hint in feedback.get("post_call_hints", ()))
+        assert _count_rows(harness.engine, composition_states_table) == 1
+        assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
+>       assert len(llm.message_snapshots) == 1
+E       assert 4 == 1
+E        +  where 4 = len([[{'content': "# Canonical Pipeline Capabilities\n\nThis is ELSPETH's static, public pipeline-language contract. It de...rd","description":null}}}', 'name': 'set_pipeline'}, 'id': 'call_complete_equal_controls', 'type': 'function'}]}, ...]])
+E        +    where [[{'content': "# Canonical Pipeline Capabilities\n\nThis is ELSPETH's static, public pipeline-language contract. It de...rd","description":null}}}', 'name': 'set_pipeline'}, 'id': 'call_complete_equal_controls', 'type': 'function'}]}, ...]] = <tests.integration.web.composer.test_freeform_proposal_prevalidation._ScriptedLLM object at 0x7fa3b3b9acc0>.message_snapshots
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:2419: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 14:23:56 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 14:23:58 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 14:23:58 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 14:23:58 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=20.0 configured_turns=5 fundable_turns_estimate=1 planning_seconds_per_turn=15.0
+2026-11-09 14:23:58 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_complete_auto_same_bytes_new_source_authority_is_published[same-inline-bytes-new-custody] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-151/test_complete_auto_same_bytes_0')
+replacement = 'inline'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("replacement", ["inline", "existing-blob"], ids=["same-inline-bytes-new-custody", "only-blob-identity-changed"])
+    async def test_complete_auto_same_bytes_new_source_authority_is_published(tmp_path: Path, replacement: str) -> None:
+        from elspeth.web.composer.pipeline_proposal import composition_content_hash
+        from tests.helpers.session_fences import fenced_operation_context
+    
+        harness = _harness(tmp_path)
+        arguments = _inline_pipeline_args(tmp_path)
+        inline = arguments["source"].pop("inline_blob")
+        content = inline["content"].encode("utf-8")
+        with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as context:
+            original = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+                UUID(harness.session_id),
+                inline["filename"],
+                content,
+                inline["mime_type"],
+                session_operation_context=context,
+            )
+            if replacement == "existing-blob":
+                replacement_blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+                    UUID(harness.session_id),
+                    inline["filename"],
+                    content,
+                    inline["mime_type"],
+                    session_operation_context=context,
+                )
+        arguments["source"]["blob_id"] = str(original.id)
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.catalog)
+        view = PolicyCatalogView.for_trained_operator(harness.catalog, snapshot)
+        with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.COMPOSE) as context:
+            seeded = real_execute_tool(
+                "set_pipeline",
+                arguments,
+                _incremental_base_state(tmp_path),
+                view,
+                plugin_snapshot=snapshot,
+                data_dir=str(tmp_path),
+                session_engine=harness.engine,
+                session_id=harness.session_id,
+                session_operation_context=context,
+                session_operation_authority=harness.sessions.session_operation_authority,
+                user_id="proposal-prevalidation-user",
+                validate_arguments=True,
+                require_data_dir_for_paths=True,
+                raise_schema_argument_errors=True,
+            )
+        assert seeded.success and seeded.validation.is_valid
+        current = seeded.updated_state
+        assert current.sources and current.outputs
+        assert current.sources["source"].options["blob_ref"] == str(original.id)
+        if replacement == "inline":
+            del arguments["source"]["blob_id"]
+            arguments["source"]["inline_blob"] = inline
+        else:
+            arguments["source"]["blob_id"] = str(replacement_blob.id)
+        await harness.sessions.update_composer_preferences(
+            UUID(harness.session_id),
+            trust_mode="auto_commit",
+            density_default="high",
+            actor="user:proposal-prevalidation-user",
+        )
+        llm = _ScriptedLLM(_tool_turn("call_complete_new_authority", "set_pipeline", arguments))
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as executor,
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Use a new source artifact with the same bytes.",
+                [],
+                current,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                user_message_id=harness.user_message_id,
+            )
+        executor.assert_called_once()
+        assert result.state.version == current.version + 1
+        assert composition_content_hash(result.state) != composition_content_hash(current)
+        source = result.state.sources["source"]
+        assert source.options["blob_ref"] != str(original.id)
+        if replacement == "existing-blob":
+            assert source.options["blob_ref"] == str(replacement_blob.id)
+            assert {key: value for key, value in source.options.items() if key not in {"path", "blob_ref"}} == {
+                key: value for key, value in current.sources["source"].options.items() if key not in {"path", "blob_ref"}
+            }
+        else:
+            assert source.options[INTERPRETATION_REQUIREMENTS_KEY][0]["kind"] == "invented_source"
+        assert result.state.nodes == current.nodes
+        assert result.state.edges == current.edges
+        assert result.state.outputs == current.outputs
+        assert result.state.metadata == current.metadata
+        assert len(result.tool_invocations) == 1
+        invocation = result.tool_invocations[0]
+        assert invocation.status is ComposerToolStatus.SUCCESS
+        response = batches[0][0].response
+        assert response.updated_state is result.state
+        assert not any("unchanged" in hint for hint in response.post_call_hints)
+        feedback = json.loads(_persisted_tool_content(harness, invocation.tool_call_id))
+        assert feedback["version"] == current.version + 1
+        assert not any("unchanged" in hint for hint in feedback.get("post_call_hints", ()))
+        with harness.engine.connect() as conn:
+            blobs = conn.execute(select(blobs_table)).all()
+        assert len(blobs) == 2
+        assert all(blob.status == "ready" and blob.content_hash == original.content_hash for blob in blobs)
+        assert all(Path(blob.storage_path).read_bytes() == content for blob in blobs)
+        assert _count_rows(harness.engine, composition_states_table) == 1
+        assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
+>       assert len(llm.message_snapshots) == (1 if replacement == "inline" else 2)
+E       assert 4 == 1
+E        +  where 4 = len([[{'content': "# Canonical Pipeline Capabilities\n\nThis is ELSPETH's static, public pipeline-language contract. It de...:"<metadata-patch:name>"}}', 'name': 'set_pipeline'}, 'id': 'call_complete_new_authority', 'type': 'function'}]}, ...]])
+E        +    where [[{'content': "# Canonical Pipeline Capabilities\n\nThis is ELSPETH's static, public pipeline-language contract. It de...:"<metadata-patch:name>"}}', 'name': 'set_pipeline'}, 'id': 'call_complete_new_authority', 'type': 'function'}]}, ...]] = <tests.integration.web.composer.test_freeform_proposal_prevalidation._ScriptedLLM object at 0x7fa3b3ad9fa0>.message_snapshots
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:2530: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 14:23:59 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 14:23:59 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 14:23:59 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 14:24:00 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+=========================== short test summary info ============================
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_complete_auto_raw_equality_still_applies_required_control_and_review_finalization
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_complete_auto_same_bytes_new_source_authority_is_published[same-inline-bytes-new-custody]
+========================= 2 failed, 1 passed in 7.44s ==========================

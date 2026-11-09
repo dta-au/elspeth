@@ -1,0 +1,1050 @@
+{
+  "after_count": 5433,
+  "before_count": 5429,
+  "compared_fields": [
+    "rule_id",
+    "file_path",
+    "severity",
+    "message",
+    "suggestion"
+  ],
+  "location_changes": [
+    {
+      "after": [
+        {
+          "location": {
+            "column": 15,
+            "fingerprint": "341023093c357d3d",
+            "line": 1205
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 15,
+            "fingerprint": "c710bd5d3f2b796b",
+            "line": 1185
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "core/landscape/database.py",
+        "message": "Potential dict.get() usage: if conn.get_execution_options().get(WRITE_INTENT_OPTION, False):",
+        "rule_id": "R1",
+        "severity": "error",
+        "suggestion": "Access dict keys directly (dict[key]) and fix the schema/contract if KeyError occurs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 15,
+            "fingerprint": "ebd6a4e27c138a19",
+            "line": 258
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 15,
+            "fingerprint": "a233b8d55e18f617",
+            "line": 238
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "core/landscape/database.py",
+        "message": "Potential dict.get() usage: lock = _SHARED_CONNECTION_LOCKS.get(engine)",
+        "rule_id": "R1",
+        "severity": "error",
+        "suggestion": "Access dict keys directly (dict[key]) and fix the schema/contract if KeyError occurs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "a4109862b730aad9",
+            "line": 205
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "576fd91b07b6cb72",
+            "line": 205
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/schema_probe.py",
+        "message": "getattr() with default hides AttributeError: value = getattr(original, \"pgcode\", None)",
+        "rule_id": "R2",
+        "severity": "error",
+        "suggestion": "Access attributes directly (obj.attr) and fix the type/contract if AttributeError occurs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "9ab3f05767f4e25b",
+            "line": 203
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "d1efe56127128be5",
+            "line": 203
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/schema_probe.py",
+        "message": "getattr() with default hides AttributeError: value = getattr(original, \"sqlstate\", None)",
+        "rule_id": "R2",
+        "severity": "error",
+        "suggestion": "Access attributes directly (obj.attr) and fix the type/contract if AttributeError occurs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "541ae47fdf7f5509",
+            "line": 2120
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "bc3ac2c215c3493e",
+            "line": 2100
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "core/landscape/database.py",
+        "message": "Broad exception caught without re-raise: except BaseException as cleanup_exc:",
+        "rule_id": "R4",
+        "severity": "error",
+        "suggestion": "Catch specific exceptions, or re-raise after logging/quarantining"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "14fad2d909a51c77",
+            "line": 1836
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "c48bb857b147a911",
+            "line": 2224
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "f2faa598c27710fa",
+            "line": 2144
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "4a9a0eb03bff8f1b",
+            "line": 2039
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "14fad2d909a51c77",
+            "line": 1842
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "c48bb857b147a911",
+            "line": 2230
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "f2faa598c27710fa",
+            "line": 2150
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "4a9a0eb03bff8f1b",
+            "line": 2045
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tool_batch.py",
+        "message": "Broad exception caught without re-raise: except BaseException as exc:",
+        "rule_id": "R4",
+        "severity": "error",
+        "suggestion": "Catch specific exceptions, or re-raise after logging/quarantining"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "c593f4ad7d2dc4fd",
+            "line": 2667
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "c593f4ad7d2dc4fd",
+            "line": 2673
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tool_batch.py",
+        "message": "Broad exception caught without re-raise: except Exception as advisor_context_error:",
+        "rule_id": "R4",
+        "severity": "error",
+        "suggestion": "Catch specific exceptions, or re-raise after logging/quarantining"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "f26b1913598ac891",
+            "line": 2914
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 8,
+            "fingerprint": "731d5b70836afd46",
+            "line": 3327
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "f26b1913598ac891",
+            "line": 2920
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 8,
+            "fingerprint": "731d5b70836afd46",
+            "line": 3333
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tool_batch.py",
+        "message": "Broad exception caught without re-raise: except Exception as tool_exc:",
+        "rule_id": "R4",
+        "severity": "error",
+        "suggestion": "Catch specific exceptions, or re-raise after logging/quarantining"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "27ee48532ae30985",
+            "line": 86
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "655164eb4ad08477",
+            "line": 79
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/process_recovery.py",
+        "message": "Broad exception caught without re-raise: except BaseException:",
+        "rule_id": "R4",
+        "severity": "error",
+        "suggestion": "Catch specific exceptions, or re-raise after logging/quarantining"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "194d08be99c411d6",
+            "line": 305
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "4bff0c0702fd1dd2",
+            "line": 288
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "1a7a24a6d52a6581",
+            "line": 299
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "630846e117183a72",
+            "line": 305
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "8a774bc05e78bdb5",
+            "line": 288
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "e6bd0b604b5e709c",
+            "line": 299
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/schema_probe.py",
+        "message": "Broad exception caught without re-raise: except BaseException as exc:",
+        "rule_id": "R4",
+        "severity": "error",
+        "suggestion": "Catch specific exceptions, or re-raise after logging/quarantining"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 4,
+            "fingerprint": "d6a05e78b819e01c",
+            "line": 219
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 4,
+            "fingerprint": "0b9885752366dfed",
+            "line": 219
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/schema_probe.py",
+        "message": "Broad exception caught without re-raise: except BaseException as invalidation_error:",
+        "rule_id": "R4",
+        "severity": "error",
+        "suggestion": "Catch specific exceptions, or re-raise after logging/quarantining"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 7,
+            "fingerprint": "456b812af013cb2f",
+            "line": 921
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 7,
+            "fingerprint": "fb9ffcab0ed996b9",
+            "line": 896
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 7,
+            "fingerprint": "490ccb09784a1b5d",
+            "line": 876
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 7,
+            "fingerprint": "7e259ee77a22f44c",
+            "line": 901
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "core/landscape/database.py",
+        "message": "isinstance() used: if isinstance(bind, Connection):",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "ab65a8f36d23035d",
+            "line": 954
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "56c91345448d8ce7",
+            "line": 934
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "core/landscape/database.py",
+        "message": "isinstance() used: if isinstance(bind, Engine):",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "5ac77fc5bd47ee27",
+            "line": 255
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "8a27a7b82397fa8b",
+            "line": 235
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "core/landscape/database.py",
+        "message": "isinstance() used: if not isinstance(engine.pool, StaticPool):",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 44,
+            "fingerprint": "4951b9766740452e",
+            "line": 3393
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 44,
+            "fingerprint": "4951b9766740452e",
+            "line": 3399
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tool_batch.py",
+        "message": "isinstance() used: admitted_result = outcome.result if isinstance(outcome.result, AdmittedDiscoveryResult) else None",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 15,
+            "fingerprint": "9473c7ed228bff82",
+            "line": 3205
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 15,
+            "fingerprint": "9473c7ed228bff82",
+            "line": 3211
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tool_batch.py",
+        "message": "isinstance() used: if isinstance(_result, AdmittedDiscoveryResult):",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 19,
+            "fingerprint": "03178707f3bdfad1",
+            "line": 2746
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 19,
+            "fingerprint": "03178707f3bdfad1",
+            "line": 2752
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tool_batch.py",
+        "message": "isinstance() used: if isinstance(first_party_exc, PromptGuardRefused):",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 19,
+            "fingerprint": "ba422f9b01177e28",
+            "line": 2422
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 19,
+            "fingerprint": "ba422f9b01177e28",
+            "line": 2428
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/composer/tool_batch.py",
+        "message": "isinstance() used: if not isinstance(advisor_arg_error, RequestAdvisorHintArgumentsModel):",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 15,
+            "fingerprint": "8e5fa966519ab38e",
+            "line": 18
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 15,
+            "fingerprint": "5c6dd840e95a57e3",
+            "line": 19
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/process_recovery.py",
+        "message": "isinstance() used: if not isinstance(watchdog, ProcessWatchdogControl):",
+        "rule_id": "R5",
+        "severity": "error",
+        "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "a56f3bcc3ce40e69",
+            "line": 83
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "7d515b46b046c625",
+            "line": 76
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/process_recovery.py",
+        "message": "Exception swallowed without re-raise or explicit error: except asyncio.CancelledError as exc:",
+        "rule_id": "R6",
+        "severity": "error",
+        "suggestion": "Raise the exception or return an explicit error/quarantine result"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "e0dc135d23156903",
+            "line": 273
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 16,
+            "fingerprint": "e0dc135d23156903",
+            "line": 268
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/process_watchdog.py",
+        "message": "Exception swallowed without re-raise or explicit error: except BlockingIOError:",
+        "rule_id": "R6",
+        "severity": "error",
+        "suggestion": "Raise the exception or return an explicit error/quarantine result"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "f6eebb79be9cb4b3",
+            "line": 146
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "f6eebb79be9cb4b3",
+            "line": 141
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/process_watchdog.py",
+        "message": "Exception swallowed without re-raise or explicit error: except subprocess.TimeoutExpired:",
+        "rule_id": "R6",
+        "severity": "error",
+        "suggestion": "Raise the exception or return an explicit error/quarantine result"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "dc5930a1312eec07",
+            "line": 1381
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 12,
+            "fingerprint": "111765905bdbad38",
+            "line": 1361
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "core/landscape/database.py",
+        "message": "dict.pop() with default hides missing keys: uri_params.pop(\"immutable\", None)",
+        "rule_id": "R9",
+        "severity": "error",
+        "suggestion": "Access keys directly and fix the schema/contract if KeyError occurs"
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 30,
+            "fingerprint": "33406a30bda465e6",
+            "line": 219
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 49,
+            "fingerprint": "ae3d52db2d183d6b",
+            "line": 221
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 30,
+            "fingerprint": "64a88fb0e46cd119",
+            "line": 199
+          },
+          "occurrences": 1
+        },
+        {
+          "location": {
+            "column": 49,
+            "fingerprint": "c4468f8255aaf38a",
+            "line": 201
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "core/landscape/database.py",
+        "message": "@trust_boundary suppressed R5 under source_param='connection_string'; source=\"an operator-supplied database connection string \u2014 external configuration whose parsed query mapping carries SQLAlchemy's declared str | tuple[str, ...] value union\"; test_ref=None; suppresses=('R5',)",
+        "rule_id": "R_TB_SUPPRESSED",
+        "severity": "note",
+        "suggestion": null
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 19,
+            "fingerprint": "8e87866270b19a89",
+            "line": 1360
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 19,
+            "fingerprint": "9a82e8e7ccd471b2",
+            "line": 1340
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "core/landscape/database.py",
+        "message": "@trust_boundary suppressed R5 under source_param='url'; source=\"an operator-supplied SQLite database URL \u2014 external configuration whose parsed query mapping carries SQLAlchemy's declared str | tuple[str, ...] value union, a tuple encoding a repeated parameter\"; test_ref='tests/unit/core/landscape/test_database_sqlcipher.py::TestSQLCipherCreateAndRead::test_repeated_query_parameter_rejected_by_the_engine_boundary'; suppresses=('R5',)",
+        "rule_id": "R_TB_SUPPRESSED",
+        "severity": "note",
+        "suggestion": null
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "6436bee69d905fd0",
+            "line": 123
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "8376d1fd7dc7aab5",
+            "line": 123
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/schema_probe.py",
+        "message": "@trust_boundary suppressed R1 under source_param='url'; source='operator-supplied database URL (settings/env-authored connection string) whose query string sqlalchemy parses into an unguaranteed mapping'; test_ref='tests/unit/web/test_schema_probe.py::test_unprovable_target_is_rejected_with_static_message'; suppresses=('R1', 'R5')",
+        "rule_id": "R_TB_SUPPRESSED",
+        "severity": "note",
+        "suggestion": null
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "1065ca0a9a11f24e",
+            "line": 206
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 20,
+            "fingerprint": "aeebfb1808fa15a5",
+            "line": 206
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/schema_probe.py",
+        "message": "@trust_boundary suppressed R5 under source_param='exc'; source='a sqlalchemy OperationalError wrapping a third-party DBAPI driver exception whose sqlstate/pgcode attributes are driver-specific and unguaranteed'; test_ref=None; suppresses=('R5',)",
+        "rule_id": "R_TB_SUPPRESSED",
+        "severity": "note",
+        "suggestion": null
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "fe3ba72ba4c48f24",
+            "line": 386
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 11,
+            "fingerprint": "bbddce1b82142e2c",
+            "line": 386
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/schema_probe.py",
+        "message": "@trust_boundary suppressed R5 under source_param='pool'; source='SQLAlchemy-owned connection pool implementation and optional public occupancy counters'; test_ref='tests/unit/web/test_schema_probe.py::test_pool_diagnostics_propagate_vendor_failure'; suppresses=('R5',)",
+        "rule_id": "R_TB_SUPPRESSED",
+        "severity": "note",
+        "suggestion": null
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 15,
+            "fingerprint": "794bb59e80289565",
+            "line": 126
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 15,
+            "fingerprint": "f9602f87b6a03ebe",
+            "line": 126
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "web/schema_probe.py",
+        "message": "@trust_boundary suppressed R5 under source_param='url'; source='operator-supplied database URL (settings/env-authored connection string) whose query string sqlalchemy parses into an unguaranteed mapping'; test_ref='tests/unit/web/test_schema_probe.py::test_unprovable_target_is_rejected_with_static_message'; suppresses=('R1', 'R5')",
+        "rule_id": "R_TB_SUPPRESSED",
+        "severity": "note",
+        "suggestion": null
+      }
+    },
+    {
+      "after": [
+        {
+          "location": {
+            "column": 5,
+            "fingerprint": "278f812a2b7b7854",
+            "line": 1274
+          },
+          "occurrences": 1
+        }
+      ],
+      "before": [
+        {
+          "location": {
+            "column": 5,
+            "fingerprint": "e4a569a0d538c7fa",
+            "line": 1254
+          },
+          "occurrences": 1
+        }
+      ],
+      "semantic": {
+        "file_path": "core/landscape/database.py",
+        "message": "@trust_boundary test_ref 'tests/unit/core/landscape/test_database_sqlcipher.py::TestSQLCipherCreateAndRead::test_repeated_query_parameter_rejected_by_the_engine_boundary' resolves to fingerprint '36db597ddb460720764d8cc000ba1779358227a3ce37c353e67d7f243e10dded', but the decorator records '5ae47b055575fa9536683396a3ef178314149483b4672eea0c51566c53e479be'.",
+        "rule_id": "R_TB_TESTS_FINGERPRINT_MISMATCH",
+        "severity": "error",
+        "suggestion": "Refresh test_fingerprint only after reviewing the changed test body still exercises the decorated trust-boundary invariant. A mismatch means the nodeid still resolves, but the test content drifted."
+      }
+    }
+  ],
+  "normalized_only_checkout_prefix": true,
+  "positive_negative_controls": "passed, including duplicate multiplicity and each semantic field",
+  "semantic_added": [
+    {
+      "file_path": "web/execution/runtime_preflight.py",
+      "message": "Broad exception caught without re-raise: except BaseException as failure:",
+      "occurrences": 1,
+      "rule_id": "R4",
+      "severity": "error",
+      "suggestion": "Catch specific exceptions, or re-raise after logging/quarantining"
+    },
+    {
+      "file_path": "web/execution/runtime_preflight.py",
+      "message": "isinstance() used: if isinstance(result, RuntimePreflightFailure):",
+      "occurrences": 1,
+      "rule_id": "R5",
+      "severity": "error",
+      "suggestion": "Validate at Tier-3 boundaries or rely on contracts; do not use isinstance to hide bugs"
+    },
+    {
+      "file_path": "web/execution/runtime_preflight.py",
+      "message": "Exception swallowed without re-raise or explicit error: except asyncio.CancelledError as original:",
+      "occurrences": 1,
+      "rule_id": "R6",
+      "severity": "error",
+      "suggestion": "Raise the exception or return an explicit error/quarantine result"
+    },
+    {
+      "file_path": "web/execution/runtime_preflight.py",
+      "message": "dict.pop() with default hides missing keys: self._retained.pop(retained.task, None)",
+      "occurrences": 1,
+      "rule_id": "R9",
+      "severity": "error",
+      "suggestion": "Access keys directly and fix the schema/contract if KeyError occurs"
+    }
+  ],
+  "semantic_added_count": 4,
+  "semantic_removed": [],
+  "semantic_removed_count": 0
+}

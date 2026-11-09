@@ -1,0 +1,26 @@
+2026-11-09 18:07:55 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 18:07:58 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 18:07:59 [info     ] openrouter_catalog_boot_prime_skipped action='serving bundled litellm catalog; no boot-time egress to openrouter.ai' configured_llm_providers=() reason='openrouter is not a configured LLM provider for this deployment'
+ERROR:    Traceback (most recent call last):
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-lifecycle-foundations/.venv/lib/python3.12/site-packages/starlette/routing.py", line 638, in lifespan
+    async with self.lifespan_context(app) as maybe_state:
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-lifecycle-foundations/tests/unit/web/test_process_recovery.py", line 106, in observed_lifespan
+    async with lifespan(application):
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-lifecycle-foundations/src/elspeth/web/app.py", line 641, in lifespan
+    async with _service_lifespan(app):
+               ^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/contextlib.py", line 217, in __aexit__
+    await anext(self.gen)
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-lifecycle-foundations/src/elspeth/web/app.py", line 1238, in _service_lifespan
+    raise failures[0]
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-lifecycle-foundations/tests/unit/web/test_process_recovery.py", line 72, in orphan_cleanup
+    raise OSError("injected fatal orphan failure")
+OSError: injected fatal orphan failure
+
+ERROR:    Application shutdown failed. Exiting.

@@ -1,0 +1,296 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 6 items
+
+tests/unit/web/composer/test_compose_loop_persistence.py ..FFF.          [100%]
+
+=================================== FAILURES ===================================
+________ test_proposal_cap_excludes_schema_errors_and_semantic_refusals ________
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7ff0850e4050>
+result_session_id = '41ee8f79-ab73-454d-aa17-3b3f95223cbe'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7ff076c7e7e0>
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-179/test_proposal_cap_excludes_sch0')
+
+    @pytest.mark.asyncio
+    async def test_proposal_cap_excludes_schema_errors_and_semantic_refusals(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+        with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+            conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+    
+        handler_calls = _record_real_tool_handlers(monkeypatch)
+        events = _record_real_batch_progress(monkeypatch)
+        source_path = tmp_path / "input.csv"
+        source_path.write_text("customer_id\n1\n")
+        caught = await _capture_tool_batch_rejection(
+            composer_service_with_real_sessions,
+            session_id=result_session_id,
+            response=_tool_batch_response(
+                *((f"call_valid_attempt_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}}) for index in range(9)),
+                ("call_schema_invalid_attempt", "set_metadata", {}),
+                (
+                    "call_semantic_invalid_attempt",
+                    "set_pipeline",
+                    {
+                        "source": {
+                            "plugin": "csv",
+                            "options": {"path": str(source_path)},
+                            "on_success": "rows",
+                            "on_validation_failure": "discard",
+                        },
+                        "nodes": [],
+                        "edges": [],
+                        "outputs": [],
+                        "metadata": {"name": "semantically incomplete"},
+                    },
+                ),
+            ),
+        )
+    
+        assert caught is None
+        # Schema validation fails before handler dispatch; only the nine admitted
+        # metadata handlers execute. The canonical refusal has its own builder.
+        assert handler_calls == ["set_metadata"] * 9
+        with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+            assert set(
+                conn.execute(
+                    select(composition_proposals_table.c.tool_call_id).where(composition_proposals_table.c.session_id == result_session_id)
+                ).scalars()
+            ) == {f"call_valid_attempt_{index}" for index in range(9)}
+            assert (
+                len(conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).all()) == 9
+            )
+            feedback = conn.execute(
+                select(chat_messages_table.c.tool_call_id, chat_messages_table.c.content)
+                .where(chat_messages_table.c.session_id == result_session_id)
+                .where(chat_messages_table.c.role == "tool")
+                .order_by(chat_messages_table.c.sequence_no)
+            ).all()
+        assert [row.tool_call_id for row in feedback] == [
+            *(f"call_valid_attempt_{index}" for index in range(9)),
+            "call_schema_invalid_attempt",
+            "call_semantic_invalid_attempt",
+        ]
+        assert json.loads(feedback[-2].content)["error_class"] == "ToolArgumentError"
+>       assert json.loads(feedback[-1].content)["data"]["status"] == "PREVALIDATION_REJECTED"
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'data'
+
+tests/unit/web/composer/test_compose_loop_persistence.py:1497: KeyError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 16:59:28 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 16:59:28 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 16:59:28 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[invalid-at-cap] _
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7ff076761340>
+result_session_id = '69c79eff-235d-4445-ae30-95f9ec4f9bc8'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-179/test_proposal_attempt_cap_incl0')
+blob_case = 'invalid-at-cap'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7ff076ce2cc0>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("blob_case", ("invalid-at-cap", "admitted-tenth", "admitted-eleventh"))
+    async def test_proposal_attempt_cap_includes_approval_required_blob_only_mutation(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        tmp_path: Path,
+        blob_case: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from tests.helpers.session_fences import fenced_operation_context
+        from tests.unit.web.composer.test_service import _blob_mutation_resources_for_test
+    
+        sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+        monkeypatch.setattr(composer_service_with_real_sessions, "_session_engine", sessions_service._engine)
+        with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+            conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+    
+        arguments: dict[str, Any] = {}
+        if blob_case != "invalid-at-cap":
+            with fenced_operation_context(sessions_service._engine, result_session_id, operation_kind=SessionOperationKind.CREATE) as context:
+                blob = await BlobServiceImpl(sessions_service._engine, tmp_path).create_blob(
+                    UUID(result_session_id), "retained.txt", b"must remain untouched", "text/plain", session_operation_context=context
+                )
+            arguments = {"blob_id": str(blob.id)}
+        resources_before = _blob_mutation_resources_for_test(sessions_service._engine, tmp_path)
+        events = _record_real_batch_progress(monkeypatch)
+        change_count = 9 if blob_case == "admitted-tenth" else 10
+    
+        caught = await _capture_tool_batch_rejection(
+            composer_service_with_real_sessions,
+            session_id=result_session_id,
+            response=_tool_batch_response(
+                *(
+                    (f"call_blob_boundary_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}})
+                    for index in range(change_count)
+                ),
+                ("call_approval_required_blob_only", "delete_blob", arguments),
+            ),
+        )
+    
+        expected_ids = {f"call_blob_boundary_proposal_{index}" for index in range(change_count)}
+        if blob_case == "admitted-eleventh":
+            assert type(caught) is ComposerConvergenceError
+            assert dict(caught.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
+            assert [inv.tool_call_id for inv in caught.tool_invocations] == [f"call_blob_boundary_proposal_{index}" for index in range(10)]
+            assert all(inv.version_before == inv.version_after == 1 for inv in caught.tool_invocations)
+        else:
+            assert caught is None
+            if blob_case == "admitted-tenth":
+                expected_ids.add("call_approval_required_blob_only")
+        with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+            assert (
+                set(
+                    conn.execute(
+                        select(composition_proposals_table.c.tool_call_id).where(composition_proposals_table.c.session_id == result_session_id)
+                    ).scalars()
+                )
+                == expected_ids
+            )
+            assert (
+                len(conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).all()) == 10
+            )
+            blob_feedback = conn.execute(
+                select(chat_messages_table.c.content).where(
+                    chat_messages_table.c.session_id == result_session_id,
+                    chat_messages_table.c.role == "tool",
+                    chat_messages_table.c.tool_call_id == "call_approval_required_blob_only",
+                )
+            ).all()
+        if blob_case == "admitted-eleventh":
+            assert blob_feedback == []
+        else:
+            assert len(blob_feedback) == 1
+            payload = json.loads(blob_feedback[0].content)
+            if blob_case == "invalid-at-cap":
+                assert payload["error_class"] == "ToolArgumentError"
+            else:
+                assert payload["data"]["status"] == "APPROVAL_REQUIRED"
+        assert await sessions_service.get_state_versions(UUID(result_session_id)) == []
+        assert _blob_mutation_resources_for_test(sessions_service._engine, tmp_path) == resources_before
+        expected_progress = [_REQUESTED_EDIT_PROGRESS]
+        if blob_case == "invalid-at-cap":
+            expected_progress += [_STARTED_EDIT_PROGRESS, _ARGUMENT_CORRECTION_PROGRESS]
+>       assert [event.model_dump(mode="json") for event in events] == expected_progress
+E       assert [{'evidence':..._tools', ...}] == [{'evidence':..._tools', ...}]
+E         
+E         Right contains 2 more items, first extra item: {'evidence': ['A pipeline-editing tool is running.'], 'headline': "I'm updating the pipeline graph.", 'likely_next': 'ELSPETH will validate the updated pipeline.', 'phase': 'using_tools', ...}
+E         Use -v to get more diff
+
+tests/unit/web/composer/test_compose_loop_persistence.py:1632: AssertionError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 16:59:28 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 16:59:28 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 16:59:28 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[admitted-tenth] _
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7ff076cee510>
+result_session_id = 'd7c35b83-075c-4d88-bf6e-df14012c73c9'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-179/test_proposal_attempt_cap_incl1')
+blob_case = 'admitted-tenth'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7ff080cb35c0>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("blob_case", ("invalid-at-cap", "admitted-tenth", "admitted-eleventh"))
+    async def test_proposal_attempt_cap_includes_approval_required_blob_only_mutation(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        tmp_path: Path,
+        blob_case: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from tests.helpers.session_fences import fenced_operation_context
+        from tests.unit.web.composer.test_service import _blob_mutation_resources_for_test
+    
+        sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+        monkeypatch.setattr(composer_service_with_real_sessions, "_session_engine", sessions_service._engine)
+        with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+            conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+    
+        arguments: dict[str, Any] = {}
+        if blob_case != "invalid-at-cap":
+            with fenced_operation_context(sessions_service._engine, result_session_id, operation_kind=SessionOperationKind.CREATE) as context:
+                blob = await BlobServiceImpl(sessions_service._engine, tmp_path).create_blob(
+                    UUID(result_session_id), "retained.txt", b"must remain untouched", "text/plain", session_operation_context=context
+                )
+            arguments = {"blob_id": str(blob.id)}
+        resources_before = _blob_mutation_resources_for_test(sessions_service._engine, tmp_path)
+        events = _record_real_batch_progress(monkeypatch)
+        change_count = 9 if blob_case == "admitted-tenth" else 10
+    
+        caught = await _capture_tool_batch_rejection(
+            composer_service_with_real_sessions,
+            session_id=result_session_id,
+            response=_tool_batch_response(
+                *(
+                    (f"call_blob_boundary_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}})
+                    for index in range(change_count)
+                ),
+                ("call_approval_required_blob_only", "delete_blob", arguments),
+            ),
+        )
+    
+        expected_ids = {f"call_blob_boundary_proposal_{index}" for index in range(change_count)}
+        if blob_case == "admitted-eleventh":
+            assert type(caught) is ComposerConvergenceError
+            assert dict(caught.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
+            assert [inv.tool_call_id for inv in caught.tool_invocations] == [f"call_blob_boundary_proposal_{index}" for index in range(10)]
+            assert all(inv.version_before == inv.version_after == 1 for inv in caught.tool_invocations)
+        else:
+            assert caught is None
+            if blob_case == "admitted-tenth":
+                expected_ids.add("call_approval_required_blob_only")
+        with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+            assert (
+                set(
+                    conn.execute(
+                        select(composition_proposals_table.c.tool_call_id).where(composition_proposals_table.c.session_id == result_session_id)
+                    ).scalars()
+                )
+                == expected_ids
+            )
+            assert (
+                len(conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).all()) == 10
+            )
+            blob_feedback = conn.execute(
+                select(chat_messages_table.c.content).where(
+                    chat_messages_table.c.session_id == result_session_id,
+                    chat_messages_table.c.role == "tool",
+                    chat_messages_table.c.tool_call_id == "call_approval_required_blob_only",
+                )
+            ).all()
+        if blob_case == "admitted-eleventh":
+            assert blob_feedback == []
+        else:
+            assert len(blob_feedback) == 1
+            payload = json.loads(blob_feedback[0].content)
+            if blob_case == "invalid-at-cap":
+                assert payload["error_class"] == "ToolArgumentError"
+            else:
+>               assert payload["data"]["status"] == "APPROVAL_REQUIRED"
+                       ^^^^^^^^^^^^^^^
+E               KeyError: 'data'
+
+tests/unit/web/composer/test_compose_loop_persistence.py:1626: KeyError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 16:59:30 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 16:59:30 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 16:59:30 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_cap_excludes_schema_errors_and_semantic_refusals
+FAILED tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[invalid-at-cap]
+FAILED tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[admitted-tenth]
+========================= 3 failed, 3 passed in 8.94s ==========================

@@ -1,0 +1,8 @@
+❌ dict[str, Any] violations found:
+
+  src/elspeth/web/composer/tools/blobs.py:1694: _validated_blob_update - arguments
+    Fix: Use TypedDict/dataclass or add to allowed_dict_patterns
+
+  src/elspeth/web/composer/tools/blobs.py:1734: admit_blob_mutation - arguments
+    Fix: Use TypedDict/dataclass or add to allowed_dict_patterns
+

@@ -1,0 +1,7 @@
+✅ All cross-boundary types are properly centralized in contracts/
+✅ All whitelist entries are valid
+✅ All Settings classes have Runtime counterparts or are exempt
+✅ All Settings fields are accessed in from_settings() methods
+✅ All field name mappings match FIELD_MAPPINGS
+✅ All hardcoded values are documented in INTERNAL_DEFAULTS
+✅ Soft-mapping census pinned to config/cicd/soft-mapping-census.yaml: 2615 soft occurrences across 416 files, 60 boundary-parsed

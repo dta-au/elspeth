@@ -1,0 +1,130 @@
+/**
+ * ExplainDialog (Phase 2C)
+ *
+ * Modal dialog rendering the narrative explanation of what the current
+ * pipeline will record. The narrative is fetched lazily on first open
+ * and cached by composition_version in the auditReadinessStore.
+ *
+ * Design spec: docs/composer/ux-redesign-2026-05/07-audit-readiness-panel.md
+ * §"The Explain view".
+ *
+ * Modal pattern matches SecretsPanel: backdrop and dialog are siblings
+ * inside a fragment. Escape is handled at the dialog boundary and backed up
+ * by a document listener for focus-drift cases.
+ */
+import { useEffect, useId, useRef } from "react";
+
+import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
+import { Button } from "@/components/ui";
+import { useAuditReadinessStore } from "../../stores/auditReadinessStore";
+import { useFocusTrap } from "@/hooks/useFocusTrap";
+
+export interface ExplainDialogProps {
+  sessionId: string;
+  compositionVersion: number;
+  onClose: () => void;
+}
+
+export function ExplainDialog({
+  sessionId,
+  compositionVersion,
+  onClose,
+}: ExplainDialogProps) {
+  // Store fields are per-session-keyed maps, NOT flat. Reading
+  // `s.isLoadingExplain` / `s.explainError` would evaluate to `undefined`
+  // at runtime — the dialog would never show loading or error. The correct
+  // accessors key by sessionId.
+  const explain = useAuditReadinessStore((s) => {
+    const cached = s.explainsBySession[sessionId];
+    return cached?.composition_version === compositionVersion ? cached : undefined;
+  });
+  const isLoading = useAuditReadinessStore(
+    (s) => s.isLoadingExplainBySession[sessionId] ?? false,
+  );
+  const error = useAuditReadinessStore(
+    (s) => s.explainErrorBySession[sessionId] ?? null,
+  );
+  const loadExplain = useAuditReadinessStore((s) => s.loadExplain);
+  const titleId = useId();
+
+  // Focus contract: trap focus inside the dialog, restore to opener on close.
+  // useFocusTrap handles: Tab-wrap, initial focus (Close button), and focus
+  // restoration on unmount. active=true unconditionally because
+  // ExplainDialog renders only while open.
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(dialogRef, true, ".explain-dialog-close");
+
+  useEffect(() => {
+    void loadExplain(sessionId, compositionVersion);
+  }, [sessionId, compositionVersion, loadExplain]);
+
+  // The dialog boundary consumes Escape before a containing inspector can
+  // act on it. The document listener remains as a defence against focus drift.
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      e.preventDefault();
+      onClose();
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  return (
+    <>
+      {/* Backdrop — sibling of the dialog, NOT nested inside it.
+          Nesting confuses the modal's a11y tree and prevents some
+          screen readers from recognising the dialog boundary. */}
+      <div
+        className="explain-dialog-backdrop"
+        onClick={onClose}
+        aria-hidden="true"
+      />
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        className="explain-dialog"
+        onKeyDown={(event) => {
+          if (event.key !== "Escape") return;
+          event.preventDefault();
+          onClose();
+        }}
+      >
+        <div className="explain-dialog-content">
+          <header className="explain-dialog-header">
+            <h2 id={titleId} className="explain-dialog-title">
+              What this pipeline will record
+            </h2>
+            <Button
+              variant="bare"
+              type="button"
+              className="explain-dialog-close"
+              onClick={onClose}
+              aria-label="Close"
+            >
+              ×
+            </Button>
+          </header>
+
+          {isLoading && !explain && (
+            <p className="explain-dialog-loading">Generating explanation…</p>
+          )}
+
+          {error && !explain && (
+            <div role="alert" className="explain-dialog-error">
+              {error}
+            </div>
+          )}
+
+          {explain && (
+            <div className="explain-dialog-narrative">
+              <MarkdownRenderer content={explain.narrative} />
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}

@@ -1,0 +1,631 @@
+"""Bound-region (SESE) computation and structural validation (spec §7 rules 3/4, depth cap §6.3).
+
+A bound region is the SESE span of one bound group: the nodes strictly
+between its opener and its closer. Membership walks SUCCESS-PATH edges
+only — RoutingMode.DIVERT edges (on_error, __quarantine__, __failsink__)
+are failure semantics, not region topology (pinned decision 1 in the WS2
+plan; §7 rule 9 treats in-region on_error as legal).
+
+`BoundRegion.member_node_ids` is a "between" set (forward reach ∩ backward
+reach, minus the opener/closer themselves) — it is a verified SESE interior
+ONLY once `validate_sese_regions` (spec §7 rule 4) has run: it rejects a
+member with an outbound edge that reaches a sink before the closer, a member
+with no success path back to the closer, a non-branch opener route that
+re-enters the region (2026-08-23 fix round, ruled), and an inbound edge into
+any in-region node that originates outside the region.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Final
+
+from elspeth.contracts.enums import FrameKind, NodeType, RoutingMode
+from elspeth.contracts.types import NodeID
+from elspeth.core.dag.group_bindings import CloserKind, GroupBinding, GroupBindingRegistry
+from elspeth.core.dag.models import GraphValidationError
+
+if TYPE_CHECKING:
+    from collections.abc import Collection, Mapping
+
+    from elspeth.core.dag.graph import ExecutionGraph
+
+# The rule-4 exit guarantee, stated ONCE and scoped honestly. Rule 4's walks
+# run over SUCCESS-PATH edges only (module docstring above), so the guarantee
+# they enforce is scoped the same way: a DIVERT leg (on_error) CAN leave a
+# bound region, by construction, and the loss ledger accounts for the escaped
+# member against its own group (reason='error_routed'; verified by 12 engine
+# runs 2026-08-26, elspeth-494491978d comment 7984). The unqualified form
+# "no token may leave a bound region except through its closer" was shipped
+# in the operator-facing message for 10 days after the engine had refuted it
+# (elspeth-46825d0055); the composer Stage-1 mirror imports this sentence
+# rather than restating it, so the two surfaces cannot drift apart again.
+BOUND_REGION_EXIT_RULE: Final[str] = (
+    "No token may leave a bound region on a success path except through its closer "
+    "— sinks inside a bound region are rejected flat (spec §7 rule 4); only an on_error "
+    "DIVERT leg may leave, and the loss ledger records that member against its group."
+)
+
+ESCALATION_ITERATIONS_PER_LEVEL = 8
+_BASE_FLUSH_ITERATIONS = 1_000
+
+
+def derive_escalation_fixpoint_bound(max_observed_depth: int) -> int:
+    """Non-convergence bound for the EOF drain fixpoint, derived from build depth.
+
+    Spec §6.3: "derived at build from the actual depth (+ margin), never a
+    constant — today's MAX_END_OF_INPUT_FLUSH_ITERATIONS = 1_000 would
+    collide with an override-deep unwind."
+
+    THE one fixpoint formula (2026-08-22 synthesis): 1_000 + 8 * depth —
+    each bound nesting level adds at most a handful of
+    escalate-notify-reevaluate rounds, so depth-5 stays at 1_040 and an
+    override-depth-1000 unwind gets 9_000. WS3's
+    `derive_end_of_input_flush_bound` aligns to exactly this formula
+    (consuming `graph.get_max_bound_region_depth()`); competing formulas are
+    deleted, never forked.
+    """
+    return _BASE_FLUSH_ITERATIONS + ESCALATION_ITERATIONS_PER_LEVEL * max_observed_depth
+
+
+@dataclass(frozen=True)
+class BoundRegion:
+    """One bound group's SESE span. Opener and closer are EXCLUDED from membership."""
+
+    binding: GroupBinding
+    member_node_ids: frozenset[NodeID]
+    depth: int
+
+
+def _forward_reach(graph: ExecutionGraph, start: NodeID, stop: NodeID) -> set[NodeID]:
+    """Nodes reachable from start via non-DIVERT edges, not expanding through stop."""
+    seen: set[NodeID] = set()
+    frontier = [start]
+    while frontier:
+        current = frontier.pop()
+        for edge in graph.get_outgoing_edges(current):
+            if edge.mode is RoutingMode.DIVERT:
+                continue
+            nxt = NodeID(edge.to_node)
+            if nxt in seen or nxt == stop:
+                if nxt == stop:
+                    seen.add(nxt)
+                continue
+            seen.add(nxt)
+            frontier.append(nxt)
+    return seen
+
+
+def _backward_reach(graph: ExecutionGraph, start: NodeID, stop: NodeID) -> set[NodeID]:
+    """Nodes that reach start via non-DIVERT edges, not expanding through stop."""
+    seen: set[NodeID] = set()
+    frontier = [start]
+    while frontier:
+        current = frontier.pop()
+        for edge in graph.get_incoming_edges(current):
+            if edge.mode is RoutingMode.DIVERT:
+                continue
+            prev = NodeID(edge.from_node)
+            if prev in seen or prev == stop:
+                if prev == stop:
+                    seen.add(prev)
+                continue
+            seen.add(prev)
+            frontier.append(prev)
+    return seen
+
+
+def _forward_reach_from(graph: ExecutionGraph, starts: set[NodeID], stop: NodeID) -> set[NodeID]:
+    """Nodes reachable from any of ``starts`` via non-DIVERT edges, not expanding through stop.
+
+    Generalizes :func:`_forward_reach` to multiple start nodes. Rule 4's
+    forward walk (:func:`validate_sese_regions`) must NOT anchor at a FORK
+    binding's opener node itself: the opener is an ordinary gate, and its
+    OTHER routing labels (e.g. a plain `'false': <sink>` route sitting beside
+    `'true': fork`) can lead straight to a sink with no fork branch ever
+    taken — that is not a leak out of the region, because no lineage frame
+    for this group was ever minted on that path. The true forward-walk
+    anchor is the set of nodes the opener's *fork branch* edges lead to
+    (``edge.label in binding.member_roster``), never the opener's full
+    outgoing-edge set. Verified against every fork_coalesce/row_union_ab
+    example: each carries exactly this "route to fork" + "route to sink"
+    pair on its opener gate.
+    """
+    seen: set[NodeID] = set()
+    frontier: list[NodeID] = []
+    for start in starts:
+        seen.add(start)
+        if start != stop:
+            frontier.append(start)
+    while frontier:
+        current = frontier.pop()
+        for edge in graph.get_outgoing_edges(current):
+            if edge.mode is RoutingMode.DIVERT:
+                continue
+            nxt = NodeID(edge.to_node)
+            if nxt in seen:
+                continue
+            seen.add(nxt)
+            if nxt != stop:
+                frontier.append(nxt)
+    return seen
+
+
+def _fork_branch_starts(graph: ExecutionGraph, binding: GroupBinding, closer_reachable: set[NodeID]) -> set[NodeID]:
+    """The forward-walk anchor for one bound group: a FORK's own branch entries.
+
+    ``closer_reachable`` is the caller's ``_backward_reach(closer, opener)``
+    set, computed ONCE per binding and passed in rather than recomputed here
+    (review A5.7, 2026-08-23 fix round: two independently-written traversals
+    that must stay semantically identical is exactly the shape that produced
+    F1 — enforced only by review, not by code, until they were unified).
+
+    For an EXPAND/scope binding (``member_roster`` empty — ruling 28, Task 8's
+    concern), the opener is a plain multi-row transform with no sibling routing
+    labels to filter out, so the opener node itself is the correct anchor.
+
+    An opener out-edge qualifies if EITHER its label is in the declared
+    roster OR its target is backward-reachable from the closer (review F1,
+    2026-08-23 fix round). The label-only predicate under-admits a route
+    whose target lands back inside the region through a node the roster
+    doesn't name directly (e.g. an intermediate non-fork gate re-entering
+    the region before reaching the closer) — a genuine forward-walk entry
+    the label check alone would let bypass rule 4 entirely.
+
+    A SEPARATE, now-fixed hazard used to live here too: a route whose target
+    happened to be one of the SAME gate's own fork branches under a route
+    label override, which `builder.py`'s MATCH-PRODUCERS-TO-CONSUMERS pass
+    used to draw under the route label instead of the branch name — making
+    `edge.label in member_roster` ask a correct question of corrupted data
+    (addendum A2). That is now fixed at the producer: `builder.py` tracks
+    `fork_branch_connections` and always labels a fork-branch edge with the
+    branch name, never a same-gate route label, so `edge.label` can be
+    trusted here structurally ("stop parsing, carry the fact structurally
+    from the producer").
+    """
+    if binding.kind is not FrameKind.FORK:
+        return {binding.opener_node_id}
+    return {
+        NodeID(edge.to_node)
+        for edge in graph.get_outgoing_edges(binding.opener_node_id)
+        if edge.mode is not RoutingMode.DIVERT and (edge.label in binding.member_roster or NodeID(edge.to_node) in closer_reachable)
+    }
+
+
+def compute_bound_regions(
+    graph: ExecutionGraph,
+    registry: GroupBindingRegistry,
+    *,
+    max_depth: int,
+) -> tuple[BoundRegion, ...]:
+    """Compute the SESE span of every bound group, enforce well-nestedness and the depth cap.
+
+    Raises:
+        GraphValidationError: two regions partially overlap (spec §7 rule 3), or
+            the deepest region's nesting exceeds ``max_depth`` (spec §6.3).
+    """
+    spans: list[tuple[GroupBinding, frozenset[NodeID]]] = []
+    for binding in registry.bindings:
+        forward = _forward_reach(graph, binding.opener_node_id, binding.closer_node_id)
+        backward = _backward_reach(graph, binding.closer_node_id, binding.opener_node_id)
+        members = frozenset((forward & backward) - {binding.opener_node_id, binding.closer_node_id})
+        spans.append((binding, members))
+
+    def _span(binding: GroupBinding, members: frozenset[NodeID]) -> frozenset[NodeID]:
+        return members | {binding.opener_node_id, binding.closer_node_id}
+
+    # Well-nestedness (spec §7 rule 3): regions fully contain or are disjoint.
+    for i, (b1, m1) in enumerate(spans):
+        for b2, m2 in spans[i + 1 :]:
+            s1, s2 = _span(b1, m1), _span(b2, m2)
+            if s1.isdisjoint(s2):
+                continue
+            if s2 <= m1 or s1 <= m2:
+                continue  # strictly nested (inner span entirely inside outer MEMBERS)
+            raise GraphValidationError(
+                f"Bound regions '{b1.closer_name}' (opener '{b1.opener_name}') and "
+                f"'{b2.closer_name}' (opener '{b2.opener_name}') partially overlap. "
+                f"Bound regions must fully contain one another or be disjoint (spec §7 rule 3): "
+                f"close the inner group before the outer closer, or separate the regions.",
+                component_id=b2.closer_name,
+                component_type=b2.closer_kind,
+            )
+
+    regions: list[BoundRegion] = []
+    for b1, m1 in spans:
+        s1 = _span(b1, m1)
+        depth = 1 + sum(1 for b2, m2 in spans if b2 is not b1 and s1 <= m2)
+        regions.append(BoundRegion(binding=b1, member_node_ids=m1, depth=depth))
+
+    too_deep = [r for r in regions if r.depth > max_depth]
+    if too_deep:
+        worst = max(too_deep, key=lambda r: r.depth)
+        raise GraphValidationError(
+            f"Bound-region nesting depth {worst.depth} exceeds the configured maximum {max_depth} "
+            f"(innermost closer: '{worst.binding.closer_name}'). Deeper nesting is model-correct but "
+            f"unsupported beyond 5 layers (spec §6.3) — per-token audit churn scales with depth. Raise "
+            f"max_bound_region_depth in settings to accept the churn knowingly.",
+            component_id=worst.binding.closer_name,
+            component_type=worst.binding.closer_kind,
+        )
+    return tuple(regions)
+
+
+def validate_sese_regions(graph: ExecutionGraph, regions: tuple[BoundRegion, ...]) -> None:
+    """§7 rule 4 — bidirectional SESE, success-path edges only (pinned decision 1).
+
+    Forward: every non-DIVERT path from a FORK binding's own branch entries
+    (or an EXPAND binding's opener) reaches the closer before any sink.
+    A non-branch opener route must not re-enter the region at all (F2,
+    maintainer ruled 2026-08-23). Backward: every non-DIVERT edge into a
+    region member or the closer originates at the opener or another member.
+
+    Raises:
+        GraphValidationError: a bound region's interior reaches a sink
+            before its closer, a member has no success path back to the
+            closer, a non-branch opener route re-enters the region, or an
+            in-region node's inbound edge originates outside the region.
+    """
+    for region in regions:
+        binding = region.binding
+        in_region = region.member_node_ids | {binding.opener_node_id, binding.closer_node_id}
+
+        # Forward walk, anchored at the branch entries (see
+        # _forward_reach_from's docstring for why the opener node itself is
+        # the wrong anchor). member_node_ids is forward ∩ backward and
+        # therefore already excludes anything with no path back to the
+        # closer, so the sink/no-path checks run over the WIDER forward-only
+        # set, not member_node_ids (a member reached but never returning to
+        # the closer is exactly what "no path to closer" must catch).
+        #
+        # closer_reachable (_backward_reach(closer, opener)) is computed ONCE
+        # here and threaded into _fork_branch_starts rather than recomputed
+        # independently inside it (review A5.7) — two separately-written
+        # traversals that must stay semantically identical is exactly the
+        # shape that produced F1.
+        closer_reachable = _backward_reach(graph, binding.closer_node_id, binding.opener_node_id)
+        branch_starts = _fork_branch_starts(graph, binding, closer_reachable)
+        forward_only = _forward_reach_from(graph, branch_starts, binding.closer_node_id) - {binding.closer_node_id}
+        # sorted(): forward_only is a set[NodeID] (NodeID is str-derived), so
+        # unordered iteration makes WHICH violation raises first depend on
+        # PYTHONHASHSEED (review F3, demonstrated across 8 seeds — including
+        # a flip between the sink-inside and no-path-to-closer LIMBS, which
+        # carry different parity dispositions). Deterministic order restores
+        # a single, reproducible verdict per topology.
+        #
+        # The sink-inside limb is checked, over ALL members, before the
+        # no-path-to-closer limb is checked over any member (review A5.9):
+        # sink-inside is the more specific diagnosis (a token actually left
+        # the region), so it must win regardless of which NodeID happens to
+        # sort first alphabetically. Splitting into two passes makes that
+        # priority a deliberate structural fact, not a lexicographic accident
+        # of whichever violating member's name sorts earliest.
+        for member in sorted(forward_only):
+            info = graph.get_node_info(member)
+            if info.node_type is NodeType.SINK:
+                raise GraphValidationError(
+                    f"Bound region '{binding.closer_name}' (opener '{binding.opener_name}') reaches sink "
+                    f"'{member}' before the region's closer. {BOUND_REGION_EXIT_RULE} "
+                    f"Move the sink after the closer, or unbind the group.",
+                    component_id=binding.closer_name,
+                    component_type=binding.closer_kind,
+                )
+        for member in sorted(forward_only):
+            if member not in closer_reachable:
+                raise GraphValidationError(
+                    f"Node '{member}' inside bound region '{binding.closer_name}' has no success path to "
+                    f"the region's closer. Every path from the opener must reach the closer "
+                    f"(spec §7 rule 4).",
+                    component_id=binding.closer_name,
+                    component_type=binding.closer_kind,
+                )
+
+        # F2 (maintainer ruled, 2026-08-23): a non-branch opener out-edge
+        # that re-enters the region. Such a route carries no lineage frame
+        # for this group — the token never took a fork branch — so it must
+        # not be allowed to feed an in-region node at all, regardless of
+        # where it leads from there (F1's widened forward walk alone does
+        # not close this: it makes the target get WALKED, which is silent
+        # when the target leads nowhere alarming, but does not stop the
+        # target being treated as a legitimate in-region MEMBER, so the
+        # backward walk below still authorizes the edge). This is exactly
+        # the E1 residual-risk class the 2026-08-23 no-queue-exemption
+        # ruling exists to foreclose: an unframed token silently entering a
+        # bound region (e.g. through a queue a real branch also feeds) and
+        # settling a branch it was never part of.
+        #
+        # legitimate_targets excludes exactly ONE known-dead label, not any
+        # coincidentally-matching target (review R1, BLOCKING, 2026-08-23
+        # re-review: the broad "any target coinciding with a roster edge's
+        # target" form re-opens the exact backdoor this limb exists to
+        # close — make a fork branch's own connection name equal a queue
+        # name, so the roster edge itself lands on that queue, then add a
+        # second, ordinary, non-"continue" route to the same queue; the
+        # broad exclusion skipped it on target-coincidence alone, with the
+        # label never inspected). The cross-module invariant this exclusion
+        # depends on: a config gate's dispatch (`engine/executors/gate.py`)
+        # never emits `RoutingAction.continue_()` — it only emits
+        # `FORK_TO_PATHS` or `ROUTE` to a sink/processing-node/discard, and
+        # raises on an unconfigured label — so builder.py's
+        # `gate_default_continue_targets` fallthrough bookkeeping (which
+        # draws an extra edge labeled "continue" to a gate's sole
+        # unambiguous processing consumer, even when that consumer is
+        # already reached via a real, roster-labeled branch edge) is
+        # suppressing a builder BOOKKEEPING ARTIFACT that is unreachable at
+        # runtime, not a live route. If that invariant ever breaks — a gate
+        # plugin gains `fork_to`, or the config-gate dispatch grows a
+        # continue fallback — this exclusion silently becomes a backdoor
+        # again, with nothing here to catch it. The one instance where this
+        # actually fires across the DAG unit surface today:
+        # `variant_fork` -> `transform_treatment_identity_...`, label
+        # 'continue' (test_dag_row_union.py).
+        if binding.kind is FrameKind.FORK:
+            opener_edges = graph.get_outgoing_edges(binding.opener_node_id)
+            legitimate_targets = {
+                NodeID(edge.to_node) for edge in opener_edges if edge.mode is not RoutingMode.DIVERT and edge.label in binding.member_roster
+            }
+            for edge in sorted(opener_edges, key=lambda e: (e.label, e.to_node)):
+                if edge.mode is RoutingMode.DIVERT:
+                    continue
+                if edge.label in binding.member_roster:
+                    continue
+                target = NodeID(edge.to_node)
+                if edge.label == "continue" and target in legitimate_targets:
+                    continue
+                if target in in_region:
+                    raise GraphValidationError(
+                        f"Gate '{binding.opener_name}' route '{edge.label}' is not one of the fork's declared "
+                        f"branches, but it feeds '{target}', which is inside bound region "
+                        f"'{binding.closer_name}'. A route outside the fork's branch list carries no lineage "
+                        f"frame for this group, so it must not enter the region (spec §7 rule 4). Route "
+                        f"'{edge.label}' outside the region, or add it to the fork's declared branches.",
+                        component_id=binding.closer_name,
+                        component_type=binding.closer_kind,
+                    )
+
+        # Backward walk: every non-DIVERT edge into an in-region node (or the
+        # closer itself) must originate at the opener or another member.
+        entry_targets = region.member_node_ids | {binding.closer_node_id}
+        for member in sorted(entry_targets):
+            for edge in graph.get_incoming_edges(member):
+                if edge.mode is RoutingMode.DIVERT:
+                    continue
+                origin = NodeID(edge.from_node)
+                if origin not in in_region:
+                    raise GraphValidationError(
+                        f"Edge into '{member}' (bound region '{binding.closer_name}') originates outside "
+                        f"the bound region at '{origin}'. Every path into an in-region node must "
+                        f"originate at the opener '{binding.opener_name}' (spec §7 rule 4, backward walk; "
+                        f"row_union precedent). Feed that input from inside the region, or move the "
+                        f"consumer outside it.",
+                        component_id=binding.closer_name,
+                        component_type=binding.closer_kind,
+                    )
+
+
+def validate_openers_bound_in_region(
+    graph: ExecutionGraph,
+    regions: tuple[BoundRegion, ...],
+    registry: GroupBindingRegistry,
+    multi_row_node_ids: Mapping[NodeID, str],
+    fork_gate_node_ids: Collection[NodeID],
+) -> None:
+    """§7 rule 5 (ruling 28): a shape change inside a group must itself be a group.
+
+    Every token-creating node inside a bound region must be a declared
+    scope opener whose closer is ALSO inside that region. A fork's own
+    branches close at an in-region COALESCE (rule 4 already enforces the
+    SESE shape; a row_union closer is rejected here — see the closer-kind
+    split below); this rule adds the EXPAND case: an
+    undeclared multi-row transform inside any bound region is rejected
+    flat, and a declared scope whose collector closes outside the
+    enclosing region is rejected too, so every member of a bound region
+    presents exactly one token, statically.
+
+    ``multi_row_node_ids`` is node-kind-agnostic (2026-08-23 review
+    finding, Task 8 follow-up): ruling 28 reads "every creates_tokens node
+    inside a bound region", not "every creates_tokens TRANSFORM", so the
+    builder's census includes aggregation and collector plugins too
+    (``BatchTransformProtocol.creates_tokens``, plugin_protocols.py:613) —
+    not reachable on any shipped plugin today, but the ruling draws no
+    node-kind exception. Two consequences, deliberately NOT special-cased:
+    a ``creates_tokens`` aggregation inside a region is independently
+    rejected by rule 6 (``validate_no_aggregations_in_regions``, called
+    right after this function) regardless of ``creates_tokens`` — both
+    rejections are correct for that shape, and this function runs first, so
+    its "not a declared scope opener" message wins the overlap; a
+    ``creates_tokens`` collector inside a region is a closer, not an
+    opener, and is rejected flat by the SAME "not a declared scope opener"
+    limb below (a collector cannot open its own scope), which is the
+    correct fail-closed outcome.
+
+    In-region FORK gates have FOUR shapes; this rule owns the fourth
+    (META-38 commit 3, 2026-08-25) and a closer-kind split of the first
+    (elspeth-9db785ace7, 2026-08-26): a fork inside a bound region either
+    closes at an in-region closer of its own (rule 3 enforces the nesting,
+    rule 4 the SESE shape — legal ONLY for a COALESCE closer, see the next
+    paragraph), closes outside the
+    enclosing region (rule 3's partial-overlap rejection already fires,
+    before this function ever runs), fans out to sinks (pure fan-out —
+    rule 4's sink-inside check already rejects a sink reached from within
+    a bound region), or — the shape the earlier version of this docstring
+    said could not exist — fans out to ordinary transforms that reach the
+    ENCLOSING closer with no coalesce/row_union of their own (rule 2 needs
+    a bound branch to bind, E2 lets an unbound branch feed a transform,
+    the builder's rule-5 census excludes gates). Such an UNBOUND fork
+    inside a bound region is refused here: its branches multiply the
+    region's members without a group of their own (roster N, arrivals
+    N x branches — and with a single branch, roster N == arrivals N with
+    the fork's provenance silently dropped at the closer's truncation),
+    which is exactly the "shape change must itself be a group" rule 5
+    states. The runtime truncation guard (``truncate_at_closer_frame``)
+    still raises on the frame it would leave above the closer's own — a
+    fail-closed defense, not the enforcement point; this is.
+
+    The closer-kind split (elspeth-9db785ace7): an earlier revision of
+    this docstring declared the first shape's closer kinds interchangeable
+    ("closes at an in-region coalesce/row_union — well-nested, legal"),
+    and they are NOT, because the two kinds differ in release cardinality.
+    A coalesce is a MERGING closer: ``truncate_at_closer_frame``
+    (contracts/identity.py) mints ONE successor per group, so the
+    enclosing region still sees exactly one token per member — legal. A
+    row_union is a PASS-THROUGH closer (ruling 27, ``pop_fork_frame``):
+    it releases the ORIGINAL branch tokens, each still carrying the same
+    innermost enclosing-group (group_id, member_key), so one member of
+    the enclosing region presents branch-count tokens at the enclosing
+    closer and rule 5's one-token-per-member certification above is
+    FALSE. The enclosing closer's fail-closed guards then raise at
+    runtime — the collector's duplicate-member check (a Tier-1
+    ``AuditIntegrityError`` whose message calls the state build-time
+    impossible), or the coalesce/row_union duplicate-arrival
+    ``OrchestrationInvariantError`` — on a builder-certified shape.
+    Rulings 27 and 28 contradict each other for that shape, so the
+    contradiction is resolved here, at build: an in-region fork gate
+    whose binding's ``closer_kind`` is ROW_UNION is rejected flat, for
+    EVERY enclosing closer kind (collector, coalesce, row_union alike).
+    The runtime guards stay exactly as they are — fail-closed defenses,
+    never the enforcement point.
+
+    The "closer closes outside" limb below is a DEFENSIVE invariant, not a
+    reachable rejection: whenever an opener node is genuinely a member of
+    the enclosing region (this loop's own precondition), `compute_bound_regions`
+    having already returned without raising rule 3's partial-overlap error
+    forces the opener's own closer to ALSO be a member of that same region
+    (the opener and closer share the enclosing span with the inner region;
+    the only well-nestedness arm that can hold once the opener is a shared
+    member is the inner region nesting entirely inside the outer one, which
+    puts the inner closer in the outer region's members too). So this limb
+    cannot fire on any graph reaching this function through the real
+    `build_execution_graph` path, composer-authored or hand-authored YAML
+    alike — see `config/cicd/runtime_rejection_parity.yaml` (key
+    `3956713c3d4e81ba`, disposition `structural`) for the full proof. Kept
+    per the plan's own Step 3 sketch as a belt-and-suspenders check against a
+    future change to rule 3's own well-nestedness logic; the raw
+    `BoundRegion`/`GroupBindingRegistry` test that exercises it bypasses
+    `compute_bound_regions` entirely for exactly this reason.
+
+    ``fork_gate_node_ids`` is the builder's census of gates with a
+    ``fork_to`` (the FORK arm's roster, node-id keyed like
+    ``multi_row_node_ids``); a gate in it is UNBOUND when the registry holds
+    no FORK binding keyed on its node (``by_opener_node`` — a bound gate's
+    branches resolve to a declared coalesce/row_union closer). ``graph``
+    names the offending gate for the message (its configured gate name via
+    ``get_config_gate_id_map``; the raw node id when a hand-built graph set
+    no map). Every other fact this rule needs — region membership, the
+    opener index, the multi-row roster — is already materialized in its
+    other parameters.
+
+    Raises:
+        GraphValidationError: a multi-row transform inside a bound region is
+            not a declared scope opener, an UNBOUND fork gate sits inside a
+            bound region, an in-region fork gate closes at a ROW_UNION (a
+            pass-through closer cannot preserve the enclosing region's
+            one-token-per-member guarantee), or (defensively; see above) a
+            scope opener's collector closes outside the enclosing region.
+    """
+    bound_openers = registry.by_opener_node()
+    gate_name_by_node_id = {node_id: str(name) for name, node_id in graph.get_config_gate_id_map().items()}
+    for region in regions:
+        binding = region.binding
+        for gate_node_id in sorted(fork_gate_node_ids):
+            if gate_node_id not in region.member_node_ids:
+                continue
+            gate_name = gate_name_by_node_id[gate_node_id] if gate_node_id in gate_name_by_node_id else str(gate_node_id)
+            fork_binding = bound_openers[gate_node_id] if gate_node_id in bound_openers else None
+            if fork_binding is None:
+                raise GraphValidationError(
+                    f"Fork gate '{gate_name}' inside bound region '{binding.closer_name}' is unbound: its branches "
+                    f"reach '{binding.closer_name}' with no coalesce or row_union of their own. Inside a bound region "
+                    f"a shape change must itself be a group (spec §7 rule 5, ruling 28): close the fork at an "
+                    f"in-region coalesce before '{binding.closer_name}' (a row_union closer is itself rejected — "
+                    f"pass-through closers violate one-token-per-member), or move the fork outside the region.",
+                    component_id=gate_name,
+                    component_type="gate",
+                )
+            if fork_binding.closer_kind is CloserKind.ROW_UNION:
+                raise GraphValidationError(
+                    f"Fork gate '{gate_name}' inside bound region '{binding.closer_name}' closes at row_union "
+                    f"'{fork_binding.closer_name}'. A row_union is a pass-through closer (ruling 27): it releases "
+                    f"the original branch tokens — one per fork branch — so each member of the region would "
+                    f"present {len(fork_binding.member_roster)} token(s) at the region's {binding.closer_kind} "
+                    f"closer '{binding.closer_name}', violating spec §7 rule 5's one-token-per-member guarantee. "
+                    f"Close the fork at an in-region coalesce instead (a merging closer releases one token per "
+                    f"member), or move the fork and '{fork_binding.closer_name}' outside the region.",
+                    component_id=gate_name,
+                    component_type="gate",
+                )
+        for node_id in sorted(multi_row_node_ids):
+            transform_name = multi_row_node_ids[node_id]
+            if node_id not in region.member_node_ids:
+                continue
+            inner = bound_openers[node_id] if node_id in bound_openers else None
+            if inner is None:
+                raise GraphValidationError(
+                    f"Multi-row transform '{transform_name}' inside bound region '{binding.closer_name}' "
+                    f"is not a declared scope opener. Inside a bound region, a shape change must itself "
+                    f"be a group (spec §7 rule 5, ruling 28): wrap '{transform_name}' in a scopes: entry "
+                    f"whose collector closes before '{binding.closer_name}'.",
+                    component_id=transform_name,
+                    component_type="transform",
+                )
+            if inner.closer_node_id not in region.member_node_ids:
+                raise GraphValidationError(
+                    f"Scope opener '{transform_name}' sits inside bound region '{binding.closer_name}' "
+                    f"but its collector '{inner.closer_name}' closes outside it. An inner group must "
+                    f"close before the enclosing region's closer (spec §7 rules 3/5).",
+                    component_id=inner.closer_name,
+                    component_type="collector",
+                )
+
+
+def validate_no_aggregations_in_regions(
+    graph: ExecutionGraph,
+    regions: tuple[BoundRegion, ...],
+    aggregation_node_ids: Mapping[NodeID, str],
+) -> None:
+    """§7 rule 6 (ruling 25): aggregators are windows, not closers — banned inside
+    every bound region, BOTH output modes, every closer kind's region.
+
+    A batch flush consumes members a roster must account for; an aggregation
+    inside a bound region can consume (and terminalize) members the region's
+    roster is watching without the region ever seeing the loss — the
+    BATCH_CONSUMED loss-blindness gap. This is a flat ban regardless of
+    ``output_mode``: the pre-existing row_union-specific backward walk in
+    ``build_execution_graph`` (the "BRANCH-INTERNAL AGGREGATION GUARD") only
+    rejects ``output_mode: transform`` aggregations feeding a row_union
+    branch, because THAT check is about a narrower hazard (transform-mode's
+    single-buffered-parent collision); it runs earlier in the builder and
+    still fires first for that one shape (a more specific diagnostic, same
+    precedent as rule 4's sink-inside-vs-no-path priority). This rule closes
+    the wider gap that check does not: passthrough-mode aggregations, and
+    aggregations inside COALESCE or EXPAND (scope/collector) regions, which
+    the row_union-only walk never inspected at all.
+
+    Outside a bound region no roster is watching, so a top-level aggregation
+    or one placed after a closer's release is unchanged (ADR-020 posture).
+
+    ``graph`` is unused in this function's body (kept for signature
+    symmetry with the other §7 validators, which all take the built graph);
+    every fact this rule needs — region membership, the aggregation index —
+    is already materialized in its other parameters.
+
+    Raises:
+        GraphValidationError: an aggregation node is a member of a bound
+            region, regardless of the region's closer kind or the
+            aggregation's output_mode.
+    """
+    for region in regions:
+        binding = region.binding
+        for node_id in sorted(aggregation_node_ids):
+            if node_id not in region.member_node_ids:
+                continue
+            agg_name = aggregation_node_ids[node_id]
+            raise GraphValidationError(
+                f"Aggregation '{agg_name}' is inside bound region '{binding.closer_name}' "
+                f"(opener '{binding.opener_name}'). Aggregators are banned inside all bound "
+                f"regions (spec §7 rule 6, ruling 25): a batch flush consumes members the roster "
+                f"must account for. Move the aggregation before the opener or after the closer; "
+                f"for an in-region N->M batch, use a scoped multi-row transform with a collector.",
+                component_id=agg_name,
+                component_type="aggregation",
+            )

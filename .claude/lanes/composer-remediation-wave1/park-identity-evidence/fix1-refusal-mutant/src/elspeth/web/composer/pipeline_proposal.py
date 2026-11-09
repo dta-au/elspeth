@@ -1,0 +1,775 @@
+"""Canonical, custody-safe pipeline proposal integrity envelope.
+
+``PipelineProposal`` wraps either exact canonical public ``set_pipeline``
+arguments or the closed private owned-state authority needed when that public
+v1 shape cannot represent the authored topology losslessly. The latter reuses
+``CompositionState`` rather than defining another topology model. The draft hash uses the
+``composer.pipeline-proposal-envelope.v4`` domain because it covers every
+authority-bearing envelope field. This intentionally supersedes the older
+design's ``composer.pipeline-proposal.v1`` pipeline-only preimage; accepting
+both would allow two different integrity meanings to share one draft concept.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from dataclasses import fields as dataclass_fields
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Final, Literal, Self, TypedDict, cast
+from uuid import UUID
+
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import FrozenJsonArray, deep_thaw, freeze_fields
+from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.web.composer.authority_hashing import composer_authority_hash, project_composer_authority_payload
+from elspeth.web.composer.bounded_json import (
+    JSON_MAX_ITEMS,
+    JSON_MAX_TOTAL_UTF8_BYTES,
+    JsonBoundaryError,
+    JsonTraversalBudget,
+)
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.state import CompositionState
+
+_DRAFT_HASH_SCHEMA = "composer.pipeline-proposal-envelope.v4"
+_REVIEWED_ANCHOR_SCHEMA = "composer.reviewed-anchors.v1"
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+OWNED_COMPOSITION_STATE_AUTHORITY: Final = "owned_composition_state.v1"
+_OWNED_COMPOSITION_STATE_FIELDS = frozenset(
+    {
+        "authority_kind",
+        "sources",
+        "nodes",
+        "edges",
+        "outputs",
+        "metadata",
+    }
+)
+_PROPOSAL_FIELDS = frozenset(
+    {
+        "pipeline",
+        "draft_hash",
+        "base",
+        "repair_count",
+        "skill_hash",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AbsentBase:
+    """Explicit assertion that no current composition state exists."""
+
+    kind: Literal["absent"] = "absent"
+
+    def __post_init__(self) -> None:
+        if self.kind != "absent":
+            raise AuditIntegrityError("AbsentBase kind must be 'absent'")
+
+
+@dataclass(frozen=True, slots=True)
+class PresentBase:
+    """Binding to one exact existing composition state and its content."""
+
+    state_id: UUID
+    composition_content_hash: str
+    kind: Literal["present"] = "present"
+
+    def __post_init__(self) -> None:
+        if self.kind != "present":
+            raise AuditIntegrityError("PresentBase kind must be 'present'")
+        if type(self.state_id) is not UUID:
+            raise AuditIntegrityError("PresentBase state_id must be a UUID")
+        _require_hash(self.composition_content_hash, "PresentBase composition_content_hash")
+
+
+ProposalBase = AbsentBase | PresentBase
+
+
+class PipelineProposalData(TypedDict):
+    """Strict JSON-safe persistence shape returned by ``to_dict``."""
+
+    pipeline: dict[str, Any]
+    draft_hash: str
+    base: dict[str, str]
+    repair_count: int
+    skill_hash: str
+
+
+class OwnedCompositionStateAuthorityData(TypedDict):
+    """Closed, version-free authored-state proposal authority."""
+
+    authority_kind: Literal["owned_composition_state.v1"]
+    sources: dict[str, dict[str, Any]]
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, Any]]
+    outputs: list[dict[str, Any]]
+    metadata: dict[str, Any]
+
+
+class OwnedCompositionStateSections(TypedDict):
+    """The five authored sections of an owned-state authority, minus its kind."""
+
+    sources: dict[str, dict[str, Any]]
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, Any]]
+    outputs: list[dict[str, Any]]
+    metadata: dict[str, Any]
+
+
+class OwnedCompositionStateSetPipelineArguments(TypedDict):
+    """Internal lossless set_pipeline execution/review projection."""
+
+    sources: dict[str, dict[str, Any]]
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, Any]]
+    outputs: list[dict[str, Any]]
+    metadata: dict[str, Any]
+
+
+def _require_hash(value: object, field_name: str) -> None:
+    if type(value) is not str or _SHA256_HEX.fullmatch(value) is None:
+        raise AuditIntegrityError(f"{field_name} must be exactly 64 lowercase hexadecimal characters")
+
+
+def _base_to_dict(base: ProposalBase) -> dict[str, str]:
+    if type(base) is AbsentBase:
+        return {"kind": "absent"}
+    if type(base) is PresentBase:
+        return {
+            "kind": "present",
+            "state_id": str(base.state_id),
+            "composition_content_hash": base.composition_content_hash,
+        }
+    raise AuditIntegrityError("PipelineProposal base must be AbsentBase or PresentBase")
+
+
+def _canonical_uuid_text(value: object, field_name: str) -> str:
+    if type(value) is not str:
+        raise AuditIntegrityError(f"{field_name} must be a canonical UUID string")
+    try:
+        parsed = UUID(value)
+    except ValueError as exc:
+        raise AuditIntegrityError(f"{field_name} must be a canonical UUID string") from exc
+    if str(parsed) != value:
+        raise AuditIntegrityError(f"{field_name} must be a canonical lowercase UUID string")
+    return value
+
+
+def _validate_and_freeze_strict_json_value(
+    value: object,
+    field_name: str,
+    *,
+    path: str,
+    depth: int,
+    budget: JsonTraversalBudget,
+    active_container_ids: set[int],
+) -> Any:
+    """Validate and detach one strict JSON value in a single recursive pass."""
+    budget.check_depth(depth, label=field_name)
+    if type(value) in {dict, MappingProxyType}:
+        mapping_value = cast(Mapping[object, object], value)
+        container_id = id(value)
+        if container_id in active_container_ids:
+            raise AuditIntegrityError(f"{field_name} contains a recursive mapping at {path}")
+        active_container_ids.add(container_id)
+        try:
+            frozen_children: dict[str, Any] = {}
+            budget.consume_items(len(mapping_value), label=field_name)
+            for key, child in mapping_value.items():
+                if type(key) is not str:
+                    raise AuditIntegrityError(f"{field_name} key at {path} must be an exact str")
+                budget.consume_text(key, label=field_name)
+                frozen_children[key] = _validate_and_freeze_strict_json_value(
+                    child,
+                    field_name,
+                    path=f"{path}.{key}",
+                    depth=depth + 1,
+                    budget=budget,
+                    active_container_ids=active_container_ids,
+                )
+        finally:
+            active_container_ids.remove(container_id)
+        return MappingProxyType(frozen_children)
+
+    if type(value) in {list, FrozenJsonArray}:
+        sequence_value = cast(Sequence[object], value)
+        container_id = id(value)
+        if container_id in active_container_ids:
+            raise AuditIntegrityError(f"{field_name} contains a recursive list at {path}")
+        active_container_ids.add(container_id)
+        try:
+            budget.consume_items(len(sequence_value), label=field_name)
+            frozen_items = FrozenJsonArray(
+                _validate_and_freeze_strict_json_value(
+                    child,
+                    field_name,
+                    path=f"{path}[{index}]",
+                    depth=depth + 1,
+                    budget=budget,
+                    active_container_ids=active_container_ids,
+                )
+                for index, child in enumerate(sequence_value)
+            )
+        finally:
+            active_container_ids.remove(container_id)
+        return frozen_items
+
+    if value is None or type(value) in {bool, str, int, float}:
+        if type(value) is str:
+            budget.consume_text(value, label=field_name)
+        return value
+
+    raise AuditIntegrityError(
+        f"{field_name} value at {path} must be an exact JSON leaf or a list/mapping container, got {type(value).__name__}"
+    )
+
+
+def _validate_and_freeze_canonical_mapping(value: Mapping[str, Any], field_name: str) -> Mapping[str, Any]:
+    """Snapshot an arbitrary Mapping once, then validate exact JSON containers."""
+    try:
+        snapshot: dict[object, object] = {}
+        for index, item in enumerate(value.items()):
+            if index >= JSON_MAX_ITEMS:
+                raise JsonBoundaryError(f"{field_name} exceeds the {JSON_MAX_ITEMS}-item JSON limit")
+            key, child = item
+            snapshot[key] = child
+    except JsonBoundaryError as exc:
+        raise AuditIntegrityError(f"{field_name} violates bounded JSON: {exc}") from exc
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise AuditIntegrityError(f"{field_name} must be a mapping") from exc
+    try:
+        frozen = _validate_and_freeze_strict_json_value(
+            snapshot,
+            field_name,
+            path="$",
+            depth=0,
+            budget=JsonTraversalBudget(),
+            active_container_ids=set(),
+        )
+        canonical = canonical_json(frozen)
+        if len(canonical.encode("utf-8")) > JSON_MAX_TOTAL_UTF8_BYTES:
+            raise JsonBoundaryError(f"{field_name} exceeds the {JSON_MAX_TOTAL_UTF8_BYTES}-byte canonical JSON limit")
+    except JsonBoundaryError as exc:
+        raise AuditIntegrityError(f"{field_name} violates bounded JSON: {exc}") from exc
+    except RecursionError as exc:
+        raise AuditIntegrityError(f"{field_name} exceeds bounded JSON recursion") from exc
+    except (TypeError, ValueError) as exc:
+        raise AuditIntegrityError(f"{field_name} contains a number outside the RFC 8785 JSON domain") from exc
+    return cast(Mapping[str, Any], frozen)
+
+
+def reviewed_anchor_hash(reviewed_facts: Mapping[str, Any]) -> str:
+    """Hash a detached, recursively immutable snapshot of reviewed facts."""
+    frozen_facts = _validate_and_freeze_canonical_mapping(reviewed_facts, "reviewed_facts")
+    preimage = {
+        "schema": _REVIEWED_ANCHOR_SCHEMA,
+        "facts": frozen_facts,
+    }
+    return stable_hash(preimage)
+
+
+def is_owned_composition_state_authority(value: Mapping[str, Any]) -> bool:
+    """Return whether ``value`` names the closed private owned-state seam."""
+    return value.get("authority_kind") == OWNED_COMPOSITION_STATE_AUTHORITY
+
+
+def _project_owned_composition_state(state: CompositionState) -> OwnedCompositionStateAuthorityData:
+    payload = state.to_dict()
+    return OwnedCompositionStateAuthorityData(
+        authority_kind=OWNED_COMPOSITION_STATE_AUTHORITY,
+        sources=payload["sources"],
+        nodes=payload["nodes"],
+        edges=payload["edges"],
+        outputs=payload["outputs"],
+        metadata=payload["metadata"],
+    )
+
+
+def owned_composition_state_authority(state: CompositionState) -> OwnedCompositionStateAuthorityData:
+    """Project exact authored content for a private pipeline proposal.
+
+    Lifecycle version is deliberately excluded. The
+    proposal base binds the current persisted version/content, while settlement
+    assigns exactly ``current.version + 1``. This seam exists for authored
+    topologies that public ``set_pipeline`` v1 cannot represent losslessly.
+    """
+    authority = _project_owned_composition_state(state)
+    # Reuse the strict restore path here so construction and reload admit the
+    # exact same closed shape.
+    restore_owned_composition_state_authority(authority, version=1)
+    return authority
+
+
+def _owned_composition_state_spec_entries(payload: Mapping[str, Any]) -> tuple[tuple[Any, type], ...]:
+    """Pair every authored sub-object in an authority with the spec that parses it.
+
+    The closed six-field guard above proves the five section keys exist; this
+    proves each section holds the container ``CompositionState.from_dict``
+    expects, so the callers below can read sub-objects without re-checking.
+    Source names are asserted to be exact strings here rather than left to the
+    round-trip comparison: a non-``str`` key survives that comparison intact
+    (``{1: {...}}`` is byte-equal to itself) but ``canonical_json`` refuses it,
+    so an authority carrying one hashes under ``stable_hash`` and then raises
+    from the canonicalisation path instead of at this boundary.
+    """
+    from elspeth.web.composer.state import EdgeSpec, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+
+    sources = payload["sources"]
+    metadata = payload["metadata"]
+    if type(sources) is not dict or any(type(source_name) is not str for source_name in sources):
+        raise AuditIntegrityError("owned composition-state authority sections are malformed")
+    entries: list[tuple[Any, type]] = [(source, SourceSpec) for source in sources.values()]
+    for section_key, spec in (("nodes", NodeSpec), ("edges", EdgeSpec), ("outputs", OutputSpec)):
+        section = payload[section_key]
+        if type(section) is not list:
+            raise AuditIntegrityError("owned composition-state authority sections are malformed")
+        entries.extend((entry, spec) for entry in section)
+    entries.append((metadata, PipelineMetadata))
+    if any(type(entry) is not dict for entry, _spec in entries):
+        raise AuditIntegrityError("owned composition-state authority sections are malformed")
+    return tuple(entries)
+
+
+def _reject_undeclared_owned_composition_state_fields(payload: Mapping[str, Any]) -> None:
+    """Reject any authored key the composer state model would silently drop.
+
+    Every spec's ``from_dict`` reads exactly the names its dataclass declares —
+    pinned mechanically by ``test_spec_from_dict_reads_exactly_its_dataclass_fields``
+    — so the declared field names ARE the set of keys a restore observes, and
+    anything outside it is discarded on the way in.
+
+    This is the only integrity-relevant limb of the old byte-equality guard, and
+    it is checked separately because it is the only one whose consequence is
+    disclosure rather than fidelity. ``tool_arguments_hash`` and
+    ``private_arguments_hash`` bind the RAW payload, while
+    ``arguments_redacted_json`` is built from the RESTORED state
+    (``sessions/service.py``), so a dropped key is persisted verbatim and never
+    reaches ``redact_tool_call_arguments`` — an unreviewed egress channel, not
+    merely a lossy reload.
+    """
+    for entry, spec in _owned_composition_state_spec_entries(payload):
+        if set(entry) - {field.name for field in dataclass_fields(spec)}:
+            raise AuditIntegrityError("owned composition-state authority carries a field the composer state model does not define")
+
+
+def _authored_and_projected_pairs(
+    payload: Mapping[str, Any],
+    emitted: Mapping[str, Any],
+) -> list[tuple[Any, Any]]:
+    """Pair each authored sub-object with the projection of its restored self."""
+    emitted_sources = emitted["sources"]
+    pairs: list[tuple[Any, Any]] = [
+        (source, emitted_sources[source_name] if source_name in emitted_sources else None)
+        for source_name, source in payload["sources"].items()
+    ]
+    for section_key in ("nodes", "edges", "outputs"):
+        emitted_section = emitted[section_key]
+        for index, entry in enumerate(payload[section_key]):
+            pairs.append((entry, emitted_section[index] if index < len(emitted_section) else None))
+    pairs.append((payload["metadata"], emitted["metadata"]))
+    return pairs
+
+
+def _authority_without_written_out_nulls(
+    payload: Mapping[str, Any],
+    emitted: Mapping[str, Any],
+) -> OwnedCompositionStateSections | None:
+    """Return ``payload`` minus every written-out null, or None if it has none.
+
+    ``CompositionState.to_dict`` emits an optional field only when it is not
+    None — it never writes a null out — so an absence spelled as
+    ``"condition": null`` is a shape no serialiser version ever produced. It
+    compares unequal whether construction leaves the field None (the key
+    vanishes from the projection) or defaults it (the key comes back with a
+    value), and both forms are removed here.
+
+    Undeclared keys are rejected before this runs, so an authored null the
+    projection does not carry back verbatim is always a declared optional whose
+    absence was written out rather than omitted. Selecting on that observed
+    null, rather than on the field's NAME, is deliberate: a name-keyed rule
+    would grant the same amnesty to an unrelated transform that happens to
+    touch the same field.
+    """
+    stripped = OwnedCompositionStateSections(
+        sources={source_name: dict(source) for source_name, source in payload["sources"].items()},
+        nodes=[dict(node) for node in payload["nodes"]],
+        edges=[dict(edge) for edge in payload["edges"]],
+        outputs=[dict(output) for output in payload["outputs"]],
+        metadata=dict(payload["metadata"]),
+    )
+    found = False
+    for entry, projected in _authored_and_projected_pairs(stripped, emitted):
+        if type(projected) is not dict:
+            continue
+        for key in [key for key, value in entry.items() if value is None and (key not in projected or projected[key] is not None)]:
+            del entry[key]
+            found = True
+    return stripped if found else None
+
+
+def _round_trips_once_written_out_nulls_are_dropped(
+    payload: Mapping[str, Any],
+    emitted: Mapping[str, Any],
+) -> bool:
+    """Return whether written-out nulls are the ONLY reason the round trip failed.
+
+    Reporting the null class on the mere PRESENCE of an authored null is
+    misdirection when the payload is ALSO stale: the operator removes the null,
+    resubmits, and hits a second fatal rejection. So the nulls are stripped and
+    the round trip re-checked — the class is claimed only when the stripped
+    payload restores exactly, which makes the message's implied remedy a real
+    one.
+
+    ``emitted`` is reused as the stripped payload's projection rather than
+    restoring a second time, because dropping a written-out null cannot change
+    what ``from_dict`` builds: every strippable key is optional BY
+    CONSTRUCTION. A field the serialiser emits unconditionally comes back as an
+    explicit None in the projection and is therefore never selected for
+    stripping; what remains is read through the ``"key" in d`` idiom, for which
+    an authored None and an absent key produce the identical value.
+    """
+    stripped = _authority_without_written_out_nulls(payload, emitted)
+    return stripped is not None and emitted == {"authority_kind": OWNED_COMPOSITION_STATE_AUTHORITY, **stripped}
+
+
+def restore_owned_composition_state_authority(
+    authority: Mapping[str, Any],
+    *,
+    version: int,
+) -> CompositionState:
+    """Restore and exact-round-trip one private owned-state authority.
+
+    Fail-closed on anything the current serialiser would not re-emit verbatim.
+    The three rejections are deliberately distinct, because they are materially
+    different conditions that used to share one message and one remedy:
+
+    * an undeclared field is silently DROPPED on restore, so the authored bytes
+      and the restored state disagree about content (see the helper above);
+    * an explicit null encodes an absence the serialiser writes by omission —
+      faithful, and REMOVABLE, which is why this class is claimed only when
+      removing the nulls actually makes the payload restore;
+    * anything else means the payload does not round-trip under the composer
+      state normalisation THIS build applies.
+
+    The order matters as much as the split. A payload that is both null-shaped
+    and stale must report as stale, because "remove the null" is a remedy that
+    would not work; a message the operator can act on and still fail is worse
+    than the single uninformative one this replaced.
+
+    The last class is why stale bytes stay fatal rather than being tolerated.
+    ``NodeSpec.__post_init__`` reads its coalesce defaults from
+    ``CoalesceSettings.model_fields`` precisely so composer state tracks the
+    runtime, so a payload that omits ``merge``/``policy`` carries no record of
+    which default was in force when it was authored: accepting it would let a
+    later change to the runtime default silently re-interpret already-reviewed
+    bytes with every hash binding still green. The bytes are hash-bound and must
+    never be rewritten, so an authority that predates a normalisation is
+    quarantined, not migrated (elspeth-da00e1c1cb).
+    """
+    from elspeth.web.composer.state import CompositionState
+
+    if type(version) is not int or version < 1:
+        raise AuditIntegrityError("owned composition-state version must be a positive exact integer")
+    detached = deep_thaw(authority)
+    if type(detached) is not dict or set(detached) != _OWNED_COMPOSITION_STATE_FIELDS:
+        raise AuditIntegrityError("owned composition-state authority fields are malformed")
+    # Membership read, not a probe: the guard above proves ``set(detached)``
+    # is exactly ``_OWNED_COMPOSITION_STATE_FIELDS``, which contains
+    # "authority_kind" — so a missing key here is a broken invariant that must
+    # crash, not be folded into the malformed-kind branch.
+    if detached["authority_kind"] != OWNED_COMPOSITION_STATE_AUTHORITY:
+        raise AuditIntegrityError("owned composition-state authority kind is malformed")
+    state_payload = {key: value for key, value in detached.items() if key != "authority_kind"}
+    _reject_undeclared_owned_composition_state_fields(state_payload)
+    try:
+        state = CompositionState.from_dict({**state_payload, "version": version})
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AuditIntegrityError("owned composition-state authority payload is malformed") from exc
+    emitted = _project_owned_composition_state(state)
+    if emitted != detached:
+        if _round_trips_once_written_out_nulls_are_dropped(state_payload, emitted):
+            raise AuditIntegrityError("owned composition-state authority encodes an absent optional field as an explicit null")
+        raise AuditIntegrityError("owned composition-state authority does not round-trip under the current composer state normalisation")
+    return state
+
+
+def owned_composition_state_execution_arguments(
+    authority: Mapping[str, Any],
+    *,
+    version: int,
+) -> OwnedCompositionStateSetPipelineArguments:
+    """Build private set-pipeline execution arguments without losing state."""
+    return owned_composition_state_execution_arguments_from_restored(restore_owned_composition_state_authority(authority, version=version))
+
+
+def owned_composition_state_execution_arguments_from_restored(state: CompositionState) -> OwnedCompositionStateSetPipelineArguments:
+    """Project execution arguments from a state the caller has just restored.
+
+    ``state`` must be the return value of
+    :func:`restore_owned_composition_state_authority` for the authority being
+    projected. This projects; it does not verify. Callers that already hold the
+    restored state use it so one authority is verified once, not once per
+    projection (the restore's exact round trip makes ``state.to_dict()`` equal
+    to what a second restore of the same authority would emit).
+    """
+    payload = state.to_dict()
+    return OwnedCompositionStateSetPipelineArguments(
+        sources=payload["sources"],
+        nodes=payload["nodes"],
+        edges=payload["edges"],
+        outputs=[
+            {"sink_name": output["name"], **{key: value for key, value in output.items() if key != "name"}} for output in payload["outputs"]
+        ],
+        metadata=payload["metadata"],
+    )
+
+
+def owned_composition_state_review_arguments(authority: Mapping[str, Any]) -> OwnedCompositionStateSetPipelineArguments:
+    """Return the familiar, manifest-redactable review projection.
+
+    Blob identities and resolver-owned paths never enter this projection. The
+    exact private authority remains separately draft-hashed and persisted.
+    """
+    from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
+
+    state = restore_owned_composition_state_authority(authority, version=1)
+    payload = owned_composition_state_execution_arguments_from_restored(state)
+    safe_sources: dict[str, Any] = {}
+    for source_name, source in state.sources.items():
+        options = deep_thaw(source.options)
+        for key in ("blob_ref", "path", "file", SOURCE_AUTHORING_KEY):
+            # Membership-then-del: absence of a redactable key is first-class
+            # in web-authored options; no defaulted pop masking either state.
+            if key in options:
+                del options[key]
+        # Web-authored option content: "mode" is genuinely optional, so
+        # membership-then-index redacts the bind_source marker without a
+        # defaulted lookup fabricating an answer for absent keys.
+        if "mode" in options and options["mode"] == "bind_source":
+            del options["mode"]
+        safe_sources[source_name] = {
+            "plugin": source.plugin,
+            "on_success": source.on_success,
+            "options": options,
+            "on_validation_failure": source.on_validation_failure,
+        }
+    payload["sources"] = safe_sources
+    return payload
+
+
+def pipeline_draft_hash(
+    *,
+    pipeline: Mapping[str, Any],
+    base: ProposalBase,
+    repair_count: int,
+    skill_hash: str,
+) -> str:
+    """Hash the complete authority-bearing proposal envelope under v4."""
+    return _owned_pipeline_draft_hash(
+        frozen_pipeline=_validate_and_freeze_canonical_mapping(pipeline, "pipeline"),
+        base=base,
+        repair_count=repair_count,
+        skill_hash=skill_hash,
+    )
+
+
+def _owned_pipeline_draft_hash(
+    *,
+    frozen_pipeline: Mapping[str, Any],
+    base: ProposalBase,
+    repair_count: int,
+    skill_hash: str,
+) -> str:
+    """Hash the v4 envelope over a pipeline this module has just frozen itself.
+
+    Module-private. ``frozen_pipeline`` must be the value
+    ``_validate_and_freeze_canonical_mapping`` returned on the caller's own
+    path in this module, never a caller-supplied mapping: that function builds
+    every container afresh, so nothing outside this module holds a reference
+    to the tree and it cannot change between freeze and hash. Being a
+    ``MappingProxyType`` proves nothing (its backing dict may be mutable
+    elsewhere), which is why the public ``pipeline_draft_hash`` always
+    re-freezes.
+
+    ``stable_hash`` is ``sha256(canonical_json(...))`` over the same
+    normalisation, so it raises everything a separate ``canonical_json`` of
+    the preimage would; the discarded pre-serialisation that used to precede
+    it was a pure duplicate. The preimage (schema, authority projection of the
+    pipeline, base, counters) is a different canonical form from the bare
+    pipeline whose bytes ``_validate_and_freeze_canonical_mapping`` measures
+    for the size limit, so those bytes cannot be shared with the hash.
+    """
+    if type(repair_count) is not int or repair_count < 0:
+        raise AuditIntegrityError("repair_count must be a non-negative integer")
+    _require_hash(skill_hash, "skill_hash")
+
+    preimage = {
+        "schema": _DRAFT_HASH_SCHEMA,
+        "pipeline": project_composer_authority_payload(frozen_pipeline),
+        "base": _base_to_dict(base),
+        "repair_count": repair_count,
+        "skill_hash": skill_hash,
+    }
+    return stable_hash(preimage)
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineProposal:
+    """Deeply immutable, hash-verified canonical pipeline authority."""
+
+    pipeline: Mapping[str, Any]
+    draft_hash: str
+    base: ProposalBase
+    repair_count: int
+    skill_hash: str
+
+    def __post_init__(self) -> None:
+        frozen_pipeline = _validate_and_freeze_canonical_mapping(self.pipeline, "pipeline")
+        if is_owned_composition_state_authority(frozen_pipeline):
+            restore_owned_composition_state_authority(frozen_pipeline, version=1)
+        _base_to_dict(self.base)
+        _require_hash(self.draft_hash, "draft_hash")
+        if type(self.repair_count) is not int or self.repair_count < 0:
+            raise AuditIntegrityError("repair_count must be a non-negative integer")
+        _require_hash(self.skill_hash, "skill_hash")
+
+        # ``frozen_pipeline`` was built by this method's own freeze above, so
+        # it is hashed without freezing it a second time.
+        expected_draft_hash = _owned_pipeline_draft_hash(
+            frozen_pipeline=frozen_pipeline,
+            base=self.base,
+            repair_count=self.repair_count,
+            skill_hash=self.skill_hash,
+        )
+        if self.draft_hash != expected_draft_hash:
+            raise AuditIntegrityError("PipelineProposal draft_hash mismatch")
+        object.__setattr__(self, "pipeline", frozen_pipeline)
+        freeze_fields(self, "pipeline")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        pipeline: Mapping[str, Any],
+        base: ProposalBase,
+        repair_count: int,
+        skill_hash: str,
+        supplied_draft_hash: str | None = None,
+    ) -> Self:
+        """Construct a proposal, optionally verifying its supplied draft hash.
+
+        Verifies once and seals what it verified. Every check ``__post_init__``
+        performs is performed here, in the same first-failure order, on the
+        single tree this call froze: the strict-JSON freeze and size limit,
+        ``repair_count``/``skill_hash``/base (inside the hash), the supplied
+        hash, and the owned-state round trip. The instance is then sealed with
+        ``object.__new__`` so ``__post_init__`` does not freeze and hash the
+        same tree a second, third and fourth time.
+
+        There is deliberately no separate "already validated" constructor or
+        flag field: the only way to reach the unchecked seal is through this
+        method, which computes every sealed value itself, so a caller cannot
+        hand it a pipeline or hash to trust. A hand-built
+        ``PipelineProposal(...)``, ``dataclasses.replace`` and ``from_dict``'s
+        payload freeze still run full verification.
+        """
+        frozen_pipeline = _validate_and_freeze_canonical_mapping(pipeline, "pipeline")
+        computed_draft_hash = _owned_pipeline_draft_hash(
+            frozen_pipeline=frozen_pipeline,
+            base=base,
+            repair_count=repair_count,
+            skill_hash=skill_hash,
+        )
+        if supplied_draft_hash is not None and supplied_draft_hash != computed_draft_hash:
+            raise AuditIntegrityError("PipelineProposal draft_hash mismatch")
+        if is_owned_composition_state_authority(frozen_pipeline):
+            restore_owned_composition_state_authority(frozen_pipeline, version=1)
+        proposal = object.__new__(cls)
+        object.__setattr__(proposal, "pipeline", frozen_pipeline)
+        object.__setattr__(proposal, "draft_hash", computed_draft_hash)
+        object.__setattr__(proposal, "base", base)
+        object.__setattr__(proposal, "repair_count", repair_count)
+        object.__setattr__(proposal, "skill_hash", skill_hash)
+        return proposal
+
+    def to_dict(self) -> PipelineProposalData:
+        """Return the strict JSON-safe envelope used for persistence."""
+        return {
+            "pipeline": deep_thaw(self.pipeline),
+            "draft_hash": self.draft_hash,
+            "base": _base_to_dict(self.base),
+            "repair_count": self.repair_count,
+            "skill_hash": self.skill_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> Self:
+        """Strictly restore and reverify an envelope."""
+        payload = _validate_and_freeze_canonical_mapping(payload, "pipeline proposal payload")
+        if set(payload) != _PROPOSAL_FIELDS:
+            raise AuditIntegrityError("PipelineProposal persisted fields are malformed")
+        _require_hash(payload["draft_hash"], "PipelineProposal draft_hash")
+
+        raw_base = payload["base"]
+        if type(raw_base) is not MappingProxyType:
+            raise AuditIntegrityError("PipelineProposal base must be a mapping")
+        base_mapping = cast(Mapping[str, Any], raw_base)
+        base_kind = base_mapping["kind"] if "kind" in base_mapping else None
+        if base_kind == "absent":
+            if set(base_mapping) != {"kind"}:
+                raise AuditIntegrityError("AbsentBase persisted fields are malformed")
+            base: ProposalBase = AbsentBase()
+        elif base_kind == "present":
+            if set(base_mapping) != {"kind", "state_id", "composition_content_hash"}:
+                raise AuditIntegrityError("PresentBase persisted fields are malformed")
+            state_id_text = _canonical_uuid_text(base_mapping["state_id"], "base.state_id")
+            base = PresentBase(
+                state_id=UUID(state_id_text),
+                composition_content_hash=base_mapping["composition_content_hash"],
+            )
+        else:
+            raise AuditIntegrityError("PipelineProposal base kind is malformed")
+
+        return cls.create(
+            pipeline=payload["pipeline"],
+            base=base,
+            repair_count=payload["repair_count"],
+            skill_hash=payload["skill_hash"],
+            supplied_draft_hash=payload["draft_hash"],
+        )
+
+
+def composition_content_hash(state: CompositionState) -> str:
+    """Hash authored composition content, excluding version.
+
+    The preimage is the Composer authority projection: the ``sources`` map
+    and mapping-form row_union and coalesce branches are hashed as ordered
+    pair arrays, so their authored order remains bound. List-form branches
+    are already ordered.
+
+    Memoized on the instance's ``_content_hash_memo`` slot: ``state`` is
+    frozen (content identity cannot change) and every mutation constructor
+    resets the slot via ``__init__``, so repeated key builds within a composer
+    turn collapse to an attribute read instead of a full ``to_dict``
+    serialization. The write is idempotent, so a concurrent duplicate compute
+    is merely wasted work, never a wrong answer.
+    """
+    memo = state._content_hash_memo
+    if memo is not None:
+        return memo
+    state_d = state.to_dict()
+    content_hash = composer_authority_hash(
+        {
+            "sources": state_d["sources"],
+            "nodes": state_d["nodes"],
+            "edges": state_d["edges"],
+            "outputs": state_d["outputs"],
+            "metadata": state_d["metadata"],
+        }
+    )
+    object.__setattr__(state, "_content_hash_memo", content_hash)
+    return content_hash

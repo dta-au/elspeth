@@ -1,0 +1,298 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 27 items / 1 deselected / 26 selected
+
+tests/unit/composer_mcp/test_portable_supervisor.py .FFFFFFFF......F...F [ 76%]
+FFFFF.                                                                   [100%]
+
+=================================== FAILURES ===================================
+________________ test_real_owned_completion_and_status[normal] _________________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_real_owned_completion_and0')
+mode = 'normal'
+
+    @pytest.mark.parametrize("mode", ["normal", "bootstrap", "wrong-witness", "repeated-cancel", "extra-peer", "raw-normal", "stdio", "exit-seven"])
+    def test_real_owned_completion_and_status(tmp_path, mode):
+        process = launch(tmp_path, mode)
+        out, receipt = finish(process, tmp_path)
+        expected = 7 if mode == "exit-seven" else 0
+>       assert process.returncode == receipt["result"] == expected
+E       AssertionError: assert 137 == -9
+E        +  where 137 = <Popen: returncode: 137 args: ['/workspace/elspeth/.claude/worktrees/compose...>.returncode
+
+tests/unit/composer_mcp/test_portable_supervisor.py:62: AssertionError
+_______________ test_real_owned_completion_and_status[bootstrap] _______________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_real_owned_completion_and1')
+mode = 'bootstrap'
+
+    @pytest.mark.parametrize("mode", ["normal", "bootstrap", "wrong-witness", "repeated-cancel", "extra-peer", "raw-normal", "stdio", "exit-seven"])
+    def test_real_owned_completion_and_status(tmp_path, mode):
+        process = launch(tmp_path, mode)
+        out, receipt = finish(process, tmp_path)
+        expected = 7 if mode == "exit-seven" else 0
+>       assert process.returncode == receipt["result"] == expected
+E       AssertionError: assert 137 == -9
+E        +  where 137 = <Popen: returncode: 137 args: ['/workspace/elspeth/.claude/worktrees/compose...>.returncode
+
+tests/unit/composer_mcp/test_portable_supervisor.py:62: AssertionError
+_____________ test_real_owned_completion_and_status[wrong-witness] _____________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_real_owned_completion_and2')
+mode = 'wrong-witness'
+
+    @pytest.mark.parametrize("mode", ["normal", "bootstrap", "wrong-witness", "repeated-cancel", "extra-peer", "raw-normal", "stdio", "exit-seven"])
+    def test_real_owned_completion_and_status(tmp_path, mode):
+        process = launch(tmp_path, mode)
+        out, receipt = finish(process, tmp_path)
+        expected = 7 if mode == "exit-seven" else 0
+>       assert process.returncode == receipt["result"] == expected
+E       AssertionError: assert 137 == -9
+E        +  where 137 = <Popen: returncode: 137 args: ['/workspace/elspeth/.claude/worktrees/compose...>.returncode
+
+tests/unit/composer_mcp/test_portable_supervisor.py:62: AssertionError
+____________ test_real_owned_completion_and_status[repeated-cancel] ____________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_real_owned_completion_and3')
+mode = 'repeated-cancel'
+
+    @pytest.mark.parametrize("mode", ["normal", "bootstrap", "wrong-witness", "repeated-cancel", "extra-peer", "raw-normal", "stdio", "exit-seven"])
+    def test_real_owned_completion_and_status(tmp_path, mode):
+        process = launch(tmp_path, mode)
+        out, receipt = finish(process, tmp_path)
+        expected = 7 if mode == "exit-seven" else 0
+>       assert process.returncode == receipt["result"] == expected
+E       AssertionError: assert 137 == -9
+E        +  where 137 = <Popen: returncode: 137 args: ['/workspace/elspeth/.claude/worktrees/compose...>.returncode
+
+tests/unit/composer_mcp/test_portable_supervisor.py:62: AssertionError
+______________ test_real_owned_completion_and_status[extra-peer] _______________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_real_owned_completion_and4')
+mode = 'extra-peer'
+
+    @pytest.mark.parametrize("mode", ["normal", "bootstrap", "wrong-witness", "repeated-cancel", "extra-peer", "raw-normal", "stdio", "exit-seven"])
+    def test_real_owned_completion_and_status(tmp_path, mode):
+        process = launch(tmp_path, mode)
+        out, receipt = finish(process, tmp_path)
+        expected = 7 if mode == "exit-seven" else 0
+>       assert process.returncode == receipt["result"] == expected
+E       AssertionError: assert 137 == -9
+E        +  where 137 = <Popen: returncode: 137 args: ['/workspace/elspeth/.claude/worktrees/compose...>.returncode
+
+tests/unit/composer_mcp/test_portable_supervisor.py:62: AssertionError
+______________ test_real_owned_completion_and_status[raw-normal] _______________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_real_owned_completion_and5')
+mode = 'raw-normal'
+
+    @pytest.mark.parametrize("mode", ["normal", "bootstrap", "wrong-witness", "repeated-cancel", "extra-peer", "raw-normal", "stdio", "exit-seven"])
+    def test_real_owned_completion_and_status(tmp_path, mode):
+        process = launch(tmp_path, mode)
+        out, receipt = finish(process, tmp_path)
+        expected = 7 if mode == "exit-seven" else 0
+>       assert process.returncode == receipt["result"] == expected
+E       AssertionError: assert 137 == -9
+E        +  where 137 = <Popen: returncode: 137 args: ['/workspace/elspeth/.claude/worktrees/compose...>.returncode
+
+tests/unit/composer_mcp/test_portable_supervisor.py:62: AssertionError
+_________________ test_real_owned_completion_and_status[stdio] _________________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_real_owned_completion_and6')
+mode = 'stdio'
+
+    @pytest.mark.parametrize("mode", ["normal", "bootstrap", "wrong-witness", "repeated-cancel", "extra-peer", "raw-normal", "stdio", "exit-seven"])
+    def test_real_owned_completion_and_status(tmp_path, mode):
+        process = launch(tmp_path, mode)
+        out, receipt = finish(process, tmp_path)
+        expected = 7 if mode == "exit-seven" else 0
+>       assert process.returncode == receipt["result"] == expected
+E       AssertionError: assert 137 == -9
+E        +  where 137 = <Popen: returncode: 137 args: ['/workspace/elspeth/.claude/worktrees/compose...>.returncode
+
+tests/unit/composer_mcp/test_portable_supervisor.py:62: AssertionError
+______________ test_real_owned_completion_and_status[exit-seven] _______________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_real_owned_completion_and7')
+mode = 'exit-seven'
+
+    @pytest.mark.parametrize("mode", ["normal", "bootstrap", "wrong-witness", "repeated-cancel", "extra-peer", "raw-normal", "stdio", "exit-seven"])
+    def test_real_owned_completion_and_status(tmp_path, mode):
+        process = launch(tmp_path, mode)
+        out, receipt = finish(process, tmp_path)
+        expected = 7 if mode == "exit-seven" else 0
+>       assert process.returncode == receipt["result"] == expected
+E       AssertionError: assert 137 == -9
+E        +  where 137 = <Popen: returncode: 137 args: ['/workspace/elspeth/.claude/worktrees/compose...>.returncode
+
+tests/unit/composer_mcp/test_portable_supervisor.py:62: AssertionError
+________ test_deadline_survives_real_protocol_and_child_faults[replay] _________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_deadline_survives_real_pr2')
+mode = 'replay'
+
+    @pytest.mark.parametrize("mode", ["wrong-direction", "frame-flood", "replay", "partial-flood", "channel-loss", "recovery-block-loop", "required-worker"])
+    def test_deadline_survives_real_protocol_and_child_faults(tmp_path, mode):
+        started = time.monotonic()
+        process = launch(tmp_path, mode)
+        out, receipt = finish(process, tmp_path)
+        assert process.returncode != 0 and out == b""
+        assert receipt["returncode"] == -signal.SIGKILL
+        assert receipt["failed"] and receipt["reaped"] and not receipt["completed"]
+        assert time.monotonic() - started < 5
+        if mode == "replay":
+>           assert (tmp_path / "immutable").exists()
+E           AssertionError: assert False
+E            +  where False = exists()
+E            +    where exists = (PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_deadline_survives_real_pr2') / 'immutable').exists
+
+tests/unit/composer_mcp/test_portable_supervisor.py:92: AssertionError
+____ test_deadline_survives_real_protocol_and_child_faults[required-worker] ____
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_deadline_survives_real_pr6')
+mode = 'required-worker'
+
+    @pytest.mark.parametrize("mode", ["wrong-direction", "frame-flood", "replay", "partial-flood", "channel-loss", "recovery-block-loop", "required-worker"])
+    def test_deadline_survives_real_protocol_and_child_faults(tmp_path, mode):
+        started = time.monotonic()
+        process = launch(tmp_path, mode)
+        out, receipt = finish(process, tmp_path)
+        assert process.returncode != 0 and out == b""
+        assert receipt["returncode"] == -signal.SIGKILL
+        assert receipt["failed"] and receipt["reaped"] and not receipt["completed"]
+        assert time.monotonic() - started < 5
+        if mode == "replay":
+            assert (tmp_path / "immutable").exists()
+        if mode == "required-worker":
+>           assert (tmp_path / "required-observed").exists()
+E           AssertionError: assert False
+E            +  where False = exists()
+E            +    where exists = (PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_deadline_survives_real_pr6') / 'required-observed').exists
+
+tests/unit/composer_mcp/test_portable_supervisor.py:94: AssertionError
+___ test_catchable_parent_stop_is_channel_intent_then_exact_kill[wait-stop] ____
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_catchable_parent_stop_is_0')
+mode = 'wait-stop'
+
+    @pytest.mark.parametrize("mode", ["wait-stop", "unresponsive-stop"])
+    def test_catchable_parent_stop_is_channel_intent_then_exact_kill(tmp_path, mode):
+        process = launch(tmp_path, mode)
+>       wait_event(process, tmp_path, "ready")
+
+tests/unit/composer_mcp/test_portable_supervisor.py:111: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+process = <Popen: returncode: 137 args: ['/workspace/elspeth/.claude/worktrees/compose...>
+directory = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_catchable_parent_stop_is_0')
+name = 'ready'
+
+    def wait_event(process, directory, name):
+        deadline = time.monotonic() + 5
+        while not (directory / name).exists():
+>           assert process.poll() is None
+E           AssertionError: assert 137 is None
+E            +  where 137 = poll()
+E            +    where poll = <Popen: returncode: 137 args: ['/workspace/elspeth/.claude/worktrees/compose...>.poll
+
+tests/unit/composer_mcp/test_portable_supervisor.py:40: AssertionError
+_ test_catchable_parent_stop_is_channel_intent_then_exact_kill[unresponsive-stop] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_catchable_parent_stop_is_1')
+mode = 'unresponsive-stop'
+
+    @pytest.mark.parametrize("mode", ["wait-stop", "unresponsive-stop"])
+    def test_catchable_parent_stop_is_channel_intent_then_exact_kill(tmp_path, mode):
+        process = launch(tmp_path, mode)
+>       wait_event(process, tmp_path, "ready")
+
+tests/unit/composer_mcp/test_portable_supervisor.py:111: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+process = <Popen: returncode: 137 args: ['/workspace/elspeth/.claude/worktrees/compose...>
+directory = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_catchable_parent_stop_is_1')
+name = 'ready'
+
+    def wait_event(process, directory, name):
+        deadline = time.monotonic() + 5
+        while not (directory / name).exists():
+>           assert process.poll() is None
+E           AssertionError: assert 137 is None
+E            +  where 137 = poll()
+E            +    where poll = <Popen: returncode: 137 args: ['/workspace/elspeth/.claude/worktrees/compose...>.poll
+
+tests/unit/composer_mcp/test_portable_supervisor.py:40: AssertionError
+________________ test_complete_does_not_strand_parent_in_atexit ________________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_complete_does_not_strand_0')
+
+    def test_complete_does_not_strand_parent_in_atexit(tmp_path):
+        process = launch(tmp_path, "atexit-hang")
+        out, receipt = finish(process, tmp_path)
+        assert out == b"" and process.returncode != 0
+>       assert (tmp_path / "completed").exists()
+E       AssertionError: assert False
+E        +  where False = exists()
+E        +    where exists = (PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_complete_does_not_strand_0') / 'completed').exists
+
+tests/unit/composer_mcp/test_portable_supervisor.py:127: AssertionError
+__________ test_inherited_sigchld_ignore_is_reset_before_actual_spawn __________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_inherited_sigchld_ignore_0')
+
+    def test_inherited_sigchld_ignore_is_reset_before_actual_spawn(tmp_path):
+        process = launch(tmp_path, "exit-seven", ignored_chld=True)
+        out, receipt = finish(process, tmp_path)
+>       assert out == b"" and process.returncode == 7
+E       AssertionError: assert (b'' == b''
+E         
+E         Use -v to get more diff and 137 == 7)
+E        +  where 137 = <Popen: returncode: 137 args: ['/workspace/elspeth/.claude/worktrees/compose...>.returncode
+
+tests/unit/composer_mcp/test_portable_supervisor.py:134: AssertionError
+__________ test_healthy_child_fails_closed_when_supervisor_is_killed ___________
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_healthy_child_fails_close0')
+
+    def test_healthy_child_fails_closed_when_supervisor_is_killed(tmp_path):
+        process = launch(tmp_path, "supervisor-loss")
+>       wait_event(process, tmp_path, "ready")
+
+tests/unit/composer_mcp/test_portable_supervisor.py:140: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+process = <Popen: returncode: 137 args: ['/workspace/elspeth/.claude/worktrees/compose...>
+directory = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.claude/supervisor-first-pytest/test_healthy_child_fails_close0')
+name = 'ready'
+
+    def wait_event(process, directory, name):
+        deadline = time.monotonic() + 5
+        while not (directory / name).exists():
+>           assert process.poll() is None
+E           AssertionError: assert 137 is None
+E            +  where 137 = poll()
+E            +    where poll = <Popen: returncode: 137 args: ['/workspace/elspeth/.claude/worktrees/compose...>.poll
+
+tests/unit/composer_mcp/test_portable_supervisor.py:40: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/composer_mcp/test_portable_supervisor.py::test_real_owned_completion_and_status[normal]
+FAILED tests/unit/composer_mcp/test_portable_supervisor.py::test_real_owned_completion_and_status[bootstrap]
+FAILED tests/unit/composer_mcp/test_portable_supervisor.py::test_real_owned_completion_and_status[wrong-witness]
+FAILED tests/unit/composer_mcp/test_portable_supervisor.py::test_real_owned_completion_and_status[repeated-cancel]
+FAILED tests/unit/composer_mcp/test_portable_supervisor.py::test_real_owned_completion_and_status[extra-peer]
+FAILED tests/unit/composer_mcp/test_portable_supervisor.py::test_real_owned_completion_and_status[raw-normal]
+FAILED tests/unit/composer_mcp/test_portable_supervisor.py::test_real_owned_completion_and_status[stdio]
+FAILED tests/unit/composer_mcp/test_portable_supervisor.py::test_real_owned_completion_and_status[exit-seven]
+FAILED tests/unit/composer_mcp/test_portable_supervisor.py::test_deadline_survives_real_protocol_and_child_faults[replay]
+FAILED tests/unit/composer_mcp/test_portable_supervisor.py::test_deadline_survives_real_protocol_and_child_faults[required-worker]
+FAILED tests/unit/composer_mcp/test_portable_supervisor.py::test_catchable_parent_stop_is_channel_intent_then_exact_kill[wait-stop]
+FAILED tests/unit/composer_mcp/test_portable_supervisor.py::test_catchable_parent_stop_is_channel_intent_then_exact_kill[unresponsive-stop]
+FAILED tests/unit/composer_mcp/test_portable_supervisor.py::test_complete_does_not_strand_parent_in_atexit
+FAILED tests/unit/composer_mcp/test_portable_supervisor.py::test_inherited_sigchld_ignore_is_reset_before_actual_spawn
+FAILED tests/unit/composer_mcp/test_portable_supervisor.py::test_healthy_child_fails_closed_when_supervisor_is_killed
+================= 15 failed, 11 passed, 1 deselected in 5.63s ==================

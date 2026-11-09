@@ -1,0 +1,255 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 150 items
+
+tests/unit/web/blobs/test_mutation_admission.py ........................ [ 16%]
+...................................................................F
+
+=================================== FAILURES ===================================
+_ test_admission_retains_every_relational_edge_and_admits_settled_edges[True-run_inline-update_blob] _
+
+self = <elspeth.web.coordination.repository._RepositoryBlobMutations object at 0x7fdcf4704490>
+blob = BlobRecord(id=UUID('dd59d3ca-00a5-4bee-a9d9-679931b7fc54'), session_id=UUID('4aaccad0-11b3-47e0-9ec8-a2f6c5beed8f'), f..., creating_model_version=None, creating_provider=None, creating_composer_skill_hash=None, creating_arguments_hash=None)
+
+    def _require_blob_deletion_retention_clear(
+        self,
+        blob: BlobRecord,
+        *,
+        accepting_proposal_id: UUID | None,
+        accepting_tool_name: str | None = None,
+    ) -> None:
+        """Check every relational retention edge inside the fenced UoW."""
+        state = self.__state
+        connection = _resolve_mutation_connection(state._connection_token)
+        blob_id = str(blob.id)
+    
+        fork_operation_id = self._in_progress_session_fork_operation_id()
+        if fork_operation_id is not None:
+            raise BlobInProgressForkError(blob_id, operation_id=fork_operation_id)
+    
+        proposal_id = pending_proposal_reference_id(
+            connection,
+            session_id=state._session_id,
+            blob_id=blob_id,
+            accepting_proposal_id=str(accepting_proposal_id) if accepting_proposal_id is not None else None,
+            accepting_tool_name=accepting_tool_name,
+        )
+        if proposal_id is not None:
+            raise BlobPendingProposalError(blob_id, proposal_id=proposal_id)
+    
+        active_link = connection.execute(
+            select(blob_run_links_table.c.run_id)
+            .join(runs_table, blob_run_links_table.c.run_id == runs_table.c.id)
+            .where(
+                blob_run_links_table.c.blob_id == blob_id,
+                runs_table.c.status.in_(("pending", "running")),
+            )
+            .order_by(blob_run_links_table.c.run_id)
+            .limit(1)
+        ).one_or_none()
+        if active_link is not None:
+            raise BlobActiveRunError(blob_id, run_id=active_link.run_id)
+    
+        active_runs = connection.execute(
+            select(*_ACTIVE_RUN_COMPOSITION_COLUMNS)
+            .join(composition_states_table, runs_table.c.state_id == composition_states_table.c.id)
+            .where(
+                runs_table.c.session_id == state._session_id,
+                runs_table.c.status.in_(("pending", "running")),
+            )
+            .order_by(runs_table.c.id)
+        ).all()
+        for active_run in active_runs:
+            try:
+>               pipeline = pipeline_dict_from_record(_active_run_state_record(active_run))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/elspeth/web/coordination/repository.py:3253: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/sessions/converters.py:63: in pipeline_dict_from_record
+    return generate_pipeline_dict(state_from_record(record))
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/converters.py:52: in state_from_record
+    return CompositionState.from_dict(state_dict)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/state.py:8434: in from_dict
+    nodes=tuple(NodeSpec.from_dict(n) for n in d["nodes"]),
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/state.py:8434: in <genexpr>
+    nodes=tuple(NodeSpec.from_dict(n) for n in d["nodes"]),
+                ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+cls = <class 'elspeth.web.composer.state.NodeSpec'>
+d = {'node_id': 'classify', 'node_type': 'transform', 'on_error': 'discard', 'on_success': 'output', ...}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Self:
+        """Reconstruct from a plain dict (inverse of to_dict serialisation).
+    
+        Optional fields (condition, routes, fork_to, branches, policy, merge,
+        trigger, output_mode, expected_output_count, timeout_seconds) default to None when
+        absent from the dict. fork_to is converted from list to tuple since
+        to_dict() serialises tuples as lists. Coalesce branches preserve their
+        list-vs-mapping semantics; row_union list branches normalize to the
+        runtime's ordered identity mapping.
+        """
+        fork_to = d["fork_to"] if "fork_to" in d else None
+        branches = d["branches"] if "branches" in d else None
+        # Mapping branches are defensively copied; list branches are coerced to
+        # a tuple and then routed through the SHARED row_union normalisation
+        # that ``__post_init__`` also applies, so the two can never drift.
+        normalized_branches: CoalesceBranches | None
+        if isinstance(branches, Mapping):
+            normalized_branches = dict(branches)
+        elif branches is None:
+            normalized_branches = None
+        else:
+            normalized_branches = _row_union_normalized_branches(d["node_type"], tuple(branches))
+        return cls(
+>           id=d["id"],
+               ^^^^^^^
+            node_type=d["node_type"],
+            plugin=d["plugin"],
+            input=d["input"],
+            on_success=d["on_success"],
+            on_error=d["on_error"],
+            options=d["options"],
+            condition=d["condition"] if "condition" in d else None,
+            routes=d["routes"] if "routes" in d else None,
+            fork_to=tuple(fork_to) if fork_to is not None else None,
+            branches=normalized_branches,
+            policy=d["policy"] if "policy" in d else None,
+            merge=d["merge"] if "merge" in d else None,
+            trigger=d["trigger"] if "trigger" in d else None,
+            output_mode=d["output_mode"] if "output_mode" in d else None,
+            expected_output_count=d["expected_output_count"] if "expected_output_count" in d else None,
+            timeout_seconds=d["timeout_seconds"] if "timeout_seconds" in d else None,
+            description=d["description"] if "description" in d else None,
+            scope_name=d["scope_name"] if "scope_name" in d else None,
+            scope_opener=d["scope_opener"] if "scope_opener" in d else None,
+            scope_policy=d["scope_policy"] if "scope_policy" in d else None,
+        )
+E       KeyError: 'id'
+
+src/elspeth/web/composer/state.py:862: KeyError
+
+The above exception was the direct cause of the following exception:
+
+blob_service = <elspeth.web.blobs.service.BlobServiceImpl object at 0x7fdcf4a19eb0>
+db_engine = Engine(sqlite:///:memory:)
+session_id = UUID('4aaccad0-11b3-47e0-9ec8-a2f6c5beed8f')
+compose_context = SessionOperationContext(fence=SessionOperationFence(session_id='4aaccad0-11b3-47e0-9ec8-a2f6c5beed8f', operation_id='4...token='c2bf754b14354af0a1da25f3fca72efa', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>)
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-72/test_admission_retains_every_r6')
+tool_name = 'update_blob', edge = 'run_inline', active = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_name", ["update_blob", "delete_blob"])
+    @pytest.mark.parametrize("edge", ["run_link", "run_source", "run_path", "run_inline", "fork_receipt"])
+    @pytest.mark.parametrize("active", [True, False])
+    async def test_admission_retains_every_relational_edge_and_admits_settled_edges(blob_service, db_engine, session_id, compose_context, tmp_path, tool_name, edge, active):
+        record = await blob_service.create_blob(session_id, "retained.csv", b"old", "text/csv", session_operation_context=compose_context)
+        if edge == "fork_receipt":
+            now = datetime.now(UTC)
+            values = {"session_id": str(session_id), "operation_id": str(uuid4()), "kind": "session_fork", "status": "in_progress" if active else "failed", "request_hash": "a" * 64, "attempt": 1, "created_at": now, "updated_at": now}
+            values.update({"lease_token": "lease", "lease_expires_at": now + timedelta(hours=1)} if active else {"settled_at": now, "failure_code": "operation_failed"})
+            with db_engine.begin() as connection:
+                connection.execute(session_operation_receipts_table.insert().values(**values))
+        else:
+            options = {"path": record.storage_path} if edge == "run_path" else {"blob_id": str(record.id)} if edge == "run_source" else {"path": "/data/external/input.csv"}
+            nodes = [{"node_id": "classify", "node_type": "transform", "plugin": "passthrough", "options": {"prompt": {"blob_ref": str(record.id), "mode": "inline_content", "sha256": record.content_hash}}, "on_success": "output", "on_error": "discard"}] if edge == "run_inline" else None
+            run_id = await service_fixtures._seed_active_run(db_engine, session_id, session_operation_context=compose_context, source={"plugin": "csv", "on_success": "output", "on_validation_failure": "discard", "options": options}, nodes=nodes, status="running" if active else "completed")
+            if edge == "run_link":
+                with db_engine.begin() as connection:
+                    connection.execute(blob_run_links_table.insert().values(blob_id=str(record.id), run_id=run_id, direction="input"))
+        before = _resources(db_engine, tmp_path)
+>       result = blobs.admit_blob_mutation(tool_name, {"blob_id": str(record.id), **({"content": "new"} if tool_name == "update_blob" else {})}, _empty_state(), _context(blob_service, db_engine, compose_context, tmp_path))
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/web/blobs/test_mutation_admission.py:422: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/composer/tools/blobs.py:1791: in admit_blob_mutation
+    authority.mutate(operation, lambda transaction: transaction.blobs.admit_blob_replacement(
+src/elspeth/web/coordination/repository.py:5588: in mutate
+    return mutation(transaction)
+           ^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/tools/blobs.py:1791: in <lambda>
+    authority.mutate(operation, lambda transaction: transaction.blobs.admit_blob_replacement(
+src/elspeth/web/coordination/repository.py:2226: in admit_blob_replacement
+    self._require_blob_replacement_prerequisites(
+src/elspeth/web/coordination/repository.py:2184: in _require_blob_replacement_prerequisites
+    self._require_blob_replacement_retention_and_quota(
+src/elspeth/web/coordination/repository.py:2193: in _require_blob_replacement_retention_and_quota
+    self._require_blob_deletion_retention_clear(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <elspeth.web.coordination.repository._RepositoryBlobMutations object at 0x7fdcf4704490>
+blob = BlobRecord(id=UUID('dd59d3ca-00a5-4bee-a9d9-679931b7fc54'), session_id=UUID('4aaccad0-11b3-47e0-9ec8-a2f6c5beed8f'), f..., creating_model_version=None, creating_provider=None, creating_composer_skill_hash=None, creating_arguments_hash=None)
+
+    def _require_blob_deletion_retention_clear(
+        self,
+        blob: BlobRecord,
+        *,
+        accepting_proposal_id: UUID | None,
+        accepting_tool_name: str | None = None,
+    ) -> None:
+        """Check every relational retention edge inside the fenced UoW."""
+        state = self.__state
+        connection = _resolve_mutation_connection(state._connection_token)
+        blob_id = str(blob.id)
+    
+        fork_operation_id = self._in_progress_session_fork_operation_id()
+        if fork_operation_id is not None:
+            raise BlobInProgressForkError(blob_id, operation_id=fork_operation_id)
+    
+        proposal_id = pending_proposal_reference_id(
+            connection,
+            session_id=state._session_id,
+            blob_id=blob_id,
+            accepting_proposal_id=str(accepting_proposal_id) if accepting_proposal_id is not None else None,
+            accepting_tool_name=accepting_tool_name,
+        )
+        if proposal_id is not None:
+            raise BlobPendingProposalError(blob_id, proposal_id=proposal_id)
+    
+        active_link = connection.execute(
+            select(blob_run_links_table.c.run_id)
+            .join(runs_table, blob_run_links_table.c.run_id == runs_table.c.id)
+            .where(
+                blob_run_links_table.c.blob_id == blob_id,
+                runs_table.c.status.in_(("pending", "running")),
+            )
+            .order_by(blob_run_links_table.c.run_id)
+            .limit(1)
+        ).one_or_none()
+        if active_link is not None:
+            raise BlobActiveRunError(blob_id, run_id=active_link.run_id)
+    
+        active_runs = connection.execute(
+            select(*_ACTIVE_RUN_COMPOSITION_COLUMNS)
+            .join(composition_states_table, runs_table.c.state_id == composition_states_table.c.id)
+            .where(
+                runs_table.c.session_id == state._session_id,
+                runs_table.c.status.in_(("pending", "running")),
+            )
+            .order_by(runs_table.c.id)
+        ).all()
+        for active_run in active_runs:
+            try:
+                pipeline = pipeline_dict_from_record(_active_run_state_record(active_run))
+            except AuditIntegrityError:
+                raise
+            except (KeyError, TypeError, ValueError) as exc:
+>               raise AuditIntegrityError("Tier 1: active run composition cannot be reconstructed") from exc
+E               elspeth.contracts.errors.AuditIntegrityError: Tier 1: active run composition cannot be reconstructed
+
+src/elspeth/web/coordination/repository.py:3257: AuditIntegrityError
+=========================== short test summary info ============================
+FAILED tests/unit/web/blobs/test_mutation_admission.py::test_admission_retains_every_relational_edge_and_admits_settled_edges[True-run_inline-update_blob]
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+======================== 1 failed, 91 passed in 24.21s =========================

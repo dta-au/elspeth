@@ -1,0 +1,83 @@
+{
+  "baseline_findings": 205,
+  "candidate_findings": 205,
+  "semantic_added": [
+    {
+      "column": 1,
+      "file_path": "web/composer/tools/sessions.py",
+      "fingerprint": "a440c9c9dd4b5ec8",
+      "message": "@trust_boundary test_ref 'tests/unit/web/composer/test_promote_set_pipeline.py::TestPromoteSetPipelineArgErrorRouting::test_candidate_builder_empty_arguments_raise_tool_argument_error' resolves to fingerprint '49fdb491a38bcaa871fab5cb33d8b1ee2cada9c2e10b72b30db01d2ba1acce9f', but the decorator records 'ddefe4e76642cb6a0fa8708b8100f4b6f1ee27f1cd3c9eebe9529daedb4778cd'.",
+      "rule_id": "R_TB_TESTS_FINGERPRINT_MISMATCH",
+      "severity": "error",
+      "suggestion": "Refresh test_fingerprint only after reviewing the changed test body still exercises the decorated trust-boundary invariant. A mismatch means the nodeid still resolves, but the test content drifted."
+    },
+    {
+      "column": 1,
+      "file_path": "web/composer/tools/sessions.py",
+      "fingerprint": "0474339f57beeded",
+      "message": "@trust_boundary test_ref 'tests/unit/web/composer/test_request_interpretation_review_tool.py::test_04_wrong_kind_node_raises' resolves to fingerprint '1505b3269ae139bd49a25670f6cc1f23844983fc780a4b11ed6fcc84c0eb2ad5', but the decorator records 'bb71cdbf2a60eb1348ab865028d80f2c1303d84495f82b5eb2572e170a96ef1d'.",
+      "rule_id": "R_TB_TESTS_FINGERPRINT_MISMATCH",
+      "severity": "error",
+      "suggestion": "Refresh test_fingerprint only after reviewing the changed test body still exercises the decorated trust-boundary invariant. A mismatch means the nodeid still resolves, but the test content drifted."
+    },
+    {
+      "column": 1,
+      "file_path": "web/composer/tools/sessions.py",
+      "fingerprint": "8260fc1d81021247",
+      "message": "@trust_boundary test_ref 'tests/unit/web/composer/test_request_interpretation_review_tool.py::test_typed_detector_raises_for_non_string_prompt_template' resolves to fingerprint 'ae99f0588aa02cbb8d3f65677fd8b5a84933a3e0e82bad9ffaa4103f2bb47ff5', but the decorator records '7e2a188e6441151da86c4da34971d2b1d764265ddf8f8d005a1709cb39b19ae1'.",
+      "rule_id": "R_TB_TESTS_FINGERPRINT_MISMATCH",
+      "severity": "error",
+      "suggestion": "Refresh test_fingerprint only after reviewing the changed test body still exercises the decorated trust-boundary invariant. A mismatch means the nodeid still resolves, but the test content drifted."
+    },
+    {
+      "column": 1,
+      "file_path": "web/execution/preflight.py",
+      "fingerprint": "e7904ee3ca6e1229",
+      "message": "@trust_boundary test_ref 'tests/unit/web/execution/test_service.py::TestResolveYamlPaths::test_non_dict_yaml_raises_type_error' resolves to fingerprint '339810209236a0ebdfd514e595c3c76f5623f4e40e4722488cd73b4819ebe668', but the decorator records '0b6962a40eb0f2ab584fb2c1de368235d046257d81da266750c8f8011e651c36'.",
+      "rule_id": "R_TB_TESTS_FINGERPRINT_MISMATCH",
+      "severity": "error",
+      "suggestion": "Refresh test_fingerprint only after reviewing the changed test body still exercises the decorated trust-boundary invariant. A mismatch means the nodeid still resolves, but the test content drifted."
+    }
+  ],
+  "semantic_removed": [
+    {
+      "column": 1,
+      "file_path": "web/composer/tools/sessions.py",
+      "fingerprint": "2eadf525ccc1bee0",
+      "message": "@trust_boundary test_ref 'tests/unit/web/composer/test_promote_set_pipeline.py::TestPromoteSetPipelineArgErrorRouting::test_candidate_builder_empty_arguments_raise_tool_argument_error' resolves to fingerprint '49fdb491a38bcaa871fab5cb33d8b1ee2cada9c2e10b72b30db01d2ba1acce9f', but the decorator records 'ddefe4e76642cb6a0fa8708b8100f4b6f1ee27f1cd3c9eebe9529daedb4778cd'.",
+      "rule_id": "R_TB_TESTS_FINGERPRINT_MISMATCH",
+      "severity": "error",
+      "suggestion": "Refresh test_fingerprint only after reviewing the changed test body still exercises the decorated trust-boundary invariant. A mismatch means the nodeid still resolves, but the test content drifted."
+    },
+    {
+      "column": 1,
+      "file_path": "web/composer/tools/sessions.py",
+      "fingerprint": "05528467c87dc568",
+      "message": "@trust_boundary test_ref 'tests/unit/web/composer/test_request_interpretation_review_tool.py::test_04_wrong_kind_node_raises' resolves to fingerprint '1505b3269ae139bd49a25670f6cc1f23844983fc780a4b11ed6fcc84c0eb2ad5', but the decorator records 'bb71cdbf2a60eb1348ab865028d80f2c1303d84495f82b5eb2572e170a96ef1d'.",
+      "rule_id": "R_TB_TESTS_FINGERPRINT_MISMATCH",
+      "severity": "error",
+      "suggestion": "Refresh test_fingerprint only after reviewing the changed test body still exercises the decorated trust-boundary invariant. A mismatch means the nodeid still resolves, but the test content drifted."
+    },
+    {
+      "column": 1,
+      "file_path": "web/composer/tools/sessions.py",
+      "fingerprint": "dab951ad1c7b1c2f",
+      "message": "@trust_boundary test_ref 'tests/unit/web/composer/test_request_interpretation_review_tool.py::test_typed_detector_raises_for_non_string_prompt_template' resolves to fingerprint 'ae99f0588aa02cbb8d3f65677fd8b5a84933a3e0e82bad9ffaa4103f2bb47ff5', but the decorator records '7e2a188e6441151da86c4da34971d2b1d764265ddf8f8d005a1709cb39b19ae1'.",
+      "rule_id": "R_TB_TESTS_FINGERPRINT_MISMATCH",
+      "severity": "error",
+      "suggestion": "Refresh test_fingerprint only after reviewing the changed test body still exercises the decorated trust-boundary invariant. A mismatch means the nodeid still resolves, but the test content drifted."
+    },
+    {
+      "column": 1,
+      "file_path": "web/execution/preflight.py",
+      "fingerprint": "1ee6dbb2d8f8e1d5",
+      "message": "@trust_boundary test_ref 'tests/unit/web/execution/test_service.py::TestResolveYamlPaths::test_non_dict_yaml_raises_type_error' resolves to fingerprint '339810209236a0ebdfd514e595c3c76f5623f4e40e4722488cd73b4819ebe668', but the decorator records '0b6962a40eb0f2ab584fb2c1de368235d046257d81da266750c8f8011e651c36'.",
+      "rule_id": "R_TB_TESTS_FINGERPRINT_MISMATCH",
+      "severity": "error",
+      "suggestion": "Refresh test_fingerprint only after reviewing the changed test body still exercises the decorated trust-boundary invariant. A mismatch means the nodeid still resolves, but the test content drifted."
+    }
+  ],
+  "position_errors": [],
+  "positive_clone_control": "passed",
+  "negative_message_control": "passed"
+}

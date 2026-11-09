@@ -1,0 +1,123 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 38 items
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py .... [ 10%]
+.......                                                                  [ 28%]
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py ........ [ 50%]
+.......                                                                  [ 68%]
+tests/unit/web/sessions/test_pipeline_rejection_callers.py ...F.F        [ 84%]
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py . [ 86%]
+...                                                                      [ 94%]
+tests/integration/web/composer/test_pipeline_proposal_lifecycle.py ..    [100%]
+
+=================================== FAILURES ===================================
+_ test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body[NO_CHANGE-no_change-True] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-133/test_actual_canonical_failure_3/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7f2858fa6450>, UUID('879f3936-3c80-4d26-a6e8-c349ccbb0820'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-133/test_actual_canonical_failure_3')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f2856c13ec0>
+manual = True, code = 'NO_CHANGE', reason = 'no_change'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("manual", [False, True])
+    @pytest.mark.parametrize("code,reason", [("VALIDATION_FAILED", "validation_failed"), ("NO_CHANGE", "no_change"), ("ARGUMENT_ERROR", "validation_failed")])
+    async def test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body(operation_store, tmp_path, monkeypatch, manual, code, reason):
+        engine, repository, _authority, _service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        app = mounted_app(operation_store, tmp_path)
+        body = PipelineCommitError("actual controlled validation failure", code=code)
+    
+        async def fail_candidate(**kwargs):
+            raise body
+    
+        monkeypatch.setattr(pipeline_settlement, "prepare_pipeline_proposal_commit", fail_candidate)
+        if manual:
+            repository.release(running.session_operation_context)
+            from elspeth.web.coordination.lifecycle import SessionOperationLease
+    
+            bound = []
+            original_bind = SessionOperationLease.bind_required_work
+    
+            def observe_bind(lease, coordinator):
+                original_bind(lease, coordinator)
+                bound.append(coordinator)
+    
+            monkeypatch.setattr(SessionOperationLease, "bind_required_work", observe_bind)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                response = await client.post(
+                    f"/api/sessions/{sid}/proposals/{expected.authority.row.id}/accept",
+                    json={"draft_hash": expected.authority.proposal.draft_hash},
+                )
+            assert response.status_code == 422
+            if code in {"NO_CHANGE", "ARGUMENT_ERROR"}:
+                payload = response.json()
+>               assert payload["error_type"] == ("proposal_no_change" if code == "NO_CHANGE" else "proposal_argument_invalid")
+                       ^^^^^^^^^^^^^^^^^^^^^
+E               KeyError: 'error_type'
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:269: KeyError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:44:35 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:44:36 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:44:36 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:44:36 [warning  ] http_error_envelope            request_id=4411e425-bb14-4ccf-b542-eaee25545b72 status_code=422
+_ test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body[ARGUMENT_ERROR-validation_failed-True] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-133/test_actual_canonical_failure_5/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7f2857181ee0>, UUID('3f5777a9-2274-4f98-9434-03d04512f958'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-133/test_actual_canonical_failure_5')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f2855b18b30>
+manual = True, code = 'ARGUMENT_ERROR', reason = 'validation_failed'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("manual", [False, True])
+    @pytest.mark.parametrize("code,reason", [("VALIDATION_FAILED", "validation_failed"), ("NO_CHANGE", "no_change"), ("ARGUMENT_ERROR", "validation_failed")])
+    async def test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body(operation_store, tmp_path, monkeypatch, manual, code, reason):
+        engine, repository, _authority, _service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        app = mounted_app(operation_store, tmp_path)
+        body = PipelineCommitError("actual controlled validation failure", code=code)
+    
+        async def fail_candidate(**kwargs):
+            raise body
+    
+        monkeypatch.setattr(pipeline_settlement, "prepare_pipeline_proposal_commit", fail_candidate)
+        if manual:
+            repository.release(running.session_operation_context)
+            from elspeth.web.coordination.lifecycle import SessionOperationLease
+    
+            bound = []
+            original_bind = SessionOperationLease.bind_required_work
+    
+            def observe_bind(lease, coordinator):
+                original_bind(lease, coordinator)
+                bound.append(coordinator)
+    
+            monkeypatch.setattr(SessionOperationLease, "bind_required_work", observe_bind)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                response = await client.post(
+                    f"/api/sessions/{sid}/proposals/{expected.authority.row.id}/accept",
+                    json={"draft_hash": expected.authority.proposal.draft_hash},
+                )
+            assert response.status_code == 422
+            if code in {"NO_CHANGE", "ARGUMENT_ERROR"}:
+                payload = response.json()
+>               assert payload["error_type"] == ("proposal_no_change" if code == "NO_CHANGE" else "proposal_argument_invalid")
+                       ^^^^^^^^^^^^^^^^^^^^^
+E               KeyError: 'error_type'
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:269: KeyError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:44:39 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:44:39 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:44:39 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:44:39 [warning  ] http_error_envelope            request_id=96a701fe-7063-4af8-9d87-0861f03edf1c status_code=422
+=========================== short test summary info ============================
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body[NO_CHANGE-no_change-True]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body[ARGUMENT_ERROR-validation_failed-True]
+======================== 2 failed, 36 passed in 20.94s =========================

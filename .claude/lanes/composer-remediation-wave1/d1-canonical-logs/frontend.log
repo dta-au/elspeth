@@ -1,0 +1,9 @@
+
+ RUN  v4.1.11 /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src/elspeth/web/frontend
+
+
+ Test Files  1 passed (1)
+      Tests  190 passed (190)
+   Start at  13:51:40
+   Duration  6.69s (transform 585ms, setup 187ms, import 586ms, tests 5.07s, environment 680ms)
+

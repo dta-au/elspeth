@@ -1,0 +1,626 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 4 items
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py FFFF          [100%]
+
+=================================== FAILURES ===================================
+_ test_real_canonical_equal_accept_http_rejects_once_without_state_or_dispatch[fresh-public] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-134/test_real_canonical_equal_acce0/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7f58d5237fb0>, UUID('8662bcb5-6887-47a2-b61c-931faa9ecb7a'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-134/test_real_canonical_equal_acce0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f58d547abd0>
+owned = False, recovered = False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owned", [False, True], ids=["public", "owned"])
+    @pytest.mark.parametrize("recovered", [False, True], ids=["fresh", "persisted-success"])
+    async def test_real_canonical_equal_accept_http_rejects_once_without_state_or_dispatch(operation_store, tmp_path, monkeypatch, owned, recovered):
+        from dataclasses import replace
+    
+        from sqlalchemy import func
+    
+        from elspeth.core.canonical import stable_hash
+        from elspeth.web.catalog.policy_view import PolicyCatalogView
+        from elspeth.web.composer.audit import begin_dispatch, dispatch_with_audit
+        from elspeth.web.composer.pipeline_commit import _bind_executor_content_hash
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal, PresentBase, composition_content_hash, owned_composition_state_authority, owned_composition_state_review_arguments
+        from elspeth.web.composer.redaction import redact_tool_call_arguments
+        from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+        from elspeth.web.composer.state import CompositionState
+        from elspeth.web.composer.tools import ToolContext, build_set_pipeline_candidate, execute_tool
+        from elspeth.web.dependencies import create_catalog_service
+        from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+        from elspeth.web.sessions.models import chat_messages_table, composition_states_table
+        from elspeth.web.sessions.protocol import CompositionStateData
+        from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
+        from tests.integration.web.composer.test_pipeline_proposal_lifecycle import _runnable_pipeline
+        from tests.unit.web.coordination.test_composer_operation_authority import start
+    
+        engine, repository, _authority, service, sid = operation_store
+        _record, running = start(operation_store)
+        context = running.session_operation_context
+        catalog = create_catalog_service()
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+        public = _runnable_pipeline(tmp_path, sid)
+        empty = _initial_composition_state()
+        candidate = build_set_pipeline_candidate(public, empty, ToolContext(
+            catalog=policy, plugin_snapshot=snapshot, data_dir=str(tmp_path), session_id=str(sid),
+            session_engine=engine, session_operation_context=context, session_operation_authority=service.session_operation_authority,
+            user_id="alice", require_data_dir_for_paths=True,
+        ))
+        assert candidate.acceptable
+        state = replace(candidate.result.updated_state, version=7)
+        payload = state.to_dict()
+        saved = await service.save_composition_state(sid, CompositionStateData(
+            sources=payload["sources"], nodes=payload["nodes"], edges=payload["edges"], outputs=payload["outputs"], metadata_=payload["metadata"],
+        ), provenance="tool_call", session_operation_context=context)
+        arguments = owned_composition_state_authority(state) if owned else public
+        plan = PipelinePlanResult(
+            proposal=PipelineProposal.create(pipeline=arguments, base=PresentBase(saved.id, composition_content_hash(state)), repair_count=0, skill_hash=stable_hash("skill")),
+            tool_call_id="equal-terminal", custody_result="not_required", model_identifier="model", model_version="v1", provider="test",
+        )
+>       row = await service.create_pipeline_composition_proposal(
+            session_id=sid, plan=plan, summary="Keep pipeline", rationale="Requested", affects=("graph",), actor="composer-web:user:alice",
+            arguments_redacted_json=redact_tool_call_arguments("set_pipeline", owned_composition_state_review_arguments(arguments) if owned else arguments, telemetry=NoopRedactionTelemetry()),
+            composer_model_identifier="model", composer_model_version="v1", composer_provider="test", session_operation_context=context,
+        )
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:99: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/sessions/service.py:3174: in create_pipeline_composition_proposal
+    result = await self._create_pipeline_composition_proposal(
+src/elspeth/web/sessions/service.py:3377: in _create_pipeline_composition_proposal
+    await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_composer_sql(_sync)
+                                                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:9042: in _run_composer_sql
+    return await run_stream_read_in_worker(func)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:675: in run_stream_read_in_worker
+    return concurrent_future.result()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/required_executor.py:119: in invoke
+    return callable_()
+           ^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3325: in _sync
+    binding = derive_proposal_composer_binding_on_connection(
+src/elspeth/web/coordination/composer_operation_authority.py:1070: in derive_proposal_composer_binding_on_connection
+    return _proposal_composer_binding(conn, context, user_message_id=user_message_id, actor=actor, running=running)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+conn = <sqlalchemy.engine.base.Connection object at 0x7f58d5274bf0>
+context = SessionOperationContext(fence=SessionOperationFence(session_id='8662bcb5-6887-47a2-b61c-931faa9ecb7a', operation_id='4...iIf_vAnKjJigWyCYJFYTrOqE13NTk4A-bFOI09k', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>)
+
+    def _proposal_composer_binding(
+        conn: Connection,
+        context: SessionOperationContext,
+        *,
+        user_message_id: UUID | None,
+        actor: str,
+        running: ComposerOperationRunning | None,
+    ) -> ComposerOperationBinding | None:
+        if context.operation_kind is not SessionOperationKind.COMPOSE:
+            if running is not None:
+                raise AuditIntegrityError("durable proposal binding requires COMPOSE")
+            return None
+        fence = context.fence
+        row = conn.execute(
+            select(jobs)
+            .where(
+                jobs.c.session_id == fence.session_id,
+                jobs.c.session_operation_epoch == fence.operation_epoch,
+            )
+            .limit(1)
+        ).one_or_none()
+        if row is None:
+            if running is not None:
+                raise AuditIntegrityError("durable proposal binding has no job")
+            return None
+        lease = conn.execute(select(fences).where(fences.c.session_id == fence.session_id).limit(1)).one_or_none()
+        now = database_now(conn)
+        if (
+            row.status != "running"
+            or row.session_operation_id != fence.operation_id
+            or row.session_operation_lease_token != fence.lease_token
+            or lease is None
+            or lease.operation_id != fence.operation_id
+            or lease.lease_token != fence.lease_token
+            or lease.operation_epoch != fence.operation_epoch
+            or lease.operation_kind != SessionOperationKind.COMPOSE.value
+            or lease.released_at is not None
+            or restore_utc(lease.lease_expires_at) <= now
+            or row.claim_owner_instance_id != lease.owner_instance_id
+            or row.claim_token is None
+            or row.attempt < 1
+        ):
+            raise AuditIntegrityError("proposal composer job/fence authority mismatch")
+        if running is not None and (
+            running.session_operation_context != context
+            or running.claim.session_id != UUID(fence.session_id)
+            or running.claim.operation_id != row.operation_id
+            or running.claim.claim_token != row.claim_token
+            or running.claim.attempt != row.attempt
+        ):
+            raise AuditIntegrityError("proposal composer claim authority mismatch")
+        if user_message_id is None or row.user_message_id != str(user_message_id) or actor != f"composer-web:user:{row.actor_user_id}":
+>           raise AuditIntegrityError("proposal composer actor/user binding mismatch")
+E           elspeth.contracts.errors.AuditIntegrityError: proposal composer actor/user binding mismatch
+
+src/elspeth/web/coordination/composer_operation_authority.py:1042: AuditIntegrityError
+_ test_real_canonical_equal_accept_http_rejects_once_without_state_or_dispatch[fresh-owned] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-134/test_real_canonical_equal_acce1/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7f58d3fec470>, UUID('17f078d7-c4b7-46a3-851c-9027aeea651a'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-134/test_real_canonical_equal_acce1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f58d52b1160>
+owned = True, recovered = False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owned", [False, True], ids=["public", "owned"])
+    @pytest.mark.parametrize("recovered", [False, True], ids=["fresh", "persisted-success"])
+    async def test_real_canonical_equal_accept_http_rejects_once_without_state_or_dispatch(operation_store, tmp_path, monkeypatch, owned, recovered):
+        from dataclasses import replace
+    
+        from sqlalchemy import func
+    
+        from elspeth.core.canonical import stable_hash
+        from elspeth.web.catalog.policy_view import PolicyCatalogView
+        from elspeth.web.composer.audit import begin_dispatch, dispatch_with_audit
+        from elspeth.web.composer.pipeline_commit import _bind_executor_content_hash
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal, PresentBase, composition_content_hash, owned_composition_state_authority, owned_composition_state_review_arguments
+        from elspeth.web.composer.redaction import redact_tool_call_arguments
+        from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+        from elspeth.web.composer.state import CompositionState
+        from elspeth.web.composer.tools import ToolContext, build_set_pipeline_candidate, execute_tool
+        from elspeth.web.dependencies import create_catalog_service
+        from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+        from elspeth.web.sessions.models import chat_messages_table, composition_states_table
+        from elspeth.web.sessions.protocol import CompositionStateData
+        from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
+        from tests.integration.web.composer.test_pipeline_proposal_lifecycle import _runnable_pipeline
+        from tests.unit.web.coordination.test_composer_operation_authority import start
+    
+        engine, repository, _authority, service, sid = operation_store
+        _record, running = start(operation_store)
+        context = running.session_operation_context
+        catalog = create_catalog_service()
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+        public = _runnable_pipeline(tmp_path, sid)
+        empty = _initial_composition_state()
+        candidate = build_set_pipeline_candidate(public, empty, ToolContext(
+            catalog=policy, plugin_snapshot=snapshot, data_dir=str(tmp_path), session_id=str(sid),
+            session_engine=engine, session_operation_context=context, session_operation_authority=service.session_operation_authority,
+            user_id="alice", require_data_dir_for_paths=True,
+        ))
+        assert candidate.acceptable
+        state = replace(candidate.result.updated_state, version=7)
+        payload = state.to_dict()
+        saved = await service.save_composition_state(sid, CompositionStateData(
+            sources=payload["sources"], nodes=payload["nodes"], edges=payload["edges"], outputs=payload["outputs"], metadata_=payload["metadata"],
+        ), provenance="tool_call", session_operation_context=context)
+        arguments = owned_composition_state_authority(state) if owned else public
+        plan = PipelinePlanResult(
+            proposal=PipelineProposal.create(pipeline=arguments, base=PresentBase(saved.id, composition_content_hash(state)), repair_count=0, skill_hash=stable_hash("skill")),
+            tool_call_id="equal-terminal", custody_result="not_required", model_identifier="model", model_version="v1", provider="test",
+        )
+>       row = await service.create_pipeline_composition_proposal(
+            session_id=sid, plan=plan, summary="Keep pipeline", rationale="Requested", affects=("graph",), actor="composer-web:user:alice",
+            arguments_redacted_json=redact_tool_call_arguments("set_pipeline", owned_composition_state_review_arguments(arguments) if owned else arguments, telemetry=NoopRedactionTelemetry()),
+            composer_model_identifier="model", composer_model_version="v1", composer_provider="test", session_operation_context=context,
+        )
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:99: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/sessions/service.py:3174: in create_pipeline_composition_proposal
+    result = await self._create_pipeline_composition_proposal(
+src/elspeth/web/sessions/service.py:3377: in _create_pipeline_composition_proposal
+    await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_composer_sql(_sync)
+                                                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:9042: in _run_composer_sql
+    return await run_stream_read_in_worker(func)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:675: in run_stream_read_in_worker
+    return concurrent_future.result()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/required_executor.py:119: in invoke
+    return callable_()
+           ^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3325: in _sync
+    binding = derive_proposal_composer_binding_on_connection(
+src/elspeth/web/coordination/composer_operation_authority.py:1070: in derive_proposal_composer_binding_on_connection
+    return _proposal_composer_binding(conn, context, user_message_id=user_message_id, actor=actor, running=running)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+conn = <sqlalchemy.engine.base.Connection object at 0x7f58d3fe91f0>
+context = SessionOperationContext(fence=SessionOperationFence(session_id='17f078d7-c4b7-46a3-851c-9027aeea651a', operation_id='6...C1CIjNbJAvmPY4mavquueBX338R3TH19yJ3wshA', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>)
+
+    def _proposal_composer_binding(
+        conn: Connection,
+        context: SessionOperationContext,
+        *,
+        user_message_id: UUID | None,
+        actor: str,
+        running: ComposerOperationRunning | None,
+    ) -> ComposerOperationBinding | None:
+        if context.operation_kind is not SessionOperationKind.COMPOSE:
+            if running is not None:
+                raise AuditIntegrityError("durable proposal binding requires COMPOSE")
+            return None
+        fence = context.fence
+        row = conn.execute(
+            select(jobs)
+            .where(
+                jobs.c.session_id == fence.session_id,
+                jobs.c.session_operation_epoch == fence.operation_epoch,
+            )
+            .limit(1)
+        ).one_or_none()
+        if row is None:
+            if running is not None:
+                raise AuditIntegrityError("durable proposal binding has no job")
+            return None
+        lease = conn.execute(select(fences).where(fences.c.session_id == fence.session_id).limit(1)).one_or_none()
+        now = database_now(conn)
+        if (
+            row.status != "running"
+            or row.session_operation_id != fence.operation_id
+            or row.session_operation_lease_token != fence.lease_token
+            or lease is None
+            or lease.operation_id != fence.operation_id
+            or lease.lease_token != fence.lease_token
+            or lease.operation_epoch != fence.operation_epoch
+            or lease.operation_kind != SessionOperationKind.COMPOSE.value
+            or lease.released_at is not None
+            or restore_utc(lease.lease_expires_at) <= now
+            or row.claim_owner_instance_id != lease.owner_instance_id
+            or row.claim_token is None
+            or row.attempt < 1
+        ):
+            raise AuditIntegrityError("proposal composer job/fence authority mismatch")
+        if running is not None and (
+            running.session_operation_context != context
+            or running.claim.session_id != UUID(fence.session_id)
+            or running.claim.operation_id != row.operation_id
+            or running.claim.claim_token != row.claim_token
+            or running.claim.attempt != row.attempt
+        ):
+            raise AuditIntegrityError("proposal composer claim authority mismatch")
+        if user_message_id is None or row.user_message_id != str(user_message_id) or actor != f"composer-web:user:{row.actor_user_id}":
+>           raise AuditIntegrityError("proposal composer actor/user binding mismatch")
+E           elspeth.contracts.errors.AuditIntegrityError: proposal composer actor/user binding mismatch
+
+src/elspeth/web/coordination/composer_operation_authority.py:1042: AuditIntegrityError
+_ test_real_canonical_equal_accept_http_rejects_once_without_state_or_dispatch[persisted-success-public] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-134/test_real_canonical_equal_acce2/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7f58d416a000>, UUID('b8d29093-6dd0-4f2b-bdf7-a3ced043e6a9'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-134/test_real_canonical_equal_acce2')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f58d52b3410>
+owned = False, recovered = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owned", [False, True], ids=["public", "owned"])
+    @pytest.mark.parametrize("recovered", [False, True], ids=["fresh", "persisted-success"])
+    async def test_real_canonical_equal_accept_http_rejects_once_without_state_or_dispatch(operation_store, tmp_path, monkeypatch, owned, recovered):
+        from dataclasses import replace
+    
+        from sqlalchemy import func
+    
+        from elspeth.core.canonical import stable_hash
+        from elspeth.web.catalog.policy_view import PolicyCatalogView
+        from elspeth.web.composer.audit import begin_dispatch, dispatch_with_audit
+        from elspeth.web.composer.pipeline_commit import _bind_executor_content_hash
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal, PresentBase, composition_content_hash, owned_composition_state_authority, owned_composition_state_review_arguments
+        from elspeth.web.composer.redaction import redact_tool_call_arguments
+        from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+        from elspeth.web.composer.state import CompositionState
+        from elspeth.web.composer.tools import ToolContext, build_set_pipeline_candidate, execute_tool
+        from elspeth.web.dependencies import create_catalog_service
+        from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+        from elspeth.web.sessions.models import chat_messages_table, composition_states_table
+        from elspeth.web.sessions.protocol import CompositionStateData
+        from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
+        from tests.integration.web.composer.test_pipeline_proposal_lifecycle import _runnable_pipeline
+        from tests.unit.web.coordination.test_composer_operation_authority import start
+    
+        engine, repository, _authority, service, sid = operation_store
+        _record, running = start(operation_store)
+        context = running.session_operation_context
+        catalog = create_catalog_service()
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+        public = _runnable_pipeline(tmp_path, sid)
+        empty = _initial_composition_state()
+        candidate = build_set_pipeline_candidate(public, empty, ToolContext(
+            catalog=policy, plugin_snapshot=snapshot, data_dir=str(tmp_path), session_id=str(sid),
+            session_engine=engine, session_operation_context=context, session_operation_authority=service.session_operation_authority,
+            user_id="alice", require_data_dir_for_paths=True,
+        ))
+        assert candidate.acceptable
+        state = replace(candidate.result.updated_state, version=7)
+        payload = state.to_dict()
+        saved = await service.save_composition_state(sid, CompositionStateData(
+            sources=payload["sources"], nodes=payload["nodes"], edges=payload["edges"], outputs=payload["outputs"], metadata_=payload["metadata"],
+        ), provenance="tool_call", session_operation_context=context)
+        arguments = owned_composition_state_authority(state) if owned else public
+        plan = PipelinePlanResult(
+            proposal=PipelineProposal.create(pipeline=arguments, base=PresentBase(saved.id, composition_content_hash(state)), repair_count=0, skill_hash=stable_hash("skill")),
+            tool_call_id="equal-terminal", custody_result="not_required", model_identifier="model", model_version="v1", provider="test",
+        )
+>       row = await service.create_pipeline_composition_proposal(
+            session_id=sid, plan=plan, summary="Keep pipeline", rationale="Requested", affects=("graph",), actor="composer-web:user:alice",
+            arguments_redacted_json=redact_tool_call_arguments("set_pipeline", owned_composition_state_review_arguments(arguments) if owned else arguments, telemetry=NoopRedactionTelemetry()),
+            composer_model_identifier="model", composer_model_version="v1", composer_provider="test", session_operation_context=context,
+        )
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:99: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/sessions/service.py:3174: in create_pipeline_composition_proposal
+    result = await self._create_pipeline_composition_proposal(
+src/elspeth/web/sessions/service.py:3377: in _create_pipeline_composition_proposal
+    await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_composer_sql(_sync)
+                                                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:9042: in _run_composer_sql
+    return await run_stream_read_in_worker(func)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:675: in run_stream_read_in_worker
+    return concurrent_future.result()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/required_executor.py:119: in invoke
+    return callable_()
+           ^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3325: in _sync
+    binding = derive_proposal_composer_binding_on_connection(
+src/elspeth/web/coordination/composer_operation_authority.py:1070: in derive_proposal_composer_binding_on_connection
+    return _proposal_composer_binding(conn, context, user_message_id=user_message_id, actor=actor, running=running)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+conn = <sqlalchemy.engine.base.Connection object at 0x7f58d2ba4fe0>
+context = SessionOperationContext(fence=SessionOperationFence(session_id='b8d29093-6dd0-4f2b-bdf7-a3ced043e6a9', operation_id='5...FJhM8jvXzHKnozbaOHADPZjgG8d8FrdR54Zi-J0', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>)
+
+    def _proposal_composer_binding(
+        conn: Connection,
+        context: SessionOperationContext,
+        *,
+        user_message_id: UUID | None,
+        actor: str,
+        running: ComposerOperationRunning | None,
+    ) -> ComposerOperationBinding | None:
+        if context.operation_kind is not SessionOperationKind.COMPOSE:
+            if running is not None:
+                raise AuditIntegrityError("durable proposal binding requires COMPOSE")
+            return None
+        fence = context.fence
+        row = conn.execute(
+            select(jobs)
+            .where(
+                jobs.c.session_id == fence.session_id,
+                jobs.c.session_operation_epoch == fence.operation_epoch,
+            )
+            .limit(1)
+        ).one_or_none()
+        if row is None:
+            if running is not None:
+                raise AuditIntegrityError("durable proposal binding has no job")
+            return None
+        lease = conn.execute(select(fences).where(fences.c.session_id == fence.session_id).limit(1)).one_or_none()
+        now = database_now(conn)
+        if (
+            row.status != "running"
+            or row.session_operation_id != fence.operation_id
+            or row.session_operation_lease_token != fence.lease_token
+            or lease is None
+            or lease.operation_id != fence.operation_id
+            or lease.lease_token != fence.lease_token
+            or lease.operation_epoch != fence.operation_epoch
+            or lease.operation_kind != SessionOperationKind.COMPOSE.value
+            or lease.released_at is not None
+            or restore_utc(lease.lease_expires_at) <= now
+            or row.claim_owner_instance_id != lease.owner_instance_id
+            or row.claim_token is None
+            or row.attempt < 1
+        ):
+            raise AuditIntegrityError("proposal composer job/fence authority mismatch")
+        if running is not None and (
+            running.session_operation_context != context
+            or running.claim.session_id != UUID(fence.session_id)
+            or running.claim.operation_id != row.operation_id
+            or running.claim.claim_token != row.claim_token
+            or running.claim.attempt != row.attempt
+        ):
+            raise AuditIntegrityError("proposal composer claim authority mismatch")
+        if user_message_id is None or row.user_message_id != str(user_message_id) or actor != f"composer-web:user:{row.actor_user_id}":
+>           raise AuditIntegrityError("proposal composer actor/user binding mismatch")
+E           elspeth.contracts.errors.AuditIntegrityError: proposal composer actor/user binding mismatch
+
+src/elspeth/web/coordination/composer_operation_authority.py:1042: AuditIntegrityError
+_ test_real_canonical_equal_accept_http_rejects_once_without_state_or_dispatch[persisted-success-owned] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-134/test_real_canonical_equal_acce3/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7f58d3394cb0>, UUID('c3164748-bad3-406a-b77f-ffb113e1bff5'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-134/test_real_canonical_equal_acce3')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f58d52a24b0>
+owned = True, recovered = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owned", [False, True], ids=["public", "owned"])
+    @pytest.mark.parametrize("recovered", [False, True], ids=["fresh", "persisted-success"])
+    async def test_real_canonical_equal_accept_http_rejects_once_without_state_or_dispatch(operation_store, tmp_path, monkeypatch, owned, recovered):
+        from dataclasses import replace
+    
+        from sqlalchemy import func
+    
+        from elspeth.core.canonical import stable_hash
+        from elspeth.web.catalog.policy_view import PolicyCatalogView
+        from elspeth.web.composer.audit import begin_dispatch, dispatch_with_audit
+        from elspeth.web.composer.pipeline_commit import _bind_executor_content_hash
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal, PresentBase, composition_content_hash, owned_composition_state_authority, owned_composition_state_review_arguments
+        from elspeth.web.composer.redaction import redact_tool_call_arguments
+        from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+        from elspeth.web.composer.state import CompositionState
+        from elspeth.web.composer.tools import ToolContext, build_set_pipeline_candidate, execute_tool
+        from elspeth.web.dependencies import create_catalog_service
+        from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+        from elspeth.web.sessions.models import chat_messages_table, composition_states_table
+        from elspeth.web.sessions.protocol import CompositionStateData
+        from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
+        from tests.integration.web.composer.test_pipeline_proposal_lifecycle import _runnable_pipeline
+        from tests.unit.web.coordination.test_composer_operation_authority import start
+    
+        engine, repository, _authority, service, sid = operation_store
+        _record, running = start(operation_store)
+        context = running.session_operation_context
+        catalog = create_catalog_service()
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+        public = _runnable_pipeline(tmp_path, sid)
+        empty = _initial_composition_state()
+        candidate = build_set_pipeline_candidate(public, empty, ToolContext(
+            catalog=policy, plugin_snapshot=snapshot, data_dir=str(tmp_path), session_id=str(sid),
+            session_engine=engine, session_operation_context=context, session_operation_authority=service.session_operation_authority,
+            user_id="alice", require_data_dir_for_paths=True,
+        ))
+        assert candidate.acceptable
+        state = replace(candidate.result.updated_state, version=7)
+        payload = state.to_dict()
+        saved = await service.save_composition_state(sid, CompositionStateData(
+            sources=payload["sources"], nodes=payload["nodes"], edges=payload["edges"], outputs=payload["outputs"], metadata_=payload["metadata"],
+        ), provenance="tool_call", session_operation_context=context)
+        arguments = owned_composition_state_authority(state) if owned else public
+        plan = PipelinePlanResult(
+            proposal=PipelineProposal.create(pipeline=arguments, base=PresentBase(saved.id, composition_content_hash(state)), repair_count=0, skill_hash=stable_hash("skill")),
+            tool_call_id="equal-terminal", custody_result="not_required", model_identifier="model", model_version="v1", provider="test",
+        )
+>       row = await service.create_pipeline_composition_proposal(
+            session_id=sid, plan=plan, summary="Keep pipeline", rationale="Requested", affects=("graph",), actor="composer-web:user:alice",
+            arguments_redacted_json=redact_tool_call_arguments("set_pipeline", owned_composition_state_review_arguments(arguments) if owned else arguments, telemetry=NoopRedactionTelemetry()),
+            composer_model_identifier="model", composer_model_version="v1", composer_provider="test", session_operation_context=context,
+        )
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:99: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/sessions/service.py:3174: in create_pipeline_composition_proposal
+    result = await self._create_pipeline_composition_proposal(
+src/elspeth/web/sessions/service.py:3377: in _create_pipeline_composition_proposal
+    await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_composer_sql(_sync)
+                                                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:9042: in _run_composer_sql
+    return await run_stream_read_in_worker(func)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:675: in run_stream_read_in_worker
+    return concurrent_future.result()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/required_executor.py:119: in invoke
+    return callable_()
+           ^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3325: in _sync
+    binding = derive_proposal_composer_binding_on_connection(
+src/elspeth/web/coordination/composer_operation_authority.py:1070: in derive_proposal_composer_binding_on_connection
+    return _proposal_composer_binding(conn, context, user_message_id=user_message_id, actor=actor, running=running)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+conn = <sqlalchemy.engine.base.Connection object at 0x7f58d2ba0f80>
+context = SessionOperationContext(fence=SessionOperationFence(session_id='c3164748-bad3-406a-b77f-ffb113e1bff5', operation_id='4...Np7IPYUbA-efKhtVMwZuqjHU6ubThXPo-CUSF7k', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>)
+
+    def _proposal_composer_binding(
+        conn: Connection,
+        context: SessionOperationContext,
+        *,
+        user_message_id: UUID | None,
+        actor: str,
+        running: ComposerOperationRunning | None,
+    ) -> ComposerOperationBinding | None:
+        if context.operation_kind is not SessionOperationKind.COMPOSE:
+            if running is not None:
+                raise AuditIntegrityError("durable proposal binding requires COMPOSE")
+            return None
+        fence = context.fence
+        row = conn.execute(
+            select(jobs)
+            .where(
+                jobs.c.session_id == fence.session_id,
+                jobs.c.session_operation_epoch == fence.operation_epoch,
+            )
+            .limit(1)
+        ).one_or_none()
+        if row is None:
+            if running is not None:
+                raise AuditIntegrityError("durable proposal binding has no job")
+            return None
+        lease = conn.execute(select(fences).where(fences.c.session_id == fence.session_id).limit(1)).one_or_none()
+        now = database_now(conn)
+        if (
+            row.status != "running"
+            or row.session_operation_id != fence.operation_id
+            or row.session_operation_lease_token != fence.lease_token
+            or lease is None
+            or lease.operation_id != fence.operation_id
+            or lease.lease_token != fence.lease_token
+            or lease.operation_epoch != fence.operation_epoch
+            or lease.operation_kind != SessionOperationKind.COMPOSE.value
+            or lease.released_at is not None
+            or restore_utc(lease.lease_expires_at) <= now
+            or row.claim_owner_instance_id != lease.owner_instance_id
+            or row.claim_token is None
+            or row.attempt < 1
+        ):
+            raise AuditIntegrityError("proposal composer job/fence authority mismatch")
+        if running is not None and (
+            running.session_operation_context != context
+            or running.claim.session_id != UUID(fence.session_id)
+            or running.claim.operation_id != row.operation_id
+            or running.claim.claim_token != row.claim_token
+            or running.claim.attempt != row.attempt
+        ):
+            raise AuditIntegrityError("proposal composer claim authority mismatch")
+        if user_message_id is None or row.user_message_id != str(user_message_id) or actor != f"composer-web:user:{row.actor_user_id}":
+>           raise AuditIntegrityError("proposal composer actor/user binding mismatch")
+E           elspeth.contracts.errors.AuditIntegrityError: proposal composer actor/user binding mismatch
+
+src/elspeth/web/coordination/composer_operation_authority.py:1042: AuditIntegrityError
+=========================== short test summary info ============================
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_real_canonical_equal_accept_http_rejects_once_without_state_or_dispatch[fresh-public]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_real_canonical_equal_accept_http_rejects_once_without_state_or_dispatch[fresh-owned]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_real_canonical_equal_accept_http_rejects_once_without_state_or_dispatch[persisted-success-public]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_real_canonical_equal_accept_http_rejects_once_without_state_or_dispatch[persisted-success-owned]
+============================== 4 failed in 6.46s ===============================

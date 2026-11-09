@@ -1,0 +1,980 @@
+"""LiteLLM response-parsing helpers for the composer service.
+
+This module is the Tier 3 trust boundary between the composer service and
+the external LiteLLM response objects. Every public helper here treats its
+input as untrusted external data: response shapes vary across providers,
+usage objects can be missing fields, and provider artefacts can be opaque
+SDK wrappers. The helpers:
+
+- Extract token usage, provider cost, response model, request id,
+  reasoning metadata, and free-form provider artefacts in a JSON-safe form.
+- Construct ``ComposerLLMCall`` audit records from the normalised values.
+- Attach the recorder's buffered LLM-call snapshot to escaping exceptions
+  so the route layer can persist a complete decision trail.
+- Apply Anthropic prompt-cache markers to messages and tools before the
+  request goes on the wire.
+
+Tier 3 boundary discipline (per docs/guides/data-trust-and-error-handling.md
+§The Three-Tier Trust Model):
+
+- Provider values are read from Mapping keys or object-owned fields only.
+  Hidden/dynamic provider properties are treated as absent rather than invoked.
+- ``isinstance(...)`` guards distinguish provider-Mapping shapes from
+  attribute-style provider response objects.
+- Missing fields surface as ``None`` (absence), not as fabricated zeros.
+
+LiteLLM pricing is imported lazily only when an otherwise admissible response
+omits cost metadata. This module must not import from ``service.py`` — that
+would create a cycle.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import re
+import time
+from collections.abc import Mapping
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Any, Final, TypedDict, cast
+
+from elspeth.contracts.composer_llm_audit import (
+    PROVIDER_SERVED_UNRECOGNISED,
+    ComposerLLMCall,
+    ComposerLLMCallStatus,
+    ComposerLLMRequestByteSplit,
+    ToolContractDialect,
+    is_provider_served_name,
+)
+from elspeth.contracts.composer_provider_context import PrivateProviderContext
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.token_usage import TokenUsage
+from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.core.llm_pricing import (
+    _merge_pydantic_extra,
+    _provider_field,
+    _provider_field_map,
+    _token_usage_from_usage,
+)
+from elspeth.core.llm_pricing import (
+    provider_cost_from_captured_usage as _provider_cost_from_captured_usage,
+)
+from elspeth.core.llm_pricing import (
+    provider_cost_from_response as _provider_cost_from_response,
+)
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMProviderMetadata
+from elspeth.web.composer.bounded_json import (
+    PROVIDER_ARTIFACT_UNAVAILABLE,
+    JsonBoundaryError,
+    JsonTraversalBudget,
+    require_bounded_text,
+)
+from elspeth.web.composer.protocol import ComposerAdmissionRefused
+from elspeth.web.composer.provider_quota import ProviderCallCustody, bind_provider_attempt
+from elspeth.web.composer.provider_thinking import parse_native_thinking_blocks
+from elspeth.web.credential_guard import require_no_credential_material_in_llm_metadata
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.audit import BufferingRecorder
+
+__all__ = [
+    "PROVIDER_STRING_TRUNCATION_MARKER",
+    "admit_llm_provider_metadata",
+    "apply_anthropic_cache_markers",
+    "attach_llm_calls",
+    "build_llm_call_record",
+    "safe_response_model",
+    "supports_anthropic_prompt_cache_markers",
+    "token_usage_from_response",
+]
+
+_LLM_ERROR_MESSAGE_MAX_CHARS = 512
+_LLM_ERROR_HASH_CHARS = 16
+_LLM_ERROR_REDACTED_DETAIL = "provider error detail redacted"
+_LLM_ERROR_HASH_LABEL = "raw_error_hash"
+
+_LLM_ERROR_SENSITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("authorization_header", re.compile(r"\bAuthorization\s*[:=]\s*[^\s,;}]+(?:\s+[^\s,;}]+)?", re.IGNORECASE)),
+    ("bearer_token", re.compile(r"Bearer\s+[A-Za-z0-9._\-]{20,}", re.IGNORECASE)),
+    ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("github_pat", re.compile(r"ghp_[A-Za-z0-9]{36}")),
+    ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{40,}")),
+    ("openai_key", re.compile(r"sk-[A-Za-z0-9]{40,}")),
+    ("jwt", re.compile(r"\b[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}\b")),
+    ("url", re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)),
+    ("email", re.compile(r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b")),
+    ("ssn", re.compile(r"\b\d{3}[-\s]\d{2}[-\s]\d{4}\b")),
+)
+
+_LLM_ERROR_HIGH_RISK_FIELD_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(?:headers?|authorization|api[_-]?key|access[_-]?token|prompt(?:_template)?|messages|sample_rows?|rows?)"
+        r"['\"]?\s*[:=]",
+        re.IGNORECASE,
+    ),
+)
+
+
+class _ReasoningMetadata(TypedDict):
+    reasoning_content: str | None
+    reasoning_details: Any | None
+    thinking_blocks: Any | None
+
+
+def token_usage_from_response(response: Any | None) -> TokenUsage:
+    """Normalize provider usage metadata without fabricating missing counts.
+
+    Captures provider-reported prompt-cache statistics in addition to the
+    base prompt/completion/total counts. Cache fields are exposed as:
+
+    - OpenAI / OpenRouter: nested ``usage.prompt_tokens_details.cached_tokens``
+    - Anthropic: sibling ``usage.cache_creation_input_tokens`` and
+      ``usage.cache_read_input_tokens``
+
+    All cache fields are read defensively: a non-Mapping ``usage`` whose
+    attributes are missing yields ``None`` rather than a fabricated zero.
+    See elspeth-4e79436719 §Bug C.
+
+    LiteLLM-shape deduplication: for Anthropic-family responses (direct
+    Anthropic, Bedrock-Claude, Vertex-Claude/Gemini), LiteLLM's transformation
+    layer populates ``prompt_tokens_details.cached_tokens`` as a synthetic
+    copy of the Anthropic sibling ``cache_read_input_tokens`` (and uses ``0``
+    when no read occurred). Treating both as independent signals would
+    double-record the same provider counter into ``cached_prompt_tokens`` and
+    ``cache_read_input_tokens`` — and, for creation-only responses, fabricate
+    a zero into ``cached_prompt_tokens`` that the provider never asserted.
+    When *either* Anthropic sibling is present we therefore drop the nested
+    OpenAI shape: presence of a sibling is the provenance signal that the
+    nested view is LiteLLM-derived, not provider-native.
+
+    Primary-source evidence (LiteLLM transformations):
+    - ``litellm/llms/anthropic/chat/transformation.py`` (Anthropic direct)
+    - ``litellm/llms/bedrock/chat/converse_transformation.py`` (Bedrock Claude)
+    - ``litellm/llms/vertex_ai/gemini/vertex_and_google_ai_studio_gemini.py``
+      (Vertex Gemini / Claude)
+
+    Each constructs ``PromptTokensDetailsWrapper(cached_tokens=cache_read_input_tokens)``
+    and emits both fields on the returned ``Usage`` object.
+    """
+    usage = None if response is None else _provider_field(response, "usage")
+    return _token_usage_from_usage(usage)
+
+
+# ---------------------------------------------------------------------------
+# Bounds on provider-authored strings that reach a stored or rendered
+# projection (elspeth: composer endpoint affordance).
+#
+# ELSPETH lets an operator point the composer at any OpenAI-compatible
+# endpoint. The realistic failure mode is not a hostile provider but a
+# malfunctioning one: a buggy proxy, a mis-translated upstream, or an error
+# blob returned where a short token belongs. Those strings land in
+# ``chat_messages.tool_calls`` (stored) and, via ``llm_call_audit_summary``,
+# in the message-list view (rendered), so an unbounded value is unbounded
+# text in a durable, rendered column.
+#
+# The response is graceful degradation, never rejection: truncate, keep the
+# audit row, and make the anomaly legible. Dropping the record because a
+# field is oversized would discard the very evidence that the endpoint
+# misbehaved.
+#
+# Bounding happens HERE, at the single extraction point, so the envelope,
+# the rendered summary, and the sidecar all inherit one already-bounded
+# value and there is one place to reason about the limit. The contract
+# (``ComposerLLMCall``) deliberately does not re-check length: a contract
+# that rejected an oversized value would raise instead of recording, which
+# is exactly the outcome this bound exists to prevent.
+# ---------------------------------------------------------------------------
+
+PROVIDER_STRING_TRUNCATION_MARKER: Final[str] = "<truncated:"
+"""Opening marker of the in-band suffix appended to a truncated provider string.
+
+The full suffix is ``<truncated:{original_length}>``. Readers detect
+truncation with ``PROVIDER_STRING_TRUNCATION_MARKER in value`` rather than
+hardcoding the literal.
+"""
+
+# A closed-vocabulary provider token (``finish_reason``). Real values are
+# short: the longest ones any provider emits are Gemini's
+# ``FINISH_REASON_UNSPECIFIED`` / ``MALFORMED_FUNCTION_CALL`` at ~25
+# characters. 128 is ~5x the longest real value — no legitimate token, even
+# one no provider has invented yet, is ever cut — while anything longer is
+# self-evidently not a termination token.
+_PROVIDER_TOKEN_MAX_CHARS: Final[int] = 128
+
+# A provider routing or correlation identifier (``model_returned``,
+# ``provider_request_id``). These are legitimately long: Bedrock
+# inference-profile ARNs and Vertex resource paths run ~100-140 characters.
+# 256 clears those with room to spare, and both identifiers share it so
+# there is one identifier bound to justify rather than two.
+_PROVIDER_IDENTIFIER_MAX_CHARS: Final[int] = 256
+
+
+def _bounded_provider_string(value: str, *, limit: int) -> str:
+    """Cap one provider-authored string, signalling truncation in band.
+
+    Returns ``value`` unchanged — byte-identical — when it is within
+    ``limit``; a well-behaved endpoint's output is never altered. Beyond the
+    limit the value is cut and an in-band ``<truncated:{original_length}>``
+    suffix is appended.
+
+    Why in-band rather than a companion flag
+    ----------------------------------------
+    Silent truncation is the failure to avoid: it turns "the endpoint sent
+    garbage" into "the value looks fine but short". The signal therefore
+    travels with the value. An in-band suffix propagates through every
+    projection — the ``tool_calls`` envelope, the rendered summary, the
+    sidecar ``to_dict()`` — with no schema change and no risk of a
+    projection carrying the value while dropping its flag. This follows the
+    precedent this module already sets for a scalar provider string in
+    ``_append_llm_error_hash`` (``...[raw_error_hash=…]``); the companion
+    ``_truncated`` dict flag at ``audit.py:475`` works there only because
+    that value is already a dict.
+
+    The original length is included because it is the diagnostic that
+    distinguishes "the endpoint sent 200 characters" from "the endpoint sent
+    two megabytes" — the difference between a sloppy value and a broken one.
+
+    Accepted trade-off: a legitimate provider value that itself ended in
+    ``<truncated:N>`` would be indistinguishable from a truncated one. That
+    is not defended against — the collision is vanishingly unlikely, and
+    guarding it would cost more clarity than the risk is worth.
+
+    Typed ``str -> str``: both call sites assert the value is an exact
+    ``str`` before calling, so a non-string branch here would be dead code.
+    """
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}{PROVIDER_STRING_TRUNCATION_MARKER}{len(value)}>"
+
+
+def safe_response_model(response: Any | None) -> str | None:
+    """Return the provider's own ``response.model`` string, bounded.
+
+    Provider-authored: the endpoint chooses these bytes. Besides the audit
+    row's ``model_returned``, this value is the provenance ``model_version``
+    stored on proposals and interpretation events, so bounding it here
+    covers every stored consumer at once.
+
+    A legitimate identifier — including a Bedrock inference-profile ARN or a
+    Vertex resource path — passes through unchanged; see
+    :func:`_bounded_provider_string` for the truncation signal.
+    """
+    if response is None:
+        return None
+    model = _provider_field(response, "model")
+    if isinstance(model, str) and model.strip():
+        return _bounded_provider_string(model, limit=_PROVIDER_IDENTIFIER_MAX_CHARS)
+    return None
+
+
+def _safe_provider_request_id(response: Any | None) -> str | None:
+    """Return the provider's own correlation id (``id``, else ``request_id``), bounded.
+
+    Provider-authored: the endpoint chooses these bytes, and they reach the
+    stored ``provider_request_id`` column and the rendered audit summary, so
+    the same bound applies as to the sibling identifier
+    :func:`safe_response_model` — one identifier limit
+    (:data:`_PROVIDER_IDENTIFIER_MAX_CHARS`) to justify rather than two.
+
+    Selection and bounding are deliberately separate steps. The attribute
+    order is a *preference* — ``id`` is what OpenAI-compatible endpoints
+    populate, ``request_id`` the fallback some proxies use — so the first
+    non-empty string wins and is then capped. Folding the length test back
+    into the acceptance predicate would make an over-long ``id`` fall through
+    to ``request_id``, and the audit row would then record a perfectly clean
+    id from an endpoint that had just emitted a broken one: the anomaly
+    disappears, which is the exact failure this bound exists to prevent.
+
+    A legitimate id passes through unchanged; see
+    :func:`_bounded_provider_string` for the truncation signal.
+
+    A blank id is absence, not a value — matching :func:`safe_response_model`
+    and the contract's own rule that a whitespace string reaching
+    ``_require_non_empty_str`` is a defect in the extraction site. Admitting
+    one on mere truthiness made the contract raise and destroyed the whole
+    audit row, which is precisely what bounding here exists to prevent.
+    """
+    if response is None:
+        return None
+    for attr in ("id", "request_id"):
+        value = _provider_field(response, attr)
+        if isinstance(value, str) and value.strip():
+            return _bounded_provider_string(value, limit=_PROVIDER_IDENTIFIER_MAX_CHARS)
+    return None
+
+
+def _response_field(value: Any, field: str) -> Any:
+    return _provider_field(value, field)
+
+
+def _admit_provider_served(value: Any) -> str | None:
+    """Bound OpenRouter's served-endpoint name to a public-safe token.
+
+    ``value`` is the response's top-level ``provider`` field, as read from the
+    provider object. It is provider-authored and reaches the persisted audit
+    projection, so only a name in the closed shape
+    (:func:`~elspeth.contracts.composer_llm_audit.is_provider_served_name`) is
+    recorded verbatim. Any other present value (the wrong type, oversized, an
+    unexpected character) is recorded as the fixed
+    :data:`~elspeth.contracts.composer_llm_audit.PROVIDER_SERVED_UNRECOGNISED`
+    token, never as provider bytes, so the anomaly stays visible without
+    copying what the endpoint sent. Absence, including a blank string, is
+    ``None``, matching the other provider identifiers.
+    """
+    if value is None:
+        return None
+    if type(value) is not str:
+        return PROVIDER_SERVED_UNRECOGNISED
+    if not value.strip():
+        return None
+    return value if is_provider_served_name(value) else PROVIDER_SERVED_UNRECOGNISED
+
+
+@observation_boundary(
+    tier=3,
+    source="a LiteLLM response object's provider-authored 'choices' container",
+    source_param="response",
+    suppresses=("R5",),
+    invariant="returns None when choices is absent, is not a list/tuple, or is empty; never raises",
+)
+def _first_response_choice(response: Any | None) -> Any | None:
+    if response is None:
+        return None
+    choices = _response_field(response, "choices")
+    if not isinstance(choices, list | tuple) or not choices:
+        return None
+    return choices[0]
+
+
+def _first_response_message(response: Any | None) -> Any | None:
+    return _response_field(_first_response_choice(response), "message")
+
+
+def _finish_reason_from_response(response: Any | None) -> str | None:
+    """Return the provider's raw ``choices[0].finish_reason`` string, verbatim.
+
+    Tier-3 extraction: the value is read through ``_provider_field`` so the
+    pydantic v2 ``extra="allow"`` overflow slot is merged in — a reader that
+    consulted ``__dict__`` alone would see a real provider object as
+    field-less and silently record ``None`` (ADR-032; the defect class of
+    elspeth-9ea866438b).
+
+    Only the *value* is asserted, never the object's type: a non-``str`` or
+    blank finish reason is treated as absent. The surviving string is stored
+    exactly as received — no mapping onto the pipeline's ``FinishReason``
+    vocabulary (which lives in ``elspeth.plugins`` and must not be imported
+    from ``contracts``), and no normalisation of unrecognised values, so a
+    provider term ELSPETH has never seen still reaches the audit trail.
+
+    "Verbatim" is bounded, not unlimited. Every real termination token is a
+    handful of characters, so a value past
+    :data:`_PROVIDER_TOKEN_MAX_CHARS` is not a token the composer failed to
+    recognise — it is an endpoint returning something else entirely where a
+    token belongs (an error blob, an HTML page). Such a value is truncated
+    with an in-band marker rather than rejected: the audit row survives, and
+    the anomaly is legible in the rendered summary, which is precisely where
+    an operator would otherwise see unbounded provider text. A value within
+    the bound — which is every value a working endpoint produces — is
+    recorded byte-identically as before.
+    """
+    finish_reason = _provider_field(_first_response_choice(response), "finish_reason")
+    if type(finish_reason) is not str or not finish_reason.strip():
+        return None
+    return _bounded_provider_string(finish_reason, limit=_PROVIDER_TOKEN_MAX_CHARS)
+
+
+def _provider_artifact_owned_fields(value: Any) -> Mapping[str, Any] | None:
+    """Return data-only object fields without invoking provider serializers.
+
+    Reads the same two data-only stores ``_provider_field_map`` reads —
+    ``__dict__`` plus the pydantic v2 ``extra="allow"`` overflow slot — because
+    a real provider object frequently keeps its entire payload in the latter.
+    Consulting ``__dict__`` alone returned ``None`` here, which raised
+    ``JsonBoundaryError`` and made ``_json_safe_provider_artifact`` store the
+    ``PROVIDER_ARTIFACT_UNAVAILABLE`` sentinel in place of the real artifact,
+    silently (ADR-032).
+
+    This deliberately does NOT delegate to ``_provider_field_map``: that helper
+    short-circuits ``Mapping`` inputs and reads ``__dict__`` via ``vars()``,
+    whereas the artifact walker handles ``dict`` itself and must reach the
+    instance store through ``object.__getattribute__`` so that a provider
+    ``__getattribute__`` override cannot run. An object with no data fields at
+    all also stays ``None`` here so the sentinel fallback is preserved.
+    """
+    try:
+        raw_fields = object.__getattribute__(value, "__dict__")
+    except (AttributeError, TypeError):
+        return None
+    if type(raw_fields) is not dict:
+        return None
+    fields = dict(_merge_pydantic_extra(value, raw_fields))
+    return fields or None
+
+
+def _normalize_provider_artifact(
+    value: Any,
+    *,
+    budget: JsonTraversalBudget,
+    depth: int,
+    active_container_ids: set[int],
+) -> Any:
+    label = "provider artifact"
+    budget.check_depth(depth, label=label)
+    if value is None or type(value) in {bool, int}:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise JsonBoundaryError("provider artifact contains a non-finite number")
+        return value
+    if type(value) is str:
+        budget.consume_text(value, label=label)
+        return value
+    if type(value) is dict:
+        container_id = id(value)
+        if container_id in active_container_ids:
+            raise JsonBoundaryError("provider artifact contains a recursive mapping")
+        budget.consume_items(len(value), label=label)
+        active_container_ids.add(container_id)
+        try:
+            normalized: dict[str, Any] = {}
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise JsonBoundaryError("provider artifact contains a non-string key")
+                budget.consume_text(key, label=label)
+                normalized[key] = _normalize_provider_artifact(
+                    item,
+                    budget=budget,
+                    depth=depth + 1,
+                    active_container_ids=active_container_ids,
+                )
+            return normalized
+        finally:
+            active_container_ids.remove(container_id)
+    if type(value) in {list, tuple}:
+        container_id = id(value)
+        if container_id in active_container_ids:
+            raise JsonBoundaryError("provider artifact contains a recursive sequence")
+        budget.consume_items(len(value), label=label)
+        active_container_ids.add(container_id)
+        try:
+            return [
+                _normalize_provider_artifact(
+                    item,
+                    budget=budget,
+                    depth=depth + 1,
+                    active_container_ids=active_container_ids,
+                )
+                for item in value
+            ]
+        finally:
+            active_container_ids.remove(container_id)
+
+    fields = _provider_artifact_owned_fields(value)
+    if fields is None:
+        raise JsonBoundaryError("provider artifact has no data-only JSON representation")
+    container_id = id(value)
+    if container_id in active_container_ids:
+        raise JsonBoundaryError("provider artifact contains a recursive object")
+    active_container_ids.add(container_id)
+    try:
+        return _normalize_provider_artifact(
+            fields,
+            budget=budget,
+            depth=depth,
+            active_container_ids=active_container_ids,
+        )
+    finally:
+        active_container_ids.remove(container_id)
+
+
+def _json_safe_provider_artifact(value: Any) -> Any:
+    try:
+        return _normalize_provider_artifact(
+            value,
+            budget=JsonTraversalBudget(),
+            depth=0,
+            active_container_ids=set(),
+        )
+    except JsonBoundaryError:
+        # The sentinel is closed and value-free. Provider values, reprs, keys,
+        # and rejection text never enter the audit record. Unexpected internal
+        # failures still propagate instead of being mislabeled as bad provider
+        # data.
+        return PROVIDER_ARTIFACT_UNAVAILABLE
+
+
+def _native_thinking_artifact(value: object) -> object:
+    """Keep complete native replay separate from bounded diagnostic artifacts."""
+    if value is None:
+        return None
+    try:
+        return parse_native_thinking_blocks(value)
+    except ComposerAdmissionRefused:
+        return PROVIDER_ARTIFACT_UNAVAILABLE
+
+
+def _reasoning_metadata_from_response(response: Any | None) -> _ReasoningMetadata:
+    message = _first_response_message(response)
+    return _reasoning_metadata_from_message(message)
+
+
+def _reasoning_metadata_from_message(message: Any | None) -> _ReasoningMetadata:
+    """Normalize reasoning fields from one already-captured message."""
+
+    if message is None:
+        return {
+            "reasoning_content": None,
+            "reasoning_details": None,
+            "thinking_blocks": None,
+        }
+    reasoning_content = _response_field(message, "reasoning")
+    if type(reasoning_content) is not str:
+        reasoning_content = _response_field(message, "reasoning_content")
+    if type(reasoning_content) is not str:
+        reasoning_content = None
+    else:
+        try:
+            reasoning_content = require_bounded_text(reasoning_content, label="provider reasoning content")
+        except JsonBoundaryError:
+            reasoning_content = PROVIDER_ARTIFACT_UNAVAILABLE
+
+    reasoning_details = _response_field(message, "reasoning_details")
+    if reasoning_details is None:
+        provider_specific = _response_field(message, "provider_specific_fields")
+        reasoning_details = _response_field(provider_specific, "reasoning_details") if provider_specific is not None else None
+
+    return {
+        "reasoning_content": reasoning_content,
+        "reasoning_details": _json_safe_provider_artifact(reasoning_details),
+        "thinking_blocks": _native_thinking_artifact(_response_field(message, "thinking_blocks")),
+    }
+
+
+def _captured_field(fields: Mapping[str, Any] | None, field: str) -> Any:
+    """Read one provider mapping field once, returning absence on KeyError."""
+
+    if fields is None:
+        return None
+    try:
+        return fields[field]
+    except KeyError:
+        return None
+
+
+@observation_boundary(
+    tier=3,
+    source="a LiteLLM response object, with its already-captured first choice and message, from the composer provider call",
+    source_param="response",
+    suppresses=("R5",),
+    invariant=(
+        "records every absent, non-string, or blank provider identifier as None (absence, never a "
+        "fabricated value) and bounds every provider-authored string it retains; never raises on "
+        "response content"
+    ),
+)
+def admit_llm_provider_metadata(
+    response: Any,
+    *,
+    choice: Any | None,
+    message: Any | None,
+    pricing_model: str | None = None,
+) -> _AdmittedLLMProviderMetadata:
+    """Capture every retained provider fact exactly once into an owned carrier."""
+
+    response_fields = _provider_field_map(response)
+    usage = _captured_field(response_fields, "usage")
+    usage_projection = _token_usage_from_usage(usage)
+    provider_cost, provider_cost_source = _provider_cost_from_captured_usage(response, usage, pricing_model=pricing_model)
+
+    model_value = _captured_field(response_fields, "model")
+    model_returned = (
+        _bounded_provider_string(model_value, limit=_PROVIDER_IDENTIFIER_MAX_CHARS)
+        if isinstance(model_value, str) and model_value.strip()
+        else None
+    )
+
+    provider_request_id: str | None = None
+    for field in ("id", "request_id"):
+        identifier = _captured_field(response_fields, field)
+        if isinstance(identifier, str) and identifier.strip():
+            provider_request_id = _bounded_provider_string(identifier, limit=_PROVIDER_IDENTIFIER_MAX_CHARS)
+            break
+
+    choice_fields = _provider_field_map(choice)
+    finish_value = _captured_field(choice_fields, "finish_reason")
+    finish_reason = (
+        _bounded_provider_string(finish_value, limit=_PROVIDER_TOKEN_MAX_CHARS)
+        if type(finish_value) is str and finish_value.strip()
+        else None
+    )
+    reasoning_metadata = _reasoning_metadata_from_message(message)
+    return _AdmittedLLMProviderMetadata(
+        model_returned=model_returned,
+        finish_reason=finish_reason,
+        usage=usage_projection,
+        provider_cost=provider_cost,
+        provider_cost_source=provider_cost_source,
+        provider_request_id=provider_request_id,
+        reasoning_content=reasoning_metadata["reasoning_content"],
+        reasoning_details=reasoning_metadata["reasoning_details"],
+        thinking_blocks=reasoning_metadata["thinking_blocks"],
+        provider_served=_admit_provider_served(_captured_field(response_fields, "provider")),
+    )
+
+
+def _llm_error_hash(raw_message: str) -> str:
+    return stable_hash({"error_message": raw_message})[:_LLM_ERROR_HASH_CHARS]
+
+
+def _append_llm_error_hash(message: str, *, raw_message: str) -> str:
+    suffix = f" [{_LLM_ERROR_HASH_LABEL}={_llm_error_hash(raw_message)}]"
+    if len(message) + len(suffix) <= _LLM_ERROR_MESSAGE_MAX_CHARS:
+        return f"{message}{suffix}"
+
+    ellipsis = "..."
+    budget = _LLM_ERROR_MESSAGE_MAX_CHARS - len(suffix) - len(ellipsis)
+    if budget <= 0:
+        return suffix.strip()[:_LLM_ERROR_MESSAGE_MAX_CHARS]
+    return f"{message[:budget].rstrip()}{ellipsis}{suffix}"
+
+
+def _safe_llm_error_message(error_message: str | None) -> str | None:
+    """Return the audit-safe provider error detail for ``ComposerLLMCall``.
+
+    Provider SDK exception strings can embed request bodies, prompts, headers,
+    URLs, and credentials. The durable audit row keeps class-level detail in
+    ``error_class``; free-form provider text is stored only after redaction and
+    length capping, with a short stable hash for operator correlation.
+    """
+
+    if error_message is None:
+        return None
+
+    raw_message = error_message.strip()
+    if not raw_message:
+        return error_message
+
+    redacted_message = raw_message
+    for name, pattern in _LLM_ERROR_SENSITIVE_PATTERNS:
+        redacted_message = pattern.sub(f"<redacted-sensitive:{name}>", redacted_message)
+
+    if any(pattern.search(raw_message) for pattern in _LLM_ERROR_HIGH_RISK_FIELD_PATTERNS):
+        return _append_llm_error_hash(_LLM_ERROR_REDACTED_DETAIL, raw_message=raw_message)
+
+    if redacted_message != raw_message or len(redacted_message) > _LLM_ERROR_MESSAGE_MAX_CHARS:
+        return _append_llm_error_hash(redacted_message, raw_message=raw_message)
+
+    return raw_message
+
+
+def _hash_and_measure_request(messages: list[Any], tools: list[Any] | None) -> tuple[str, str | None, ComposerLLMRequestByteSplit]:
+    """Hash the sent messages and tools and measure their components in one pass.
+
+    ``messages_hash`` / ``tools_spec_hash`` are ``stable_hash`` of the exact
+    lists: SHA-256 over their RFC 8785 canonical JSON. A canonical array is its
+    elements' canonical encodings joined by single commas inside brackets, so
+    each message is canonicalized once and both the hash and the sizes come
+    from that one serialization; nothing is serialized a second time.
+
+    A message whose ``content`` is a ``str`` is sized by that content's UTF-8
+    bytes (every planner message: the prompt text the provider tokenizes).
+    Any other message (an assistant tool-call turn, structured content parts)
+    is sized by its canonical encoding as hashed. The tool block is sized by
+    the canonical encoding its hash covers.
+    """
+    encoded_messages = [canonical_json(message).encode("utf-8") for message in messages]
+    messages_hash = hashlib.sha256(b"[" + b",".join(encoded_messages) + b"]").hexdigest()
+    message_bytes = tuple(
+        len(message["content"].encode("utf-8")) if "content" in message and type(message["content"]) is str else len(encoded)
+        for message, encoded in zip(messages, encoded_messages, strict=True)
+    )
+    tools_spec_hash: str | None = None
+    tools_bytes: int | None = None
+    if tools is not None:
+        encoded_tools = canonical_json(tools).encode("utf-8")
+        tools_spec_hash = hashlib.sha256(encoded_tools).hexdigest()
+        tools_bytes = len(encoded_tools)
+    split = ComposerLLMRequestByteSplit(
+        message_bytes=message_bytes,
+        tools_bytes=tools_bytes,
+        total_bytes=sum(message_bytes) + (tools_bytes if tools_bytes is not None else 0),
+    )
+    return messages_hash, tools_spec_hash, split
+
+
+def build_llm_call_record(
+    *,
+    model_requested: str,
+    pricing_model: str | None = None,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    status: ComposerLLMCallStatus,
+    started_at: datetime,
+    started_ns: int,
+    temperature: float | None,
+    seed: int | None,
+    response: Any | None = None,
+    response_metadata: _AdmittedLLMProviderMetadata | None = None,
+    error_class: str | None = None,
+    error_message: str | None = None,
+    max_completion_tokens_requested: int | None = None,
+    planner_policy_hash: str | None = None,
+    planner_call_ordinal: int | None = None,
+    credential_surface: str = "composer_provider_response",
+    provider_custody: ProviderCallCustody | None = None,
+    failure: BaseException | None = None,
+    private_request: PrivateProviderContext | None = None,
+) -> ComposerLLMCall:
+    from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
+
+    if response_metadata is None:
+        usage = token_usage_from_response(response)
+        provider_cost, provider_cost_source = _provider_cost_from_response(
+            response, pricing_model=pricing_model if pricing_model is not None else model_requested
+        )
+        reasoning_metadata = _reasoning_metadata_from_response(response)
+        model_returned = safe_response_model(response)
+        finish_reason = _finish_reason_from_response(response)
+        provider_request_id = _safe_provider_request_id(response)
+        provider_served = None if response is None else _admit_provider_served(_provider_field(response, "provider"))
+    else:
+        usage = response_metadata.usage
+        provider_cost = response_metadata.provider_cost
+        provider_cost_source = response_metadata.provider_cost_source
+        reasoning_metadata = {
+            "reasoning_content": response_metadata.reasoning_content,
+            "reasoning_details": response_metadata.reasoning_details,
+            "thinking_blocks": response_metadata.thinking_blocks,
+        }
+        model_returned = response_metadata.model_returned
+        finish_reason = response_metadata.finish_reason
+        provider_request_id = response_metadata.provider_request_id
+        provider_served = response_metadata.provider_served
+    require_no_credential_material_in_llm_metadata(
+        content=None,
+        tool_calls=(),
+        reasoning_content=reasoning_metadata["reasoning_content"],
+        reasoning_details=reasoning_metadata["reasoning_details"],
+        thinking_blocks=reasoning_metadata["thinking_blocks"],
+        model_returned=model_returned,
+        provider_request_id=provider_request_id,
+        finish_reason=finish_reason,
+        provider_served=provider_served,
+        surface=credential_surface,
+    )
+    # The dialect and strict count are read off the exact list that was sent
+    # (the bytes ``tools_spec_hash`` covers): every tool stamped with an exact
+    # bool is ``openai_strict``, no stamp at all is ``none``, and anything in
+    # between is a list ELSPETH should never have built.
+    tool_contract_dialect: ToolContractDialect | None = None
+    strict_tool_count: int | None = None
+    if tools:
+        stamps = [tool["function"]["strict"] if "strict" in tool["function"] else None for tool in tools]
+        if all(type(stamp) is bool for stamp in stamps):
+            tool_contract_dialect = ToolContractDialect.OPENAI_STRICT
+            strict_tool_count = sum(1 for stamp in stamps if stamp is True)
+        elif not any("strict" in tool["function"] for tool in tools):
+            tool_contract_dialect = ToolContractDialect.NONE
+            strict_tool_count = 0
+        else:
+            raise AuditIntegrityError("sent tool list mixes strict-stamped and unstamped tools")
+    elapsed_ns = time.monotonic_ns() - started_ns
+    messages_hash, tools_spec_hash, request_byte_split = _hash_and_measure_request(messages, tools)
+    call = ComposerLLMCall(
+        model_requested=model_requested,
+        pricing_model=pricing_model if pricing_model is not None else model_requested,
+        model_returned=model_returned,
+        status=status,
+        finish_reason=finish_reason,
+        prompt_tokens=usage.prompt_tokens,
+        completion_tokens=usage.completion_tokens,
+        total_tokens=usage.total_tokens,
+        cached_prompt_tokens=usage.cached_prompt_tokens,
+        cache_creation_input_tokens=usage.cache_creation_input_tokens,
+        cache_read_input_tokens=usage.cache_read_input_tokens,
+        reasoning_tokens=usage.reasoning_tokens,
+        reasoning_content=reasoning_metadata["reasoning_content"],
+        reasoning_details=reasoning_metadata["reasoning_details"],
+        thinking_blocks=reasoning_metadata["thinking_blocks"],
+        provider_cost=provider_cost,
+        provider_cost_source=provider_cost_source,
+        latency_ms=elapsed_ns // 1_000_000,
+        provider_request_id=provider_request_id,
+        messages_hash=messages_hash,
+        tools_spec_hash=tools_spec_hash,
+        declared_tool_names=tuple(tool["function"]["name"] for tool in tools) if tools is not None else (),
+        started_at=started_at,
+        finished_at=started_at + timedelta(microseconds=elapsed_ns // 1_000),
+        error_class=error_class,
+        error_message=_safe_llm_error_message(error_message),
+        private_failure=capture_failure_facts(failure) if failure is not None else None,
+        private_request=private_request,
+        temperature=temperature,
+        seed=seed,
+        max_completion_tokens_requested=max_completion_tokens_requested,
+        planner_policy_hash=planner_policy_hash,
+        planner_call_ordinal=planner_call_ordinal,
+        provider_served=provider_served,
+        tool_contract_dialect=tool_contract_dialect,
+        strict_tool_count=strict_tool_count,
+        request_byte_split=request_byte_split,
+    )
+    return provider_custody.bind_call(call) if provider_custody is not None else bind_provider_attempt(call)
+
+
+def attach_llm_calls(
+    exc: BaseException,
+    recorder: BufferingRecorder | None,
+    *,
+    start_index: int = 0,
+) -> None:
+    """Attach only this operation's buffered LLM calls to an exception."""
+    if recorder is None:
+        return
+    if type(start_index) is not int or start_index < 0:
+        raise ValueError("start_index must be a non-negative exact integer")
+    exc_with_calls = cast(Any, exc)
+    exc_with_calls.llm_calls = recorder.llm_calls[start_index:]
+
+
+# ---------------------------------------------------------------------------
+# Provider prompt-cache markers (elspeth-4e79436719)
+#
+# Anthropic-family providers (Anthropic direct, OpenRouter Anthropic routing,
+# AWS Bedrock Anthropic, Google Vertex Anthropic) use explicit
+# ``cache_control: {"type": "ephemeral"}`` markers placed on the system
+# message, the deployment-constant catalog context message, the trailing
+# function tool, and (opt-in, freeform loop only) the last message — so the
+# static prefix AND the append-only conversation are cached for follow-up
+# requests (elspeth-4e79436719, extended by elspeth-a79f1b2e6b).
+#
+# OpenAI / OpenRouter OpenAI / Azure OpenAI providers use *automatic* prefix
+# caching above a 1024-token threshold and do NOT honor the ``cache_control``
+# field — for them, the marker is silently ignored. We still skip the
+# transform on those providers to keep the wire payload smaller and the
+# audit ``messages_hash`` clean.
+#
+# LiteLLM's Anthropic adapter (verified against
+# ``litellm/llms/anthropic/chat/transformation.py``) accepts cache_control
+# either at the message level OR per-content-block; we use the simpler
+# message-level shape so existing message-construction code in prompts.py
+# stays untouched. Tools accept cache_control either at the tool level OR
+# inside the ``function`` field; we use the tool-level shape for symmetry.
+# ---------------------------------------------------------------------------
+
+
+def supports_anthropic_prompt_cache_markers(model: str | None) -> bool:
+    """Return True when the configured model honors Anthropic cache_control markers.
+
+    Coverage: Anthropic direct (``anthropic/...``), OpenRouter Anthropic
+    routing (``openrouter/anthropic/...``), AWS Bedrock Anthropic
+    (``bedrock/anthropic.*``), Google Vertex Anthropic
+    (``vertex_ai/claude-*``), and bare ``claude-*`` model identifiers.
+
+    Returns False for OpenAI, Azure OpenAI, Google Gemini, and any model
+    not matched by the prefix heuristics — those providers use automatic
+    prefix caching that doesn't need explicit markers.
+    """
+    if not isinstance(model, str):
+        return False
+    lowered = model.lower()
+    return (
+        lowered.startswith("anthropic/")
+        or lowered.startswith("openrouter/anthropic/")
+        or lowered.startswith("bedrock/anthropic.")
+        or lowered.startswith("vertex_ai/claude-")
+        or "claude-" in lowered
+    )
+
+
+def apply_anthropic_cache_markers(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    *,
+    mark_history_tail: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
+    """Return new messages/tools lists with Anthropic ``cache_control`` markers.
+
+    Behavior (at most four breakpoints total — Anthropic's limit):
+    - The first message with ``role == "system"`` receives a top-level
+      ``cache_control: {"type": "ephemeral"}`` field. ``build_messages()``
+      keeps this first system message to the stable skill/deployment prompt.
+      LiteLLM's Anthropic transform recognizes this marker and propagates it
+      onto the corresponding ``AnthropicSystemMessageContent`` block on the
+      wire.
+    - A ``role == "user"`` message whose content starts with
+      ``CATALOG_CONTEXT_PREFIX`` (the deployment-constant catalog context
+      from ``build_catalog_context_string``) receives the same marker: the
+      block is byte-stable per deployment, so it is written to the cache
+      once and read at ~10% price on every later call of every session
+      (elspeth-a79f1b2e6b). Calls without a catalog message are unaffected.
+    - When ``mark_history_tail`` is True, the LAST message receives the
+      marker — the sliding-breakpoint pattern for append-only agentic
+      loops: each call re-reads the previously written conversation prefix
+      and writes only the new tail. Opt-in because on single-shot calls it
+      pays the cache-write premium with no follow-up call to redeem it;
+      only the freeform tool loop (``_call_llm_with_audit``) opts in.
+    - The LAST tool in ``tools`` receives the same marker at the tool
+      level. Anthropic caches all tools up to and including the marker,
+      so marking the trailing tool covers the full tools array.
+
+    Inputs are NOT mutated; new lists are returned. Messages and tools
+    other than the marked entries are passed through by reference (their
+    contents are not deep-copied) — this keeps the transform cheap and
+    is safe because the receiver (LiteLLM) does not mutate them.
+    """
+    # Local import: prompts.py has no import back into this module, but the
+    # header contract is authored there next to the builders that emit it.
+    from elspeth.web.composer.prompts import CATALOG_CONTEXT_PREFIX
+
+    new_messages: list[dict[str, Any]] = list(messages)
+    system_marked = False
+    catalog_marked = False
+    for index, message in enumerate(new_messages):
+        # ``messages`` is our outbound request payload built by
+        # ``build_messages()`` (prompts.py), not an external response object.
+        # Every message dict we construct carries a ``"role"`` key by
+        # contract; a missing role is a first-party bug, so access it
+        # directly and let ``KeyError`` surface it rather than masking it
+        # with ``.get()``. This is Tier-2 data we authored, not the Tier-3
+        # provider responses the rest of this module normalizes.
+        if not system_marked and message["role"] == "system":
+            new_messages[index] = {**message, "cache_control": {"type": "ephemeral"}}
+            system_marked = True
+        elif (
+            not catalog_marked
+            and message["role"] == "user"
+            # ``content`` is genuinely optional on a message we author (an
+            # assistant tool-call turn carries none), so its absence is a
+            # value fact, not the first-party bug a missing ``role`` would
+            # be. Presence is therefore asserted explicitly and the value
+            # then read in membership form, keeping the Tier-2 posture the
+            # ``role`` read above states.
+            and "content" in message
+            and type(message["content"]) is str
+            and message["content"].startswith(CATALOG_CONTEXT_PREFIX)
+        ):
+            new_messages[index] = {**message, "cache_control": {"type": "ephemeral"}}
+            catalog_marked = True
+        if system_marked and catalog_marked:
+            break
+
+    if mark_history_tail and new_messages:
+        last = new_messages[-1]
+        if "cache_control" not in last:
+            new_messages[-1] = {**last, "cache_control": {"type": "ephemeral"}}
+
+    new_tools: list[dict[str, Any]] | None = None
+    if tools:
+        new_tools = list(tools)
+        # Cache-key contract: the marker is placed on the trailing tool because
+        # Anthropic caches "all content up to and including the marker." Tool
+        # ORDER is therefore part of the cache key — a reordering of
+        # ``get_tool_definitions()`` would silently shift which tool is "last"
+        # and invalidate the prompt cache for every follow-up turn. The order
+        # contract is locked by ``TestToolListOrderIsCacheKeyContract`` in
+        # ``tests/unit/web/composer/test_provider_cache_markers.py``.
+        new_tools[-1] = {**new_tools[-1], "cache_control": {"type": "ephemeral"}}
+
+    return new_messages, new_tools

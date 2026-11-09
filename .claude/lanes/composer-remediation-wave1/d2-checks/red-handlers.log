@@ -1,0 +1,316 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-d2
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 95 items / 85 deselected / 10 selected
+
+tests/unit/composer_mcp/test_configured_root_admission.py F.F.FFFFFF     [100%]
+
+=================================== FAILURES ===================================
+_______ test_configured_root_admits_file_authoring[relative-set-source] ________
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-197/test_configured_root_admits_fi0')
+writer = 'set_source', code = 'source_path_policy_invalid', component = 'source'
+spelling = 'relative'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("writer", "code", "component"), _WRITERS)
+    @pytest.mark.parametrize("spelling", ["relative", "absolute"])
+    async def test_configured_root_admits_file_authoring(
+        tmp_path: Path, writer: str, code: str, component: str, spelling: str
+    ) -> None:
+        """Removing root authority from any writer must break its positive control."""
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "admitted.csv").write_text("text\nhello\n")
+        live = await _live_mcp(tmp_path, root)
+        path = "admitted.csv" if spelling == "relative" else str(root / "admitted.csv")
+        tool, arguments = _mutation(writer, path)
+        result = await live.call(tool, arguments)
+>       assert result["success"] is True, result
+E       AssertionError: {'affected_nodes': [], 'state': {'edges': [{'edge_type': 'on_success', 'from_node': 'source', 'id': 'source-before', '...ed_component': 'source', ...}], 'graph_repair_suggestions': [], 'is_valid': False, 'semantic_contracts': [], ...}, ...}
+E       assert False is True
+
+tests/unit/composer_mcp/test_configured_root_admission.py:233: AssertionError
+_______ test_configured_root_admits_file_authoring[absolute-set-source] ________
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-197/test_configured_root_admits_fi2')
+writer = 'set_source', code = 'source_path_policy_invalid', component = 'source'
+spelling = 'absolute'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("writer", "code", "component"), _WRITERS)
+    @pytest.mark.parametrize("spelling", ["relative", "absolute"])
+    async def test_configured_root_admits_file_authoring(
+        tmp_path: Path, writer: str, code: str, component: str, spelling: str
+    ) -> None:
+        """Removing root authority from any writer must break its positive control."""
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "admitted.csv").write_text("text\nhello\n")
+        live = await _live_mcp(tmp_path, root)
+        path = "admitted.csv" if spelling == "relative" else str(root / "admitted.csv")
+        tool, arguments = _mutation(writer, path)
+        result = await live.call(tool, arguments)
+>       assert result["success"] is True, result
+E       AssertionError: {'affected_nodes': [], 'state': {'edges': [{'edge_type': 'on_success', 'from_node': 'source', 'id': 'source-before', '...ed_component': 'source', ...}], 'graph_repair_suggestions': [], 'is_valid': False, 'semantic_contracts': [], ...}, ...}
+E       assert False is True
+
+tests/unit/composer_mcp/test_configured_root_admission.py:233: AssertionError
+_______ test_each_writer_refuses_escape_atomically[absolute-set-source] ________
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-197/test_each_writer_refuses_escap0')
+writer = 'set_source', code = 'source_path_policy_invalid', component = 'source'
+escape = 'absolute'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("writer", "code", "component"), _WRITERS)
+    @pytest.mark.parametrize("escape", ["absolute", "traversal", "symlink"])
+    async def test_each_writer_refuses_escape_atomically(tmp_path: Path, writer: str, code: str, component: str, escape: str) -> None:
+        """Skipping any gate must expose both the exact reason and state mutation."""
+        root = tmp_path / "data"
+        root.mkdir()
+        outside = tmp_path / "private"
+        outside.mkdir()
+        (root / "link").symlink_to(outside, target_is_directory=True)
+        (root / "outputs").mkdir()
+        (root / "outputs" / "link").symlink_to(outside, target_is_directory=True)
+        path = {"absolute": str(outside / "data.csv"), "traversal": "../private/data.csv", "symlink": "link/data.csv"}[escape]
+        live = await _live_mcp(tmp_path, root)
+        if writer == "bulk-output" and escape == "traversal":
+            # Existing spelling canonicalization intentionally rejects '..'
+            # before the containment gate and keeps its option-error channel.
+            await _assert_refused_unchanged(live, writer, path, "plugin_options_invalid", component)
+            return
+        result = await _assert_refused_unchanged(live, writer, path, code, component)
+        message = result["validation"]["errors"][0]["message"]
+>       assert "configured" in message.lower() and "root" in message.lower()
+E       assert ('configured' in "source file path options (path or file) must use this session's permitted source locations. use the session's blob binding or an authorized source path.")
+E        +  where "source file path options (path or file) must use this session's permitted source locations. use the session's blob binding or an authorized source path." = <built-in method lower of str object at 0x7f5df98b3020>()
+E        +    where <built-in method lower of str object at 0x7f5df98b3020> = "Source file path options (path or file) must use this session's permitted source locations. Use the session's blob binding or an authorized source path.".lower
+
+tests/unit/composer_mcp/test_configured_root_admission.py:259: AssertionError
+_______ test_each_writer_refuses_escape_atomically[absolute-set-output] ________
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-197/test_each_writer_refuses_escap1')
+writer = 'set_output', code = 'sink_path_policy_invalid'
+component = 'output:result', escape = 'absolute'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("writer", "code", "component"), _WRITERS)
+    @pytest.mark.parametrize("escape", ["absolute", "traversal", "symlink"])
+    async def test_each_writer_refuses_escape_atomically(tmp_path: Path, writer: str, code: str, component: str, escape: str) -> None:
+        """Skipping any gate must expose both the exact reason and state mutation."""
+        root = tmp_path / "data"
+        root.mkdir()
+        outside = tmp_path / "private"
+        outside.mkdir()
+        (root / "link").symlink_to(outside, target_is_directory=True)
+        (root / "outputs").mkdir()
+        (root / "outputs" / "link").symlink_to(outside, target_is_directory=True)
+        path = {"absolute": str(outside / "data.csv"), "traversal": "../private/data.csv", "symlink": "link/data.csv"}[escape]
+        live = await _live_mcp(tmp_path, root)
+        if writer == "bulk-output" and escape == "traversal":
+            # Existing spelling canonicalization intentionally rejects '..'
+            # before the containment gate and keeps its option-error channel.
+            await _assert_refused_unchanged(live, writer, path, "plugin_options_invalid", component)
+            return
+>       result = await _assert_refused_unchanged(live, writer, path, code, component)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/composer_mcp/test_configured_root_admission.py:257: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+live = _LiveMcp(server=<mcp.server.lowlevel.server.Server object at 0x7f5df9d58170>, scratch=PosixPath('/tmp/pytest-of-agent/pytest-197/test_each_writer_refuses_escap1/scratch'), session_id='19178ab5eeed')
+writer = 'set_output'
+path = '/tmp/pytest-of-agent/pytest-197/test_each_writer_refuses_escap1/private/data.csv'
+code = 'sink_path_policy_invalid', component = 'output:result'
+
+    async def _assert_refused_unchanged(live: _LiveMcp, writer: str, path: object, code: str, component: str) -> dict[str, Any]:
+        before = live.private_state
+        saved = live.saved_bytes
+        public_before = await live.call("get_pipeline_state", {})
+        tool, arguments = _mutation(writer, path)
+        result = await live.call(tool, arguments)
+        assert live.last_audit["status"] == "success"
+        assert live.last_audit["version_before"] == before.version
+>       assert live.last_audit["version_after"] == before.version
+E       AssertionError: assert 5 == 4
+E        +  where 4 = CompositionState(nodes=(NodeSpec(id='before', node_type='transform', plugin='passthrough', input='rows', on_success='m...th': 'input.csv', 'schema': mappingproxy({'mode': 'observed'})}), on_validation_failure='discard', description=None)})).version
+
+tests/unit/composer_mcp/test_configured_root_admission.py:200: AssertionError
+_______ test_each_writer_refuses_escape_atomically[traversal-set-source] _______
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-197/test_each_writer_refuses_escap2')
+writer = 'set_source', code = 'source_path_policy_invalid', component = 'source'
+escape = 'traversal'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("writer", "code", "component"), _WRITERS)
+    @pytest.mark.parametrize("escape", ["absolute", "traversal", "symlink"])
+    async def test_each_writer_refuses_escape_atomically(tmp_path: Path, writer: str, code: str, component: str, escape: str) -> None:
+        """Skipping any gate must expose both the exact reason and state mutation."""
+        root = tmp_path / "data"
+        root.mkdir()
+        outside = tmp_path / "private"
+        outside.mkdir()
+        (root / "link").symlink_to(outside, target_is_directory=True)
+        (root / "outputs").mkdir()
+        (root / "outputs" / "link").symlink_to(outside, target_is_directory=True)
+        path = {"absolute": str(outside / "data.csv"), "traversal": "../private/data.csv", "symlink": "link/data.csv"}[escape]
+        live = await _live_mcp(tmp_path, root)
+        if writer == "bulk-output" and escape == "traversal":
+            # Existing spelling canonicalization intentionally rejects '..'
+            # before the containment gate and keeps its option-error channel.
+            await _assert_refused_unchanged(live, writer, path, "plugin_options_invalid", component)
+            return
+        result = await _assert_refused_unchanged(live, writer, path, code, component)
+        message = result["validation"]["errors"][0]["message"]
+>       assert "configured" in message.lower() and "root" in message.lower()
+E       assert ('configured' in "source file path options (path or file) must use this session's permitted source locations. use the session's blob binding or an authorized source path.")
+E        +  where "source file path options (path or file) must use this session's permitted source locations. use the session's blob binding or an authorized source path." = <built-in method lower of str object at 0x7f5df9324920>()
+E        +    where <built-in method lower of str object at 0x7f5df9324920> = "Source file path options (path or file) must use this session's permitted source locations. Use the session's blob binding or an authorized source path.".lower
+
+tests/unit/composer_mcp/test_configured_root_admission.py:259: AssertionError
+_______ test_each_writer_refuses_escape_atomically[traversal-set-output] _______
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-197/test_each_writer_refuses_escap3')
+writer = 'set_output', code = 'sink_path_policy_invalid'
+component = 'output:result', escape = 'traversal'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("writer", "code", "component"), _WRITERS)
+    @pytest.mark.parametrize("escape", ["absolute", "traversal", "symlink"])
+    async def test_each_writer_refuses_escape_atomically(tmp_path: Path, writer: str, code: str, component: str, escape: str) -> None:
+        """Skipping any gate must expose both the exact reason and state mutation."""
+        root = tmp_path / "data"
+        root.mkdir()
+        outside = tmp_path / "private"
+        outside.mkdir()
+        (root / "link").symlink_to(outside, target_is_directory=True)
+        (root / "outputs").mkdir()
+        (root / "outputs" / "link").symlink_to(outside, target_is_directory=True)
+        path = {"absolute": str(outside / "data.csv"), "traversal": "../private/data.csv", "symlink": "link/data.csv"}[escape]
+        live = await _live_mcp(tmp_path, root)
+        if writer == "bulk-output" and escape == "traversal":
+            # Existing spelling canonicalization intentionally rejects '..'
+            # before the containment gate and keeps its option-error channel.
+            await _assert_refused_unchanged(live, writer, path, "plugin_options_invalid", component)
+            return
+>       result = await _assert_refused_unchanged(live, writer, path, code, component)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/composer_mcp/test_configured_root_admission.py:257: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+live = _LiveMcp(server=<mcp.server.lowlevel.server.Server object at 0x7f5df93011f0>, scratch=PosixPath('/tmp/pytest-of-agent/pytest-197/test_each_writer_refuses_escap3/scratch'), session_id='39d2bc68e375')
+writer = 'set_output', path = '../private/data.csv'
+code = 'sink_path_policy_invalid', component = 'output:result'
+
+    async def _assert_refused_unchanged(live: _LiveMcp, writer: str, path: object, code: str, component: str) -> dict[str, Any]:
+        before = live.private_state
+        saved = live.saved_bytes
+        public_before = await live.call("get_pipeline_state", {})
+        tool, arguments = _mutation(writer, path)
+        result = await live.call(tool, arguments)
+        assert live.last_audit["status"] == "success"
+        assert live.last_audit["version_before"] == before.version
+>       assert live.last_audit["version_after"] == before.version
+E       AssertionError: assert 5 == 4
+E        +  where 4 = CompositionState(nodes=(NodeSpec(id='before', node_type='transform', plugin='passthrough', input='rows', on_success='m...th': 'input.csv', 'schema': mappingproxy({'mode': 'observed'})}), on_validation_failure='discard', description=None)})).version
+
+tests/unit/composer_mcp/test_configured_root_admission.py:200: AssertionError
+________ test_each_writer_refuses_escape_atomically[symlink-set-source] ________
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-197/test_each_writer_refuses_escap4')
+writer = 'set_source', code = 'source_path_policy_invalid', component = 'source'
+escape = 'symlink'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("writer", "code", "component"), _WRITERS)
+    @pytest.mark.parametrize("escape", ["absolute", "traversal", "symlink"])
+    async def test_each_writer_refuses_escape_atomically(tmp_path: Path, writer: str, code: str, component: str, escape: str) -> None:
+        """Skipping any gate must expose both the exact reason and state mutation."""
+        root = tmp_path / "data"
+        root.mkdir()
+        outside = tmp_path / "private"
+        outside.mkdir()
+        (root / "link").symlink_to(outside, target_is_directory=True)
+        (root / "outputs").mkdir()
+        (root / "outputs" / "link").symlink_to(outside, target_is_directory=True)
+        path = {"absolute": str(outside / "data.csv"), "traversal": "../private/data.csv", "symlink": "link/data.csv"}[escape]
+        live = await _live_mcp(tmp_path, root)
+        if writer == "bulk-output" and escape == "traversal":
+            # Existing spelling canonicalization intentionally rejects '..'
+            # before the containment gate and keeps its option-error channel.
+            await _assert_refused_unchanged(live, writer, path, "plugin_options_invalid", component)
+            return
+        result = await _assert_refused_unchanged(live, writer, path, code, component)
+        message = result["validation"]["errors"][0]["message"]
+>       assert "configured" in message.lower() and "root" in message.lower()
+E       assert ('configured' in "source file path options (path or file) must use this session's permitted source locations. use the session's blob binding or an authorized source path.")
+E        +  where "source file path options (path or file) must use this session's permitted source locations. use the session's blob binding or an authorized source path." = <built-in method lower of str object at 0x7f5df8d9c9f0>()
+E        +    where <built-in method lower of str object at 0x7f5df8d9c9f0> = "Source file path options (path or file) must use this session's permitted source locations. Use the session's blob binding or an authorized source path.".lower
+
+tests/unit/composer_mcp/test_configured_root_admission.py:259: AssertionError
+________ test_each_writer_refuses_escape_atomically[symlink-set-output] ________
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-197/test_each_writer_refuses_escap5')
+writer = 'set_output', code = 'sink_path_policy_invalid'
+component = 'output:result', escape = 'symlink'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("writer", "code", "component"), _WRITERS)
+    @pytest.mark.parametrize("escape", ["absolute", "traversal", "symlink"])
+    async def test_each_writer_refuses_escape_atomically(tmp_path: Path, writer: str, code: str, component: str, escape: str) -> None:
+        """Skipping any gate must expose both the exact reason and state mutation."""
+        root = tmp_path / "data"
+        root.mkdir()
+        outside = tmp_path / "private"
+        outside.mkdir()
+        (root / "link").symlink_to(outside, target_is_directory=True)
+        (root / "outputs").mkdir()
+        (root / "outputs" / "link").symlink_to(outside, target_is_directory=True)
+        path = {"absolute": str(outside / "data.csv"), "traversal": "../private/data.csv", "symlink": "link/data.csv"}[escape]
+        live = await _live_mcp(tmp_path, root)
+        if writer == "bulk-output" and escape == "traversal":
+            # Existing spelling canonicalization intentionally rejects '..'
+            # before the containment gate and keeps its option-error channel.
+            await _assert_refused_unchanged(live, writer, path, "plugin_options_invalid", component)
+            return
+>       result = await _assert_refused_unchanged(live, writer, path, code, component)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/composer_mcp/test_configured_root_admission.py:257: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+live = _LiveMcp(server=<mcp.server.lowlevel.server.Server object at 0x7f5df9310ec0>, scratch=PosixPath('/tmp/pytest-of-agent/pytest-197/test_each_writer_refuses_escap5/scratch'), session_id='4e8819455a19')
+writer = 'set_output', path = 'link/data.csv', code = 'sink_path_policy_invalid'
+component = 'output:result'
+
+    async def _assert_refused_unchanged(live: _LiveMcp, writer: str, path: object, code: str, component: str) -> dict[str, Any]:
+        before = live.private_state
+        saved = live.saved_bytes
+        public_before = await live.call("get_pipeline_state", {})
+        tool, arguments = _mutation(writer, path)
+        result = await live.call(tool, arguments)
+        assert live.last_audit["status"] == "success"
+        assert live.last_audit["version_before"] == before.version
+>       assert live.last_audit["version_after"] == before.version
+E       AssertionError: assert 5 == 4
+E        +  where 4 = CompositionState(nodes=(NodeSpec(id='before', node_type='transform', plugin='passthrough', input='rows', on_success='m...th': 'input.csv', 'schema': mappingproxy({'mode': 'observed'})}), on_validation_failure='discard', description=None)})).version
+
+tests/unit/composer_mcp/test_configured_root_admission.py:200: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_configured_root_admits_file_authoring[relative-set-source]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_configured_root_admits_file_authoring[absolute-set-source]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_each_writer_refuses_escape_atomically[absolute-set-source]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_each_writer_refuses_escape_atomically[absolute-set-output]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_each_writer_refuses_escape_atomically[traversal-set-source]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_each_writer_refuses_escape_atomically[traversal-set-output]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_each_writer_refuses_escape_atomically[symlink-set-source]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_each_writer_refuses_escape_atomically[symlink-set-output]
+================== 8 failed, 2 passed, 85 deselected in 9.19s ==================

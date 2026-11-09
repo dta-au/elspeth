@@ -1,0 +1,204 @@
+"""ExecutionService protocol — called from FastAPI route handlers."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol
+from uuid import UUID
+
+from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
+from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities
+from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.auth.models import UserIdentity
+from elspeth.web.composer.state import CompositionState
+from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.execution.completion_gates import CompletionGateFacts
+from elspeth.web.execution.schemas import RunAccounting, RunStatusResponse, ValidationResult
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.sessions.protocol import RunRecord
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenRunSettings:
+    """One run's immutable policy decision and split configuration forms.
+
+    Both mappings contain references rather than resolved secret values. The
+    executable form may contain operator-private profile bindings; the authored
+    form is the only form permitted to reach audit and export surfaces.
+    """
+
+    plugin_snapshot: PluginAvailabilitySnapshot
+    executable_config: Mapping[str, Any]
+    audit_safe_config: Mapping[str, Any]
+    profiled_s3_audit_identities: S3ProfiledAuditIdentities = ()
+    profiled_textract_audit_identities: TextractProfiledAuditIdentities = ()
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "executable_config", "audit_safe_config")
+
+
+class ValidationSettings(Protocol):
+    """Settings needed by direct runtime preflight validation.
+
+    Structurally satisfied by WebSettings (data_dir is a Path) and any test
+    stub that exposes a Path-typed data_dir attribute.
+    """
+
+    @property
+    def data_dir(self) -> Path: ...
+
+
+class StateAccessError(Exception):
+    """Raised when a client-supplied ``state_id`` cannot be accessed.
+
+    Deliberately does NOT distinguish between "state does not exist"
+    and "state exists but belongs to another user's session". Echoing
+    that distinction through the HTTP response body is an IDOR oracle:
+    an authenticated user can probe arbitrary UUIDs against their own
+    ``/execute`` endpoint and learn which ones exist in OTHER users'
+    sessions. The two cases are therefore folded into a single
+    exception type whose handler MUST return a byte-identical
+    ``{"detail": "State not found"}`` 404. The ``send_message`` route in
+    ``sessions/routes.py`` carries the same contract on the chat-message
+    IDOR surface.
+
+    If a future refactor needs diagnostic precision about which of the
+    two branches tripped (e.g. for ops dashboards), it MUST route that
+    signal through server-side audit/telemetry, never through the HTTP
+    response body or status code.
+    """
+
+
+class YamlGenerator(Protocol):
+    """Protocol for objects that generate YAML from CompositionState.
+
+    The production implementation is the ``elspeth.web.composer.yaml_generator``
+    module, which satisfies this protocol via its module-level ``generate_yaml``
+    function. Injected as a dependency so tests can substitute a stub.
+    """
+
+    def generate_yaml(self, state: CompositionState) -> str: ...
+
+
+class ExecutionService(Protocol):
+    """Protocol for pipeline execution operations.
+
+    All methods are called from FastAPI route handlers in the async context.
+    execute() returns immediately; the pipeline runs in a background thread.
+    """
+
+    async def validate(
+        self,
+        session_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+        user_id: str | None = None,
+    ) -> ValidationResult:
+        """Async dry-run validation using real engine code paths.
+
+        Loads the current CompositionState for the session, generates YAML,
+        and runs it through load_settings -> instantiate_plugins_from_config
+        -> ExecutionGraph.from_plugin_instances -> graph.validate().
+
+        When user_id and a secret_service are provided, also validates
+        that all {"secret_ref": "NAME"} patterns are resolvable.
+
+        Async because the implementation wraps the sync validate_pipeline()
+        call via run_in_executor to avoid blocking the event loop.
+        """
+        ...
+
+    async def validate_state(
+        self,
+        state: CompositionState,
+        *,
+        session_operation_context: SessionOperationContext,
+        user_id: str | None = None,
+        session_id: UUID | None = None,
+        completion_gates: CompletionGateFacts | None = None,
+        fresh: bool = False,
+    ) -> ValidationResult:
+        """Async dry-run validation for an already materialized composition state.
+
+        Callers that have already read a CompositionState use this overload so
+        validation and any adjacent projections are computed from the same
+        composition version. When provided, ``session_id`` scopes inline blob
+        metadata lookups to the same session boundary that execution enforces
+        before linking blobs to runs.
+
+        ``completion_gates`` carries persisted composer completion-gate facts
+        parsed off the caller's ``composition_states`` record; the recompute
+        cannot rediscover those turn events, so the implementation merges them
+        into the returned readiness (withholding ``completion_ready`` only).
+
+        ``fresh=True`` bypasses the implementation's short-lived advisory
+        result memo; callers writing the verdict into a durable audit-bearing
+        record must pass it.
+        """
+        ...
+
+    async def execute(
+        self,
+        session_id: UUID,
+        state_id: UUID | None = None,
+        *,
+        session_operation_lease: SessionOperationLease,
+        user_id: str | None = None,
+        auth_provider_type: str | None = None,
+        fanout_ack_token: str | None = None,
+        secret_ack_token: str | None = None,
+    ) -> UUID:
+        """Start a background pipeline run.
+
+        Returns the run_id immediately. Raises RunAlreadyActiveError if
+        a pending or running Run already exists for this session.
+
+        Args:
+            session_id: Session to execute.
+            state_id: Specific state to execute (latest if None).
+            user_id: Authenticated user's ID for scoped secret resolution.
+            auth_provider_type: Auth provider namespace for Landscape run attribution.
+            fanout_ack_token: Optional launch acknowledgement for high-fanout
+                LLM/provider-call risk.
+            secret_ack_token: Optional out-of-band approval of the run's wired
+                secret→destination set (elspeth-f3c1aafd25).
+
+        Note: async because it calls SessionService (async) for active-run
+        check and run creation. The actual pipeline runs in a background
+        thread via ThreadPoolExecutor — only the setup is async.
+        """
+        ...
+
+    def get_session_lock(self, session_id: str) -> asyncio.Lock:
+        """Return the per-session lock shared by execute and delete flows."""
+        ...
+
+    def cleanup_session_lock(self, session_id: str) -> None:
+        """Remove ephemeral per-session lock state after session deletion."""
+        ...
+
+    async def get_status(
+        self,
+        run_id: UUID,
+        *,
+        accounting: RunAccounting | None = None,
+        run_record: RunRecord | None = None,
+    ) -> RunStatusResponse:
+        """Return current run status from the Run database record."""
+        ...
+
+    async def cancel(self, run_id: UUID, *, user: UserIdentity) -> None:
+        """Persist authenticated cancellation intent; terminal requests are idempotent."""
+        ...
+
+    async def verify_run_ownership(self, user: UserIdentity, run_id: str) -> bool:
+        """Verify that a run belongs to the authenticated user's session."""
+        ...
+
+    async def shutdown(self) -> None:
+        """Drain executor-owned runs without blocking the event loop."""
+        ...

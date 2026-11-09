@@ -1,0 +1,12 @@
+diff --git a/src/elspeth/web/composer/tool_batch.py b/src/elspeth/web/composer/tool_batch.py
+index 05a5b93db..53e944b60 100644
+--- a/src/elspeth/web/composer/tool_batch.py
++++ b/src/elspeth/web/composer/tool_batch.py
+@@ -2298,6 +2298,7 @@ async def run_tool_batch(
+                             recorder=recorder,
+                         )
+                 except ProposalResourceUnavailableError:
++                    proposals_this_turn += 1
+                     unapplied_admission = _unapplied_admission(
+                         _saved_graph_rejection_result(
+                             state,

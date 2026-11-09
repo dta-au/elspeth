@@ -1,0 +1,1292 @@
+{
+  "new": {
+    "success": true,
+    "data": {
+      "session_id": "be1c512e6917",
+      "name": "Untitled Pipeline"
+    },
+    "state": {
+      "version": 1,
+      "metadata": {
+        "name": "Untitled Pipeline",
+        "description": ""
+      },
+      "sources": {},
+      "nodes": [],
+      "edges": [],
+      "outputs": []
+    }
+  },
+  "source": {
+    "success": true,
+    "validation": {
+      "is_valid": false,
+      "errors": [
+        {
+          "component": "pipeline",
+          "message": "No sinks configured.",
+          "severity": "high",
+          "error_code": "no_sinks_configured"
+        },
+        {
+          "component": "source",
+          "message": "Source on_success 'result' is neither a sink nor a known connection.",
+          "severity": "high",
+          "error_code": "source_on_success_dangling"
+        }
+      ],
+      "warnings": [
+        {
+          "component": "source",
+          "message": "Source on_success 'result' does not match any node input or output \u2014 data may not flow.",
+          "severity": "medium"
+        }
+      ],
+      "suggestions": [],
+      "semantic_contracts": [],
+      "graph_repair_suggestions": []
+    },
+    "affected_nodes": [
+      "source"
+    ],
+    "version": 2,
+    "validation_delta": {
+      "new_errors": [
+        {
+          "component": "source",
+          "message": "Source on_success 'result' is neither a sink nor a known connection.",
+          "severity": "high",
+          "error_code": "source_on_success_dangling"
+        }
+      ],
+      "resolved_errors": [
+        {
+          "component": "source",
+          "message": "No source configured.",
+          "severity": "high",
+          "error_code": "no_source_configured"
+        }
+      ],
+      "new_warnings": [
+        {
+          "component": "source",
+          "message": "Source on_success 'result' does not match any node input or output \u2014 data may not flow.",
+          "severity": "medium"
+        }
+      ],
+      "resolved_warnings": []
+    },
+    "applied_component": {
+      "source": {
+        "plugin": "null",
+        "on_success": "result",
+        "options": {
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_validation_failure": "discard",
+        "description": null
+      }
+    },
+    "state": {
+      "version": 2,
+      "metadata": {
+        "name": "Untitled Pipeline",
+        "description": ""
+      },
+      "sources": {
+        "source": {
+          "plugin": "null",
+          "on_success": "result",
+          "options": {
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [],
+      "edges": [],
+      "outputs": []
+    }
+  },
+  "output": {
+    "success": true,
+    "validation": {
+      "is_valid": true,
+      "errors": [],
+      "warnings": [],
+      "suggestions": [],
+      "semantic_contracts": [],
+      "graph_repair_suggestions": []
+    },
+    "affected_nodes": [
+      "result"
+    ],
+    "version": 3,
+    "validation_delta": {
+      "new_errors": [],
+      "resolved_errors": [
+        {
+          "component": "pipeline",
+          "message": "No sinks configured.",
+          "severity": "high",
+          "error_code": "no_sinks_configured"
+        },
+        {
+          "component": "source",
+          "message": "Source on_success 'result' is neither a sink nor a known connection.",
+          "severity": "high",
+          "error_code": "source_on_success_dangling"
+        }
+      ],
+      "new_warnings": [],
+      "resolved_warnings": [
+        {
+          "component": "source",
+          "message": "Source on_success 'result' does not match any node input or output \u2014 data may not flow.",
+          "severity": "medium"
+        }
+      ]
+    },
+    "applied_component": {
+      "outputs": [
+        {
+          "sink_name": "result",
+          "plugin": "csv",
+          "options": {
+            "path": "output.csv",
+            "schema": {
+              "mode": "observed"
+            },
+            "mode": "write",
+            "collision_policy": "auto_increment"
+          },
+          "on_write_failure": "discard",
+          "description": null
+        }
+      ]
+    },
+    "state": {
+      "version": 3,
+      "metadata": {
+        "name": "Untitled Pipeline",
+        "description": ""
+      },
+      "sources": {
+        "source": {
+          "plugin": "null",
+          "on_success": "result",
+          "options": {
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "result",
+          "plugin": "csv",
+          "options": {
+            "path": "output.csv",
+            "schema": {
+              "mode": "observed"
+            },
+            "mode": "write",
+            "collision_policy": "auto_increment"
+          },
+          "on_write_failure": "discard"
+        }
+      ]
+    }
+  },
+  "preview": {
+    "success": true,
+    "validation": {
+      "is_valid": true,
+      "errors": [],
+      "warnings": [],
+      "suggestions": [],
+      "semantic_contracts": [],
+      "graph_repair_suggestions": []
+    },
+    "affected_nodes": [],
+    "version": 3,
+    "data": {
+      "preview_is_valid": true,
+      "preview_errors": [],
+      "edge_contracts": [],
+      "proof_diagnostics": [],
+      "sources": {
+        "source": {
+          "plugin": "null",
+          "on_success": "result",
+          "has_schema_config": true
+        }
+      },
+      "node_count": 0,
+      "output_count": 1,
+      "nodes": [],
+      "outputs": [
+        {
+          "name": "result",
+          "plugin": "csv"
+        }
+      ]
+    },
+    "runtime_preflight": {
+      "is_valid": true,
+      "checks": [
+        {
+          "name": "plugin_enablement",
+          "passed": true,
+          "detail": "plugin_enablement passed.",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "operator_profile_options",
+          "passed": true,
+          "detail": "operator_profile_options passed.",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "required_control_availability",
+          "passed": true,
+          "detail": "required_control_availability passed.",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "required_control_coverage",
+          "passed": true,
+          "detail": "required_control_coverage passed.",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "path_allowlist",
+          "passed": true,
+          "detail": "All paths within allowed directories",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "web_scrape_network_policy",
+          "passed": true,
+          "detail": "Local trained-operator validation is exempt from the web fetch private-network policy",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "web_fetch_resource_policy",
+          "passed": true,
+          "detail": "Local trained-operator validation is exempt from the web HTTP-fetch resource policy",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "secret_refs",
+          "passed": true,
+          "detail": "No secret service \u2014 check skipped",
+          "affected_nodes": [],
+          "outcome_code": "secret_refs.skipped_no_service"
+        },
+        {
+          "name": "semantic_contracts",
+          "passed": true,
+          "detail": "No semantic contracts to check",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "batch_transform_options",
+          "passed": true,
+          "detail": "Batch-aware transform options are compatible with ADR-013",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "interpretation_review",
+          "passed": true,
+          "detail": "No pending interpretation review",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "blob_inline_refs",
+          "passed": true,
+          "detail": "No inline-content blob references found",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "llm_retry_budget_policy",
+          "passed": true,
+          "detail": "No unsafe web-authored sequential multi-query LLM retry budget",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "llm_base_url_policy",
+          "passed": true,
+          "detail": "No web-authored OpenRouter base_url override",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "llm_tracing_policy",
+          "passed": true,
+          "detail": "No web-authored LLM tracing configuration",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "aws_s3_endpoint_url_policy",
+          "passed": true,
+          "detail": "Local trained-operator validation is exempt from the web aws_s3 endpoint_url policy",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "aws_s3_source_policy",
+          "passed": true,
+          "detail": "Local trained-operator validation is exempt from the web aws_s3 source policy",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "settings_load",
+          "passed": true,
+          "detail": "Settings loaded successfully",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "plugin_instantiation",
+          "passed": true,
+          "detail": "All plugins instantiated",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "value_source_compliance",
+          "passed": true,
+          "detail": "All declared value sources satisfied",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "graph_structure",
+          "passed": true,
+          "detail": "Graph structure is valid",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "route_target_resolution",
+          "passed": true,
+          "detail": "All route targets resolve to existing sinks",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "schema_compatibility",
+          "passed": true,
+          "detail": "All edge schemas compatible",
+          "affected_nodes": [],
+          "outcome_code": null
+        }
+      ],
+      "errors": [],
+      "warnings": [],
+      "readiness": {
+        "authoring_valid": true,
+        "execution_ready": true,
+        "completion_ready": true,
+        "blockers": []
+      },
+      "semantic_contracts": []
+    },
+    "state": {
+      "version": 3,
+      "metadata": {
+        "name": "Untitled Pipeline",
+        "description": ""
+      },
+      "sources": {
+        "source": {
+          "plugin": "null",
+          "on_success": "result",
+          "options": {
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "result",
+          "plugin": "csv",
+          "options": {
+            "path": "output.csv",
+            "schema": {
+              "mode": "observed"
+            },
+            "mode": "write",
+            "collision_policy": "auto_increment"
+          },
+          "on_write_failure": "discard"
+        }
+      ]
+    }
+  },
+  "file_source": {
+    "success": true,
+    "validation": {
+      "is_valid": true,
+      "errors": [],
+      "warnings": [],
+      "suggestions": [],
+      "semantic_contracts": [],
+      "graph_repair_suggestions": []
+    },
+    "affected_nodes": [
+      "source"
+    ],
+    "version": 4,
+    "validation_delta": {
+      "new_errors": [],
+      "resolved_errors": [],
+      "new_warnings": [],
+      "resolved_warnings": []
+    },
+    "applied_component": {
+      "source": {
+        "plugin": "csv",
+        "on_success": "result",
+        "options": {
+          "path": "input.csv",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "on_validation_failure": "discard",
+        "description": null
+      }
+    },
+    "state": {
+      "version": 4,
+      "metadata": {
+        "name": "Untitled Pipeline",
+        "description": ""
+      },
+      "sources": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "result",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "result",
+          "plugin": "csv",
+          "options": {
+            "path": "output.csv",
+            "schema": {
+              "mode": "observed"
+            },
+            "mode": "write",
+            "collision_policy": "auto_increment"
+          },
+          "on_write_failure": "discard"
+        }
+      ]
+    }
+  },
+  "source_pipeline": {
+    "success": true,
+    "validation": {
+      "is_valid": true,
+      "errors": [],
+      "warnings": [],
+      "suggestions": [],
+      "semantic_contracts": [],
+      "graph_repair_suggestions": []
+    },
+    "affected_nodes": [
+      "source",
+      "result"
+    ],
+    "version": 5,
+    "validation_delta": {
+      "new_errors": [],
+      "resolved_errors": [],
+      "new_warnings": [],
+      "resolved_warnings": []
+    },
+    "state": {
+      "version": 5,
+      "metadata": {
+        "name": "Untitled Pipeline",
+        "description": ""
+      },
+      "sources": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "result",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "result",
+          "plugin": "csv",
+          "options": {
+            "path": "outputs/output.csv",
+            "schema": {
+              "mode": "observed"
+            },
+            "mode": "write",
+            "collision_policy": "auto_increment"
+          },
+          "on_write_failure": "discard"
+        }
+      ]
+    }
+  },
+  "source_preview": {
+    "success": true,
+    "validation": {
+      "is_valid": true,
+      "errors": [],
+      "warnings": [],
+      "suggestions": [],
+      "semantic_contracts": [],
+      "graph_repair_suggestions": []
+    },
+    "affected_nodes": [],
+    "version": 5,
+    "data": {
+      "preview_is_valid": true,
+      "preview_errors": [],
+      "edge_contracts": [],
+      "proof_diagnostics": [],
+      "sources": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "result",
+          "has_schema_config": true
+        }
+      },
+      "node_count": 0,
+      "output_count": 1,
+      "nodes": [],
+      "outputs": [
+        {
+          "name": "result",
+          "plugin": "csv"
+        }
+      ]
+    },
+    "runtime_preflight": {
+      "is_valid": true,
+      "checks": [
+        {
+          "name": "plugin_enablement",
+          "passed": true,
+          "detail": "plugin_enablement passed.",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "operator_profile_options",
+          "passed": true,
+          "detail": "operator_profile_options passed.",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "required_control_availability",
+          "passed": true,
+          "detail": "required_control_availability passed.",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "required_control_coverage",
+          "passed": true,
+          "detail": "required_control_coverage passed.",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "path_allowlist",
+          "passed": true,
+          "detail": "All paths within allowed directories",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "web_scrape_network_policy",
+          "passed": true,
+          "detail": "Local trained-operator validation is exempt from the web fetch private-network policy",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "web_fetch_resource_policy",
+          "passed": true,
+          "detail": "Local trained-operator validation is exempt from the web HTTP-fetch resource policy",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "secret_refs",
+          "passed": true,
+          "detail": "No secret service \u2014 check skipped",
+          "affected_nodes": [],
+          "outcome_code": "secret_refs.skipped_no_service"
+        },
+        {
+          "name": "semantic_contracts",
+          "passed": true,
+          "detail": "No semantic contracts to check",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "batch_transform_options",
+          "passed": true,
+          "detail": "Batch-aware transform options are compatible with ADR-013",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "interpretation_review",
+          "passed": true,
+          "detail": "No pending interpretation review",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "blob_inline_refs",
+          "passed": true,
+          "detail": "No inline-content blob references found",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "llm_retry_budget_policy",
+          "passed": true,
+          "detail": "No unsafe web-authored sequential multi-query LLM retry budget",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "llm_base_url_policy",
+          "passed": true,
+          "detail": "No web-authored OpenRouter base_url override",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "llm_tracing_policy",
+          "passed": true,
+          "detail": "No web-authored LLM tracing configuration",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "aws_s3_endpoint_url_policy",
+          "passed": true,
+          "detail": "Local trained-operator validation is exempt from the web aws_s3 endpoint_url policy",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "aws_s3_source_policy",
+          "passed": true,
+          "detail": "Local trained-operator validation is exempt from the web aws_s3 source policy",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "settings_load",
+          "passed": true,
+          "detail": "Settings loaded successfully",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "plugin_instantiation",
+          "passed": true,
+          "detail": "All plugins instantiated",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "value_source_compliance",
+          "passed": true,
+          "detail": "All declared value sources satisfied",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "graph_structure",
+          "passed": true,
+          "detail": "Graph structure is valid",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "route_target_resolution",
+          "passed": true,
+          "detail": "All route targets resolve to existing sinks",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "schema_compatibility",
+          "passed": true,
+          "detail": "All edge schemas compatible",
+          "affected_nodes": [],
+          "outcome_code": null
+        }
+      ],
+      "errors": [],
+      "warnings": [],
+      "readiness": {
+        "authoring_valid": true,
+        "execution_ready": true,
+        "completion_ready": true,
+        "blockers": []
+      },
+      "semantic_contracts": []
+    },
+    "state": {
+      "version": 5,
+      "metadata": {
+        "name": "Untitled Pipeline",
+        "description": ""
+      },
+      "sources": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "result",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "result",
+          "plugin": "csv",
+          "options": {
+            "path": "outputs/output.csv",
+            "schema": {
+              "mode": "observed"
+            },
+            "mode": "write",
+            "collision_policy": "auto_increment"
+          },
+          "on_write_failure": "discard"
+        }
+      ]
+    }
+  },
+  "sources_pipeline": {
+    "success": true,
+    "validation": {
+      "is_valid": true,
+      "errors": [],
+      "warnings": [],
+      "suggestions": [],
+      "semantic_contracts": [],
+      "graph_repair_suggestions": []
+    },
+    "affected_nodes": [
+      "source:orders",
+      "result"
+    ],
+    "version": 6,
+    "validation_delta": {
+      "new_errors": [],
+      "resolved_errors": [],
+      "new_warnings": [],
+      "resolved_warnings": []
+    },
+    "state": {
+      "version": 6,
+      "metadata": {
+        "name": "Untitled Pipeline",
+        "description": ""
+      },
+      "sources": {
+        "orders": {
+          "plugin": "csv",
+          "on_success": "result",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "result",
+          "plugin": "csv",
+          "options": {
+            "path": "outputs/output.csv",
+            "schema": {
+              "mode": "observed"
+            },
+            "mode": "write",
+            "collision_policy": "auto_increment"
+          },
+          "on_write_failure": "discard"
+        }
+      ]
+    }
+  },
+  "sources_preview": {
+    "success": true,
+    "validation": {
+      "is_valid": true,
+      "errors": [],
+      "warnings": [],
+      "suggestions": [],
+      "semantic_contracts": [],
+      "graph_repair_suggestions": []
+    },
+    "affected_nodes": [],
+    "version": 6,
+    "data": {
+      "preview_is_valid": true,
+      "preview_errors": [],
+      "edge_contracts": [],
+      "proof_diagnostics": [],
+      "sources": {
+        "orders": {
+          "plugin": "csv",
+          "on_success": "result",
+          "has_schema_config": true
+        }
+      },
+      "node_count": 0,
+      "output_count": 1,
+      "nodes": [],
+      "outputs": [
+        {
+          "name": "result",
+          "plugin": "csv"
+        }
+      ]
+    },
+    "runtime_preflight": {
+      "is_valid": true,
+      "checks": [
+        {
+          "name": "plugin_enablement",
+          "passed": true,
+          "detail": "plugin_enablement passed.",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "operator_profile_options",
+          "passed": true,
+          "detail": "operator_profile_options passed.",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "required_control_availability",
+          "passed": true,
+          "detail": "required_control_availability passed.",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "required_control_coverage",
+          "passed": true,
+          "detail": "required_control_coverage passed.",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "path_allowlist",
+          "passed": true,
+          "detail": "All paths within allowed directories",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "web_scrape_network_policy",
+          "passed": true,
+          "detail": "Local trained-operator validation is exempt from the web fetch private-network policy",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "web_fetch_resource_policy",
+          "passed": true,
+          "detail": "Local trained-operator validation is exempt from the web HTTP-fetch resource policy",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "secret_refs",
+          "passed": true,
+          "detail": "No secret service \u2014 check skipped",
+          "affected_nodes": [],
+          "outcome_code": "secret_refs.skipped_no_service"
+        },
+        {
+          "name": "semantic_contracts",
+          "passed": true,
+          "detail": "No semantic contracts to check",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "batch_transform_options",
+          "passed": true,
+          "detail": "Batch-aware transform options are compatible with ADR-013",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "interpretation_review",
+          "passed": true,
+          "detail": "No pending interpretation review",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "blob_inline_refs",
+          "passed": true,
+          "detail": "No inline-content blob references found",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "llm_retry_budget_policy",
+          "passed": true,
+          "detail": "No unsafe web-authored sequential multi-query LLM retry budget",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "llm_base_url_policy",
+          "passed": true,
+          "detail": "No web-authored OpenRouter base_url override",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "llm_tracing_policy",
+          "passed": true,
+          "detail": "No web-authored LLM tracing configuration",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "aws_s3_endpoint_url_policy",
+          "passed": true,
+          "detail": "Local trained-operator validation is exempt from the web aws_s3 endpoint_url policy",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "aws_s3_source_policy",
+          "passed": true,
+          "detail": "Local trained-operator validation is exempt from the web aws_s3 source policy",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "settings_load",
+          "passed": true,
+          "detail": "Settings loaded successfully",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "plugin_instantiation",
+          "passed": true,
+          "detail": "All plugins instantiated",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "value_source_compliance",
+          "passed": true,
+          "detail": "All declared value sources satisfied",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "graph_structure",
+          "passed": true,
+          "detail": "Graph structure is valid",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "route_target_resolution",
+          "passed": true,
+          "detail": "All route targets resolve to existing sinks",
+          "affected_nodes": [],
+          "outcome_code": null
+        },
+        {
+          "name": "schema_compatibility",
+          "passed": true,
+          "detail": "All edge schemas compatible",
+          "affected_nodes": [],
+          "outcome_code": null
+        }
+      ],
+      "errors": [],
+      "warnings": [],
+      "readiness": {
+        "authoring_valid": true,
+        "execution_ready": true,
+        "completion_ready": true,
+        "blockers": []
+      },
+      "semantic_contracts": []
+    },
+    "state": {
+      "version": 6,
+      "metadata": {
+        "name": "Untitled Pipeline",
+        "description": ""
+      },
+      "sources": {
+        "orders": {
+          "plugin": "csv",
+          "on_success": "result",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "result",
+          "plugin": "csv",
+          "options": {
+            "path": "outputs/output.csv",
+            "schema": {
+              "mode": "observed"
+            },
+            "mode": "write",
+            "collision_policy": "auto_increment"
+          },
+          "on_write_failure": "discard"
+        }
+      ]
+    }
+  },
+  "patch": {
+    "success": true,
+    "validation": {
+      "is_valid": true,
+      "errors": [],
+      "warnings": [],
+      "suggestions": [],
+      "semantic_contracts": [],
+      "graph_repair_suggestions": []
+    },
+    "affected_nodes": [
+      "result"
+    ],
+    "version": 7,
+    "validation_delta": {
+      "new_errors": [],
+      "resolved_errors": [],
+      "new_warnings": [],
+      "resolved_warnings": []
+    },
+    "applied_component": {
+      "outputs": [
+        {
+          "sink_name": "result",
+          "plugin": "csv",
+          "options": {
+            "path": "patched.csv",
+            "schema": {
+              "mode": "observed"
+            },
+            "mode": "write",
+            "collision_policy": "auto_increment"
+          },
+          "on_write_failure": "discard",
+          "description": null
+        }
+      ]
+    },
+    "state": {
+      "version": 7,
+      "metadata": {
+        "name": "Untitled Pipeline",
+        "description": ""
+      },
+      "sources": {
+        "orders": {
+          "plugin": "csv",
+          "on_success": "result",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "result",
+          "plugin": "csv",
+          "options": {
+            "path": "patched.csv",
+            "schema": {
+              "mode": "observed"
+            },
+            "mode": "write",
+            "collision_policy": "auto_increment"
+          },
+          "on_write_failure": "discard"
+        }
+      ]
+    }
+  },
+  "export": {
+    "success": true,
+    "data": "sources:\n  orders:\n    plugin: csv\n    on_success: result\n    options:\n      schema:\n        mode: observed\n      on_validation_failure: discard\nsinks:\n  result:\n    plugin: csv\n    on_write_failure: discard\n    options:\n      schema:\n        mode: observed\n      mode: write\n      collision_policy: auto_increment\n",
+    "state": {
+      "version": 7,
+      "metadata": {
+        "name": "Untitled Pipeline",
+        "description": ""
+      },
+      "sources": {
+        "orders": {
+          "plugin": "csv",
+          "on_success": "result",
+          "options": {
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "result",
+          "plugin": "csv",
+          "options": {
+            "schema": {
+              "mode": "observed"
+            },
+            "mode": "write",
+            "collision_policy": "auto_increment"
+          },
+          "on_write_failure": "discard"
+        }
+      ]
+    }
+  },
+  "private": {
+    "edges": [],
+    "metadata": {
+      "description": "",
+      "name": "Untitled Pipeline"
+    },
+    "nodes": [],
+    "outputs": [
+      {
+        "name": "result",
+        "on_write_failure": "discard",
+        "options": {
+          "collision_policy": "auto_increment",
+          "mode": "write",
+          "path": "patched.csv",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "plugin": "csv"
+      }
+    ],
+    "sources": {
+      "orders": {
+        "on_success": "result",
+        "on_validation_failure": "discard",
+        "options": {
+          "path": "input.csv",
+          "schema": {
+            "mode": "observed"
+          }
+        },
+        "plugin": "csv"
+      }
+    },
+    "version": 7
+  },
+  "returncode": 0
+}

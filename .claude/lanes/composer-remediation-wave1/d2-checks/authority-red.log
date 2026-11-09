@@ -1,0 +1,173 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-d2
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 98 items / 73 deselected / 25 selected
+
+tests/unit/composer_mcp/test_configured_root_admission.py ......F....... [ 56%]
+...F....F.F                                                              [100%]
+
+=================================== FAILURES ===================================
+_____ test_configured_root_admits_file_authoring[relative-splice-provider] _____
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/authority-red-tmp/test_configured_root_admits_fi6')
+writer = 'splice_transform', code = 'provider_config_path_policy_invalid'
+component = 'node:inserted', spelling = 'relative'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("writer", "code", "component"), _WRITERS)
+    @pytest.mark.parametrize("spelling", ["relative", "absolute"])
+    async def test_configured_root_admits_file_authoring(
+        tmp_path: Path, writer: str, code: str, component: str, spelling: str
+    ) -> None:
+        """Removing root authority from any writer must break its positive control."""
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "admitted.csv").write_text("text\nhello\n")
+        live = await _live_mcp(tmp_path, root)
+        path = "admitted.csv" if spelling == "relative" else str(root / "admitted.csv")
+        tool, arguments = _mutation(writer, path)
+        result = await live.call(tool, arguments)
+>       assert result["success"] is True, result
+E       AssertionError: {'affected_nodes': [], 'state': {'edges': [{'edge_type': 'on_success', 'from_node': 'source', 'id': 'source-before', '...pper before this node.", ...}], 'graph_repair_suggestions': [], 'is_valid': False, 'semantic_contracts': [], ...}, ...}
+E       assert False is True
+
+tests/unit/composer_mcp/test_configured_root_admission.py:246: AssertionError
+_____ test_configured_root_admits_file_authoring[absolute-splice-provider] _____
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/authority-red-tmp/test_configured_root_admits_fi17')
+writer = 'splice_transform', code = 'provider_config_path_policy_invalid'
+component = 'node:inserted', spelling = 'absolute'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("writer", "code", "component"), _WRITERS)
+    @pytest.mark.parametrize("spelling", ["relative", "absolute"])
+    async def test_configured_root_admits_file_authoring(
+        tmp_path: Path, writer: str, code: str, component: str, spelling: str
+    ) -> None:
+        """Removing root authority from any writer must break its positive control."""
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "admitted.csv").write_text("text\nhello\n")
+        live = await _live_mcp(tmp_path, root)
+        path = "admitted.csv" if spelling == "relative" else str(root / "admitted.csv")
+        tool, arguments = _mutation(writer, path)
+        result = await live.call(tool, arguments)
+>       assert result["success"] is True, result
+E       AssertionError: {'affected_nodes': [], 'state': {'edges': [{'edge_type': 'on_success', 'from_node': 'source', 'id': 'source-before', '...pper before this node.", ...}], 'graph_repair_suggestions': [], 'is_valid': False, 'semantic_contracts': [], ...}, ...}
+E       assert False is True
+
+tests/unit/composer_mcp/test_configured_root_admission.py:246: AssertionError
+___ test_mcp_execution_and_compiled_identity_resolve_the_same_private_paths ____
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/authority-red-tmp/test_mcp_execution_and_compile0')
+
+    def test_mcp_execution_and_compiled_identity_resolve_the_same_private_paths(tmp_path: Path) -> None:
+        """Dropping authority at either materializer must expose a path disagreement."""
+        state = _seed_state()
+        authority = McpConfiguredRootAuthority(tmp_path / "data")
+        generator = yaml_generator
+>       report = materialize_validation_yaml(
+            _interpretation(state), yaml_generator=generator, data_dir=authority.root,
+            session_id=None, blob_get_metadata=None, load_yaml=yaml.safe_load,
+            mcp_root_authority=authority,
+        )
+E       TypeError: materialize_validation_yaml() got an unexpected keyword argument 'mcp_root_authority'
+
+tests/unit/composer_mcp/test_configured_root_admission.py:477: TypeError
+___ test_shared_coordinator_distinguishes_authority_mode_and_canonical_root ____
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/authority-red-tmp/test_shared_coordinator_distin0')
+
+    @pytest.mark.asyncio
+    async def test_shared_coordinator_distinguishes_authority_mode_and_canonical_root(tmp_path: Path) -> None:
+        """Equal caller settings hashes cannot let one filesystem mode borrow another's verdict."""
+        coordinator = RuntimePreflightCoordinator()
+        release = asyncio.Event()
+        started: list[str] = []
+        servers = []
+        roots = [tmp_path / "a", tmp_path / "a" / ".", tmp_path / "b", None]
+        for index, root in enumerate(roots):
+            async def preflight(state: CompositionState, label: str = str(index)) -> ValidationResult:
+                started.append(label)
+                await release.wait()
+                return ValidationResult(is_valid=True, checks=[], errors=[], warnings=[])
+            scratch = tmp_path / str(index)
+            scratch.mkdir()
+            servers.append(_LiveMcp(create_server(
+                create_catalog_service(), scratch, runtime_preflight=preflight,
+                runtime_preflight_settings_hash="same-settings", runtime_preflight_coordinator=coordinator,
+                session_scope_provider=lambda: "same-scope",
+                mcp_root_authority=McpConfiguredRootAuthority(root) if root is not None else None,
+            ), scratch, "unused"))
+        calls = [asyncio.create_task(live.call("preview_pipeline", {})) for live in servers]
+        try:
+            for _ in range(100):
+                if len(started) >= 3:
+                    break
+                await asyncio.sleep(0.001)
+>           assert len(started) == 3
+E           AssertionError: assert 1 == 3
+E            +  where 1 = len(['0'])
+
+tests/unit/composer_mcp/test_configured_root_admission.py:540: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/authority-red-tmp/test_shared_coordinator_distin0')
+
+    @pytest.mark.asyncio
+    async def test_shared_coordinator_distinguishes_authority_mode_and_canonical_root(tmp_path: Path) -> None:
+        """Equal caller settings hashes cannot let one filesystem mode borrow another's verdict."""
+        coordinator = RuntimePreflightCoordinator()
+        release = asyncio.Event()
+        started: list[str] = []
+        servers = []
+        roots = [tmp_path / "a", tmp_path / "a" / ".", tmp_path / "b", None]
+        for index, root in enumerate(roots):
+            async def preflight(state: CompositionState, label: str = str(index)) -> ValidationResult:
+                started.append(label)
+                await release.wait()
+                return ValidationResult(is_valid=True, checks=[], errors=[], warnings=[])
+            scratch = tmp_path / str(index)
+            scratch.mkdir()
+            servers.append(_LiveMcp(create_server(
+                create_catalog_service(), scratch, runtime_preflight=preflight,
+                runtime_preflight_settings_hash="same-settings", runtime_preflight_coordinator=coordinator,
+                session_scope_provider=lambda: "same-scope",
+                mcp_root_authority=McpConfiguredRootAuthority(root) if root is not None else None,
+            ), scratch, "unused"))
+        calls = [asyncio.create_task(live.call("preview_pipeline", {})) for live in servers]
+        try:
+            for _ in range(100):
+                if len(started) >= 3:
+                    break
+                await asyncio.sleep(0.001)
+            assert len(started) == 3
+        finally:
+            release.set()
+>           await asyncio.gather(*calls)
+
+tests/unit/composer_mcp/test_configured_root_admission.py:543: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = _LiveMcp(server=<mcp.server.lowlevel.server.Server object at 0x7f6d947f67e0>, scratch=PosixPath('/workspace/elspeth/.c.../lanes/composer-remediation-wave1/d2-checks/authority-red-tmp/test_shared_coordinator_distin0/0'), session_id='unused')
+name = 'preview_pipeline', arguments = {}
+
+    async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        response = await self.raw_call(name, arguments)
+>       assert not response.isError, response
+E       AssertionError: CallToolResult(meta=None, content=[TextContent(type='text', text='Tool error: ValidationError', annotations=None, meta=None)], structuredContent=None, isError=True)
+E       assert not True
+E        +  where True = CallToolResult(meta=None, content=[TextContent(type='text', text='Tool error: ValidationError', annotations=None, meta=None)], structuredContent=None, isError=True).isError
+
+tests/unit/composer_mcp/test_configured_root_admission.py:169: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_configured_root_admits_file_authoring[relative-splice-provider]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_configured_root_admits_file_authoring[absolute-splice-provider]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_mcp_execution_and_compiled_identity_resolve_the_same_private_paths
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_shared_coordinator_distinguishes_authority_mode_and_canonical_root
+================= 4 failed, 21 passed, 73 deselected in 12.71s =================

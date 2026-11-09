@@ -1,0 +1,701 @@
+"""TokenManager: High-level token operations for the SDA engine.
+
+Provides a simplified interface over DataFlowRepository for managing
+tokens (row instances flowing through the DAG).
+"""
+
+from __future__ import annotations
+
+__all__ = ["TokenInfo", "TokenManager"]
+
+import copy
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
+
+from elspeth.contracts import AggregationParentDisposition, CoalesceParentCompletion, SourceRow, TokenInfo
+from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import FrameKind, RoutingMode, TerminalOutcome, TerminalPath
+from elspeth.contracts.errors import ExecutionError, OrchestrationInvariantError, SourceQuarantineReason
+from elspeth.contracts.identity import LineageFrame, innermost_own_frame, truncate_at_closer_frame
+from elspeth.contracts.results import RowResult
+from elspeth.contracts.scheduler import BarrierEmission, SourceIngestSpec, TokenWorkItem
+from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.contracts.types import NodeID, StepResolver
+from elspeth.core.checkpoint.serialization import checkpoint_dumps
+from elspeth.core.dag.group_bindings import GroupBinding, GroupBindingRegistry
+from elspeth.core.ids import generate_id
+from elspeth.core.landscape.data_flow_repository import DataFlowRepository
+from elspeth.engine._error_hash import compute_error_hash
+
+if TYPE_CHECKING:
+    from elspeth.core.landscape.execution_repository import ExecutionRepository
+    from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
+
+
+def quarantine_pipeline_row(row: object) -> PipelineRow:
+    """The audit row of a quarantined source row: the rejected data under an empty OBSERVED contract.
+
+    A quarantined row failed source validation, so it carries no contract and
+    may not even be a mapping. A mapping is normalised to a plain ``dict``
+    (``PipelineRow`` requires exactly ``dict``); anything else is wrapped as
+    ``{"_raw": row}``. The data is never validated or transformed. This exact
+    object is what the quarantine sink writes live AND what the durable
+    PENDING_SINK handoff serialises, so a resumed write rebuilds the same
+    member row (``payload_hash``) and reuses a reserved sink effect.
+    """
+    row_data: dict[str, Any]
+    if isinstance(row, dict):
+        row_data = dict(row) if type(row) is not dict else row
+    else:
+        row_data = {"_raw": row}
+    return PipelineRow(row_data, SchemaContract(mode="OBSERVED", fields=(), locked=False))
+
+
+def ingest_source_quarantine(
+    *,
+    scheduler: TokenSchedulerRepository,
+    data_flow: DataFlowRepository,
+    execution: ExecutionRepository,
+    coordination_token: CoordinationToken,
+    source_node_id: NodeID,
+    row_index: int,
+    source_row_index: int,
+    ingest_sequence: int,
+    row: object,
+    validation_error_id: str | None,
+    quarantine_sink: str,
+    quarantine_error: str,
+    quarantine_edge_id: str,
+    terminal_step_index: int,
+) -> RowResult:
+    """Record a source-quarantined row and park its quarantine-sink handoff, in ONE fenced transaction.
+
+    The single composition of the source-quarantine ingest (``RowProcessor.
+    ingest_quarantined_row`` supplies its repositories and the terminal-lane
+    step). ``row`` is the already-sanitised rejected data; ``quarantine_error``
+    the bounded, non-empty plugin error text — the ONE text behind the FAILED
+    state's error, the DIVERT reason, the pending-sink message and the error
+    hash. The returned result is the token's sink-bound ``(FAILURE,
+    QUARANTINED_AT_SOURCE)`` result, carrying the audited hash for the shared
+    accumulator; the outcome itself is recorded after sink durability.
+    """
+    pipeline_row = quarantine_pipeline_row(row)
+    token = TokenInfo(row_id=generate_id(), token_id=generate_id(), row_data=pipeline_row)
+    error_hash = compute_error_hash(quarantine_error)
+    source_state_id = generate_id()
+    divert_event = execution.node_states.prepare_routing_event_for_new_state(
+        source_state_id,
+        quarantine_edge_id,
+        RoutingMode.DIVERT,
+        SourceQuarantineReason(quarantine_error=quarantine_error),
+        run_id=coordination_token.run_id,
+        owner="ingest_source_quarantine",
+    )
+    scheduler.ingest_quarantine_row_with_pending_sink(
+        coordination_token=coordination_token,
+        source=SourceIngestSpec(
+            source_node_id=str(source_node_id),
+            row_index=row_index,
+            data=pipeline_row.to_dict(),
+            source_row_index=source_row_index,
+            ingest_sequence=ingest_sequence,
+            row_id=token.row_id,
+            token_id=token.token_id,
+        ),
+        data_flow=data_flow,
+        execution=execution,
+        validation_error_id=validation_error_id,
+        source_state_id=source_state_id,
+        failure=ExecutionError(exception=quarantine_error, exception_type="ValidationError"),
+        divert_event=divert_event,
+        pending_sink=BarrierEmission(
+            token_id=token.token_id,
+            row_payload_json=scheduler.serialize_row_payload(pipeline_row),
+            sink_name=quarantine_sink,
+            outcome=TerminalOutcome.FAILURE.value,
+            path=TerminalPath.QUARANTINED_AT_SOURCE.value,
+            error_hash=error_hash,
+            error_message=quarantine_error,
+            row_id=token.row_id,
+            node_id=None,
+            step_index=terminal_step_index,
+            ingest_sequence=ingest_sequence,
+        ),
+    )
+    return RowResult(
+        token=token,
+        final_data=pipeline_row,
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.QUARANTINED_AT_SOURCE,
+        sink_name=quarantine_sink,
+        scheduler_pending_sink=True,
+        authoritative_error_hash=error_hash,
+    )
+
+
+class TokenManager:
+    """Manages token lifecycle for the SDA engine.
+
+    Provides high-level operations:
+    - Create initial token from source row
+    - Fork token to multiple branches
+    - Coalesce tokens from branches
+    - Update token row data after transforms
+
+    Example:
+        manager = TokenManager(recorder, step_resolver=graph.resolve_step)
+
+        # Create token for source row
+        token = manager.create_initial_token(
+            coordination_token=ctx.require_coordination_token(),
+            source_node_id=source.node_id,
+            row_index=0,
+            source_row_index=0,
+            ingest_sequence=0,
+            source_row=source_row,
+        )
+
+        # After transform
+        token = token.with_updated_data(PipelineRow({"value": 42, "processed": True}))
+
+        # Fork to branches (node_id resolved to step internally)
+        children = manager.fork_token(
+            member_token=ctx.require_member_token(),
+            work_item=ctx.require_work_item(),
+            parent_token=token,
+            branches=["stats", "classifier"],
+            node_id=NodeID("gate_classifier_abc123"),
+        )
+    """
+
+    def __init__(
+        self,
+        data_flow: DataFlowRepository,
+        *,
+        step_resolver: StepResolver,
+        group_bindings: GroupBindingRegistry | None = None,
+        max_expand_group_width: int | None = None,
+    ) -> None:
+        """Initialize with data flow repository and step resolver.
+
+        Args:
+            data_flow: DataFlowRepository for audit trail
+            step_resolver: Callable that resolves NodeID to 1-indexed audit step position.
+                The canonical implementation is RowProcessor._resolve_audit_step_for_node.
+            group_bindings: The unified FORK/EXPAND group-binding registry (barrier-scopes
+                spec §3). WS3's mint-path call site (spec §4.2, ``graph.py:883``'s freeze
+                note): ``expand_token`` registers each runtime-minted EXPAND group id on
+                this SAME registry instance — attempted at every mint, pre-filtered via
+                the cached ``by_opener_node()`` index (below), so a declared scope
+                opener's node_id calls ``register_expand_group`` and an undeclared
+                expand's node_id simply is not one of its keys and never calls it at
+                all. None (e.g. CoalesceExecutor's own internal TokenManager, which
+                never calls ``expand_token``) disables registration entirely;
+                ``by_opener_node()`` is resolved ONCE here, not per mint — ``bindings``
+                is build-time immutable, only the registry's own ``_expand_groups``
+                index mutates.
+            max_expand_group_width: Fail-closed backstop for the expand-width
+                fence (elspeth-258bd49d81, settings.max_expand_group_width).
+                ``expand_token`` refuses a wider mint BEFORE any DB work.
+                Callers with a loss channel (the traversal's multi-row arm)
+                gate ahead of the mint and route the refusal through
+                on_error/quarantine + settlement; this backstop is what a
+                caller that skips that gate hits instead. None = unfenced
+                (executor-internal managers that never call ``expand_token``,
+                and direct test constructions).
+        """
+        self._data_flow = data_flow
+        self._step_resolver = step_resolver
+        self._group_bindings = group_bindings
+        self._max_expand_group_width = max_expand_group_width
+        self._opener_binding_by_node_id: dict[NodeID, GroupBinding] = group_bindings.by_opener_node() if group_bindings is not None else {}
+        # META-38: per-(run_id, group_id) memo of the durable release fact.
+        # Populated ONLY by is_release_group's durable read — never seeded
+        # from a CommittedCollect at mint time, which would give the minting
+        # leader an answer a follower/resumed process could not reproduce
+        # (the asymmetry this fact exists to remove). A group's release-ness
+        # is immutable once minted, so the memo never invalidates.
+        self._release_group_memo: dict[tuple[str, str], bool] = {}
+
+    def is_release_group(self, run_id: str, group_id: str) -> bool:
+        """Whether ``group_id`` is a collector RELEASE group (META-38 written fact).
+
+        One durable read per (run, group) per process, through
+        ``DataFlowRepository.is_release_group``; the repository raises
+        ``AuditIntegrityError`` for a group with no ``group_records`` row
+        (fail closed), and that raise is NOT memoised.
+        """
+        key = (run_id, group_id)
+        if key not in self._release_group_memo:
+            self._release_group_memo[key] = self._data_flow.is_release_group(run_id=run_id, group_id=group_id)
+        return self._release_group_memo[key]
+
+    def create_initial_token(
+        self,
+        source_node_id: str,
+        row_index: int,
+        source_row: SourceRow,
+        *,
+        source_row_index: int,
+        ingest_sequence: int,
+        row_id: str | None = None,
+        token_id: str | None = None,
+        coordination_token: CoordinationToken,
+    ) -> TokenInfo:
+        """Create a token for a source row.
+
+        Args:
+            source_node_id: Source node that loaded the row
+            row_index: Position in source (0-indexed)
+            source_row: SourceRow from source (must have contract)
+            row_id: Optional pre-minted row identity (the processor's fenced
+                ingest path pre-mints ids so boundary checks can run BEFORE
+                any durable write)
+            token_id: Optional pre-minted token identity (see ``row_id``)
+            coordination_token: Leader fencing token (ADR-030 §C.4 row 9) —
+                threaded into ``create_row_with_token`` so this ingest-
+                adjacent ``rows`` write is epoch-fenced. The happy path of
+                ``RowProcessor.process_row`` does NOT come through here (it
+                composes the fenced ``ingest_row_with_initial_claim``); this
+                arm serves boundary-failure recording and direct callers.
+
+        Returns:
+            TokenInfo with row and token IDs, row_data as PipelineRow
+
+        Raises:
+            ValueError: If source_row has no contract
+
+        Note:
+            Payload persistence is now handled by DataFlowRepository.create_row(),
+            not by TokenManager. This ensures Landscape owns its audit format.
+        """
+        # Guard: source must provide contract
+        if source_row.contract is None:
+            raise OrchestrationInvariantError(
+                "SourceRow must have contract to create token. Source plugins must set contract on all valid rows."
+            )
+
+        # Convert to PipelineRow
+        pipeline_row = source_row.to_pipeline_row()
+
+        # Create row record and initial token atomically; the repository owns
+        # run/source identity and payload persistence for both audit rows.
+        row, token = self._data_flow.create_row_with_token(
+            source_node_id=source_node_id,
+            row_index=row_index,
+            source_row_index=source_row_index,
+            ingest_sequence=ingest_sequence,
+            data=pipeline_row.to_dict(),
+            source_contract_json=checkpoint_dumps(source_row.contract.to_checkpoint_format()),
+            row_id=row_id,
+            token_id=token_id,
+            coordination_token=coordination_token,
+        )
+
+        return TokenInfo(
+            row_id=row.row_id,
+            token_id=token.token_id,
+            row_data=pipeline_row,
+        )
+
+    def fork_token(
+        self,
+        parent_token: TokenInfo,
+        branches: list[str],
+        node_id: NodeID,
+        row_data: PipelineRow | None = None,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
+    ) -> tuple[list[TokenInfo], str]:
+        """Fork a token to multiple branches.
+
+        ATOMIC: Creates children AND records parent FORKED outcome in single transaction.
+
+        Args:
+            parent_token: Parent token to fork
+            branches: List of branch names
+            node_id: NodeID of the gate/transform performing the fork (resolved to
+                audit step position internally via step_resolver)
+            member_token: Registered worker that owns the claimed work item.
+            work_item: Actual scheduler claim authorizing the fork.
+            row_data: Optional PipelineRow (defaults to parent's data)
+
+        Returns:
+            Tuple of (child TokenInfo list, fork_group_id)
+
+        Note:
+            Contract is propagated from row_data to all children via deepcopy.
+            PipelineRow.__deepcopy__ preserves contract reference (immutable).
+        """
+        data = row_data if row_data is not None else parent_token.row_data
+        step = self._step_resolver(node_id)
+
+        children, fork_group_id = self._data_flow.fork_token(
+            parent_ref=TokenRef(token_id=parent_token.token_id, run_id=member_token.run_id),
+            member_token=member_token,
+            work_item=work_item,
+            row_id=parent_token.row_id,
+            branches=branches,
+            step_in_pipeline=step,
+            parent_lineage_path=parent_token.lineage_path,
+        )
+
+        # CRITICAL: Use deepcopy to prevent nested mutable objects from being
+        # shared across forked children. Shallow copy would cause mutations in
+        # one branch to leak to siblings, breaking audit trail integrity.
+        #
+        # resume_attempt_offset and resume_checkpoint_id are intentionally NOT
+        # inherited here. Fork children mint new token_ids with no run-1 node_states,
+        # so attempt=0 is correct and they must not inherit the parent's resume offset.
+        child_infos: list[TokenInfo] = []
+        for child in children:
+            innermost = child.lineage_path[-1] if child.lineage_path else None
+            if innermost is None or innermost.kind is not FrameKind.FORK:
+                # The durable writer always stacks a FORK frame for every fork
+                # child (data_flow.fork_token); a missing one here is audit
+                # corruption, not a config shape.
+                raise OrchestrationInvariantError(
+                    f"fork_token: child token {child.token_id!r} minted without an innermost FORK frame "
+                    f"— every fork child must carry its branch name (lineage_path={child.lineage_path!r})"
+                )
+            child_infos.append(
+                TokenInfo(
+                    row_id=parent_token.row_id,
+                    token_id=child.token_id,
+                    row_data=copy.deepcopy(data),
+                    lineage_path=child.lineage_path,
+                )
+            )
+        return child_infos, fork_group_id
+
+    def coalesce_tokens(
+        self,
+        parents: list[TokenInfo],
+        merged_data: PipelineRow,
+        node_id: NodeID,
+        parent_completions: Sequence[CoalesceParentCompletion] = (),
+        *,
+        coordination_token: CoordinationToken,
+    ) -> tuple[TokenInfo, str]:
+        """Coalesce multiple tokens into one.
+
+        Args:
+            parents: Parent tokens to merge
+            merged_data: Merged row data as PipelineRow (with merged contract)
+            node_id: NodeID of the coalesce node performing the merge (resolved to
+                audit step position internally via step_resolver)
+            coordination_token: Leadership authority for the barrier merge.
+
+        Returns:
+            Tuple of (merged TokenInfo with PipelineRow row_data, join_group_id)
+        """
+        run_id = coordination_token.run_id
+        if not parents:
+            raise OrchestrationInvariantError("coalesce_tokens requires at least one parent token")
+
+        row_id = parents[0].row_id
+        mismatched = [p.token_id for p in parents if p.row_id != row_id]
+        if mismatched:
+            raise OrchestrationInvariantError(
+                f"coalesce_tokens requires all parents to share row_id={row_id}; mismatched token_ids={mismatched}"
+            )
+
+        step = self._step_resolver(node_id)
+
+        # Guarded truncation (rulings 24/28 as amended by META-38) via
+        # contracts.identity.truncate_at_closer_frame: a closer closes
+        # exactly its own FORK frame — the anchor is the first parent's
+        # innermost FORK frame, which a collector release inside the branch
+        # carries BELOW its own release-group EXPAND frame. Truncation runs
+        # PER PARENT, passing only release-group frames (the written
+        # group_records.closes_group_id fact, memoised on this manager); any
+        # other frame above the FORK frame raises. The cross-parent
+        # remaining-path equality check is load-bearing: it is what catches
+        # parents that disagree about their enclosing scope after each has
+        # been truncated independently.
+        # Anchor (amendment 1 B): the first parent's OWN frame via the guarded
+        # walk — never innermost_fork_frame, which would skip an unreleased
+        # scope's EXPAND frame, exactly the shape the guard must reject.
+        own = innermost_own_frame(parents[0].lineage_path, is_release_group=lambda gid: self.is_release_group(run_id, gid))
+        if own is None or own[1].kind is not FrameKind.FORK:
+            raise OrchestrationInvariantError(
+                f"coalesce_tokens: parent token {parents[0].token_id!r} has no innermost FORK frame to close "
+                f"(searched below collector release-group frames; lineage_path={parents[0].lineage_path!r})"
+            )
+        shared_group_id = own[1].group_id
+        remaining_paths = {
+            truncate_at_closer_frame(
+                parent.lineage_path,
+                kind=FrameKind.FORK,
+                group_id=shared_group_id,
+                is_release_group=lambda gid: self.is_release_group(run_id, gid),
+            )
+            for parent in parents
+        }
+        if len(remaining_paths) != 1:
+            raise OrchestrationInvariantError("coalesce_tokens: parents do not share their remaining lineage path after the pop")
+        merged_path = remaining_paths.pop()
+
+        # Pass the merged row dict and its contract so the envelope is persisted
+        # atomically with the coalesced token INSERT (epoch 11: token_data_ref).
+        # merged_data is a PipelineRow; .to_dict() is mandated over dict(row).
+        # merged_contract = merged_data.contract — the contract the PipelineRow carries
+        # (set by the coalesce executor after merging the branch contracts).
+        merged = self._data_flow.coalesce_tokens(
+            coordination_token=coordination_token,
+            parent_refs=[TokenRef(token_id=p.token_id, run_id=run_id) for p in parents],
+            row_id=row_id,
+            coalesce_node_id=str(node_id),
+            parent_state_ids=[item.state_id for item in parent_completions] or None,
+            merged_payload=merged_data.to_dict(),
+            merged_contract=merged_data.contract,
+            step_in_pipeline=step,
+            parent_lineage_paths={p.token_id: p.lineage_path for p in parents},
+        )
+        if parent_completions:
+            self._data_flow.finalize_coalesce_effect(
+                coordination_token=coordination_token,
+                merged=merged,
+                parent_completions=parent_completions,
+            )
+
+        # resume_attempt_offset and resume_checkpoint_id are intentionally NOT
+        # inherited here. The merged token is a brand-new token_id with no run-1
+        # node_states, so attempt=0 is correct and it must not inherit the parent
+        # branches' resume offsets. (The branch tokens' coalesce node_states already
+        # carry the provenance marker for the arriving tokens.)
+        if merged.join_group_id is None:
+            raise OrchestrationInvariantError(
+                f"coalesce_tokens: merged token {merged.token_id!r} has no join_group_id — the durable coalesce writer always mints one"
+            )
+        merged_info = TokenInfo(
+            row_id=row_id,
+            token_id=merged.token_id,
+            row_data=merged_data,
+            lineage_path=merged_path,
+        )
+        return merged_info, merged.join_group_id
+
+    def collect_tokens(
+        self,
+        members: Sequence[TokenInfo],
+        output_rows: Sequence[PipelineRow],
+        node_id: NodeID,
+        group_id: str,
+        *,
+        coordination_token: CoordinationToken,
+    ) -> tuple[TokenInfo, ...]:
+        """Close a bound EXPAND group: strict-pop the closer's frame, mint outputs.
+
+        spec §4.2 (ruling 24 as amended by 28 and META-38): every member
+        carries the closer's own EXPAND frame — innermost, or below its own
+        collector release-group frame(s) when the member is itself a
+        collector release (collector-in-collector) — and all members share
+        the remaining path; §7 rule 5 makes any other shape a genuine engine
+        invariant. The truncation is the SHARED ``truncate_at_closer_frame``
+        (contracts/identity.py): it raises OrchestrationInvariantError unless
+        a frame matches kind+group_id (empty paths included) and every frame
+        above it is a release group (the written ``closes_group_id`` fact,
+        memoised on this manager).
+        The emission is RATIFIED (2026-08-22 synthesis): the aggregation-flush
+        precedent — outputs form a fresh EXPAND group over the popped base
+        path (inert unless bound). An empty ``output_rows`` (M=0) still mints
+        a durable, idempotent empty release group (fix-round ruling 1, spec
+        §4.3/§5) — only the engine-visible return is trivially ``()``.
+        """
+        run_id = coordination_token.run_id
+        if not members:
+            raise OrchestrationInvariantError("collect_tokens requires at least one member token")
+        # truncate_at_closer_frame owns the frame validation (kind, group_id,
+        # non-empty path, only release-group frames above); this method adds
+        # only the cross-member consistency check, PER MEMBER after each
+        # member's own truncation.
+        base_path = truncate_at_closer_frame(
+            members[0].lineage_path,
+            kind=FrameKind.EXPAND,
+            group_id=group_id,
+            is_release_group=lambda gid: self.is_release_group(run_id, gid),
+        )
+        for member in members[1:]:
+            popped = truncate_at_closer_frame(
+                member.lineage_path,
+                kind=FrameKind.EXPAND,
+                group_id=group_id,
+                is_release_group=lambda gid: self.is_release_group(run_id, gid),
+            )
+            if popped != base_path:
+                raise OrchestrationInvariantError(
+                    f"collect_tokens: member {member.token_id} does not share the group's "
+                    f"remaining path after the strict pop of EXPAND group {group_id!r} — "
+                    f"{popped!r} != {base_path!r} (spec §4.2). Engine/validation bug."
+                )
+        # The durable half is called unconditionally, including M=0: spec
+        # §4.3/§5 requires an empty release to leave the same durable
+        # footprint a non-empty one does (fix-round ruling 1, overriding the
+        # plan's "mint nothing" text). The engine-visible return stays ()
+        # either way — ``committed.children`` is empty when output_rows is.
+        step = self._step_resolver(node_id)
+        committed = self._data_flow.collect_tokens(
+            coordination_token=coordination_token,
+            member_refs=[TokenRef(token_id=m.token_id, run_id=run_id) for m in members],
+            group_id=group_id,
+            collector_node_id=str(node_id),
+            output_payloads=[row.to_dict() for row in output_rows],
+            output_contracts=[row.contract for row in output_rows],
+            step_in_pipeline=step,
+            member_lineage_paths={m.token_id: m.lineage_path for m in members},
+        )
+        release_frames = tuple(
+            (*base_path, LineageFrame(kind=FrameKind.EXPAND, group_id=committed.release_group_id, member_key=child.token_id))
+            for child in committed.children
+        )
+        return tuple(
+            TokenInfo(
+                row_id=members[0].row_id,
+                token_id=child.token_id,
+                row_data=row,
+                lineage_path=path,
+            )
+            for child, row, path in zip(committed.children, output_rows, release_frames, strict=True)
+        )
+
+    def expand_token(
+        self,
+        parent_token: TokenInfo,
+        expanded_rows: list[dict[str, Any]],
+        output_contract: SchemaContract,
+        node_id: NodeID,
+        parent_path: TerminalPath = TerminalPath.EXPAND_PARENT,
+        parent_batch_id: str | None = None,
+        aggregation_parent_dispositions: Sequence[AggregationParentDisposition] = (),
+        *,
+        member_token: WorkerMembershipToken,
+    ) -> tuple[list[TokenInfo], str]:
+        """Create child tokens for deaggregation (1 input -> N outputs).
+
+        ATOMIC: Creates children and records the parent's explicit terminal
+        disposition in one transaction.
+
+        Unlike fork_token (which creates parallel paths through the same DAG),
+        expand_token creates sequential children that all continue down the
+        same path. Used when a transform outputs multiple rows from single input.
+
+        Args:
+            parent_token: The token being expanded
+            expanded_rows: List of output row dicts (transforms output dicts, not PipelineRow)
+            output_contract: Contract for output rows (from TransformResult.contract)
+            node_id: NodeID of the transform performing the expansion (resolved to
+                audit step position internally via step_resolver)
+            member_token: Registered worker authorizing the expansion.
+            parent_path: EXPAND_PARENT for ordinary deaggregation or
+                BATCH_CONSUMED for transform-mode aggregation.
+            parent_batch_id: Required for BATCH_CONSUMED and forbidden for
+                EXPAND_PARENT.
+
+        Returns:
+            Tuple of (child TokenInfo list, expand_group_id)
+
+        Note:
+            Expanded rows are dicts from transform output; we wrap them in PipelineRow
+            with the output_contract (post-transform schema), not parent's contract.
+        """
+        # Expand-width fence backstop (elspeth-258bd49d81): refuse BEFORE any
+        # DB work — the mint is one eager transaction (every child INSERT plus
+        # depth-many lineage-frame rows), so an over-wide group must never
+        # reach it. The traversal's multi-row arm gates ahead of this call and
+        # routes the refusal through the transform error channel (on_error /
+        # quarantine + member-loss settlement); reaching THIS raise means a
+        # caller skipped that gate (e.g. an aggregation flush emitting a
+        # pathological row count), and the run fails closed rather than OOM.
+        if self._max_expand_group_width is not None and len(expanded_rows) > self._max_expand_group_width:
+            raise OrchestrationInvariantError(
+                f"Expansion at node '{node_id}' would mint {len(expanded_rows)} members, exceeding "
+                f"max_expand_group_width={self._max_expand_group_width} (settings.max_expand_group_width). "
+                f"Refused before the mint transaction. Callers with a loss channel must gate ahead of "
+                f"expand_token and route the refusal as expand_width_exceeded."
+            )
+
+        # Guard - contract must be locked before any expansion side effects.
+        # Expansion writes child tokens and may record parent EXPANDED outcome
+        # atomically in the recorder; validate preconditions first.
+        if not output_contract.locked:
+            raise OrchestrationInvariantError(
+                f"Output contract must be locked before token expansion. "
+                f"Contract mode={output_contract.mode}, locked={output_contract.locked}"
+            )
+
+        # Delegate to recorder which handles DB operations and parent linking.
+        # Pass expanded_rows as child_payloads and output_contract so each child's
+        # {data, contract} envelope is persisted atomically with its token INSERT
+        # (epoch 11: token_data_ref). output_contract is the locked contract from
+        # TransformResult.contract, shared by all expanded children.
+        # expanded_rows are already plain dicts (transform output) — no .to_dict() needed.
+        step = self._step_resolver(node_id)
+        db_children, expand_group_id = self._data_flow.expand_token(
+            parent_ref=TokenRef(token_id=parent_token.token_id, run_id=member_token.run_id),
+            member_token=member_token,
+            row_id=parent_token.row_id,
+            child_payloads=expanded_rows,
+            output_contract=output_contract,
+            step_in_pipeline=step,
+            parent_path=parent_path,
+            parent_batch_id=parent_batch_id,
+            aggregation_parent_dispositions=aggregation_parent_dispositions,
+            parent_lineage_path=parent_token.lineage_path,
+        )
+
+        # WS3 mint-path wiring (spec §4.2, graph.py:883's freeze note): register
+        # this runtime-minted EXPAND group id on the group-binding registry.
+        # Attempted at every expand_token call, regardless of caller (2026-08-24
+        # review M5 correction: pre-filtered HERE via the cached
+        # by_opener_node() index, not inside register_expand_group — node_id
+        # is a declared scope opener only if it appears there; an ordinary
+        # (non-scope) multi-row node_id is simply absent, and this is a no-op).
+        if self._group_bindings is not None and node_id in self._opener_binding_by_node_id:
+            opener_name = self._opener_binding_by_node_id[node_id].opener_name
+            self._group_bindings.register_expand_group(expand_group_id, opener_name=opener_name)
+
+        # Use output_contract (post-transform schema) for all expanded children
+        # This ensures downstream transforms can access newly added/renamed fields
+        #
+        # CRITICAL: Use deepcopy to prevent nested mutable objects from being
+        # shared across expanded children. Same reasoning as fork_token - without
+        # this, mutations in one sibling leak to others, corrupting audit trail.
+        # Bug fix: expand_token was sharing row_data references across tokens
+        #
+        # resume_attempt_offset and resume_checkpoint_id are intentionally NOT
+        # inherited here. Expand children mint new token_ids with no run-1 node_states,
+        # so attempt=0 is correct and they must not inherit the parent's resume offset.
+        child_infos = [
+            TokenInfo(
+                row_id=parent_token.row_id,
+                token_id=db_child.token_id,
+                # Create PipelineRow with output contract
+                row_data=PipelineRow(copy.deepcopy(row_data), output_contract),
+                # branch_name is inherited automatically: it derives from the
+                # innermost FORK frame anywhere in lineage_path, and expand
+                # only ever APPENDS an EXPAND frame, never touching it.
+                lineage_path=db_child.lineage_path,
+            )
+            for db_child, row_data in zip(db_children, expanded_rows, strict=True)
+        ]
+        return child_infos, expand_group_id
+
+    def record_empty_expansion(self, parent_token: TokenInfo, *, member_token: WorkerMembershipToken) -> str:
+        """Durable member_count=0 group record for a zero-row expansion (spec §4.3).
+
+        Deliberately does NOT call `register_expand_group`: a zero-row
+        expansion mints zero children, so no `lineage_path` anywhere in the
+        system can ever carry this group_id's EXPAND frame — nothing can
+        call `binding_for` on it. Registering would be inert bookkeeping.
+        """
+        return self._data_flow.record_empty_expansion(
+            TokenRef(token_id=parent_token.token_id, run_id=member_token.run_id), member_token=member_token
+        )
+
+    # NOTE: Step resolution is handled by the injected StepResolver, which
+    # maps NodeID → 1-indexed audit step position. The canonical implementation
+    # is RowProcessor._resolve_audit_step_for_node. TokenManager resolves steps
+    # internally — callers pass node_id, not step_in_pipeline.

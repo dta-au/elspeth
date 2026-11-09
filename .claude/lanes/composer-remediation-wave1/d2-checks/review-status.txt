@@ -1,0 +1,20 @@
+ M src/elspeth/composer_mcp/server.py
+ M src/elspeth/web/composer/tools/_common.py
+ M src/elspeth/web/composer/tools/_dispatch.py
+ M src/elspeth/web/composer/tools/outputs.py
+ M src/elspeth/web/composer/tools/sessions.py
+ M src/elspeth/web/composer/tools/sources.py
+ M src/elspeth/web/composer/tools/transforms.py
+ M src/elspeth/web/execution/_validation_authoring.py
+ M src/elspeth/web/execution/_validation_materialization.py
+ M src/elspeth/web/execution/_validation_pipeline.py
+ M src/elspeth/web/execution/preflight.py
+ M src/elspeth/web/execution/validation.py
+ M src/elspeth/web/paths.py
+ M tests/unit/composer_mcp/test_server.py
+ M tests/unit/web/composer/test_set_pipeline_candidate.py
+ M tests/unit/web/execution/test_validation.py
+ M tests/unit/web/execution/test_validation_materialization.py
+ M tests/unit/web/test_paths.py
+?? src/elspeth/contracts/composer_paths.py
+?? tests/unit/composer_mcp/test_configured_root_admission.py

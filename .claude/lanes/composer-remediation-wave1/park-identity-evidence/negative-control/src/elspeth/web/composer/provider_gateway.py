@@ -1,0 +1,1167 @@
+"""Physical Composer provider transport and its request/response boundary."""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+import time
+from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
+from dataclasses import replace
+from datetime import UTC, datetime
+from typing import Any, Final
+
+from openai import OpenAIError
+
+from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus, ToolContractDialect
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.prompt_guard import (
+    PromptGuardContentPart,
+    PromptGuardMode,
+    PromptGuardRole,
+    PromptGuardTextMessage,
+    PromptGuardThinkingParts,
+    PromptGuardToolArgumentParts,
+    detach_prompt_guard_evidence,
+    validate_prompt_guard_content_parts,
+    validate_prompt_guard_thinking_parts,
+    validate_prompt_guard_tool_argument_parts,
+)
+from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.plugins.transforms.llm.model_catalog import OPENROUTER_LITELLM_PREFIX
+from elspeth.web.composer._compose_loop_carriers import (
+    _AdmittedAssistantMessage,
+    _AdmittedLLMCompletion,
+    _AdmittedLLMProviderMetadata,
+    _AdmittedToolBatch,
+)
+from elspeth.web.composer.advisor_content import PreparedAdvisorContent, scan_prepared_advisor_content
+from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.llm_response_parsing import (
+    admit_llm_provider_metadata,
+    apply_anthropic_cache_markers,
+    attach_llm_calls,
+    build_llm_call_record,
+    supports_anthropic_prompt_cache_markers,
+)
+from elspeth.web.composer.private_diagnostic_facts import bind_received_response, capture_received_response
+from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount, enforce_prompt_guard
+from elspeth.web.composer.protocol import ComposerServiceError, ComposerSettings
+from elspeth.web.composer.provider_context import capture_provider_context
+from elspeth.web.composer.provider_errors import classify_provider_failure
+from elspeth.web.composer.provider_quota import (
+    ProviderCallCustody,
+    provider_call_scope,
+    quota_provider_calls,
+    required_provider_audit_scope,
+)
+from elspeth.web.composer.reasoning import apply_reasoning_kwargs
+from elspeth.web.composer.state import CompositionState
+from elspeth.web.composer.tools.wire_projection import wire_tool_definitions
+from elspeth.web.credential_guard import (
+    CredentialMaterialRefused,
+    credential_state_for_tool_batch,
+    require_no_credential_material,
+    require_no_credential_material_in_llm_metadata,
+    require_no_credential_material_in_tool_wire,
+)
+
+_COMPOSER_LLM_SEED_PARAM: Final[str] = "seed"
+
+
+class _MalformedLLMResponseError(ComposerServiceError):
+    """Malformed completion with only already-admitted provider facts."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_metadata: _AdmittedLLMProviderMetadata,
+        text_received: bool = False,
+        credential_surface: str = "composer_provider_response",
+    ) -> None:
+        _require_no_credential_material_in_completion_fields(
+            content=None,
+            tool_calls=(),
+            provider_metadata=provider_metadata,
+            surface=credential_surface,
+        )
+        super().__init__(message)
+        self.provider_metadata = provider_metadata
+        self.text_received = text_received
+
+
+def advisor_provider_failure_types() -> tuple[type[Exception], ...]:
+    """The Tier-3 failure surface an advisor call can raise.
+
+    Single authority for the callers that degrade an advisor outage into
+    structured tool feedback instead of failing the composer turn. It names
+    the provider SDK, transport and malformed-response families only.
+
+    Deliberately absent: ``TimeoutError`` and ``asyncio.CancelledError``,
+    which callers route through their own deadline and lifecycle arms, and
+    every first-party error. An ``AuditIntegrityError`` out of the recorder,
+    a plugin crash, or an ordinary defect in controlled code is not a
+    provider fault and must keep unwinding rather than be reported to the
+    composer LLM as an advisor outage.
+    """
+
+    import httpx
+    from litellm.exceptions import APIError as LiteLLMAPIError
+    from litellm.exceptions import AuthenticationError as LiteLLMAuthError
+    from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
+    from openai import OpenAIError as OpenAIProviderError
+
+    return (
+        LiteLLMAPIError,
+        LiteLLMAuthError,
+        LiteLLMBadRequestError,
+        OpenAIProviderError,
+        httpx.HTTPError,
+        _MalformedLLMResponseError,
+    )
+
+
+@trust_boundary(
+    tier=3,
+    source="raw LiteLLM/provider-SDK completion response object (untrusted model/provider output)",
+    source_param="response",
+    suppresses=("R5",),
+    invariant=(
+        "raises _MalformedLLMResponseError (carrying only already-admitted provider facts) on any "
+        "malformed choices/message/content/tool_calls surface; an explicitly optional absent tool_calls field is empty; "
+        "never coerces or fabricates a field"
+    ),
+    test_ref="tests/unit/web/composer/test_capture_llm_completion_boundary.py::test_malformed_choices_raises_malformed_llm_response_error",
+    test_fingerprint="bde1559884f55a4452526d639a4c77f46e2f20c2a98cc7884cc3ab2421105866",
+)
+def _capture_composer_llm_completion_fields(
+    response: Any,
+    *,
+    pricing_model: str | None = None,
+    credential_surface: str = "composer_provider_response",
+    require_tool_calls_field: bool = True,
+) -> tuple[_AdmittedAssistantMessage, tuple[Any, ...], _AdmittedLLMProviderMetadata]:
+    """Read the response/message surface once, before validating its tool batch."""
+
+    missing = object()
+    choices = getattr(response, "choices", missing)
+    choice = choices[0] if isinstance(choices, list | tuple) and choices else None
+    message = getattr(choice, "message", missing) if choice is not None else missing
+    provider_metadata = admit_llm_provider_metadata(
+        response,
+        choice=choice,
+        message=None if message is missing else message,
+        pricing_model=pricing_model,
+    )
+    _require_no_credential_material_in_completion_fields(
+        content=None,
+        tool_calls=(),
+        provider_metadata=provider_metadata,
+        surface=credential_surface,
+    )
+    if choices is missing or not isinstance(choices, list | tuple):
+        raise _MalformedLLMResponseError(
+            "LLM returned malformed choices — cannot continue composition",
+            provider_metadata=provider_metadata,
+            credential_surface=credential_surface,
+        )
+    if not choices:
+        raise _MalformedLLMResponseError(
+            "LLM returned empty choices array — cannot continue composition",
+            provider_metadata=provider_metadata,
+            credential_surface=credential_surface,
+        )
+    if message is missing:
+        raise _MalformedLLMResponseError(
+            "LLM response choice carries no message",
+            provider_metadata=provider_metadata,
+            credential_surface=credential_surface,
+        )
+    content = getattr(message, "content", missing)
+    if content is missing or (content is not None and type(content) is not str):
+        raise _MalformedLLMResponseError(
+            "LLM message content is neither absent nor a string",
+            provider_metadata=provider_metadata,
+            credential_surface=credential_surface,
+        )
+    _require_no_credential_material_in_completion_fields(
+        content=content,
+        tool_calls=(),
+        provider_metadata=provider_metadata,
+        surface=credential_surface,
+    )
+    tool_calls = getattr(message, "tool_calls", missing)
+    if tool_calls is missing and not require_tool_calls_field:
+        tool_calls = None
+    if tool_calls is missing or (tool_calls is not None and not isinstance(tool_calls, list | tuple)):
+        raise _MalformedLLMResponseError(
+            "LLM message tool_calls is neither absent nor a sequence",
+            provider_metadata=provider_metadata,
+            credential_surface=credential_surface,
+        )
+    return _AdmittedAssistantMessage(content=content), tuple(tool_calls or ()), provider_metadata
+
+
+def _admit_composer_llm_completion(
+    response: Any,
+    *,
+    wrap_tool_batch_error: bool = True,
+    pricing_model: str | None = None,
+) -> _AdmittedLLMCompletion:
+    """Read one LiteLLM completion once and discard the provider objects."""
+
+    message, tool_calls, provider_metadata = _capture_composer_llm_completion_fields(response, pricing_model=pricing_model)
+    return _admit_captured_composer_llm_completion(
+        message,
+        tool_calls,
+        provider_metadata,
+        wrap_tool_batch_error=wrap_tool_batch_error,
+    )
+
+
+def _admit_captured_composer_llm_completion(
+    message: _AdmittedAssistantMessage,
+    tool_calls: tuple[Any, ...],
+    provider_metadata: _AdmittedLLMProviderMetadata,
+    *,
+    wrap_tool_batch_error: bool,
+) -> _AdmittedLLMCompletion:
+    """Validate captured calls and finish the fully owned completion."""
+
+    from elspeth.web.composer.tool_batch import _admit_tool_batch
+
+    try:
+        admitted_batch = _admit_tool_batch(tool_calls)
+    except AuditIntegrityError as exc:
+        if not wrap_tool_batch_error:
+            raise
+        raise _MalformedLLMResponseError(
+            f"LLM tool batch failed admission: {exc}",
+            provider_metadata=provider_metadata,
+        ) from exc
+    return _AdmittedLLMCompletion(
+        message=message,
+        tool_batch=admitted_batch,
+        provider_metadata=provider_metadata,
+    )
+
+
+def _require_no_credential_material_in_completion(
+    completion: _AdmittedLLMCompletion,
+    *,
+    surface: str,
+) -> None:
+    """Reject all persisted or replayed text metadata in an owned completion."""
+    _require_no_credential_material_in_completion_fields(
+        content=completion.message.content,
+        tool_calls=tuple((call.id, call.function.name) for call in completion.tool_batch.calls),
+        provider_metadata=completion.provider_metadata,
+        surface=surface,
+    )
+
+
+def _require_no_credential_material_in_completion_fields(
+    *,
+    content: str | None,
+    tool_calls: Sequence[tuple[str, str]],
+    provider_metadata: _AdmittedLLMProviderMetadata,
+    surface: str,
+) -> None:
+    """Guard the normalized provider fields that can be audited or replayed."""
+    require_no_credential_material_in_llm_metadata(
+        content=content,
+        tool_calls=tool_calls,
+        reasoning_content=provider_metadata.reasoning_content,
+        reasoning_details=provider_metadata.reasoning_details,
+        thinking_blocks=provider_metadata.thinking_blocks,
+        model_returned=provider_metadata.model_returned,
+        provider_request_id=provider_metadata.provider_request_id,
+        finish_reason=provider_metadata.finish_reason,
+        provider_served=provider_metadata.provider_served,
+        surface=surface,
+    )
+
+
+class _BadRequestLLMError(ComposerServiceError):
+    """Internal carrier for provider bad-request failures.
+
+    Carries the raw provider message and HTTP status code on dedicated
+    attributes so the route layer can surface them under
+    ``expose_provider_error=True`` without having to re-parse the wrapped
+    LiteLLM exception. ``str(self)`` is unchanged from the parent class —
+    only the wrap message is rendered there.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_detail: str | None = None,
+        provider_status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider_detail = provider_detail
+        self.provider_status_code = provider_status_code
+
+
+def _apply_openrouter_app_identity(kwargs: dict[str, Any]) -> None:
+    """Brand OpenRouter-routed composer calls as ELSPETH, not LiteLLM.
+
+    LiteLLM injects its own OpenRouter attribution headers on every request
+    unless the caller overrides them — ``HTTP-Referer: https://litellm.ai`` and
+    ``X-Title: liteLLM`` (litellm/main.py). Without this the OpenRouter
+    dashboard attributes all composer ("orchestrator") traffic to LiteLLM. The
+    LLM transform plugins speak raw HTTP and set the same identity directly
+    (``OPENROUTER_APP_REFERER`` / ``OPENROUTER_APP_TITLE`` in
+    ``plugins/transforms/llm/providers/openrouter.py``); this brings the
+    composer's LiteLLM-routed calls to parity using the one canonical source.
+
+    Scoped to OpenRouter by the ``openrouter/`` routing prefix so the headers
+    are never sent to other providers. ``HTTP-Referer`` is OpenRouter's primary
+    ranking identifier; ``X-OpenRouter-Title`` is its current display-name
+    header (what the plugins send) and ``X-Title`` is the legacy spelling
+    LiteLLM defaults to ``liteLLM`` — we override both so no LiteLLM branding
+    survives whichever one OpenRouter honours. Caller-supplied headers win: we
+    only fill the identity keys we own (``setdefault``).
+    """
+    model = kwargs["model"] if "model" in kwargs else None
+    if model is None or not model.startswith(OPENROUTER_LITELLM_PREFIX):
+        return
+
+    # Lazy import: providers/openrouter.py pulls httpx and the provider stack,
+    # and the composer keeps that off the app-startup path.
+    from elspeth.plugins.transforms.llm.providers.openrouter import (
+        OPENROUTER_APP_REFERER,
+        OPENROUTER_APP_TITLE,
+    )
+
+    existing = kwargs["extra_headers"] if "extra_headers" in kwargs else None
+    # Caller-supplied headers win: our three attribution identity keys are laid
+    # down first, then any caller headers overlay them (a key the caller already
+    # set survives the merge). This expresses the precedence explicitly instead
+    # of relying on setdefault's "fill-if-absent" side effect.
+    headers: dict[str, str] = {
+        "HTTP-Referer": OPENROUTER_APP_REFERER,
+        "X-OpenRouter-Title": OPENROUTER_APP_TITLE,
+        "X-Title": OPENROUTER_APP_TITLE,
+        **(dict(existing) if existing else {}),
+    }
+    kwargs["extra_headers"] = headers
+
+
+def _apply_openrouter_usage_accounting(kwargs: dict[str, Any]) -> None:
+    """Pin OpenRouter's usage-accounting opt-in on the request, explicitly.
+
+    The audit's provider cost (``response_usage.cost``) and in-band cache
+    detail (``prompt_tokens_details.cached_tokens``) exist on the response
+    only under OpenRouter's ``usage: {"include": true}`` opt-in. litellm
+    1.85.0 happens to inject that opt-in unconditionally
+    (``OpenrouterConfig.transform_request``), but that is undocumented
+    internal behaviour and the dependency range admits any 1.x — this makes
+    the opt-in an ELSPETH-owned contract rather than a litellm-version
+    accident. Survival through litellm's param shaping is pinned by
+    ``tests/unit/web/composer/test_openrouter_usage_accounting.py``.
+
+    ``usage`` is an OpenRouter-proprietary request field, so non-openrouter/
+    models are never touched. A caller-supplied ``usage`` value wins.
+    """
+    model = kwargs["model"] if "model" in kwargs else None
+    if model is None or not model.startswith(OPENROUTER_LITELLM_PREFIX):
+        return
+    if "usage" not in kwargs:
+        kwargs["usage"] = {"include": True}
+
+
+def _apply_endpoint_kwargs(kwargs: dict[str, Any], *, base_url: str | None, api_key: str | None) -> None:
+    """Add ``api_base``/``api_key`` to a LiteLLM kwargs dict, role-scoped.
+
+    Both are omitted entirely when unset (the no-regression guarantee: an
+    unconfigured deployment sends the exact same kwargs as before this
+    affordance existed). Configuration surface only — no client boundary,
+    no model-string rewriting. Callers pick which role's (base_url, api_key)
+    pair to pass; this function has no opinion about roles.
+    """
+    if base_url is not None:
+        kwargs["api_base"] = base_url
+    if api_key is not None:
+        kwargs["api_key"] = api_key
+
+
+def composer_loop_tool_definitions(dialect: ToolContractDialect) -> list[dict[str, Any]]:
+    """Return the tool list the freeform compose loop sends, in LiteLLM function format.
+
+    The compose loop and the boot probe both call this, so the probe sends
+    exactly the list production sends. The list is the static wire
+    projection W of the registry for ``dialect``
+    (:func:`elspeth.web.composer.tools.wire_projection.wire_tool_definitions`),
+    which also owns the web ``set_pipeline`` envelope;
+    :mod:`elspeth.web.composer.tool_batch` unwraps that envelope before
+    custody, audit, redaction, or dispatch.
+
+    Advisor is mandatory, so ``request_advisor_hint`` is always present
+    in the LLM-visible list. The CLI MCP server (composer_mcp/) is not
+    affected; advisor is web-composer only by design (the tool is not
+    registered in the CLI dispatch tables).
+    """
+    from elspeth.web.composer.recovery_controls import recovery_tool_definitions
+
+    tools = wire_tool_definitions(dialect)
+    # Preserve the established trailing cache anchor.
+    return [*tools[:-1], *recovery_tool_definitions(dialect), tools[-1]]
+
+
+def build_composer_loop_request_kwargs(
+    *,
+    model: str,
+    messages: Sequence[Mapping[str, Any]],
+    tools: Sequence[Mapping[str, Any]],
+    settings: ComposerSettings,
+    api_base: str | None,
+    api_key: str | None,
+) -> dict[str, Any]:
+    """Build the LiteLLM kwargs of one freeform compose-loop or prose call.
+
+    ``_call_llm``, ``_call_text_llm`` and the boot probe's loop-list request
+    all build their request here, so temperature, seed, reasoning and
+    endpoint kwargs cannot drift between the probe and production. An empty
+    ``tools`` sequence omits the key (the prose call).
+    """
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        # The Composer loop owns retries and records each provider attempt.
+        # Disable LiteLLM and SDK retries inside one audited call.
+        "num_retries": 0,
+        "max_retries": 0,
+    }
+    if tools:
+        kwargs["tools"] = tools
+    if settings.composer_temperature is not None:
+        kwargs["temperature"] = settings.composer_temperature
+    if settings.composer_seed is not None:
+        kwargs[_COMPOSER_LLM_SEED_PARAM] = settings.composer_seed
+    # Freeform tool-loop and prose calls are interactive tool
+    # choreography — discovery class (elspeth-dc459d438e).
+    apply_reasoning_kwargs(kwargs, model=model, effort=settings.composer_discovery_reasoning_effort)
+    _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
+    return kwargs
+
+
+async def _litellm_acompletion(
+    *,
+    prompt_guard_mount: PromptGuardMount | None,
+    prompt_guard_mode: PromptGuardMode,
+    prompt_guard_role: PromptGuardRole,
+    prompt_guard_user_prompt: str | None = None,
+    prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+    prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+    prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+    prompt_guard_thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
+    prepared_advisor_content: tuple[PreparedAdvisorContent, ...] | None = None,
+    provider_custody: ProviderCallCustody | None = None,
+    on_provider_dispatch: Callable[[], None] | None = None,
+    **kwargs: Any,
+) -> Any:
+    """Call LiteLLM lazily so app startup never imports provider machinery.
+
+    Brands OpenRouter-routed calls with ELSPETH's app-attribution headers (see
+    :func:`_apply_openrouter_app_identity`) so the OpenRouter dashboard credits
+    composer traffic to ELSPETH rather than LiteLLM's defaults, and pins
+    OpenRouter's usage-accounting opt-in (see
+    :func:`_apply_openrouter_usage_accounting`) so provider cost and cache
+    detail arrive in-band for the call audit.
+    """
+    if type(provider_custody) is not ProviderCallCustody:
+        raise AuditIntegrityError("Physical provider requires exact explicit custody")
+    import litellm
+
+    # Endpoint credentials are purpose-specific transport configuration and
+    # intentionally excluded.  The dynamic messages are the Web/Composer
+    # control content that crosses the provider boundary.
+    kwargs = deepcopy(kwargs)
+    evidence = detach_prompt_guard_evidence(kwargs["messages"])
+    kwargs["messages"] = evidence.messages
+    content_parts = evidence.content_parts
+    argument_parts = evidence.tool_argument_parts
+    thinking_parts = evidence.thinking_parts
+    if prompt_guard_content_parts is not None:
+        validate_prompt_guard_content_parts(evidence.messages, prompt_guard_content_parts)
+        if any(
+            current is not None and forwarded is not None and current != forwarded
+            for current, forwarded in zip(content_parts, prompt_guard_content_parts, strict=True)
+        ):
+            raise AuditIntegrityError("Prompt guard content provenance changed before physical dispatch")
+        content_parts = tuple(
+            current if current is not None else forwarded
+            for current, forwarded in zip(content_parts, prompt_guard_content_parts, strict=True)
+        )
+    if prompt_guard_tool_argument_parts is not None:
+        validate_prompt_guard_tool_argument_parts(evidence.messages, prompt_guard_tool_argument_parts)
+        if any(
+            current is not None and forwarded is not None and current != forwarded
+            for current, forwarded in zip(argument_parts, prompt_guard_tool_argument_parts, strict=True)
+        ):
+            raise AuditIntegrityError("Prompt guard tool argument provenance changed before physical dispatch")
+        argument_parts = tuple(
+            current if current is not None else forwarded
+            for current, forwarded in zip(argument_parts, prompt_guard_tool_argument_parts, strict=True)
+        )
+    if prompt_guard_thinking_parts is not None:
+        validate_prompt_guard_thinking_parts(evidence.messages, prompt_guard_thinking_parts)
+        if any(
+            current is not None and forwarded is not None and current != forwarded
+            for current, forwarded in zip(thinking_parts, prompt_guard_thinking_parts, strict=True)
+        ):
+            raise AuditIntegrityError("Provider thinking provenance changed before physical dispatch")
+        thinking_parts = tuple(
+            current if current is not None else forwarded
+            for current, forwarded in zip(thinking_parts, prompt_guard_thinking_parts, strict=True)
+        )
+    credential_messages: list[Mapping[str, Any]] = []
+    for message in kwargs["messages"]:
+        if "thinking_blocks" in message:
+            from elspeth.web.composer.provider_thinking import native_thinking_blocks
+
+            if message["role"] != "assistant":
+                raise AuditIntegrityError("Provider thinking belongs to an assistant message")
+            # Scan complete native fields under their closed grammar before
+            # applying generic control-content bounds to the other fields.
+            native_thinking_blocks(message["thinking_blocks"])
+            credential_messages.append({key: value for key, value in message.items() if key != "thinking_blocks"})
+        else:
+            credential_messages.append(message)
+    if prepared_advisor_content is not None:
+        credential_messages = scan_prepared_advisor_content(credential_messages, prepared_advisor_content, role=prompt_guard_role)
+    require_no_credential_material(credential_messages, surface="composer_provider_request")
+    await enforce_prompt_guard(
+        mount=prompt_guard_mount,
+        mode=prompt_guard_mode,
+        role=prompt_guard_role,
+        provider_custody=provider_custody,
+        messages=kwargs["messages"],
+        tools=kwargs["tools"] if "tools" in kwargs else (),
+        user_prompt=prompt_guard_user_prompt,
+        trusted_message_indexes=evidence.trusted_message_indexes | prompt_guard_trusted_message_indexes,
+        content_parts=content_parts,
+        tool_argument_parts=argument_parts,
+        thinking_parts=thinking_parts,
+    )
+    _apply_openrouter_app_identity(kwargs)
+    _apply_openrouter_usage_accounting(kwargs)
+    await provider_custody.admit(model=kwargs["model"])
+    if on_provider_dispatch is not None:
+        try:
+            on_provider_dispatch()
+        except BaseException as callback_failure:
+            try:
+                cancellations = await provider_custody.cancel_before_sdk(model=kwargs["model"])
+            except BaseException as disposition_failure:
+                raise BaseExceptionGroup(
+                    "Provider pre-dispatch callback and required disposition outcomes", [callback_failure, disposition_failure]
+                ) from None
+            if cancellations:
+                raise BaseExceptionGroup(
+                    "Provider pre-dispatch callback and original cancellations", [callback_failure, *cancellations]
+                ) from None
+            raise
+    provider_custody.mark_sdk_entered()
+    return await litellm.acompletion(**kwargs)
+
+
+class ProviderGateway:
+    """Primary-role request, admission, and audit owner for one deployment.
+
+    Endpoint credentials are held on a plain instance with the default object
+    representation. They are never copied into repr-bearing carriers.
+    """
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        settings: ComposerSettings,
+        endpoint_base_url: str | None,
+        endpoint_api_key: str | None,
+    ) -> None:
+        self._model = model
+        self._settings = settings
+        self._endpoint_base_url = endpoint_base_url
+        self._endpoint_api_key = endpoint_api_key
+        self._prompt_guard_mount = build_prompt_guard_mount(settings.composer_prompt_guard)
+        self._prompt_guard_mode = settings.composer_prompt_guard_mode
+
+    @property
+    def prompt_guard_mount(self) -> PromptGuardMount | None:
+        """The immutable deployment dependency shared with primary-role callers."""
+        return self._prompt_guard_mount
+
+    async def _call_llm(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        provider_custody: ProviderCallCustody | None = None,
+        credential_state: CompositionState | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prompt_guard_thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
+    ) -> _AdmittedLLMCompletion:
+        """Call LiteLLM and return only the admitted, owned completion."""
+        from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
+
+        try:
+            kwargs = build_composer_loop_request_kwargs(
+                model=self._model,
+                messages=messages,
+                tools=tools,
+                settings=self._settings,
+                api_base=self._endpoint_base_url,
+                api_key=self._endpoint_api_key,
+            )
+            response = await _litellm_acompletion(
+                provider_custody=provider_custody,
+                prompt_guard_mount=self.prompt_guard_mount,
+                prompt_guard_mode=self._prompt_guard_mode,
+                prompt_guard_role="composer",
+                prompt_guard_trusted_message_indexes=prompt_guard_trusted_message_indexes,
+                prompt_guard_content_parts=prompt_guard_content_parts,
+                prompt_guard_tool_argument_parts=prompt_guard_tool_argument_parts,
+                prompt_guard_thinking_parts=prompt_guard_thinking_parts,
+                **kwargs,
+            )
+        except LiteLLMBadRequestError as exc:
+            raise _BadRequestLLMError(
+                f"LLM request rejected ({type(exc).__name__})",
+                provider_detail=str(exc) or None,
+                provider_status_code=exc.status_code,
+            ) from exc
+        completion = _admit_composer_llm_completion(
+            response,
+            pricing_model=self._settings.composer_pricing_model or self._model,
+        )
+        batch_credential_state = credential_state_for_tool_batch(
+            credential_state, tuple(call.function.name for call in completion.tool_batch.calls)
+        )
+        for call in completion.tool_batch.calls:
+            require_no_credential_material_in_tool_wire(
+                call.function.name,
+                call.function.arguments,
+                surface="composer_provider_response",
+                credential_state=batch_credential_state,
+            )
+        _require_no_credential_material_in_completion(
+            completion,
+            surface="composer_provider_response",
+        )
+        return completion
+
+    async def _call_text_llm(
+        self,
+        messages: list[PromptGuardTextMessage],
+        *,
+        provider_custody: ProviderCallCustody | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+    ) -> Any:
+        """Call the LLM for non-tool text generation."""
+        from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
+
+        try:
+            kwargs = build_composer_loop_request_kwargs(
+                model=self._model,
+                messages=messages,
+                tools=(),
+                settings=self._settings,
+                api_base=self._endpoint_base_url,
+                api_key=self._endpoint_api_key,
+            )
+            response = await _litellm_acompletion(
+                provider_custody=provider_custody,
+                prompt_guard_mount=self.prompt_guard_mount,
+                prompt_guard_mode=self._prompt_guard_mode,
+                prompt_guard_role="composer",
+                prompt_guard_user_prompt="",
+                prompt_guard_trusted_message_indexes=prompt_guard_trusted_message_indexes,
+                prompt_guard_content_parts=prompt_guard_content_parts,
+                **kwargs,
+            )
+        except LiteLLMBadRequestError as exc:
+            raise _BadRequestLLMError(
+                f"LLM request rejected ({type(exc).__name__})",
+                provider_detail=str(exc) or None,
+                provider_status_code=exc.status_code,
+            ) from exc
+        if not response.choices:
+            empty_response_metadata = admit_llm_provider_metadata(
+                response,
+                choice=None,
+                message=None,
+                pricing_model=self._settings.composer_pricing_model or self._model,
+            )
+            _require_no_credential_material_in_completion_fields(
+                content=None,
+                tool_calls=(),
+                provider_metadata=empty_response_metadata,
+                surface="composer_provider_response",
+            )
+            raise _MalformedLLMResponseError(
+                "LLM returned empty choices array — cannot explain run diagnostics",
+                provider_metadata=empty_response_metadata,
+            )
+        choice = response.choices[0]
+        message = choice.message
+        response_metadata = admit_llm_provider_metadata(
+            response,
+            choice=choice,
+            message=message,
+            pricing_model=self._settings.composer_pricing_model or self._model,
+        )
+        try:
+            content = message.content
+        except AttributeError:
+            _require_no_credential_material_in_completion_fields(
+                content=None,
+                tool_calls=(),
+                provider_metadata=response_metadata,
+                surface="composer_provider_response",
+            )
+            raise _MalformedLLMResponseError(
+                "LLM returned a diagnostics message with no content field",
+                provider_metadata=response_metadata,
+            ) from None
+        _require_no_credential_material_in_completion_fields(
+            content=content if type(content) is str else None,
+            tool_calls=(),
+            provider_metadata=response_metadata,
+            surface="composer_provider_response",
+        )
+        if type(content) is not str:
+            raise _MalformedLLMResponseError(
+                "LLM returned malformed diagnostics content",
+                provider_metadata=response_metadata,
+            )
+        return response
+
+    async def _call_llm_with_audit_body(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
+        *,
+        timeout: float,
+        recorder: BufferingRecorder | None,
+        provider_custody: ProviderCallCustody | None = None,
+        credential_state: CompositionState | None = None,
+    ) -> _AdmittedLLMCompletion:
+        """Call the primary model once and record the exact marked request."""
+        evidence = detach_prompt_guard_evidence(messages)
+        wire_messages, trusted_indexes = evidence.messages, evidence.trusted_message_indexes
+        wire_tools = [dict(tool) for tool in tools]
+        if supports_anthropic_prompt_cache_markers(self._model):
+            wire_messages, tools_or_none = apply_anthropic_cache_markers(wire_messages, wire_tools, mark_history_tail=True)
+            wire_tools = tools_or_none if tools_or_none is not None else wire_tools
+
+        private_request = capture_provider_context(messages=wire_messages, tools=wire_tools or None)
+
+        started_at = datetime.now(UTC)
+        started_ns = time.monotonic_ns()
+        status: ComposerLLMCallStatus | None = None
+        response_metadata: _AdmittedLLMProviderMetadata | None = None
+        error_class: str | None = None
+        error_message: str | None = None
+        failure_to_capture: Exception | None = None
+        recovery_batch: _AdmittedToolBatch | None = None
+        try:
+            if any(parts is not None for parts in evidence.thinking_parts):
+                completion_call = self._call_llm(
+                    wire_messages,
+                    wire_tools,
+                    provider_custody=provider_custody,
+                    credential_state=credential_state,
+                    prompt_guard_trusted_message_indexes=trusted_indexes,
+                    prompt_guard_content_parts=evidence.content_parts,
+                    prompt_guard_tool_argument_parts=evidence.tool_argument_parts,
+                    prompt_guard_thinking_parts=evidence.thinking_parts,
+                )
+            elif any(parts is not None for parts in evidence.tool_argument_parts):
+                completion_call = self._call_llm(
+                    wire_messages,
+                    wire_tools,
+                    provider_custody=provider_custody,
+                    credential_state=credential_state,
+                    prompt_guard_trusted_message_indexes=trusted_indexes,
+                    prompt_guard_content_parts=evidence.content_parts,
+                    prompt_guard_tool_argument_parts=evidence.tool_argument_parts,
+                )
+            elif any(parts is not None for parts in evidence.content_parts):
+                completion_call = self._call_llm(
+                    wire_messages,
+                    wire_tools,
+                    provider_custody=provider_custody,
+                    credential_state=credential_state,
+                    prompt_guard_trusted_message_indexes=trusted_indexes,
+                    prompt_guard_content_parts=evidence.content_parts,
+                )
+            elif provider_custody is not None or credential_state is not None or trusted_indexes:
+                completion_call = self._call_llm(
+                    wire_messages,
+                    wire_tools,
+                    provider_custody=provider_custody,
+                    credential_state=credential_state,
+                    prompt_guard_trusted_message_indexes=trusted_indexes,
+                )
+            else:
+                completion_call = self._call_llm(wire_messages, wire_tools)
+            completion = await asyncio.wait_for(completion_call, timeout=timeout)
+            _require_no_credential_material_in_completion(
+                completion,
+                surface="composer_provider_response",
+            )
+            response_metadata = completion.provider_metadata
+            from elspeth.web.composer.recovery_controls import RECOVERY_TOOL_NAMES
+
+            if any(tool.function.name in RECOVERY_TOOL_NAMES for tool in completion.tool_batch.calls):
+                recovery_batch = completion.tool_batch
+            recovery_only = bool(wire_tools) and all(tool["function"]["name"] in RECOVERY_TOOL_NAMES for tool in wire_tools)
+            if recovery_only and (
+                any(call.function.name not in RECOVERY_TOOL_NAMES for call in completion.tool_batch.calls)
+                or (not completion.tool_batch.calls and not (completion.message.content or "").strip())
+            ):
+                raise _MalformedLLMResponseError(
+                    "Reply stage requires text or a terminal recovery control",
+                    provider_metadata=completion.provider_metadata,
+                )
+            if not wire_tools and (completion.tool_batch.calls or not (completion.message.content or "").strip()):
+                raise _MalformedLLMResponseError(
+                    "Reply-only completion must contain text and no tool calls",
+                    provider_metadata=completion.provider_metadata,
+                )
+            status = ComposerLLMCallStatus.SUCCESS
+            return completion
+        except PromptGuardRefused:
+            raise
+        except TimeoutError as exc:
+            failure_to_capture = exc
+            status = ComposerLLMCallStatus.TIMEOUT
+            error_class = "TimeoutError"
+            error_message = "TimeoutError"
+            raise
+        except asyncio.CancelledError as exc:
+            status = ComposerLLMCallStatus.CANCELLED
+            error_class = type(exc).__name__
+            error_message = type(exc).__name__
+            attach_llm_calls(exc, recorder)
+            raise
+        except OpenAIError as exc:
+            failure_to_capture = exc
+            failure = classify_provider_failure(exc)
+            status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
+            error_class = type(exc).__name__
+            error_message = type(exc).__name__
+            attach_llm_calls(exc, recorder)
+            raise
+        except _MalformedLLMResponseError as exc:
+            failure_to_capture = exc
+            status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+            response_metadata = exc.provider_metadata
+            error_class = type(exc).__name__
+            error_message = "malformed_response"
+            attach_llm_calls(exc, recorder)
+            raise
+        except _BadRequestLLMError as exc:
+            failure_to_capture = exc
+            cause = exc.__cause__
+            status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
+            error_class = type(cause).__name__ if cause is not None else type(exc).__name__
+            error_message = error_class
+            attach_llm_calls(exc, recorder)
+            raise
+        except CredentialMaterialRefused as exc:
+            failure_to_capture = exc
+            status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+            error_class = type(exc).__name__
+            error_message = "credential_material_rejected"
+            attach_llm_calls(exc, recorder)
+            raise
+        except Exception as exc:
+            failure_to_capture = exc
+            status = ComposerLLMCallStatus.API_ERROR
+            error_class = type(exc).__name__
+            error_message = type(exc).__name__
+            attach_llm_calls(exc, recorder)
+            raise
+        finally:
+            with required_provider_audit_scope(provider_custody):
+                if status is not None and (recorder is not None or provider_custody is not None):
+                    if provider_custody is not None and not provider_custody.needs_terminal_audit():
+                        return_to_audit = False
+                    else:
+                        return_to_audit = True
+                    if return_to_audit:
+                        call = build_llm_call_record(
+                            model_requested=self._model,
+                            pricing_model=self._settings.composer_pricing_model,
+                            messages=wire_messages,
+                            tools=wire_tools or None,
+                            status=status,
+                            started_at=started_at,
+                            started_ns=started_ns,
+                            temperature=self._settings.composer_temperature,
+                            seed=self._settings.composer_seed,
+                            response_metadata=response_metadata,
+                            error_class=error_class,
+                            error_message=error_message,
+                            provider_custody=provider_custody,
+                            failure=failure_to_capture,
+                            private_request=private_request,
+                        )
+                        if recovery_batch is not None:
+                            if call.call_id is None:
+                                raise AuditIntegrityError("Received recovery control has no physical provider call identity")
+                            # Terminal controls bypass ordinary dispatch. Retain
+                            # their received arguments through the same bounded,
+                            # credential-filtered private evidence channel.
+                            received = capture_received_response(
+                                {
+                                    "choices": [
+                                        {
+                                            "message": {
+                                                "tool_calls": [
+                                                    {
+                                                        "id": tool.id,
+                                                        "function": {
+                                                            "name": tool.function.name,
+                                                            "arguments": tool.function.arguments,
+                                                        },
+                                                    }
+                                                    for tool in recovery_batch.calls
+                                                ]
+                                            }
+                                        }
+                                    ]
+                                },
+                                namespace=call.call_id,
+                                ordinal=1,
+                                known_tools=frozenset(tool["function"]["name"] for tool in wire_tools),
+                            )
+                            call = replace(
+                                call,
+                                private_diagnostics=bind_received_response(
+                                    received,
+                                    physical_call_id=call.call_id,
+                                    refusal_code=None if status is ComposerLLMCallStatus.SUCCESS else error_message,
+                                ),
+                            )
+                        if provider_custody is not None:
+                            provider_custody.retain_audit(call)
+                        if recorder is not None:
+                            recorder.record_llm_call(call, provider_custody=provider_custody)
+                    current_exc = sys.exc_info()[1]
+                    if current_exc is not None:
+                        attach_llm_calls(current_exc, recorder)
+
+    async def _call_text_llm_with_audit_body(
+        self,
+        messages: list[PromptGuardTextMessage],
+        *,
+        timeout: float,
+        recorder: BufferingRecorder | None,
+        provider_custody: ProviderCallCustody | None = None,
+    ) -> str:
+        """Call the diagnostics text model and record one redacted audit row."""
+        evidence = detach_prompt_guard_evidence(messages)
+        messages, trusted_indexes = evidence.messages, evidence.trusted_message_indexes
+        private_request = capture_provider_context(messages=messages, tools=None)
+        started_at = datetime.now(UTC)
+        started_ns = time.monotonic_ns()
+        status: ComposerLLMCallStatus | None = None
+        response_metadata: _AdmittedLLMProviderMetadata | None = None
+        error_class: str | None = None
+        error_message: str | None = None
+        failure_to_capture: Exception | None = None
+        try:
+            if any(parts is not None for parts in evidence.content_parts):
+                response_call = self._call_text_llm(
+                    messages,
+                    provider_custody=provider_custody,
+                    prompt_guard_trusted_message_indexes=trusted_indexes,
+                    prompt_guard_content_parts=evidence.content_parts,
+                )
+            elif provider_custody is not None or trusted_indexes:
+                response_call = self._call_text_llm(
+                    messages, provider_custody=provider_custody, prompt_guard_trusted_message_indexes=trusted_indexes
+                )
+            else:
+                response_call = self._call_text_llm(messages)
+            provider_response = await asyncio.wait_for(response_call, timeout=timeout)
+            choice = provider_response.choices[0] if provider_response.choices else None
+            message = choice.message if choice is not None else None
+            admitted_metadata = admit_llm_provider_metadata(
+                provider_response,
+                choice=choice,
+                message=message,
+                pricing_model=self._settings.composer_pricing_model or self._model,
+            )
+            try:
+                content = provider_response.choices[0].message.content
+            except (AttributeError, IndexError, TypeError):
+                raise _MalformedLLMResponseError(
+                    "LLM returned a malformed diagnostics explanation",
+                    provider_metadata=admitted_metadata,
+                ) from None
+            _require_no_credential_material_in_completion_fields(
+                content=content if type(content) is str else None,
+                tool_calls=(),
+                provider_metadata=admitted_metadata,
+                surface="composer_provider_response",
+            )
+            if type(content) is not str or not content.strip():
+                raise _MalformedLLMResponseError(
+                    "LLM returned an empty diagnostics explanation",
+                    provider_metadata=admitted_metadata,
+                )
+            response_metadata = admitted_metadata
+            status = ComposerLLMCallStatus.SUCCESS
+            return content.strip()
+        except PromptGuardRefused:
+            raise
+        except TimeoutError as exc:
+            failure_to_capture = exc
+            status = ComposerLLMCallStatus.TIMEOUT
+            error_class = "TimeoutError"
+            error_message = "TimeoutError"
+            raise
+        except asyncio.CancelledError as exc:
+            status = ComposerLLMCallStatus.CANCELLED
+            error_class = type(exc).__name__
+            error_message = type(exc).__name__
+            attach_llm_calls(exc, recorder)
+            raise
+        except OpenAIError as exc:
+            failure_to_capture = exc
+            failure = classify_provider_failure(exc)
+            status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
+            error_class = type(exc).__name__
+            error_message = type(exc).__name__
+            attach_llm_calls(exc, recorder)
+            raise
+        except _MalformedLLMResponseError as exc:
+            failure_to_capture = exc
+            status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+            response_metadata = exc.provider_metadata
+            error_class = type(exc).__name__
+            error_message = "malformed_response"
+            attach_llm_calls(exc, recorder)
+            raise
+        except _BadRequestLLMError as exc:
+            failure_to_capture = exc
+            cause = exc.__cause__
+            status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
+            error_class = type(cause).__name__ if cause is not None else type(exc).__name__
+            error_message = error_class
+            attach_llm_calls(exc, recorder)
+            raise
+        except CredentialMaterialRefused as exc:
+            failure_to_capture = exc
+            status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+            error_class = type(exc).__name__
+            error_message = "credential_material_rejected"
+            attach_llm_calls(exc, recorder)
+            raise
+        except Exception as exc:
+            failure_to_capture = exc
+            status = ComposerLLMCallStatus.API_ERROR
+            error_class = type(exc).__name__
+            error_message = type(exc).__name__
+            attach_llm_calls(exc, recorder)
+            raise
+        finally:
+            with required_provider_audit_scope(provider_custody):
+                if status is not None and (recorder is not None or provider_custody is not None):
+                    if provider_custody is not None and not provider_custody.needs_terminal_audit():
+                        return_to_audit = False
+                    else:
+                        return_to_audit = True
+                    if return_to_audit:
+                        call = build_llm_call_record(
+                            model_requested=self._model,
+                            pricing_model=self._settings.composer_pricing_model,
+                            messages=messages,
+                            tools=None,
+                            status=status,
+                            started_at=started_at,
+                            started_ns=started_ns,
+                            temperature=self._settings.composer_temperature,
+                            seed=self._settings.composer_seed,
+                            response_metadata=response_metadata,
+                            error_class=error_class,
+                            error_message=error_message,
+                            provider_custody=provider_custody,
+                            failure=failure_to_capture,
+                            private_request=private_request,
+                        )
+                        if provider_custody is not None:
+                            provider_custody.retain_audit(call)
+                        if recorder is not None:
+                            recorder.record_llm_call(call, provider_custody=provider_custody)
+                    current_exc = sys.exc_info()[1]
+                    if current_exc is not None:
+                        attach_llm_calls(current_exc, recorder)
+
+    @quota_provider_calls
+    async def _call_llm_with_audit_legacy(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
+        *,
+        timeout: float,
+        recorder: BufferingRecorder | None,
+        credential_state: CompositionState | None = None,
+    ) -> _AdmittedLLMCompletion:
+        return await self._call_llm_with_audit_body(messages, tools, timeout=timeout, recorder=recorder, credential_state=credential_state)
+
+    async def _call_llm_with_audit(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        timeout: float,
+        recorder: BufferingRecorder | None,
+        provider_custody: ProviderCallCustody | None = None,
+        credential_state: CompositionState | None = None,
+    ) -> _AdmittedLLMCompletion:
+        if provider_custody is None:
+            return await self._call_llm_with_audit_legacy(
+                messages, tools, timeout=timeout, recorder=recorder, credential_state=credential_state
+            )
+        async with provider_call_scope(provider_custody):
+            return await self._call_llm_with_audit_body(
+                messages,
+                tools,
+                timeout=timeout,
+                recorder=recorder,
+                provider_custody=provider_custody,
+                credential_state=credential_state,
+            )
+
+    @quota_provider_calls
+    async def _call_text_llm_with_audit_legacy(
+        self, messages: list[PromptGuardTextMessage], *, timeout: float, recorder: BufferingRecorder | None
+    ) -> str:
+        return await self._call_text_llm_with_audit_body(messages, timeout=timeout, recorder=recorder)
+
+    async def _call_text_llm_with_audit(
+        self,
+        messages: list[PromptGuardTextMessage],
+        *,
+        timeout: float,
+        recorder: BufferingRecorder | None,
+        provider_custody: ProviderCallCustody | None = None,
+    ) -> str:
+        if provider_custody is None:
+            return await self._call_text_llm_with_audit_legacy(messages, timeout=timeout, recorder=recorder)
+        async with provider_call_scope(provider_custody):
+            return await self._call_text_llm_with_audit_body(
+                messages, timeout=timeout, recorder=recorder, provider_custody=provider_custody
+            )

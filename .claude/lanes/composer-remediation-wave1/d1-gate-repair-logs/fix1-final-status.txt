@@ -1,0 +1,11 @@
+ M tests/helpers/required_work_reserve_recipes/reviewed-full-source-guards.json
+ M tests/helpers/required_work_reserve_recipes/reviewed-writer-recipes.json
+ M tests/helpers/web_reserve_compose_proposal_transfers.py
+ M tests/helpers/web_reserve_proposal_child_transfers.py
+ M tests/integration/web/composer/test_composer_against_gateway.py
+ M tests/unit/architecture/test_web_reserve_reviewed_contracts.py
+ M tests/unit/web/composer/test_compose_loop_persistence.py
+ M tests/unit/web/composer/test_endpoint_affordance.py
+ M tests/unit/web/composer/test_service.py
+ M tests/unit/web/sessions/test_operation_fence_wiring.py
+ M tests/unit/web/sessions/test_static_direct_writers.py

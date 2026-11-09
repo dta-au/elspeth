@@ -1,0 +1,419 @@
+"""Core Orchestrator facade for pipeline execution.
+
+The Orchestrator is the main entry point for running ELSPETH pipelines. Since
+archived issue elspeth-9e71ae82a4 it is a composition facade: ``__init__`` wires the
+collaborating services and every public entry point delegates to exactly one
+of them.
+
+Phase ownership:
+- Run lifecycle (bootstrap, DATABASE phase, heartbeat, finalize ordering,
+  export, ceremonies): RunLifecycleCoordinator (run_lifecycle.py)
+- GRAPH phase (node/edge registration + routing validation):
+  GraphRegistrationService (graph_registration.py)
+- Run-body phase sequencing (source loop, peer-lease wait, sink flush,
+  follower drain): LeaderDrainCoordinator (leader_drain.py)
+- Resume-path orchestration: ResumeCoordinator (resume.py)
+- Follower admission (ADR-030 §B.1): JoinAdmissionService (join_admission.py)
+
+The thin private delegators (``_initialize_database_phase``, ``_execute_run``,
+``_register_graph_nodes_and_edges``) are deliberate test seams: they are passed
+into the coordinators as bound methods AT CALL TIME, so class-level
+monkeypatches and instance-level stubs on the Orchestrator keep intercepting
+the corresponding phase.
+
+Re-exports for the stable legacy import path ``…orchestrator.core``:
+- prepare_for_run (bootstrap.py)
+- _RunFailedWithPartialResultError (types.py)
+"""
+
+from __future__ import annotations
+
+import threading
+from typing import TYPE_CHECKING, Any
+
+import elspeth.engine.executors.declaration_contract_bootstrap  # noqa: F401
+from elspeth.contracts.call_governance import LLMCallGovernance
+from elspeth.contracts.sink_effects import SinkEffectInputKind
+from elspeth.engine.orchestrator.bootstrap import prepare_for_run as prepare_for_run
+from elspeth.engine.orchestrator.ceremony import RunCeremony
+from elspeth.engine.orchestrator.checkpointing import CheckpointCoordinator
+from elspeth.engine.orchestrator.graph_registration import GraphRegistrationService
+from elspeth.engine.orchestrator.join_admission import JoinAdmissionService
+from elspeth.engine.orchestrator.leader_drain import LeaderDrainCoordinator
+from elspeth.engine.orchestrator.preflight import require_sink_effect_admission
+from elspeth.engine.orchestrator.processor_factory import ProcessorFactory
+from elspeth.engine.orchestrator.resume import ResumeCoordinator
+from elspeth.engine.orchestrator.run_context_factory import RunContextFactory
+from elspeth.engine.orchestrator.run_lifecycle import RunLifecycleCoordinator
+from elspeth.engine.orchestrator.run_modes import RuntimeRunMode, resolve_runtime_run_mode
+from elspeth.engine.orchestrator.run_state import (
+    _RunFailedWithPartialResultError as _RunFailedWithPartialResultError,
+)
+from elspeth.engine.orchestrator.sink_flush import SinkFlushCoordinator
+from elspeth.engine.orchestrator.source_iteration import SourceIterationDriver
+from elspeth.engine.spans import SpanFactory
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from elspeth.contracts import (
+        ResumePoint,
+        SecretResolutionInput,
+    )
+    from elspeth.contracts.audit_export import AuditExportContentStore, AuditExportContentStoreResolver
+    from elspeth.contracts.call_mode import CallModeSession
+    from elspeth.contracts.config.runtime import RuntimeCheckpointConfig, RuntimeConcurrencyConfig
+    from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+    from elspeth.contracts.payload_store import PayloadStore
+    from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
+    from elspeth.contracts.preflight import PreflightResult
+    from elspeth.contracts.run_start import RunStartPermitBinding
+    from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
+    from elspeth.core.checkpoint import CheckpointManager
+    from elspeth.core.config import ElspethSettings
+    from elspeth.core.dag import ExecutionGraph
+    from elspeth.core.events import EventBusProtocol
+    from elspeth.core.landscape import LandscapeDB
+    from elspeth.core.landscape.factory import RecorderFactory
+    from elspeth.core.rate_limit import RateLimitRegistry
+    from elspeth.engine.clock import Clock
+    from elspeth.engine.orchestrator.ports import TelemetryManagerProtocol
+    from elspeth.engine.orchestrator.run_state import GraphArtifacts
+    from elspeth.engine.orchestrator.types import (
+        PipelineConfig,
+        RunResult,
+    )
+
+
+class Orchestrator:
+    """Orchestrates full pipeline runs.
+
+    Manages the complete lifecycle:
+    1. Begin run in Landscape
+    2. Register all nodes (and set node_id on each plugin instance)
+    3. Load rows from source
+    4. Process rows through transforms
+    5. Write to sinks
+    6. Complete run
+
+    The Orchestrator sets node_id on each plugin instance AFTER registering
+    it with Landscape. This is part of the plugin protocol contract - all
+    plugins define node_id: str | None and the orchestrator populates it.
+    """
+
+    def __init__(
+        self,
+        db: LandscapeDB,
+        *,
+        event_bus: EventBusProtocol | None = None,
+        canonical_version: str = "sha256-rfc8785-v1",
+        checkpoint_manager: CheckpointManager | None = None,
+        checkpoint_config: RuntimeCheckpointConfig | None = None,
+        clock: Clock | None = None,
+        rate_limit_registry: RateLimitRegistry | None = None,
+        concurrency_config: RuntimeConcurrencyConfig | None = None,
+        telemetry_manager: TelemetryManagerProtocol | None = None,
+        coalesce_completed_keys_limit: int = 10000,
+        llm_call_governance: LLMCallGovernance | None = None,
+        call_mode_session_factory: Callable[[RecorderFactory, RuntimeRunMode, str], CallModeSession] | None = None,
+    ) -> None:
+        from elspeth.core.events import NullEventBus
+        from elspeth.engine.clock import DEFAULT_CLOCK
+
+        self._db = db
+        self._events = event_bus if event_bus is not None else NullEventBus()
+        self._canonical_version = canonical_version
+        self._span_factory = SpanFactory(
+            telemetry_emit=telemetry_manager.handle_event if telemetry_manager is not None else None,
+        )
+        self._checkpoint_manager = checkpoint_manager
+        self._clock = clock if clock is not None else DEFAULT_CLOCK
+        self._rate_limit_registry = rate_limit_registry
+        self._concurrency_config = concurrency_config
+        self._coalesce_completed_keys_limit = coalesce_completed_keys_limit
+        self._call_mode_session_factory = call_mode_session_factory
+        self._telemetry = telemetry_manager  # Optional, disabled by default
+        self._ceremony = RunCeremony(events=self._events, telemetry=self._telemetry)
+        self._checkpoints = CheckpointCoordinator(checkpoint_manager=checkpoint_manager, checkpoint_config=checkpoint_config)
+        self._source_driver = SourceIterationDriver(events=self._events, span_factory=self._span_factory, ceremony=self._ceremony)
+        self._processor_factory = ProcessorFactory(
+            span_factory=self._span_factory,
+            clock=self._clock,
+            concurrency_config=self._concurrency_config,
+            telemetry=self._telemetry,
+            coalesce_completed_keys_limit=self._coalesce_completed_keys_limit,
+        )
+        self._context_factory = RunContextFactory(
+            llm_call_governance=llm_call_governance,
+            ceremony=self._ceremony,
+            rate_limit_registry=self._rate_limit_registry,
+            concurrency_config=self._concurrency_config,
+            processor_factory=self._processor_factory,
+            call_mode_session_factory=call_mode_session_factory,
+        )
+        self._sink_flush = SinkFlushCoordinator(
+            span_factory=self._span_factory,
+            checkpoints=self._checkpoints,
+            clock=self._clock,
+        )
+        self._resume_coordinator = ResumeCoordinator(
+            db=self._db,
+            events=self._events,
+            ceremony=self._ceremony,
+            checkpoints=self._checkpoints,
+            context_factory=self._context_factory,
+            sink_flush=self._sink_flush,
+            span_factory=self._span_factory,
+            checkpoint_manager=self._checkpoint_manager,
+        )
+        self._graph_registration = GraphRegistrationService(
+            events=self._events,
+            ceremony=self._ceremony,
+        )
+        self._leader_drain = LeaderDrainCoordinator(
+            events=self._events,
+            checkpoints=self._checkpoints,
+            context_factory=self._context_factory,
+            sink_flush=self._sink_flush,
+            source_driver=self._source_driver,
+        )
+        self._run_lifecycle = RunLifecycleCoordinator(
+            db=self._db,
+            events=self._events,
+            ceremony=self._ceremony,
+            checkpoints=self._checkpoints,
+            span_factory=self._span_factory,
+            canonical_version=self._canonical_version,
+        )
+        self._join_admission = JoinAdmissionService(db=self._db)
+
+    def _initialize_database_phase(
+        self,
+        config: PipelineConfig,
+        payload_store: PayloadStore,
+        secret_resolutions: list[SecretResolutionInput] | None,
+        *,
+        run_id: str | None = None,
+        initiated_by_user_id: str | None = None,
+        auth_provider_type: str | None = None,
+        openrouter_catalog_sha256: str,
+        openrouter_catalog_source: str,
+        web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        run_start_permit: RunStartPermitBinding | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
+    ) -> tuple[RecorderFactory, Any, CoordinationToken]:
+        """DATABASE-phase delegator (test seam — see RunLifecycleCoordinator)."""
+        return self._run_lifecycle.initialize_database_phase(
+            config,
+            payload_store,
+            secret_resolutions,
+            run_id=run_id,
+            initiated_by_user_id=initiated_by_user_id,
+            auth_provider_type=auth_provider_type,
+            openrouter_catalog_sha256=openrouter_catalog_sha256,
+            openrouter_catalog_source=openrouter_catalog_source,
+            web_plugin_policy_evidence=web_plugin_policy_evidence,
+            run_start_permit=run_start_permit,
+            pre_effect_guard=pre_effect_guard,
+        )
+
+    def run(
+        self,
+        config: PipelineConfig,
+        graph: ExecutionGraph | None = None,
+        settings: ElspethSettings | None = None,
+        *,
+        payload_store: PayloadStore,
+        audit_export_content_store: AuditExportContentStore | None = None,
+        audit_export_content_store_resolver: AuditExportContentStoreResolver | None = None,
+        secret_resolutions: list[SecretResolutionInput] | None = None,
+        preflight_results: PreflightResult | None = None,
+        shutdown_event: threading.Event | None = None,
+        sink_factory: Callable[[str], SinkEffectRuntimeBinding] | None = None,
+        run_id: str | None = None,
+        initiated_by_user_id: str | None = None,
+        auth_provider_type: str | None = None,
+        openrouter_catalog_sha256: str | None = None,
+        openrouter_catalog_source: str | None = None,
+        web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        check_coordination_latch: Callable[[], None] | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
+        run_start_permit: RunStartPermitBinding | None = None,
+    ) -> RunResult:
+        """Execute a pipeline run.
+
+        Delegates to :class:`RunLifecycleCoordinator`, which owns the
+        fresh-run lifecycle ordering extracted from this class. The public
+        signature is the stable contract; the implementation lives in
+        run_lifecycle.py.
+
+        Args:
+            config: Pipeline configuration with plugins
+            graph: Pre-validated execution graph (required)
+            settings: Full settings (for post-run hooks like export)
+            payload_store: PayloadStore for persisting source row payloads.
+            secret_resolutions: Optional secret resolution records from
+                load_secrets_from_config(). Recorded in audit trail after run creation.
+            preflight_results: Optional pre-flight results (dependency runs and
+                commencement gates) from bootstrap_and_run(). Recorded in audit
+                trail after run creation.
+            shutdown_event: Optional pre-created shutdown event for testing.
+                Skips signal handler installation when provided.
+            sink_factory: Creates a fresh sink instance by name. Required when
+                landscape export is enabled (the pipeline's sinks are already
+                closed by the time export runs).
+            run_id: Optional caller-supplied Landscape run ID. When omitted,
+                Landscape generates a run ID.
+            initiated_by_user_id: Optional authenticated web user that initiated the run.
+            auth_provider_type: Optional auth provider namespace for the initiating user.
+            run_start_permit: Immutable admission binding. An exact prepared
+                retry regenerates initialization under fresh Landscape authority.
+            pre_effect_guard: Revalidates caller ownership after acquiring
+                Landscape authority and before plugin effects.
+            check_coordination_latch: Revalidates caller ownership at execution
+                admission points throughout the run.
+
+        Raises:
+            OrchestrationInvariantError: If graph or payload_store is not provided
+        """
+        runtime_mode = resolve_runtime_run_mode(config, settings)
+
+        require_sink_effect_admission(
+            config.sinks,
+            configured_modes=config.sink_effect_modes,
+            required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+            admission=config.sink_effect_admission,
+            runtime_bindings=config.sink_effect_bindings,
+            run_mode=runtime_mode.mode,
+        )
+        return self._run_lifecycle.run(
+            config,
+            graph,
+            settings,
+            payload_store=payload_store,
+            audit_export_content_store=audit_export_content_store,
+            audit_export_content_store_resolver=audit_export_content_store_resolver,
+            secret_resolutions=secret_resolutions,
+            preflight_results=preflight_results,
+            shutdown_event=shutdown_event,
+            sink_factory=sink_factory,
+            run_id=run_id,
+            initiated_by_user_id=initiated_by_user_id,
+            auth_provider_type=auth_provider_type,
+            openrouter_catalog_sha256=openrouter_catalog_sha256,
+            openrouter_catalog_source=openrouter_catalog_source,
+            web_plugin_policy_evidence=web_plugin_policy_evidence,
+            check_coordination_latch=check_coordination_latch,
+            pre_effect_guard=pre_effect_guard,
+            run_start_permit=run_start_permit,
+            # Bound AT CALL TIME (not construction) so monkeypatch.setattr on
+            # the class and patch.object on this instance keep intercepting.
+            initialize_database_phase=self._initialize_database_phase,
+            execute_run=self._execute_run,
+        )
+
+    def _register_graph_nodes_and_edges(
+        self,
+        factory: RecorderFactory,
+        run_id: str,
+        config: PipelineConfig,
+        graph: ExecutionGraph,
+        coordination_token: CoordinationToken,
+    ) -> GraphArtifacts:
+        """GRAPH-phase delegator (test seam — see GraphRegistrationService)."""
+        return self._graph_registration.register_graph_nodes_and_edges(factory, run_id, config, graph, coordination_token)
+
+    def _execute_run(
+        self,
+        factory: RecorderFactory,
+        run_id: str,
+        config: PipelineConfig,
+        graph: ExecutionGraph,
+        settings: ElspethSettings | None = None,
+        *,
+        payload_store: PayloadStore,
+        shutdown_event: threading.Event | None = None,
+        coordination_token: CoordinationToken,
+        check_coordination_latch: Callable[[], None] | None = None,
+        before_plugin_effects: Callable[[], None] | None = None,
+    ) -> RunResult:
+        """Run-body delegator (test seam — see LeaderDrainCoordinator).
+
+        Returns RunStatus.RUNNING — the public run() wrapper transitions to
+        COMPLETED after finalize_run().
+        """
+        return self._leader_drain.execute_run(
+            factory,
+            run_id,
+            config,
+            graph,
+            settings,
+            payload_store=payload_store,
+            shutdown_event=shutdown_event,
+            coordination_token=coordination_token,
+            check_coordination_latch=check_coordination_latch,
+            before_plugin_effects=before_plugin_effects,
+            register_graph_nodes_and_edges=self._register_graph_nodes_and_edges,
+        )
+
+    def resume(
+        self,
+        resume_point: ResumePoint,
+        config: PipelineConfig,
+        graph: ExecutionGraph,
+        *,
+        payload_store: PayloadStore,
+        settings: ElspethSettings | None = None,
+        shutdown_event: threading.Event | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
+        check_coordination_latch: Callable[[], None] | None = None,
+    ) -> RunResult:
+        """Resume a failed run from a checkpoint.
+
+        Delegates to :class:`ResumeCoordinator`, which owns the resume-path
+        orchestration extracted from this class. The public signature is the
+        stable contract; the implementation lives in resume.py.
+
+        ``pre_effect_guard`` runs after winning Landscape leadership, before
+        repair writes. ``check_coordination_latch`` checks caller authority
+        throughout processing. Refusal releases the seat without declaring
+        the pipeline failed.
+        """
+        require_sink_effect_admission(
+            config.sinks,
+            configured_modes=config.sink_effect_modes,
+            required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+            admission=config.sink_effect_admission,
+            runtime_bindings=config.sink_effect_bindings,
+            run_mode=resolve_runtime_run_mode(config, settings).mode,
+        )
+        return self._resume_coordinator.resume(
+            resume_point,
+            config,
+            graph,
+            payload_store=payload_store,
+            settings=settings,
+            shutdown_event=shutdown_event,
+            pre_effect_guard=pre_effect_guard,
+            check_coordination_latch=check_coordination_latch,
+        )
+
+    def join_run(
+        self,
+        run_id: str,
+        settings: ElspethSettings,
+        *,
+        window_seconds: float | None = None,
+    ) -> WorkerMembershipToken:
+        """§B.1: atomic follower admission — public entry point (ADR-030).
+
+        Delegates to :class:`JoinAdmissionService`, which owns the follower
+        attach path (filesystem preflight + atomic admission) extracted from
+        this class. The public signature is the stable contract; the
+        implementation lives in join_admission.py.
+        """
+        return self._join_admission.join_run(
+            run_id,
+            settings,
+            window_seconds=window_seconds,
+        )

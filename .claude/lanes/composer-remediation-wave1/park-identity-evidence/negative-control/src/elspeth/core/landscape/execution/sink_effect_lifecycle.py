@@ -1,0 +1,1093 @@
+"""Short, generation-fenced transactions for the sink-effect lifecycle."""
+
+from __future__ import annotations
+
+import re
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
+from typing import Any, Final
+
+from sqlalchemy import ColumnElement, Row, bindparam, func, select
+from sqlalchemy.engine import Connection
+
+from elspeth.contracts import CallStatus, CallType
+from elspeth.contracts.audit import SinkEffect, SinkEffectAttempt
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.sink_effects import (
+    SinkEffectAttemptAction,
+    SinkEffectAttemptRequest,
+    SinkEffectAttemptResult,
+    SinkEffectAttemptState,
+    SinkEffectCommitResult,
+    SinkEffectDescriptorMode,
+    SinkEffectInputKind,
+    SinkEffectInspectionMode,
+    SinkEffectLease,
+    SinkEffectPlan,
+    SinkEffectReconcileKind,
+    SinkEffectReconcileResult,
+    SinkEffectState,
+)
+from elspeth.core.landscape._helpers import now
+from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.database_clock import landscape_clock_resolution, read_landscape_decision_time
+from elspeth.core.landscape.errors import LandscapeRecordError, SinkEffectLeaseLiveError
+from elspeth.core.landscape.execution.sink_effect_attempt_results import (
+    decode_sink_effect_returned_result,
+    encode_sink_effect_returned_result,
+)
+from elspeth.core.landscape.lease_deadlines import DeadlineKey, DeadlineKind, record_issued_deadline
+from elspeth.core.landscape.model_loaders import SinkEffectAttemptLoader, SinkEffectLoader
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+from elspeth.core.landscape.schema import (
+    calls_table,
+    operations_table,
+    sink_effect_attempts_table,
+    sink_effect_members_table,
+    sink_effect_streams_table,
+    sink_effects_table,
+)
+
+_LOWER_HEX_64: Final = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _require_hash(value: object, field_name: str) -> None:
+    if type(value) is not str or _LOWER_HEX_64.fullmatch(value) is None:
+        raise ValueError(f"{field_name} must be a lowercase SHA-256 digest")
+
+
+def _require_positive_ttl(ttl: timedelta) -> None:
+    if type(ttl) is not timedelta or ttl <= timedelta(0):
+        raise ValueError("lease ttl must be a positive timedelta")
+
+
+def _aligned_lease_ttl(conn: Connection, ttl: timedelta) -> timedelta:
+    """Return the DURATION to add to database time so the deadline outlasts ``ttl``.
+
+    A duration, never an instant: this reads no clock, it rounds ``ttl`` up to
+    a whole multiple of the coarsest supported comparison precision. SQLite
+    retains whole-second alignment for compatibility even though fresh
+    decisions now sample milliseconds. Whole-second TTLs, used by every
+    production caller, are unchanged on both dialects.
+    """
+    resolution = landscape_clock_resolution(conn)
+    return -(-ttl // resolution) * resolution
+
+
+def _utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def lease_is_live(conn: Connection, effect_id: str, liveness: ColumnElement[bool]) -> bool:
+    """Decide, in SQL, whether the effect's lease satisfies ``liveness`` right now.
+
+    ADR-047: the caller builds ``liveness`` as ``lease_expires_at >= database_now``
+    from the fresh database clock it read under the row lock, so the deadline
+    comparison is a predicate bound to Landscape database time — neither
+    dialect's datetime convention nor a process clock enters the decision. A
+    deadline equal to database time is still live; a NULL deadline is not live.
+    """
+    return (
+        conn.execute(
+            select(sink_effects_table.c.effect_id).where(sink_effects_table.c.effect_id == effect_id, liveness)
+        ).scalar_one_or_none()
+        is not None
+    )
+
+
+def _descriptor_payload(plan: SinkEffectPlan) -> object:
+    descriptor = plan.expected_descriptor
+    if descriptor is None:
+        return None
+    return {
+        "artifact_type": descriptor.artifact_type,
+        "content_hash": descriptor.content_hash,
+        "metadata": None if descriptor.metadata is None else deep_thaw(descriptor.metadata),
+        "path_or_uri": descriptor.path_or_uri,
+        "size_bytes": descriptor.size_bytes,
+    }
+
+
+def _plan_json(plan: SinkEffectPlan) -> str:
+    return canonical_json(
+        {
+            "descriptor_mode": plan.descriptor_mode.value,
+            "effect_id": plan.effect_id,
+            "expected_descriptor": _descriptor_payload(plan),
+            "input_kind": plan.input_kind.value,
+            "inspection_mode": plan.inspection_mode.value,
+            "payload_hash": plan.payload_hash,
+            "plan_hash": plan.plan_hash,
+            "protocol_version": plan.protocol_version,
+            "safe_evidence": deep_thaw(plan.safe_evidence),
+            "target": plan.target,
+        }
+    )
+
+
+def _attempt_id(request: SinkEffectAttemptRequest, *, ordinal: int) -> str:
+    return stable_hash(
+        {
+            "action": request.action.value,
+            "effect_id": request.effect_id,
+            "generation": request.generation,
+            "member_ordinal": request.member_ordinal,
+            "ordinal": ordinal,
+            "request_hash": request.request_hash,
+            "schema": "sink-effect-attempt-v1",
+        }
+    )
+
+
+class SinkEffectLifecycle:
+    """Own lifecycle mutations without holding locks across external I/O.
+
+    Every mutation takes the run's current leader ``CoordinationToken`` and
+    opens :func:`fenced_leader_transaction` as its FIRST database effect
+    (ADR-048): a deposed leader's write is refused by the seat CAS before any
+    payload statement runs, and the effect it names must belong to the
+    token's run. Sink effects are leader-only work (ADR-030 §B.1 / §C.3), so
+    there is no follower arm.
+    """
+
+    def __init__(self, db: LandscapeDB, *, effect_loader: SinkEffectLoader) -> None:
+        self._db = db
+        self._effect_loader = effect_loader
+        self._attempt_loader = SinkEffectAttemptLoader()
+
+    def claim_preparation(
+        self,
+        effect_id: str,
+        *,
+        owner: str,
+        ttl: timedelta,
+        coordination_token: CoordinationToken,
+    ) -> SinkEffectLease:
+        """Durably claim exclusive preparation ownership of a reserved effect.
+
+        Preparation runs side-effecting adapter code (it may replace or bind
+        the deterministic staging path), so it must be fenced exactly like
+        commit/reconcile: one live owner, generation-bumping takeover only
+        after expiry.
+        """
+        self._validate_owner(owner)
+        _require_positive_ttl(ttl)
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="claim_preparation",
+        ) as conn:
+            row = self._lock_effect(conn, effect_id, include_stream=True, coordination_token=coordination_token)
+            if row.state != SinkEffectState.RESERVED.value:
+                raise LandscapeRecordError("sink effect preparation claim requires a reserved effect")
+            # ADR-047: the claim decides liveness and stamps its deadline from
+            # Landscape database time read under the row lock, never from the
+            # process clock — a drifted worker cannot claim early or long.
+            database_now = read_landscape_decision_time(conn)
+            lease_live = lease_is_live(conn, effect_id, sink_effects_table.c.lease_expires_at >= database_now)
+            if row.lease_owner is not None and row.lease_owner != owner and lease_live:
+                raise SinkEffectLeaseLiveError("sink effect preparation has a live claim owned by another worker")
+            self._require_predecessor_finalized(conn, row)
+            generation = int(row.generation) + 1
+            # Bind eligibility and issuance to this one post-lock sample.
+            expires_at = database_now + _aligned_lease_ttl(conn, ttl)
+            claimed = conn.execute(
+                sink_effects_table.update()
+                .where(
+                    sink_effects_table.c.effect_id == effect_id,
+                    sink_effects_table.c.state == SinkEffectState.RESERVED.value,
+                    sink_effects_table.c.generation == row.generation,
+                )
+                .values(
+                    lease_owner=owner,
+                    generation=generation,
+                    lease_heartbeat_at=database_now,
+                    lease_expires_at=expires_at,
+                    updated_at=database_now,
+                )
+            )
+            if claimed.rowcount != 1:
+                raise LandscapeRecordError("sink effect preparation claim CAS lost unexpectedly")
+            record_issued_deadline(
+                conn,
+                key=DeadlineKey(DeadlineKind.SINK_EFFECT, (effect_id,)),
+                expires_at=expires_at,
+                window_seconds=_aligned_lease_ttl(conn, ttl).total_seconds(),
+            )
+            return SinkEffectLease(effect_id, owner, generation, expires_at)
+
+    def complete_plan(
+        self,
+        effect_id: str,
+        plan: SinkEffectPlan,
+        *,
+        claim: SinkEffectLease,
+        coordination_token: CoordinationToken,
+    ) -> SinkEffect:
+        _require_hash(effect_id, "effect_id")
+        if type(plan) is not SinkEffectPlan:
+            raise TypeError("plan must be exact SinkEffectPlan")
+        if plan.effect_id != effect_id:
+            raise ValueError("plan effect_id does not match the requested effect")
+        if type(claim) is not SinkEffectLease:
+            raise TypeError("claim must be exact SinkEffectLease")
+        if claim.effect_id != effect_id:
+            raise ValueError("claim effect_id does not match the requested effect")
+        encoded_plan = _plan_json(plan)
+        expected_descriptor_hash = None if plan.expected_descriptor is None else stable_hash(_descriptor_payload(plan))
+
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="complete_plan",
+        ) as conn:
+            row = self._lock_effect(conn, effect_id, include_stream=True, coordination_token=coordination_token)
+            if row.input_kind != plan.input_kind.value:
+                raise LandscapeRecordError("sink effect plan input kind is divergent")
+            if row.state != SinkEffectState.RESERVED.value:
+                if row.plan_json == encoded_plan and row.plan_hash == plan.plan_hash:
+                    return self._effect_loader.load(row)
+                raise LandscapeRecordError("sink effect has a divergent plan")
+            # The bind fence is ownership identity, not expiry: any rival
+            # takeover bumps the generation, so an expired-but-unstolen claim
+            # is still the unique preparer and may bind its plan safely.
+            if row.lease_owner != claim.owner or int(row.generation) != claim.generation:
+                raise LandscapeRecordError("sink effect plan bind requires the owning preparation claim")
+            self._require_predecessor_finalized(conn, row)
+
+            inspection_attempt_id: str
+            if plan.inspection_mode is SinkEffectInspectionMode.NO_INSPECTION_REQUIRED:
+                inspection_attempt_id = stable_hash(
+                    {"effect_id": effect_id, "reference": "no-inspection-required:v1", "schema": "sink-effect-inspection-sentinel-v1"}
+                )
+            else:
+                attempt = conn.execute(
+                    select(sink_effect_attempts_table)
+                    .where(
+                        sink_effect_attempts_table.c.effect_id == effect_id,
+                        sink_effect_attempts_table.c.action == SinkEffectAttemptAction.INSPECT.value,
+                        sink_effect_attempts_table.c.state == SinkEffectAttemptState.RETURNED.value,
+                    )
+                    .order_by(sink_effect_attempts_table.c.completed_at.desc(), sink_effect_attempts_table.c.attempt_id.desc())
+                    .limit(1)
+                ).fetchone()
+                if attempt is None:
+                    raise LandscapeRecordError("inspected sink effect plan requires a returned inspect attempt")
+                inspection_attempt_id = str(attempt.attempt_id)
+
+            timestamp = now()
+            updated = conn.execute(
+                sink_effects_table.update()
+                .where(
+                    sink_effects_table.c.effect_id == effect_id,
+                    sink_effects_table.c.state == SinkEffectState.RESERVED.value,
+                    sink_effects_table.c.plan_hash.is_(None),
+                    sink_effects_table.c.lease_owner == claim.owner,
+                    sink_effects_table.c.generation == claim.generation,
+                )
+                .values(
+                    state=SinkEffectState.PREPARED.value,
+                    target_json=canonical_json({"resolved_target": plan.target}),
+                    inspection_mode=plan.inspection_mode.value,
+                    inspection_attempt_id=inspection_attempt_id,
+                    plan_json=encoded_plan,
+                    plan_hash=plan.plan_hash,
+                    descriptor_mode=plan.descriptor_mode.value,
+                    expected_descriptor_hash=expected_descriptor_hash,
+                    precondition_hash=stable_hash(
+                        {"inspection_attempt_id": inspection_attempt_id, "safe_evidence": deep_thaw(plan.safe_evidence)}
+                    ),
+                    prepared_at=timestamp,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    lease_heartbeat_at=None,
+                    updated_at=timestamp,
+                )
+            )
+            if updated.rowcount != 1:
+                raise LandscapeRecordError("sink effect plan CAS lost unexpectedly")
+            if row.input_kind == SinkEffectInputKind.PIPELINE_MEMBERS.value:
+                member_rows = list(
+                    conn.execute(
+                        select(sink_effect_members_table.c.ordinal)
+                        .where(sink_effect_members_table.c.effect_id == effect_id)
+                        .order_by(sink_effect_members_table.c.ordinal)
+                    ).fetchall()
+                )
+                durable_ordinals_list: list[int] = []
+                for member in member_rows:
+                    ordinal = member.ordinal
+                    if type(ordinal) is not int:
+                        raise LandscapeRecordError("durable sink effect member ordinal must be an integer")
+                    durable_ordinals_list.append(ordinal)
+                durable_ordinals = tuple(durable_ordinals_list)
+                accepted, diverted, reason_hashes = self._planned_member_partition(plan, durable_ordinals)
+                # One executemany UPDATE binds every member's planned
+                # disposition (the fencing gate forbids DML inside a loop);
+                # durable_ordinals is dense and non-empty for pipeline members.
+                member_dispositions: list[dict[str, int | str | None]] = []
+                for ordinal in accepted:
+                    member_dispositions.append({"member_ordinal": ordinal, "disposition": "accepted", "member_reason_hash": None})
+                for ordinal in diverted:
+                    member_dispositions.append(
+                        {"member_ordinal": ordinal, "disposition": "diverted", "member_reason_hash": reason_hashes[ordinal]}
+                    )
+                if member_dispositions:
+                    conn.execute(
+                        sink_effect_members_table.update()
+                        .where(
+                            sink_effect_members_table.c.effect_id == effect_id,
+                            sink_effect_members_table.c.ordinal == bindparam("member_ordinal"),
+                        )
+                        .values(
+                            prepared_disposition=bindparam("disposition"),
+                            reason_hash=bindparam("member_reason_hash"),
+                            member_state=SinkEffectState.PREPARED.value,
+                        ),
+                        member_dispositions,
+                    )
+            winner = conn.execute(select(sink_effects_table).where(sink_effects_table.c.effect_id == effect_id)).fetchone()
+            if winner is None:  # pragma: no cover - same transaction
+                raise LandscapeRecordError("prepared sink effect disappeared")
+            return self._effect_loader.load(winner)
+
+    @staticmethod
+    def _planned_member_partition(
+        plan: SinkEffectPlan,
+        durable_ordinals: tuple[int, ...],
+    ) -> tuple[tuple[int, ...], tuple[int, ...], dict[int, str]]:
+        evidence = deep_thaw(plan.safe_evidence)
+        if type(evidence) is not dict:
+            raise LandscapeRecordError("sink effect plan evidence must be an object")
+        has_accepted = "accepted_ordinals" in evidence
+        has_diverted = "diverted_ordinals" in evidence
+        if not has_accepted and not has_diverted:
+            return durable_ordinals, (), {}
+        if has_accepted != has_diverted:
+            raise LandscapeRecordError("planned accepted/diverted ordinals must both be present")
+        raw_accepted = evidence["accepted_ordinals"]
+        raw_diverted = evidence["diverted_ordinals"]
+        if type(raw_accepted) is not list or type(raw_diverted) is not list:
+            raise LandscapeRecordError("planned accepted/diverted ordinals must both be lists")
+        accepted = tuple(raw_accepted)
+        diverted = tuple(raw_diverted)
+        for label, values in (("accepted", accepted), ("diverted", diverted)):
+            if any(type(value) is not int or value < 0 for value in values) or values != tuple(sorted(set(values))):
+                raise LandscapeRecordError(f"planned {label} ordinals must be unique ascending non-negative integers")
+        if tuple(sorted((*accepted, *diverted))) != durable_ordinals:
+            raise LandscapeRecordError("planned accepted/diverted ordinals must exactly partition durable members")
+        reason_hashes: dict[int, str] = {}
+        if "diversion_attribution" in evidence:
+            raw_attribution = evidence["diversion_attribution"]
+        else:
+            raw_attribution = []
+        if type(raw_attribution) is not list:
+            raise LandscapeRecordError("planned diversion attribution must be a list")
+        for item in raw_attribution:
+            if type(item) is not dict or set(item) != {"error_hash", "ordinal", "reason_hash"}:
+                raise LandscapeRecordError("planned diversion attribution has a divergent field set")
+            ordinal = item["ordinal"]
+            reason_hash = item["reason_hash"]
+            error_hash = item["error_hash"]
+            if (
+                type(ordinal) is not int
+                or ordinal not in diverted
+                or ordinal in reason_hashes
+                or type(reason_hash) is not str
+                or _LOWER_HEX_64.fullmatch(reason_hash) is None
+                or type(error_hash) is not str
+                or re.fullmatch(r"[0-9a-f]{16}", error_hash) is None
+            ):
+                raise LandscapeRecordError("planned diversion attribution is invalid")
+            reason_hashes[ordinal] = reason_hash
+        if set(reason_hashes) != set(diverted):
+            raise LandscapeRecordError("planned diversion attribution must cover every diverted member")
+        return accepted, diverted, reason_hashes
+
+    def acquire_lease(
+        self,
+        effect_id: str,
+        *,
+        owner: str,
+        ttl: timedelta,
+        coordination_token: CoordinationToken,
+    ) -> SinkEffectLease:
+        self._validate_owner(owner)
+        _require_positive_ttl(ttl)
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="acquire_lease",
+        ) as conn:
+            row = self._lock_effect(conn, effect_id, include_stream=True, coordination_token=coordination_token)
+            if row.state == SinkEffectState.RESERVED.value:
+                raise LandscapeRecordError("sink effect must be prepared before lease acquisition")
+            database_now = read_landscape_decision_time(conn)
+            lease_live = lease_is_live(conn, effect_id, sink_effects_table.c.lease_expires_at >= database_now)
+            if row.state != SinkEffectState.PREPARED.value:
+                if row.state == SinkEffectState.IN_FLIGHT.value and row.lease_owner == owner and lease_live:
+                    return SinkEffectLease(row.effect_id, row.lease_owner, row.generation, _utc(row.lease_expires_at))
+                raise LandscapeRecordError(f"sink effect cannot acquire lease from state {row.state!r}")
+            self._require_predecessor_finalized(conn, row)
+            # Bind eligibility and issuance to this one post-lock sample.
+            expires_at = database_now + _aligned_lease_ttl(conn, ttl)
+            generation = int(row.generation) + 1
+            conn.execute(
+                sink_effects_table.update()
+                .where(sink_effects_table.c.effect_id == effect_id, sink_effects_table.c.state == SinkEffectState.PREPARED.value)
+                .values(
+                    state=SinkEffectState.IN_FLIGHT.value,
+                    lease_owner=owner,
+                    generation=generation,
+                    lease_heartbeat_at=database_now,
+                    lease_expires_at=expires_at,
+                    updated_at=database_now,
+                )
+            )
+            record_issued_deadline(
+                conn,
+                key=DeadlineKey(DeadlineKind.SINK_EFFECT, (effect_id,)),
+                expires_at=expires_at,
+                window_seconds=_aligned_lease_ttl(conn, ttl).total_seconds(),
+            )
+            return SinkEffectLease(effect_id, owner, generation, expires_at)
+
+    def heartbeat_lease(
+        self,
+        effect_id: str,
+        *,
+        owner: str,
+        generation: int,
+        ttl: timedelta,
+        coordination_token: CoordinationToken,
+    ) -> SinkEffectLease:
+        self._validate_owner(owner)
+        _require_positive_ttl(ttl)
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="heartbeat_lease",
+        ) as conn:
+            row = self._lock_effect(conn, effect_id, include_stream=False, coordination_token=coordination_token)
+            database_now = read_landscape_decision_time(conn)
+            lease_live = lease_is_live(conn, effect_id, sink_effects_table.c.lease_expires_at >= database_now)
+            # Expiry alone does not depose a RESERVED preparation holder. A
+            # competing claim wins by changing owner/generation under this
+            # same row lock; an otherwise unchanged claim may revive, matching
+            # complete_plan(). Preserve the stricter IN_FLIGHT lease contract.
+            if (
+                row.state not in {SinkEffectState.RESERVED.value, SinkEffectState.IN_FLIGHT.value}
+                or row.lease_owner != owner
+                or row.generation != generation
+                or (row.state == SinkEffectState.IN_FLIGHT.value and not lease_live)
+            ):
+                raise LandscapeRecordError("sink effect lease heartbeat has stale owner or generation")
+            # Bind eligibility and issuance to this one post-lock sample.
+            expires_at = database_now + _aligned_lease_ttl(conn, ttl)
+            conn.execute(
+                sink_effects_table.update()
+                .where(sink_effects_table.c.effect_id == effect_id)
+                .values(lease_heartbeat_at=database_now, lease_expires_at=expires_at, updated_at=database_now)
+            )
+            record_issued_deadline(
+                conn,
+                key=DeadlineKey(DeadlineKind.SINK_EFFECT, (effect_id,)),
+                expires_at=expires_at,
+                window_seconds=_aligned_lease_ttl(conn, ttl).total_seconds(),
+            )
+            return SinkEffectLease(effect_id, owner, generation, expires_at)
+
+    def takeover_expired(
+        self,
+        effect_id: str,
+        *,
+        owner: str,
+        ttl: timedelta,
+        coordination_token: CoordinationToken,
+    ) -> SinkEffectLease:
+        self._validate_owner(owner)
+        _require_positive_ttl(ttl)
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="takeover_expired",
+        ) as conn:
+            row = self._lock_effect(conn, effect_id, include_stream=False, coordination_token=coordination_token)
+            database_now = read_landscape_decision_time(conn)
+            lease_live = lease_is_live(conn, effect_id, sink_effects_table.c.lease_expires_at >= database_now)
+            if row.state == SinkEffectState.FINALIZED.value:
+                raise LandscapeRecordError("finalized sink effect cannot be taken over")
+            if row.state != SinkEffectState.IN_FLIGHT.value:
+                raise LandscapeRecordError("sink effect lease has not expired")
+            if lease_live:
+                raise SinkEffectLeaseLiveError("sink effect lease has not expired")
+            generation = int(row.generation) + 1
+            # Bind eligibility and issuance to this one post-lock sample.
+            expires_at = database_now + _aligned_lease_ttl(conn, ttl)
+            conn.execute(
+                sink_effects_table.update()
+                .where(
+                    sink_effects_table.c.effect_id == effect_id,
+                    sink_effects_table.c.state == SinkEffectState.IN_FLIGHT.value,
+                    sink_effects_table.c.generation == row.generation,
+                )
+                .values(
+                    lease_owner=owner,
+                    generation=generation,
+                    lease_heartbeat_at=database_now,
+                    lease_expires_at=expires_at,
+                    updated_at=database_now,
+                )
+            )
+            record_issued_deadline(
+                conn,
+                key=DeadlineKey(DeadlineKind.SINK_EFFECT, (effect_id,)),
+                expires_at=expires_at,
+                window_seconds=_aligned_lease_ttl(conn, ttl).total_seconds(),
+            )
+            return SinkEffectLease(effect_id, owner, generation, expires_at)
+
+    def lease_validity_seconds(self, effect_id: str) -> float | None:
+        """Seconds the effect's lease stays live at Landscape database time; ``None`` once it has lapsed or never existed.
+
+        Both operands come from the database: the stored deadline and a fresh
+        Landscape sample (ADR-047). This unlocked estimate is advisory; a
+        subsequent mutation rechecks eligibility under its locks. A caller
+        pacing a wait for a foreign lease uses this instead of subtracting the deadline from its
+        own process clock, so its budget and the repository's takeover
+        decision are measured on the same clock.
+        """
+        _require_hash(effect_id, "effect_id")
+        with self._db.read_only_connection() as conn:
+            deadline = conn.execute(
+                select(sink_effects_table.c.lease_expires_at).where(sink_effects_table.c.effect_id == effect_id)
+            ).scalar_one_or_none()
+            if deadline is None:
+                return None
+            database_now = read_landscape_decision_time(conn)
+        remaining = (_utc(deadline) - database_now).total_seconds()
+        return None if remaining < 0.0 else remaining
+
+    def begin_attempt(self, request: SinkEffectAttemptRequest, *, coordination_token: CoordinationToken) -> SinkEffectAttempt:
+        if type(request) is not SinkEffectAttemptRequest:
+            raise TypeError("request must be exact SinkEffectAttemptRequest")
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="begin_attempt",
+        ) as conn:
+            effect = self._lock_effect(conn, request.effect_id, include_stream=True, coordination_token=coordination_token)
+            self._validate_attempt_authority(effect, request)
+            if request.member_ordinal is not None:
+                member = conn.execute(
+                    select(sink_effect_members_table)
+                    .where(
+                        sink_effect_members_table.c.effect_id == request.effect_id,
+                        sink_effect_members_table.c.ordinal == request.member_ordinal,
+                    )
+                    .with_for_update()
+                ).fetchone()
+                if member is None:
+                    raise LandscapeRecordError("sink effect attempt references a missing member")
+            operation = self._lock_operation(conn, request.effect_id)
+            member_predicate = (
+                sink_effect_attempts_table.c.member_ordinal.is_(None)
+                if request.member_ordinal is None
+                else sink_effect_attempts_table.c.member_ordinal == request.member_ordinal
+            )
+            existing_intent = conn.execute(
+                select(sink_effect_attempts_table).where(
+                    sink_effect_attempts_table.c.effect_id == request.effect_id,
+                    member_predicate,
+                    sink_effect_attempts_table.c.generation == request.generation,
+                    sink_effect_attempts_table.c.action == request.action.value,
+                    sink_effect_attempts_table.c.request_hash == request.request_hash,
+                    sink_effect_attempts_table.c.state == SinkEffectAttemptState.INTENT.value,
+                )
+            ).fetchone()
+            if existing_intent is not None:
+                return self._attempt_loader.load(existing_intent)
+            ordinal = int(
+                conn.scalar(
+                    select(func.count())
+                    .select_from(sink_effect_attempts_table)
+                    .where(sink_effect_attempts_table.c.effect_id == request.effect_id)
+                )
+                or 0
+            )
+            attempt_id = _attempt_id(request, ordinal=ordinal)
+            timestamp = now()
+            conn.execute(
+                sink_effect_attempts_table.insert().values(
+                    attempt_id=attempt_id,
+                    effect_id=request.effect_id,
+                    member_ordinal=request.member_ordinal,
+                    generation=request.generation,
+                    action=request.action.value,
+                    call_kind=request.call_kind.value,
+                    request_hash=request.request_hash,
+                    state=SinkEffectAttemptState.INTENT.value,
+                    evidence_json=None,
+                    evidence_hash=None,
+                    started_at=timestamp,
+                    completed_at=None,
+                    latency_ms=None,
+                )
+            )
+            if request.member_ordinal is not None and request.action in {
+                SinkEffectAttemptAction.COMMIT,
+                SinkEffectAttemptAction.RECONCILE,
+            }:
+                conn.execute(
+                    sink_effect_members_table.update()
+                    .where(
+                        sink_effect_members_table.c.effect_id == request.effect_id,
+                        sink_effect_members_table.c.ordinal == request.member_ordinal,
+                        sink_effect_members_table.c.member_state != SinkEffectState.FINALIZED.value,
+                    )
+                    .values(member_state=SinkEffectState.IN_FLIGHT.value)
+                )
+            row = conn.execute(select(sink_effect_attempts_table).where(sink_effect_attempts_table.c.attempt_id == attempt_id)).one()
+            assert operation is not None
+            return self._attempt_loader.load(row)
+
+    def get_attempts(self, effect_id: str) -> tuple[SinkEffectAttempt, ...]:
+        _require_hash(effect_id, "effect_id")
+        with self._db.read_only_connection() as conn:
+            rows = conn.execute(
+                select(sink_effect_attempts_table)
+                .where(sink_effect_attempts_table.c.effect_id == effect_id)
+                .order_by(sink_effect_attempts_table.c.started_at, sink_effect_attempts_table.c.attempt_id)
+            ).fetchall()
+        return tuple(self._attempt_loader.load(row) for row in rows)
+
+    def record_attempt_result(self, result: SinkEffectAttemptResult, *, coordination_token: CoordinationToken) -> SinkEffectAttempt:
+        if type(result) is not SinkEffectAttemptResult:
+            raise TypeError("result must be exact SinkEffectAttemptResult")
+        evidence_json = canonical_json(deep_thaw(result.evidence))
+        evidence_hash = sha256(evidence_json.encode("utf-8")).hexdigest()
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="record_attempt_result",
+        ) as conn:
+            optimistic = conn.execute(
+                select(sink_effect_attempts_table).where(sink_effect_attempts_table.c.attempt_id == result.attempt_id)
+            ).fetchone()
+            if optimistic is None:
+                raise LandscapeRecordError(f"sink effect attempt {result.attempt_id!r} does not exist")
+            effect = self._lock_effect(conn, optimistic.effect_id, include_stream=True, coordination_token=coordination_token)
+            operation = self._lock_operation(conn, optimistic.effect_id)
+            attempt = self._lock_attempt(conn, result.attempt_id)
+            if attempt.state == SinkEffectAttemptState.RETURNED.value:
+                if (
+                    attempt.evidence_json == evidence_json
+                    and attempt.evidence_hash == evidence_hash
+                    and attempt.latency_ms == result.latency_ms
+                ):
+                    return self._attempt_loader.load(attempt)
+                raise LandscapeRecordError("attempt result is divergent from the durable winner")
+            if attempt.state != SinkEffectAttemptState.INTENT.value:
+                raise LandscapeRecordError(f"attempt cannot return from state {attempt.state!r}")
+            if effect.generation != attempt.generation:
+                raise LandscapeRecordError("attempt result has stale generation")
+            decode_sink_effect_returned_result(SinkEffectAttemptAction(attempt.action), evidence_json)
+            timestamp = now()
+            conn.execute(
+                sink_effect_attempts_table.update()
+                .where(
+                    sink_effect_attempts_table.c.attempt_id == result.attempt_id,
+                    sink_effect_attempts_table.c.state == SinkEffectAttemptState.INTENT.value,
+                )
+                .values(
+                    state=SinkEffectAttemptState.RETURNED.value,
+                    evidence_json=evidence_json,
+                    evidence_hash=evidence_hash,
+                    completed_at=timestamp,
+                    latency_ms=result.latency_ms,
+                )
+            )
+            self._insert_call(
+                conn,
+                operation_id=operation.operation_id,
+                call_type=self._call_type(attempt.call_kind),
+                status=CallStatus.SUCCESS,
+                request_hash=attempt.request_hash,
+                response_hash=evidence_hash,
+                error_json=None,
+                latency_ms=result.latency_ms,
+            )
+            winner = conn.execute(
+                select(sink_effect_attempts_table).where(sink_effect_attempts_table.c.attempt_id == result.attempt_id)
+            ).one()
+            return self._attempt_loader.load(winner)
+
+    def complete_member_result(
+        self,
+        attempt_id: str,
+        result: SinkEffectCommitResult | SinkEffectReconcileResult,
+        *,
+        lease: SinkEffectLease,
+        coordination_token: CoordinationToken,
+    ) -> None:
+        """Persist one returned member result under its effect generation fence."""
+        _require_hash(attempt_id, "attempt_id")
+        if type(result) not in {SinkEffectCommitResult, SinkEffectReconcileResult}:
+            raise TypeError("member result must be an exact commit or reconcile result")
+        if type(lease) is not SinkEffectLease:
+            raise TypeError("lease must be an exact SinkEffectLease")
+        encoded_result = canonical_json(deep_thaw(encode_sink_effect_returned_result(result)))
+        evidence_hash = sha256(canonical_json(deep_thaw(result.evidence)).encode("utf-8")).hexdigest()
+        descriptor = result.descriptor
+        descriptor_hash = (
+            None
+            if descriptor is None
+            else sha256(
+                canonical_json(
+                    {
+                        "artifact_type": descriptor.artifact_type,
+                        "content_hash": descriptor.content_hash,
+                        "metadata": None if descriptor.metadata is None else deep_thaw(descriptor.metadata),
+                        "path_or_uri": descriptor.path_or_uri,
+                        "size_bytes": descriptor.size_bytes,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        if isinstance(result, SinkEffectCommitResult) or result.kind is SinkEffectReconcileKind.APPLIED_WITH_EXACT_DESCRIPTOR:
+            next_state = SinkEffectState.FINALIZED
+        elif result.kind is SinkEffectReconcileKind.NOT_APPLIED:
+            next_state = SinkEffectState.PREPARED
+        else:
+            next_state = SinkEffectState.IN_FLIGHT
+
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="complete_member_result",
+        ) as conn:
+            optimistic = conn.execute(
+                select(sink_effect_attempts_table).where(sink_effect_attempts_table.c.attempt_id == attempt_id)
+            ).fetchone()
+            if optimistic is None:
+                raise LandscapeRecordError(f"sink effect attempt {attempt_id!r} does not exist")
+            effect = self._lock_effect(conn, optimistic.effect_id, include_stream=True, coordination_token=coordination_token)
+            attempt = self._lock_attempt(conn, attempt_id)
+            database_now = read_landscape_decision_time(conn)
+            lease_live = lease_is_live(conn, str(effect.effect_id), sink_effects_table.c.lease_expires_at >= database_now)
+            if (
+                lease.effect_id != effect.effect_id
+                or effect.state != SinkEffectState.IN_FLIGHT.value
+                or effect.lease_owner != lease.owner
+                or effect.generation != lease.generation
+                or not lease_live
+            ):
+                raise LandscapeRecordError("member result has stale lease authority")
+            if attempt.member_ordinal is None:
+                raise LandscapeRecordError("member result requires a member-scoped attempt")
+            expected_action = (
+                SinkEffectAttemptAction.COMMIT.value if type(result) is SinkEffectCommitResult else SinkEffectAttemptAction.RECONCILE.value
+            )
+            if attempt.action != expected_action or attempt.state != SinkEffectAttemptState.RETURNED.value:
+                raise LandscapeRecordError("member result does not match a returned member attempt")
+            if attempt.generation > lease.generation:
+                raise LandscapeRecordError("member result has impossible future generation")
+            if attempt.evidence_json != encoded_result:
+                raise LandscapeRecordError("member result differs from the durable returned attempt")
+            member = conn.execute(
+                select(sink_effect_members_table)
+                .where(
+                    sink_effect_members_table.c.effect_id == effect.effect_id,
+                    sink_effect_members_table.c.ordinal == attempt.member_ordinal,
+                )
+                .with_for_update()
+            ).fetchone()
+            if member is None:
+                raise LandscapeRecordError("member result references a missing member")
+            if member.member_state == SinkEffectState.FINALIZED.value:
+                if descriptor_hash is None:
+                    raise LandscapeRecordError("finalized member result is missing the winning descriptor")
+                if member.descriptor_hash != descriptor_hash:
+                    raise LandscapeRecordError("finalized member result descriptor is divergent")
+                if member.evidence_hash != evidence_hash:
+                    raise LandscapeRecordError("finalized member result evidence is divergent")
+                return
+            disposition, reason_hash = self._member_result_disposition(result, member_ordinal=int(attempt.member_ordinal))
+            values: dict[str, object] = {
+                "prepared_disposition": disposition,
+                "member_state": next_state.value,
+                "descriptor_hash": descriptor_hash,
+                "evidence_hash": evidence_hash,
+            }
+            if reason_hash is not None:
+                values["reason_hash"] = reason_hash
+            conn.execute(
+                sink_effect_members_table.update()
+                .where(
+                    sink_effect_members_table.c.effect_id == effect.effect_id,
+                    sink_effect_members_table.c.ordinal == attempt.member_ordinal,
+                    sink_effect_members_table.c.member_state != SinkEffectState.FINALIZED.value,
+                )
+                .values(**values)
+            )
+
+    @staticmethod
+    def _member_result_disposition(
+        result: SinkEffectCommitResult | SinkEffectReconcileResult,
+        *,
+        member_ordinal: int,
+    ) -> tuple[str, str | None]:
+        """Classify one member result as accepted or diverted-with-attribution.
+
+        A member commit that diverted its own ordinal must carry exact durable
+        attribution in its result evidence; anything else fails closed rather
+        than recording an unattributed diversion.
+        """
+        if not isinstance(result, SinkEffectCommitResult) or member_ordinal not in set(result.diverted_ordinals):
+            return "accepted", None
+        evidence = deep_thaw(result.evidence)
+        if type(evidence) is not dict:
+            raise LandscapeRecordError("diverted member result evidence must be an object")
+        raw_attribution = None
+        if "diversion_attribution" in evidence:
+            raw_attribution = evidence["diversion_attribution"]
+        if type(raw_attribution) is not list:
+            raise LandscapeRecordError("diverted member result requires diversion attribution evidence")
+        for item in raw_attribution:
+            if (
+                type(item) is not dict
+                or set(item) != {"error_hash", "ordinal", "reason_hash"}
+                or type(item["ordinal"]) is not int
+                or item["ordinal"] < 0
+                or type(item["reason_hash"]) is not str
+                or _LOWER_HEX_64.fullmatch(item["reason_hash"]) is None
+                or type(item["error_hash"]) is not str
+                or re.fullmatch(r"[0-9a-f]{16}", item["error_hash"]) is None
+            ):
+                raise LandscapeRecordError("diverted member result attribution is invalid")
+            if item["ordinal"] == member_ordinal:
+                return "diverted", item["reason_hash"]
+        raise LandscapeRecordError("diverted member result attribution does not cover the member ordinal")
+
+    def mark_response_lost(
+        self,
+        attempt_id: str,
+        *,
+        recovery_lease: SinkEffectLease | None = None,
+        coordination_token: CoordinationToken,
+    ) -> SinkEffectAttempt:
+        _require_hash(attempt_id, "attempt_id")
+        if recovery_lease is not None and type(recovery_lease) is not SinkEffectLease:
+            raise TypeError("recovery_lease must be exact SinkEffectLease or None")
+        evidence = {"classification": "response_lost"}
+        evidence_json = canonical_json(evidence)
+        evidence_hash = sha256(evidence_json.encode("utf-8")).hexdigest()
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="mark_response_lost",
+        ) as conn:
+            optimistic = conn.execute(
+                select(sink_effect_attempts_table).where(sink_effect_attempts_table.c.attempt_id == attempt_id)
+            ).fetchone()
+            if optimistic is None:
+                raise LandscapeRecordError(f"sink effect attempt {attempt_id!r} does not exist")
+            effect = self._lock_effect(conn, optimistic.effect_id, include_stream=True, coordination_token=coordination_token)
+            operation = self._lock_operation(conn, optimistic.effect_id)
+            attempt = self._lock_attempt(conn, attempt_id)
+            timestamp = now()
+            database_now = read_landscape_decision_time(conn)
+            lease_live = lease_is_live(conn, str(effect.effect_id), sink_effects_table.c.lease_expires_at >= database_now)
+            if recovery_lease is None:
+                if effect.generation != attempt.generation:
+                    raise LandscapeRecordError("response-lost classification has stale generation")
+            elif (
+                recovery_lease.effect_id != effect.effect_id
+                or effect.state != SinkEffectState.IN_FLIGHT.value
+                or effect.lease_owner != recovery_lease.owner
+                or effect.generation != recovery_lease.generation
+                or not lease_live
+                or attempt.generation > recovery_lease.generation
+            ):
+                raise LandscapeRecordError("response-lost recovery has stale lease authority")
+            if attempt.state == SinkEffectAttemptState.RESPONSE_LOST.value:
+                return self._attempt_loader.load(attempt)
+            if attempt.state != SinkEffectAttemptState.INTENT.value:
+                raise LandscapeRecordError(f"attempt cannot become response-lost from state {attempt.state!r}")
+            latency_ms = max(0.0, (timestamp - _utc(attempt.started_at)).total_seconds() * 1_000)
+            conn.execute(
+                sink_effect_attempts_table.update()
+                .where(
+                    sink_effect_attempts_table.c.attempt_id == attempt_id,
+                    sink_effect_attempts_table.c.state == SinkEffectAttemptState.INTENT.value,
+                )
+                .values(
+                    state=SinkEffectAttemptState.RESPONSE_LOST.value,
+                    evidence_json=evidence_json,
+                    evidence_hash=evidence_hash,
+                    completed_at=timestamp,
+                    latency_ms=latency_ms,
+                )
+            )
+            self._insert_call(
+                conn,
+                operation_id=operation.operation_id,
+                call_type=self._call_type(attempt.call_kind),
+                status=CallStatus.ERROR,
+                request_hash=attempt.request_hash,
+                response_hash=None,
+                error_json=evidence_json,
+                latency_ms=latency_ms,
+            )
+            winner = conn.execute(select(sink_effect_attempts_table).where(sink_effect_attempts_table.c.attempt_id == attempt_id)).one()
+            return self._attempt_loader.load(winner)
+
+    def _lock_effect(
+        self,
+        conn: Connection,
+        effect_id: str,
+        *,
+        include_stream: bool,
+        coordination_token: CoordinationToken,
+    ) -> Row[Any]:
+        _require_hash(effect_id, "effect_id")
+        optimistic = conn.execute(select(sink_effects_table).where(sink_effects_table.c.effect_id == effect_id)).fetchone()
+        if optimistic is None:
+            raise LandscapeRecordError(f"sink effect {effect_id!r} does not exist")
+        if optimistic.run_id != coordination_token.run_id:
+            # ADR-048 §2: the token proves leadership of ONE run; an effect of
+            # another run is a cross-run write, refused before any lock.
+            raise LandscapeRecordError(f"sink effect {effect_id!r} belongs to run {optimistic.run_id!r}, not the coordination token's run")
+        if include_stream and optimistic.stream_id is not None:
+            stream = conn.execute(
+                select(sink_effect_streams_table).where(sink_effect_streams_table.c.stream_id == optimistic.stream_id).with_for_update()
+            ).fetchone()
+            if stream is None:
+                raise LandscapeRecordError("sink effect stream disappeared")
+        effect_ids = sorted({effect_id, optimistic.predecessor_effect_id} - {None})
+        rows = conn.execute(
+            select(sink_effects_table)
+            .where(sink_effects_table.c.effect_id.in_(effect_ids))
+            .order_by(sink_effects_table.c.effect_id)
+            .with_for_update()
+        ).fetchall()
+        by_id = {row.effect_id: row for row in rows}
+        if effect_id not in by_id:
+            raise LandscapeRecordError("sink effect disappeared while locking")
+        row = by_id[effect_id]
+        self._after_effect_lock(self._backend_pid(conn), effect_id)
+        return row
+
+    @staticmethod
+    def _require_predecessor_finalized(conn: Connection, effect: Row[Any]) -> None:
+        if effect.predecessor_effect_id is None:
+            return
+        predecessor = conn.execute(
+            select(sink_effects_table.c.state).where(sink_effects_table.c.effect_id == effect.predecessor_effect_id)
+        ).fetchone()
+        if predecessor is None or predecessor.state != SinkEffectState.FINALIZED.value:
+            raise LandscapeRecordError("sink effect predecessor must be finalized")
+
+    @staticmethod
+    def _lock_operation(conn: Connection, effect_id: str) -> Row[Any]:
+        row = conn.execute(select(operations_table).where(operations_table.c.sink_effect_id == effect_id).with_for_update()).fetchone()
+        if row is None:
+            raise LandscapeRecordError("sink effect operation is missing")
+        return row
+
+    @staticmethod
+    def _lock_attempt(conn: Connection, attempt_id: str) -> Row[Any]:
+        row = conn.execute(
+            select(sink_effect_attempts_table).where(sink_effect_attempts_table.c.attempt_id == attempt_id).with_for_update()
+        ).fetchone()
+        if row is None:
+            raise LandscapeRecordError(f"sink effect attempt {attempt_id!r} does not exist")
+        return row
+
+    @staticmethod
+    def _validate_attempt_authority(effect: Row[Any], request: SinkEffectAttemptRequest) -> None:
+        if effect.generation != request.generation:
+            raise LandscapeRecordError("sink effect attempt has stale generation")
+        if request.action is SinkEffectAttemptAction.INSPECT:
+            if effect.state not in {SinkEffectState.RESERVED.value, SinkEffectState.PREPARED.value}:
+                raise LandscapeRecordError("inspect attempt requires reserved or prepared effect")
+        elif effect.state != SinkEffectState.IN_FLIGHT.value:
+            raise LandscapeRecordError("commit/reconcile attempt requires an in-flight effect")
+        if effect.descriptor_mode == SinkEffectDescriptorMode.NO_PUBLICATION.value and request.action is SinkEffectAttemptAction.COMMIT:
+            raise LandscapeRecordError("no-publication effect cannot begin a commit attempt")
+
+    @staticmethod
+    def _insert_call(
+        conn: Connection,
+        *,
+        operation_id: str,
+        call_type: CallType,
+        status: CallStatus,
+        request_hash: str,
+        response_hash: str | None,
+        error_json: str | None,
+        latency_ms: float,
+    ) -> None:
+        current = conn.scalar(select(func.max(calls_table.c.call_index)).where(calls_table.c.operation_id == operation_id))
+        call_index = 0 if current is None else int(current) + 1
+        call_id = stable_hash({"call_index": call_index, "operation_id": operation_id, "schema": "sink-effect-call-v1"})
+        conn.execute(
+            calls_table.insert().values(
+                call_id=call_id,
+                state_id=None,
+                operation_id=operation_id,
+                call_index=call_index,
+                call_type=call_type.value,
+                status=status.value,
+                request_hash=request_hash,
+                request_ref=None,
+                response_hash=response_hash,
+                response_ref=None,
+                approved_prompt_artifact_hash=None,
+                error_json=error_json,
+                latency_ms=latency_ms,
+                created_at=now(),
+            )
+        )
+
+    @staticmethod
+    def _call_type(call_kind: str) -> CallType:
+        try:
+            return CallType(call_kind)
+        except ValueError as exc:
+            raise LandscapeRecordError(f"sink effect attempt has unknown call kind {call_kind!r}") from exc
+
+    @staticmethod
+    def _validate_owner(owner: str) -> None:
+        if not owner.strip():
+            raise ValueError("lease owner must be non-empty")
+        if len(owner) > 128:
+            raise ValueError("lease owner exceeds 128 characters")
+
+    @staticmethod
+    def _backend_pid(conn: Connection) -> int:
+        if conn.dialect.name == "postgresql":
+            return int(conn.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
+        return id(conn.connection)
+
+    def _after_effect_lock(self, _backend_pid: int, _effect_id: str) -> None:
+        """Deterministic contention seam used only by real-backend tests."""
+
+
+__all__ = [
+    "SinkEffectAttemptRequest",
+    "SinkEffectAttemptResult",
+    "SinkEffectLease",
+    "SinkEffectLifecycle",
+]

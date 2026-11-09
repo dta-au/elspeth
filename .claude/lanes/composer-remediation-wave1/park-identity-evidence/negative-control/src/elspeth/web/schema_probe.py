@@ -1,0 +1,395 @@
+"""Fail-closed schema probes and serialized database initialization."""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from enum import Enum
+from types import MappingProxyType
+from typing import TypedDict
+
+from sqlalchemy import Connection, Engine, inspect, text
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.pool import Pool, QueuePool
+
+from elspeth.contracts.advisory_locks import ELSPETH_SCHEMA_INIT_LOCK_CLASSID
+from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.core.landscape.database import (
+    LandscapeSchemaShape,
+    SchemaCompatibilityError,
+    _create_landscape_tables,
+    probe_schema_shape,
+)
+from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
+from elspeth.core.landscape.schema import schema_identity_table as landscape_schema_identity_table
+from elspeth.core.schema_identity import insert_schema_identity
+from elspeth.web.sessions.models import metadata as session_metadata
+from elspeth.web.sessions.schema import (
+    SessionSchemaError,
+    _create_session_tables,
+    _stamp_schema_sentinels,
+    explain_non_current_schema,
+    probe_current_schema,
+)
+
+_LOCK_TARGET = "elspeth_schema_init"
+_LOCK_TIMEOUT = "5s"
+_TARGET_ERROR = "PostgreSQL database target cannot be proven safe from static URL configuration."
+_SCHEMA_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*\Z")
+_SEARCH_PATH = re.compile(r"-c(?:\s+)?search_path=([^\s]+)\Z")
+_POSTGRES_TARGET_QUERY_OVERRIDES = frozenset({"host", "hostaddr", "port", "dbname", "database", "service", "servicefile"})
+_POSTGRES_MAX_IDENTIFIER_BYTES = 63
+
+
+class SchemaState(Enum):
+    MISSING = "missing"
+    PARTIAL = "partial"
+    CURRENT = "current"
+    STALE = "stale"
+
+
+class SchemaInitBusyError(RuntimeError):
+    """Raised when another initializer holds the PostgreSQL schema lock."""
+
+
+class SchemaInitError(RuntimeError):
+    """Raised when schema initialization cannot safely begin."""
+
+
+class SchemaLockCleanupError(RuntimeError):
+    """Raised when advisory-lock cleanup cannot be proven."""
+
+
+class DatabaseTargetConflictError(ValueError):
+    """Raised when two PostgreSQL logical targets are not provably distinct."""
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresLogicalTarget:
+    host: str
+    port: int
+    database: str
+    explicit_schema: str | None
+
+
+EXTERNAL_POSTGRES_POOL_KWARGS: Mapping[str, object] = MappingProxyType({"pool_size": 5, "max_overflow": 5, "pool_pre_ping": True})
+AWS_ECS_POOL_KWARGS = EXTERNAL_POSTGRES_POOL_KWARGS
+
+
+class PostgresEngineKwargs(TypedDict, total=False):
+    pool_size: int
+    max_overflow: int
+    pool_pre_ping: bool
+
+
+def postgres_engine_kwargs(url: str | URL) -> PostgresEngineKwargs:
+    parsed = make_url(url)
+    if parsed.drivername.split("+", 1)[0] != "postgresql":
+        return {}
+    return {"pool_size": 5, "max_overflow": 5, "pool_pre_ping": True}
+
+
+def _target_error() -> DatabaseTargetConflictError:
+    return DatabaseTargetConflictError(_TARGET_ERROR)
+
+
+@trust_boundary(
+    tier=3,
+    source="operator-supplied database URL (settings/env-authored connection string) whose query "
+    "string sqlalchemy parses into an unguaranteed mapping",
+    source_param="url",
+    suppresses=("R1", "R5"),
+    invariant="raises DatabaseTargetConflictError on every malformed or unprovable input: an "
+    "unparseable URL, a non-postgresql driver, a missing host or database, a connection-target "
+    "query override, a non-string or non-single-search-path options value, and an unstable or "
+    "oversized schema identifier; absence of the optional options key is the only tolerated gap "
+    "and never fabricates a schema",
+    test_ref="tests/unit/web/test_schema_probe.py::test_unprovable_target_is_rejected_with_static_message",
+    test_fingerprint="32df7ac5a595bab682693c7b20c9aeeacac93809fd5752f4e1fb6b34374f8092",
+)
+def postgres_logical_target_key(url: str | URL) -> PostgresLogicalTarget:
+    """Parse only statically provable PostgreSQL logical-target attributes."""
+    try:
+        parsed = make_url(url)
+    except (TypeError, ValueError):
+        raise _target_error() from None
+    if parsed.drivername.split("+", 1)[0] != "postgresql" or not parsed.host or not parsed.database:
+        raise _target_error()
+    if set(parsed.query).intersection(_POSTGRES_TARGET_QUERY_OVERRIDES):
+        raise _target_error()
+
+    options_value = parsed.query.get("options")
+    explicit_schema: str | None = None
+    if options_value is not None:
+        if not isinstance(options_value, str):
+            raise _target_error()
+        match = _SEARCH_PATH.fullmatch(options_value.strip())
+        if match is None:
+            raise _target_error()
+        candidate = match.group(1)
+        normalized_candidate = candidate.lower()
+        if (
+            not _SCHEMA_NAME.fullmatch(candidate)
+            or candidate.startswith("$")
+            or len(candidate.encode("utf-8")) > _POSTGRES_MAX_IDENTIFIER_BYTES
+            or normalized_candidate.startswith("pg_")
+        ):
+            raise _target_error()
+        explicit_schema = normalized_candidate
+
+    return PostgresLogicalTarget(
+        host=parsed.host.lower(),
+        port=parsed.port or 5432,
+        database=parsed.database,
+        explicit_schema=explicit_schema,
+    )
+
+
+def require_distinct_postgres_targets(session_url: str | URL, landscape_url: str | URL) -> None:
+    session = postgres_logical_target_key(session_url)
+    landscape = postgres_logical_target_key(landscape_url)
+    if (session.host, session.port, session.database) != (landscape.host, landscape.port, landscape.database):
+        return
+    if session.explicit_schema is None or landscape.explicit_schema is None:
+        raise _target_error()
+    if session.explicit_schema == landscape.explicit_schema:
+        raise _target_error()
+
+
+def probe_session_schema(bind: Engine | Connection) -> SchemaState:
+    inspector = inspect(bind)
+    existing = set(inspector.get_table_names())
+    if bind.dialect.name == "sqlite":
+        existing.discard("sqlite_sequence")
+    if not existing:
+        try:
+            from elspeth.web.sessions.schema import assert_empty_session_target
+
+            assert_empty_session_target(bind)
+        except SessionSchemaError:
+            return SchemaState.STALE
+        return SchemaState.MISSING
+    expected = set(session_metadata.tables)
+    if not existing & expected or existing != expected:
+        return SchemaState.STALE
+    return SchemaState.CURRENT if probe_current_schema(bind) else SchemaState.STALE
+
+
+def probe_landscape_schema(bind: Engine | Connection) -> SchemaState:
+    return {
+        LandscapeSchemaShape.EMPTY: SchemaState.MISSING,
+        LandscapeSchemaShape.INCOMPLETE: SchemaState.PARTIAL,
+        LandscapeSchemaShape.MATCHES: SchemaState.CURRENT,
+        LandscapeSchemaShape.FOREIGN: SchemaState.STALE,
+        LandscapeSchemaShape.DIVERGENT: SchemaState.STALE,
+    }[probe_schema_shape(bind)]
+
+
+@trust_boundary(
+    tier=3,
+    source="a sqlalchemy OperationalError wrapping a third-party DBAPI driver exception whose "
+    "sqlstate/pgcode attributes are driver-specific and unguaranteed",
+    source_param="exc",
+    suppresses=("R5",),
+    invariant="never raises on exc: returns the SQLSTATE only when the driver exposes it as a "
+    "str (psycopg 'sqlstate', psycopg2 'pgcode'), and the None sentinel for an absent or "
+    "non-string value; never coerces or fabricates a code",
+    non_raising=True,
+)
+def _sqlstate(exc: OperationalError) -> str | None:
+    original = exc.orig
+    value = getattr(original, "sqlstate", None)
+    if value is None:
+        value = getattr(original, "pgcode", None)
+    return value if isinstance(value, str) else None
+
+
+def database_sqlstate(exc: OperationalError) -> str | None:
+    """Restrict admitted driver codes to SQLSTATE's alphabet before logging."""
+    value = _sqlstate(exc)
+    return value if value is not None and re.fullmatch(r"[A-Z0-9]{5}", value) is not None else None
+
+
+def _invalidate_uncertain(conn: Connection, *, original: BaseException) -> None:
+    """Invalidate without allowing secondary cleanup errors to replace the original."""
+    try:
+        conn.invalidate()
+    except BaseException as invalidation_error:
+        original.add_note(
+            f"Schema connection invalidation also failed with {type(invalidation_error).__name__}; connection disposal was not verified."
+        )
+
+
+def _finish_lock_cleanup(
+    conn: Connection,
+    *,
+    cleanup_error: BaseException,
+    earlier: BaseException | None,
+) -> None:
+    _invalidate_uncertain(conn, original=cleanup_error if earlier is None else earlier)
+    if earlier is not None:
+        earlier.add_note(f"Schema lock cleanup was not verified: {type(cleanup_error).__name__}.")
+        return
+    raise SchemaLockCleanupError(
+        "Schema initialization may have completed but lock cleanup was not verified; investigate and rerun."
+    ) from cleanup_error
+
+
+def _run_locked(
+    engine: Engine,
+    *,
+    target: str,
+    body: Callable[[Connection], None],
+    verify: Callable[[Connection], None],
+) -> None:
+    """Run schema DDL and verification on one connection under one lock."""
+    with engine.connect() as conn:
+        postgres = conn.dialect.name == "postgresql"
+        acquired = False
+        earlier: BaseException | None = None
+        try:
+            if postgres:
+                try:
+                    conn.execute(
+                        text("SELECT pg_catalog.set_config('lock_timeout', :timeout, true)"),
+                        {"timeout": _LOCK_TIMEOUT},
+                    )
+                    conn.execute(
+                        text("SELECT pg_catalog.pg_advisory_lock(:classid, pg_catalog.hashtext(:target))"),
+                        {"classid": ELSPETH_SCHEMA_INIT_LOCK_CLASSID, "target": target},
+                    )
+                    acquired = True
+                except OperationalError as exc:
+                    _invalidate_uncertain(conn, original=exc)
+                    if _sqlstate(exc) == "55P03":
+                        raise SchemaInitBusyError("Another schema initialization is in progress; retry shortly.") from exc
+                    raise SchemaInitError(
+                        "Schema initialization lock could not be acquired; investigate database connectivity and retry."
+                    ) from exc
+                except BaseException as exc:
+                    _invalidate_uncertain(conn, original=exc)
+                    raise
+
+            body(conn)
+            if conn.in_transaction():
+                conn.commit()
+            verify(conn)
+        except BaseException as exc:
+            earlier = exc
+            raise
+        finally:
+            if postgres and acquired:
+                cleanup_error: BaseException | None = None
+                try:
+                    if conn.in_transaction():
+                        conn.rollback()
+                except BaseException as exc:
+                    cleanup_error = exc
+
+                if cleanup_error is None:
+                    try:
+                        unlocked = conn.execute(
+                            text("SELECT pg_catalog.pg_advisory_unlock(:classid, pg_catalog.hashtext(:target))"),
+                            {"classid": ELSPETH_SCHEMA_INIT_LOCK_CLASSID, "target": target},
+                        ).scalar_one()
+                        if unlocked is not True:
+                            cleanup_error = RuntimeError("unlock was not confirmed")
+                    except BaseException as exc:
+                        cleanup_error = exc
+
+                try:
+                    if conn.in_transaction():
+                        conn.rollback()
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+                    else:
+                        note_target = cleanup_error if earlier is None else earlier
+                        note_target.add_note(f"Final schema rollback also failed with {type(exc).__name__}.")
+
+                if cleanup_error is not None:
+                    _finish_lock_cleanup(conn, cleanup_error=cleanup_error, earlier=earlier)
+            elif not postgres and conn.in_transaction():
+                conn.rollback()
+
+
+def init_session_schema(engine: Engine) -> None:
+    def body(conn: Connection) -> None:
+        state = probe_session_schema(conn)
+        if state is SchemaState.CURRENT:
+            return
+        if state is SchemaState.MISSING:
+            _create_session_tables(conn, checkfirst=True)
+            _stamp_schema_sentinels(conn)
+            return
+        # Preserve the target and report the precise drift; initialization
+        # authority does not permit converting an unsupported existing store.
+        explain_non_current_schema(conn)
+
+    def verify(conn: Connection) -> None:
+        if probe_session_schema(conn) is SchemaState.CURRENT:
+            return
+        # Never raise a bare "did not produce the current schema" here. The
+        # probe collapsed a precise diagnosis into an enum to answer a yes/no
+        # question; on this path the answer is fatal, so re-run the validators
+        # un-guarded and let the one that objects say WHAT drifted. See
+        # ``explain_non_current_schema`` for why re-validating is the right
+        # trade. It never returns.
+        explain_non_current_schema(conn)
+
+    _run_locked(engine, target=_LOCK_TARGET, body=body, verify=verify)
+
+
+def init_landscape_schema(engine: Engine) -> None:
+    def body(conn: Connection) -> None:
+        state = probe_landscape_schema(conn)
+        if state is SchemaState.CURRENT:
+            return
+        if state is SchemaState.MISSING:
+            _create_landscape_tables(bind=conn, checkfirst=True)
+            insert_schema_identity(
+                conn,
+                landscape_schema_identity_table,
+                store_kind="landscape",
+                schema_epoch=SQLITE_SCHEMA_EPOCH,
+            )
+            if conn.dialect.name == "sqlite":
+                conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")
+            return
+        raise SchemaCompatibilityError(
+            "Landscape database schema is partial, stale or foreign; pre-1.0 schemas are not migrated in place. "
+            "Preserve this store unchanged and configure an explicitly new Landscape database."
+        )
+
+    def verify(conn: Connection) -> None:
+        if probe_landscape_schema(conn) is not SchemaState.CURRENT:
+            raise SchemaCompatibilityError("Landscape database initialization did not produce the current schema.")
+
+    _run_locked(engine, target=_LOCK_TARGET, body=body, verify=verify)
+
+
+@trust_boundary(
+    tier=3,
+    source="SQLAlchemy-owned connection pool implementation and optional public occupancy counters",
+    source_param="pool",
+    suppresses=("R5",),
+    invariant="admits only QueuePool counters as exact integers, rejects negative size/checkedout "
+    "and malformed counters to None, preserves legitimate negative overflow, and reports unsupported "
+    "pool implementations as unavailable; never checks out a connection or suppresses vendor failures",
+    test_ref="tests/unit/web/test_schema_probe.py::test_pool_diagnostics_propagate_vendor_failure",
+    test_fingerprint="2e91d473d6f10934a5778a29e9e51810aee7d432a6fcb74efb7af61318ae3a7a",
+)
+def admit_pool_diagnostics(pool: Pool) -> tuple[int | None, int | None, int | None]:
+    """Observe supported vendor counters without acquiring another database connection."""
+    if not isinstance(pool, QueuePool):
+        return None, None, None
+    size = pool.size()
+    checked_out = pool.checkedout()
+    overflow = pool.overflow()
+    return (
+        size if type(size) is int and size >= 0 else None,
+        checked_out if type(checked_out) is int and checked_out >= 0 else None,
+        overflow if type(overflow) is int else None,
+    )

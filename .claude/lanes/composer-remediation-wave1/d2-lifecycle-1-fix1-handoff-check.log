@@ -1,0 +1,11 @@
+{"head": "f9c23c59c63bbd3099029e995a778bade594f6c8", "inputs": 6205, "sha256": "a38a76152c8f73641f2f48f2e560fd0e27500634f57499e20d2dc56e7d34904b"}
+Fix1 source/test inputs unchanged; final review diff exactly matches tested candidate.
+Original diff unchanged; original report preserved as exact prefix and standalone snapshot.
+All final scoped receipts: exit0; no unpackaged new files.
+Fresh real worker exit: 0
+ M src/elspeth/web/execution/runtime_preflight.py
+ M src/elspeth/web/process_recovery.py
+ M src/elspeth/web/process_watchdog.py
+ M tests/fixtures/process_watchdog.py
+ M tests/unit/web/execution/test_runtime_preflight_coordinator.py
+ M tests/unit/web/test_process_watchdog.py

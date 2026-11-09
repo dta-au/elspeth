@@ -1,0 +1,19 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_ TestRegistryCensus.test_every_non_literal_code_site_is_a_reviewed_forwarder __
+
+self = <tests.unit.web.composer.test_error_code_redaction.TestRegistryCensus object at 0x7ff5c96fb680>
+
+    def test_every_non_literal_code_site_is_a_reviewed_forwarder(self) -> None:
+>       assert _unreviewed_forwarders(_live_code_sites()) == set()
+E       AssertionError: assert {('composer/t...atched_code')} == set()
+E         
+E         Extra items in the left set:
+E         ('composer/tools/generation.py', '_execute_explain_validation_error', 'error_text')
+E         ('composer/tools/generation.py', '_execute_explain_validation_error', 'matched_code')
+E         Use -v to get more diff
+
+tests/unit/web/composer/test_error_code_redaction.py:341: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_error_code_redaction.py::TestRegistryCensus::test_every_non_literal_code_site_is_a_reviewed_forwarder
+1 failed in 2.88s

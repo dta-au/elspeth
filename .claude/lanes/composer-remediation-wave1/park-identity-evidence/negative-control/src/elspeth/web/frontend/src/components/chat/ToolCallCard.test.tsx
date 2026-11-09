@@ -1,0 +1,573 @@
+import { readFileSync } from "node:fs";
+import { render, screen } from "@testing-library/react";
+import { describe, expect, it } from "vitest";
+import { ToolCallCard } from "./ToolCallCard";
+import type { CompositionProposal, CompositionState, ToolCall } from "@/types/api";
+import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
+
+const toolCall: ToolCall = {
+  id: "call-1",
+  type: "function",
+  function: {
+    name: "set_pipeline",
+    arguments: "{\"source\":{\"plugin\":\"csv\"}}",
+  },
+};
+
+function makeToolCall(
+  name: string,
+  overrides: { outcome?: ToolCall["outcome"]; applied_state_version?: number | null } = {},
+): ToolCall {
+  return {
+    id: `call-${name}`,
+    type: "function",
+    function: { name, arguments: "{}" },
+    ...(overrides.outcome !== undefined ? { outcome: overrides.outcome } : {}),
+    ...(overrides.applied_state_version !== undefined
+      ? { applied_state_version: overrides.applied_state_version }
+      : {}),
+  };
+}
+
+const proposal: CompositionProposal = {
+  id: "proposal-1",
+  session_id: "session-1",
+  tool_call_id: "call-1",
+  tool_name: "set_pipeline",
+  status: "pending",
+  summary: "Replace the pipeline with csv input, 1 transform, and 1 output.",
+  rationale: "Requested by the current composer turn.",
+  affects: ["graph", "validation", "yaml"],
+  arguments_redacted_json: { source: { plugin: "csv" } },
+  base_state_id: null,
+  committed_state_id: null,
+  audit_event_id: "event-1",
+  created_at: "2026-05-14T00:00:00Z",
+  updated_at: "2026-05-14T00:00:00Z",
+};
+
+describe("ToolCallCard", () => {
+  it("shows safe repair guidance for a rejected mutation without its arguments", () => {
+    render(<ToolCallCard toolCall={{
+      ...toolCall, outcome: "rejected",
+      rejection: {
+        error_code: "source_data_contract_required",
+        guidance: ["Declare an explicit runtime schema or request a source data contract review."],
+      },
+    }} proposal={null} />);
+    expect(screen.getByText("Validation issue")).toBeInTheDocument();
+    expect(screen.getByText("Declare an explicit runtime schema or request a source data contract review.")).toBeInTheDocument();
+    expect(screen.queryByText(toolCall.function.arguments)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["get_blob_content", /text content of a session file/],
+    ["get_blob_metadata", /session file's name, size, and status/],
+    ["inspect_source", /headers, inferred types, and sample-row count/],
+    ["set_source_from_blob", /session file as the pipeline's data source/],
+    ["set_source_from_blobs", /files containing user-provided content/],
+    ["wire_blob_inline_ref", /session file's content/],
+  ])("shows %s guidance without claiming an uploaded-only origin", (name, description) => {
+    render(
+      <ToolCallCard
+        toolCall={makeToolCall(name)}
+        proposal={null}
+      />,
+    );
+    expect(screen.getByText(description, { selector: ".tool-call-ribbon-text" })).toBeInTheDocument();
+    expect(screen.getByRole("tooltip")).toHaveTextContent(description);
+    expect(screen.queryByText(/uploaded file/)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["update_blob", "Replaces the content of a session file.", "Overwrite session file \"assistant-created-file\"."],
+    ["delete_blob", "Deletes a session file and its storage.", "Delete session file \"assistant-created-file\"."],
+    ["patch_node_options", "Updates configuration options on a pipeline node.", "Update options for node \"collector\"."],
+  ])("describes the full %s proposal without narrowing its supported targets", (name, heading, summary) => {
+    render(
+      <ToolCallCard
+        toolCall={makeToolCall(name)}
+        proposal={{ ...proposal, tool_name: name, summary, arguments_redacted_json: { target: "safe-label" } }}
+      />,
+    );
+    expect(screen.getByText(`Proposed: ${heading}`)).toBeInTheDocument();
+    expect(screen.getByText(summary)).toBeInTheDocument();
+    expect(screen.getByText(proposal.rationale)).toBeInTheDocument();
+    expect(screen.queryByText(/uploaded file|transform or gate/)).not.toBeInTheDocument();
+  });
+
+  it.each(["source_data_contract", "pipeline_decision"])("renders kind-neutral Why text for %s review", (kind) => {
+    const rationale = "Review the planner's proposed interpretation or assumption before it is accepted into the pipeline.";
+    render(
+      <ToolCallCard
+        toolCall={makeToolCall("request_interpretation_review")}
+        proposal={{
+          ...proposal,
+          tool_name: "request_interpretation_review",
+          summary: "Surface an interpretation draft for user review.",
+          rationale,
+          affects: ["interpretation"],
+          arguments_redacted_json: { kind },
+        }}
+      />,
+    );
+    expect(screen.getByText("Proposed: Asks you to review an assumption the planner made before it is built into the pipeline.")).toBeInTheDocument();
+    expect(screen.getByText(rationale)).toBeInTheDocument();
+    expect(screen.queryByText(/subjective|underspecified|prompt template/)).not.toBeInTheDocument();
+  });
+
+  it("labels blob storage effects as session files while preserving other domains", () => {
+    render(
+      <ToolCallCard
+        toolCall={makeToolCall("update_blob")}
+        proposal={{ ...proposal, tool_name: "update_blob", affects: ["blob_store", "future-domain"] }}
+      />,
+    );
+    expect(screen.getByText("Session files, future-domain")).toBeInTheDocument();
+    expect(screen.queryByText(/blob_store/)).not.toBeInTheDocument();
+  });
+
+  it("renders pending write proposals as read-only history", () => {
+    render(
+      <ToolCallCard
+        toolCall={toolCall}
+        proposal={proposal}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        "Proposed: Replaces the entire pipeline configuration in a single operation.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText(proposal.summary)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", {
+        name: `Accept proposal: ${proposal.summary}`,
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", {
+        name: `Reject proposal: ${proposal.summary}`,
+      }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders read-only tools as ribbons", () => {
+    render(
+      <ToolCallCard
+        toolCall={{
+          id: "read-1",
+          type: "function",
+          function: { name: "get_pipeline_state", arguments: "{}" },
+        }}
+        proposal={null}
+      />,
+    );
+
+    expect(screen.getByText("Looked up: Reads the current pipeline state being composed in this session.")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Accept proposal/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  describe("server-authenticated outcome labels (elspeth-f5e6723133)", () => {
+    const call = (
+      outcome?: ToolCall["outcome"],
+      appliedStateVersion?: number | null,
+    ): ToolCall => ({
+      id: "call-x",
+      type: "function",
+      function: { name: "upsert_node", arguments: "{}" },
+      ...(outcome !== undefined ? { outcome } : {}),
+      ...(appliedStateVersion !== undefined
+        ? { applied_state_version: appliedStateVersion }
+        : {}),
+    });
+
+    it("labels an applied mutation Applied with the resulting version", () => {
+      render(
+        <ToolCallCard
+          toolCall={call("applied", 3)}
+          proposal={null}
+        />,
+      );
+      expect(screen.getByText("Applied: Adds a new transform or gate node, or replaces an existing one with the same id.")).toBeInTheDocument();
+      expect(screen.getByText("v3")).toBeInTheDocument();
+      expect(screen.queryByText(/Looked up/)).not.toBeInTheDocument();
+    });
+
+    it("labels an applied mutation without a resolvable version as Applied alone", () => {
+      render(
+        <ToolCallCard
+          toolCall={call("applied", null)}
+          proposal={null}
+        />,
+      );
+      expect(screen.getByText("Applied: Adds a new transform or gate node, or replaces an existing one with the same id.")).toBeInTheDocument();
+      expect(screen.queryByText(/^v\d+$/)).not.toBeInTheDocument();
+    });
+
+    it("labels a validation-refused mutation as attempted, not applied", () => {
+      render(
+        <ToolCallCard
+          toolCall={call("rejected")}
+          proposal={null}
+        />,
+      );
+      expect(
+        screen.getByText(
+          "Attempted: Adds a new transform or gate node, or replaces an existing one with the same id. (not applied)",
+        ),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/Looked up/)).not.toBeInTheDocument();
+    });
+
+    it("labels a crashed dispatch as Failed", () => {
+      render(
+        <ToolCallCard
+          toolCall={call("failed")}
+          proposal={null}
+        />,
+      );
+      expect(
+        screen.getByText(
+          "Failed: Adds a new transform or gate node, or replaces an existing one with the same id.",
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it("labels a cancelled dispatch as Cancelled", () => {
+      render(
+        <ToolCallCard
+          toolCall={call("cancelled")}
+          proposal={null}
+        />,
+      );
+      expect(
+        screen.getByText(
+          "Cancelled: Adds a new transform or gate node, or replaces an existing one with the same id.",
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it("never claims completion — or a lookup — for a non-read-only call with no outcome stamp", () => {
+      // Deliberate oracle rewrite: this used to pin "Looked up: upsert_node"
+      // (mislabelled a mutation as a read), then briefly "Completed:
+      // upsert_node" (claimed success with no server evidence). An unstamped
+      // row carries no outcome stamp at all, so the ribbon claims dispatch
+      // only: "Ran".
+      render(
+        <ToolCallCard
+          toolCall={call()}
+          proposal={null}
+        />,
+      );
+      expect(
+        screen.getByText(
+          "Ran: Adds a new transform or gate node, or replaces an existing one with the same id.",
+        ),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/Completed/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Looked up/)).not.toBeInTheDocument();
+    });
+
+    it("labels a completed durable blob mutation as Completed, never Looked up", () => {
+      // create_blob succeeds without creating a composition-state version,
+      // so the server stamps it "completed" — it is still a durable write.
+      render(
+        <ToolCallCard
+          toolCall={{
+            id: "call-blob",
+            type: "function",
+            function: { name: "create_blob", arguments: "{}" },
+            outcome: "completed",
+          }}
+          proposal={null}
+        />,
+      );
+      expect(
+        screen.getByText(
+          "Completed: Creates a new file from inline content for the pipeline to use.",
+        ),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/Looked up/)).not.toBeInTheDocument();
+    });
+
+    it("keeps Looked up for a completed read-only lookup", () => {
+      render(
+        <ToolCallCard
+          toolCall={{
+            id: "call-read",
+            type: "function",
+            function: { name: "get_pipeline_state", arguments: "{}" },
+            outcome: "completed",
+          }}
+          proposal={null}
+        />,
+      );
+      expect(
+        screen.getByText("Looked up: Reads the current pipeline state being composed in this session."),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it("keeps the tool-call info button at or above the 24px target-size threshold", () => {
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    const rule = /\.tool-call-info-trigger\s*\{(?<body>[\s\S]*?)\n\}/.exec(css);
+    expect(rule?.groups?.body).toContain("width: 24px");
+    expect(rule?.groups?.body).toContain("height: 24px");
+  });
+
+  it("keeps proposal mutation handlers out of transcript history", () => {
+    render(
+      <ToolCallCard
+        toolCall={toolCall}
+        proposal={proposal}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: /Accept proposal|Reject proposal/ })).toBeNull();
+  });
+
+  it("renders stale proposals without actionable accept or reject buttons", () => {
+    render(
+      <ToolCallCard
+        toolCall={toolCall}
+        proposal={proposal}
+        isStale={true}
+      />,
+    );
+
+    expect(screen.getByText(/Stale proposal/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Ask the composer to rebase or revise this proposal/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Accept proposal/ }),
+    ).not.toBeInTheDocument();
+  });
+});
+
+describe("ToolCallCard humanised primary label (elspeth-af559a0bab)", () => {
+  it("renders the sentence as the ribbon primary and the raw name as mono secondary", () => {
+    render(
+      <ToolCallCard
+        toolCall={makeToolCall("upsert_node", { outcome: "applied", applied_state_version: 3 })}
+        proposal={null}
+      />,
+    );
+    expect(
+      screen.getByText(
+        "Applied: Adds a new transform or gate node, or replaces an existing one with the same id.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("upsert_node", { selector: "code" })).toBeInTheDocument();
+    expect(screen.getByText("v3")).toBeInTheDocument();
+  });
+
+  it("keeps the rejected qualifier attached to the sentence", () => {
+    render(
+      <ToolCallCard
+        toolCall={makeToolCall("upsert_node", { outcome: "rejected" })}
+        proposal={null}
+      />,
+    );
+    expect(
+      screen.getByText(
+        "Attempted: Adds a new transform or gate node, or replaces an existing one with the same id. (not applied)",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("falls back to the raw-name label for an unknown tool (no dishonest sentence)", () => {
+    render(
+      <ToolCallCard
+        toolCall={makeToolCall("mystery_tool")}
+        proposal={null}
+      />,
+    );
+    expect(screen.getByText("Ran: mystery_tool")).toBeInTheDocument();
+  });
+
+  it("default DOM of a settled card passes the shared identifier pin", () => {
+    const { container } = render(
+      <ToolCallCard
+        toolCall={makeToolCall("set_source_from_blob", { outcome: "applied", applied_state_version: 7 })}
+        proposal={null}
+      />,
+    );
+    expectNoIdentifiersInDefaultDom(container);
+  });
+
+  it("describes request_interpretation_review instead of shipping a raw snake_case primary (elspeth-af559a0bab live-check finding)", () => {
+    // request_interpretation_review is session-aware, not a ToolDeclaration,
+    // so it is invisible to _REGISTERED_TOOLS-derived parity checks alone.
+    // It is a durable interpretation-event write: the settled ribbon must
+    // read "Completed: <sentence>", never the bare tool name.
+    const { container } = render(
+      <ToolCallCard
+        toolCall={makeToolCall("request_interpretation_review", { outcome: "completed" })}
+        proposal={null}
+      />,
+    );
+    expect(
+      screen.getByText(
+        "Completed: Asks you to review an assumption the planner made before it is built into the pipeline.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("request_interpretation_review", { selector: "code" }),
+    ).toBeInTheDocument();
+    expectNoIdentifiersInDefaultDom(container);
+  });
+});
+
+describe("ToolCallCard proposal change surface (elspeth-10f76f9250)", () => {
+  const currentState: CompositionState = {
+    id: "state-1",
+    ...compositionStateAuthorityFields,
+    version: 2,
+    sources: {},
+    nodes: [
+      {
+        id: "extract",
+        node_type: "transform",
+        plugin: "field_mapper",
+        input: "rows",
+        on_success: "mapped",
+        on_error: null,
+        options: {},
+      },
+    ],
+    edges: [],
+    outputs: [],
+    metadata: { name: null, description: null },
+  };
+
+  const upsertToolCall: ToolCall = {
+    id: "call-2",
+    type: "function",
+    function: {
+      name: "upsert_node",
+      arguments: "{}",
+    },
+  };
+
+  function upsertProposal(
+    overrides: Partial<CompositionProposal> = {},
+  ): CompositionProposal {
+    return {
+      ...proposal,
+      id: "proposal-2",
+      tool_call_id: "call-2",
+      tool_name: "upsert_node",
+      summary: "Swap the extract step to html_extract.",
+      arguments_redacted_json: {
+        id: "extract",
+        node_type: "transform",
+        plugin: "html_extract",
+        input: "rows",
+      },
+      ...overrides,
+    };
+  }
+
+  it("renders a before/after diff for a pending proposal against the current state", () => {
+    render(
+      <ToolCallCard
+        toolCall={upsertToolCall}
+        proposal={upsertProposal()}
+        currentState={currentState}
+      />,
+    );
+
+    expect(screen.getByTestId("proposal-diff")).toBeInTheDocument();
+    expect(screen.getByText("Changed node")).toBeInTheDocument();
+    expect(screen.getByText("transform field_mapper")).toBeInTheDocument();
+    expect(screen.getByText("transform html_extract")).toBeInTheDocument();
+    // The structured-fields fallback does not double-render alongside the diff.
+    expect(screen.queryByTestId("proposal-arg-fields")).not.toBeInTheDocument();
+  });
+
+  it("keeps the raw JSON available behind the details expander alongside the diff", () => {
+    render(
+      <ToolCallCard
+        toolCall={upsertToolCall}
+        proposal={upsertProposal()}
+        currentState={currentState}
+      />,
+    );
+
+    expect(screen.getByText("View arguments (JSON)")).toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Tool call arguments (scrollable)"),
+    ).toHaveTextContent('"plugin": "html_extract"');
+  });
+
+  it("falls back to structured argument fields for stale proposals", () => {
+    // The current state is no longer the state a stale proposal targets, so a
+    // before/after diff against it would be dishonest.
+    render(
+      <ToolCallCard
+        toolCall={upsertToolCall}
+        proposal={upsertProposal()}
+        currentState={currentState}
+        isStale={true}
+      />,
+    );
+
+    expect(screen.queryByTestId("proposal-diff")).not.toBeInTheDocument();
+    expect(screen.getByTestId("proposal-arg-fields")).toBeInTheDocument();
+  });
+
+  it("does not diff an ordinary proposal against a different base state", () => {
+    render(<ToolCallCard toolCall={upsertToolCall} proposal={upsertProposal({ base_state_id: "older-state" })} currentState={currentState} />);
+    expect(screen.queryByTestId("proposal-diff")).not.toBeInTheDocument();
+    expect(screen.getByTestId("proposal-arg-fields")).toBeInTheDocument();
+    expect(screen.getByText(/targets an earlier pipeline state/)).toBeInTheDocument();
+  });
+
+  it("does not apply ordinary base checks to canonical pipeline proposals", () => {
+    render(<ToolCallCard toolCall={toolCall} proposal={{
+      ...proposal, tool_name: "set_pipeline",
+      arguments_redacted_json: { sources: {}, nodes: [], edges: [], outputs: [] },
+      base_state_id: "older-state",
+      pipeline_metadata: {
+        draft_hash: "d".repeat(64), base: { kind: "absent" },
+        repair_count: 0, skill_hash: "s".repeat(64),
+        audit_payload_hash: "p".repeat(64), custody_result: "not_required",
+      },
+    }} currentState={currentState} />);
+    expect(screen.getByTestId("proposal-diff")).toBeInTheDocument();
+    expect(screen.queryByText(/targets an earlier pipeline state/)).not.toBeInTheDocument();
+  });
+
+  it("falls back to structured argument fields for resolved proposals", () => {
+    render(
+      <ToolCallCard
+        toolCall={upsertToolCall}
+        proposal={upsertProposal({ status: "committed" })}
+        currentState={currentState}
+      />,
+    );
+
+    expect(screen.queryByTestId("proposal-diff")).not.toBeInTheDocument();
+    expect(screen.getByTestId("proposal-arg-fields")).toBeInTheDocument();
+  });
+
+  it("falls back to structured argument fields when no current state is loaded", () => {
+    render(
+      <ToolCallCard
+        toolCall={upsertToolCall}
+        proposal={upsertProposal()}
+      />,
+    );
+
+    expect(screen.queryByTestId("proposal-diff")).not.toBeInTheDocument();
+    expect(screen.getByTestId("proposal-arg-fields")).toBeInTheDocument();
+    expect(screen.getByText("node_type")).toBeInTheDocument();
+    expect(screen.getByText('"html_extract"')).toBeInTheDocument();
+  });
+});

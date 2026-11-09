@@ -1,0 +1,4 @@
+freeze_compare_exit=0
+src/elspeth/web/composer/tool_batch.py: OK
+tests/unit/web/composer/test_service.py: OK
+tests/unit/web/composer/test_compose_loop_audit_wiring.py: OK

@@ -1,0 +1,692 @@
+diff --git a/src/elspeth/web/execution/runtime_preflight.py b/src/elspeth/web/execution/runtime_preflight.py
+index 23eb91f294b23526a16f35ee26544c337beda25e..d6a59246a598297467d0701bfea59a22e46a2ce2 100644
+--- a/src/elspeth/web/execution/runtime_preflight.py
++++ b/src/elspeth/web/execution/runtime_preflight.py
+@@ -40,6 +40,20 @@ RuntimePreflightEntry = ValidationResult | RuntimePreflightFailure
+ RuntimePreflightWorker = Callable[[], Awaitable[ValidationResult]]
+ 
+ 
++class RuntimePreflightUnavailable(RuntimeError):
++    """The lifecycle sealed preflight admission before this request arrived."""
++
++
++@dataclass(slots=True)
++class _RetainedPreflight:
++    task: asyncio.Task[RuntimePreflightEntry]
++    awaiters_settled: asyncio.Event
++    awaiters: int = 0
++    observed: bool = False
++    delivered: bool = False
++    failure: BaseException | None = None
++
++
+ class RuntimePreflightCoordinator:
+     """Deduplicate in-flight runtime preflight for one Python process.
+ 
+@@ -55,6 +69,9 @@ class RuntimePreflightCoordinator:
+     def __init__(self) -> None:
+         self._lock = asyncio.Lock()
+         self._inflight: dict[RuntimePreflightKey, asyncio.Task[RuntimePreflightEntry]] = {}
++        self._retained: dict[asyncio.Task[RuntimePreflightEntry], _RetainedPreflight] = {}
++        self._sealed = False
++        self._join_task: asyncio.Task[tuple[BaseException, ...]] | None = None
+ 
+     async def run(
+         self,
+@@ -72,6 +89,8 @@ class RuntimePreflightCoordinator:
+         is exactly the early release this coordinator exists to prevent.
+         """
+         async with self._lock:
++            if self._sealed:
++                return RuntimePreflightFailure(RuntimePreflightUnavailable("runtime preflight admission is sealed"))
+             if key not in self._inflight:
+                 if timeout is not None and timeout <= 0:
+                     # No budget left and nothing to join: do not admit work
+@@ -79,6 +98,8 @@ class RuntimePreflightCoordinator:
+                     return RuntimePreflightFailure(TimeoutError("runtime preflight budget exhausted before admission"))
+                 task = asyncio.create_task(self._capture(worker))
+                 self._inflight[key] = task
++                retained = _RetainedPreflight(task, asyncio.Event())
++                self._retained[task] = retained
+ 
+                 # Drop the in-flight entry as soon as the task finishes, even
+                 # if all awaiters have been cancelled. Without this callback,
+@@ -90,22 +111,116 @@ class RuntimePreflightCoordinator:
+                 # GIL; the identity guard prevents deleting a replacement task
+                 # scheduled by a later run() after this one was evicted.
+                 def _evict(finished: asyncio.Task[RuntimePreflightEntry]) -> None:
++                    self._observe(retained)
+                     if key in self._inflight and self._inflight[key] is finished:
+                         del self._inflight[key]
+ 
+                 task.add_done_callback(_evict)
+ 
+             task = self._inflight[key]
++            retained = self._retained[task]
++            retained.awaiters += 1
++            retained.awaiters_settled.clear()
+ 
+-        if timeout is None:
+-            return await asyncio.shield(task)
++        caller = asyncio.current_task()
++        assert caller is not None
++        cancellations_before = caller.cancelling()
+         try:
+-            # ``wait_for`` cancels only the shield wrapper on expiry; the
+-            # shared task — and the sync work it awaits — keeps running and
+-            # keeps its admission until it actually finishes.
+-            return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+-        except TimeoutError as exc:
+-            return RuntimePreflightFailure(exc)
++            if timeout is None:
++                result = await asyncio.shield(task)
++            else:
++                try:
++                    # Expiry cancels only the shield, never the shared task.
++                    result = await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
++                except TimeoutError as exc:
++                    return RuntimePreflightFailure(exc)
++        except BaseException:
++            # A caller's cancellation does not deliver the worker's outcome.
++            # A cancellation raised by the worker itself does: shield creates
++            # a replacement CancelledError, so recover the retained original.
++            if task.done() and caller.cancelling() == cancellations_before:
++                self._observe(retained)
++                self._delivered(retained)
++                assert retained.failure is not None
++                raise retained.failure from None
++            raise
++        else:
++            self._delivered(retained)
++            return result
++        finally:
++            retained.awaiters -= 1
++            if retained.awaiters == 0:
++                retained.awaiters_settled.set()
++
++    def _observe(self, retained: _RetainedPreflight) -> None:
++        """Retrieve each task outcome once, even when eviction wins the race."""
++        if retained.observed:
++            return
++        retained.observed = True
++        try:
++            result = retained.task.result()
++        except BaseException as failure:
++            retained.failure = failure
++        else:
++            if isinstance(result, RuntimePreflightFailure):
++                retained.failure = result.original_exc
++        if retained.failure is None or retained.delivered:
++            self._retained.pop(retained.task, None)
++
++    def _delivered(self, retained: _RetainedPreflight) -> None:
++        retained.delivered = True
++        self._retained.pop(retained.task, None)
++
++    async def _join(self, retained: tuple[_RetainedPreflight, ...]) -> tuple[BaseException, ...]:
++        if retained:
++            await asyncio.wait([entry.task for entry in retained])
++        failures: list[BaseException] = []
++        for entry in retained:
++            self._observe(entry)
++            # Let existing run() callers receive the outcome before deciding
++            # whether it was abandoned. Their cancellation never releases work.
++            if entry.awaiters:
++                await entry.awaiters_settled.wait()
++            if not entry.delivered and entry.failure is not None and all(entry.failure is not failure for failure in failures):
++                failures.append(entry.failure)
++        return tuple(failures)
++
++    async def seal_and_join(self) -> None:
++        """Permanently refuse new admissions and settle all admitted preflight.
++
++        Sealing and run admission share one lock. Already admitted callers keep
++        their result; later calls receive RuntimePreflightFailure containing
++        RuntimePreflightUnavailable, including calls for an existing key.
++        Join never cancels workers, and repeated calls share one retained join.
++        Caller cancellation is deferred until every owned task and existing
++        awaiter has settled, then re-raised with its original identity.
++
++        Task outcomes are retrieved at completion even after every caller has
++        left. Failures delivered through run() remain ordinary result values;
++        abandoned failures are retained for this lifecycle join, including
++        ones whose task was evicted before seal. Distinct undelivered failures
++        and join cancellation are raised together, never discarded or emitted
++        as a second preflight response. No unrelated host tasks are joined.
++        """
++        async with self._lock:
++            self._sealed = True
++            if self._join_task is None:
++                self._join_task = asyncio.create_task(self._join(tuple(self._retained.values())))
++            task = self._join_task
++        cancellation: asyncio.CancelledError | None = None
++        while not task.done():
++            try:
++                await asyncio.shield(task)
++            except asyncio.CancelledError as original:
++                if cancellation is None:
++                    cancellation = original
++        failures = list(task.result())
++        if cancellation is not None and all(cancellation is not failure for failure in failures):
++            failures.append(cancellation)
++        if len(failures) == 1:
++            raise failures[0]
++        if failures:
++            raise BaseExceptionGroup("Runtime preflight join obligations failed", failures)
+ 
+     async def _capture(self, worker: RuntimePreflightWorker) -> RuntimePreflightEntry:
+         try:
+diff --git a/src/elspeth/web/process_recovery.py b/src/elspeth/web/process_recovery.py
+index 6c9e06d90714c7f952a3446a63ef6563998306a6..d20ee9bda5c204857ee08255a1c9a87279482d0e 100644
+--- a/src/elspeth/web/process_recovery.py
++++ b/src/elspeth/web/process_recovery.py
+@@ -3,7 +3,6 @@
+ from __future__ import annotations
+ 
+ import asyncio
+-import signal
+ import threading
+ from typing import TYPE_CHECKING
+ 
+@@ -33,19 +32,27 @@ class ProcessRecovery:
+     async def _monitor(self) -> None:
+         try:
+             await self.watchdog.observe_helper_outcome()
+-        except BaseException:
++        except BaseException as original:
+             self.instance_draining.set()
+-            self.watchdog.request_signal(signal.SIGKILL)
++            self._force_after_failure(original)
+             raise
+ 
++    def _force_after_failure(self, original: BaseException) -> None:
++        try:
++            self.watchdog.force_termination()
++        except BaseException as termination:
++            if termination is original:
++                raise
++            raise BaseExceptionGroup("Process supervision and forced termination failed", [original, termination]) from None
++
+     async def _escalate(self, reason: RecoveryReason, *, signal_target: bool) -> None:
+         try:
+             await self.watchdog.begin_recovery(reason)
+-        except BaseException:
+-            self.watchdog.request_signal(signal.SIGKILL)
++        except BaseException as original:
++            self._force_after_failure(original)
+             raise
+         if signal_target:
+-            self.watchdog.request_signal(signal.SIGTERM)
++            self.watchdog.request_graceful_termination()
+ 
+     def _begin(self, reason: RecoveryReason, *, signal_target: bool) -> None:
+         self.instance_draining.set()
+diff --git a/src/elspeth/web/process_watchdog.py b/src/elspeth/web/process_watchdog.py
+index 3b2ff64af1feb2d37e6167fb2207924a535b9ef3..5ce1535a2f95edcf593ffd5a03a8e6be61638da7 100644
+--- a/src/elspeth/web/process_watchdog.py
++++ b/src/elspeth/web/process_watchdog.py
+@@ -89,7 +89,12 @@ class ProcessWatchdogControl(ABC):
+     async def observe_helper_outcome(self) -> None: ...
+ 
+     @abstractmethod
+-    def request_signal(self, sig: signal.Signals) -> None: ...
++    def request_graceful_termination(self) -> None:
++        """Request the owned process's cooperative shutdown after grace is armed."""
++
++    @abstractmethod
++    def force_termination(self) -> None:
++        """Force termination of the exact owned process when supervision fails."""
+ 
+ 
+ _active_watchdog: ProcessWatchdog | None = None
+@@ -277,6 +282,12 @@ class ProcessWatchdog(ProcessWatchdogControl):
+         if not self._disarmed:
+             raise ProcessWatchdogFailure("Required process watchdog exited while owner remained active")
+ 
++    def request_graceful_termination(self) -> None:
++        self.request_signal(signal.SIGTERM)
++
++    def force_termination(self) -> None:
++        self.request_signal(signal.SIGKILL)
++
+     def request_signal(self, sig: signal.Signals) -> None:
+         if type(sig) is not signal.Signals or sig not in (signal.SIGTERM, signal.SIGKILL):
+             raise ProcessWatchdogFailure("Unapproved process recovery signal")
+diff --git a/tests/fixtures/process_watchdog.py b/tests/fixtures/process_watchdog.py
+index 6539be912b1a77771ed021860107e39f29e6c398..273550492a242ba3b8a8fc6cd133d74c079349fa 100644
+--- a/tests/fixtures/process_watchdog.py
++++ b/tests/fixtures/process_watchdog.py
+@@ -75,6 +75,12 @@ class OwnedTestProcessWatchdog(ProcessWatchdogControl):
+     def request_signal(self, sig: signal.Signals) -> None:
+         self.signals.append(sig)
+ 
++    def request_graceful_termination(self) -> None:
++        self.request_signal(signal.SIGTERM)
++
++    def force_termination(self) -> None:
++        self.request_signal(signal.SIGKILL)
++
+     def fail(self, error: BaseException) -> None:
+         self.failure = error
+         self._outcome.set()
+diff --git a/tests/unit/web/execution/test_runtime_preflight_coordinator.py b/tests/unit/web/execution/test_runtime_preflight_coordinator.py
+index 277133e0f771079bf6dbdbe8b887bef4b810a507..77e613265dfefae311bbefd9a97c6c7ad2a5bf1b 100644
+--- a/tests/unit/web/execution/test_runtime_preflight_coordinator.py
++++ b/tests/unit/web/execution/test_runtime_preflight_coordinator.py
+@@ -3,6 +3,10 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import os
++import subprocess
++import sys
++from pathlib import Path
+ 
+ import pytest
+ 
+@@ -10,6 +14,7 @@ from elspeth.web.execution.runtime_preflight import (
+     RuntimePreflightCoordinator,
+     RuntimePreflightFailure,
+     RuntimePreflightKey,
++    RuntimePreflightUnavailable,
+ )
+ from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
+ 
+@@ -264,3 +269,311 @@ async def test_untimed_run_awaits_worker_completion() -> None:
+         return expected
+ 
+     assert await coordinator.run(key, worker) is expected
++
++
++@pytest.mark.asyncio
++async def test_worker_cancellation_preserves_original_identity() -> None:
++    coordinator = RuntimePreflightCoordinator()
++    original = asyncio.CancelledError("worker cancelled itself")
++
++    async def worker() -> ValidationResult:
++        raise original
++
++    with pytest.raises(asyncio.CancelledError) as caught:
++        await coordinator.run(RuntimePreflightKey("cancel", 1, "state", "settings"), worker)
++    assert caught.value is original
++
++
++@pytest.mark.asyncio
++async def test_worker_cancellation_after_consumed_caller_cancellation_preserves_original() -> None:
++    coordinator = RuntimePreflightCoordinator()
++    original = asyncio.CancelledError("worker cancelled during cleanup")
++
++    async def worker() -> ValidationResult:
++        raise original
++
++    async def cleanup() -> None:
++        caller = asyncio.current_task()
++        assert caller is not None
++        caller.cancel("earlier lifecycle cancellation")
++        try:
++            await asyncio.sleep(0)
++        except asyncio.CancelledError:
++            # Lifecycle cleanup deliberately defers this earlier cancellation.
++            # Its nonzero cancelling count must not misclassify a worker abort.
++            with pytest.raises(asyncio.CancelledError) as caught:
++                await coordinator.run(RuntimePreflightKey("cleanup", 1, "s", "k"), worker)
++            assert caught.value is original
++            await coordinator.seal_and_join()
++
++    await asyncio.create_task(cleanup())
++
++
++@pytest.mark.asyncio
++async def test_seal_joins_admitted_worker_and_refuses_new_work() -> None:
++    coordinator = RuntimePreflightCoordinator()
++    key = RuntimePreflightKey("seal", 1, "state", "settings")
++    started = asyncio.Event()
++    release = asyncio.Event()
++    calls = 0
++    expected = _passing_preflight()
++
++    async def worker() -> ValidationResult:
++        nonlocal calls
++        calls += 1
++        started.set()
++        await release.wait()
++        return expected
++
++    caller = asyncio.create_task(coordinator.run(key, worker))
++    await started.wait()
++    join = asyncio.create_task(coordinator.seal_and_join())
++    await asyncio.sleep(0)
++    assert not join.done()
++    refused = await coordinator.run(key, worker)
++    assert isinstance(refused, RuntimePreflightFailure)
++    assert isinstance(refused.original_exc, RuntimePreflightUnavailable)
++    other = await coordinator.run(RuntimePreflightKey("new-after-seal", 2, "state", "settings"), worker)
++    assert isinstance(other, RuntimePreflightFailure)
++    assert isinstance(other.original_exc, RuntimePreflightUnavailable)
++    assert calls == 1
++    release.set()
++    assert await caller is expected
++    await join
++    await coordinator.seal_and_join()
++    after_join = await coordinator.run(key, worker)
++    assert isinstance(after_join, RuntimePreflightFailure)
++    assert isinstance(after_join.original_exc, RuntimePreflightUnavailable)
++    assert calls == 1
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("abandoned", [False, True])
++async def test_seal_observes_failure_racing_completed_eviction_without_duplicate_delivery(abandoned: bool) -> None:
++    coordinator = RuntimePreflightCoordinator()
++    key = RuntimePreflightKey("failure", 1, "state", "settings")
++    release = asyncio.Event()
++    started = asyncio.Event()
++    original = ValueError("preflight failed")
++
++    async def worker() -> ValidationResult:
++        started.set()
++        await release.wait()
++        raise original
++
++    caller = asyncio.create_task(coordinator.run(key, worker))
++    await started.wait()
++    if abandoned:
++        caller.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await caller
++    release.set()
++    if abandoned:
++        # Eviction runs before the join: close must still own its failure.
++        for _ in range(4):
++            await asyncio.sleep(0)
++        with pytest.raises(ValueError) as caught:
++            await coordinator.seal_and_join()
++        assert caught.value is original
++    else:
++        result = await caller
++        assert isinstance(result, RuntimePreflightFailure)
++        assert result.original_exc is original
++        await coordinator.seal_and_join()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("fail", [False, True])
++async def test_seal_retains_repeated_caller_cancellation_until_actual_completion(fail: bool) -> None:
++    coordinator = RuntimePreflightCoordinator()
++    release = asyncio.Event()
++    started = asyncio.Event()
++    original = ValueError("abandoned failure")
++
++    async def worker() -> ValidationResult:
++        started.set()
++        await release.wait()
++        if fail:
++            raise original
++        return _passing_preflight()
++
++    caller = asyncio.create_task(coordinator.run(RuntimePreflightKey("join", 1, "s", "k"), worker))
++    await started.wait()
++    caller.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await caller
++    join = asyncio.create_task(coordinator.seal_and_join())
++    await asyncio.sleep(0)
++    join.cancel("first join cancellation")
++    await asyncio.sleep(0)
++    join.cancel("second join cancellation")
++    await asyncio.sleep(0)
++    assert not join.done()
++    release.set()
++    if fail:
++        with pytest.raises(BaseExceptionGroup) as caught:
++            await join
++        assert caught.value.exceptions[0] is original
++        cancellation = caught.value.exceptions[1]
++    else:
++        with pytest.raises(asyncio.CancelledError) as cancelled:
++            await join
++        cancellation = cancelled.value
++    assert isinstance(cancellation, asyncio.CancelledError)
++    assert cancellation.args == ("first join cancellation",)
++
++
++@pytest.mark.asyncio
++async def test_empty_coordinator_can_be_sealed_repeatedly() -> None:
++    coordinator = RuntimePreflightCoordinator()
++    await coordinator.seal_and_join()
++    await coordinator.seal_and_join()
++
++
++class PreflightTaskAbort(BaseException):
++    """Uncaptured task failure distinct from an ordinary result envelope."""
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("original", [PreflightTaskAbort("task aborted"), asyncio.CancelledError("task cancelled")])
++async def test_seal_retains_abandoned_actual_task_failure(original: BaseException) -> None:
++    coordinator = RuntimePreflightCoordinator()
++    started = asyncio.Event()
++    release = asyncio.Event()
++    loop = asyncio.get_running_loop()
++    unobserved: list[object] = []
++    previous_handler = loop.get_exception_handler()
++    loop.set_exception_handler(lambda _loop, context: unobserved.append(context["exception"]))
++
++    async def worker() -> ValidationResult:
++        started.set()
++        await release.wait()
++        raise original
++
++    try:
++        caller = asyncio.create_task(coordinator.run(RuntimePreflightKey("abort", 1, "s", "k"), worker))
++        await started.wait()
++        caller.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await caller
++        release.set()
++        for _ in range(4):
++            await asyncio.sleep(0)
++        with pytest.raises(type(original)) as caught:
++            await coordinator.seal_and_join()
++        assert caught.value is original
++        assert unobserved == []
++    finally:
++        loop.set_exception_handler(previous_handler)
++
++
++@pytest.mark.asyncio
++async def test_cancelled_waiter_does_not_duplicate_failure_delivered_to_patient_waiter() -> None:
++    coordinator = RuntimePreflightCoordinator()
++    key = RuntimePreflightKey("waiters", 1, "s", "k")
++    started = asyncio.Event()
++    release = asyncio.Event()
++    original = ValueError("one delivered result")
++    calls = 0
++
++    async def worker() -> ValidationResult:
++        nonlocal calls
++        calls += 1
++        started.set()
++        await release.wait()
++        raise original
++
++    departing = asyncio.create_task(coordinator.run(key, worker))
++    await started.wait()
++    patient = asyncio.create_task(coordinator.run(key, worker))
++    await asyncio.sleep(0)
++    departing.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await departing
++    join = asyncio.create_task(coordinator.seal_and_join())
++    await asyncio.sleep(0)
++    release.set()
++    await join
++    result = await patient
++    assert isinstance(result, RuntimePreflightFailure)
++    assert result.original_exc is original
++    assert calls == 1
++    await coordinator.seal_and_join()
++
++
++def _run_real_worker_join_child() -> None:
++    """Fresh lifecycle; never borrow or reset pytest's shared executor owner."""
++    import threading
++
++    from elspeth.web.async_workers import configure_required_executor_recovery, run_sync_in_worker, shutdown_async_workers
++
++    def unexpected_recovery(observation: object) -> None:
++        raise AssertionError(observation)
++
++    async def main() -> None:
++        configure_required_executor_recovery(
++            drain_seconds=10,
++            instance_draining=threading.Event(),
++            generation_unavailable=threading.Event(),
++            recovery_callback=unexpected_recovery,
++        )
++        coordinator = RuntimePreflightCoordinator()
++        started = threading.Event()
++        release = threading.Event()
++        finished = threading.Event()
++
++        def blocking() -> ValidationResult:
++            started.set()
++            assert release.wait(5), "outer worker release was lost"
++            finished.set()
++            return _passing_preflight()
++
++        async def worker() -> ValidationResult:
++            return await run_sync_in_worker(blocking)
++
++        key = RuntimePreflightKey("real", 1, "state", "settings")
++        result = await coordinator.run(key, worker, timeout=0.05)
++        assert isinstance(result, RuntimePreflightFailure)
++        assert isinstance(result.original_exc, TimeoutError)
++        assert started.is_set()
++        join = asyncio.create_task(coordinator.seal_and_join())
++        await asyncio.sleep(0)
++        join.cancel("outer cancellation")
++        await asyncio.sleep(0)
++        assert not join.done() and not finished.is_set()
++        release.set()
++        try:
++            await join
++        except asyncio.CancelledError as cancellation:
++            assert cancellation.args == ("outer cancellation",)
++        else:
++            raise AssertionError("join lost cancellation")
++        assert finished.is_set()
++        await shutdown_async_workers()
++        print("real worker and coordinator joined", flush=True)
++
++    asyncio.run(main())
++
++
++def test_seal_joins_real_worker_in_fresh_explicit_lifecycle(tmp_path: Path) -> None:
++    log = tmp_path / "worker-child.log"
++    with log.open("w", encoding="utf-8") as output:
++        process = subprocess.Popen(
++            [
++                sys.executable,
++                "-c",
++                "from tests.unit.web.execution.test_runtime_preflight_coordinator import _run_real_worker_join_child; _run_real_worker_join_child()",
++            ],
++            env=os.environ.copy(),
++            stdout=output,
++            stderr=subprocess.STDOUT,
++        )
++        try:
++            code = process.wait(timeout=15)
++        finally:
++            if process.poll() is None:
++                process.kill()
++                process.wait(timeout=5)
++            log.with_suffix(".exit").write_text(str(process.returncode), encoding="utf-8")
++    assert code == 0, log.read_text(encoding="utf-8")
++    assert "real worker and coordinator joined" in log.read_text(encoding="utf-8")
+diff --git a/tests/unit/web/test_process_watchdog.py b/tests/unit/web/test_process_watchdog.py
+index 2df19708b9a78d349fecfd571fb46961ed3d27a1..25ba6b6f2ece6a5d20ceeefa7635e071682f418f 100644
+--- a/tests/unit/web/test_process_watchdog.py
++++ b/tests/unit/web/test_process_watchdog.py
+@@ -205,3 +205,81 @@ async def test_repeated_caller_cancel_joins_actual_watchdog_ack(fail):
+             await join
+         assert watchdog.signals == [signal.SIGTERM]
+     assert recovery._escalation_task.done()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("failure", [None, "ack", "monitor"])
++async def test_recovery_uses_semantic_owner_operations(failure):
++    """Recovery must work with an owner that has no Unix signal authority."""
++
++    class SemanticOwner(OwnedTestProcessWatchdog):
++        def __init__(self, draining):
++            super().__init__(draining)
++            self.operations = []
++
++        async def begin_recovery(self, reason):
++            if failure == "ack":
++                raise original
++            result = await super().begin_recovery(reason)
++            self.operations.append("ack")
++            return result
++
++        def request_graceful_termination(self):
++            self.operations.append("graceful")
++
++        def force_termination(self):
++            self.operations.append("force")
++
++        def request_signal(self, sig):
++            raise AssertionError("portable recovery attempted Unix signal dispatch")
++
++    original = ProcessWatchdogFailure("semantic owner failed")
++    draining = threading.Event()
++    owner = SemanticOwner(draining)
++    recovery = ProcessRecovery(watchdog=owner, instance_draining=draining)
++    if failure == "monitor":
++        recovery.start_monitor()
++        owner.fail(original)
++        with pytest.raises(ProcessWatchdogFailure) as caught:
++            await recovery.join_monitor_after_completion()
++        assert caught.value is original
++        assert owner.operations == ["force"]
++    else:
++        recovery.request_shutdown()
++        recovery.request_shutdown()
++        if failure == "ack":
++            with pytest.raises(ProcessWatchdogFailure) as caught:
++                await recovery.join_escalation()
++            assert caught.value is original
++            assert owner.operations == ["force"]
++        else:
++            await recovery.join_escalation()
++            assert owner.operations == ["ack", "graceful"]
++    assert draining.is_set()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("monitor", [False, True])
++async def test_failed_force_preserves_original_supervision_failure(monitor):
++    original = ProcessWatchdogFailure("supervision failed")
++    termination = OSError("force termination failed")
++
++    class FailedOwner(OwnedTestProcessWatchdog):
++        async def begin_recovery(self, reason):
++            raise original
++
++        def force_termination(self):
++            raise termination
++
++    draining = threading.Event()
++    owner = FailedOwner(draining)
++    recovery = ProcessRecovery(watchdog=owner, instance_draining=draining)
++    with pytest.raises(BaseExceptionGroup) as caught:
++        if monitor:
++            recovery.start_monitor()
++            owner.fail(original)
++            await recovery.join_monitor_after_completion()
++        else:
++            recovery.request_shutdown()
++            await recovery.join_escalation()
++    assert caught.value.exceptions == (original, termination)

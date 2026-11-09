@@ -1,0 +1,1962 @@
+import { canonicalUuid, operationKind, validateComposerRecoveryBody, decodeComposerOperationAck, decodeComposerOperationSnapshot, decodeComposerOperationFailurePage } from "./composerOperationDecoder";
+import { authFetch, currentAuthGeneration, isCurrentAuthGeneration, responseOwnsCredential } from "./authSession";
+// ============================================================================
+// ELSPETH API Client
+//
+// Typed fetch wrappers for all backend endpoints. Auth token injection via
+// localStorage. Global 401 interceptor triggers authStore logout.
+// All fetch calls use relative paths -- Vite proxy forwards to FastAPI
+// in development; same-origin serving works in production.
+// ============================================================================
+
+import { isValidationCheck, isValidationReadiness } from "./validationReadiness";
+import type {
+  ApiError,
+  ApiStructuredError,
+  AuthConfig,
+  BlobCreationModalityWire,
+  BlobMetadata,
+  ChatMessage,
+  ComposerPreferences,
+  CompositionProposal,
+  CompositionState,
+  CompositionStateVersion,
+  ComposerProgressSnapshot,
+  ExecutionFanoutAck,
+  ExecutionFanoutGuard,
+  ExecutionSecretAck,
+  ExecutionSecretGuard,
+  CancelRunResponse,
+  InlineSourceProvenance,
+  PluginSchemaInfo,
+  PluginPolicyFinding,
+  PluginPolicyResponse,
+  PluginSnapshotResponse,
+  PluginSummary,
+  Run,
+  RunDiagnostics,
+  RunDiagnosticsEvaluation,
+  RunOutputArtifactPreview,
+  RunOutputsResponse,
+  WebSocketTicketResponse,
+  SecretInventoryItem,
+  Session,
+  AdminGeneratedPassword,
+  AdminUserSummary,
+  UserProfile,
+  ValidationResult,
+  SystemStatus,
+  MessageWithStateResponse,
+} from "@/types/index";
+import {
+  decodeCompositionState,
+  decodeCompositionStateVersions,
+} from "./compositionDecoder";
+import { decodeUserComposerPreferences } from "./preferencesDecoder";
+import type {
+  InterpretationEvent,
+  InterpretationOptOutResponse,
+  InterpretationResolveRequest,
+  InterpretationResolveResponse,
+  ListInterpretationEventsResponse,
+  OptOutSummaryResponse,
+} from "@/types/interpretation";
+import type { RecoveryTranscriptRow } from "@/types/recovery";
+import type {
+  RunAuditStoryResponse,
+  TutorialCancelResponse,
+  TutorialOrphanCleanupResponse,
+  TutorialRunRequest,
+  TutorialRunResponse,
+  TutorialReadinessResponse,
+  TutorialSampleResponse,
+  UserComposerPreferencesPayload,
+  UpdateUserComposerPreferencesPayload,
+} from "@/types/api";
+
+// ── Token Management ────────────────────────────────────────────────────────
+
+const TOKEN_KEY = "auth_token";
+
+function getToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY);
+}
+
+/**
+ * Build headers with auth token injection and optional content type.
+ * Every authenticated request includes Authorization: Bearer {token}.
+ */
+export function authHeaders(contentType?: string): HeadersInit {
+  const headers: Record<string, string> = {};
+  const token = getToken();
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+  if (contentType) {
+    headers["Content-Type"] = contentType;
+  }
+  return headers;
+}
+
+// Review decisions and validation both acquire a backend session lease. Queue
+// these calls per session so rapid decisions across cards, or validation after
+// a decision, do not race each other into a lease-conflict response. Nginx's
+// production read timeout is 360s; a slightly longer client deadline also
+// bounds this queue when a direct/local connection loses its response.
+const REVIEW_MUTATION_TIMEOUT_MS = 370_000;
+const REVIEW_MUTATION_RECOVERY_MESSAGE =
+  "The request outcome is uncertain. Refresh the page to reload this session before making another review decision.";
+const reviewMutationTails = new Map<string, Promise<void>>();
+const ambiguousReviewMutations = new Set<string>();
+
+function isDefinitiveReviewRejection(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("status" in error)) {
+    return false;
+  }
+  const status = error.status;
+  // A 4xx other than request timeout means the server rejected this action.
+  // A 5xx, malformed success, or transport failure may follow a committed
+  // decision, so later queued actions must wait for a fresh session reload.
+  return typeof status === "number" && status >= 400 && status < 500 && status !== 408;
+}
+
+function serializeReviewMutation<T>(
+  sessionId: string,
+  action: (signal: AbortSignal) => Promise<T>,
+  externalSignal?: AbortSignal,
+): Promise<T> {
+  const authGeneration = currentAuthGeneration();
+  const token = getToken();
+  const key = `${authGeneration}:${sessionId}`;
+  const previous = reviewMutationTails.get(key) ?? Promise.resolve();
+  const result = previous.then(async () => {
+    if (!isCurrentAuthGeneration(authGeneration) || getToken() !== token) {
+      throw { status: 0, detail: "Authentication changed before request dispatch" } satisfies ApiError;
+    }
+    if (ambiguousReviewMutations.has(key)) {
+      throw { status: 504, detail: REVIEW_MUTATION_RECOVERY_MESSAGE } satisfies ApiError;
+    }
+    if (externalSignal?.aborted) {
+      throw { status: 0, detail: "Request cancelled before dispatch" } satisfies ApiError;
+    }
+    const deadline = new AbortController();
+    const signal = externalSignal === undefined
+      ? deadline.signal
+      : AbortSignal.any([externalSignal, deadline.signal]);
+    const timer = setTimeout(() => deadline.abort(), REVIEW_MUTATION_TIMEOUT_MS);
+    try {
+      return await action(signal);
+    } catch (error) {
+      if (deadline.signal.aborted || externalSignal?.aborted || !isDefinitiveReviewRejection(error)) {
+        ambiguousReviewMutations.add(key);
+        throw { status: 504, detail: REVIEW_MUTATION_RECOVERY_MESSAGE } satisfies ApiError;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+  const tail = result.then(() => undefined, () => undefined);
+  reviewMutationTails.set(key, tail);
+  void tail.then(() => {
+    if (reviewMutationTails.get(key) === tail) {
+      reviewMutationTails.delete(key);
+    }
+  });
+  return result;
+}
+
+// ── Response Parsing ────────────────────────────────────────────────────────
+
+function ownField(source: unknown, field: string): unknown {
+  if (typeof source !== "object" || source === null) {
+    return undefined;
+  }
+  if (!Object.prototype.hasOwnProperty.call(source, field)) {
+    return undefined;
+  }
+  return (source as Record<string, unknown>)[field];
+}
+
+function firstDefined<T>(primary: T | undefined, secondary: T | undefined): T | undefined {
+  return primary !== undefined ? primary : secondary;
+}
+
+function firstStringField(
+  sources: readonly unknown[],
+  fields: readonly string[],
+): string | undefined {
+  for (const field of fields) {
+    for (const source of sources) {
+      const value = ownField(source, field);
+      if (typeof value === "string") {
+        return value;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * FastAPI's global RequestValidationError handler (app.py) returns
+ * `{detail: [{type, loc, msg}, ...], request_id}` -- an ARRAY `detail`, not
+ * the string/object shape every other route uses. Neither `firstStringField`
+ * nor the `errors` lookup below reads an array, so without this the human
+ * `msg` the backend already allowlisted as safe was dropped and every caller
+ * fell back to `response.statusText` ("Unprocessable Entity", or "" over
+ * HTTP/2). Map each entry with a string `msg` into a structured error,
+ * loc-prefixed so "body -> content: String should have at most 65536
+ * characters" beats a bare status phrase.
+ */
+function fastApiValidationErrors(
+  detailArray: readonly unknown[],
+): ApiStructuredError[] {
+  const out: ApiStructuredError[] = [];
+  for (const entry of detailArray) {
+    const msg = ownField(entry, "msg");
+    if (typeof msg !== "string") {
+      continue;
+    }
+    const loc = ownField(entry, "loc");
+    const locPath = Array.isArray(loc)
+      ? loc.filter((part) => typeof part === "string" || typeof part === "number").join(" -> ")
+      : undefined;
+    out.push({ message: locPath ? `${locPath}: ${msg}` : msg });
+  }
+  return out;
+}
+
+function optionalResponseHeader(response: Response, name: string): string | undefined {
+  const headers = (response as unknown as { headers?: unknown }).headers;
+  if (typeof headers !== "object" || headers === null) {
+    return undefined;
+  }
+  const getHeader = (headers as { get?: unknown }).get;
+  if (typeof getHeader !== "function") {
+    return undefined;
+  }
+  const value = getHeader.call(headers, name) as unknown;
+  return typeof value === "string" ? value : undefined;
+}
+
+/**
+ * Parse a response. Throws ApiError for non-2xx status codes.
+ *
+ * Includes a global 401 interceptor: any API call returning 401 triggers
+ * authStore.logout() to handle token expiry mid-session without requiring
+ * each caller to check for auth failures. Callers that intentionally handle
+ * a non-session capability boundary may opt out of the logout side effect.
+ *
+ * Error envelope handling priority:
+ *   1. error_type (if present in response body) -- most specific
+ *   2. HTTP status code -- structural fallback
+ *   3. detail text -- human-readable description
+ */
+interface ParseResponseOptions {
+  logoutOnUnauthorized?: boolean;
+}
+
+export class ForkCommittedResponseError extends Error {
+  readonly committedSuccessResponse = true;
+  readonly cause: unknown;
+
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = "ForkCommittedResponseError";
+    this.cause = cause;
+  }
+}
+
+export function isForkCommittedResponseError(error: unknown): error is ForkCommittedResponseError {
+  return error instanceof ForkCommittedResponseError;
+}
+
+
+const CANONICAL_SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function decodeForkSessionLocator(value: unknown): { session_id: string } {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("fork locator must be an exact object");
+  }
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).length !== 1 || !Object.prototype.hasOwnProperty.call(record, "session_id")) {
+    throw new Error("fork locator must contain exactly session_id");
+  }
+  if (typeof record.session_id !== "string" || !CANONICAL_SESSION_UUID.test(record.session_id)) {
+    throw new Error("fork locator session_id must be a canonical UUID");
+  }
+  return { session_id: record.session_id };
+}
+
+export async function parseResponse<T>(
+  response: Response,
+  options: ParseResponseOptions = {},
+): Promise<T> {
+  if (!response.ok) {
+    // A rejected credential can only invalidate the login that sent it.
+    // Dynamic import avoids circular dependency at module load time
+    // (authStore imports from client, client imports authStore for logout).
+    if (response.status === 401 && options.logoutOnUnauthorized !== false) {
+      const { useAuthStore } = await import("@/stores/authStore");
+      if (responseOwnsCredential(response, useAuthStore.getState().token)) {
+        await useAuthStore.getState().logout({ revoke: false });
+      }
+    }
+
+    let body: unknown;
+    try { body = await response.json(); } catch { body = null; }
+    throw buildApiError(response.status, body, response.statusText, optionalResponseHeader(response, "X-ELSPETH-Plugin-Snapshot"));
+  }
+
+  return response.json() as Promise<T>;
+}
+
+function buildApiError(status: number, errorBody: unknown, statusText: string, snapshotHeader?: string): ApiError {
+    // Parse the error envelope into one ApiError contract. Canonical backend
+    // fields are `error_type`, `detail`, and optional `errors`; `kind` and
+    // `message` remain accepted as compatibility aliases for older execution
+    // responses.
+    let detail = statusText;
+    let errorType: string | undefined;
+    let currentState: string | undefined;
+    let unavailableStateHead: ApiError["unavailable_state_head"];
+    let storageQuota: ApiError["storage_quota"];
+    let sources: string[] | undefined;
+    let requestId: string | undefined;
+    let diagnosticId: string | undefined;
+    let failureCode: string | undefined;
+    let guidance: string | undefined;
+    let componentId: string | undefined;
+    let pluginId: string | undefined;
+    let nestedSnapshotFingerprint: string | undefined;
+    let providerDetail: string | undefined;
+    let providerStatusCode: number | undefined;
+    let fanoutGuard: ExecutionFanoutGuard | undefined;
+    let secretGuard: ExecutionSecretGuard | undefined;
+    let validationErrors: ApiError["validation_errors"];
+    let errors: ApiError["errors"];
+    let reason: string | undefined;
+    let recoveryText: ApiError["recovery_text"];
+    let timeoutSeconds: number | undefined;
+    let retryAfter: number | undefined;
+    let partialState: ApiError["partial_state"];
+    let failedTurn: ApiError["failed_turn"];
+    let partialStateSaveFailed: ApiError["partial_state_save_failed"];
+    let partialStateSaveError: ApiError["partial_state_save_error"];
+    try {
+      const body = errorBody as Record<string, unknown>;
+      const nestedDetail =
+        typeof body.detail === "object" && body.detail !== null
+          ? body.detail as Record<string, unknown>
+          : null;
+
+      errorType = firstStringField(
+        [body, nestedDetail],
+        ["error_type", "error_code", "refusal", "code", "kind"],
+      );
+      currentState = firstStringField([body, nestedDetail], ["current_state"]);
+      if (status === 409 && errorType === "composition_state_unavailable") {
+        const stateId = firstStringField([body, nestedDetail], ["state_id"]);
+        const version = firstDefined(ownField(body, "version"), ownField(nestedDetail, "version"));
+        if (stateId !== undefined && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(stateId)
+          && typeof version === "number" && Number.isSafeInteger(version) && version > 0) {
+          unavailableStateHead = { state_id: stateId, version };
+        }
+      }
+      if (status === 413 && errorType === "storage_quota_exceeded") {
+        const dimension = firstDefined(ownField(nestedDetail, "dimension"), ownField(body, "dimension"));
+        const cap = firstDefined(ownField(nestedDetail, "cap"), ownField(body, "cap"));
+        const ceiling = firstDefined(ownField(nestedDetail, "ceiling"), ownField(body, "ceiling"));
+        const usage = firstDefined(ownField(nestedDetail, "usage"), ownField(body, "usage"));
+        const scope = firstDefined(ownField(nestedDetail, "scope"), ownField(body, "scope"));
+        const limit = firstDefined(ownField(nestedDetail, "limit"), ownField(body, "limit"));
+        const validQuantity = (value: unknown): value is string | number =>
+          (typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value))
+          || (typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
+        const validLimit = (value: unknown): value is string | number | null => value === null || validQuantity(value);
+        if (dimension === "storage" && validLimit(cap) && validLimit(ceiling) && validQuantity(usage)
+          && (scope === "identity" || scope === "container") && validQuantity(limit)) {
+          const bindingLimit = scope === "identity" ? cap : ceiling;
+          if (bindingLimit !== null && BigInt(bindingLimit) === BigInt(limit)) {
+            storageQuota = { cap, ceiling, usage, scope, limit };
+          }
+        }
+      }
+      const rawSources = firstDefined(ownField(body, "sources"), ownField(nestedDetail, "sources"));
+      sources = Array.isArray(rawSources) && rawSources.every((source): source is string => typeof source === "string")
+        ? rawSources
+        : undefined;
+
+      requestId = firstStringField([body, nestedDetail], ["request_id"]);
+      const rawDiagnostic = firstStringField([body, nestedDetail], ["diagnostic_id"]);
+      if (rawDiagnostic !== undefined && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(rawDiagnostic)) diagnosticId = rawDiagnostic;
+      failureCode = firstStringField([body, nestedDetail], ["failure_code"]);
+      guidance = firstStringField([body, nestedDetail], ["guidance"]);
+
+      // Convergence discriminator + its recovery copy. Kept off `detail` so
+      // the SPA branches on the taxonomy rather than parsing prose.
+      reason = firstStringField([body, nestedDetail], ["reason"]);
+      recoveryText = firstStringField([body, nestedDetail], ["recovery_text"]);
+
+      const rawTimeoutSeconds = firstDefined(
+        ownField(body, "timeout_seconds"),
+        ownField(nestedDetail, "timeout_seconds"),
+      );
+      // Finite and positive or absent — error copy must not name a number the
+      // response did not actually stand behind.
+      timeoutSeconds =
+        typeof rawTimeoutSeconds === "number" &&
+        Number.isFinite(rawTimeoutSeconds) &&
+        rawTimeoutSeconds > 0
+          ? rawTimeoutSeconds
+          : undefined;
+
+      const rawRetryAfter = firstDefined(
+        ownField(body, "retry_after"),
+        ownField(nestedDetail, "retry_after"),
+      );
+      retryAfter = typeof rawRetryAfter === "number" ? rawRetryAfter : undefined;
+
+      const rawComponentId = firstDefined(
+        ownField(body, "component_id"),
+        ownField(nestedDetail, "component_id"),
+      );
+      componentId = typeof rawComponentId === "string" ? rawComponentId : undefined;
+
+      const rawPluginId = firstDefined(
+        ownField(body, "plugin_id"),
+        ownField(nestedDetail, "plugin_id"),
+      );
+      pluginId = typeof rawPluginId === "string" ? rawPluginId : undefined;
+
+      const rawSnapshotFingerprint = firstDefined(
+        ownField(body, "snapshot_fingerprint"),
+        ownField(nestedDetail, "snapshot_fingerprint"),
+      );
+      nestedSnapshotFingerprint =
+        typeof rawSnapshotFingerprint === "string"
+          ? rawSnapshotFingerprint
+          : undefined;
+
+      providerDetail =
+        typeof body.provider_detail === "string"
+          ? body.provider_detail
+          : typeof nestedDetail?.provider_detail === "string"
+            ? nestedDetail.provider_detail
+            : undefined;
+
+      const rawProviderStatusCode =
+        typeof body.provider_status_code === "number"
+          ? body.provider_status_code
+          : typeof nestedDetail?.provider_status_code === "number"
+            ? nestedDetail.provider_status_code
+            : undefined;
+      providerStatusCode = Number.isInteger(rawProviderStatusCode)
+        ? rawProviderStatusCode
+        : undefined;
+
+      fanoutGuard =
+        (body.fanout_guard ?? nestedDetail?.fanout_guard) as ApiError["fanout_guard"];
+
+      secretGuard =
+        (body.secret_guard ?? nestedDetail?.secret_guard) as ApiError["secret_guard"];
+
+      validationErrors =
+        (body.validation_errors ?? nestedDetail?.validation_errors) as ApiError["validation_errors"];
+
+      const rawErrors = firstDefined(
+        ownField(body, "errors"),
+        ownField(nestedDetail, "errors"),
+      );
+      const filteredErrors = Array.isArray(rawErrors)
+        ? rawErrors.filter(
+            (entry): entry is NonNullable<ApiError["errors"]>[number] =>
+              typeof entry === "object" &&
+              entry !== null &&
+              !Array.isArray(entry) &&
+              typeof ownField(entry, "message") === "string",
+          )
+        : undefined;
+      // FastAPI's global RequestValidationError envelope puts its own
+      // array shape on `detail` (see fastApiValidationErrors above), not on
+      // `errors` -- only reached when nothing already claimed `errors`.
+      const fastApiErrors =
+        filteredErrors === undefined && Array.isArray(body.detail)
+          ? fastApiValidationErrors(body.detail)
+          : undefined;
+      errors =
+        filteredErrors ?? (fastApiErrors && fastApiErrors.length > 0 ? fastApiErrors : undefined);
+
+      const explicitDetail = firstStringField(
+        [nestedDetail, body],
+        ["detail", "message"],
+      );
+      const firstErrorMessage = errors
+        ?.map((entry) => ownField(entry, "message"))
+        .find((message): message is string => typeof message === "string");
+      detail = explicitDetail ?? firstErrorMessage ?? detail;
+
+      const rawPartialState =
+        firstDefined(
+          ownField(body, "partial_state"),
+          ownField(nestedDetail, "partial_state"),
+        );
+      partialState = rawPartialState as ApiError["partial_state"];
+
+      const rawFailedTurn =
+        firstDefined(
+          ownField(body, "failed_turn"),
+          ownField(nestedDetail, "failed_turn"),
+        );
+      failedTurn = rawFailedTurn as ApiError["failed_turn"];
+
+      const rawPartialStateSaveFailed =
+        firstDefined(
+          ownField(body, "partial_state_save_failed"),
+          ownField(nestedDetail, "partial_state_save_failed"),
+        );
+      partialStateSaveFailed =
+        typeof rawPartialStateSaveFailed === "boolean"
+          ? rawPartialStateSaveFailed
+          : undefined;
+
+      const rawPartialStateSaveError =
+        firstDefined(
+          ownField(body, "partial_state_save_error"),
+          ownField(nestedDetail, "partial_state_save_error"),
+        );
+      partialStateSaveError =
+        typeof rawPartialStateSaveError === "string" ||
+        rawPartialStateSaveError === null
+          ? rawPartialStateSaveError
+          : undefined;
+    } catch {
+      // Response body wasn't JSON -- use statusText as detail fallback
+    }
+
+    const error: ApiError = {
+      status: status,
+      detail,
+      error_type: errorType,
+      current_state: currentState,
+      unavailable_state_head: unavailableStateHead,
+      storage_quota: storageQuota,
+      sources,
+      request_id: requestId,
+      diagnostic_id: diagnosticId,
+      failure_code: failureCode,
+      guidance,
+      component_id: componentId,
+      plugin_id: pluginId,
+      reason,
+      recovery_text: recoveryText,
+      timeout_seconds: timeoutSeconds,
+      retry_after: retryAfter,
+      partial_state: partialState,
+      failed_turn: failedTurn,
+      partial_state_save_failed: partialStateSaveFailed,
+      partial_state_save_error: partialStateSaveError,
+      fanout_guard: fanoutGuard,
+      secret_guard: secretGuard,
+      provider_detail: providerDetail,
+      provider_status_code: providerStatusCode,
+      validation_errors: validationErrors,
+      errors,
+      snapshot_fingerprint:
+        snapshotHeader ??
+        nestedSnapshotFingerprint,
+    };
+    return error;
+}
+
+// ── Auth ────────────────────────────────────────────────────────────────────
+
+/**
+ * Fetch auth provider configuration. Unauthenticated endpoint --
+ * callable before login. Returns provider type and OIDC params.
+ */
+export async function fetchAuthConfig(): Promise<AuthConfig> {
+  const response = await authFetch("/api/auth/config", { cache: "no-store" });
+  return parseResponse<AuthConfig>(response);
+}
+
+/**
+ * Authenticate with username and password (local auth provider).
+ * Returns the JWT access token.
+ */
+export async function login(
+  username: string,
+  password: string,
+): Promise<{ access_token: string }> {
+  const response = await authFetch("/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  return parseResponse<{ access_token: string }>(response);
+}
+
+/**
+ * Refresh the current auth token. Returns a new access token.
+ */
+export async function refreshToken(): Promise<{ access_token: string }> {
+  const response = await authFetch("/api/auth/token", {
+    method: "POST",
+    headers: authHeaders("application/json"),
+  });
+  return parseResponse<{ access_token: string }>(response);
+}
+
+/** Revoke the captured session, even after local credential custody is cleared. */
+export async function logoutSession(token: string): Promise<void> {
+  const response = await authFetch("/api/auth/logout", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) await parseResponse<void>(response, { logoutOnUnauthorized: false });
+}
+
+/**
+ * Get the current user's profile. Used to validate the stored token
+ * on page load and to populate the user display.
+ */
+export async function fetchCurrentUser(options: ParseResponseOptions = {}): Promise<UserProfile> {
+  const response = await authFetch("/api/auth/me", {
+    headers: authHeaders(),
+  });
+  return parseResponse<UserProfile>(response, options);
+}
+
+// ── Dev-admin user management (env-gated; 404 unless the backend's
+//    dev_admin_user names the current local-auth user) ──────────────────────
+
+/** List every local-auth account (dev admin only). */
+export async function fetchAdminUsers(): Promise<{ users: AdminUserSummary[] }> {
+  const response = await authFetch("/api/auth/admin/users", {
+    headers: authHeaders(),
+  });
+  return parseResponse<{ users: AdminUserSummary[] }>(response);
+}
+
+/** Create a local-auth account; the server generates and returns the password once. */
+export async function createAdminUser(body: {
+  username: string;
+  display_name: string;
+  email?: string;
+}): Promise<AdminGeneratedPassword> {
+  const response = await authFetch("/api/auth/admin/users", {
+    method: "POST",
+    headers: authHeaders("application/json"),
+    body: JSON.stringify(body),
+  });
+  return parseResponse<AdminGeneratedPassword>(response);
+}
+
+/** Reset an account's password; the server generates and returns it once. */
+export async function resetAdminUserPassword(
+  userId: string,
+): Promise<AdminGeneratedPassword> {
+  const response = await authFetch(
+    `/api/auth/admin/users/${encodeURIComponent(userId)}/reset-password`,
+    { method: "POST", headers: authHeaders() },
+  );
+  return parseResponse<AdminGeneratedPassword>(response);
+}
+
+/** Delete a local-auth account. Backend returns 204 No Content. */
+/** Longest deletion reason the server accepts (LOCAL_DELETION_REASON_MAX_LENGTH). */
+export const DELETE_ADMIN_USER_REASON_MAX_LENGTH = 480;
+
+/**
+ * Delete a local account. `reason` is required and lands in the audit trail:
+ * deleting must not cost less than disabling, which asks for one. It travels
+ * in the body, not the query string, which access logs record.
+ */
+export async function deleteAdminUser(userId: string, reason: string): Promise<void> {
+  const response = await authFetch(
+    `/api/auth/admin/users/${encodeURIComponent(userId)}`,
+    {
+      method: "DELETE",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    },
+  );
+  if (!response.ok) {
+    await parseResponse<never>(response);
+  }
+}
+
+/** Return boot-time system readiness for the web UX. */
+export async function fetchSystemStatus(): Promise<SystemStatus> {
+  // Health probe must be snappy: during a network drop a bare fetch can hang
+  // for the OS connect timeout (30-120s), which made the outage banner's
+  // Retry button look dead (operator-observed). 5s is generous for a
+  // same-origin health endpoint.
+  const response = await authFetch("/api/system/status", {
+    signal: AbortSignal.timeout(5000),
+  });
+  return parseResponse<SystemStatus>(response);
+}
+
+// ── Sessions ────────────────────────────────────────────────────────────────
+
+/** List all sessions for the current user. */
+export async function fetchSessions(includeArchived = true): Promise<Session[]> {
+  const params = new URLSearchParams();
+  if (includeArchived) {
+    params.set("include_archived", "true");
+  }
+  const query = params.size > 0 ? `?${params.toString()}` : "";
+  const response = await authFetch(`/api/sessions${query}`, {
+    headers: authHeaders(),
+  });
+  return parseResponse<Session[]>(response);
+}
+
+/** Create a new session.
+ *
+ * No title is sent: the backend mints the app-wide default
+ * ("Session — 2 Jul 2026", auto-disambiguated per user) so every client
+ * shares one naming convention (elspeth-ef8c18a6cb).
+ */
+export async function createSession(): Promise<Session> {
+  const response = await authFetch("/api/sessions", {
+    method: "POST",
+    headers: authHeaders("application/json"),
+    body: JSON.stringify({}),
+  });
+  return parseResponse<Session>(response);
+}
+
+/** Get a single session by ID. */
+export async function getSession(sessionId: string): Promise<Session> {
+  const response = await authFetch(`/api/sessions/${sessionId}`, {
+    headers: authHeaders(),
+  });
+  return parseResponse<Session>(response);
+}
+
+/** Update the user-visible title for a session. */
+export async function renameSession(
+  sessionId: string,
+  title: string,
+): Promise<Session> {
+  const response = await authFetch(`/api/sessions/${sessionId}`, {
+    method: "PATCH",
+    headers: authHeaders("application/json"),
+    body: JSON.stringify({ title }),
+  });
+  return parseResponse<Session>(response);
+}
+
+/** Run the tutorial pipeline for an already-built tutorial session.
+ *
+ * Accepts an optional `AbortSignal` so the Turn 4 cancel button can abort
+ * an in-flight LLM call. Matches the signal convention used elsewhere in
+ * this module (see `fetchMessages`, `sendMessage`, etc.). */
+export async function runTutorialPipeline(
+  body: TutorialRunRequest,
+  signal?: AbortSignal,
+): Promise<TutorialRunResponse> {
+  const response = await authFetch("/api/tutorial/run", {
+    method: "POST",
+    headers: authHeaders("application/json"),
+    body: JSON.stringify(body),
+    signal,
+  });
+  return parseResponse<TutorialRunResponse>(response);
+}
+
+/** Best-effort server-side cancel of an active tutorial run.
+ *
+ * Idempotent: `cancelled: false` means there was no active run left to stop.
+ * `keepalive` lets the request survive the user closing the tab immediately
+ * after clicking Cancel (the auth is a bearer header, so this cannot be a
+ * `navigator.sendBeacon` — beacons carry no custom headers). */
+export async function cancelTutorialRun(
+  sessionId: string,
+): Promise<TutorialCancelResponse> {
+  const response = await authFetch("/api/tutorial/cancel", {
+    method: "POST",
+    headers: authHeaders("application/json"),
+    body: JSON.stringify({ session_id: sessionId }),
+    keepalive: true,
+  });
+  return parseResponse<TutorialCancelResponse>(response);
+}
+
+/** Fire the tutorial-abandoned telemetry beacon (POST /api/tutorial/abandon).
+ *
+ * Best-effort and fire-and-forget: called from a `pagehide` handler while the
+ * page is being torn down, so failures are swallowed — there is nowhere left
+ * to surface them. The endpoint requires the bearer header, which
+ * `navigator.sendBeacon` cannot carry, so this is a keepalive fetch (the
+ * browser lets it outlive the page). */
+export function sendTutorialAbandonBeacon(): void {
+  void authFetch("/api/tutorial/abandon", {
+    method: "POST",
+    headers: authHeaders(),
+    keepalive: true,
+  }).catch(() => {
+    // Best-effort telemetry: the page is going away; nothing to surface.
+  });
+}
+
+/** Read the audit-story projection for a completed tutorial run. */
+export async function getRunAuditSummary(
+  sessionId: string,
+  runId: string,
+): Promise<RunAuditStoryResponse> {
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/runs/${runId}/audit-story`,
+    { headers: authHeaders() },
+  );
+  return parseResponse<RunAuditStoryResponse>(response);
+}
+
+/** Clean up orphaned tutorial sessions for the authenticated user. */
+export async function deleteTutorialOrphans(): Promise<TutorialOrphanCleanupResponse> {
+  const response = await authFetch("/api/tutorial/orphans", {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  return parseResponse<TutorialOrphanCleanupResponse>(response);
+}
+
+/** Archive (soft-delete) a session. Backend returns 204 No Content. */
+export async function archiveSession(sessionId: string): Promise<void> {
+  const response = await authFetch(`/api/sessions/${sessionId}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!response.ok) {
+    await parseResponse<never>(response);
+  }
+}
+
+// ── Messages ────────────────────────────────────────────────────────────────
+
+/** Get the complete conversational history, preserving the server's order. */
+export async function fetchMessages(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<ChatMessage[]> {
+  const limit = 500;
+  const messages = new Map<string, ChatMessage>();
+  for (let offset = 0; ; offset += limit) {
+    const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    const response = await authFetch(`/api/sessions/${sessionId}/messages?${params}`, {
+      headers: authHeaders(),
+      signal,
+    });
+    // Do not publish a partial transcript if any later page fails. History is
+    // append-only and ordered by sequence number, so new rows cannot move the
+    // earlier page boundaries. Preserve that order and avoid duplicate rows.
+    const page = await parseResponse<ChatMessage[]>(response);
+    const previousCount = messages.size;
+    for (const message of page) messages.set(message.id, message);
+    if (page.length < limit) return [...messages.values()];
+    if (messages.size === previousCount) {
+      throw new Error("Conversation history pagination did not advance.");
+    }
+  }
+}
+
+/** Fetch the audit-grade recovery transcript for a failed compose turn. */
+export async function fetchRecoveryTranscript(
+  sessionId: string,
+  opts: { limit?: number; offset?: number } = {},
+): Promise<RecoveryTranscriptRow[]> {
+  const params = new URLSearchParams({
+    include_tool_rows: "true",
+    limit: String(opts.limit ?? 500),
+    offset: String(opts.offset ?? 0),
+  });
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/messages?${params}`,
+    {
+      headers: authHeaders(),
+    },
+  );
+  return parseResponse<RecoveryTranscriptRow[]>(response);
+}
+
+/** Get the latest provider-safe composer progress snapshot for a session. */
+export async function fetchComposerProgress(
+  sessionId: string,
+): Promise<ComposerProgressSnapshot> {
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/composer-progress`,
+    {
+      headers: authHeaders(),
+    },
+  );
+  return parseResponse<ComposerProgressSnapshot>(response);
+}
+
+/** Get composer trust and display preferences for a session. */
+export async function fetchComposerPreferences(
+  sessionId: string,
+): Promise<ComposerPreferences> {
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/composer/preferences`,
+    {
+      headers: authHeaders(),
+    },
+  );
+  return parseResponse<ComposerPreferences>(response);
+}
+
+/** Update composer trust and display preferences for a session. */
+export async function updateComposerPreferences(
+  sessionId: string,
+  body: Pick<ComposerPreferences, "trust_mode" | "density_default">,
+): Promise<ComposerPreferences> {
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/composer/preferences`,
+    {
+      method: "PATCH",
+      headers: authHeaders("application/json"),
+      body: JSON.stringify(body),
+    },
+  );
+  return parseResponse<ComposerPreferences>(response);
+}
+
+// ── Account-level composer preferences (Phase 1B) ──────────────────────────
+// Account-scoped row keyed by user_id. Distinct from the per-session
+// helpers above (trust_mode / density_default).
+
+/** Get the user's account-level composer preferences. */
+export async function fetchUserComposerPreferences(): Promise<UserComposerPreferencesPayload> {
+  const response = await authFetch("/api/composer-preferences", {
+    headers: authHeaders(),
+  });
+  return decodeUserComposerPreferences(await parseResponse<unknown>(response));
+}
+
+/** Partial-update the user's account-level composer preferences. */
+export async function updateUserComposerPreferences(
+  payload: UpdateUserComposerPreferencesPayload,
+): Promise<UserComposerPreferencesPayload> {
+  const response = await authFetch("/api/composer-preferences", {
+    method: "PATCH",
+    headers: authHeaders("application/json"),
+    body: JSON.stringify(payload),
+  });
+  return decodeUserComposerPreferences(await parseResponse<unknown>(response));
+}
+
+/** List composition proposals for a session. */
+export async function fetchCompositionProposals(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<CompositionProposal[]> {
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/proposals?status=pending`,
+    {
+      headers: authHeaders(),
+      signal,
+    },
+  );
+  return parseResponse<CompositionProposal[]>(response);
+}
+
+/** Accept a pending composition proposal and commit its resulting state. */
+export async function acceptCompositionProposal(
+  sessionId: string,
+  proposalId: string,
+  draftHash: string | null,
+): Promise<CompositionProposal> {
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/proposals/${proposalId}/accept`,
+    {
+      method: "POST",
+      headers: authHeaders("application/json"),
+      ...(draftHash === null ? {} : { body: JSON.stringify({ draft_hash: draftHash }) }),
+    },
+  );
+  return parseResponse<CompositionProposal>(response);
+}
+
+/** Reject a pending composition proposal. */
+export async function rejectCompositionProposal(
+  sessionId: string,
+  proposalId: string,
+): Promise<CompositionProposal> {
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/proposals/${proposalId}/reject`,
+    {
+      method: "POST",
+      headers: authHeaders("application/json"),
+      body: JSON.stringify({ reason: null }),
+    },
+  );
+  return parseResponse<CompositionProposal>(response);
+}
+
+/**
+ * Send a user message. The backend runs the composer tool-use loop
+ * and returns the assistant response with updated composition state.
+ *
+ * The response wire format uses `state` (not `compositionState`) --
+ * the sessionStore maps the key on destructure.
+ */
+export function apiErrorFromBody(status: number, body: unknown): ApiError {
+  validateComposerRecoveryBody(body);
+  const admitted = buildApiError(status, body, "Request failed");
+  return admitted.partial_state == null ? admitted : { ...admitted, partial_state: decodeCompositionState(admitted.partial_state) };
+}
+
+export function isDefinitiveComposerRefusal(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("status" in error)) return false;
+  if (error.status === 429) {
+    // These application refusals occur before admission commits. Surface the
+    // refusal (including retry_after) and leave a retry to the user. A generic
+    // gateway 429 can follow dispatch, so its custody remains uncertain.
+    return "error_type" in error && (error.error_type === "rate_limited" || error.error_type === "composer_queue_full");
+  }
+  return typeof error.status === "number" && error.status >= 400 && error.status < 500 && error.status !== 408;
+}
+export function composerActiveOperation(error: unknown): { operation_id: string; kind: import("@/types/composerOperations").OperationKind } | null {
+  if (typeof error !== "object" || error === null || !("error_type" in error) || error.error_type !== "composer_operation_active" || !("operation_id" in error) || !("kind" in error)) return null;
+  return { operation_id: canonicalUuid(error.operation_id), kind: operationKind(error.kind) };
+}
+export async function submitComposerOperation(descriptor: import("@/types/composerOperations").SubmittedCustody): Promise<import("@/types/composerOperations").ComposerOperationAck> {
+  const path = descriptor.kind === "compose_message" ? "messages" : "recompose";
+  const response = await authFetch(`/api/sessions/${descriptor.sessionId}/${path}`, {
+    method: "POST", headers: authHeaders("application/json"), body: JSON.stringify(descriptor.body), signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) {
+    const body: unknown = await response.json();
+    const error = await apiErrorFromBody(response.status, body as Record<string, unknown>);
+    if (typeof body === "object" && body !== null && "detail" in body && typeof body.detail === "object" && body.detail !== null && "operation_id" in body.detail && "kind" in body.detail) throw { ...error, operation_id: body.detail.operation_id, kind: body.detail.kind };
+    throw error;
+  }
+  if (response.status !== 202) throw new Error("Composer admission must return 202");
+  return decodeComposerOperationAck(await response.json());
+}
+export async function fetchComposerOperationFailures(sessionId: string, options: { cursor?: string; operationId?: string; signal?: AbortSignal } = {}): Promise<import("@/types/composerOperations").ComposerOperationFailurePage> {
+  const params = new URLSearchParams();
+  if (options.cursor !== undefined) params.set("cursor", options.cursor);
+  if (options.operationId !== undefined) params.set("operation_id", options.operationId);
+  const response = await authFetch(`/api/sessions/${sessionId}/operations?${params}`, {
+    headers: authHeaders(), signal: options.signal ?? AbortSignal.timeout(15000), cache: "no-store",
+  });
+  return decodeComposerOperationFailurePage(await parseResponse<unknown>(response), sessionId, options.operationId);
+}
+export async function fetchComposerOperation(sessionId: string, operationId: string): Promise<import("@/types/composerOperations").ComposerOperationSnapshot | import("@/types/composerOperations").MissingOperation> {
+  const response = await authFetch(`/api/sessions/${sessionId}/operations/${operationId}`, { headers: authHeaders(), signal: AbortSignal.timeout(15000), cache: "no-store" });
+  if (response.status === 404) {
+    const body: unknown = await response.json();
+    if (typeof body === "object" && body !== null && !Array.isArray(body) && Object.keys(body).length === 1 && "detail" in body) {
+      if (body.detail === "Session not found") return { kind: "session_missing" };
+      if (body.detail === "Operation not found") return { kind: "operation_missing" };
+    }
+    throw await apiErrorFromBody(404, body as Record<string, unknown>);
+  }
+  return decodeComposerOperationSnapshot(await parseResponse<unknown>(response), sessionId, operationId);
+}
+export async function cancelComposerOperation(sessionId: string, operationId: string): Promise<import("@/types/composerOperations").ComposerOperationSnapshot | import("@/types/composerOperations").MissingOperation> {
+  const response = await authFetch(`/api/sessions/${sessionId}/operations/${operationId}/cancel`, { method: "POST", headers: authHeaders(), signal: AbortSignal.timeout(15000) });
+  if (response.status === 404) {
+    const body: unknown = await response.json();
+    if (typeof body === "object" && body !== null && !Array.isArray(body) && Object.keys(body).length === 1 && "detail" in body) {
+      if (body.detail === "Session not found") return { kind: "session_missing" };
+      if (body.detail === "Operation not found") return { kind: "operation_missing" };
+    }
+    throw apiErrorFromBody(404, body);
+  }
+  return decodeComposerOperationSnapshot(await parseResponse<unknown>(response), sessionId, operationId);
+}
+export function fetchComposerOperationStream(sessionId: string, operationId: string, signal: AbortSignal): Promise<Response> {
+  return authFetch(`/api/sessions/${sessionId}/operations/${operationId}/stream`, { headers: { ...authHeaders(), Accept: "text/event-stream" }, signal, cache: "no-store" });
+}
+export async function sendMessage(sessionId: string, content: string, operationId: string, stateId: string | null = null, signal?: AbortSignal): Promise<MessageWithStateResponse> {
+  const { submitAndObserveComposerOperation } = await import("./composerOperationObserver");
+  const { composerCustodyScope } = await import("@/stores/composerOperationCustody");
+  const scope = composerCustodyScope();
+  if (scope === null) throw new Error("Authenticated composer scope is not ready");
+  return submitAndObserveComposerOperation({ mode: "submitted", scope, sessionId, operationId, kind: "compose_message", createdAt: Date.now(), body: { operation_id: operationId, content, state_id: stateId } }, { signal });
+}
+export async function recompose(sessionId: string, expectedUserMessageId: string, signal?: AbortSignal, stateId: string | null = null): Promise<MessageWithStateResponse> {
+  const { submitAndObserveComposerOperation } = await import("./composerOperationObserver");
+  const { composerCustodyScope } = await import("@/stores/composerOperationCustody");
+  const scope = composerCustodyScope();
+  if (scope === null) throw new Error("Authenticated composer scope is not ready");
+  const operationId = crypto.randomUUID();
+  return submitAndObserveComposerOperation({ mode: "submitted", scope, sessionId, operationId, kind: "compose_recompose", createdAt: Date.now(), body: { operation_id: operationId, expected_user_message_id: expectedUserMessageId, state_id: stateId } }, { signal });
+}
+
+
+/**
+ * Fetch runtime-derived sample URLs for the freeform tutorial brief.
+ * They are data, not a server-authored pipeline proposal.
+ */
+export async function getTutorialSample(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<TutorialSampleResponse> {
+  const response = await authFetch(
+    `/api/tutorial/${sessionId}/sample`,
+    {
+      method: "GET",
+      headers: authHeaders(),
+      signal,
+    },
+  );
+  return parseResponse<TutorialSampleResponse>(response);
+}
+
+export async function getTutorialReadiness(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<TutorialReadinessResponse> {
+  const response = await authFetch(`/api/tutorial/${sessionId}/readiness`, {
+    method: "GET",
+    headers: authHeaders(),
+    signal,
+  });
+  return parseResponse<TutorialReadinessResponse>(response);
+}
+
+
+
+
+
+
+
+
+/** Fork a session from a specific user message. */
+export async function forkFromMessage(
+  sessionId: string,
+  operationId: string,
+  fromMessageId: string,
+  newMessageContent: string,
+): Promise<{ session_id: string }> {
+  const response = await authFetch(`/api/sessions/${sessionId}/fork`, {
+    method: "POST",
+    headers: authHeaders("application/json"),
+    body: JSON.stringify({
+      operation_id: operationId,
+      from_message_id: fromMessageId,
+      new_message_content: newMessageContent,
+    }),
+  });
+  if (!response.ok) {
+    return parseResponse<{ session_id: string }>(response);
+  }
+  try {
+    return decodeForkSessionLocator(await response.json());
+  } catch (cause) {
+    throw new ForkCommittedResponseError("Fork succeeded but its result locator could not be decoded", cause);
+  }
+}
+
+// ── Composition State ───────────────────────────────────────────────────────
+
+/** Get the current composition state for a session. Returns null if none exists. */
+export async function fetchCompositionState(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<CompositionState | null> {
+  const response = await authFetch(`/api/sessions/${sessionId}/state`, {
+    headers: authHeaders(),
+    signal,
+  });
+  if (response.status === 404) {
+    return null;
+  }
+  const body = await parseResponse<unknown>(response);
+  return body === null ? null : decodeCompositionState(body);
+}
+
+/** Get all composition state versions for a session. */
+export async function fetchStateVersions(
+  sessionId: string,
+): Promise<CompositionStateVersion[]> {
+  const response = await authFetch(`/api/sessions/${sessionId}/state/versions`, {
+    headers: authHeaders(),
+  });
+  return decodeCompositionStateVersions(await parseResponse<unknown>(response));
+}
+
+/**
+ * Revert the composition state to a prior version.
+ * The backend sets the selected version as active and injects a system
+ * message into the session's message history.
+ */
+export async function revertToVersion(
+  sessionId: string,
+  stateId: string,
+  operationId: string,
+): Promise<CompositionState> {
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/state/revert`,
+    {
+      method: "POST",
+      headers: authHeaders("application/json"),
+      body: JSON.stringify({ operation_id: operationId, state_id: stateId }),
+    },
+  );
+  return decodeCompositionState(await parseResponse<unknown>(response));
+}
+
+/** Fetch the generated YAML for the current composition state. */
+/**
+ * Fetch the current composition's exported YAML. For a source whose options
+ * point into session blob storage, the backend returns a `source_blob_ids`
+ * sidecar (source name -> blob UUID) alongside the YAML: the blob UUIDs are
+ * stripped from the public YAML body, so this sidecar is the ONLY channel by
+ * which the frontend learns them. It must be preserved for the import
+ * round-trip (importCompositionYaml's third arg) — dropping it strands a
+ * re-imported blob-backed source as unbound. Omitted when no source is
+ * blob-backed.
+ */
+export async function fetchYaml(
+  sessionId: string,
+): Promise<{ yaml: string; source_blob_ids?: Record<string, string> }> {
+  const response = await authFetch(`/api/sessions/${sessionId}/state/yaml`, {
+    headers: authHeaders(),
+  });
+  return parseResponse<{ yaml: string; source_blob_ids?: Record<string, string> }>(
+    response,
+  );
+}
+
+/** Request body for POST /api/sessions/{id}/state/yaml. */
+export interface ImportCompositionYamlRequest {
+  /** Raw YAML text, 1..262144 chars (backend-enforced). */
+  yaml: string;
+  /**
+   * Optional source-name -> blob-UUID map, only needed when the YAML's
+   * source options point into session blob storage (the replay-of-export
+   * case). Omitted entirely when not needed -- the backend 400s a
+   * blob-storage-path source that has no entry here rather than assuming one.
+   */
+  source_blob_ids?: Record<string, string>;
+}
+
+/**
+ * Import confirmations consume this subset of CompositionStateResponse.
+ * The HTTP boundary still decodes the full state using the shared decoder;
+ * callers re-fetch through selectSession to synchronize the session stores.
+ */
+export interface ImportedCompositionState {
+  id: string;
+  version: number;
+  is_valid: boolean;
+  validation_errors: CompositionState["validation_errors"];
+  plugin_policy_findings?: PluginPolicyFinding[];
+}
+
+/**
+ * Import (replace) a session's composition state from hand-edited or
+ * previously-exported YAML (elspeth-24c56585f9 T-1). This REPLACES the
+ * current composition -- the backend does not merge. The prior version remains reachable via `fetchStateVersions` /
+ * `revertToVersion`. A 200 response does not imply the imported pipeline is
+ * runnable: check `is_valid`/`validation_errors` on the result.
+ */
+export async function importCompositionYaml(
+  sessionId: string,
+  yamlText: string,
+  sourceBlobIds?: Record<string, string>,
+): Promise<ImportedCompositionState> {
+  const body: ImportCompositionYamlRequest = sourceBlobIds
+    ? { yaml: yamlText, source_blob_ids: sourceBlobIds }
+    : { yaml: yamlText };
+  const response = await authFetch(`/api/sessions/${sessionId}/state/yaml`, {
+    method: "POST",
+    headers: authHeaders("application/json"),
+    body: JSON.stringify(body),
+  });
+  return decodeCompositionState(await parseResponse<unknown>(response));
+}
+
+// ── Plugin Catalog ──────────────────────────────────────────────────────────
+
+async function parsePluginSnapshotResponse<T>(
+  response: Response,
+): Promise<PluginSnapshotResponse<T>> {
+  const data = await parseResponse<T>(response);
+  const snapshotFingerprint = response.headers.get(
+    "X-ELSPETH-Plugin-Snapshot",
+  );
+  if (snapshotFingerprint === null || snapshotFingerprint === "") {
+    throw new Error("Plugin catalog response omitted its snapshot fingerprint.");
+  }
+  return { data, snapshotFingerprint };
+}
+
+/** Fetch the current principal's immutable plugin-policy snapshot metadata. */
+export async function fetchPluginPolicy(): Promise<PluginSnapshotResponse<PluginPolicyResponse>> {
+  const response = await authFetch("/api/catalog/policy", {
+    headers: authHeaders(),
+    cache: "no-store",
+  });
+  return parsePluginSnapshotResponse<PluginPolicyResponse>(response);
+}
+
+/** List available source plugins. */
+export async function listSources(): Promise<PluginSnapshotResponse<PluginSummary[]>> {
+  const response = await authFetch("/api/catalog/sources", {
+    headers: authHeaders(),
+  });
+  return parsePluginSnapshotResponse<PluginSummary[]>(response);
+}
+
+/** List available transform plugins. */
+export async function listTransforms(): Promise<PluginSnapshotResponse<PluginSummary[]>> {
+  const response = await authFetch("/api/catalog/transforms", {
+    headers: authHeaders(),
+  });
+  return parsePluginSnapshotResponse<PluginSummary[]>(response);
+}
+
+/** List available sink plugins. */
+export async function listSinks(): Promise<PluginSnapshotResponse<PluginSummary[]>> {
+  const response = await authFetch("/api/catalog/sinks", {
+    headers: authHeaders(),
+  });
+  return parsePluginSnapshotResponse<PluginSummary[]>(response);
+}
+
+/**
+ * Get the full schema for a specific plugin.
+ * The plugin type uses singular form ("source", "transform", "sink")
+ * matching the CatalogService protocol.
+ */
+export async function getPluginSchema(
+  pluginType: "source" | "transform" | "sink",
+  pluginName: string,
+): Promise<PluginSnapshotResponse<PluginSchemaInfo>> {
+  // REST URL uses plural path segments; the route handler translates
+  // plural -> singular before calling CatalogService.
+  const pluralType = `${pluginType}s`;
+  const response = await authFetch(
+    `/api/catalog/${pluralType}/${pluginName}/schema`,
+    { headers: authHeaders() },
+  );
+  return parsePluginSnapshotResponse<PluginSchemaInfo>(response);
+}
+
+// ── Validation & Execution ──────────────────────────────────────────────────
+
+/**
+ * Validate the current pipeline composition.
+ * Stage 2 validation with per-component error detail.
+ */
+export async function validatePipeline(
+  sessionId: string,
+  stateId?: string,
+): Promise<ValidationResult> {
+  const params = new URLSearchParams();
+  if (stateId) {
+    params.set("state_id", stateId);
+  }
+  const query = params.size > 0 ? `?${params.toString()}` : "";
+  const { result, status } = await serializeReviewMutation(sessionId, async (signal) => {
+    const response = await authFetch(`/api/sessions/${sessionId}/validate${query}`, {
+      method: "POST",
+      headers: authHeaders("application/json"),
+      signal,
+    });
+    const result = await parseResponse<ValidationResult>(response);
+    return { result, status: response.status };
+  });
+  if (typeof result !== "object" || result === null || !isValidationReadiness(result.readiness)) {
+    throw { status, detail: "Unexpected readiness shape from validate endpoint" } satisfies ApiError;
+  }
+  if (!Array.isArray(result.checks) || !result.checks.every(isValidationCheck)) {
+    throw { status, detail: "Unexpected validation checks from validate endpoint" } satisfies ApiError;
+  }
+  return result;
+}
+
+/**
+ * Execute the validated pipeline. Returns the created Run record.
+ * The run executes asynchronously; progress streams via WebSocket.
+ * Throws 409 if a run is already in progress for this session.
+ */
+export async function executePipeline(
+  sessionId: string,
+  fanoutAck?: ExecutionFanoutAck,
+  secretAck?: ExecutionSecretAck,
+  stateId?: string,
+): Promise<{ run_id: string }> {
+  const params = new URLSearchParams();
+  if (stateId) {
+    params.set("state_id", stateId);
+  }
+  const query = params.size > 0 ? `?${params.toString()}` : "";
+  const init: RequestInit = {
+    method: "POST",
+    headers: authHeaders("application/json"),
+  };
+  if (fanoutAck || secretAck) {
+    // Both guards can fire on one run; an acknowledged re-send must carry
+    // every token acquired so far, never just the most recent one.
+    const body: Record<string, string> = {};
+    if (fanoutAck) {
+      body.fanout_ack_token = fanoutAck.token;
+    }
+    if (secretAck) {
+      body.secret_ack_token = secretAck.token;
+    }
+    init.body = JSON.stringify(body);
+  }
+  const response = await authFetch(`/api/sessions/${sessionId}/execute${query}`, init);
+  return parseResponse<{ run_id: string }>(response);
+}
+
+/** Get the status of a specific run. */
+export async function getRunStatus(runId: string): Promise<Run> {
+  const response = await authFetch(`/api/runs/${runId}`, {
+    headers: authHeaders(),
+  });
+  return parseResponse<Run>(response);
+}
+
+/** Cancel a running pipeline execution. */
+export async function cancelRun(runId: string): Promise<CancelRunResponse> {
+  const response = await authFetch(`/api/runs/${runId}/cancel`, {
+    method: "POST",
+    headers: authHeaders("application/json"),
+  });
+  return parseResponse<CancelRunResponse>(response);
+}
+
+/** Issue a short-lived one-use ticket for the run progress WebSocket. */
+export async function createRunWebSocketTicket(
+  runId: string,
+): Promise<WebSocketTicketResponse> {
+  const response = await authFetch(`/api/runs/${runId}/ws-ticket`, {
+    method: "POST",
+    headers: authHeaders("application/json"),
+  });
+  return parseResponse<WebSocketTicketResponse>(response);
+}
+
+/** Get the results/summary of a completed run. */
+export async function getRunResults(
+  runId: string,
+): Promise<Run> {
+  const response = await authFetch(`/api/runs/${runId}/results`, {
+    headers: authHeaders(),
+  });
+  return parseResponse<Run>(response);
+}
+
+/** List runs for a session. */
+export async function fetchRuns(sessionId: string, signal?: AbortSignal): Promise<Run[]> {
+  const response = await authFetch(`/api/sessions/${sessionId}/runs`, {
+    headers: authHeaders(),
+    signal,
+  });
+  return parseResponse<Run[]>(response);
+}
+
+/** Fetch a bounded diagnostics snapshot for a run. */
+export async function fetchRunDiagnostics(
+  runId: string,
+  limit = 50,
+): Promise<RunDiagnostics> {
+  const response = await authFetch(
+    `/api/runs/${runId}/diagnostics?limit=${encodeURIComponent(String(limit))}`,
+    {
+      headers: authHeaders(),
+    },
+  );
+  return parseResponse<RunDiagnostics>(response);
+}
+
+/** Ask the configured composer LLM to explain a diagnostics snapshot. */
+export async function evaluateRunDiagnostics(
+  runId: string,
+  limit = 50,
+): Promise<RunDiagnosticsEvaluation> {
+  const response = await authFetch(
+    `/api/runs/${runId}/diagnostics/evaluate?limit=${encodeURIComponent(String(limit))}`,
+    {
+      method: "POST",
+      headers: authHeaders("application/json"),
+    },
+  );
+  return parseResponse<RunDiagnosticsEvaluation>(response);
+}
+
+/**
+ * Fetch the FULL audit-evidence manifest of every sink-write artefact
+ * for a run. Distinct from `fetchRunDiagnostics`, whose `artifacts`
+ * field is capped at 20 for operator-UI pacing — this endpoint is
+ * unbounded and intended for the per-run Outputs section.
+ */
+export async function fetchRunOutputs(runId: string): Promise<RunOutputsResponse> {
+  const response = await authFetch(`/api/runs/${runId}/outputs`, {
+    headers: authHeaders(),
+  });
+  return parseResponse<RunOutputsResponse>(response);
+}
+
+/**
+ * Fetch a bounded head-of-file preview of one sink-write artefact.
+ * Bounded to 256 KiB or 100 rows server-side.
+ */
+export async function fetchRunOutputPreview(
+  runId: string,
+  artifactId: string,
+): Promise<RunOutputArtifactPreview> {
+  const response = await authFetch(
+    `/api/runs/${runId}/outputs/${encodeURIComponent(artifactId)}/preview`,
+    {
+      headers: authHeaders(),
+    },
+  );
+  return parseResponse<RunOutputArtifactPreview>(response);
+}
+
+/**
+ * Fetch the full bytes of an artefact and return them as a Blob plus
+ * the server-suggested filename (parsed from Content-Disposition).
+ *
+ * IMPORTANT: this can NOT be a plain `<a href download>` link. The
+ * `/content` endpoint requires `Authorization: Bearer ${token}` and
+ * the browser does NOT attach localStorage values to top-level
+ * navigations. The same fetch-then-objectURL pattern is used for
+ * `downloadBlobContent` — see `blobStore.downloadBlob` for the
+ * caller-side trigger.
+ */
+export async function downloadRunOutputContent(
+  runId: string,
+  artifactId: string,
+): Promise<{ data: Blob; filename: string }> {
+  const response = await authFetch(
+    `/api/runs/${runId}/outputs/${encodeURIComponent(artifactId)}/content`,
+    { headers: authHeaders() },
+  );
+  if (!response.ok) {
+    await parseResponse<never>(response);
+  }
+  const disposition = response.headers.get("Content-Disposition");
+  const filenameMatch = disposition?.match(/filename="(.+)"/);
+  const filename = filenameMatch?.[1] ?? "download";
+  const data = await response.blob();
+  return { data, filename };
+}
+
+// ── Blobs ──────────────────────────────────────────────────────────────────
+
+/** Upload a file as a session-scoped blob. */
+export async function uploadBlob(
+  sessionId: string,
+  file: File,
+): Promise<BlobMetadata> {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const token = getToken();
+  const headers: Record<string, string> = {};
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  const response = await authFetch(`/api/sessions/${sessionId}/blobs`, {
+    method: "POST",
+    headers,
+    body: formData,
+  });
+  return parseResponse<BlobMetadata>(response);
+}
+
+/** List all blobs for a session. */
+export async function listBlobs(sessionId: string): Promise<BlobMetadata[]> {
+  const response = await authFetch(`/api/sessions/${sessionId}/blobs`, {
+    headers: authHeaders(),
+  });
+  return parseResponse<BlobMetadata[]>(response);
+}
+
+/**
+ * Wire → display translation for the inline-blob creation modality
+ * (Phase 5a Task 2.5). The server records the modality in snake_case
+ * (matching the SQL CHECK constraint); the frontend's
+ * `InlineSourceSummary.provenance` discriminant uses the hyphenated form
+ * so URL-fragment routing and aria-label rendering work without a
+ * second normalisation step. This adapter is the SINGLE translation
+ * point — no second mapping in the store, no third one in a component.
+ *
+ * The mapping is exhaustive over `BlobCreationModalityWire`; a future
+ * enum extension at the server forces both `BlobCreationModalityWire`
+ * and `InlineSourceProvenance` to widen, and the TypeScript exhaustive
+ * `never` arm here turns into a compile error rather than silently
+ * dropping into the default branch. That's the discoverability
+ * mechanism that lets a future change cascade through both wire and
+ * display layers in the same commit.
+ */
+export function toInlineSourceProvenance(
+  wire: BlobCreationModalityWire,
+): InlineSourceProvenance {
+  switch (wire) {
+    case "verbatim":
+      return "verbatim";
+    case "llm_generated":
+      return "llm-generated";
+    case "disambiguated":
+      return "disambiguated";
+    case "llm_generated_then_amended":
+      return "llm-generated-then-amended";
+    default: {
+      const _exhaustive: never = wire;
+      throw new Error(
+        `Unhandled BlobCreationModalityWire value: ${String(_exhaustive)}`,
+      );
+    }
+  }
+}
+
+/** Get metadata for a single blob. */
+export async function getBlobMetadata(
+  sessionId: string,
+  blobId: string,
+): Promise<BlobMetadata> {
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/blobs/${blobId}`,
+    { headers: authHeaders() },
+  );
+  return parseResponse<BlobMetadata>(response);
+}
+
+/** Download blob content as a Blob (browser Blob, not ELSPETH Blob). */
+export async function downloadBlobContent(
+  sessionId: string,
+  blobId: string,
+): Promise<{ data: Blob; filename: string }> {
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/blobs/${blobId}/content`,
+    { headers: authHeaders() },
+  );
+  if (!response.ok) {
+    await parseResponse<never>(response);
+  }
+
+  const disposition = response.headers.get("Content-Disposition");
+  const filenameMatch = disposition?.match(/filename="(.+)"/);
+  const filename = filenameMatch?.[1] ?? "download";
+  const data = await response.blob();
+  return { data, filename };
+}
+
+/** Fetch blob content as text for inline preview. */
+export async function previewBlobContent(
+  sessionId: string,
+  blobId: string,
+): Promise<string> {
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/blobs/${blobId}/content`,
+    { headers: authHeaders() },
+  );
+  if (!response.ok) {
+    await parseResponse<never>(response);
+  }
+  return response.text();
+}
+
+export interface BlobContentPreview {
+  text: string;
+  truncated: boolean;
+  limit: number;
+}
+
+/** Fetch bounded blob content as text for inline UI preview. */
+export async function previewBlobContentSnippet(
+  sessionId: string,
+  blobId: string,
+  limit: number,
+): Promise<BlobContentPreview> {
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/blobs/${blobId}/preview?limit=${limit}`,
+    { headers: authHeaders() },
+  );
+  if (!response.ok) {
+    await parseResponse<never>(response);
+  }
+  const headerLimit = Number(response.headers.get("X-Preview-Limit"));
+  return {
+    text: await response.text(),
+    truncated: response.headers.get("X-Preview-Truncated") === "true",
+    limit: Number.isFinite(headerLimit) && headerLimit > 0 ? headerLimit : limit,
+  };
+}
+
+/** Delete a blob and its backing file. */
+export async function deleteBlob(
+  sessionId: string,
+  blobId: string,
+): Promise<void> {
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/blobs/${blobId}`,
+    { method: "DELETE", headers: authHeaders() },
+  );
+  if (!response.ok) {
+    await parseResponse<never>(response);
+  }
+}
+
+// ── Secrets ────────────────────────────────────────────────────────────────
+
+export const PLUGIN_CATALOG_INVALIDATED_EVENT =
+  "elspeth:plugin-catalog-invalidated";
+
+function emitPluginCatalogInvalidation(): void {
+  window.dispatchEvent(new Event(PLUGIN_CATALOG_INVALIDATED_EVENT));
+}
+
+/** List all available secret references (no values). */
+export async function listSecrets(): Promise<SecretInventoryItem[]> {
+  const response = await authFetch("/api/secrets", { headers: authHeaders() });
+  return parseResponse<SecretInventoryItem[]>(response);
+}
+
+/** Create or update a user-scoped secret. Response never contains the value. */
+export async function createSecret(
+  name: string,
+  value: string,
+): Promise<{ name: string; scope: string; available: boolean }> {
+  const response = await authFetch("/api/secrets", {
+    method: "POST",
+    headers: authHeaders("application/json"),
+    body: JSON.stringify({ name, value }),
+  });
+  const created = await parseResponse<{ name: string; scope: string; available: boolean }>(response);
+  emitPluginCatalogInvalidation();
+  return created;
+}
+
+/** Delete a user-scoped secret. */
+export async function deleteSecret(name: string): Promise<void> {
+  const response = await authFetch(`/api/secrets/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!response.ok) {
+    await parseResponse<never>(response);
+  }
+  emitPluginCatalogInvalidation();
+}
+
+// ── Interpretation events (Phase 5b) ───────────────────────────────────────
+//
+// HTTP surface mirroring the four routes in
+// src/elspeth/web/sessions/routes.py (Phase 5b Tasks 6 + 7):
+//
+//   GET  /api/sessions/{id}/interpretations[?status=pending|all]
+//   POST /api/sessions/{id}/interpretations/{event_id}/resolve
+//   POST /api/sessions/{id}/interpretations/opt_out
+//   GET  /api/sessions/{id}/interpretations/opt_out_summary
+//
+// Error envelopes:
+// - 422 (validation, e.g. amended_value missing when choice="amended") flows
+//   through parseResponse and surfaces as an ApiError with status: 422.
+// - 404 (session or event not found, or 404 on IDOR-deflected access) flows
+//   through parseResponse and surfaces as an ApiError with status: 404.
+// - 409 (already-resolved event, or conflict between concurrent resolves)
+//   flows through parseResponse and surfaces as an ApiError with status: 409.
+//
+// Per the existing client convention, all four functions throw the typed
+// ApiError envelope; callers branch on error_type / status code, not on
+// detail text.
+
+/**
+ * List interpretation events for a session.
+ *
+ * `status` selects the row subset:
+ *   - "pending" — only choice="pending" rows (active review affordances).
+ *   - "all"     — every row regardless of choice (for audit-readiness
+ *                 counts and the post-resolve event list).
+ *
+ * The backend default is "all"; this client mirrors that default so the
+ * common case (fetch everything on session load for the readiness panel)
+ * needs no explicit argument.
+ */
+export async function listInterpretationEvents(
+  sessionId: string,
+  status: "pending" | "all" = "all",
+  signal?: AbortSignal,
+): Promise<InterpretationEvent[]> {
+  // Use URLSearchParams to handle the query-string boundary cleanly: it
+  // does percent-encoding correctly for any future status-value extension
+  // and keeps the call site free of manual string concatenation.
+  const qs = new URLSearchParams({ status });
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/interpretations?${qs.toString()}`,
+    {
+      method: "GET",
+      headers: authHeaders(),
+      signal,
+    },
+  );
+  const body = await parseResponse<ListInterpretationEventsResponse>(response);
+  return body.events;
+}
+
+/**
+ * Resolve a single interpretation event.
+ *
+ * `body.choice` is narrowed to the two user-driven values
+ * (accepted_as_drafted, amended) — opt-out goes through a separate route,
+ * and pending/abandoned are not user resolve actions.
+ *
+ * The response returns the resolved event row PLUS the new composition
+ * state produced by patching the affected LLM transform.  Single-envelope
+ * shape so the caller can update its event-list view and
+ * composition-state view atomically.
+ */
+export async function resolveInterpretation(
+  sessionId: string,
+  eventId: string,
+  body: InterpretationResolveRequest,
+  signal?: AbortSignal,
+): Promise<InterpretationResolveResponse> {
+  return serializeReviewMutation(sessionId, async (requestSignal) => {
+    const response = await authFetch(
+      `/api/sessions/${sessionId}/interpretations/${eventId}/resolve`,
+      {
+        method: "POST",
+        headers: authHeaders("application/json"),
+        body: JSON.stringify(body),
+        signal: requestSignal,
+      },
+    );
+    return parseResponse<InterpretationResolveResponse>(response);
+  }, signal);
+}
+
+/**
+ * Record the per-session "stop asking about interpretations" decision.
+ *
+ * No request body: the route is a discrete user decision, parameterised
+ * only by the session ID and the authenticated actor (carried by the
+ * auth middleware).  On success the backend (a) sets the session's
+ * interpretation_review_disabled flag and (b) writes an opt-out row to
+ * interpretation_events_table with choice='opted_out' and
+ * interpretation_source='auto_interpreted_opt_out'.
+ */
+export async function optOutOfInterpretations(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<InterpretationOptOutResponse> {
+  return serializeReviewMutation(sessionId, async (requestSignal) => {
+    const response = await authFetch(
+      `/api/sessions/${sessionId}/interpretations/opt_out`,
+      {
+        method: "POST",
+        headers: authHeaders("application/json"),
+        // The route accepts an empty body; sending "{}" rather than omitting
+        // body entirely so the Content-Type: application/json header has a
+        // matching payload (some HTTP intermediaries reject the inverse).
+        body: "{}",
+        signal: requestSignal,
+      },
+    );
+    return parseResponse<InterpretationOptOutResponse>(response);
+  }, signal);
+}
+
+/**
+ * Retroactive audit of auto-baked interpretations (F-22).
+ *
+ * After a session has opted out, the composer-LLM continues to auto-bake
+ * interpretations.  This route lets the user retroactively review every
+ * auto-baked event whose interpretation_source is auto_interpreted_opt_out
+ * or auto_interpreted_no_surfaces.  user_approved rows are excluded; the
+ * standard list route is the right surface for those.
+ */
+export async function getInterpretationOptOutSummary(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<InterpretationEvent[]> {
+  const response = await authFetch(
+    `/api/sessions/${sessionId}/interpretations/opt_out_summary`,
+    {
+      method: "GET",
+      headers: authHeaders(),
+      signal,
+    },
+  );
+  const body = await parseResponse<OptOutSummaryResponse>(response);
+  return body.events;
+}
+
+export {
+  fetchAuditReadiness,
+  fetchAuditReadinessExplain,
+} from "./auditReadiness";
+
+export interface AuthTokenResponse {
+  access_token: string;
+  token_type?: string;
+}
+
+export type RegisterResponse =
+  | AuthTokenResponse
+  | { status: "verification_required"; email: string };
+
+/**
+ * Register a new local-auth account. Open registration returns a JWT and
+ * email-verified registration returns a pending-verification response.
+ * display_name defaults to the username; the minimal sign-up form does not
+ * collect a separate one.
+ */
+export async function register(
+  username: string,
+  password: string,
+  email?: string,
+): Promise<RegisterResponse> {
+  const body: {
+    username: string;
+    password: string;
+    display_name: string;
+    email?: string;
+  } = { username, password, display_name: username };
+  if (email !== undefined) {
+    body.email = email;
+  }
+  const response = await authFetch("/api/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return parseResponse<RegisterResponse>(response);
+}
+
+/**
+ * Consume an email-verification token and return a normal local-auth JWT.
+ */
+export async function verifyEmail(token: string): Promise<AuthTokenResponse> {
+  const response = await authFetch("/api/auth/verify-email", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  return parseResponse<AuthTokenResponse>(response, { logoutOnUnauthorized: false });
+}
+
+/**
+ * Exchange the single-use SSO handoff code (read from the `#/auth/callback`
+ * fragment) for the session token. The code is spent by this call whether
+ * or not the login is admitted, so a refusal here is final for that code.
+ *
+ * `logoutOnUnauthorized: false` for the same reason as `verifyEmail`: a 401
+ * is the backend refusing THIS handoff (pending, disabled, already spent) and
+ * must not evict a session that may already be signed in.
+ */
+export async function completeSsoLogin(code: string): Promise<AuthTokenResponse> {
+  const response = await authFetch("/api/auth/sso/complete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }),
+    cache: "no-store",
+  });
+  return parseResponse<AuthTokenResponse>(response, { logoutOnUnauthorized: false });
+}

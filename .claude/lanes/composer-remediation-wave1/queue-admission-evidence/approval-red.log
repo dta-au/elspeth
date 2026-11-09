@@ -1,0 +1,242 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 5 items
+
+tests/unit/web/composer/test_queue_scope_approval.py .FFFF               [100%]
+
+=================================== FAILURES ===================================
+_ test_real_explicit_approval_previews_changed_queue_without_committing_composition[override1] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_real_explicit_approval_pr1')
+override = {'scope_name': 'document_pages'}
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f78904b48f0>
+result_session_id = '45e28dc3-b4fc-41e1-937d-72047b4bb38b'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("override", [{}, *({key: value} for key, value in SCOPE.items()), SCOPE])
+    async def test_real_explicit_approval_previews_changed_queue_without_committing_composition(
+        tmp_path: Path, override: dict[str, Any], composer_service_with_real_sessions: ComposerServiceImpl, result_session_id: str,
+    ) -> None:
+        sessions = composer_service_with_real_sessions._require_sessions_service()
+        composer = ComposerServiceImpl.for_trained_operator(
+            catalog=create_catalog_service(), settings=_make_settings(data_dir=tmp_path), sessions_service=sessions,
+        )
+        session_id = result_session_id
+        session_uuid = UUID(session_id)
+        _, built, _ = complete_queue(tmp_path, session_id=session_id)
+        data = built.to_dict()
+        saved = await _save_composition_state(
+            sessions, session_uuid,
+            CompositionStateData(sources=data["sources"], nodes=data["nodes"], edges=data["edges"], outputs=data["outputs"], metadata_=data["metadata"]),
+            provenance="session_seed",
+        )
+        state = state_from_record(saved)
+        before = private_snapshot(state)
+        await sessions.update_composer_preferences(session_uuid, trust_mode="explicit_approve", density_default="high", actor="user:phase3-test-user")
+        arguments = {**QUEUE, "description": "Changed queue description", **override}
+        llm = _FakeComposeLLM((
+            _fake_llm_response(tool_calls=({"id": "queue_edit", "name": "upsert_node", "arguments": arguments},)),
+            _fake_llm_response(content="The queue edit has been considered."),
+        ))
+        result = await composer._run_one_turn_for_test(
+            llm=llm, session_id=session_id, current_state_id=str(saved.id), initial_state=state,
+        )
+        proposals = await sessions.list_composition_proposals(session_uuid)
+        assert len(result.tool_outcomes) == 1
+        feedback = result.tool_outcomes[0].response
+        assert isinstance(feedback, ToolResult)
+        if override:
+>           assert proposals == []
+E           AssertionError: assert [CompositionP...etadata=None)] == []
+E             
+E             Left contains one more item: CompositionProposalRecord(id=UUID('81dc5d13-2503-436e-b821-7196aef6f517'), session_id=UUID('45e28dc3-b4fc-41e1-937d-72...ezone.utc), updated_at=datetime.datetime(2026, 11, 9, 19, 8, 51, tzinfo=datetime.timezone.utc), pipeline_metadata=None)
+E             Use -v to get more diff
+
+tests/unit/web/composer/test_queue_scope_approval.py:59: AssertionError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 19:08:51 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:08:51 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:08:51 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 19:08:51 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:08:51 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:08:51 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_real_explicit_approval_previews_changed_queue_without_committing_composition[override2] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_real_explicit_approval_pr2')
+override = {'scope_opener': 'expand_rows'}
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f789019c980>
+result_session_id = '46cac3ac-f379-4c40-adbd-6af028e7c65e'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("override", [{}, *({key: value} for key, value in SCOPE.items()), SCOPE])
+    async def test_real_explicit_approval_previews_changed_queue_without_committing_composition(
+        tmp_path: Path, override: dict[str, Any], composer_service_with_real_sessions: ComposerServiceImpl, result_session_id: str,
+    ) -> None:
+        sessions = composer_service_with_real_sessions._require_sessions_service()
+        composer = ComposerServiceImpl.for_trained_operator(
+            catalog=create_catalog_service(), settings=_make_settings(data_dir=tmp_path), sessions_service=sessions,
+        )
+        session_id = result_session_id
+        session_uuid = UUID(session_id)
+        _, built, _ = complete_queue(tmp_path, session_id=session_id)
+        data = built.to_dict()
+        saved = await _save_composition_state(
+            sessions, session_uuid,
+            CompositionStateData(sources=data["sources"], nodes=data["nodes"], edges=data["edges"], outputs=data["outputs"], metadata_=data["metadata"]),
+            provenance="session_seed",
+        )
+        state = state_from_record(saved)
+        before = private_snapshot(state)
+        await sessions.update_composer_preferences(session_uuid, trust_mode="explicit_approve", density_default="high", actor="user:phase3-test-user")
+        arguments = {**QUEUE, "description": "Changed queue description", **override}
+        llm = _FakeComposeLLM((
+            _fake_llm_response(tool_calls=({"id": "queue_edit", "name": "upsert_node", "arguments": arguments},)),
+            _fake_llm_response(content="The queue edit has been considered."),
+        ))
+        result = await composer._run_one_turn_for_test(
+            llm=llm, session_id=session_id, current_state_id=str(saved.id), initial_state=state,
+        )
+        proposals = await sessions.list_composition_proposals(session_uuid)
+        assert len(result.tool_outcomes) == 1
+        feedback = result.tool_outcomes[0].response
+        assert isinstance(feedback, ToolResult)
+        if override:
+>           assert proposals == []
+E           AssertionError: assert [CompositionP...etadata=None)] == []
+E             
+E             Left contains one more item: CompositionProposalRecord(id=UUID('aa3afc91-faa2-46b6-aa80-7193e3a79fae'), session_id=UUID('46cac3ac-f379-4c40-adbd-6a...ezone.utc), updated_at=datetime.datetime(2026, 11, 9, 19, 8, 52, tzinfo=datetime.timezone.utc), pipeline_metadata=None)
+E             Use -v to get more diff
+
+tests/unit/web/composer/test_queue_scope_approval.py:59: AssertionError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 19:08:52 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:08:52 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:08:52 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 19:08:52 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:08:52 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:08:52 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_real_explicit_approval_previews_changed_queue_without_committing_composition[override3] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_real_explicit_approval_pr3')
+override = {'scope_policy': 'require_all'}
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f789018fe30>
+result_session_id = '647cd16e-66e7-42ed-9fcd-4f66a346ea18'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("override", [{}, *({key: value} for key, value in SCOPE.items()), SCOPE])
+    async def test_real_explicit_approval_previews_changed_queue_without_committing_composition(
+        tmp_path: Path, override: dict[str, Any], composer_service_with_real_sessions: ComposerServiceImpl, result_session_id: str,
+    ) -> None:
+        sessions = composer_service_with_real_sessions._require_sessions_service()
+        composer = ComposerServiceImpl.for_trained_operator(
+            catalog=create_catalog_service(), settings=_make_settings(data_dir=tmp_path), sessions_service=sessions,
+        )
+        session_id = result_session_id
+        session_uuid = UUID(session_id)
+        _, built, _ = complete_queue(tmp_path, session_id=session_id)
+        data = built.to_dict()
+        saved = await _save_composition_state(
+            sessions, session_uuid,
+            CompositionStateData(sources=data["sources"], nodes=data["nodes"], edges=data["edges"], outputs=data["outputs"], metadata_=data["metadata"]),
+            provenance="session_seed",
+        )
+        state = state_from_record(saved)
+        before = private_snapshot(state)
+        await sessions.update_composer_preferences(session_uuid, trust_mode="explicit_approve", density_default="high", actor="user:phase3-test-user")
+        arguments = {**QUEUE, "description": "Changed queue description", **override}
+        llm = _FakeComposeLLM((
+            _fake_llm_response(tool_calls=({"id": "queue_edit", "name": "upsert_node", "arguments": arguments},)),
+            _fake_llm_response(content="The queue edit has been considered."),
+        ))
+        result = await composer._run_one_turn_for_test(
+            llm=llm, session_id=session_id, current_state_id=str(saved.id), initial_state=state,
+        )
+        proposals = await sessions.list_composition_proposals(session_uuid)
+        assert len(result.tool_outcomes) == 1
+        feedback = result.tool_outcomes[0].response
+        assert isinstance(feedback, ToolResult)
+        if override:
+>           assert proposals == []
+E           AssertionError: assert [CompositionP...etadata=None)] == []
+E             
+E             Left contains one more item: CompositionProposalRecord(id=UUID('e7f077da-6529-4a7b-b905-ade2506d010c'), session_id=UUID('647cd16e-66e7-42ed-9fcd-4f...ezone.utc), updated_at=datetime.datetime(2026, 11, 9, 19, 8, 53, tzinfo=datetime.timezone.utc), pipeline_metadata=None)
+E             Use -v to get more diff
+
+tests/unit/web/composer/test_queue_scope_approval.py:59: AssertionError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 19:08:53 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:08:53 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:08:53 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 19:08:53 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:08:53 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:08:53 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_real_explicit_approval_previews_changed_queue_without_committing_composition[override4] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_real_explicit_approval_pr4')
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows', 'scope_policy': 'require_all'}
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f788f5c7ef0>
+result_session_id = '417d13ac-27a6-44b3-b609-2db916deb378'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("override", [{}, *({key: value} for key, value in SCOPE.items()), SCOPE])
+    async def test_real_explicit_approval_previews_changed_queue_without_committing_composition(
+        tmp_path: Path, override: dict[str, Any], composer_service_with_real_sessions: ComposerServiceImpl, result_session_id: str,
+    ) -> None:
+        sessions = composer_service_with_real_sessions._require_sessions_service()
+        composer = ComposerServiceImpl.for_trained_operator(
+            catalog=create_catalog_service(), settings=_make_settings(data_dir=tmp_path), sessions_service=sessions,
+        )
+        session_id = result_session_id
+        session_uuid = UUID(session_id)
+        _, built, _ = complete_queue(tmp_path, session_id=session_id)
+        data = built.to_dict()
+        saved = await _save_composition_state(
+            sessions, session_uuid,
+            CompositionStateData(sources=data["sources"], nodes=data["nodes"], edges=data["edges"], outputs=data["outputs"], metadata_=data["metadata"]),
+            provenance="session_seed",
+        )
+        state = state_from_record(saved)
+        before = private_snapshot(state)
+        await sessions.update_composer_preferences(session_uuid, trust_mode="explicit_approve", density_default="high", actor="user:phase3-test-user")
+        arguments = {**QUEUE, "description": "Changed queue description", **override}
+        llm = _FakeComposeLLM((
+            _fake_llm_response(tool_calls=({"id": "queue_edit", "name": "upsert_node", "arguments": arguments},)),
+            _fake_llm_response(content="The queue edit has been considered."),
+        ))
+        result = await composer._run_one_turn_for_test(
+            llm=llm, session_id=session_id, current_state_id=str(saved.id), initial_state=state,
+        )
+        proposals = await sessions.list_composition_proposals(session_uuid)
+        assert len(result.tool_outcomes) == 1
+        feedback = result.tool_outcomes[0].response
+        assert isinstance(feedback, ToolResult)
+        if override:
+>           assert proposals == []
+E           AssertionError: assert [CompositionP...etadata=None)] == []
+E             
+E             Left contains one more item: CompositionProposalRecord(id=UUID('87e07621-c3b9-42b0-849c-4c519b45750e'), session_id=UUID('417d13ac-27a6-44b3-b609-2d...ezone.utc), updated_at=datetime.datetime(2026, 11, 9, 19, 8, 54, tzinfo=datetime.timezone.utc), pipeline_metadata=None)
+E             Use -v to get more diff
+
+tests/unit/web/composer/test_queue_scope_approval.py:59: AssertionError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 19:08:54 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:08:54 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:08:54 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 19:08:54 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:08:54 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:08:54 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_queue_scope_approval.py::test_real_explicit_approval_previews_changed_queue_without_committing_composition[override1]
+FAILED tests/unit/web/composer/test_queue_scope_approval.py::test_real_explicit_approval_previews_changed_queue_without_committing_composition[override2]
+FAILED tests/unit/web/composer/test_queue_scope_approval.py::test_real_explicit_approval_previews_changed_queue_without_committing_composition[override3]
+FAILED tests/unit/web/composer/test_queue_scope_approval.py::test_real_explicit_approval_previews_changed_queue_without_committing_composition[override4]
+========================= 4 failed, 1 passed in 7.21s ==========================

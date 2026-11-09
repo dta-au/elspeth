@@ -1,0 +1,162 @@
+"""Authentication contracts shared across web identity boundaries.
+
+Layer: L0 (contracts). No upward imports.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Final, Literal, final
+
+from elspeth.contracts.freeze import freeze_fields
+
+AuthProviderType = Literal["local", "oidc", "entra", "vanguard", "google"]
+"""Closed discriminator for the ways a browser can authenticate.
+
+One value per registered IdP profile, plus ``local``.  ``service`` is
+deliberately absent: service identity rows are reserved vocabulary and no
+machine-to-Web-API authentication scheme is shipped in this release. They
+cannot be the ``auth_provider`` of a container, a session, or a user secret.
+The profile registry asserts parity against this Literal at import, which
+makes an unregistered value a boot failure rather than a test failure.
+"""
+
+IdentityProviderType = Literal[AuthProviderType, "service"]
+"""Closed discriminator for how an identity row came to exist.
+
+A superset of :data:`AuthProviderType` by exactly ``service``, so the
+``sessions.user_id`` -> ``identities.identity_id`` foreign key stays sound:
+every value ``sessions`` admits is a value ``identities`` admits.
+
+Written nested rather than as a union on purpose.  ``AuthProviderType |
+Literal["service"]`` is a ``Union``, and ``get_args`` on it returns two nested
+``Literal`` objects rather than the six strings, so every membership check and
+every contract assertion over it reads the wrong shape.  Nesting the alias
+inside ``Literal[...]`` flattens it.
+"""
+
+IdentityRole = Literal[
+    "admin",
+    "approver",
+    "reviewer",
+    "user",
+    "curator",
+    "auditor",
+    "oversight",
+]
+"""Closed set of roles an identity may hold.
+
+``user`` may author and run; ``approver`` decides approvals and holds approver
+edges; ``reviewer`` attests; ``curator`` gates the library; ``admin`` is
+container operations (identity, roles, org tree) and is never combined with a
+workload role. ``auditor`` and ``oversight`` are reserved vocabulary in this
+release and confer no route authority; their intended future audit and narrow
+operations surfaces require separate admission contracts before activation.
+
+Activation grants a role chosen from ``user``, ``approver``, ``reviewer`` or
+``none``.  ``none`` is a request argument, not a stored role -- it writes no
+``identity_roles`` row -- so it is not a member here.
+"""
+
+RelationshipType = Literal["approver"]
+"""Closed set of identity-to-identity edge types.
+
+The org tree carries one job: who oversees whom, for the approver's audit
+view.  Approver eligibility and leave cover are role questions, not tree
+questions, so no second edge type exists.
+"""
+
+ActivationRole = Literal["user", "approver", "reviewer", "none"]
+"""What an activation may grant (spec D20).
+
+The three workload roles an administrator may hand out with the "tick of
+approval", plus ``none``: a request argument that writes no ``identity_roles``
+row, and the only value an identity that already holds ``admin`` may be
+activated with (R8).  ``none`` is deliberately not a member of
+:data:`IdentityRole` -- nothing stores it.
+"""
+
+IdentityAccessState = Literal["pending", "active", "disabled"]
+"""Closed vocabulary of ``identities.access_state`` (D12).
+
+``pending`` is where every first sight lands and is not escapable by logging
+in again; ``active`` is the only state a token is issued to; ``disabled`` is
+where an administrator or a credential deletion leaves a row, which is never
+deleted because it anchors that person's audit history.
+"""
+
+AUTH_EVENT_ON_BEHALF_OF_KEY: Final = "on_behalf_of"
+AUTH_EVENT_CONSOLE_REQUEST_ID_KEY: Final = "console_request_id"
+"""The two provenance keys every admin-mutation ``auth_events`` row carries (spec rev2.2).
+
+The reserved future organisation-console design acts through a ``service``
+identity on behalf of a person, and the row must say so at the moment it is
+written: a row written without these keys is permanently anonymous, because
+nothing later can reconstruct who asked.  0.8.1 ships no service credential
+or service-authenticated Web route.  Pinned here, at L0, so the writer and
+every reader name the same keys; the writer records both on every admin
+mutation, ``None`` when the actor is a human administrator acting for
+themselves.
+"""
+
+AuthAuditEventType = Literal[
+    # Authentication.
+    "login",
+    "token_issued",
+    "auth_failure",
+    "logout",
+    # Admission and authority. Every one of these is an admin mutation whose
+    # row is written synchronously, before the response.
+    "identity_activated",
+    "identity_disabled",
+    "identity_enabled",
+    "role_granted",
+    "role_revoked",
+    "relationship_asserted",
+    "relationship_revoked",
+    # Workflow governance.
+    "approval_requested",
+    "approval_decided",
+    "review_requested",
+    "review_request_cancelled",
+    "review_attested",
+    "library_published",
+    "library_accepted",
+    "library_rejected",
+    "library_deprecated",
+    "library_recalled",
+    "quota_set",
+    "quota_exceeded",
+    # Identity lifecycle maintenance.
+    "pending_identities_purged",
+]
+"""Closed vocabulary of auditable authentication and authority events.
+
+The CHECK constraint backing this is closed too, so a missing value refuses
+the audited mutation. Authorization denials use ``auth_failure`` with a
+failure category; business-rule refusals retain their own categories.
+"""
+
+AuthAuditOutcome = Literal["success", "failure"]
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class AuthAuditEventInput:
+    """One validated event in a single Landscape audit transaction."""
+
+    event_type: AuthAuditEventType
+    outcome: AuthAuditOutcome
+    provider: AuthProviderType
+    user_id: str | None
+    username: str | None
+    failure_category: str | None
+    request_id: str | None
+    client_host: str | None
+    user_agent: str | None
+    metadata: Mapping[str, object]
+    identity_id: str | None = None
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "metadata")

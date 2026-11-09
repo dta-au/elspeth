@@ -1,0 +1,146 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 1 item
+
+tests/unit/composer_mcp/test_portable_supervisor.py F                    [100%]
+
+=================================== FAILURES ===================================
+__________________ test_shutdown_intent_has_closed_roundtrip ___________________
+
+payload = b'{"v": 1, "kind": "SHUTDOWN_REQUEST", "nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "target_pid": 1}'
+
+    def decode_frame(payload: bytes) -> WatchdogFrame:
+        try:
+            value: object = json.loads(
+                payload.decode("utf-8"), object_pairs_hook=_unique_pairs, parse_float=_reject_number, parse_constant=_reject_number
+            )
+            if not isinstance(value, dict):
+                raise WatchdogProtocolError("Watchdog frame must be one object")
+            if type(value["v"]) is not int or value["v"] != 1 or type(value["kind"]) is not str:
+                raise WatchdogProtocolError("Unknown watchdog frame version")
+>           kind = FrameKind(value["kind"])
+                   ^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/elspeth/web/process_watchdog_codec.py:95: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/enum.py:751: in __call__
+    return cls.__new__(cls, value)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+cls = <enum 'FrameKind'>, value = 'SHUTDOWN_REQUEST'
+
+    def __new__(cls, value):
+        # all enum instances are actually created during class construction
+        # without calling this method; this method is called by the metaclass'
+        # __call__ (i.e. Color(3) ), and by pickle
+        if type(value) is cls:
+            # For lookups like Color(Color.RED)
+            return value
+        # by-value search for a matching enum member
+        # see if it's in the reverse mapping (for hashable values)
+        try:
+            return cls._value2member_map_[value]
+        except KeyError:
+            # Not found, no need to do long O(n) search
+            pass
+        except TypeError:
+            # not there, now do long search -- O(n) behavior
+            for member in cls._member_map_.values():
+                if member._value_ == value:
+                    return member
+        # still not found -- verify that members exist, in-case somebody got here mistakenly
+        # (such as via super when trying to override __new__)
+        if not cls._member_map_:
+            raise TypeError("%r has no members defined" % cls)
+        #
+        # still not found -- try _missing_ hook
+        try:
+            exc = None
+            result = cls._missing_(value)
+        except Exception as e:
+            exc = e
+            result = None
+        try:
+            if isinstance(result, cls):
+                return result
+            elif (
+                    Flag is not None and issubclass(cls, Flag)
+                    and cls._boundary_ is EJECT and isinstance(result, int)
+                ):
+                return result
+            else:
+                ve_exc = ValueError("%r is not a valid %s" % (value, cls.__qualname__))
+                if result is None and exc is None:
+>                   raise ve_exc
+E                   ValueError: 'SHUTDOWN_REQUEST' is not a valid FrameKind
+
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/enum.py:1170: ValueError
+
+The above exception was the direct cause of the following exception:
+
+    def test_shutdown_intent_has_closed_roundtrip():
+        # Positive HELLO prevents vacuous rejection by a broken parser.
+        from elspeth.web.process_watchdog_codec import FrameKind, WatchdogFrame
+    
+        hello = WatchdogFrame(FrameKind.HELLO, "a" * 64, 1)
+        assert FrameReader().feed(encode_frame(hello)) == (hello,)
+        payload = json.dumps({"v": 1, "kind": "SHUTDOWN_REQUEST", "nonce": "a" * 64, "target_pid": 1}).encode()
+>       frame, = FrameReader().feed(len(payload).to_bytes(4, "big") + payload)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/composer_mcp/test_portable_supervisor.py:15: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/process_watchdog_codec.py:159: in feed
+    frames.append(decode_frame(bytes(self._buffer[4 : 4 + length])))
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+payload = b'{"v": 1, "kind": "SHUTDOWN_REQUEST", "nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "target_pid": 1}'
+
+    def decode_frame(payload: bytes) -> WatchdogFrame:
+        try:
+            value: object = json.loads(
+                payload.decode("utf-8"), object_pairs_hook=_unique_pairs, parse_float=_reject_number, parse_constant=_reject_number
+            )
+            if not isinstance(value, dict):
+                raise WatchdogProtocolError("Watchdog frame must be one object")
+            if type(value["v"]) is not int or value["v"] != 1 or type(value["kind"]) is not str:
+                raise WatchdogProtocolError("Unknown watchdog frame version")
+            kind = FrameKind(value["kind"])
+            expected = {"v", "kind", "nonce", "target_pid"}
+            if kind in (FrameKind.HELLO, FrameKind.WATCHING_ACK):
+                expected.add("grace_ns")
+            elif kind is FrameKind.BEGIN_RECOVERY:
+                expected.add("reason")
+            elif kind is FrameKind.GRACE_ACK:
+                expected.update(("grace_ns", "armed_at_ns", "deadline_ns"))
+            else:
+                expected.add("completion_seq")
+            if set(value) != expected or any(type(field) not in (str, int) for field in value.values()):
+                raise WatchdogProtocolError("Watchdog frame fields disagree with schema")
+            if "grace_ns" in value and (type(value["grace_ns"]) is not int or value["grace_ns"] != GRACE_NS):
+                raise WatchdogProtocolError("Watchdog grace disagreement")
+            if "completion_seq" in value and (type(value["completion_seq"]) is not int or value["completion_seq"] != 1):
+                raise WatchdogProtocolError("Watchdog completion sequence disagreement")
+            return WatchdogFrame(
+                kind,
+                value["nonce"],
+                value["target_pid"],
+                RecoveryReason(value["reason"]) if kind is FrameKind.BEGIN_RECOVERY else None,
+                value["armed_at_ns"] if kind is FrameKind.GRACE_ACK else None,
+                value["deadline_ns"] if kind is FrameKind.GRACE_ACK else None,
+            )
+        except (KeyError, TypeError, ValueError, UnicodeError) as error:
+>           raise WatchdogProtocolError("Invalid watchdog frame") from error
+E           elspeth.web.process_watchdog_codec.WatchdogProtocolError: Invalid watchdog frame
+
+src/elspeth/web/process_watchdog_codec.py:120: WatchdogProtocolError
+=========================== short test summary info ============================
+FAILED tests/unit/composer_mcp/test_portable_supervisor.py::test_shutdown_intent_has_closed_roundtrip
+============================== 1 failed in 3.90s ===============================

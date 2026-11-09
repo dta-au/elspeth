@@ -1,0 +1,17 @@
+tree        : /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata
+HEAD        : f9c23c59c63bbd3099029e995a778bade594f6c8  ()
+stages      : ruff,mypy,contracts,lints,pytest
+log dir     : /workspace/elspeth/.claude/lanes/composer-remediation-wave1/combined-final-gates
+provenance  : elspeth -> /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/src/elspeth/__init__.py
+              elspeth_lints -> /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/elspeth-lints/src/elspeth_lints/__init__.py
+siblings    : 0 pytest process(es) already on this box -> workers=4
+tree state  : f9c23c59c63bbd3099029e995a778bade594f6c8 01ba4719c80b6fe9  (HEAD + sha256 of status+diff; must match after the run)
+
+commands (PYTHONPATH=/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/src:/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/elspeth-lints/src exported for every stage):
+  [ruff] /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv/bin/ruff check src/ tests/ scripts/ examples/ elspeth-lints/src/ && /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv/bin/ruff format --check src/ tests/ scripts/ examples/ elspeth-lints/src/
+  [mypy] /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv/bin/mypy src/ elspeth-lints/src/
+  [contracts] /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv/bin/python scripts/check_contracts.py && /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv/bin/python scripts/cicd/generate_skill_inventory.py --check
+  [lints] ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv/bin/python -m elspeth_lints.core.cli check --rules all --root src/elspeth
+  [pytest] /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv/bin/python -m pytest tests/ -n 4 -o 'pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/src /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/elspeth-lints/src' -v --junitxml=<run-dir>/pytest-junit.xml -p composer_test_cache -p scripts.ci_test_shards --ci-partition=ordinary --ci-shard-count=1 --ci-shard-index=0 --ci-shard-report=/workspace/elspeth/.claude/lanes/composer-remediation-wave1/combined-ordinary-manifest.json -o 'pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/src /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/elspeth-lints/src /workspace/elspeth/.claude/lanes/composer-remediation-wave1/runtime-deps/pytest_plugins'
+
+dry-run: nothing run. Re-run with --execute (add --detach from a shell that times out).

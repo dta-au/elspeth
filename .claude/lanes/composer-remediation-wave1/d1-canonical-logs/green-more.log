@@ -1,0 +1,130 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 62 items
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py ....          [  6%]
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py .... [ 12%]
+.......F.                                                                [ 27%]
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py ........ [ 40%]
+.......                                                                  [ 51%]
+tests/unit/web/composer/test_audit_cohort_settlement.py ................ [ 77%]
+............                                                             [ 96%]
+tests/unit/web/composer/test_pipeline_planner.py .F                      [100%]
+
+=================================== FAILURES ===================================
+_ test_equal_content_with_failed_authored_validation_remains_validation_failure _
+
+proposal = _Proposal(service=<elspeth.web.sessions.service.SessionServiceImpl object at 0x7f57382d6570>, engine=Engine(sqlite:///...1ad29834575f5d94b228c0a4eb88468b4'), root=PosixPath('/tmp/pytest-of-agent/pytest-137/test_equal_content_with_failed0'))
+
+    @pytest.mark.asyncio
+    async def test_equal_content_with_failed_authored_validation_remains_validation_failure(proposal: _Proposal) -> None:
+        operations = proposal.service.session_operation_authority
+        context = operations.acquire(
+            session_id=proposal.authority.row.session_id, operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=proposal.service.session_operation_owner_instance_id, lease_seconds=300,
+        )
+        try:
+            accepted = await _prepare(proposal, context)
+            refusing_policy = _RejectCompletePolicy.for_trained_operator(create_catalog_service(), proposal.snapshot)
+            recorder = BufferingRecorder()
+            with pytest.raises(PipelineCommitError) as caught:
+>               await _prepare(replace(proposal, policy=refusing_policy), context, current_state=accepted.result.updated_state, recorder=recorder)
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:473: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:179: in _prepare
+    result = await prepare_pipeline_proposal_commit(
+src/elspeth/web/composer/pipeline_commit.py:493: in prepare_pipeline_proposal_commit
+    prior_validation = (await bounded(policy_catalog.validate_composition_state, current_state)).validation
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/pipeline_commit.py:489: in bounded
+    return await asyncio.wait_for(run_sync_in_worker(func, *args, **kwargs), timeout=remaining)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/tasks.py:520: in wait_for
+    return await fut
+           ^^^^^^^^^
+src/elspeth/web/async_workers.py:650: in run_sync_in_worker
+    return await _await_worker_future(concurrent_future, cancel_queued=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:720: in _await_worker_future
+    return future.result()
+           ^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/required_executor.py:119: in invoke
+    return callable_()
+           ^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <tests.unit.web.composer.test_pipeline_commit_operation_authority._RejectCompletePolicy object at 0x7f5739effda0>
+state = CompositionState(nodes=(), edges=(), outputs=(OutputSpec(name='rows', plugin='json', options=mappingproxy({'path': '/t...rtifact_hash': None, 'resolved_prompt_template_hash': None}),)}), on_validation_failure='discard', description=None)}))
+
+    def validate_composition_state(self, state: CompositionState) -> ProfileAwareValidationResult:
+        from elspeth.web.composer.state import ValidationEntry, ValidationSummary
+    
+        validation = state.validate()
+>       if state.source is not None:
+           ^^^^^^^^^^^^
+E       AttributeError: 'CompositionState' object has no attribute 'source'. Did you mean: 'sources'?
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:453: AttributeError
+_ test_happy_path_returns_proposal_and_audits_exact_marked_wire_payload[already-current] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-137/test_happy_path_returns_propos1')
+tool_context = ToolContext(catalog=<elspeth.web.catalog.policy_view.PolicyCatalogView object at 0x7f5736b08f50>, plugin_snapshot=Plug...hash=None, reviewed_source_authority=None, executing_proposal_id=None, _interpretation_requirements_are_internal=False)
+equal_current = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("equal_current", [False, True], ids=["new", "already-current"])
+    async def test_happy_path_returns_proposal_and_audits_exact_marked_wire_payload(
+        tmp_path: Path,
+        tool_context: ToolContext,
+        equal_current: bool,
+    ) -> None:
+        pipeline = _pipeline(tmp_path)
+        completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": pipeline})))
+        recorder = BufferingRecorder()
+        lifecycle_events: list[str] = []
+        policy = _budget()
+        context, _, _ = _candidate_context(tmp_path, _TEST_SESSION_ID)
+        candidate = build_set_pipeline_candidate(pipeline, _empty_state(), context)
+        assert candidate.acceptable
+        current = candidate.result.updated_state if equal_current else _empty_state()
+    
+        proposal = await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            budget=policy,
+            lifecycle=_lifecycle(lifecycle_events),
+            current_state=current,
+        )
+    
+        assert deep_thaw(proposal.proposal.pipeline) == pipeline
+        assert proposal.proposal.base == AbsentBase()
+        assert proposal.proposal.repair_count == 0
+        if equal_current:
+            from elspeth.web.composer.pipeline_proposal import composition_content_hash
+    
+            assert proposal.candidate_state is not None
+            assert composition_content_hash(proposal.candidate_state) == composition_content_hash(current)
+>           assert len(recorder.invocations) == 1
+E           assert 0 == 1
+E            +  where 0 = len(())
+E            +    where () = <elspeth.web.composer.audit.BufferingRecorder object at 0x7f5737c99be0>.invocations
+
+tests/unit/web/composer/test_pipeline_planner.py:1057: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:48:56 [info     ] composer.planner_attempt       attempt=1 led_to=done operation_id=None outcome=accepted phase=candidate planner_code=None rejection_codes=[] repeated_fingerprint=False session_id=11111111-1111-4111-8111-111111111111 surface=freeform tool_calls=1
+2026-11-09 13:48:56 [info     ] composer.planner_summary       final_outcome=accepted operation_id=None phase_counts={'candidate': 1} rejection_history=[] session_id=11111111-1111-4111-8111-111111111111 surface=freeform total_attempts=1
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_pipeline_commit_operation_authority.py::test_equal_content_with_failed_authored_validation_remains_validation_failure
+FAILED tests/unit/web/composer/test_pipeline_planner.py::test_happy_path_returns_proposal_and_audits_exact_marked_wire_payload[already-current]
+======================== 2 failed, 60 passed in 27.66s =========================

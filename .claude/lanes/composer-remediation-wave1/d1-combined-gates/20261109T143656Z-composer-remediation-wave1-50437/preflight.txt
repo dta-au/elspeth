@@ -1,0 +1,9 @@
+tree        : /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+HEAD        : 14fef5e5342ccbd79b4fdd69b276c20f77d66dc1  ()
+stages      : ruff,mypy,contracts,lints,pytest,testcontainer
+log dir     : /workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-combined-gates
+provenance  : elspeth -> /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src/elspeth/__init__.py
+              elspeth_lints -> /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src/elspeth_lints/__init__.py
+siblings    : 0 pytest process(es) already on this box -> workers=12
+docker      : reachable
+tree state  : 14fef5e5342ccbd79b4fdd69b276c20f77d66dc1 01ba4719c80b6fe9  (HEAD + sha256 of status+diff; must match after the run)

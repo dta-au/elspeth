@@ -1,0 +1,772 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 10 items
+
+tests/unit/web/composer/test_queue_scope_approval.py FFFFF               [ 50%]
+tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py F [ 60%]
+FFF.                                                                     [100%]
+
+=================================== FAILURES ===================================
+_ test_real_explicit_approval_previews_changed_queue_without_committing_composition[override0] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_real_explicit_approval_pr0')
+override = {}
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f064102cc50>
+result_session_id = '60a40c76-fff1-40c2-a458-807e13980946'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("override", [{}, *({key: value} for key, value in SCOPE.items()), SCOPE])
+    async def test_real_explicit_approval_previews_changed_queue_without_committing_composition(
+        tmp_path: Path, override: dict[str, Any], composer_service_with_real_sessions: ComposerServiceImpl, result_session_id: str,
+    ) -> None:
+        sessions = composer_service_with_real_sessions._require_sessions_service()
+        composer = ComposerServiceImpl.for_trained_operator(
+            catalog=create_catalog_service(), settings=_make_settings(data_dir=tmp_path), sessions_service=sessions,
+        )
+        session_id = result_session_id
+        session_uuid = UUID(session_id)
+        _, built, _ = complete_queue(tmp_path, session_id=session_id)
+        data = built.to_dict()
+        saved = await _save_composition_state(
+            sessions, session_uuid,
+            CompositionStateData(sources=data["sources"], nodes=data["nodes"], edges=data["edges"], outputs=data["outputs"], metadata_=data["metadata"]),
+            provenance="session_seed",
+        )
+        state = state_from_record(saved)
+        before = private_snapshot(state)
+        await sessions.update_composer_preferences(session_uuid, trust_mode="explicit_approve", density_default="high", actor="user:phase3-test-user")
+        arguments = {**QUEUE, "description": "Changed queue description", **override}
+        llm = _FakeComposeLLM((
+            _fake_llm_response(tool_calls=({"id": "queue_edit", "name": "upsert_node", "arguments": arguments},)),
+            _fake_llm_response(content="The queue edit has been considered."),
+        ))
+>       result = await composer._run_one_turn_for_test(
+            llm=llm, session_id=session_id, current_state_id=str(saved.id), initial_state=state,
+        )
+
+tests/unit/web/composer/test_queue_scope_approval.py:50: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/helpers/composer_lease.py:176: in run_one_turn
+    return await _with_lease(self, kwargs.get("session_id"), kwargs, call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:108: in _with_lease
+    return await _with_provider_owner(self, forwarded, call, lease) if bind_provider_owner else await call(**forwarded)
+                                                                                                ^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:174: in call
+    return await real_turn(self, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:886: in _run_one_turn_for_test
+    result = await self._compose_loop(
+src/elspeth/web/composer/service.py:2614: in _compose_loop
+    terminate = await self._completion._try_terminate_no_tools(
+src/elspeth/web/composer/composition_completion.py:1728: in _try_terminate_no_tools
+    advisor_gate = await self._evaluate_terminal_no_tool_advisor_gate(
+src/elspeth/web/composer/composition_completion.py:2315: in _evaluate_terminal_no_tool_advisor_gate
+    verdict = await self._advisor_checkpoint._run_advisor_checkpoint(
+src/elspeth/web/composer/advisor_checkpoint.py:1407: in _run_advisor_checkpoint
+    guidance, _meta = await self._call_advisor_with_audit(
+src/elspeth/web/composer/advisor_checkpoint.py:713: in _call_advisor_with_audit
+    return await self._call_advisor_with_audit_legacy(
+src/elspeth/web/composer/provider_quota.py:432: in wrapped
+    return await operation(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/advisor_checkpoint.py:692: in _call_advisor_with_audit_legacy
+    return await self._call_advisor_with_audit_body(
+src/elspeth/web/composer/advisor_checkpoint.py:524: in _call_advisor_with_audit_body
+    response = await asyncio.wait_for(
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/tasks.py:520: in wait_for
+    return await fut
+           ^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+prompt_guard_mount = None, prompt_guard_mode = 'debug-when-unconfigured'
+prompt_guard_role = 'advisor', prompt_guard_user_prompt = None
+prompt_guard_trusted_message_indexes = frozenset({0})
+prompt_guard_content_parts = (None, (PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), ...))
+prompt_guard_tool_argument_parts = None, prompt_guard_thinking_parts = None
+
+    async def _litellm_acompletion(
+        *,
+        prompt_guard_mount: PromptGuardMount | None,
+        prompt_guard_mode: PromptGuardMode,
+        prompt_guard_role: PromptGuardRole,
+        prompt_guard_user_prompt: str | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prompt_guard_thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
+        prepared_advisor_content: tuple[PreparedAdvisorContent, ...] | None = None,
+        provider_custody: ProviderCallCustody | None = None,
+        on_provider_dispatch: Callable[[], None] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Call LiteLLM lazily so app startup never imports provider machinery.
+    
+        Brands OpenRouter-routed calls with ELSPETH's app-attribution headers (see
+        :func:`_apply_openrouter_app_identity`) so the OpenRouter dashboard credits
+        composer traffic to ELSPETH rather than LiteLLM's defaults, and pins
+        OpenRouter's usage-accounting opt-in (see
+        :func:`_apply_openrouter_usage_accounting`) so provider cost and cache
+        detail arrive in-band for the call audit.
+        """
+        if type(provider_custody) is not ProviderCallCustody:
+>           raise AuditIntegrityError("Physical provider requires exact explicit custody")
+E           elspeth.contracts.errors.AuditIntegrityError: Physical provider requires exact explicit custody
+
+src/elspeth/web/composer/provider_gateway.py:476: AuditIntegrityError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 19:07:45 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:07:47 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:07:47 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 19:07:48 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:07:48 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:07:48 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_real_explicit_approval_previews_changed_queue_without_committing_composition[override1] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_real_explicit_approval_pr1')
+override = {'scope_name': 'document_pages'}
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f063a0b46e0>
+result_session_id = 'a1904f8b-d1aa-4d54-ae9c-ea1890442451'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("override", [{}, *({key: value} for key, value in SCOPE.items()), SCOPE])
+    async def test_real_explicit_approval_previews_changed_queue_without_committing_composition(
+        tmp_path: Path, override: dict[str, Any], composer_service_with_real_sessions: ComposerServiceImpl, result_session_id: str,
+    ) -> None:
+        sessions = composer_service_with_real_sessions._require_sessions_service()
+        composer = ComposerServiceImpl.for_trained_operator(
+            catalog=create_catalog_service(), settings=_make_settings(data_dir=tmp_path), sessions_service=sessions,
+        )
+        session_id = result_session_id
+        session_uuid = UUID(session_id)
+        _, built, _ = complete_queue(tmp_path, session_id=session_id)
+        data = built.to_dict()
+        saved = await _save_composition_state(
+            sessions, session_uuid,
+            CompositionStateData(sources=data["sources"], nodes=data["nodes"], edges=data["edges"], outputs=data["outputs"], metadata_=data["metadata"]),
+            provenance="session_seed",
+        )
+        state = state_from_record(saved)
+        before = private_snapshot(state)
+        await sessions.update_composer_preferences(session_uuid, trust_mode="explicit_approve", density_default="high", actor="user:phase3-test-user")
+        arguments = {**QUEUE, "description": "Changed queue description", **override}
+        llm = _FakeComposeLLM((
+            _fake_llm_response(tool_calls=({"id": "queue_edit", "name": "upsert_node", "arguments": arguments},)),
+            _fake_llm_response(content="The queue edit has been considered."),
+        ))
+>       result = await composer._run_one_turn_for_test(
+            llm=llm, session_id=session_id, current_state_id=str(saved.id), initial_state=state,
+        )
+
+tests/unit/web/composer/test_queue_scope_approval.py:50: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/helpers/composer_lease.py:176: in run_one_turn
+    return await _with_lease(self, kwargs.get("session_id"), kwargs, call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:108: in _with_lease
+    return await _with_provider_owner(self, forwarded, call, lease) if bind_provider_owner else await call(**forwarded)
+                                                                                                ^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:174: in call
+    return await real_turn(self, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:886: in _run_one_turn_for_test
+    result = await self._compose_loop(
+src/elspeth/web/composer/service.py:2614: in _compose_loop
+    terminate = await self._completion._try_terminate_no_tools(
+src/elspeth/web/composer/composition_completion.py:1728: in _try_terminate_no_tools
+    advisor_gate = await self._evaluate_terminal_no_tool_advisor_gate(
+src/elspeth/web/composer/composition_completion.py:2315: in _evaluate_terminal_no_tool_advisor_gate
+    verdict = await self._advisor_checkpoint._run_advisor_checkpoint(
+src/elspeth/web/composer/advisor_checkpoint.py:1407: in _run_advisor_checkpoint
+    guidance, _meta = await self._call_advisor_with_audit(
+src/elspeth/web/composer/advisor_checkpoint.py:713: in _call_advisor_with_audit
+    return await self._call_advisor_with_audit_legacy(
+src/elspeth/web/composer/provider_quota.py:432: in wrapped
+    return await operation(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/advisor_checkpoint.py:692: in _call_advisor_with_audit_legacy
+    return await self._call_advisor_with_audit_body(
+src/elspeth/web/composer/advisor_checkpoint.py:524: in _call_advisor_with_audit_body
+    response = await asyncio.wait_for(
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/tasks.py:520: in wait_for
+    return await fut
+           ^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+prompt_guard_mount = None, prompt_guard_mode = 'debug-when-unconfigured'
+prompt_guard_role = 'advisor', prompt_guard_user_prompt = None
+prompt_guard_trusted_message_indexes = frozenset({0})
+prompt_guard_content_parts = (None, (PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), ...))
+prompt_guard_tool_argument_parts = None, prompt_guard_thinking_parts = None
+
+    async def _litellm_acompletion(
+        *,
+        prompt_guard_mount: PromptGuardMount | None,
+        prompt_guard_mode: PromptGuardMode,
+        prompt_guard_role: PromptGuardRole,
+        prompt_guard_user_prompt: str | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prompt_guard_thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
+        prepared_advisor_content: tuple[PreparedAdvisorContent, ...] | None = None,
+        provider_custody: ProviderCallCustody | None = None,
+        on_provider_dispatch: Callable[[], None] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Call LiteLLM lazily so app startup never imports provider machinery.
+    
+        Brands OpenRouter-routed calls with ELSPETH's app-attribution headers (see
+        :func:`_apply_openrouter_app_identity`) so the OpenRouter dashboard credits
+        composer traffic to ELSPETH rather than LiteLLM's defaults, and pins
+        OpenRouter's usage-accounting opt-in (see
+        :func:`_apply_openrouter_usage_accounting`) so provider cost and cache
+        detail arrive in-band for the call audit.
+        """
+        if type(provider_custody) is not ProviderCallCustody:
+>           raise AuditIntegrityError("Physical provider requires exact explicit custody")
+E           elspeth.contracts.errors.AuditIntegrityError: Physical provider requires exact explicit custody
+
+src/elspeth/web/composer/provider_gateway.py:476: AuditIntegrityError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 19:07:49 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:07:49 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:07:49 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 19:07:49 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:07:49 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:07:49 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_real_explicit_approval_previews_changed_queue_without_committing_composition[override2] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_real_explicit_approval_pr2')
+override = {'scope_opener': 'expand_rows'}
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f0639f0b650>
+result_session_id = 'de261918-370b-452b-b525-41342e40461c'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("override", [{}, *({key: value} for key, value in SCOPE.items()), SCOPE])
+    async def test_real_explicit_approval_previews_changed_queue_without_committing_composition(
+        tmp_path: Path, override: dict[str, Any], composer_service_with_real_sessions: ComposerServiceImpl, result_session_id: str,
+    ) -> None:
+        sessions = composer_service_with_real_sessions._require_sessions_service()
+        composer = ComposerServiceImpl.for_trained_operator(
+            catalog=create_catalog_service(), settings=_make_settings(data_dir=tmp_path), sessions_service=sessions,
+        )
+        session_id = result_session_id
+        session_uuid = UUID(session_id)
+        _, built, _ = complete_queue(tmp_path, session_id=session_id)
+        data = built.to_dict()
+        saved = await _save_composition_state(
+            sessions, session_uuid,
+            CompositionStateData(sources=data["sources"], nodes=data["nodes"], edges=data["edges"], outputs=data["outputs"], metadata_=data["metadata"]),
+            provenance="session_seed",
+        )
+        state = state_from_record(saved)
+        before = private_snapshot(state)
+        await sessions.update_composer_preferences(session_uuid, trust_mode="explicit_approve", density_default="high", actor="user:phase3-test-user")
+        arguments = {**QUEUE, "description": "Changed queue description", **override}
+        llm = _FakeComposeLLM((
+            _fake_llm_response(tool_calls=({"id": "queue_edit", "name": "upsert_node", "arguments": arguments},)),
+            _fake_llm_response(content="The queue edit has been considered."),
+        ))
+>       result = await composer._run_one_turn_for_test(
+            llm=llm, session_id=session_id, current_state_id=str(saved.id), initial_state=state,
+        )
+
+tests/unit/web/composer/test_queue_scope_approval.py:50: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/helpers/composer_lease.py:176: in run_one_turn
+    return await _with_lease(self, kwargs.get("session_id"), kwargs, call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:108: in _with_lease
+    return await _with_provider_owner(self, forwarded, call, lease) if bind_provider_owner else await call(**forwarded)
+                                                                                                ^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:174: in call
+    return await real_turn(self, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:886: in _run_one_turn_for_test
+    result = await self._compose_loop(
+src/elspeth/web/composer/service.py:2614: in _compose_loop
+    terminate = await self._completion._try_terminate_no_tools(
+src/elspeth/web/composer/composition_completion.py:1728: in _try_terminate_no_tools
+    advisor_gate = await self._evaluate_terminal_no_tool_advisor_gate(
+src/elspeth/web/composer/composition_completion.py:2315: in _evaluate_terminal_no_tool_advisor_gate
+    verdict = await self._advisor_checkpoint._run_advisor_checkpoint(
+src/elspeth/web/composer/advisor_checkpoint.py:1407: in _run_advisor_checkpoint
+    guidance, _meta = await self._call_advisor_with_audit(
+src/elspeth/web/composer/advisor_checkpoint.py:713: in _call_advisor_with_audit
+    return await self._call_advisor_with_audit_legacy(
+src/elspeth/web/composer/provider_quota.py:432: in wrapped
+    return await operation(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/advisor_checkpoint.py:692: in _call_advisor_with_audit_legacy
+    return await self._call_advisor_with_audit_body(
+src/elspeth/web/composer/advisor_checkpoint.py:524: in _call_advisor_with_audit_body
+    response = await asyncio.wait_for(
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/tasks.py:520: in wait_for
+    return await fut
+           ^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+prompt_guard_mount = None, prompt_guard_mode = 'debug-when-unconfigured'
+prompt_guard_role = 'advisor', prompt_guard_user_prompt = None
+prompt_guard_trusted_message_indexes = frozenset({0})
+prompt_guard_content_parts = (None, (PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), ...))
+prompt_guard_tool_argument_parts = None, prompt_guard_thinking_parts = None
+
+    async def _litellm_acompletion(
+        *,
+        prompt_guard_mount: PromptGuardMount | None,
+        prompt_guard_mode: PromptGuardMode,
+        prompt_guard_role: PromptGuardRole,
+        prompt_guard_user_prompt: str | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prompt_guard_thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
+        prepared_advisor_content: tuple[PreparedAdvisorContent, ...] | None = None,
+        provider_custody: ProviderCallCustody | None = None,
+        on_provider_dispatch: Callable[[], None] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Call LiteLLM lazily so app startup never imports provider machinery.
+    
+        Brands OpenRouter-routed calls with ELSPETH's app-attribution headers (see
+        :func:`_apply_openrouter_app_identity`) so the OpenRouter dashboard credits
+        composer traffic to ELSPETH rather than LiteLLM's defaults, and pins
+        OpenRouter's usage-accounting opt-in (see
+        :func:`_apply_openrouter_usage_accounting`) so provider cost and cache
+        detail arrive in-band for the call audit.
+        """
+        if type(provider_custody) is not ProviderCallCustody:
+>           raise AuditIntegrityError("Physical provider requires exact explicit custody")
+E           elspeth.contracts.errors.AuditIntegrityError: Physical provider requires exact explicit custody
+
+src/elspeth/web/composer/provider_gateway.py:476: AuditIntegrityError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 19:07:50 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:07:50 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:07:50 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 19:07:51 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:07:51 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:07:51 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_real_explicit_approval_previews_changed_queue_without_committing_composition[override3] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_real_explicit_approval_pr3')
+override = {'scope_policy': 'require_all'}
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f0640fd6180>
+result_session_id = '4838c635-326f-406d-97a4-d81b3613102a'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("override", [{}, *({key: value} for key, value in SCOPE.items()), SCOPE])
+    async def test_real_explicit_approval_previews_changed_queue_without_committing_composition(
+        tmp_path: Path, override: dict[str, Any], composer_service_with_real_sessions: ComposerServiceImpl, result_session_id: str,
+    ) -> None:
+        sessions = composer_service_with_real_sessions._require_sessions_service()
+        composer = ComposerServiceImpl.for_trained_operator(
+            catalog=create_catalog_service(), settings=_make_settings(data_dir=tmp_path), sessions_service=sessions,
+        )
+        session_id = result_session_id
+        session_uuid = UUID(session_id)
+        _, built, _ = complete_queue(tmp_path, session_id=session_id)
+        data = built.to_dict()
+        saved = await _save_composition_state(
+            sessions, session_uuid,
+            CompositionStateData(sources=data["sources"], nodes=data["nodes"], edges=data["edges"], outputs=data["outputs"], metadata_=data["metadata"]),
+            provenance="session_seed",
+        )
+        state = state_from_record(saved)
+        before = private_snapshot(state)
+        await sessions.update_composer_preferences(session_uuid, trust_mode="explicit_approve", density_default="high", actor="user:phase3-test-user")
+        arguments = {**QUEUE, "description": "Changed queue description", **override}
+        llm = _FakeComposeLLM((
+            _fake_llm_response(tool_calls=({"id": "queue_edit", "name": "upsert_node", "arguments": arguments},)),
+            _fake_llm_response(content="The queue edit has been considered."),
+        ))
+>       result = await composer._run_one_turn_for_test(
+            llm=llm, session_id=session_id, current_state_id=str(saved.id), initial_state=state,
+        )
+
+tests/unit/web/composer/test_queue_scope_approval.py:50: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/helpers/composer_lease.py:176: in run_one_turn
+    return await _with_lease(self, kwargs.get("session_id"), kwargs, call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:108: in _with_lease
+    return await _with_provider_owner(self, forwarded, call, lease) if bind_provider_owner else await call(**forwarded)
+                                                                                                ^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:174: in call
+    return await real_turn(self, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:886: in _run_one_turn_for_test
+    result = await self._compose_loop(
+src/elspeth/web/composer/service.py:2614: in _compose_loop
+    terminate = await self._completion._try_terminate_no_tools(
+src/elspeth/web/composer/composition_completion.py:1728: in _try_terminate_no_tools
+    advisor_gate = await self._evaluate_terminal_no_tool_advisor_gate(
+src/elspeth/web/composer/composition_completion.py:2315: in _evaluate_terminal_no_tool_advisor_gate
+    verdict = await self._advisor_checkpoint._run_advisor_checkpoint(
+src/elspeth/web/composer/advisor_checkpoint.py:1407: in _run_advisor_checkpoint
+    guidance, _meta = await self._call_advisor_with_audit(
+src/elspeth/web/composer/advisor_checkpoint.py:713: in _call_advisor_with_audit
+    return await self._call_advisor_with_audit_legacy(
+src/elspeth/web/composer/provider_quota.py:432: in wrapped
+    return await operation(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/advisor_checkpoint.py:692: in _call_advisor_with_audit_legacy
+    return await self._call_advisor_with_audit_body(
+src/elspeth/web/composer/advisor_checkpoint.py:524: in _call_advisor_with_audit_body
+    response = await asyncio.wait_for(
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/tasks.py:520: in wait_for
+    return await fut
+           ^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+prompt_guard_mount = None, prompt_guard_mode = 'debug-when-unconfigured'
+prompt_guard_role = 'advisor', prompt_guard_user_prompt = None
+prompt_guard_trusted_message_indexes = frozenset({0})
+prompt_guard_content_parts = (None, (PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), ...))
+prompt_guard_tool_argument_parts = None, prompt_guard_thinking_parts = None
+
+    async def _litellm_acompletion(
+        *,
+        prompt_guard_mount: PromptGuardMount | None,
+        prompt_guard_mode: PromptGuardMode,
+        prompt_guard_role: PromptGuardRole,
+        prompt_guard_user_prompt: str | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prompt_guard_thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
+        prepared_advisor_content: tuple[PreparedAdvisorContent, ...] | None = None,
+        provider_custody: ProviderCallCustody | None = None,
+        on_provider_dispatch: Callable[[], None] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Call LiteLLM lazily so app startup never imports provider machinery.
+    
+        Brands OpenRouter-routed calls with ELSPETH's app-attribution headers (see
+        :func:`_apply_openrouter_app_identity`) so the OpenRouter dashboard credits
+        composer traffic to ELSPETH rather than LiteLLM's defaults, and pins
+        OpenRouter's usage-accounting opt-in (see
+        :func:`_apply_openrouter_usage_accounting`) so provider cost and cache
+        detail arrive in-band for the call audit.
+        """
+        if type(provider_custody) is not ProviderCallCustody:
+>           raise AuditIntegrityError("Physical provider requires exact explicit custody")
+E           elspeth.contracts.errors.AuditIntegrityError: Physical provider requires exact explicit custody
+
+src/elspeth/web/composer/provider_gateway.py:476: AuditIntegrityError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 19:07:51 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:07:51 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:07:51 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 19:07:52 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:07:52 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:07:52 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_real_explicit_approval_previews_changed_queue_without_committing_composition[override4] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_real_explicit_approval_pr4')
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows', 'scope_policy': 'require_all'}
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f063a0b6180>
+result_session_id = '59d7239c-afb7-48c8-b05b-22b7ee8b966c'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("override", [{}, *({key: value} for key, value in SCOPE.items()), SCOPE])
+    async def test_real_explicit_approval_previews_changed_queue_without_committing_composition(
+        tmp_path: Path, override: dict[str, Any], composer_service_with_real_sessions: ComposerServiceImpl, result_session_id: str,
+    ) -> None:
+        sessions = composer_service_with_real_sessions._require_sessions_service()
+        composer = ComposerServiceImpl.for_trained_operator(
+            catalog=create_catalog_service(), settings=_make_settings(data_dir=tmp_path), sessions_service=sessions,
+        )
+        session_id = result_session_id
+        session_uuid = UUID(session_id)
+        _, built, _ = complete_queue(tmp_path, session_id=session_id)
+        data = built.to_dict()
+        saved = await _save_composition_state(
+            sessions, session_uuid,
+            CompositionStateData(sources=data["sources"], nodes=data["nodes"], edges=data["edges"], outputs=data["outputs"], metadata_=data["metadata"]),
+            provenance="session_seed",
+        )
+        state = state_from_record(saved)
+        before = private_snapshot(state)
+        await sessions.update_composer_preferences(session_uuid, trust_mode="explicit_approve", density_default="high", actor="user:phase3-test-user")
+        arguments = {**QUEUE, "description": "Changed queue description", **override}
+        llm = _FakeComposeLLM((
+            _fake_llm_response(tool_calls=({"id": "queue_edit", "name": "upsert_node", "arguments": arguments},)),
+            _fake_llm_response(content="The queue edit has been considered."),
+        ))
+>       result = await composer._run_one_turn_for_test(
+            llm=llm, session_id=session_id, current_state_id=str(saved.id), initial_state=state,
+        )
+
+tests/unit/web/composer/test_queue_scope_approval.py:50: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/helpers/composer_lease.py:176: in run_one_turn
+    return await _with_lease(self, kwargs.get("session_id"), kwargs, call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:108: in _with_lease
+    return await _with_provider_owner(self, forwarded, call, lease) if bind_provider_owner else await call(**forwarded)
+                                                                                                ^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:174: in call
+    return await real_turn(self, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:886: in _run_one_turn_for_test
+    result = await self._compose_loop(
+src/elspeth/web/composer/service.py:2614: in _compose_loop
+    terminate = await self._completion._try_terminate_no_tools(
+src/elspeth/web/composer/composition_completion.py:1728: in _try_terminate_no_tools
+    advisor_gate = await self._evaluate_terminal_no_tool_advisor_gate(
+src/elspeth/web/composer/composition_completion.py:2315: in _evaluate_terminal_no_tool_advisor_gate
+    verdict = await self._advisor_checkpoint._run_advisor_checkpoint(
+src/elspeth/web/composer/advisor_checkpoint.py:1407: in _run_advisor_checkpoint
+    guidance, _meta = await self._call_advisor_with_audit(
+src/elspeth/web/composer/advisor_checkpoint.py:713: in _call_advisor_with_audit
+    return await self._call_advisor_with_audit_legacy(
+src/elspeth/web/composer/provider_quota.py:432: in wrapped
+    return await operation(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/advisor_checkpoint.py:692: in _call_advisor_with_audit_legacy
+    return await self._call_advisor_with_audit_body(
+src/elspeth/web/composer/advisor_checkpoint.py:524: in _call_advisor_with_audit_body
+    response = await asyncio.wait_for(
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/tasks.py:520: in wait_for
+    return await fut
+           ^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+prompt_guard_mount = None, prompt_guard_mode = 'debug-when-unconfigured'
+prompt_guard_role = 'advisor', prompt_guard_user_prompt = None
+prompt_guard_trusted_message_indexes = frozenset({0})
+prompt_guard_content_parts = (None, (PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), PromptGuardContentPart(trust=None), ...))
+prompt_guard_tool_argument_parts = None, prompt_guard_thinking_parts = None
+
+    async def _litellm_acompletion(
+        *,
+        prompt_guard_mount: PromptGuardMount | None,
+        prompt_guard_mode: PromptGuardMode,
+        prompt_guard_role: PromptGuardRole,
+        prompt_guard_user_prompt: str | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prompt_guard_thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
+        prepared_advisor_content: tuple[PreparedAdvisorContent, ...] | None = None,
+        provider_custody: ProviderCallCustody | None = None,
+        on_provider_dispatch: Callable[[], None] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Call LiteLLM lazily so app startup never imports provider machinery.
+    
+        Brands OpenRouter-routed calls with ELSPETH's app-attribution headers (see
+        :func:`_apply_openrouter_app_identity`) so the OpenRouter dashboard credits
+        composer traffic to ELSPETH rather than LiteLLM's defaults, and pins
+        OpenRouter's usage-accounting opt-in (see
+        :func:`_apply_openrouter_usage_accounting`) so provider cost and cache
+        detail arrive in-band for the call audit.
+        """
+        if type(provider_custody) is not ProviderCallCustody:
+>           raise AuditIntegrityError("Physical provider requires exact explicit custody")
+E           elspeth.contracts.errors.AuditIntegrityError: Physical provider requires exact explicit custody
+
+src/elspeth/web/composer/provider_gateway.py:476: AuditIntegrityError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 19:07:52 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:07:52 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:07:52 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 19:07:53 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 19:07:53 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 19:07:53 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_legacy_queue_scope_replay_terminalizes_without_changing_private_composition[override0] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_legacy_queue_scope_replay0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f063a12d040>
+override = {'scope_name': 'document_pages'}
+
+    @pytest.mark.parametrize("override", [*({key: value} for key, value in SCOPE.items()), SCOPE, {"scope_policy": []}])
+    def test_legacy_queue_scope_replay_terminalizes_without_changing_private_composition(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override: dict[str, Any],
+    ) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = UUID(client.post("/api/sessions", json={"title": "Queue replay"}).json()["id"])
+        _, built, _ = complete_queue(tmp_path, session_id=str(session_id))
+        data = built.to_dict()
+        saved = asyncio.run(_save_composition_state(
+            service, session_id,
+            CompositionStateData(sources=data["sources"], nodes=data["nodes"], edges=data["edges"], outputs=data["outputs"], metadata_=data["metadata"]),
+            provenance="session_seed",
+        ))
+        before = private_snapshot(state_from_record(saved))
+        proposal = _proposal(service, session_id, "upsert_node", {**QUEUE, "description": "Do not apply", **override}, saved.id)
+        real_dispatch = routes.execute_tool
+        results = []
+        attempts = []
+    
+        def observe(*args: Any, **kwargs: Any) -> Any:
+            attempts.append(True)
+            result = real_dispatch(*args, **kwargs)
+            results.append(result)
+            return result
+    
+        monkeypatch.setattr(routes, "execute_tool", observe)
+        endpoint = f"/api/sessions/{session_id}/proposals/{proposal.id}/accept"
+        response = client.post(endpoint)
+>       assert response.status_code == 422, response.text
+E       AssertionError: {"id":"7459b960-53a0-488c-9683-4223eba71123","session_id":"20a0c0e6-c1ce-4b3c-86bf-51436bc032dd","tool_call_id":"call_upsert_node","tool_name":"upsert_node","status":"committed","summary":"Legacy change","rationale":"Operator requested change","affects":["graph"],"arguments_redacted_json":{},"base_state_id":"1787eeb7-0f3f-419c-afc8-3cdacd4e2811","committed_state_id":"7dc50507-fc6f-4553-9a8d-cead964455e7","audit_event_id":"08febd19-7804-4370-b1e2-c2addff1eea6","pipeline_metadata":null,"created_at":"2026-11-09T19:07:55Z","updated_at":"2026-11-09T19:07:55Z"}
+E       assert 200 == 422
+E        +  where 200 = <Response [200 OK]>.status_code
+
+tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py:97: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 19:07:54 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+_ test_legacy_queue_scope_replay_terminalizes_without_changing_private_composition[override1] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_legacy_queue_scope_replay1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f063a6ae570>
+override = {'scope_opener': 'expand_rows'}
+
+    @pytest.mark.parametrize("override", [*({key: value} for key, value in SCOPE.items()), SCOPE, {"scope_policy": []}])
+    def test_legacy_queue_scope_replay_terminalizes_without_changing_private_composition(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override: dict[str, Any],
+    ) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = UUID(client.post("/api/sessions", json={"title": "Queue replay"}).json()["id"])
+        _, built, _ = complete_queue(tmp_path, session_id=str(session_id))
+        data = built.to_dict()
+        saved = asyncio.run(_save_composition_state(
+            service, session_id,
+            CompositionStateData(sources=data["sources"], nodes=data["nodes"], edges=data["edges"], outputs=data["outputs"], metadata_=data["metadata"]),
+            provenance="session_seed",
+        ))
+        before = private_snapshot(state_from_record(saved))
+        proposal = _proposal(service, session_id, "upsert_node", {**QUEUE, "description": "Do not apply", **override}, saved.id)
+        real_dispatch = routes.execute_tool
+        results = []
+        attempts = []
+    
+        def observe(*args: Any, **kwargs: Any) -> Any:
+            attempts.append(True)
+            result = real_dispatch(*args, **kwargs)
+            results.append(result)
+            return result
+    
+        monkeypatch.setattr(routes, "execute_tool", observe)
+        endpoint = f"/api/sessions/{session_id}/proposals/{proposal.id}/accept"
+        response = client.post(endpoint)
+>       assert response.status_code == 422, response.text
+E       AssertionError: {"id":"748bffb2-3fb8-4688-8d1a-7f188d9ef2a4","session_id":"16b82b17-9789-42de-b215-8b3e15d63a6e","tool_call_id":"call_upsert_node","tool_name":"upsert_node","status":"committed","summary":"Legacy change","rationale":"Operator requested change","affects":["graph"],"arguments_redacted_json":{},"base_state_id":"d835627f-8e2f-4a90-903d-194d06abc47e","committed_state_id":"6f93fece-ffec-4318-9708-a0825d247dc3","audit_event_id":"c36f6ee3-4623-46d8-bc47-186c1be0cc88","pipeline_metadata":null,"created_at":"2026-11-09T19:07:55Z","updated_at":"2026-11-09T19:07:55Z"}
+E       assert 200 == 422
+E        +  where 200 = <Response [200 OK]>.status_code
+
+tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py:97: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 19:07:55 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+_ test_legacy_queue_scope_replay_terminalizes_without_changing_private_composition[override2] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_legacy_queue_scope_replay2')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f063a6ace00>
+override = {'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("override", [*({key: value} for key, value in SCOPE.items()), SCOPE, {"scope_policy": []}])
+    def test_legacy_queue_scope_replay_terminalizes_without_changing_private_composition(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override: dict[str, Any],
+    ) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = UUID(client.post("/api/sessions", json={"title": "Queue replay"}).json()["id"])
+        _, built, _ = complete_queue(tmp_path, session_id=str(session_id))
+        data = built.to_dict()
+        saved = asyncio.run(_save_composition_state(
+            service, session_id,
+            CompositionStateData(sources=data["sources"], nodes=data["nodes"], edges=data["edges"], outputs=data["outputs"], metadata_=data["metadata"]),
+            provenance="session_seed",
+        ))
+        before = private_snapshot(state_from_record(saved))
+        proposal = _proposal(service, session_id, "upsert_node", {**QUEUE, "description": "Do not apply", **override}, saved.id)
+        real_dispatch = routes.execute_tool
+        results = []
+        attempts = []
+    
+        def observe(*args: Any, **kwargs: Any) -> Any:
+            attempts.append(True)
+            result = real_dispatch(*args, **kwargs)
+            results.append(result)
+            return result
+    
+        monkeypatch.setattr(routes, "execute_tool", observe)
+        endpoint = f"/api/sessions/{session_id}/proposals/{proposal.id}/accept"
+        response = client.post(endpoint)
+>       assert response.status_code == 422, response.text
+E       AssertionError: {"id":"e7a68f73-b1c8-4c07-b0a0-bd6c7e537dbf","session_id":"3c480349-c619-4257-aa58-b43930555693","tool_call_id":"call_upsert_node","tool_name":"upsert_node","status":"committed","summary":"Legacy change","rationale":"Operator requested change","affects":["graph"],"arguments_redacted_json":{},"base_state_id":"7a6fa71a-adf0-4ff9-be44-fe44ac24aca9","committed_state_id":"377d4ed4-7167-428a-8e9c-4c9e72a38f51","audit_event_id":"932a1b95-5346-4bab-8414-9491f7380cd0","pipeline_metadata":null,"created_at":"2026-11-09T19:07:56Z","updated_at":"2026-11-09T19:07:56Z"}
+E       assert 200 == 422
+E        +  where 200 = <Response [200 OK]>.status_code
+
+tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py:97: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 19:07:56 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+_ test_legacy_queue_scope_replay_terminalizes_without_changing_private_composition[override3] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission/.claude/queue-admission-pytest/test_legacy_queue_scope_replay3')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f063a0b48f0>
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("override", [*({key: value} for key, value in SCOPE.items()), SCOPE, {"scope_policy": []}])
+    def test_legacy_queue_scope_replay_terminalizes_without_changing_private_composition(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override: dict[str, Any],
+    ) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = UUID(client.post("/api/sessions", json={"title": "Queue replay"}).json()["id"])
+        _, built, _ = complete_queue(tmp_path, session_id=str(session_id))
+        data = built.to_dict()
+        saved = asyncio.run(_save_composition_state(
+            service, session_id,
+            CompositionStateData(sources=data["sources"], nodes=data["nodes"], edges=data["edges"], outputs=data["outputs"], metadata_=data["metadata"]),
+            provenance="session_seed",
+        ))
+        before = private_snapshot(state_from_record(saved))
+        proposal = _proposal(service, session_id, "upsert_node", {**QUEUE, "description": "Do not apply", **override}, saved.id)
+        real_dispatch = routes.execute_tool
+        results = []
+        attempts = []
+    
+        def observe(*args: Any, **kwargs: Any) -> Any:
+            attempts.append(True)
+            result = real_dispatch(*args, **kwargs)
+            results.append(result)
+            return result
+    
+        monkeypatch.setattr(routes, "execute_tool", observe)
+        endpoint = f"/api/sessions/{session_id}/proposals/{proposal.id}/accept"
+        response = client.post(endpoint)
+>       assert response.status_code == 422, response.text
+E       AssertionError: {"id":"01ff1521-58e0-4721-b77c-3c4f42600342","session_id":"deb3da59-f0dc-43c7-8f29-23d68902f876","tool_call_id":"call_upsert_node","tool_name":"upsert_node","status":"committed","summary":"Legacy change","rationale":"Operator requested change","affects":["graph"],"arguments_redacted_json":{},"base_state_id":"26a080e3-fb8a-45ca-9d89-6a244ca16f9d","committed_state_id":"4d57047a-977f-4e33-9771-a75f05acf156","audit_event_id":"06d1f1ac-6985-4efe-8e93-7331cf880d41","pipeline_metadata":null,"created_at":"2026-11-09T19:07:57Z","updated_at":"2026-11-09T19:07:57Z"}
+E       assert 200 == 422
+E        +  where 200 = <Response [200 OK]>.status_code
+
+tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py:97: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 19:07:56 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_queue_scope_approval.py::test_real_explicit_approval_previews_changed_queue_without_committing_composition[override0]
+FAILED tests/unit/web/composer/test_queue_scope_approval.py::test_real_explicit_approval_previews_changed_queue_without_committing_composition[override1]
+FAILED tests/unit/web/composer/test_queue_scope_approval.py::test_real_explicit_approval_previews_changed_queue_without_committing_composition[override2]
+FAILED tests/unit/web/composer/test_queue_scope_approval.py::test_real_explicit_approval_previews_changed_queue_without_committing_composition[override3]
+FAILED tests/unit/web/composer/test_queue_scope_approval.py::test_real_explicit_approval_previews_changed_queue_without_committing_composition[override4]
+FAILED tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py::test_legacy_queue_scope_replay_terminalizes_without_changing_private_composition[override0]
+FAILED tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py::test_legacy_queue_scope_replay_terminalizes_without_changing_private_composition[override1]
+FAILED tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py::test_legacy_queue_scope_replay_terminalizes_without_changing_private_composition[override2]
+FAILED tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py::test_legacy_queue_scope_replay_terminalizes_without_changing_private_composition[override3]
+========================= 9 failed, 1 passed in 13.23s =========================

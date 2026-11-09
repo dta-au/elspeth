@@ -1,0 +1,23 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 7 items
+
+<Dir composer-remediation-wave1>
+  <Package tests>
+    <Dir testcontainer>
+      <Dir web>
+        <Module test_blob_mutation_admission_postgres.py>
+          <Function test_postgres_admission_waiter_observes_real_writer_debt_without_allocating[update_blob]>
+          <Function test_postgres_admission_waiter_observes_real_writer_debt_without_allocating[delete_blob]>
+          <Function test_postgres_admission_releases_sessions_during_file_io_and_rechecks[expiry]>
+          <Function test_postgres_admission_releases_sessions_during_file_io_and_rechecks[metadata]>
+          <Function test_postgres_admission_waiting_on_container_sees_committed_output_reservation>
+          <Function test_postgres_real_writer_waits_for_read_only_admission_custody>
+          <Function test_postgres_admission_fence_waiter_cannot_read_after_expiry>
+
+========================== 7 tests collected in 2.15s ==========================

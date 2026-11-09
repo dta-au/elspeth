@@ -1,0 +1,3680 @@
+diff --git a/src/elspeth/contracts/blobs.py b/src/elspeth/contracts/blobs.py
+index 385c45dce..43a355c5e 100644
+--- a/src/elspeth/contracts/blobs.py
++++ b/src/elspeth/contracts/blobs.py
+@@ -20,6 +20,7 @@ from typing import ClassVar, Literal, Protocol, get_args
+ from uuid import UUID, uuid5
+ 
+ from elspeth.contracts.enums import CreationModality
++from elspeth.contracts.errors import AuditIntegrityError
+ from elspeth.contracts.freeze import freeze_fields
+ from elspeth.contracts.hashing import canonical_json
+ from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+@@ -776,19 +777,7 @@ class BlobDeletionPlan:
+             or any(character not in "0123456789abcdef" for character in self.blob_snapshot_hash)
+         ):
+             raise ValueError("BlobDeletionPlan.blob_snapshot_hash must be lowercase SHA-256")
+-        if type(self.expected_file_present) is not bool:
+-            raise TypeError("BlobDeletionPlan.expected_file_present must be bool")
+-        if self.expected_file_present:
+-            if type(self.expected_file_size) is not int or self.expected_file_size < 0:
+-                raise ValueError("BlobDeletionPlan.expected_file_size must be non-negative when bytes are present")
+-            if (
+-                type(self.expected_file_hash) is not str
+-                or len(self.expected_file_hash) != 64
+-                or any(character not in "0123456789abcdef" for character in self.expected_file_hash)
+-            ):
+-                raise ValueError("BlobDeletionPlan.expected_file_hash must be lowercase SHA-256 when bytes are present")
+-        elif self.expected_file_size is not None or self.expected_file_hash is not None:
+-            raise ValueError("BlobDeletionPlan absent-file evidence must not carry size or hash")
++        self.require_file_evidence(self.expected_file_present, self.expected_file_size, self.expected_file_hash)
+         if type(self.created_at) is not datetime or type(self.updated_at) is not datetime:
+             raise TypeError("BlobDeletionPlan timestamps must be exact datetimes")
+         if self.created_at.utcoffset() is None or self.updated_at.utcoffset() is None:
+@@ -798,6 +787,19 @@ class BlobDeletionPlan:
+         if self.blob is not None and (type(self.blob) is not BlobRecord or self.blob.id != self.blob_id):
+             raise ValueError("BlobDeletionPlan.blob must match blob_id")
+ 
++    @staticmethod
++    def require_file_evidence(present: bool, size: int | None, digest: str | None) -> None:
++        """Admission and durable preparation use exactly the same evidence domain."""
++        if type(present) is not bool:
++            raise TypeError("BlobDeletionPlan.expected_file_present must be bool")
++        if present:
++            if type(size) is not int or size < 0:
++                raise ValueError("BlobDeletionPlan.expected_file_size must be non-negative when bytes are present")
++            if type(digest) is not str or len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
++                raise ValueError("BlobDeletionPlan.expected_file_hash must be lowercase SHA-256 when bytes are present")
++        elif size is not None or digest is not None:
++            raise ValueError("BlobDeletionPlan absent-file evidence must not carry size or hash")
++
+ 
+ @dataclass(frozen=True, slots=True)
+ class BlobReplacementPlan:
+@@ -874,6 +876,20 @@ class BlobReplacementPlan:
+         if blob_record_snapshot_hash(self.replacement_blob) != self.replacement_blob_snapshot_hash:
+             raise ValueError("BlobReplacementPlan replacement snapshot hash does not match metadata")
+ 
++    def require_current_metadata(self, current: BlobRecord | None) -> None:
++        """Recovery and admission require the same complete phase snapshot."""
++        if current != (self.replacement_blob if self.phase == "purge_pending" else self.old_blob):
++            raise AuditIntegrityError("replacement recovery metadata differs from the complete durable snapshot")
++
++
++@dataclass(frozen=True, slots=True)
++class BlobMutationObservation:
++    """Transient fenced metadata/debt observation; grants no durable admission."""
++
++    blob: BlobRecord | None
++    deletion: BlobDeletionPlan | BlobAtomicDeletionObligation | None
++    replacement: BlobReplacementPlan | None
++
+ 
+ @dataclass(frozen=True, slots=True)
+ class BlobCreationObligation:
+diff --git a/src/elspeth/web/blobs/replacement.py b/src/elspeth/web/blobs/replacement.py
+index 28c9925a6..24efc5a52 100644
+--- a/src/elspeth/web/blobs/replacement.py
++++ b/src/elspeth/web/blobs/replacement.py
+@@ -134,6 +134,37 @@ class BlobReplacementCoordinator:
+     def _matches(evidence: _Evidence, expected: Literal["old", "new"]) -> bool:
+         return evidence in {expected, "both"}
+ 
++    def _require_canonical_replacement_content(self, expected: BlobRecord, directory_fd: _CustodyDirectory) -> None:
++        session_dir = self._data_dir / "blobs" / str(expected.session_id)
++        storage = session_dir / f"{expected.id}_{expected.filename}"
++        if storage.parent != session_dir or Path(expected.storage_path) != storage:
++            raise AuditIntegrityError("blob replacement storage escaped exact custody")
++        old_data = self._read_bytes(storage, directory_fd)
++        if old_data is None or expected.content_hash is None:
++            raise AuditIntegrityError("replacement requires existing canonical content with a hash")
++        digest = content_hash(old_data)
++        if len(old_data) != expected.size_bytes or not hmac.compare_digest(digest, expected.content_hash):
++            raise BlobIntegrityError(str(expected.id), expected=expected.content_hash, actual=digest)
++
++    def _require_recovery_content(self, plan: BlobReplacementPlan, directory_fd: _CustodyDirectory) -> _Evidence:
++        """Only observe supported interrupted alternatives; never repair them."""
++        storage, staging, backup, temporary = self._validated_paths(plan)
++        for path in (storage, staging, backup, temporary):
++            self._regular_or_absent(path, directory_fd)
++        storage_evidence = self._evidence(storage, plan, directory_fd)
++        staging_evidence = self._evidence(staging, plan, directory_fd)
++        backup_evidence = self._evidence(backup, plan, directory_fd)
++        if staging_evidence != "absent" and not self._matches(staging_evidence, "new"):
++            raise AuditIntegrityError("replacement staging does not contain proposed bytes")
++        if backup_evidence != "absent" and not self._matches(backup_evidence, "old"):
++            raise AuditIntegrityError("replacement backup does not contain old bytes")
++        if plan.phase == "purge_pending":
++            if not self._matches(storage_evidence, "new") and not self._matches(staging_evidence, "new"):
++                raise AuditIntegrityError("committed replacement lost exact proposed bytes")
++        elif not self._matches(storage_evidence, "old") and not self._matches(backup_evidence, "old"):
++            raise AuditIntegrityError("uncommitted replacement lost exact old bytes")
++        return storage_evidence
++
+     def _read_plan(self, context: SessionOperationContext, blob_id: UUID) -> BlobReplacementPlan | None:
+         return self._authority.mutate(context, lambda transaction: transaction.blobs.read_blob_replacement(blob_id=blob_id))
+ 
+@@ -167,29 +198,14 @@ class BlobReplacementCoordinator:
+             raise AuditIntegrityError("replacement recovery escaped exact session custody")
+         current = self._authority.mutate(context, lambda transaction: transaction.blobs.read_blob(blob_id=plan.blob_id))
+         committed = plan.phase == "purge_pending"
+-        if current != (plan.replacement_blob if committed else plan.old_blob):
+-            raise AuditIntegrityError("replacement recovery metadata differs from the complete durable snapshot")
++        plan.require_current_metadata(current)
+         storage, staging, backup, temporary = self._validated_paths(plan)
+         with self._directory(plan.session_id) as directory_fd:
+-            # Validate every artifact before the first mutation. A malformed
+-            # temporary must preserve the ledger and the recoverable copies.
+-            for path in (storage, staging, backup, temporary):
+-                self._regular_or_absent(path, directory_fd)
+-            storage_evidence = self._evidence(storage, plan, directory_fd)
+-            staging_evidence = self._evidence(staging, plan, directory_fd)
+-            backup_evidence = self._evidence(backup, plan, directory_fd)
+-            if staging_evidence != "absent" and not self._matches(staging_evidence, "new"):
+-                raise AuditIntegrityError("replacement staging does not contain proposed bytes")
+-            if backup_evidence != "absent" and not self._matches(backup_evidence, "old"):
+-                raise AuditIntegrityError("replacement backup does not contain old bytes")
++            storage_evidence = self._require_recovery_content(plan, directory_fd)
+             if committed:
+                 if not self._matches(storage_evidence, "new"):
+-                    if not self._matches(staging_evidence, "new"):
+-                        raise AuditIntegrityError("committed replacement lost exact proposed bytes")
+                     self._rename(staging, storage, directory_fd, context)
+             elif not self._matches(storage_evidence, "old"):
+-                if not self._matches(backup_evidence, "old"):
+-                    raise AuditIntegrityError("uncommitted replacement lost exact old bytes")
+                 self._rename(backup, storage, directory_fd, context)
+             for path in (staging, backup, temporary):
+                 self._remove(path, directory_fd, context)
+@@ -273,12 +289,7 @@ class BlobReplacementCoordinator:
+             staging = storage.with_name(f"{stem}.stage")
+             backup = storage.with_name(f"{stem}.backup")
+             with self._directory(expected.session_id) as directory_fd:
+-                old_data = self._read_bytes(storage, directory_fd)
+-                if old_data is None or expected.content_hash is None:
+-                    raise AuditIntegrityError("replacement requires existing canonical content with a hash")
+-                digest = content_hash(old_data)
+-                if len(old_data) != expected.size_bytes or not hmac.compare_digest(digest, expected.content_hash):
+-                    raise BlobIntegrityError(str(expected.id), expected=expected.content_hash, actual=digest)
++                self._require_canonical_replacement_content(expected, directory_fd)
+                 try:
+                     plan = self._authority.mutate(
+                         context,
+diff --git a/src/elspeth/web/blobs/service.py b/src/elspeth/web/blobs/service.py
+index 1a653a6b1..09ac7bcde 100644
+--- a/src/elspeth/web/blobs/service.py
++++ b/src/elspeth/web/blobs/service.py
+@@ -720,7 +720,7 @@ def _finalize_staged_blob_deletion(stage: _StagedBlobDeletion) -> None:
+     _remove_blob_temp_artifacts(stage.storage)
+ 
+ 
+-def _atomic_blob_deletion_stage(
++def _validated_atomic_blob_deletion_paths(
+     obligation: BlobAtomicDeletionObligation,
+     *,
+     data_dir: Path,
+@@ -742,11 +742,20 @@ def _atomic_blob_deletion_stage(
+             or _LOWERCASE_UUID_HEX.fullmatch(tombstone_suffix) is None
+         ):
+             raise AuditIntegrityError(f"Blob deletion cleanup tombstone path escapes blob custody: {tombstone}")
+-    if storage.exists() or storage.is_symlink():
+-        raise AuditIntegrityError("committed atomic deletion unexpectedly retained canonical bytes")
+     return _StagedBlobDeletion(storage=storage, tombstone=tombstone)
+ 
+ 
++def _atomic_blob_deletion_stage(
++    obligation: BlobAtomicDeletionObligation,
++    *,
++    data_dir: Path,
++) -> _StagedBlobDeletion:
++    stage = _validated_atomic_blob_deletion_paths(obligation, data_dir=data_dir)
++    if stage.storage.exists() or stage.storage.is_symlink():
++        raise AuditIntegrityError("committed atomic deletion unexpectedly retained canonical bytes")
++    return stage
++
++
+ def _registered_blob_deletion_stage(
+     row: Row[Any],
+     *,
+@@ -2892,10 +2901,100 @@ class BlobServiceImpl:
+         return storage, tombstone, temp
+ 
+     @staticmethod
+-    def _require_exact_deletion_bytes(path: Path, plan: BlobDeletionPlan) -> None:
+-        if not _regular_custody_file_exists(path):
+-            raise AuditIntegrityError(f"blob deletion expected exact bytes at {path}")
+-        data = path.read_bytes()
++    def _read_deletion_content(path: Path, *, directory_fd: int) -> bytes | None:
++        if not _regular_custody_file_exists(path, directory_fd=directory_fd):
++            return None
++        descriptor = os.open(path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
++        with os.fdopen(descriptor, "rb") as source:
++            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
++                raise AuditIntegrityError("blob deletion artifact changed to a nonregular file")
++            return source.read()
++
++    def _observe_blob_deletion_content(self, record: BlobRecord) -> tuple[bool, int | None, str | None]:
++        """Observe the direct driver's deliberate absent-file evidence safely."""
++        storage = Path(record.storage_path)
++        if storage != self._storage_path(str(record.session_id), str(record.id), record.filename):
++            raise AuditIntegrityError("blob deletion storage escaped exact custody")
++        with _inline_custody_directory_fds(storage, session_id=str(record.session_id), create=False) as descriptors:
++            data = None if descriptors is None else self._read_deletion_content(storage, directory_fd=descriptors[1])
++            if descriptors is not None:
++                self._require_stable_deletion_directory(storage, descriptors)
++        if data is None:
++            return False, None, None
++        digest = content_hash(data)
++        if record.size_bytes != len(data):
++            raise AuditIntegrityError("blob deletion bytes disagree with recorded size")
++        if record.content_hash is not None and not hmac.compare_digest(record.content_hash, digest):
++            raise BlobIntegrityError(str(record.id), expected=record.content_hash, actual=digest)
++        return True, len(data), digest
++
++    @staticmethod
++    def _require_stable_deletion_directory(storage: Path, descriptors: tuple[int, int]) -> None:
++        _require_stable_custody_root(storage.parent.parent, descriptors[0])
++        _require_stable_custody_session(
++            descriptors[0], session_name=storage.parent.name, descriptor=descriptors[1], session_dir=storage.parent
++        )
++
++    def _require_blob_deletion_recovery_content(self, plan: BlobDeletionPlan | BlobAtomicDeletionObligation) -> None:
++        """Validate interrupted evidence without staging, restoring or purging."""
++        paths: tuple[Path, ...]
++        if isinstance(plan, BlobAtomicDeletionObligation):
++            stage = _validated_atomic_blob_deletion_paths(plan, data_dir=self._data_dir)
++            storage, tombstone = stage.storage, stage.tombstone
++            paths = (storage,) if tombstone is None else (storage, tombstone)
++        else:
++            storage, tombstone, temporary = self._validated_blob_deletion_paths(plan)
++            paths = (storage, tombstone, temporary, storage.with_name(f".{storage.name}.custody.tmp"))
++        with _inline_custody_directory_fds(storage, session_id=str(plan.session_id), create=False) as descriptors:
++            observed = tuple(
++                False if descriptors is None else _regular_custody_file_exists(path, directory_fd=descriptors[1]) for path in paths
++            )
++            canonical_present = observed[0]
++            tombstone_present = tombstone is not None and len(observed) > 1 and observed[1]
++            if isinstance(plan, BlobAtomicDeletionObligation):
++                if canonical_present:
++                    raise AuditIntegrityError("committed atomic deletion unexpectedly retained canonical bytes")
++                if descriptors is not None:
++                    self._require_stable_deletion_directory(storage, descriptors)
++                return
++            if plan.phase == "purge_pending":
++                if canonical_present:
++                    raise AuditIntegrityError("committed blob deletion unexpectedly retained canonical bytes")
++            else:
++                self._require_uncommitted_deletion_presence(plan, canonical_present=canonical_present, tombstone_present=tombstone_present)
++            if descriptors is not None:
++                for path, present in ((storage, canonical_present), (tombstone, tombstone_present)):
++                    if path is not None and present:
++                        data = self._read_deletion_content(path, directory_fd=descriptors[1])
++                        if data is None:
++                            raise AuditIntegrityError(f"blob deletion expected exact bytes at {path}")
++                        self._require_deletion_content_evidence(data, plan)
++                self._require_stable_deletion_directory(storage, descriptors)
++
++    @staticmethod
++    def _require_uncommitted_deletion_presence(plan: BlobDeletionPlan, *, canonical_present: bool, tombstone_present: bool) -> None:
++        if plan.expected_file_present:
++            if canonical_present and tombstone_present:
++                raise AuditIntegrityError(
++                    "blob deletion found both canonical and tombstone bytes"
++                    if plan.phase == "intent"
++                    else "staged blob deletion has ambiguous filesystem state"
++                )
++            if not canonical_present and not tombstone_present:
++                raise AuditIntegrityError(
++                    "blob deletion lost both canonical and tombstone bytes"
++                    if plan.phase == "intent"
++                    else "staged blob deletion has ambiguous filesystem state"
++                )
++        elif canonical_present or tombstone_present:
++            raise AuditIntegrityError(
++                "blob deletion found bytes for an absent-file ledger"
++                if plan.phase == "intent"
++                else "staged absent-file deletion unexpectedly found bytes"
++            )
++
++    @staticmethod
++    def _require_deletion_content_evidence(data: bytes, plan: BlobDeletionPlan) -> None:
+         actual_hash = content_hash(data)
+         if (
+             plan.expected_file_size is None
+@@ -2903,11 +3002,14 @@ class BlobServiceImpl:
+             or len(data) != plan.expected_file_size
+             or not hmac.compare_digest(actual_hash, plan.expected_file_hash)
+         ):
+-            raise BlobIntegrityError(
+-                str(plan.blob_id),
+-                expected=plan.expected_file_hash or "<absent>",
+-                actual=actual_hash,
+-            )
++            raise BlobIntegrityError(str(plan.blob_id), expected=plan.expected_file_hash or "<absent>", actual=actual_hash)
++
++    @staticmethod
++    def _require_exact_deletion_bytes(path: Path, plan: BlobDeletionPlan) -> None:
++        if not _regular_custody_file_exists(path):
++            raise AuditIntegrityError(f"blob deletion expected exact bytes at {path}")
++        data = path.read_bytes()
++        BlobServiceImpl._require_deletion_content_evidence(data, plan)
+ 
+     def _read_blob_deletion_plan(
+         self,
+@@ -2942,9 +3044,8 @@ class BlobServiceImpl:
+         storage, tombstone, _temp = self._validated_blob_deletion_paths(plan)
+         self._session_operation_authority.compare_and_swap(context)
+         try:
++            self._require_uncommitted_deletion_presence(plan, canonical_present=storage.exists(), tombstone_present=tombstone.exists())
+             if plan.expected_file_present:
+-                if storage.exists() and tombstone.exists():
+-                    raise AuditIntegrityError("blob deletion found both canonical and tombstone bytes")
+                 if storage.exists():
+                     self._require_exact_deletion_bytes(storage, plan)
+                     self._session_operation_authority.compare_and_swap(context)
+@@ -2952,10 +3053,6 @@ class BlobServiceImpl:
+                     _fsync_parent_directory(storage.parent)
+                 elif tombstone.exists():
+                     self._require_exact_deletion_bytes(tombstone, plan)
+-                else:
+-                    raise AuditIntegrityError("blob deletion lost both canonical and tombstone bytes")
+-            elif storage.exists() or tombstone.exists():
+-                raise AuditIntegrityError("blob deletion found bytes for an absent-file ledger")
+             self._session_operation_authority.compare_and_swap(context)
+         except Exception as exc:
+             self._restore_and_abort_blob_deletion(
+@@ -3030,17 +3127,14 @@ class BlobServiceImpl:
+     ) -> BlobDeletionPlan:
+         storage, tombstone, _temp = self._validated_blob_deletion_paths(plan)
+         self._session_operation_authority.compare_and_swap(context)
++        self._require_uncommitted_deletion_presence(plan, canonical_present=storage.exists(), tombstone_present=tombstone.exists())
+         if plan.expected_file_present:
+             if storage.exists() and not tombstone.exists():
+                 self._require_exact_deletion_bytes(storage, plan)
+                 self._session_operation_authority.compare_and_swap(context)
+                 os.replace(storage, tombstone)
+                 _fsync_parent_directory(storage.parent)
+-            elif storage.exists() or not tombstone.exists():
+-                raise AuditIntegrityError("staged blob deletion has ambiguous filesystem state")
+             self._require_exact_deletion_bytes(tombstone, plan)
+-        elif storage.exists() or tombstone.exists():
+-            raise AuditIntegrityError("staged absent-file deletion unexpectedly found bytes")
+         self._session_operation_authority.compare_and_swap(context)
+         try:
+             return self._session_operation_authority.mutate(
+@@ -3174,21 +3268,8 @@ class BlobServiceImpl:
+                 raise BlobNotFoundError(str(blob_id)) from None
+             if str(record.session_id) != context.fence.session_id:
+                 raise AuditIntegrityError("fenced blob delete lost session custody")
++            expected_file_present, expected_file_size, expected_file_hash = self._observe_blob_deletion_content(record)
+             storage = Path(record.storage_path)
+-            expected_storage = self._storage_path(str(record.session_id), str(record.id), record.filename)
+-            if storage != expected_storage:
+-                raise AuditIntegrityError("blob deletion storage escaped exact custody")
+-            expected_file_present = storage.exists()
+-            expected_file_size: int | None = None
+-            expected_file_hash: str | None = None
+-            if expected_file_present:
+-                data = storage.read_bytes()
+-                expected_file_size = len(data)
+-                expected_file_hash = content_hash(data)
+-                if record.size_bytes != expected_file_size:
+-                    raise AuditIntegrityError("blob deletion bytes disagree with recorded size")
+-                if record.content_hash is not None and not hmac.compare_digest(record.content_hash, expected_file_hash):
+-                    raise BlobIntegrityError(str(blob_id), expected=record.content_hash, actual=expected_file_hash)
+             operation_token = _blob_operation_path_token(
+                 operation_id=context.fence.operation_id,
+                 operation_epoch=context.fence.operation_epoch,
+diff --git a/src/elspeth/web/composer/tool_batch.py b/src/elspeth/web/composer/tool_batch.py
+index 792990065..0ca6f1af2 100644
+--- a/src/elspeth/web/composer/tool_batch.py
++++ b/src/elspeth/web/composer/tool_batch.py
+@@ -174,6 +174,7 @@ from elspeth.web.composer.tools import (
+ )
+ from elspeth.web.composer.tools._common import _candidate_rejection_result, _saved_graph_rejection_result
+ from elspeth.web.composer.tools._registry import resolve_tool_effects, response_contract_for
++from elspeth.web.composer.tools.blobs import admit_blob_mutation
+ from elspeth.web.composer.tools.declarations import EffectDomain
+ from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, _admit_source_proof_claims
+ from elspeth.web.composer.tools.sessions import ADVISOR_TRIGGER_CANNOT_COMPLETE, RequestAdvisorHintArgumentsModel
+@@ -2088,6 +2089,46 @@ async def run_tool_batch(
+                             redacted_arguments = None
+ 
+             proposal_redacted_arguments = redacted_arguments
++            if redacted_arguments is not None and tool_name in {"update_blob", "delete_blob"}:
++                try:
++                    blob_admission = await run_sync_in_worker(
++                        admit_blob_mutation,
++                        tool_name,
++                        arguments,
++                        state,
++                        ToolContext(
++                            catalog=ctx.policy_catalog,
++                            plugin_snapshot=ctx.plugin_snapshot,
++                            data_dir=ctx.custody.data_dir,
++                            require_data_dir_for_paths=True,
++                            session_engine=ctx.custody.session_engine,
++                            session_id=session_id,
++                            session_operation_context=ctx.session_operation_context,
++                            session_operation_authority=ctx.session_operation_authority,
++                            max_blob_storage_per_session_bytes=ctx.custody.max_blob_storage_per_session_bytes,
++                            user_message_id=user_message_id,
++                            user_message_content=user_message_content,
++                            composer_model_identifier=ctx.provenance.model_identifier,
++                            composer_model_version=provider_model_version,
++                            composer_provider=ctx.provenance.provider or "unknown",
++                            composer_skill_hash=ctx.provenance.skill_hash,
++                            tool_arguments_hash=audit.binding_arguments_hash,
++                        ),
++                    )
++                    if blob_admission is not None:
++                        unapplied_admission = _unapplied_admission(
++                            blob_admission,
++                            "refused",
++                            state=state,
++                            validation=last_validation
++                            if last_validation is not None
++                            else ctx.policy_catalog.validate_composition_state(state).validation,
++                            runtime_preflight=last_runtime_preflight,
++                        )
++                        proposal_redacted_arguments = None
++                except BaseException as exc:
++                    preproposal_exception = exc
++                    proposal_redacted_arguments = None
+             if (
+                 redacted_arguments is not None
+                 and tool_name != "set_pipeline"
+diff --git a/src/elspeth/web/composer/tools/blobs.py b/src/elspeth/web/composer/tools/blobs.py
+index a932d6472..1d549d396 100644
+--- a/src/elspeth/web/composer/tools/blobs.py
++++ b/src/elspeth/web/composer/tools/blobs.py
+@@ -1691,6 +1691,145 @@ _CREATE_BLOB_DECLARATION = ToolDeclaration(
+ )
+ 
+ 
++def _validated_blob_update(arguments: object) -> UpdateBlobArgumentsModel:
++    try:
++        return UpdateBlobArgumentsModel.model_validate(arguments)
++    except PydanticValidationError as exc:
++        raise ToolArgumentError(
++            argument="update_blob arguments",
++            expected="object conforming to UpdateBlobArgumentsModel",
++            actual_type=type(exc).__name__,
++            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
++        ) from exc
++
++
++def _blob_update_bytes(validated: UpdateBlobArgumentsModel) -> bytes:
++    try:
++        return validated.content.encode("utf-8")
++    except UnicodeEncodeError as exc:
++        raise ToolArgumentError(
++            argument="update_blob content",
++            expected="valid UTF-8 text",
++            actual_type=type(exc).__name__,
++        ) from exc
++
++
++def _blob_replacement_record(
++    expected: BlobRecord, content_bytes: bytes, provenance: _BlobCreationProvenance, context: ToolContext
++) -> BlobRecord:
++    return replace(
++        expected,
++        size_bytes=len(content_bytes),
++        content_hash=content_hash(content_bytes),
++        creation_modality=provenance.creation_modality,
++        created_from_message_id=_blob_provenance_message_id(context.user_message_id),
++        creating_model_identifier=provenance.creating_model_identifier,
++        creating_model_version=provenance.creating_model_version,
++        creating_provider=provenance.creating_provider,
++        creating_composer_skill_hash=provenance.creating_composer_skill_hash,
++        creating_arguments_hash=provenance.creating_arguments_hash,
++    )
++
++
++def admit_blob_mutation(tool_name: str, arguments: object, state: CompositionState, context: ToolContext) -> ToolResult | None:
++    """Observe update/delete prerequisites without invoking either effect handler.
++
++    None means stageable admission, including identical content. Only an
++    actual refusal produces feedback; acceptance repeats every prerequisite.
++    """
++    from elspeth.web.blobs.replacement import BlobReplacementCoordinator
++
++    if tool_name not in {"update_blob", "delete_blob"}:
++        raise ValueError("blob admission requires update_blob or delete_blob")
++    deleting = tool_name == "delete_blob"
++    deletion_arguments = _validate_mutation_arguments(BlobIdArgumentsModel, arguments, "delete_blob arguments") if deleting else None
++    if context.session_engine is None or context.session_id is None:
++        return _failure_result(state, "Blob tools require session context.")
++    if context.data_dir is None:
++        return _failure_result(state, "Blob tools require data_dir for storage.")
++    if deletion_arguments is not None:
++        blob_id = deletion_arguments.blob_id
++        update_arguments = None
++    else:
++        update_arguments = _validated_blob_update(arguments)
++        blob_id = update_arguments.blob_id
++    blob_id_error = _blob_id_uuid_validation_error(blob_id)
++    if blob_id_error is not None:
++        return _failure_result(state, blob_id_error)
++    content_bytes = _blob_update_bytes(update_arguments) if update_arguments is not None else None
++    authority, operation = _require_blob_tool_authority(context)
++    provenance = _blob_creation_provenance(update_arguments.content, context) if update_arguments is not None else None
++    if context.executing_proposal_id is not None:
++        raise AuditIntegrityError("proposal preview cannot invent a retention exclusion")
++    with _blob_custody_session_lock(context.session_engine, context.session_id):
++        observed = authority.mutate(
++            operation,
++            lambda transaction: transaction.blobs.inspect_blob_mutation(
++                blob_id=UUID(blob_id), tool_name="delete_blob" if deleting else "update_blob"
++            ),
++        )
++        service = BlobServiceImpl(context.session_engine, Path(context.data_dir), session_operation_authority=authority)
++        driver = BlobReplacementCoordinator(
++            engine=context.session_engine, data_dir=Path(context.data_dir), session_operation_authority=authority
++        )
++        if observed.deletion is not None or observed.replacement is not None:
++            if observed.deletion is not None:
++                service._require_blob_deletion_recovery_content(observed.deletion)
++            if observed.replacement is not None:
++                with driver._directory(observed.replacement.session_id) as directory_fd:
++                    driver._require_recovery_content(observed.replacement, directory_fd)
++            current = authority.mutate(
++                operation,
++                lambda transaction: transaction.blobs.inspect_blob_mutation(
++                    blob_id=UUID(blob_id), tool_name="delete_blob" if deleting else "update_blob"
++                ),
++            )
++            if current != observed:
++                raise AuditIntegrityError("blob recovery evidence changed during admission")
++            return _failure_result(state, f"Blob '{blob_id}' requires recovery before another mutation can be proposed.")
++        expected = observed.blob
++        if expected is None:
++            return _failure_result(state, f"Blob '{blob_id}' not found.")
++        if expected.status != "ready":
++            return _failure_result(state, f"Blob '{blob_id}' is not ready and cannot be proposed for mutation.")
++        if _state_references_blob(state, blob_id, expected.storage_path):
++            return _failure_result(
++                state,
++                f"Blob '{blob_id}' is referenced by the current composition and cannot be {'deleted' if deleting else 'updated'}; unbind it first.",
++            )
++        try:
++            if deleting:
++                present, size, digest = service._observe_blob_deletion_content(expected)
++                authority.mutate(
++                    operation,
++                    lambda transaction: transaction.blobs.admit_blob_deletion(
++                        expected=expected,
++                        expected_file_present=present,
++                        expected_file_size=size,
++                        expected_file_hash=digest,
++                        accepting_proposal_id=None,
++                    ),
++                )
++            else:
++                if content_bytes is None or provenance is None:
++                    raise AuditIntegrityError("blob update admission lost prepared content or provenance")
++                replacement = _blob_replacement_record(expected, content_bytes, provenance, context)
++                with driver._directory(expected.session_id) as directory_fd:
++                    driver._require_canonical_replacement_content(expected, directory_fd)
++                authority.mutate(
++                    operation,
++                    lambda transaction: transaction.blobs.admit_blob_replacement(
++                        expected=expected,
++                        replacement=replacement,
++                        max_storage_per_session=_resolve_blob_quota_bytes(context.max_blob_storage_per_session_bytes),
++                        accepting_proposal_id=None,
++                    ),
++                )
++        except (BlobActiveRunError, BlobPendingProposalError, BlobInProgressForkError, BlobQuotaExceededError, BlobStateError) as exc:
++            return _failure_result(state, str(exc))
++    return None
++
++
+ def _execute_update_blob(
+     arguments: dict[str, Any],
+     state: CompositionState,
+@@ -1704,26 +1843,11 @@ def _execute_update_blob(
+         return _failure_result(state, "Blob tools require session context.")
+     if context.data_dir is None:
+         return _failure_result(state, "Blob tools require data_dir for storage.")
+-    try:
+-        validated = UpdateBlobArgumentsModel.model_validate(arguments)
+-    except PydanticValidationError as exc:
+-        raise ToolArgumentError(
+-            argument="update_blob arguments",
+-            expected="object conforming to UpdateBlobArgumentsModel",
+-            actual_type=type(exc).__name__,
+-            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
+-        ) from exc
++    validated = _validated_blob_update(arguments)
+     blob_id_error = _blob_id_uuid_validation_error(validated.blob_id)
+     if blob_id_error is not None:
+         return _failure_result(state, blob_id_error)
+-    try:
+-        content_bytes = validated.content.encode("utf-8")
+-    except UnicodeEncodeError as exc:
+-        raise ToolArgumentError(
+-            argument="update_blob content",
+-            expected="valid UTF-8 text",
+-            actual_type=type(exc).__name__,
+-        ) from exc
++    content_bytes = _blob_update_bytes(validated)
+     authority, operation = _require_blob_tool_authority(context)
+     provenance = _blob_creation_provenance(validated.content, context)
+     driver = BlobReplacementCoordinator(
+@@ -1743,18 +1867,7 @@ def _execute_update_blob(
+                 state,
+                 f"Blob '{validated.blob_id}' is referenced by the current composition and cannot be updated; unbind it first.",
+             )
+-        replacement = replace(
+-            expected,
+-            size_bytes=len(content_bytes),
+-            content_hash=content_hash(content_bytes),
+-            creation_modality=provenance.creation_modality,
+-            created_from_message_id=_blob_provenance_message_id(context.user_message_id),
+-            creating_model_identifier=provenance.creating_model_identifier,
+-            creating_model_version=provenance.creating_model_version,
+-            creating_provider=provenance.creating_provider,
+-            creating_composer_skill_hash=provenance.creating_composer_skill_hash,
+-            creating_arguments_hash=provenance.creating_arguments_hash,
+-        )
++        replacement = _blob_replacement_record(expected, content_bytes, provenance, context)
+         result = driver.replace_blob(
+             expected=expected,
+             replacement=replacement,
+diff --git a/src/elspeth/web/coordination/repository.py b/src/elspeth/web/coordination/repository.py
+index d0cb890c2..27cd274da 100644
+--- a/src/elspeth/web/coordination/repository.py
++++ b/src/elspeth/web/coordination/repository.py
+@@ -33,6 +33,7 @@ from elspeth.contracts.blobs import (
+     BlobCreationObligation,
+     BlobDeletionPlan,
+     BlobInProgressForkError,
++    BlobMutationObservation,
+     BlobPendingProposalError,
+     BlobRecord,
+     BlobReplacementPlan,
+@@ -2120,6 +2121,121 @@ class _RepositoryBlobMutations:
+         self._require_operation_kinds(_BLOB_READ_OPERATION_KINDS)
+         return self._blob_record(state._require_blob(blob_id))
+ 
++    def inspect_blob_mutation(self, *, blob_id: UUID, tool_name: Literal["update_blob", "delete_blob"]) -> BlobMutationObservation:
++        """Read both ledgers and phase-consistent metadata without recovery."""
++        state = self.__state
++        state._require_active()
++        if tool_name == "update_blob":
++            self._require_operation_kinds(_BLOB_REPLACEMENT_OPERATION_KINDS)
++        elif tool_name == "delete_blob":
++            self._require_operation_kinds(_BLOB_DELETION_OPERATION_KINDS)
++        else:
++            raise ValueError("blob admission requires update_blob or delete_blob")
++        # Preserve global deletion-before-replacement lock order, including
++        # the atomic producer's all-NULL schema before qualified parsing.
++        atomic = self.read_atomic_blob_deletion(blob_id=blob_id)
++        deletion = atomic if atomic is not None else self._read_blob_deletion_locked(blob_id=blob_id)
++        replacement = self._read_blob_replacement_locked(blob_id=blob_id)
++        if deletion is not None and replacement is not None:
++            raise AuditIntegrityError("blob has mutually exclusive deletion and replacement ledgers")
++        row = (
++            _resolve_mutation_connection(state._connection_token)
++            .execute(
++                select(blobs_table).where(blobs_table.c.id == str(blob_id), blobs_table.c.session_id == state._session_id).with_for_update()
++            )
++            .one_or_none()
++        )
++        blob = self._blob_record(row) if row is not None else None
++        if replacement is not None:
++            replacement.require_current_metadata(blob)
++        return BlobMutationObservation(blob=blob, deletion=deletion, replacement=replacement)
++
++    def _require_blob_mutation_exclusion(self, accepting_proposal_id: UUID | None, *, replacement: bool) -> None:
++        context = self._require_operation_kinds(_BLOB_REPLACEMENT_OPERATION_KINDS if replacement else _BLOB_DELETION_OPERATION_KINDS)
++        if context.operation_kind is SessionOperationKind.PROPOSAL:
++            if type(accepting_proposal_id) is not UUID:
++                raise AuditIntegrityError("proposal blob mutation requires an exact accepting proposal identity")
++        elif accepting_proposal_id is not None:
++            raise AuditIntegrityError("non-proposal blob mutation cannot exclude proposal retention")
++
++    def _require_blob_replacement_prerequisites(
++        self, *, expected: BlobRecord, replacement: BlobRecord, max_storage_per_session: int, accepting_proposal_id: UUID | None
++    ) -> BlobRecord:
++        state = self.__state
++        actual = self._blob_record(state._require_blob(expected.id))
++        if actual != expected:
++            raise AuditIntegrityError("ready blob metadata changed before replacement intent")
++        if actual.status != "ready" or actual.content_hash is None:
++            raise AuditIntegrityError("blob replacement requires ready metadata with a content hash")
++        immutable_projection = (
++            ("id", replacement.id, expected.id),
++            ("session_id", replacement.session_id, expected.session_id),
++            ("filename", replacement.filename, expected.filename),
++            ("mime_type", replacement.mime_type, expected.mime_type),
++            ("storage_path", replacement.storage_path, expected.storage_path),
++            ("created_at", replacement.created_at, expected.created_at),
++            ("created_by", replacement.created_by, expected.created_by),
++            ("source_description", replacement.source_description, expected.source_description),
++            ("status", replacement.status, expected.status),
++        )
++        for field_name, replacement_value, expected_value in immutable_projection:
++            if replacement_value != expected_value:
++                raise AuditIntegrityError(f"blob replacement changed immutable field {field_name}")
++        if replacement.content_hash is None or type(replacement.size_bytes) is not int or replacement.size_bytes < 0:
++            raise AuditIntegrityError("blob replacement requires exact proposed size and content hash")
++        self._require_blob_replacement_retention_and_quota(
++            actual, replacement=replacement, max_storage_per_session=max_storage_per_session, accepting_proposal_id=accepting_proposal_id
++        )
++        return actual
++
++    def _require_blob_replacement_retention_and_quota(
++        self, actual: BlobRecord, *, replacement: BlobRecord, max_storage_per_session: int, accepting_proposal_id: UUID | None
++    ) -> None:
++        state = self.__state
++        self._require_blob_deletion_retention_clear(
++            actual,
++            accepting_proposal_id=accepting_proposal_id,
++            accepting_tool_name="update_blob" if accepting_proposal_id is not None else None,
++        )
++        connection = _resolve_mutation_connection(state._connection_token)
++        current_total = session_storage_bytes_on_connection(connection, session_id=state._session_id)
++        if type(current_total) is not int:
++            raise AuditIntegrityError("Tier 1: blob quota total must be an exact integer")
++        if current_total - actual.size_bytes + replacement.size_bytes > max_storage_per_session:
++            from elspeth.contracts.blobs import BlobQuotaExceededError
++
++            raise BlobQuotaExceededError(state._session_id, current_bytes=current_total, limit_bytes=max_storage_per_session)
++        RepositoryQuotaAuthority.admit_storage_bytes(
++            state._connection_token,
++            session_id=state._session_id,
++            additional_bytes=replacement.size_bytes - actual.size_bytes,
++            operation="blob_replacement",
++            record=state._quota_exceeded_recorder,
++        )
++
++    def admit_blob_replacement(
++        self, *, expected: BlobRecord, replacement: BlobRecord, max_storage_per_session: int, accepting_proposal_id: UUID | None
++    ) -> None:
++        """Check fresh replacement prerequisites, without preparing an intent."""
++        state = self.__state
++        state._require_active()
++        self._require_blob_mutation_exclusion(accepting_proposal_id, replacement=True)
++        if type(expected) is not BlobRecord or type(replacement) is not BlobRecord:
++            raise TypeError("expected and replacement must be exact BlobRecord values")
++        if type(max_storage_per_session) is not int or max_storage_per_session < 0:
++            raise TypeError("max_storage_per_session must be a non-negative exact integer")
++        if str(expected.session_id) != state._session_id or replacement.session_id != expected.session_id:
++            raise SessionDerivedCustodyError
++        observation = self.inspect_blob_mutation(blob_id=expected.id, tool_name="update_blob")
++        if observation.deletion is not None or observation.replacement is not None:
++            raise AuditIntegrityError("blob debt changed during fresh replacement admission")
++        self._require_blob_replacement_prerequisites(
++            expected=expected,
++            replacement=replacement,
++            max_storage_per_session=max_storage_per_session,
++            accepting_proposal_id=accepting_proposal_id,
++        )
++
+     @staticmethod
+     def _blob_replacement_snapshot(record: BlobRecord) -> BlobSnapshotPayload:
+         # One projection for receipts and the replacement ledger: a divergent
+@@ -2322,48 +2438,14 @@ class _RepositoryBlobMutations:
+                 raise AuditIntegrityError("a different blob replacement invocation is already in progress")
+             return existing
+ 
+-        actual = self._blob_record(state._require_blob(expected.id))
+-        if actual != expected:
+-            raise AuditIntegrityError("ready blob metadata changed before replacement intent")
+-        if actual.status != "ready" or actual.content_hash is None:
+-            raise AuditIntegrityError("blob replacement requires ready metadata with a content hash")
+-        immutable_projection = (
+-            ("id", replacement.id, expected.id),
+-            ("session_id", replacement.session_id, expected.session_id),
+-            ("filename", replacement.filename, expected.filename),
+-            ("mime_type", replacement.mime_type, expected.mime_type),
+-            ("storage_path", replacement.storage_path, expected.storage_path),
+-            ("created_at", replacement.created_at, expected.created_at),
+-            ("created_by", replacement.created_by, expected.created_by),
+-            ("source_description", replacement.source_description, expected.source_description),
+-            ("status", replacement.status, expected.status),
+-        )
+-        for field_name, replacement_value, expected_value in immutable_projection:
+-            if replacement_value != expected_value:
+-                raise AuditIntegrityError(f"blob replacement changed immutable field {field_name}")
+-        if replacement.content_hash is None or type(replacement.size_bytes) is not int or replacement.size_bytes < 0:
+-            raise AuditIntegrityError("blob replacement requires exact proposed size and content hash")
+-        self._require_blob_deletion_retention_clear(
+-            actual,
++        self._require_blob_replacement_prerequisites(
++            expected=expected,
++            replacement=replacement,
++            max_storage_per_session=max_storage_per_session,
+             accepting_proposal_id=accepting_proposal_id,
+-            accepting_tool_name="update_blob" if accepting_proposal_id is not None else None,
+-        )
+-        connection = _resolve_mutation_connection(state._connection_token)
+-        current_total = session_storage_bytes_on_connection(connection, session_id=state._session_id)
+-        if type(current_total) is not int:
+-            raise AuditIntegrityError("Tier 1: blob quota total must be an exact integer")
+-        if current_total - actual.size_bytes + replacement.size_bytes > max_storage_per_session:
+-            from elspeth.contracts.blobs import BlobQuotaExceededError
+-
+-            raise BlobQuotaExceededError(state._session_id, current_bytes=current_total, limit_bytes=max_storage_per_session)
+-        RepositoryQuotaAuthority.admit_storage_bytes(
+-            state._connection_token,
+-            session_id=state._session_id,
+-            additional_bytes=replacement.size_bytes - actual.size_bytes,
+-            operation="blob_replacement",
+-            record=state._quota_exceeded_recorder,
+         )
+ 
++        connection = _resolve_mutation_connection(state._connection_token)
+         owner_instance_id = connection.execute(
+             select(session_operation_fences_table.c.owner_instance_id)
+             .where(
+@@ -2500,26 +2582,13 @@ class _RepositoryBlobMutations:
+         actual = self._blob_record(state._require_blob(exact.blob_id))
+         if actual != exact.old_blob:
+             raise AuditIntegrityError("blob metadata changed before replacement commit")
+-        self._require_blob_deletion_retention_clear(
++        self._require_blob_replacement_retention_and_quota(
+             actual,
++            replacement=exact.replacement_blob,
++            max_storage_per_session=max_storage_per_session,
+             accepting_proposal_id=accepting_proposal_id,
+-            accepting_tool_name="update_blob" if accepting_proposal_id is not None else None,
+         )
+         connection = _resolve_mutation_connection(state._connection_token)
+-        current_total = session_storage_bytes_on_connection(connection, session_id=state._session_id)
+-        if type(current_total) is not int:
+-            raise AuditIntegrityError("Tier 1: blob quota total must be an exact integer")
+-        if current_total - actual.size_bytes + exact.replacement_blob.size_bytes > max_storage_per_session:
+-            from elspeth.contracts.blobs import BlobQuotaExceededError
+-
+-            raise BlobQuotaExceededError(state._session_id, current_bytes=current_total, limit_bytes=max_storage_per_session)
+-        RepositoryQuotaAuthority.admit_storage_bytes(
+-            state._connection_token,
+-            session_id=state._session_id,
+-            additional_bytes=exact.replacement_blob.size_bytes - actual.size_bytes,
+-            operation="blob_replacement",
+-            record=state._quota_exceeded_recorder,
+-        )
+         advanced = connection.execute(
+             update(blob_replacement_cleanups_table)
+             .where(and_(*self._blob_replacement_plan_predicates(exact)))
+@@ -3254,6 +3323,62 @@ class _RepositoryBlobMutations:
+             )
+         )
+ 
++    def _require_blob_deletion_prerequisites(
++        self,
++        *,
++        blob: BlobRecord,
++        blob_snapshot_hash: str,
++        expected_file_present: bool,
++        expected_file_size: int | None,
++        expected_file_hash: str | None,
++        accepting_proposal_id: UUID | None,
++    ) -> None:
++        self._require_blob_deletion_retention_clear(
++            blob,
++            accepting_proposal_id=accepting_proposal_id,
++            accepting_tool_name="delete_blob" if accepting_proposal_id is not None else None,
++        )
++        if blob_record_snapshot_hash(blob) != blob_snapshot_hash:
++            raise AuditIntegrityError("blob metadata changed before deletion intent admission")
++        if expected_file_present:
++            if expected_file_size != blob.size_bytes:
++                raise AuditIntegrityError("blob deletion file size evidence does not match metadata")
++            if blob.content_hash is not None and expected_file_hash != blob.content_hash:
++                raise AuditIntegrityError("blob deletion file hash evidence does not match metadata")
++        elif expected_file_size is not None or expected_file_hash is not None:
++            raise AuditIntegrityError("absent blob deletion file evidence cannot carry size or hash")
++        BlobDeletionPlan.require_file_evidence(expected_file_present, expected_file_size, expected_file_hash)
++
++    def admit_blob_deletion(
++        self,
++        *,
++        expected: BlobRecord,
++        expected_file_present: bool,
++        expected_file_size: int | None,
++        expected_file_hash: str | None,
++        accepting_proposal_id: UUID | None,
++    ) -> None:
++        """Check exact observed deletion evidence without creating a ledger."""
++        state = self.__state
++        state._require_active()
++        self._require_blob_mutation_exclusion(accepting_proposal_id, replacement=False)
++        if type(expected) is not BlobRecord:
++            raise TypeError("expected must be an exact BlobRecord")
++        if str(expected.session_id) != state._session_id:
++            raise SessionDerivedCustodyError
++        observation = self.inspect_blob_mutation(blob_id=expected.id, tool_name="delete_blob")
++        if observation.deletion is not None or observation.replacement is not None:
++            raise AuditIntegrityError("blob debt changed during fresh deletion admission")
++        blob = self._blob_record(state._require_blob(expected.id))
++        self._require_blob_deletion_prerequisites(
++            blob=blob,
++            blob_snapshot_hash=blob_record_snapshot_hash(expected),
++            expected_file_present=expected_file_present,
++            expected_file_size=expected_file_size,
++            expected_file_hash=expected_file_hash,
++            accepting_proposal_id=accepting_proposal_id,
++        )
++
+     def prepare_blob_deletion(
+         self,
+         *,
+@@ -3284,20 +3409,14 @@ class _RepositoryBlobMutations:
+             return existing
+ 
+         blob = self._blob_record(state._require_blob(blob_id))
+-        self._require_blob_deletion_retention_clear(
+-            blob,
++        self._require_blob_deletion_prerequisites(
++            blob=blob,
++            blob_snapshot_hash=blob_snapshot_hash,
++            expected_file_present=expected_file_present,
++            expected_file_size=expected_file_size,
++            expected_file_hash=expected_file_hash,
+             accepting_proposal_id=accepting_proposal_id,
+-            accepting_tool_name="delete_blob" if accepting_proposal_id is not None else None,
+         )
+-        if blob_record_snapshot_hash(blob) != blob_snapshot_hash:
+-            raise AuditIntegrityError("blob metadata changed before deletion intent admission")
+-        if expected_file_present:
+-            if expected_file_size != blob.size_bytes:
+-                raise AuditIntegrityError("blob deletion file size evidence does not match metadata")
+-            if blob.content_hash is not None and expected_file_hash != blob.content_hash:
+-                raise AuditIntegrityError("blob deletion file hash evidence does not match metadata")
+-        elif expected_file_size is not None or expected_file_hash is not None:
+-            raise AuditIntegrityError("absent blob deletion file evidence cannot carry size or hash")
+         created_at = state._database_now
+         candidate = BlobDeletionPlan(
+             blob_id=blob_id,
+diff --git a/src/elspeth/web/sessions/protocol.py b/src/elspeth/web/sessions/protocol.py
+index 8a8f9404a..21f6eb7c0 100644
+--- a/src/elspeth/web/sessions/protocol.py
++++ b/src/elspeth/web/sessions/protocol.py
+@@ -25,6 +25,7 @@ from elspeth.contracts.blobs import (
+     BlobCreationObligation,
+     BlobDeletionPlan,
+     BlobForkPlanEntry,
++    BlobMutationObservation,
+     BlobRecord,
+     BlobReplacementPlan,
+     BlobRunLinkDirection,
+@@ -2169,6 +2170,22 @@ class SessionOperationBlobMutations(Protocol):
+ 
+     def read_blob(self, *, blob_id: UUID) -> BlobRecord: ...
+ 
++    def inspect_blob_mutation(self, *, blob_id: UUID, tool_name: Literal["update_blob", "delete_blob"]) -> BlobMutationObservation: ...
++
++    def admit_blob_replacement(
++        self, *, expected: BlobRecord, replacement: BlobRecord, max_storage_per_session: int, accepting_proposal_id: UUID | None
++    ) -> None: ...
++
++    def admit_blob_deletion(
++        self,
++        *,
++        expected: BlobRecord,
++        expected_file_present: bool,
++        expected_file_size: int | None,
++        expected_file_hash: str | None,
++        accepting_proposal_id: UUID | None,
++    ) -> None: ...
++
+     def prepare_blob_replacement(
+         self,
+         *,
+diff --git a/tests/integration/web/composer/test_freeform_proposal_prevalidation.py b/tests/integration/web/composer/test_freeform_proposal_prevalidation.py
+index 4e7de1205..a387f5717 100644
+--- a/tests/integration/web/composer/test_freeform_proposal_prevalidation.py
++++ b/tests/integration/web/composer/test_freeform_proposal_prevalidation.py
+@@ -1630,7 +1630,9 @@ async def test_unapplied_incremental_feedback_then_repair_stages_once(
+ 
+ 
+ @pytest.mark.asyncio
+-@pytest.mark.parametrize("call_kind", ("noop", "refusal", "argument", "at-cap-noop", "at-cap-refusal", "change", "inline"))
++@pytest.mark.parametrize(
++    "call_kind", ("noop", "refusal", "argument", "at-cap-noop", "at-cap-refusal", "at-cap-blob-refusal", "change", "inline")
++)
+ async def test_proposal_cap_counts_only_admitted_changes(tmp_path: Path, call_kind: str) -> None:
+     harness = _harness(tmp_path)
+     state = _incremental_base_state(tmp_path)
+@@ -1648,6 +1650,8 @@ async def test_proposal_cap_counts_only_admitted_changes(tmp_path: Path, call_ki
+         tool_name, arguments = "set_metadata", {"patch": "invalid"}
+     if call_kind == "inline":
+         tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
++    if call_kind == "at-cap-blob-refusal":
++        tool_name, arguments = "delete_blob", {"blob_id": str(uuid4())}
+     calls.extend({"id": f"call_tail_{i}", "name": tool_name, "arguments": arguments} for i in range(1 if at_cap else 11))
+     llm = _ScriptedLLM(_fake_llm_response(tool_calls=tuple(calls)), _fake_llm_response(content="Done."))
+     with patch.object(harness.service._provider_gateway, "_call_llm", new=llm):
+@@ -2156,7 +2160,10 @@ async def test_canonical_source_order_change_remains_stageable(tmp_path: Path) -
+ 
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize("tool_name", ("update_blob", "delete_blob"))
+-async def test_durable_blob_mutations_are_staged_without_executing_preview(tmp_path: Path, tool_name: str) -> None:
++@pytest.mark.parametrize("content", ("replacement bytes", "original bytes"))
++async def test_durable_blob_mutations_admit_and_stage_without_executing_effect_handler(
++    tmp_path: Path, tool_name: str, content: str
++) -> None:
+     from tests.helpers.session_fences import fenced_operation_context
+ 
+     harness = _harness(tmp_path)
+@@ -2171,7 +2178,7 @@ async def test_durable_blob_mutations_are_staged_without_executing_preview(tmp_p
+         )
+     arguments = {"blob_id": str(blob.id)}
+     if tool_name == "update_blob":
+-        arguments["content"] = "replacement bytes"
++        arguments["content"] = content
+     llm = _ScriptedLLM(_tool_turn("call_durable", tool_name, arguments), _fake_llm_response(content="The blob change awaits approval."))
+     with (
+         patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+@@ -2193,6 +2200,64 @@ async def test_durable_blob_mutations_are_staged_without_executing_preview(tmp_p
+     assert _count_rows(harness.engine, blobs_table) == 1
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "tool_name,refusal",
++    [(tool, refusal) for tool in ("update_blob", "delete_blob") for refusal in ("nonready", "bound", "missing")]
++    + [("update_blob", "quota")],
++)
++async def test_blob_admission_refuses_known_ineligible_effect_once_without_proposal(tmp_path: Path, tool_name: str, refusal: str) -> None:
++    from sqlalchemy import update
++
++    from tests.helpers.session_fences import fenced_operation_context
++
++    harness = _harness(tmp_path)
++    state = _incremental_base_state(tmp_path)
++    with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as operation:
++        blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
++            UUID(harness.session_id), "retained.txt", b"original bytes", "text/plain", session_operation_context=operation
++        )
++    if refusal == "nonready":
++        with harness.engine.begin() as connection:
++            connection.execute(update(blobs_table).where(blobs_table.c.id == str(blob.id)).values(status="pending"))
++    elif refusal == "bound":
++        state = replace(
++            state,
++            sources={
++                name: replace(source, options={**source.options, "path": blob.storage_path}) for name, source in state.sources.items()
++            },
++        )
++    elif refusal == "quota":
++        harness.service._settings = harness.service._settings.model_copy(update={"max_blob_storage_per_session_bytes": 15})
++    arguments = {"blob_id": str(uuid4()) if refusal == "missing" else str(blob.id)}
++    if tool_name == "update_blob":
++        arguments["content"] = "replacement bytes"
++    llm = _ScriptedLLM(
++        _tool_turn("call_refused_blob", tool_name, arguments),
++        _tool_turn("call_repair", "set_metadata", {"patch": {"name": "repaired draft"}}),
++        _fake_llm_response(content="The repair awaits approval."),
++    )
++    with patch.object(harness.service._provider_gateway, "_call_llm", new=llm), _record_phase3_outcomes(harness.service) as batches:
++        result = await harness.service.compose(
++            "Review this blob change.",
++            [],
++            state,
++            session_id=harness.session_id,
++            user_id="proposal-prevalidation-user",
++            user_message_id=harness.user_message_id,
++        )
++    proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
++    assert [proposal.tool_call_id for proposal in proposals] == ["call_repair"]
++    feedback = [message for message in llm.message_snapshots[1] if message.get("tool_call_id") == "call_refused_blob"]
++    assert len(feedback) == 1
++    assert json.loads(feedback[0]["content"])["success"] is False
++    outcomes = [outcome for batch in batches for outcome in batch if outcome.call.function.name == tool_name]
++    assert len(outcomes) == 1
++    assert outcomes[0].pre_version == outcomes[0].post_version == state.version
++    assert result.state is state
++    assert Path(blob.storage_path).read_bytes() == b"original bytes"
++
++
+ @pytest.mark.asyncio
+ async def test_inline_same_text_with_new_blob_authority_is_a_real_change(tmp_path: Path) -> None:
+     harness = _harness(tmp_path)
+diff --git a/tests/testcontainer/web/test_blob_mutation_admission_postgres.py b/tests/testcontainer/web/test_blob_mutation_admission_postgres.py
+new file mode 100644
+index 000000000..29481166f
+--- /dev/null
++++ b/tests/testcontainer/web/test_blob_mutation_admission_postgres.py
+@@ -0,0 +1,380 @@
++"""Real PostgreSQL admission contention: custody, live fences and quota policies."""
++
++from __future__ import annotations
++
++import asyncio
++from concurrent.futures import ThreadPoolExecutor
++from dataclasses import replace
++from datetime import UTC, datetime
++from pathlib import Path
++from threading import Event
++from uuid import UUID, uuid4
++
++import pytest
++from sqlalchemy import event, select, update
++from tests.testcontainer.web import test_quota_authority_postgres as quota_fixtures
++from tests.testcontainer.web.test_quota_authority_postgres import _wait_for_database_lock
++from tests.unit.web.auth.test_audit import _durable_recorder, _durable_rows, _metadata
++from tests.unit.web.blobs.test_mutation_admission import _context, _empty_state, _resources
++
++from elspeth.contracts.blobs import blob_record_snapshot_hash
++from elspeth.contracts.errors import AuditIntegrityError
++from elspeth.contracts.session_operation import SessionOperationKind
++from elspeth.web.blobs.replacement import BlobReplacementCoordinator
++from elspeth.web.blobs.service import BlobServiceImpl, _blob_operation_path_token, content_hash
++from elspeth.web.composer.tools.blobs import admit_blob_mutation
++from elspeth.web.coordination.contracts import SessionOperationFenceLost
++from elspeth.web.coordination.repository import PostgresSessionOperationRepository
++from elspeth.web.sessions.engine import create_session_engine
++from elspeth.web.sessions.models import (
++    blob_deletion_cleanups_table,
++    blob_replacement_cleanups_table,
++    chat_messages_table,
++    output_storage_reservations_table,
++    quota_policies_table,
++    session_operation_fences_table,
++)
++
++pytestmark = pytest.mark.testcontainer
++pg_fenced = quota_fixtures.pg_fenced
++
++
++def _setup(fenced, tmp_path):
++    recorder, url = _durable_recorder(tmp_path)
++    repository = PostgresSessionOperationRepository(fenced.engine, quota_exceeded_recorder=recorder.record_quota_exceeded)
++    operation = repository.acquire(
++        session_id=UUID(fenced.session_id),
++        operation_kind=SessionOperationKind.COMPOSE,
++        owner_instance_id="blob-admission",
++        lease_seconds=120,
++    )
++    service = BlobServiceImpl(fenced.engine, tmp_path, session_operation_authority=repository)
++    record = asyncio.run(service.create_blob(UUID(fenced.session_id), "admit.csv", b"old", "text/csv", session_operation_context=operation))
++    message_id = str(uuid4())
++    with fenced.engine.begin() as connection:
++        connection.execute(
++            chat_messages_table.insert().values(
++                id=message_id,
++                session_id=fenced.session_id,
++                role="user",
++                content="new larger",
++                sequence_no=1,
++                writer_principal="route_user_message",
++                created_at=datetime.now(UTC),
++            )
++        )
++    context = replace(_context(service, fenced.engine, operation, tmp_path), user_message_id=message_id)
++    return repository, service, record, context, recorder, url
++
++
++@pytest.mark.parametrize("tool_name", ["update_blob", "delete_blob"])
++def test_postgres_admission_waiter_observes_real_writer_debt_without_allocating(pg_fenced, tmp_path, tool_name):
++    repository, service, record, context, recorder, _url = _setup(pg_fenced, tmp_path)
++    operation = context.session_operation_context
++    arguments = {"blob_id": str(record.id), **({"content": "new"} if tool_name == "update_blob" else {})}
++    before = _resources(pg_fenced.engine, tmp_path / "blobs")
++    assert admit_blob_mutation(tool_name, arguments, _empty_state(), context) is None
++    assert _resources(pg_fenced.engine, tmp_path / "blobs") == before
++    contender_engine = create_session_engine(pg_fenced.engine.url.render_as_string(hide_password=False))
++    contender = PostgresSessionOperationRepository(contender_engine, quota_exceeded_recorder=recorder.record_quota_exceeded)
++    contender_context = replace(context, session_engine=contender_engine, session_operation_authority=contender)
++    writer_entered, release_writer, waiter_started = Event(), Event(), Event()
++    pid = []
++    token = _blob_operation_path_token(
++        operation_id=operation.fence.operation_id, operation_epoch=operation.fence.operation_epoch, operation_kind=operation.operation_kind
++    )
++    replacement_id = uuid4()
++    storage = Path(record.storage_path)
++
++    def hold_intent(transaction):
++        if tool_name == "update_blob":
++            plan = transaction.blobs.prepare_blob_replacement(
++                replacement_id=replacement_id,
++                expected=record,
++                replacement=replace(record, content_hash=content_hash(b"new")),
++                staging_path=str(storage.with_name(f".{record.id}.replace-{token}-{replacement_id}.stage")),
++                backup_path=str(storage.with_name(f".{record.id}.replace-{token}-{replacement_id}.backup")),
++                max_storage_per_session=1000,
++                accepting_proposal_id=None,
++            )
++        else:
++            plan = transaction.blobs.prepare_blob_deletion(
++                blob_id=record.id,
++                tombstone_path=str(storage.with_name(f".{record.id}.delete-{token}")),
++                blob_snapshot_hash=blob_record_snapshot_hash(record),
++                expected_file_present=True,
++                expected_file_size=record.size_bytes,
++                expected_file_hash=record.content_hash,
++                accepting_proposal_id=None,
++            )
++        writer_entered.set()
++        assert release_writer.wait(10)
++        return plan
++
++    def observe_waiter(connection, _cursor, statement, _parameters, _execution, _many):
++        if "pg_advisory_xact_lock" in statement and not pid:
++            pid.append(connection.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
++            waiter_started.set()
++
++    event.listen(contender_engine, "before_cursor_execute", observe_waiter)
++    try:
++        with ThreadPoolExecutor(max_workers=2) as workers:
++            writer = workers.submit(repository.mutate, operation, hold_intent)
++            assert writer_entered.wait(5)
++            waiter = workers.submit(admit_blob_mutation, tool_name, arguments, _empty_state(), contender_context)
++            try:
++                assert waiter_started.wait(5)
++                _wait_for_database_lock(pg_fenced, pid[0])
++                assert not waiter.done()
++            finally:
++                release_writer.set()
++            plan = writer.result(timeout=5)
++            result = waiter.result(timeout=5)
++        assert result is not None
++        assert not result.success
++        assert any("recovery" in error.message.lower() for error in result.validation.errors)
++        with pg_fenced.engine.connect() as connection:
++            replacements = connection.execute(
++                select(blob_replacement_cleanups_table).where(blob_replacement_cleanups_table.c.blob_id == str(record.id))
++            ).all()
++            deletions = connection.execute(
++                select(blob_deletion_cleanups_table).where(blob_deletion_cleanups_table.c.blob_id == str(record.id))
++            ).all()
++            assert len(replacements) + len(deletions) == 1
++            assert (replacements or deletions)[0].phase == plan.phase == "intent"
++        assert storage.read_bytes() == b"old"
++        if tool_name == "update_blob":
++            BlobReplacementCoordinator(engine=pg_fenced.engine, data_dir=tmp_path, session_operation_authority=repository).reconcile(
++                context=operation
++            )
++        else:
++            asyncio.run(service.delete_blob(record.id, session_operation_context=operation))
++    finally:
++        release_writer.set()
++        event.remove(contender_engine, "before_cursor_execute", observe_waiter)
++        contender_engine.dispose()
++        recorder.close()
++
++
++@pytest.mark.parametrize("race", ["expiry", "metadata"])
++def test_postgres_admission_releases_sessions_during_file_io_and_rechecks(pg_fenced, tmp_path, monkeypatch, race):
++    repository, _service, record, context, recorder, _url = _setup(pg_fenced, tmp_path)
++    entered, resume = Event(), Event()
++    original = BlobReplacementCoordinator._read_bytes
++
++    def pause(path, directory_fd):
++        entered.set()
++        assert resume.wait(10)
++        return original(path, directory_fd)
++
++    monkeypatch.setattr(BlobReplacementCoordinator, "_read_bytes", staticmethod(pause))
++    from elspeth.web.sessions.models import blobs_table
++
++    with ThreadPoolExecutor(max_workers=2) as workers:
++        admission = workers.submit(
++            admit_blob_mutation, "update_blob", {"blob_id": str(record.id), "content": "new"}, _empty_state(), context
++        )
++        try:
++            assert entered.wait(5)
++            # A real renew requires SESSIONS. It must finish while admission is
++            # paused holding BLOB_CUSTODY, proving no DB transaction spans I/O.
++            renewed = workers.submit(repository.renew, context.session_operation_context, lease_seconds=120)
++            assert renewed.result(timeout=2).fence.operation_id == context.session_operation_context.fence.operation_id
++            with pg_fenced.engine.begin() as connection:
++                if race == "expiry":
++                    connection.execute(
++                        update(session_operation_fences_table)
++                        .where(session_operation_fences_table.c.session_id == pg_fenced.session_id)
++                        .values(lease_expires_at=datetime(2000, 1, 1, tzinfo=UTC))
++                    )
++                else:
++                    connection.execute(
++                        update(blobs_table).where(blobs_table.c.id == str(record.id)).values(source_description="changed during read")
++                    )
++        finally:
++            resume.set()
++        with pytest.raises(SessionOperationFenceLost if race == "expiry" else AuditIntegrityError):
++            admission.result(timeout=5)
++    assert Path(record.storage_path).read_bytes() == b"old"
++    with pg_fenced.engine.connect() as connection:
++        assert connection.execute(select(blob_replacement_cleanups_table)).all() == []
++        assert connection.execute(select(blob_deletion_cleanups_table)).all() == []
++    recorder.close()
++
++
++def test_postgres_admission_waiting_on_container_sees_committed_output_reservation(pg_fenced, tmp_path):
++    _repository, _service, record, context, recorder, url = _setup(pg_fenced, tmp_path)
++    from tests.fixtures.identities import ensure_test_identity
++
++    from elspeth.web.sessions.models import composition_states_table, runs_table, sessions_table
++
++    other_session, state_id, run_id = (str(uuid4()) for _ in range(3))
++    now = datetime.now(UTC)
++    with pg_fenced.engine.begin() as connection:
++        ensure_test_identity(connection, identity_id="bob")
++        connection.execute(
++            sessions_table.insert().values(
++                id=other_session, user_id="bob", auth_provider_type="local", title="other owner", created_at=now, updated_at=now
++            )
++        )
++        connection.execute(
++            composition_states_table.insert().values(
++                id=state_id, session_id=other_session, version=1, is_valid=True, provenance="session_seed", created_at=now
++            )
++        )
++        connection.execute(
++            runs_table.insert().values(id=run_id, session_id=other_session, state_id=state_id, status="completed", started_at=now)
++        )
++        connection.execute(
++            quota_policies_table.insert().values(
++                policy_id="container-storage", identity_id=None, storage_bytes=8, set_by_actor="operator", set_at=now
++            )
++        )
++    contender_engine = create_session_engine(pg_fenced.engine.url.render_as_string(hide_password=False))
++    contender = PostgresSessionOperationRepository(contender_engine, quota_exceeded_recorder=recorder.record_quota_exceeded)
++    contender_context = replace(
++        context, session_engine=contender_engine, session_operation_authority=contender, user_message_content="larger"
++    )
++    pid, started = [], Event()
++
++    def observe_waiter(connection, _cursor, statement, _parameters, _execution, _many):
++        if "quota_policies" in statement and "FOR UPDATE" in statement and not pid:
++            pid.append(connection.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
++            started.set()
++
++    event.listen(contender_engine, "before_cursor_execute", observe_waiter)
++    try:
++        # A genuine accepting writer reserves six bytes for another identity
++        # while holding the shared container policy, before admission measures.
++        from elspeth.web.coordination.quota_authority import admit_storage_bytes_on_connection
++
++        with ThreadPoolExecutor(max_workers=1) as workers, pg_fenced.engine.begin() as writer:
++            admit_storage_bytes_on_connection(
++                writer, session_id=other_session, additional_bytes=5, operation="run_output_finalize", record=recorder.record_quota_exceeded
++            )
++            writer.execute(
++                output_storage_reservations_table.insert().values(
++                    target_path=str(tmp_path / "other.csv"),
++                    session_id=other_session,
++                    run_id=run_id,
++                    size_bytes=5,
++                    custody_operation_id="execute-other",
++                    custody_operation_epoch=1,
++                )
++            )
++            admission = workers.submit(
++                admit_blob_mutation, "update_blob", {"blob_id": str(record.id), "content": "larger"}, _empty_state(), contender_context
++            )
++            assert started.wait(5)
++            _wait_for_database_lock(pg_fenced, pid[0])
++            writer.commit()
++            assert admission.result(timeout=5) is not None
++        rows = _durable_rows(url)
++        assert len(rows) == 1
++        payload = _metadata(rows[0])
++        assert (payload["usage"], payload["ceiling"], payload["scope"]) == (8, 8, "container")
++        with pg_fenced.engine.connect() as connection:
++            assert connection.execute(select(output_storage_reservations_table.c.size_bytes)).all() == [(5,)]
++            assert connection.execute(select(blob_replacement_cleanups_table)).all() == []
++        assert Path(record.storage_path).read_bytes() == b"old"
++    finally:
++        event.remove(contender_engine, "before_cursor_execute", observe_waiter)
++        contender_engine.dispose()
++        recorder.close()
++
++
++def test_postgres_real_writer_waits_for_read_only_admission_custody(pg_fenced, tmp_path, monkeypatch):
++    _repository, _service, record, context, recorder, _url = _setup(pg_fenced, tmp_path)
++    entered, resume, writer_started = Event(), Event(), Event()
++    original_read = BlobReplacementCoordinator._read_bytes
++
++    def pause(path, directory_fd):
++        entered.set()
++        assert resume.wait(10)
++        return original_read(path, directory_fd)
++
++    monkeypatch.setattr(BlobReplacementCoordinator, "_read_bytes", staticmethod(pause))
++    writer_engine = create_session_engine(pg_fenced.engine.url.render_as_string(hide_password=False))
++    writer_authority = PostgresSessionOperationRepository(writer_engine, quota_exceeded_recorder=recorder.record_quota_exceeded)
++    writer_service = BlobServiceImpl(writer_engine, tmp_path, session_operation_authority=writer_authority)
++    pid = []
++
++    def observe_writer(connection, _cursor, statement, _parameters, _execution, _many):
++        if "pg_advisory_lock(" in statement and not pid:
++            pid.append(connection.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
++            writer_started.set()
++
++    event.listen(writer_engine, "before_cursor_execute", observe_writer)
++    try:
++        with ThreadPoolExecutor(max_workers=2) as workers:
++            admission = workers.submit(
++                admit_blob_mutation, "update_blob", {"blob_id": str(record.id), "content": "new"}, _empty_state(), context
++            )
++            assert entered.wait(5)
++            writer = workers.submit(
++                asyncio.run, writer_service.delete_blob(record.id, session_operation_context=context.session_operation_context)
++            )
++            try:
++                assert writer_started.wait(5)
++                _wait_for_database_lock(pg_fenced, pid[0])
++                assert not writer.done()
++            finally:
++                resume.set()
++            assert admission.result(timeout=5) is None
++            writer.result(timeout=5)
++        assert not Path(record.storage_path).exists()
++        with pg_fenced.engine.connect() as connection:
++            assert connection.execute(select(blob_deletion_cleanups_table)).all() == []
++            assert connection.execute(select(blob_replacement_cleanups_table)).all() == []
++    finally:
++        resume.set()
++        event.remove(writer_engine, "before_cursor_execute", observe_writer)
++        writer_engine.dispose()
++        recorder.close()
++
++
++def test_postgres_admission_fence_waiter_cannot_read_after_expiry(pg_fenced, tmp_path, monkeypatch):
++    _repository, _service, record, context, recorder, _url = _setup(pg_fenced, tmp_path)
++    contender_engine = create_session_engine(pg_fenced.engine.url.render_as_string(hide_password=False))
++    contender = PostgresSessionOperationRepository(contender_engine, quota_exceeded_recorder=recorder.record_quota_exceeded)
++    contender_context = replace(context, session_engine=contender_engine, session_operation_authority=contender)
++    started, pid = Event(), []
++
++    def observe_waiter(connection, _cursor, statement, _parameters, _execution, _many):
++        if "session_operation_fences" in statement and "FOR UPDATE" in statement and not pid:
++            pid.append(connection.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
++            started.set()
++
++    def forbidden_read(*args, **kwargs):
++        pytest.fail("expired admission reached filesystem content")
++
++    monkeypatch.setattr(BlobReplacementCoordinator, "_read_bytes", forbidden_read)
++    event.listen(contender_engine, "before_cursor_execute", observe_waiter)
++    try:
++        with ThreadPoolExecutor(max_workers=1) as workers, pg_fenced.engine.begin() as blocker:
++            blocker.execute(
++                select(session_operation_fences_table)
++                .where(session_operation_fences_table.c.session_id == pg_fenced.session_id)
++                .with_for_update()
++            ).one()
++            waiter = workers.submit(
++                admit_blob_mutation, "update_blob", {"blob_id": str(record.id), "content": "new"}, _empty_state(), contender_context
++            )
++            assert started.wait(5)
++            _wait_for_database_lock(pg_fenced, pid[0])
++            blocker.execute(
++                update(session_operation_fences_table)
++                .where(session_operation_fences_table.c.session_id == pg_fenced.session_id)
++                .values(lease_expires_at=datetime(2000, 1, 1, tzinfo=UTC))
++            )
++            blocker.commit()
++            with pytest.raises(SessionOperationFenceLost):
++                waiter.result(timeout=5)
++        assert Path(record.storage_path).read_bytes() == b"old"
++        with pg_fenced.engine.connect() as connection:
++            assert connection.execute(select(blob_replacement_cleanups_table)).all() == []
++            assert connection.execute(select(blob_deletion_cleanups_table)).all() == []
++    finally:
++        event.remove(contender_engine, "before_cursor_execute", observe_waiter)
++        contender_engine.dispose()
++        recorder.close()
+diff --git a/tests/unit/architecture/test_session_db_mutation_authority.py b/tests/unit/architecture/test_session_db_mutation_authority.py
+index 21b6825e5..218f27b45 100644
+--- a/tests/unit/architecture/test_session_db_mutation_authority.py
++++ b/tests/unit/architecture/test_session_db_mutation_authority.py
+@@ -1490,7 +1490,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="eeb24b28f3f2ab1c",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=2559,
++        line=2628,
+     ),
+     WriterIdentity(
+         path="src/elspeth/web/coordination/repository.py",
+@@ -1500,7 +1500,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="3d723c4f6c791eec",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3559,
++        line=3678,
+     ),
+     WriterIdentity(
+         path="src/elspeth/web/coordination/repository.py",
+@@ -1510,7 +1510,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="3d723c4f6c791eec",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3561,
++        line=3680,
+     ),
+     WriterIdentity(
+         path="src/elspeth/web/coordination/repository.py",
+@@ -1520,7 +1520,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="8c40ff41aedf8438",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3887,
++        line=4006,
+     ),
+     WriterIdentity(
+         path="src/elspeth/web/coordination/repository.py",
+@@ -1530,7 +1530,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="8c40ff41aedf8438",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3890,
++        line=4009,
+     ),
+     WriterIdentity(
+         path="src/elspeth/web/coordination/repository.py",
+@@ -1540,7 +1540,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="4cfeafb2df7dcb9d",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3895,
++        line=4014,
+     ),
+     WriterIdentity(
+         path="src/elspeth/web/coordination/auth_session_authority.py",
+@@ -1690,7 +1690,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="ceea1c242cbfdb83",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=4291,
++        line=4372,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -1701,7 +1701,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="ceea1c242cbfdb83",
+         ordinal=2,
+         authority="SessionBlobMutationAuthority",
+-        line=4334,
++        line=4415,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -1712,7 +1712,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="ceea1c242cbfdb83",
+         ordinal=3,
+         authority="SessionBlobMutationAuthority",
+-        line=4447,
++        line=4528,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -1723,7 +1723,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="ceea1c242cbfdb83",
+         ordinal=4,
+         authority="SessionBlobMutationAuthority",
+-        line=4371,
++        line=4452,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -1734,7 +1734,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="16da07b191192600",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=4234,
++        line=4315,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -1745,7 +1745,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="16da07b191192600",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=4244,
++        line=4325,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -1756,7 +1756,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="1039c549bf5d962c",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=4263,
++        line=4344,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -1767,7 +1767,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="9adc75e8d72e71ad",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=4266,
++        line=4347,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -1778,7 +1778,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="726caad0e48b0bcc",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=1458,
++        line=1467,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -1789,7 +1789,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="dfb9e7995e5fc483",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=1460,
++        line=1469,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -1800,7 +1800,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="9f94f34df90428d1",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=1431,
++        line=1440,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -1811,7 +1811,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="69ac6eeb2d6a3bb4",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=1441,
++        line=1450,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -1822,7 +1822,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="bb9d60d5e991d99d",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=1317,
++        line=1326,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -1833,7 +1833,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="58557289c6621c6c",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=1353,
++        line=1362,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -1844,7 +1844,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="8269e201d89d7e63",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=2057,
++        line=2066,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -1855,7 +1855,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="c29cebfe705db1ba",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=1893,
++        line=1902,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3252,7 +3252,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="b3fcd50e04854888",
+         ordinal=1,
+         authority="SessionForkChildMutations",
+-        line=4275,
++        line=4394,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3263,7 +3263,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="a20e7856361bd56b",
+         ordinal=1,
+         authority="SessionForkChildMutations",
+-        line=4222,
++        line=4341,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3274,7 +3274,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="93116a46895f86ed",
+         ordinal=1,
+         authority="SessionForkParentReceiptMutations",
+-        line=4404,
++        line=4523,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3285,7 +3285,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="d8e2ea36cf4bd35c",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3699,
++        line=3818,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3296,7 +3296,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="8c66fbb679cf7fa3",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3243,
++        line=3312,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3307,7 +3307,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="4f9e61b1cf7247b0",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3598,
++        line=3717,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3318,7 +3318,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="75415f0d12b7a661",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=2618,
++        line=2687,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3329,7 +3329,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="32bd4fca1428b085",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3511,
++        line=3630,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3340,7 +3340,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="87f41b9adb5c8772",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3518,
++        line=3637,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3351,7 +3351,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="2ecd759927d60392",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=2524,
++        line=2593,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3362,7 +3362,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="d2ea73ee0e8472e4",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=2532,
++        line=2601,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3373,7 +3373,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="0e357be387ddc260",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=2945,
++        line=3014,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3384,7 +3384,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="d2eb84d546dbcdd2",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=2721,
++        line=2790,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3395,7 +3395,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="4c42110eaa7c5994",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=4067,
++        line=4186,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3406,7 +3406,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="05fd90838bf9a030",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3623,
++        line=3742,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3417,7 +3417,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="afe03ed89b5a16c7",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3470,
++        line=3589,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3428,7 +3428,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="3fd8ace829dbb08b",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=2916,
++        line=2985,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3439,7 +3439,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="6128417bd9a69f02",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=2465,
++        line=2547,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3450,7 +3450,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="f7b3307ef1e90c89",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3984,
++        line=4103,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3461,7 +3461,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="a2e525368ada9268",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3956,
++        line=4075,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3472,7 +3472,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="850298970c19565f",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3320,
++        line=3439,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3483,7 +3483,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="bca2ee74a8a93022",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=2402,
++        line=2484,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3494,7 +3494,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="d112eae374c9b904",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=2838,
++        line=2907,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3505,7 +3505,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="d4eba14bc84728e8",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=2791,
++        line=2860,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3516,7 +3516,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="c997a216a1a51351",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=2637,
++        line=2706,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3527,7 +3527,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="d22b3792b721f8ac",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3012,
++        line=3081,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3538,7 +3538,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="2f1a2d64948bf4b7",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3421,
++        line=3540,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3549,7 +3549,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="4f9e61b1cf7247b0",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=3580,
++        line=3699,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3560,7 +3560,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="75415f0d12b7a661",
+         ordinal=1,
+         authority="SessionBlobMutationAuthority",
+-        line=2598,
++        line=2667,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3571,7 +3571,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="b0eb63d6e0d9027b",
+         ordinal=1,
+         authority="SessionComposerMutationAuthority",
+-        line=6110,
++        line=6229,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3582,7 +3582,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="2e42be4b632cb581",
+         ordinal=1,
+         authority="SessionComposerMutationAuthority",
+-        line=6134,
++        line=6253,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3593,7 +3593,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="ac69541fd42b27b5",
+         ordinal=1,
+         authority="SessionMutationAuthority",
+-        line=897,
++        line=898,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3604,7 +3604,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="41c9e2e9e0ed6283",
+         ordinal=1,
+         authority="SessionInterpretationAuthority",
+-        line=1379,
++        line=1380,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3615,7 +3615,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="0a4fa2d4c69e1069",
+         ordinal=1,
+         authority="SessionInterpretationAuthority",
+-        line=1302,
++        line=1303,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3626,7 +3626,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="146bbcd39bedce3b",
+         ordinal=1,
+         authority="SessionInterpretationAuthority",
+-        line=1330,
++        line=1331,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3637,7 +3637,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="b62dec99662793d2",
+         ordinal=1,
+         authority="SessionInterpretationAuthority",
+-        line=1225,
++        line=1226,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3648,7 +3648,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="9cb6f5b7f0c9310b",
+         ordinal=1,
+         authority="SessionInterpretationAuthority",
+-        line=1514,
++        line=1515,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3659,7 +3659,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="b12fb9db66a3bddd",
+         ordinal=1,
+         authority="SessionInterpretationAuthority",
+-        line=1455,
++        line=1456,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3670,7 +3670,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="3966641511f4795d",
+         ordinal=1,
+         authority="SessionInterpretationAuthority",
+-        line=1483,
++        line=1484,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3681,7 +3681,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="569666d773a0b112",
+         ordinal=1,
+         authority="SessionInterpretationAuthority",
+-        line=1572,
++        line=1573,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3692,7 +3692,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="5009526a773c2d16",
+         ordinal=1,
+         authority="SessionRunMutationAuthority",
+-        line=1994,
++        line=1995,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3703,7 +3703,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="ab417310ef40b484",
+         ordinal=1,
+         authority="SessionRunMutationAuthority",
+-        line=1773,
++        line=1774,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3714,7 +3714,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="46b7dd19a3e250fc",
+         ordinal=1,
+         authority="SessionRunMutationAuthority",
+-        line=1695,
++        line=1696,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3725,7 +3725,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="6e3fcabf86bb6ffa",
+         ordinal=1,
+         authority="SessionRunMutationAuthority",
+-        line=1678,
++        line=1679,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3736,7 +3736,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="46b7dd19a3e250fc",
+         ordinal=1,
+         authority="SessionRunMutationAuthority",
+-        line=1699,
++        line=1700,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3747,7 +3747,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="1822dba79eb9ed3d",
+         ordinal=1,
+         authority="SessionRunMutationAuthority",
+-        line=1816,
++        line=1817,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3758,7 +3758,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="6613984de3a26bff",
+         ordinal=1,
+         authority="SessionRunMutationAuthority",
+-        line=1835,
++        line=1836,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3769,7 +3769,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="911ff034cb757589",
+         ordinal=1,
+         authority="SessionRunMutationAuthority",
+-        line=1800,
++        line=1801,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3780,7 +3780,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="f926157e24accee8",
+         ordinal=1,
+         authority="SessionRunMutationAuthority",
+-        line=1895,
++        line=1896,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3791,7 +3791,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="2aec308084effcf4",
+         ordinal=1,
+         authority="SessionMutationAuthority",
+-        line=842,
++        line=843,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3802,7 +3802,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="44e58336446946af",
+         ordinal=1,
+         authority="SessionMutationAuthority",
+-        line=676,
++        line=677,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3813,7 +3813,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="e0386cbdb277f0b0",
+         ordinal=1,
+         authority="SessionMutationAuthority",
+-        line=711,
++        line=712,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3824,7 +3824,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="016ef4c50b5e5390",
+         ordinal=1,
+         authority="SessionMutationAuthority",
+-        line=650,
++        line=651,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3835,7 +3835,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="feed562da5394634",
+         ordinal=1,
+         authority="SessionMutationAuthority",
+-        line=745,
++        line=746,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3846,7 +3846,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="8cf4bc5cc87457bd",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=5110,
++        line=5229,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3857,7 +3857,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="8cf4bc5cc87457bd",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=5118,
++        line=5237,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3868,7 +3868,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="4ad5425d08f127f8",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=4988,
++        line=5107,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3879,7 +3879,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="ff923dcba8b3e8e7",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=5236,
++        line=5355,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3890,7 +3890,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="d5ab9aa3497d191a",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=5639,
++        line=5758,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3901,7 +3901,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="7326f9c03db2a1c7",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=5653,
++        line=5772,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3912,7 +3912,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="b964b22650d92b97",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=5624,
++        line=5743,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3923,7 +3923,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="988ac755147ef9bc",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=5714,
++        line=5833,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3934,7 +3934,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="66cc108182d86009",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=5890,
++        line=6009,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3945,7 +3945,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="3d19f2b10e4f6a34",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=4864,
++        line=4983,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3956,7 +3956,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="3d19f2b10e4f6a34",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=4878,
++        line=4997,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3967,7 +3967,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="3d19f2b10e4f6a34",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=4854,
++        line=4973,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3978,7 +3978,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="7b84539400c1c53a",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=5760,
++        line=5879,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -3989,7 +3989,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="bafc06df8fd8905b",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=5865,
++        line=5984,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -4000,7 +4000,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="bafc06df8fd8905b",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=5855,
++        line=5974,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -4011,7 +4011,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="d41bbaef242667cd",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=5315,
++        line=5434,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -4022,7 +4022,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="d41bbaef242667cd",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=5302,
++        line=5421,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -4033,7 +4033,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+         fingerprint="b268c9591db479c5",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=5419,
++        line=5538,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -4984,7 +4984,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         fingerprint="990aa332b8773eb8",
+         ordinal=1,
+         authority=None,
+-        line=3944,
++        line=4025,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -4995,7 +4995,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         fingerprint="4536b6d6104a3575",
+         ordinal=1,
+         authority=None,
+-        line=4153,
++        line=4234,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -5006,7 +5006,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         fingerprint="3a607d21bd66351e",
+         ordinal=1,
+         authority=None,
+-        line=4028,
++        line=4109,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -5017,7 +5017,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         fingerprint="793b2531e21a4ec2",
+         ordinal=1,
+         authority=None,
+-        line=3530,
++        line=3611,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -5028,7 +5028,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         fingerprint="4fa518a6c8ccdf63",
+         ordinal=1,
+         authority=None,
+-        line=2865,
++        line=2874,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -5039,7 +5039,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         fingerprint="ef84064b21eb8128",
+         ordinal=1,
+         authority=None,
+-        line=1796,
++        line=1805,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -5479,7 +5479,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         fingerprint="f98bc6d74193a045",
+         ordinal=1,
+         authority="SessionOperationAuthority",
+-        line=4909,
++        line=5028,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+diff --git a/tests/unit/web/blobs/test_mutation_admission.py b/tests/unit/web/blobs/test_mutation_admission.py
+new file mode 100644
+index 000000000..bb7485e2c
+--- /dev/null
++++ b/tests/unit/web/blobs/test_mutation_admission.py
+@@ -0,0 +1,950 @@
++"""Non-writing Composer blob admission through real custody and fence authority."""
++
++from __future__ import annotations
++
++import os
++from collections.abc import Callable
++from dataclasses import replace
++from datetime import UTC, datetime, timedelta
++from pathlib import Path
++from typing import Any
++from uuid import UUID, uuid4
++
++import pytest
++from sqlalchemy import Engine, select, update
++
++from elspeth.contracts.blobs import BlobDeletionPlan, BlobIntegrityError, BlobReplacementPlan
++from elspeth.contracts.errors import AuditIntegrityError
++from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
++from elspeth.web.blobs import replacement as replacement_module
++from elspeth.web.blobs import service as service_module
++from elspeth.web.blobs.replacement import BlobReplacementCoordinator
++from elspeth.web.blobs.service import BlobServiceImpl
++from elspeth.web.catalog.policy_view import PolicyCatalogView
++from elspeth.web.composer.tools import blobs
++from elspeth.web.composer.tools._common import ToolContext
++from elspeth.web.coordination.contracts import SessionOperationFenceLost
++from elspeth.web.coordination.repository import _RepositoryBlobMutations
++from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
++from elspeth.web.sessions.models import (
++    blob_deletion_cleanups_table,
++    blob_inline_resolutions_table,
++    blob_replacement_cleanups_table,
++    blob_run_links_table,
++    blobs_table,
++    chat_messages_table,
++    output_storage_reservations_table,
++    proposal_blob_effect_receipts_table,
++    session_operation_fences_table,
++    session_operation_receipts_table,
++)
++from tests.helpers.session_fences import seed_live_operation_context
++from tests.unit.web.blobs import test_service as service_fixtures
++from tests.unit.web.blobs.test_atomic_deletion_recovery import _fork_cleanup_obligation
++from tests.unit.web.blobs.test_composer_replacement_recovery import _proposed_record
++from tests.unit.web.composer.test_tools import _empty_state, _mock_catalog
++
++blob_service = service_fixtures.blob_service
++compose_context = service_fixtures.compose_context
++db_engine = service_fixtures.db_engine
++session_id = service_fixtures.session_id
++
++
++@pytest.fixture(autouse=True)
++def admission_message(db_engine, session_id):
++    with db_engine.begin() as connection:
++        connection.execute(
++            chat_messages_table.insert().values(
++                id="00000000-0000-4000-8000-000000000001",
++                session_id=str(session_id),
++                role="user",
++                content="new old",
++                sequence_no=100,
++                writer_principal="route_user_message",
++                created_at=datetime.now(UTC),
++            )
++        )
++
++
++def _context(service: BlobServiceImpl, engine: Engine, operation: SessionOperationContext, data_dir: Path) -> ToolContext:
++    catalog = _mock_catalog()
++    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
++    return ToolContext(
++        catalog=PolicyCatalogView.for_trained_operator(catalog, snapshot),
++        plugin_snapshot=snapshot,
++        session_engine=engine,
++        session_id=operation.fence.session_id,
++        session_operation_context=operation,
++        session_operation_authority=service._session_operation_authority,
++        data_dir=str(data_dir),
++        user_message_content="new",
++        user_message_id="00000000-0000-4000-8000-000000000001",
++        max_blob_storage_per_session_bytes=1000,
++    )
++
++
++def _resources(engine: Engine, root: Path) -> tuple[Any, ...]:
++    tables = (
++        blobs_table,
++        blob_deletion_cleanups_table,
++        blob_replacement_cleanups_table,
++        output_storage_reservations_table,
++        blob_inline_resolutions_table,
++        proposal_blob_effect_receipts_table,
++        session_operation_fences_table,
++    )
++    with engine.connect() as connection:
++        rows = tuple(tuple(connection.execute(select(table))) for table in tables)
++    files = []
++    for path in root.glob("**/*"):
++        files.append(
++            (
++                str(path.relative_to(root)),
++                path.lstat().st_mode,
++                os.readlink(path) if path.is_symlink() else path.read_bytes() if path.is_file() else None,
++            )
++        )
++    return rows, tuple(sorted(files))
++
++
++def _forbid_effects(monkeypatch: pytest.MonkeyPatch, engine: Engine) -> Callable[..., None]:
++    def forbidden(*args: object, **kwargs: object) -> None:
++        pytest.fail("admission executed a resource write or recovery")
++
++    for target, name in (
++        (BlobReplacementCoordinator, "replace_blob"),
++        (BlobReplacementCoordinator, "reconcile"),
++        (BlobReplacementCoordinator, "_recover_plan"),
++        (BlobReplacementCoordinator, "_reconcile_blob_replacements_locked"),
++        (BlobReplacementCoordinator, "_rename"),
++        (BlobReplacementCoordinator, "_remove"),
++        (BlobServiceImpl, "_delete_blob_with_ledger"),
++        (BlobServiceImpl, "_reconcile_blob_deletions_locked"),
++        (BlobServiceImpl, "_reconcile_abandoned_creations_locked"),
++        (BlobServiceImpl, "_persist_fenced_blob_record"),
++        (BlobServiceImpl, "_stage_blob_deletion_plan"),
++        (BlobServiceImpl, "_commit_blob_deletion_plan"),
++        (BlobServiceImpl, "_purge_blob_deletion_plan"),
++        (BlobServiceImpl, "_restore_and_abort_blob_deletion"),
++        (service_module, "_atomic_write_blob"),
++        (service_module, "_persist_blob_content"),
++        (replacement_module, "_atomic_write_blob"),
++        (service_module, "_finalize_staged_blob_deletion"),
++        (Path, "unlink"),
++        (Path, "write_bytes"),
++        (os, "replace"),
++        (os, "rename"),
++        (os, "unlink"),
++    ):
++        monkeypatch.setattr(target, name, forbidden)
++    for name in (
++        "prepare_blob_replacement",
++        "mark_blob_replacement_staged",
++        "commit_blob_replacement",
++        "retire_blob_replacement",
++        "abort_blob_replacement",
++        "prepare_blob_deletion",
++        "mark_blob_deletion_staged",
++        "commit_blob_deletion",
++        "retire_blob_deletion",
++        "abort_blob_deletion",
++        "retire_atomic_blob_deletion",
++        "reserve_blob",
++        "reserve_pending_output_blob",
++        "finalize_pending_output_blob",
++        "mark_blob_ready",
++        "discard_pending_blob",
++        "retire_abandoned_blob_reservation",
++        "reserve_run_output_storage",
++        "reconcile_run_output_storage",
++        "mark_run_output_blob_ready",
++        "mark_run_output_blob_error",
++        "insert_blob_inline_resolutions",
++        "_record_applied_blob_proposal_effect",
++    ):
++        monkeypatch.setattr(_RepositoryBlobMutations, name, forbidden)
++    from sqlalchemy import event
++
++    def no_dml(_conn, _cursor, statement, _parameters, _context, _many) -> None:
++        # SQLite's real fence CAS uses an exact self-assignment to prove its
++        # row count. It writes no resource, metadata, provenance or ledger.
++        fence_cas = statement.startswith(
++            "UPDATE session_operation_fences SET operation_epoch=session_operation_fences.operation_epoch WHERE "
++        )
++        if statement.lstrip().upper().startswith(("INSERT ", "UPDATE ", "DELETE ")) and not fence_cas:
++            pytest.fail(f"admission attempted DML: {statement}")
++
++    event.listen(engine, "before_cursor_execute", no_dml)
++    # Listener is removed by the caller before the positive effect control.
++    return no_dml
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("tool_name", ["update_blob", "delete_blob"])
++@pytest.mark.parametrize("content", [b"old", b"new"])
++async def test_admission_is_stageable_without_any_resource_effect(
++    blob_service, db_engine, session_id, compose_context, tmp_path, monkeypatch, tool_name, content
++) -> None:
++    record = await blob_service.create_blob(session_id, "admit.csv", b"old", "text/csv", session_operation_context=compose_context)
++    context = replace(_context(blob_service, db_engine, compose_context, tmp_path), user_message_content=content.decode())
++    arguments = {"blob_id": str(record.id), **({"content": content.decode()} if tool_name == "update_blob" else {})}
++    before = _resources(db_engine, tmp_path)
++    from sqlalchemy import event
++
++    with monkeypatch.context() as guards:
++        listener = _forbid_effects(guards, db_engine)
++        try:
++            result = blobs.admit_blob_mutation(tool_name, arguments, _empty_state(), context)
++        finally:
++            event.remove(db_engine, "before_cursor_execute", listener)
++    assert result is None
++    assert _resources(db_engine, tmp_path) == before
++    # A real writer proves the snapshot oracle sees both metadata and bytes.
++    result = (blobs._execute_update_blob if tool_name == "update_blob" else blobs._execute_delete_blob)(arguments, _empty_state(), context)
++    assert result.success
++    assert _resources(db_engine, tmp_path) != before
++
++
++class _ProcessStopped(BaseException):
++    pass
++
++
++async def _interrupt(service, engine, context, data_dir, monkeypatch, producer, phase):
++    if producer == "atomic":
++        return await _fork_cleanup_obligation(service, engine, context, data_dir, monkeypatch)
++    record = await service.create_blob(UUID(context.fence.session_id), "debt.csv", b"old", "text/csv", session_operation_context=context)
++    original = service._session_operation_authority.mutate
++    stopped = False
++
++    def stop_after[T](operation, mutation) -> T:
++        nonlocal stopped
++        result = original(operation, mutation)
++        if isinstance(result, (BlobReplacementPlan, BlobDeletionPlan)) and result.phase == phase:
++            stopped = True
++            raise _ProcessStopped
++        return result
++
++    replacement = _proposed_record(record, engine) if producer == "replacement" else None
++    with monkeypatch.context() as faults:
++        faults.setattr(service._session_operation_authority, "mutate", stop_after)
++        with pytest.raises(_ProcessStopped):
++            if producer == "replacement":
++                BlobReplacementCoordinator(
++                    engine=engine, data_dir=data_dir, session_operation_authority=service._session_operation_authority
++                ).replace_blob(
++                    expected=record,
++                    replacement=replacement,
++                    content=b"new",
++                    context=context,
++                    max_storage_per_session=1000,
++                    accepting_proposal_id=None,
++                )
++            else:
++                await service.delete_blob(record.id, session_operation_context=context)
++    assert stopped
++    return record
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "producer,phase",
++    [
++        ("replacement", "intent"),
++        ("replacement", "swap_pending"),
++        ("replacement", "purge_pending"),
++        ("deletion", "intent"),
++        ("deletion", "staged"),
++        ("deletion", "purge_pending"),
++        ("atomic", None),
++    ],
++)
++@pytest.mark.parametrize("tool_name", ["update_blob", "delete_blob"])
++async def test_admission_refuses_actual_interrupted_debt_without_recovery(
++    blob_service, db_engine, compose_context, tmp_path, monkeypatch, producer, phase, tool_name
++) -> None:
++    record = await _interrupt(blob_service, db_engine, compose_context, tmp_path, monkeypatch, producer, phase)
++    authority = blob_service._session_operation_authority
++    authority.release(compose_context)
++    compose_context = authority.acquire(
++        session_id=record.session_id,
++        operation_kind=SessionOperationKind.COMPOSE,
++        owner_instance_id="admission-successor",
++        lease_seconds=120,
++    )
++    before = _resources(db_engine, tmp_path)
++    from sqlalchemy import event
++
++    with monkeypatch.context() as guards:
++        listener = _forbid_effects(guards, db_engine)
++        try:
++            result = blobs.admit_blob_mutation(
++                tool_name,
++                {"blob_id": str(record.id), **({"content": "new"} if tool_name == "update_blob" else {})},
++                _empty_state(),
++                _context(blob_service, db_engine, compose_context, tmp_path),
++            )
++        finally:
++            event.remove(db_engine, "before_cursor_execute", listener)
++    assert result is not None
++    assert not result.success
++    assert any("recovery" in entry.message.lower() for entry in result.validation.errors)
++    assert _resources(db_engine, tmp_path) == before
++    # Safe successor recovery is a separate real positive control.
++    if producer == "replacement":
++        BlobReplacementCoordinator(
++            engine=db_engine, data_dir=tmp_path, session_operation_authority=blob_service._session_operation_authority
++        ).reconcile(context=compose_context)
++    else:
++        await blob_service.delete_blob(record.id, session_operation_context=compose_context)
++    assert _resources(db_engine, tmp_path) != before
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "producer,phase,fault",
++    [
++        (producer, phase, fault)
++        for producer, phase in [
++            ("replacement", "intent"),
++            ("replacement", "swap_pending"),
++            ("replacement", "purge_pending"),
++            ("deletion", "intent"),
++            ("deletion", "staged"),
++            ("deletion", "purge_pending"),
++            ("atomic", None),
++        ]
++        for fault in (
++            ["live_mismatch", "missing_row", "foreign_path", "wrong_invocation", "corrupt_bytes"]
++            if producer == "replacement"
++            else ["live_mismatch", "foreign_path", "wrong_invocation", "corrupt_bytes"]
++            if producer == "deletion"
++            else ["live_mismatch", "foreign_path"]
++        )
++    ],
++)
++async def test_admission_keeps_corrupt_interrupted_evidence_an_integrity_fault(
++    blob_service, db_engine, compose_context, tmp_path, monkeypatch, producer, phase, fault
++) -> None:
++    record = await _interrupt(blob_service, db_engine, compose_context, tmp_path, monkeypatch, producer, phase)
++    table = blob_replacement_cleanups_table if producer == "replacement" else blob_deletion_cleanups_table
++    with db_engine.begin() as connection:
++        row = connection.execute(select(table)).one()
++        if fault == "live_mismatch":
++            if (phase == "purge_pending" and producer == "deletion") or producer == "atomic":
++                connection.execute(
++                    blobs_table.insert().values(
++                        **{
++                            "id": str(record.id),
++                            "session_id": str(record.session_id),
++                            "filename": record.filename,
++                            "mime_type": record.mime_type,
++                            "size_bytes": record.size_bytes,
++                            "content_hash": record.content_hash,
++                            "storage_path": record.storage_path,
++                            "created_at": record.created_at,
++                            "created_by": record.created_by,
++                            "status": record.status,
++                            "creation_modality": record.creation_modality.value,
++                        }
++                    )
++                )
++            else:
++                connection.execute(
++                    update(blobs_table).where(blobs_table.c.id == str(record.id)).values(source_description="changed complete snapshot")
++                )
++        elif fault == "missing_row":
++            connection.execute(blobs_table.delete().where(blobs_table.c.id == str(record.id)))
++        elif fault == "foreign_path":
++            foreign = tmp_path / "foreign-artifact"
++            foreign.write_bytes(b"foreign bytes must not be opened")
++            connection.execute(
++                update(table).values(**({"backup_path": str(foreign)} if producer == "replacement" else {"tombstone_path": str(foreign)}))
++            )
++        elif fault == "wrong_invocation":
++            connection.execute(update(table).values(operation_id=str(uuid4())))
++        else:
++            path = Path(row.storage_path) if Path(row.storage_path).exists() else Path(row.tombstone_path)
++            path.write_bytes(b"bad")
++    before = _resources(db_engine, tmp_path)
++    from sqlalchemy import event
++
++    with monkeypatch.context() as guards:
++        listener = _forbid_effects(guards, db_engine)
++        if fault == "foreign_path":
++            original_open, original_path_open = os.open, Path.open
++
++            def no_foreign_open(path, *args, **kwargs):
++                assert Path(path).name != "foreign-artifact", "admission opened foreign artifact"
++                return original_open(path, *args, **kwargs)
++
++            def no_foreign_path_open(path, *args, **kwargs):
++                assert path.name != "foreign-artifact", "admission opened foreign artifact"
++                return original_path_open(path, *args, **kwargs)
++
++            guards.setattr(os, "open", no_foreign_open)
++            guards.setattr(Path, "open", no_foreign_path_open)
++        try:
++            with pytest.raises(BlobIntegrityError if fault == "corrupt_bytes" else AuditIntegrityError):
++                blobs.admit_blob_mutation(
++                    "delete_blob", {"blob_id": str(record.id)}, _empty_state(), _context(blob_service, db_engine, compose_context, tmp_path)
++                )
++        finally:
++            event.remove(db_engine, "before_cursor_execute", listener)
++    assert _resources(db_engine, tmp_path) == before
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("tool_name", ["update_blob", "delete_blob"])
++@pytest.mark.parametrize("fault", ["absent", "corrupt", "symlink", "directory", "foreign_path", "pending", "missing"])
++async def test_admission_preserves_source_specific_file_and_readiness_contracts(
++    blob_service, db_engine, session_id, compose_context, tmp_path, monkeypatch, tool_name, fault
++) -> None:
++    record = await blob_service.create_blob(session_id, "admit.csv", b"old", "text/csv", session_operation_context=compose_context)
++    path = Path(record.storage_path)
++    if fault in {"absent", "symlink", "directory"}:
++        path.unlink()
++    if fault == "corrupt":
++        path.write_bytes(b"bad")
++    elif fault == "symlink":
++        foreign = tmp_path / "foreign.csv"
++        foreign.write_bytes(b"old")
++        path.symlink_to(foreign)
++    elif fault == "directory":
++        path.mkdir()
++    elif fault in {"foreign_path", "pending"}:
++        with db_engine.begin() as connection:
++            connection.execute(
++                update(blobs_table)
++                .where(blobs_table.c.id == str(record.id))
++                .values(**({"storage_path": str(tmp_path / "foreign.csv")} if fault == "foreign_path" else {"status": "pending"}))
++            )
++    context = _context(blob_service, db_engine, compose_context, tmp_path)
++    arguments = {
++        "blob_id": str(uuid4()) if fault == "missing" else str(record.id),
++        **({"content": "new"} if tool_name == "update_blob" else {}),
++    }
++    before = _resources(db_engine, tmp_path)
++    expected_error = BlobIntegrityError if fault == "corrupt" else AuditIntegrityError
++    from sqlalchemy import event
++
++    with monkeypatch.context() as guards:
++        listener = _forbid_effects(guards, db_engine)
++        try:
++            if fault in {"missing", "pending"} or (fault == "absent" and tool_name == "delete_blob"):
++                result = blobs.admit_blob_mutation(tool_name, arguments, _empty_state(), context)
++                assert (result is None) is (fault == "absent")
++            else:
++                with pytest.raises(expected_error):
++                    blobs.admit_blob_mutation(tool_name, arguments, _empty_state(), context)
++        finally:
++            event.remove(db_engine, "before_cursor_execute", listener)
++    assert _resources(db_engine, tmp_path) == before
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("status", ["pending", "error"])
++@pytest.mark.parametrize("present", [True, False])
++async def test_proposal_readiness_does_not_remove_direct_nonready_deletion(
++    blob_service, db_engine, session_id, compose_context, tmp_path, status, present
++):
++    record = await blob_service.create_blob(session_id, "nonready.csv", b"old", "text/csv", session_operation_context=compose_context)
++    with db_engine.begin() as connection:
++        connection.execute(update(blobs_table).where(blobs_table.c.id == str(record.id)).values(status=status, content_hash=None))
++    if not present:
++        Path(record.storage_path).unlink()
++    before = _resources(db_engine, tmp_path)
++    result = blobs.admit_blob_mutation(
++        "delete_blob", {"blob_id": str(record.id)}, _empty_state(), _context(blob_service, db_engine, compose_context, tmp_path)
++    )
++    assert result is not None
++    assert not result.success
++    assert _resources(db_engine, tmp_path) == before
++    await blob_service.delete_blob(record.id, session_operation_context=compose_context)
++    assert not Path(record.storage_path).exists()
++    assert _resources(db_engine, tmp_path) != before
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("tool_name", ["update_blob", "delete_blob"])
++@pytest.mark.parametrize("fence", ["create", "blob_read", "execute", "session_fork", "expired", "released", "forged", "foreign"])
++async def test_admission_requires_exact_live_mutation_authority_before_reading_files(
++    blob_service, db_engine, session_id, compose_context, tmp_path, monkeypatch, tool_name, fence
++):
++    record = await blob_service.create_blob(session_id, "authority.csv", b"old", "text/csv", session_operation_context=compose_context)
++    authority = blob_service._session_operation_authority
++    operation = compose_context
++    if fence == "blob_read":
++        operation = authority.acquire(
++            session_id=session_id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="admission-reader", lease_seconds=60
++        )
++    elif fence in {"create", "execute", "session_fork"}:
++        operation = seed_live_operation_context(db_engine, session_id, operation_kind=SessionOperationKind(fence))
++    elif fence == "released":
++        authority.release(operation)
++    elif fence == "expired":
++        with db_engine.begin() as connection:
++            connection.execute(update(session_operation_fences_table).values(lease_expires_at=datetime.now(UTC) - timedelta(hours=1)))
++    elif fence == "forged":
++        operation = replace(operation, fence=replace(operation.fence, lease_token="forged-token"))
++    context = _context(blob_service, db_engine, operation, tmp_path)
++    if fence == "foreign":
++        context = replace(context, session_id=str(uuid4()))
++    before = _resources(db_engine, tmp_path)
++
++    def forbidden_read(*args, **kwargs):
++        pytest.fail("invalid authority reached filesystem content")
++
++    with monkeypatch.context() as guards:
++        guards.setattr(BlobReplacementCoordinator, "_read_bytes", forbidden_read)
++        guards.setattr(BlobServiceImpl, "_read_deletion_content", forbidden_read)
++        with pytest.raises(SessionOperationFenceLost if fence in {"expired", "released", "forged"} else AuditIntegrityError):
++            blobs.admit_blob_mutation(
++                tool_name,
++                {"blob_id": str(record.id), **({"content": "new"} if tool_name == "update_blob" else {})},
++                _empty_state(),
++                context,
++            )
++    assert _resources(db_engine, tmp_path) == before
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("tool_name", ["update_blob", "delete_blob"])
++@pytest.mark.parametrize("race", ["metadata", "release", "directory"])
++async def test_final_admission_rechecks_metadata_and_live_fence_after_file_io(
++    blob_service, db_engine, session_id, compose_context, tmp_path, monkeypatch, tool_name, race
++):
++    record = await blob_service.create_blob(session_id, "raced.csv", b"old", "text/csv", session_operation_context=compose_context)
++    original_read = BlobServiceImpl._read_deletion_content
++    original_replace_read = BlobReplacementCoordinator._read_bytes
++    active_transactions = 0
++    from sqlalchemy import event
++
++    def begin(_connection):
++        nonlocal active_transactions
++        active_transactions += 1
++
++    def end(_connection):
++        nonlocal active_transactions
++        active_transactions -= 1
++
++    def inject():
++        assert active_transactions == 0, "Sessions transaction held across filesystem I/O"
++        if race == "release":
++            blob_service._session_operation_authority.release(compose_context)
++        elif race == "directory":
++            directory = Path(record.storage_path).parent
++            detached = directory.with_name("detached-session")
++            directory.rename(detached)
++            directory.symlink_to(detached, target_is_directory=True)
++        else:
++            with db_engine.begin() as connection:
++                connection.execute(
++                    update(blobs_table).where(blobs_table.c.id == str(record.id)).values(source_description="raced metadata")
++                )
++
++    def read_delete(path, *, directory_fd):
++        data = original_read(path, directory_fd=directory_fd)
++        inject()
++        return data
++
++    def read_replace(path, directory_fd):
++        data = original_replace_read(path, directory_fd)
++        inject()
++        return data
++
++    for name, callback in (("begin", begin), ("commit", end), ("rollback", end)):
++        event.listen(db_engine, name, callback)
++    try:
++        with monkeypatch.context() as faults:
++            faults.setattr(BlobServiceImpl, "_read_deletion_content", staticmethod(read_delete))
++            faults.setattr(BlobReplacementCoordinator, "_read_bytes", staticmethod(read_replace))
++            with pytest.raises(SessionOperationFenceLost if race == "release" else AuditIntegrityError):
++                blobs.admit_blob_mutation(
++                    tool_name,
++                    {"blob_id": str(record.id), **({"content": "new"} if tool_name == "update_blob" else {})},
++                    _empty_state(),
++                    _context(blob_service, db_engine, compose_context, tmp_path),
++                )
++    finally:
++        for name, callback in (("begin", begin), ("commit", end), ("rollback", end)):
++            event.remove(db_engine, name, callback)
++    with db_engine.connect() as connection:
++        assert connection.execute(select(blob_deletion_cleanups_table)).all() == []
++        assert connection.execute(select(blob_replacement_cleanups_table)).all() == []
++    assert Path(record.storage_path).read_bytes() == b"old"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("tool_name", ["update_blob", "delete_blob"])
++@pytest.mark.parametrize("edge", ["run_link", "run_source", "run_path", "run_inline", "fork_receipt"])
++@pytest.mark.parametrize("active", [True, False])
++async def test_admission_retains_every_relational_edge_and_admits_settled_edges(
++    blob_service, db_engine, session_id, compose_context, tmp_path, tool_name, edge, active
++):
++    record = await blob_service.create_blob(session_id, "retained.csv", b"old", "text/csv", session_operation_context=compose_context)
++    if edge == "fork_receipt":
++        now = datetime.now(UTC)
++        values = {
++            "session_id": str(session_id),
++            "operation_id": str(uuid4()),
++            "kind": "session_fork",
++            "status": "in_progress" if active else "failed",
++            "request_hash": "a" * 64,
++            "attempt": 1,
++            "created_at": now,
++            "updated_at": now,
++        }
++        values.update(
++            {"lease_token": "lease", "lease_expires_at": now + timedelta(hours=1)}
++            if active
++            else {"settled_at": now, "failure_code": "operation_failed"}
++        )
++        with db_engine.begin() as connection:
++            connection.execute(session_operation_receipts_table.insert().values(**values))
++    else:
++        options = (
++            {"path": record.storage_path}
++            if edge == "run_path"
++            else {"blob_id": str(record.id)}
++            if edge == "run_source"
++            else {"path": "/data/external/input.csv"}
++        )
++        nodes = (
++            [
++                {
++                    "id": "classify",
++                    "node_type": "transform",
++                    "plugin": "llm",
++                    "input": "source_out",
++                    "options": {"system_prompt": {"blob_ref": str(record.id), "mode": "inline_content", "sha256": record.content_hash}},
++                    "on_success": "output",
++                    "on_error": "discard",
++                }
++            ]
++            if edge == "run_inline"
++            else None
++        )
++        run_id = await service_fixtures._seed_active_run(
++            db_engine,
++            session_id,
++            session_operation_context=compose_context,
++            source={"plugin": "csv", "on_success": "output", "on_validation_failure": "discard", "options": options},
++            nodes=nodes,
++            status="running" if active else "completed",
++        )
++        if edge == "run_link":
++            with db_engine.begin() as connection:
++                connection.execute(blob_run_links_table.insert().values(blob_id=str(record.id), run_id=run_id, direction="input"))
++    before = _resources(db_engine, tmp_path)
++    result = blobs.admit_blob_mutation(
++        tool_name,
++        {"blob_id": str(record.id), **({"content": "new"} if tool_name == "update_blob" else {})},
++        _empty_state(),
++        _context(blob_service, db_engine, compose_context, tmp_path),
++    )
++    assert (result is None) is not active
++    assert _resources(db_engine, tmp_path) == before
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("tool_name", ["update_blob", "delete_blob"])
++@pytest.mark.parametrize("proposal_tool", ["update_blob", "delete_blob", "set_source_from_blob", "set_pipeline", "wire_blob_inline_ref"])
++@pytest.mark.parametrize("pending", [True, False])
++async def test_admission_preserves_pending_proposal_retention_without_invented_exclusion(
++    blob_service, db_engine, session_id, compose_context, tmp_path, tool_name, proposal_tool, pending
++):
++    import structlog
++
++    from elspeth.web.sessions.models import composition_proposals_table
++    from elspeth.web.sessions.service import SessionServiceImpl
++    from elspeth.web.sessions.telemetry import build_sessions_telemetry
++
++    record = await blob_service.create_blob(session_id, "pending.csv", b"old", "text/csv", session_operation_context=compose_context)
++    sessions = SessionServiceImpl(db_engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test.admission"))
++    arguments = {"source": {"blob_id": str(record.id)}} if proposal_tool == "set_pipeline" else {"blob_id": str(record.id)}
++    proposal = await sessions.create_composition_proposal(
++        session_id=session_id,
++        tool_call_id="call_retention",
++        tool_name=proposal_tool,
++        summary="Keep this blob for review",
++        rationale="review",
++        affects=("blob",),
++        arguments_json=arguments,
++        arguments_redacted_json=arguments,
++        base_state_id=None,
++        actor="composer-web:user:test-user",
++        session_operation_context=compose_context,
++    )
++    if not pending:
++        with db_engine.begin() as connection:
++            connection.execute(
++                update(composition_proposals_table).where(composition_proposals_table.c.id == str(proposal.id)).values(status="rejected")
++            )
++    before = _resources(db_engine, tmp_path)
++    context = _context(blob_service, db_engine, compose_context, tmp_path)
++    result = blobs.admit_blob_mutation(
++        tool_name, {"blob_id": str(record.id), **({"content": "new"} if tool_name == "update_blob" else {})}, _empty_state(), context
++    )
++    assert (result is None) is not pending
++    assert _resources(db_engine, tmp_path) == before
++    with pytest.raises(AuditIntegrityError, match="retention exclusion"):
++        blobs.admit_blob_mutation(
++            tool_name,
++            {"blob_id": str(record.id), **({"content": "new"} if tool_name == "update_blob" else {})},
++            _empty_state(),
++            replace(context, executing_proposal_id=str(proposal.id)),
++        )
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("mutation", ["handler", "resource_sql", "fence_sql"])
++async def test_admission_effect_oracle_detects_destructive_dispatch_and_changed_fence(
++    blob_service, db_engine, session_id, compose_context, tmp_path, monkeypatch, mutation
++):
++    record = await blob_service.create_blob(session_id, "oracle.csv", b"old", "text/csv", session_operation_context=compose_context)
++    before = _resources(db_engine, tmp_path)
++    from sqlalchemy import event
++
++    with monkeypatch.context() as guards:
++        listener = _forbid_effects(guards, db_engine)
++        try:
++            with pytest.raises(pytest.fail.Exception, match=r"resource write|attempted DML"):
++                if mutation == "handler":
++                    # An isolated admission mutant that dispatches the actual
++                    # destructive handler trips before it can prepare debt.
++                    blobs._execute_delete_blob(
++                        {"blob_id": str(record.id)}, _empty_state(), _context(blob_service, db_engine, compose_context, tmp_path)
++                    )
++                else:
++                    with db_engine.begin() as connection:
++                        connection.execute(
++                            update(blobs_table).values(source_description="forbidden resource mutation")
++                            if mutation == "resource_sql"
++                            else update(session_operation_fences_table).values(owner_instance_id="forbidden fence mutation")
++                        )
++        finally:
++            event.remove(db_engine, "before_cursor_execute", listener)
++    assert _resources(db_engine, tmp_path) == before
++
++
++@pytest.mark.asyncio
++async def test_admission_faults_if_both_incompatible_real_producer_ledgers_exist(
++    blob_service, db_engine, session_id, compose_context, tmp_path, monkeypatch
++):
++    # Keep two independently genuine pre-commit plans for the same unchanged
++    # row, then introduce the impossible simultaneous persisted combination.
++    record = await _interrupt(blob_service, db_engine, compose_context, tmp_path, monkeypatch, "deletion", "intent")
++    with db_engine.begin() as connection:
++        deletion = dict(connection.execute(select(blob_deletion_cleanups_table)).one()._mapping)
++        connection.execute(blob_deletion_cleanups_table.delete())
++    proposed = _proposed_record(record, db_engine)
++    original = blob_service._session_operation_authority.mutate
++
++    def stop_after(operation, mutation):
++        result = original(operation, mutation)
++        if isinstance(result, BlobReplacementPlan):
++            raise _ProcessStopped
++        return result
++
++    with monkeypatch.context() as faults:
++        faults.setattr(blob_service._session_operation_authority, "mutate", stop_after)
++        with pytest.raises(_ProcessStopped):
++            BlobReplacementCoordinator(
++                engine=db_engine, data_dir=tmp_path, session_operation_authority=blob_service._session_operation_authority
++            ).replace_blob(
++                expected=record,
++                replacement=proposed,
++                content=b"new",
++                context=compose_context,
++                max_storage_per_session=1000,
++                accepting_proposal_id=None,
++            )
++    with db_engine.begin() as connection:
++        connection.execute(blob_deletion_cleanups_table.insert().values(**deletion))
++    before = _resources(db_engine, tmp_path)
++    with pytest.raises(AuditIntegrityError, match="mutually exclusive"):
++        blobs.admit_blob_mutation(
++            "delete_blob", {"blob_id": str(record.id)}, _empty_state(), _context(blob_service, db_engine, compose_context, tmp_path)
++        )
++    assert _resources(db_engine, tmp_path) == before
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("producer", ["replacement", "deletion", "atomic"])
++@pytest.mark.parametrize("race", ["ledger", "fence"])
++async def test_recovery_needed_disposition_rechecks_exact_debt_after_observation(
++    blob_service, db_engine, compose_context, tmp_path, monkeypatch, producer, race
++):
++    record = await _interrupt(
++        blob_service, db_engine, compose_context, tmp_path, monkeypatch, producer, "intent" if producer != "atomic" else None
++    )
++    expected_after_injection = None
++    original_replace = BlobReplacementCoordinator._require_recovery_content
++    original_delete = BlobServiceImpl._require_blob_deletion_recovery_content
++
++    def inject():
++        nonlocal expected_after_injection
++        with db_engine.begin() as connection:
++            if race == "ledger":
++                table = blob_replacement_cleanups_table if producer == "replacement" else blob_deletion_cleanups_table
++                connection.execute(update(table).values(updated_at=datetime.now(UTC) + timedelta(seconds=1)))
++            else:
++                connection.execute(update(session_operation_fences_table).values(lease_expires_at=datetime.now(UTC) - timedelta(hours=1)))
++        expected_after_injection = _resources(db_engine, tmp_path)
++
++    def replacement_observation(driver, plan, directory_fd):
++        result = original_replace(driver, plan, directory_fd)
++        inject()
++        return result
++
++    def deletion_observation(service, plan):
++        original_delete(service, plan)
++        inject()
++
++    with monkeypatch.context() as faults:
++        faults.setattr(BlobReplacementCoordinator, "_require_recovery_content", replacement_observation)
++        faults.setattr(BlobServiceImpl, "_require_blob_deletion_recovery_content", deletion_observation)
++        with pytest.raises(SessionOperationFenceLost if race == "fence" else AuditIntegrityError):
++            blobs.admit_blob_mutation(
++                "delete_blob", {"blob_id": str(record.id)}, _empty_state(), _context(blob_service, db_engine, compose_context, tmp_path)
++            )
++    assert expected_after_injection is not None
++    assert _resources(db_engine, tmp_path) == expected_after_injection
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("interruption", ["first_swap", "second_swap", "backup_removed", "delete_rename"])
++async def test_admission_accepts_driver_supported_interrupted_artifact_alternatives(
++    blob_service, db_engine, session_id, compose_context, tmp_path, monkeypatch, interruption
++):
++    record = await blob_service.create_blob(session_id, "alternatives.csv", b"old", "text/csv", session_operation_context=compose_context)
++    proposed = _proposed_record(record, db_engine)
++    driver = BlobReplacementCoordinator(
++        engine=db_engine, data_dir=tmp_path, session_operation_authority=blob_service._session_operation_authority
++    )
++    original_rename, original_remove, original_replace = driver._rename, driver._remove, os.replace
++    renames = 0
++
++    def stop_swap(source, target, directory_fd, context):
++        nonlocal renames
++        original_rename(source, target, directory_fd, context)
++        renames += 1
++        if renames == (1 if interruption == "first_swap" else 2):
++            raise _ProcessStopped
++
++    def stop_cleanup(path, directory_fd, context):
++        original_remove(path, directory_fd, context)
++        if path.name.endswith(".backup"):
++            raise _ProcessStopped
++
++    def stop_delete_rename(source, target, *args, **kwargs):
++        original_replace(source, target, *args, **kwargs)
++        if Path(target).name.startswith(f".{record.id}.delete-"):
++            raise _ProcessStopped
++
++    with monkeypatch.context() as faults:
++        if interruption == "delete_rename":
++            faults.setattr(os, "replace", stop_delete_rename)
++        elif interruption == "backup_removed":
++            faults.setattr(driver, "_remove", stop_cleanup)
++        else:
++            faults.setattr(driver, "_rename", stop_swap)
++        with pytest.raises(_ProcessStopped):
++            if interruption == "delete_rename":
++                await blob_service.delete_blob(record.id, session_operation_context=compose_context)
++            else:
++                driver.replace_blob(
++                    expected=record,
++                    replacement=proposed,
++                    content=b"new",
++                    context=compose_context,
++                    max_storage_per_session=1000,
++                    accepting_proposal_id=None,
++                )
++    before = _resources(db_engine, tmp_path)
++    from sqlalchemy import event
++
++    with monkeypatch.context() as guards:
++        listener = _forbid_effects(guards, db_engine)
++        try:
++            result = blobs.admit_blob_mutation(
++                "delete_blob", {"blob_id": str(record.id)}, _empty_state(), _context(blob_service, db_engine, compose_context, tmp_path)
++            )
++        finally:
++            event.remove(db_engine, "before_cursor_execute", listener)
++    assert result is not None
++    assert not result.success
++    assert any("recovery" in error.message.lower() for error in result.validation.errors)
++    assert _resources(db_engine, tmp_path) == before
++    if interruption == "delete_rename":
++        await blob_service.delete_blob(record.id, session_operation_context=compose_context)
++    else:
++        driver.reconcile(context=compose_context)
++    assert _resources(db_engine, tmp_path) != before
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("phase", ["intent", "staged", "purge_pending"])
++@pytest.mark.parametrize("corrupt", [False, True])
++async def test_absent_file_deletion_debt_never_acquires_unrecorded_bytes(
++    blob_service, db_engine, session_id, compose_context, tmp_path, monkeypatch, phase, corrupt
++):
++    record = await blob_service.create_blob(session_id, "absent.csv", b"old", "text/csv", session_operation_context=compose_context)
++    Path(record.storage_path).unlink()
++    original = blob_service._session_operation_authority.mutate
++
++    def stop_after(operation, mutation):
++        result = original(operation, mutation)
++        if isinstance(result, BlobDeletionPlan) and result.phase == phase:
++            assert result.expected_file_present is False
++            assert result.expected_file_size is result.expected_file_hash is None
++            raise _ProcessStopped
++        return result
++
++    with monkeypatch.context() as faults:
++        faults.setattr(blob_service._session_operation_authority, "mutate", stop_after)
++        with pytest.raises(_ProcessStopped):
++            await blob_service.delete_blob(record.id, session_operation_context=compose_context)
++    if corrupt:
++        Path(record.storage_path).write_bytes(b"new unrecorded bytes")
++    before = _resources(db_engine, tmp_path)
++    if corrupt:
++        with pytest.raises(AuditIntegrityError):
++            blobs.admit_blob_mutation(
++                "delete_blob", {"blob_id": str(record.id)}, _empty_state(), _context(blob_service, db_engine, compose_context, tmp_path)
++            )
++    else:
++        result = blobs.admit_blob_mutation(
++            "delete_blob", {"blob_id": str(record.id)}, _empty_state(), _context(blob_service, db_engine, compose_context, tmp_path)
++        )
++        assert result is not None
++        assert not result.success
++        assert any("recovery" in error.message.lower() for error in result.validation.errors)
++    assert _resources(db_engine, tmp_path) == before
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "evidence,error", [((1, 3, "a" * 64), TypeError), ((True, 3, "invalid-hash"), ValueError), ((True, 3, None), ValueError)]
++)
++async def test_deletion_facet_admission_preserves_exact_prepare_file_evidence_contract(
++    blob_service, db_engine, session_id, compose_context, tmp_path, evidence, error
++):
++    record = await blob_service.create_blob(session_id, "evidence.csv", b"old", "text/csv", session_operation_context=compose_context)
++    with db_engine.begin() as connection:
++        connection.execute(update(blobs_table).where(blobs_table.c.id == str(record.id)).values(status="pending", content_hash=None))
++    authority = blob_service._session_operation_authority
++    expected = authority.mutate(compose_context, lambda transaction: transaction.blobs.read_blob(blob_id=record.id))
++    before = _resources(db_engine, tmp_path)
++    with pytest.raises(error):
++        authority.mutate(
++            compose_context,
++            lambda transaction: transaction.blobs.admit_blob_deletion(
++                expected=expected,
++                expected_file_present=evidence[0],
++                expected_file_size=evidence[1],
++                expected_file_hash=evidence[2],
++                accepting_proposal_id=None,
++            ),
++        )
++    assert _resources(db_engine, tmp_path) == before
+diff --git a/tests/unit/web/blobs/test_mutation_admission_quota.py b/tests/unit/web/blobs/test_mutation_admission_quota.py
+new file mode 100644
+index 000000000..0548a2e52
+--- /dev/null
++++ b/tests/unit/web/blobs/test_mutation_admission_quota.py
+@@ -0,0 +1,226 @@
++"""Admission shares live storage accounting and its real refusal audit writer."""
++
++from dataclasses import replace
++from datetime import UTC, datetime
++from pathlib import Path
++from uuid import UUID
++
++import pytest
++from sqlalchemy import event, select
++from sqlalchemy.exc import OperationalError
++
++from elspeth.contracts.blobs import StorageAccountingUnavailableError
++from elspeth.contracts.session_operation import SessionOperationKind
++from elspeth.web.blobs.service import BlobServiceImpl, _atomic_write_blob, content_hash
++from elspeth.web.composer.tools.blobs import admit_blob_mutation
++from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
++from elspeth.web.sessions.models import output_storage_reservations_table, quota_policies_table
++from tests.helpers.session_fences import seed_live_compose_context, seed_live_operation_context
++from tests.unit.web.auth.test_audit import _durable_recorder, _durable_rows, _metadata
++from tests.unit.web.blobs import test_mutation_admission as admission
++from tests.unit.web.blobs import test_service as service_fixtures
++
++db_engine = service_fixtures.db_engine
++session_id = service_fixtures.session_id
++compose_context = service_fixtures.compose_context
++admission_message = admission.admission_message
++
++
++def _policies(engine, *, cap: int | None, ceiling: int | None, revoked=False):
++    now = datetime.now(UTC)
++    with engine.begin() as connection:
++        for name, identity, bound in (("identity", "test-user", cap), ("container", None, ceiling)):
++            if bound is not None:
++                connection.execute(
++                    quota_policies_table.insert().values(
++                        policy_id=name,
++                        identity_id=identity,
++                        tokens_per_day=1000,
++                        storage_bytes=bound,
++                        set_by_actor="operator",
++                        set_at=now,
++                        revoked_at=now if revoked and identity is not None else None,
++                    )
++                )
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("binding", ["session", "identity", "container", "both", "container-only", "none"])
++async def test_independent_admission_bounds_keep_truthful_durable_quota_evidence(db_engine, session_id, compose_context, tmp_path, binding):
++    recorder, url = _durable_recorder(tmp_path)
++    authority = SQLiteLocalSessionOperationAuthority(db_engine, quota_exceeded_recorder=recorder.record_quota_exceeded)
++    service = BlobServiceImpl(db_engine, tmp_path, session_operation_authority=authority)
++    record = await service.create_blob(session_id, "quota.csv", b"old", "text/csv", session_operation_context=compose_context)
++    _policies(
++        db_engine,
++        cap=5 if binding in {"identity", "both"} else None if binding == "container-only" else 1000,
++        ceiling=5 if binding in {"container", "container-only", "both"} else 1000,
++    )
++    context = replace(
++        admission._context(service, db_engine, compose_context, tmp_path),
++        user_message_content="larger",
++        max_blob_storage_per_session_bytes=5 if binding == "session" else 1000,
++    )
++    before = admission._resources(db_engine, tmp_path / "blobs")
++    result = admit_blob_mutation("update_blob", {"blob_id": str(record.id), "content": "larger"}, admission._empty_state(), context)
++    assert (result is None) is (binding == "none")
++    assert admission._resources(db_engine, tmp_path / "blobs") == before
++    rows = _durable_rows(url)
++    if binding not in {"session", "none"}:
++        assert len(rows) == 1
++        payload = _metadata(rows[0])
++        assert (payload["operation"], payload["usage"], payload["scope"], payload["limit"]) == (
++            "blob_replacement",
++            3,
++            "identity" if binding in {"identity", "both"} else "container",
++            5,
++        )
++        assert payload["cap"] == (None if binding == "container-only" else 5 if binding in {"identity", "both"} else 1000)
++        assert payload["ceiling"] == (5 if binding in {"container", "container-only", "both"} else 1000)
++    else:
++        assert rows == []
++    recorder.close()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("policy", ["revoked", "unavailable"])
++@pytest.mark.parametrize(
++    "content,session_cap,success", [("new", 1000, True), ("x", 1000, True), ("new", 2, False), ("x", 0, False), ("larger", 1000, None)]
++)
++async def test_nonpositive_growth_bypasses_policy_measurement_but_never_session_projection(
++    db_engine, session_id, compose_context, tmp_path, policy, content, session_cap, success
++):
++    service = BlobServiceImpl(db_engine, tmp_path)
++    record = await service.create_blob(session_id, "quota.csv", b"old", "text/csv", session_operation_context=compose_context)
++    _policies(db_engine, cap=1, ceiling=1, revoked=policy == "revoked")
++    context = replace(
++        admission._context(service, db_engine, compose_context, tmp_path),
++        user_message_content=content,
++        max_blob_storage_per_session_bytes=session_cap,
++    )
++    measured = []
++
++    def unavailable(_conn, _cursor, statement, _parameters, _context, _many):
++        if statement.lstrip().upper().startswith("SELECT") and "quota_policies" in statement:
++            measured.append(statement)
++            raise OperationalError(statement, {}, RuntimeError("policy unavailable"))
++
++    before = admission._resources(db_engine, tmp_path)
++    if policy == "unavailable":
++        event.listen(db_engine, "before_cursor_execute", unavailable)
++    try:
++        if success is None:
++            with pytest.raises(StorageAccountingUnavailableError):
++                admit_blob_mutation("update_blob", {"blob_id": str(record.id), "content": content}, admission._empty_state(), context)
++        else:
++            result = admit_blob_mutation("update_blob", {"blob_id": str(record.id), "content": content}, admission._empty_state(), context)
++            assert (result is None) is success
++    finally:
++        if policy == "unavailable":
++            event.remove(db_engine, "before_cursor_execute", unavailable)
++    assert bool(measured) is (success is None and policy == "unavailable")
++    assert admission._resources(db_engine, tmp_path) == before
++    # Delete introduces no positive-growth accounting policy gate.
++    assert admit_blob_mutation("delete_blob", {"blob_id": str(record.id)}, admission._empty_state(), context) is None
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("coverage", ["unmatched", "partial", "full"])
++@pytest.mark.parametrize("binding", ["session", "identity", "container"])
++async def test_output_reservation_excess_is_charged_once_by_every_admission_bound(
++    db_engine, session_id, compose_context, tmp_path, coverage, binding
++):
++    recorder, url = _durable_recorder(tmp_path)
++    authority = SQLiteLocalSessionOperationAuthority(db_engine, quota_exceeded_recorder=recorder.record_quota_exceeded)
++    service = BlobServiceImpl(db_engine, tmp_path, session_operation_authority=authority)
++    run_id = await service_fixtures._seed_active_run(
++        db_engine, session_id, session_operation_context=compose_context, source=service_fixtures._RUN_SOURCE, status="completed"
++    )
++    execute = seed_live_operation_context(db_engine, session_id, operation_kind=SessionOperationKind.EXECUTE)
++    record = service_fixtures._pending_output_record(service, session_id, "quota.csv")
++
++    def reserve_output(transaction):
++        transaction.blobs.reserve_pending_output_blob(record=record)
++        transaction.blobs.insert_blob_run_link(blob_id=record.id, run_id=UUID(run_id), direction="output")
++
++    authority.mutate(execute, reserve_output)
++    reservation_size = {"unmatched": 5, "partial": 5, "full": 3}[coverage]
++    authority.mutate(
++        execute,
++        lambda transaction: transaction.blobs.reserve_run_output_storage(
++            run_id=UUID(run_id),
++            target_path=str(tmp_path / "unmatched.csv") if coverage == "unmatched" else record.storage_path,
++            size_bytes=reservation_size,
++            max_storage_per_session=1000,
++        ),
++    )
++    _atomic_write_blob(Path(record.storage_path), b"old", write_guard=lambda: authority.compare_and_swap(execute))
++    record = authority.mutate(
++        execute,
++        lambda transaction: transaction.blobs.mark_run_output_blob_ready(
++            run_id=UUID(run_id),
++            blob_id=record.id,
++            size_bytes=3,
++            content_hash=content_hash(b"old"),
++            max_storage_per_session=1000,
++        ),
++    )
++    operation = seed_live_compose_context(db_engine, session_id)
++    _policies(db_engine, cap=6 if binding == "identity" else 1000, ceiling=6 if binding == "container" else 1000)
++    context = replace(
++        admission._context(service, db_engine, operation, tmp_path),
++        user_message_content="larger",
++        max_blob_storage_per_session_bytes=6 if binding == "session" else 1000,
++    )
++    before = admission._resources(db_engine, tmp_path / "blobs")
++    result = admit_blob_mutation("update_blob", {"blob_id": str(record.id), "content": "larger"}, admission._empty_state(), context)
++    assert (result is None) is (coverage == "full")
++    assert admission._resources(db_engine, tmp_path / "blobs") == before
++    with db_engine.connect() as connection:
++        assert connection.execute(select(output_storage_reservations_table.c.size_bytes)).scalar_one() == reservation_size
++    if binding != "session" and coverage != "full":
++        rows = _durable_rows(url)
++        assert len(rows) == 1
++        assert _metadata(rows[0])["usage"] == (8 if coverage == "unmatched" else 5)
++    recorder.close()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("foreign_owner", [False, True])
++async def test_admission_accounts_for_other_sessions_and_other_identities(db_engine, session_id, compose_context, tmp_path, foreign_owner):
++    from uuid import uuid4
++
++    from elspeth.web.sessions.models import sessions_table
++    from tests.fixtures.identities import ensure_test_identity
++
++    recorder, url = _durable_recorder(tmp_path)
++    authority = SQLiteLocalSessionOperationAuthority(db_engine, quota_exceeded_recorder=recorder.record_quota_exceeded)
++    service = BlobServiceImpl(db_engine, tmp_path, session_operation_authority=authority)
++    record = await service.create_blob(session_id, "quota.csv", b"old", "text/csv", session_operation_context=compose_context)
++    other_session = uuid4()
++    owner = "other-owner" if foreign_owner else "test-user"
++    with db_engine.begin() as connection:
++        ensure_test_identity(connection, identity_id=owner)
++        connection.execute(
++            sessions_table.insert().values(
++                id=str(other_session),
++                user_id=owner,
++                auth_provider_type="local",
++                title="other retained bytes",
++                created_at=datetime.now(UTC),
++                updated_at=datetime.now(UTC),
++            )
++        )
++    other_operation = seed_live_compose_context(db_engine, other_session)
++    await service.create_blob(other_session, "elsewhere.csv", b"old", "text/csv", session_operation_context=other_operation)
++    _policies(db_engine, cap=1000 if foreign_owner else 8, ceiling=8 if foreign_owner else 1000)
++    context = replace(admission._context(service, db_engine, compose_context, tmp_path), user_message_content="larger")
++    before = admission._resources(db_engine, tmp_path / "blobs")
++    assert (
++        admit_blob_mutation("update_blob", {"blob_id": str(record.id), "content": "larger"}, admission._empty_state(), context) is not None
++    )
++    assert admission._resources(db_engine, tmp_path / "blobs") == before
++    (row,) = _durable_rows(url)
++    payload = _metadata(row)
++    assert (payload["usage"], payload["scope"], payload["limit"]) == (6, "container" if foreign_owner else "identity", 8)
++    recorder.close()
+diff --git a/tests/unit/web/sessions/test_blob_proposal_accept.py b/tests/unit/web/sessions/test_blob_proposal_accept.py
+index 6f8fa1f35..b51303a4f 100644
+--- a/tests/unit/web/sessions/test_blob_proposal_accept.py
++++ b/tests/unit/web/sessions/test_blob_proposal_accept.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import threading
++from dataclasses import replace
+ from pathlib import Path
+ from typing import Any
+ from unittest.mock import MagicMock
+@@ -22,6 +23,7 @@ from elspeth.web.auth.models import UserIdentity
+ from elspeth.web.blobs.protocol import BlobRecord
+ from elspeth.web.blobs.service import BlobServiceImpl
+ from elspeth.web.composer.progress import ComposerProgressRegistry
++from elspeth.web.composer.tools.blobs import admit_blob_mutation
+ from elspeth.web.config import WebSettings
+ from elspeth.web.dependencies import create_catalog_service
+ from elspeth.web.middleware.rate_limit import ComposerRateLimiter
+@@ -43,6 +45,7 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
+ from tests.fixtures.audit_hashing import fake_sha256
+ from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
+ from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
++from tests.unit.web.blobs.test_mutation_admission import _context, _empty_state, _resources
+ from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
+ 
+ 
+@@ -196,7 +199,32 @@ async def _save_composition_state(
+         await service._run_sync(service.session_operation_authority.release, context)
+ 
+ 
+-def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp_path: Path) -> None:
++def _admit_test_blob_effect(service, blob_service, session_id, tmp_path, tool_name, arguments, user_message_id=None):
++    operation = service.session_operation_authority.acquire(
++        session_id=session_id,
++        operation_kind=SessionOperationKind.COMPOSE,
++        owner_instance_id=service.session_operation_owner_instance_id,
++        lease_seconds=120,
++    )
++    try:
++        context = replace(
++            _context(blob_service, service._engine, operation, tmp_path),
++            user_message_id=str(user_message_id) if user_message_id else None,
++            composer_model_identifier="openai/gpt-5-mini",
++            composer_model_version="gpt-5-mini-2026-05-01",
++            composer_provider="openai",
++            composer_skill_hash=fake_sha256("composer-skill"),
++            tool_arguments_hash=stable_hash(arguments),
++        )
++        before = _resources(service._engine, tmp_path / "blobs")
++        assert admit_blob_mutation(tool_name, arguments, _empty_state(), context) is None
++        assert _resources(service._engine, tmp_path / "blobs") == before
++    finally:
++        service.session_operation_authority.release(operation)
++
++
++@pytest.mark.parametrize("content", ["approved content", "original content"])
++def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp_path: Path, content: str) -> None:
+     app, service = _make_app(tmp_path)
+     blob_service = BlobServiceImpl(
+         service._engine,
+@@ -230,7 +258,8 @@ def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp
+             content=b"original content",
+         )
+     )
+-    arguments = {"blob_id": str(blob.id), "content": "approved content"}
++    arguments = {"blob_id": str(blob.id), "content": content}
++    _admit_test_blob_effect(service, blob_service, session_id, tmp_path, "update_blob", arguments, user_message.id)
+     proposal = asyncio.run(
+         _create_test_proposal(
+             service,
+@@ -259,10 +288,13 @@ def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp
+     body = response.json()
+     assert body["status"] == "committed"
+     assert body["committed_state_id"] == str(state_record.id)
+-    assert Path(blob.storage_path).read_text(encoding="utf-8") == "approved content"
++    assert Path(blob.storage_path).read_text(encoding="utf-8") == content
+     persisted = asyncio.run(service.get_current_state(session_id))
+     assert persisted is not None
+     assert persisted.id == state_record.id
++    assert client.post(f"/api/sessions/{session_id}/proposals/{proposal.id}/accept").status_code == 200
++    with service._engine.connect() as connection:
++        assert len(connection.execute(select(proposal_blob_effect_receipts_table)).all()) == 1
+ 
+ 
+ def test_accept_update_blob_proposal_remains_blocked_by_second_pending_reference(tmp_path: Path) -> None:
+@@ -364,6 +396,7 @@ def test_accept_delete_blob_proposal_commits_without_composition_state_delta(tmp
+         )
+     )
+     arguments = {"blob_id": str(blob.id)}
++    _admit_test_blob_effect(service, blob_service, session_id, tmp_path, "delete_blob", arguments)
+     proposal = asyncio.run(
+         _create_test_proposal(
+             service,

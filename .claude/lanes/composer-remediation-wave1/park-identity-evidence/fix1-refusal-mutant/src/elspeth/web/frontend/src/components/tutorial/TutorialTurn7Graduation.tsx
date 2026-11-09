@@ -1,0 +1,190 @@
+import { type JSX, useCallback, useEffect, useRef, useState } from "react";
+import { Button } from "@/components/ui";
+import { capturePreferenceOwner, requirePreferenceOwner, PreferencesRequestSuperseded, usePreferencesStore } from "@/stores/preferencesStore";
+import { useSessionStore } from "@/stores/sessionStore";
+import { departTutorialSession } from "./tutorialDeparture";
+import {
+  GRADUATION_CANCELLED_NOTE,
+  HELLO_WORLD_SESSION_TITLE,
+  TURN_7_LEARNING_BULLETS,
+  TURN_7_LEARNING_BULLETS_SKIPPED,
+  TURN_7_PRIMARY_BUTTON,
+} from "./copy";
+
+interface TutorialTurn7GraduationProps {
+  sessionId: string | null;
+  skipped: boolean;
+  cancelled: boolean;
+  /**
+   * Back affordance. Omitted (undefined) when there is no real prior step to
+   * return to — e.g. a skipped or cancelled tutorial whose audit step has no
+   * run. When undefined the Back button is not rendered so the user can never
+   * navigate back into an empty audit.
+   */
+  onBack?: () => void;
+}
+
+export function TutorialTurn7Graduation({
+  sessionId,
+  skipped,
+  cancelled,
+  onBack,
+}: TutorialTurn7GraduationProps): JSX.Element {
+  const headingRef = useRef<HTMLHeadingElement | null>(null);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const finishingRef = useRef(false);
+  const skippedSessionRef = useRef<string | null>(null);
+  const activeRef = useRef(false);
+  const ownsMountRef = useRef(capturePreferenceOwner());
+  const writing = usePreferencesStore((state) => state.writing);
+
+  useEffect(() => {
+    activeRef.current = true;
+    headingRef.current?.focus();
+    window.dispatchEvent(new CustomEvent("tutorial_graduation_shown"));
+    return () => { activeRef.current = false; };
+  }, []);
+
+  const onFinish = useCallback(async () => {
+    if (finishingRef.current) return;
+    finishingRef.current = true;
+    setPending(true);
+    setError(null);
+    const owns = ownsMountRef.current;
+    const requireCurrent = () => {
+      requirePreferenceOwner(owns);
+      if (!activeRef.current) throw new PreferencesRequestSuperseded();
+    };
+    try {
+      requireCurrent();
+      // Preserve the built pipeline and finish its authoritative mode
+      // transition before publishing the tutorial dismissal.
+      if (sessionId !== null && !skipped) {
+        await useSessionStore
+          .getState()
+          .renameSession(sessionId, HELLO_WORLD_SESSION_TITLE);
+        requireCurrent();
+      }
+      if (sessionId !== null && !skipped) {
+        // Land the user ON the pipeline they just built so they can click Run
+        // for real and revisit it later — graduation used to drop them into a
+        // fresh empty composer, abandoning the worked example. Refresh the
+        // session list FIRST so the completed tutorial session appears in the
+        // switcher: it was created outside the store (raw API on Start), so
+        // renameSession alone never adds it to the in-memory list the switcher
+        // renders. selectSession loads its composition state, which the
+        // composer auto-validates so the Run button enables.
+        await useSessionStore.getState().loadSessions();
+        requireCurrent();
+        await useSessionStore.getState().selectSession(sessionId);
+        requireCurrent();
+        const landed = useSessionStore.getState();
+        if (landed.activeSessionId !== sessionId) {
+          throw new Error(
+            landed.error ?? "The composer could not open your pipeline.",
+          );
+        }
+        await departTutorialSession(sessionId, "complete", () => activeRef.current && owns());
+      } else {
+        // Skipped (no built pipeline to land on): drop into a fresh composer
+        // session so the user still lands somewhere usable.
+        const completion = await usePreferencesStore.getState().markTutorialGraduated({
+          via: "skip",
+          publishLocally: false,
+        });
+        requireCurrent();
+        completion.assertCurrent();
+        if (skippedSessionRef.current === null) {
+          const previousActiveSessionId = useSessionStore.getState().activeSessionId;
+          await useSessionStore.getState().createSession();
+          requireCurrent();
+          completion.assertCurrent();
+          const sessionState = useSessionStore.getState();
+          if (sessionState.activeSessionId === null || sessionState.activeSessionId === previousActiveSessionId) {
+            throw new Error(sessionState.error ?? "The composer session could not be created.");
+          }
+          skippedSessionRef.current = sessionState.activeSessionId;
+        }
+        requireCurrent();
+        completion.publish();
+      }
+    } catch (err) {
+      if (!activeRef.current || !owns() || err instanceof PreferencesRequestSuperseded) return;
+      setError(formatError(err));
+    } finally {
+      finishingRef.current = false;
+      if (activeRef.current && owns()) setPending(false);
+    }
+  }, [sessionId, skipped]);
+
+  const busy = pending || writing;
+
+  return (
+    <section className="tutorial-turn" aria-labelledby="tutorial-graduation-title">
+      <p className="tutorial-kicker">Graduation</p>
+      <h2 id="tutorial-graduation-title" ref={headingRef} tabIndex={-1}>
+        You're ready to use the composer.
+      </h2>
+      {cancelled && (
+        <p role="status" className="tutorial-cancelled-note">
+          {GRADUATION_CANCELLED_NOTE}
+        </p>
+      )}
+      <ul className="tutorial-graduation-list">
+        {/* Honest skip variant (elspeth-918f4434b3): a user who skipped
+            never built or ran anything, so the "pipeline you just ran" /
+            "gestures you just practised" bullets would be false. The first
+            two bullets swap for future-tense equivalents; the last two are
+            shared (they make no just-ran claims). */}
+        {(skipped
+          ? [...TURN_7_LEARNING_BULLETS_SKIPPED, ...TURN_7_LEARNING_BULLETS.slice(2)]
+          : TURN_7_LEARNING_BULLETS
+        ).map((bullet) => (
+          <li key={bullet.title}>
+            <strong>{bullet.title}</strong>
+            <span>{bullet.body}</span>
+          </li>
+        ))}
+      </ul>
+      <div className="tutorial-actions">
+        <Button variant="primary" disabled={busy} onClick={() => void onFinish()}>
+          {busy ? "Saving..." : TURN_7_PRIMARY_BUTTON}
+        </Button>
+        {onBack !== undefined && (
+          <Button
+            variant="bare"
+            className="tutorial-link-button"
+            disabled={busy}
+            onClick={onBack}
+          >
+            Back
+          </Button>
+        )}
+      </div>
+      <p role="status" className="sr-only">
+        {busy ? "Saving tutorial completion" : ""}
+      </p>
+      {error !== null && (
+        <p role="alert" className="tutorial-error">
+          {error}
+        </p>
+      )}
+    </section>
+  );
+}
+
+function formatError(err: unknown): string {
+  if (
+    typeof err === "object" &&
+    err !== null &&
+    "detail" in err &&
+    typeof (err as { detail?: unknown }).detail === "string"
+  ) {
+    return (err as { detail: string }).detail;
+  }
+  if (err instanceof Error) {
+    return err.message;
+  }
+  return "The tutorial could not be completed.";
+}

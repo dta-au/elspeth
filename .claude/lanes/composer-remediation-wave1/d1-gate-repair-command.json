@@ -1,0 +1,28 @@
+{
+  "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates",
+  "argv": [
+    ".venv/bin/python",
+    "-m",
+    "pytest",
+    "-n",
+    "0",
+    "-o",
+    "pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates/src /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates/elspeth-lints/src",
+    "tests/unit/architecture/test_web_reserve_reviewed_contracts.py",
+    "tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_required_work_reserve_admission_on_actual_sources",
+    "tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_required_work_reserve_rejects_protected_instance_formal_recovery",
+    "tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_no_mutation_alias_wrapper_dynamic_or_raw_write_escape_exists",
+    "tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_required_work_reserve_proposal_namespace_ignores_unrelated_parent_metadata",
+    "tests/unit/web/sessions/test_operation_fence_wiring.py::test_fenced_unit_of_work_exposes_only_exact_composed_capabilities",
+    "tests/unit/web/sessions/test_static_direct_writers.py",
+    "tests/unit/web/composer/test_compose_loop_persistence.py::test_explicit_approval_batch_caps_after_first_ten_admitted_publications",
+    "tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_cap_excludes_schema_errors_and_semantic_refusals",
+    "tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_attempt_cap_includes_approval_required_blob_only_mutation",
+    "tests/unit/web/composer/test_service.py::TestComposerSingleToolCall::test_explicit_approve_intercepts_update_blob_without_mutating_blob",
+    "tests/unit/web/composer/test_endpoint_affordance.py",
+    "tests/integration/web/composer/test_composer_against_gateway.py"
+  ],
+  "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates/src:/workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates/elspeth-lints/src",
+  "log": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-gate-repair-logs/authority-fixtures.log",
+  "exit_file": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-gate-repair-logs/authority-fixtures.exit"
+}

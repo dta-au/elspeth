@@ -1,0 +1,150 @@
+[
+  {
+    "stage": "ruff",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-d2/.venv/bin/ruff",
+      "check",
+      "src/elspeth/composer_mcp/server.py",
+      "src/elspeth/web/composer/tools/_common.py",
+      "src/elspeth/web/composer/tools/_dispatch.py",
+      "src/elspeth/web/composer/tools/outputs.py",
+      "src/elspeth/web/composer/tools/sessions.py",
+      "src/elspeth/web/composer/tools/sources.py",
+      "src/elspeth/web/composer/tools/transforms.py",
+      "src/elspeth/web/execution/_validation_authoring.py",
+      "src/elspeth/web/execution/_validation_materialization.py",
+      "src/elspeth/web/execution/_validation_pipeline.py",
+      "src/elspeth/web/execution/preflight.py",
+      "src/elspeth/web/execution/validation.py",
+      "src/elspeth/web/paths.py",
+      "tests/unit/composer_mcp/test_server.py",
+      "tests/unit/web/composer/test_set_pipeline_candidate.py",
+      "tests/unit/web/execution/test_validation.py",
+      "tests/unit/web/execution/test_validation_materialization.py",
+      "tests/unit/web/test_paths.py",
+      "tests/unit/composer_mcp/test_configured_root_admission.py",
+      "src/elspeth/contracts/composer_paths.py"
+    ],
+    "exit": 0
+  },
+  {
+    "stage": "format",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-d2/.venv/bin/ruff",
+      "format",
+      "--check",
+      "src/elspeth/composer_mcp/server.py",
+      "src/elspeth/web/composer/tools/_common.py",
+      "src/elspeth/web/composer/tools/_dispatch.py",
+      "src/elspeth/web/composer/tools/outputs.py",
+      "src/elspeth/web/composer/tools/sessions.py",
+      "src/elspeth/web/composer/tools/sources.py",
+      "src/elspeth/web/composer/tools/transforms.py",
+      "src/elspeth/web/execution/_validation_authoring.py",
+      "src/elspeth/web/execution/_validation_materialization.py",
+      "src/elspeth/web/execution/_validation_pipeline.py",
+      "src/elspeth/web/execution/preflight.py",
+      "src/elspeth/web/execution/validation.py",
+      "src/elspeth/web/paths.py",
+      "tests/unit/composer_mcp/test_server.py",
+      "tests/unit/web/composer/test_set_pipeline_candidate.py",
+      "tests/unit/web/execution/test_validation.py",
+      "tests/unit/web/execution/test_validation_materialization.py",
+      "tests/unit/web/test_paths.py",
+      "tests/unit/composer_mcp/test_configured_root_admission.py",
+      "src/elspeth/contracts/composer_paths.py"
+    ],
+    "exit": 0
+  },
+  {
+    "stage": "mypy",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-d2/.venv/bin/mypy",
+      "--cache-dir",
+      "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/mypy-cache",
+      "src/elspeth/composer_mcp/server.py",
+      "src/elspeth/web/composer/tools/_common.py",
+      "src/elspeth/web/composer/tools/_dispatch.py",
+      "src/elspeth/web/composer/tools/outputs.py",
+      "src/elspeth/web/composer/tools/sessions.py",
+      "src/elspeth/web/composer/tools/sources.py",
+      "src/elspeth/web/composer/tools/transforms.py",
+      "src/elspeth/web/execution/_validation_authoring.py",
+      "src/elspeth/web/execution/_validation_materialization.py",
+      "src/elspeth/web/execution/_validation_pipeline.py",
+      "src/elspeth/web/execution/preflight.py",
+      "src/elspeth/web/execution/validation.py",
+      "src/elspeth/web/paths.py",
+      "src/elspeth/contracts/composer_paths.py"
+    ],
+    "exit": 0
+  },
+  {
+    "stage": "contracts",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-d2/.venv/bin/python",
+      "-m",
+      "scripts.check_contracts"
+    ],
+    "exit": 0
+  },
+  {
+    "stage": "inventory",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-d2/.venv/bin/python",
+      "scripts/cicd/generate_skill_inventory.py",
+      "--check"
+    ],
+    "exit": 0
+  },
+  {
+    "stage": "boundaries",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-d2/.venv/bin/python",
+      "-m",
+      "elspeth_lints.core.cli",
+      "check",
+      "--rules",
+      "trust_boundary.tests,trust_boundary.scope,trust_boundary.tier",
+      "--root",
+      "src/elspeth",
+      "--format",
+      "json"
+    ],
+    "exit": 1
+  },
+  {
+    "stage": "boundary-delta",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-d2/.venv/bin/python",
+      "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/compare_boundaries.py",
+      "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/post-contract-boundaries.json"
+    ],
+    "exit": 1
+  },
+  {
+    "stage": "pytest",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-d2/.venv/bin/python",
+      "-m",
+      "pytest",
+      "-o",
+      "pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-d2/src /workspace/elspeth/.claude/worktrees/composer-remediation-d2/elspeth-lints/src",
+      "--basetemp=/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/post-contract-tmp",
+      "-n",
+      "0",
+      "tests/unit/composer_mcp",
+      "tests/unit/web/test_paths.py",
+      "tests/unit/web/composer/test_set_pipeline_candidate.py::test_later_path_refusal_does_not_persist_a_prepared_inline_source",
+      "tests/unit/web/execution/test_validation_authoring.py",
+      "tests/unit/web/execution/test_validation_materialization.py",
+      "tests/unit/web/execution/test_validation_identity_document.py",
+      "tests/unit/web/execution/test_validation.py::test_validate_pipeline_public_signature_is_stable_through_boundary_decorator",
+      "tests/unit/web/execution/test_preflight_side_effects.py",
+      "tests/unit/web/execution/test_service.py::TestResolveYamlPaths",
+      "tests/unit/contracts/test_leaf_boundary.py",
+      "tests/unit/web/test_sessions_composer_attribute_contracts.py"
+    ],
+    "exit": 0
+  }
+]

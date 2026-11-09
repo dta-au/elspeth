@@ -1,0 +1,287 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 11 items
+
+tests/unit/web/composer/test_compose_loop_persistence.py F.F.            [ 36%]
+tests/integration/web/composer/test_composer_against_gateway.py .        [ 45%]
+tests/unit/architecture/test_web_reserve_reviewed_contracts.py FFFFF     [ 90%]
+tests/unit/web/sessions/test_operation_fence_wiring.py .                 [100%]
+
+=================================== FAILURES ===================================
+________ test_proposal_cap_excludes_schema_errors_and_semantic_refusals ________
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f8433d02f90>
+result_session_id = '833cbeb4-36f9-4c5b-bc95-ef55500b5134'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f8438b871a0>
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-175/test_proposal_cap_excludes_sch0')
+
+    @pytest.mark.asyncio
+    async def test_proposal_cap_excludes_schema_errors_and_semantic_refusals(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+        with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+            conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+    
+        handler_calls = _record_real_tool_handlers(monkeypatch)
+        source_path = tmp_path / "input.csv"
+        source_path.write_text("customer_id\n1\n")
+        caught = await _capture_tool_batch_rejection(
+            composer_service_with_real_sessions,
+            session_id=result_session_id,
+            response=_tool_batch_response(
+                *((f"call_valid_attempt_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}}) for index in range(9)),
+                ("call_schema_invalid_attempt", "set_metadata", {}),
+                (
+                    "call_semantic_invalid_attempt",
+                    "set_pipeline",
+                    {
+                        "source": {
+                            "plugin": "csv",
+                            "options": {"path": str(source_path)},
+                            "on_success": "rows",
+                            "on_validation_failure": "discard",
+                        },
+                        "nodes": [],
+                        "edges": [],
+                        "outputs": [],
+                        "metadata": {"name": "semantically incomplete"},
+                    },
+                ),
+            ),
+        )
+    
+        assert caught is None
+        # Schema validation fails before handler dispatch; only the nine admitted
+        # metadata handlers execute. The canonical refusal has its own builder.
+        assert handler_calls == ["set_metadata"] * 9
+        with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+            assert set(
+                conn.execute(
+                    select(composition_proposals_table.c.tool_call_id).where(composition_proposals_table.c.session_id == result_session_id)
+                ).scalars()
+            ) == {f"call_valid_attempt_{index}" for index in range(9)}
+            assert (
+                len(conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).all()) == 9
+            )
+            feedback = conn.execute(
+                select(chat_messages_table.c.tool_call_id, chat_messages_table.c.content)
+                .where(chat_messages_table.c.session_id == result_session_id)
+                .where(chat_messages_table.c.role == "tool")
+                .order_by(chat_messages_table.c.sequence_no)
+            ).all()
+        assert [row.tool_call_id for row in feedback] == [
+            *(f"call_valid_attempt_{index}" for index in range(9)),
+            "call_schema_invalid_attempt",
+            "call_semantic_invalid_attempt",
+        ]
+        assert json.loads(feedback[-2].content)["error_class"] == "ToolArgumentError"
+>       assert json.loads(feedback[-1].content)["status"] == "PREVALIDATION_REJECTED"
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'status'
+
+tests/unit/web/composer/test_compose_loop_persistence.py:1453: KeyError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 16:38:21 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 16:38:23 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 16:38:23 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[admitted-tenth] _
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f842dba5070>
+result_session_id = '57705d97-43f2-439f-bf59-d888dfd7cc16'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-175/test_proposal_attempt_cap_incl1')
+blob_case = 'admitted-tenth'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f843307f050>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("blob_case", ("invalid-at-cap", "admitted-tenth", "admitted-eleventh"))
+    async def test_proposal_attempt_cap_includes_approval_required_blob_only_mutation(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        tmp_path: Path,
+        blob_case: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from tests.helpers.session_fences import fenced_operation_context
+        from tests.unit.web.composer.test_service import _blob_mutation_resources_for_test
+    
+        sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+        monkeypatch.setattr(composer_service_with_real_sessions, "_session_engine", sessions_service._engine)
+        with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+            conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+    
+        arguments: dict[str, Any] = {}
+        if blob_case != "invalid-at-cap":
+            with fenced_operation_context(sessions_service._engine, result_session_id, operation_kind=SessionOperationKind.CREATE) as context:
+                blob = await BlobServiceImpl(sessions_service._engine, tmp_path).create_blob(
+                    UUID(result_session_id), "retained.txt", b"must remain untouched", "text/plain", session_operation_context=context
+                )
+            arguments = {"blob_id": str(blob.id)}
+        resources_before = _blob_mutation_resources_for_test(sessions_service._engine, tmp_path)
+        change_count = 9 if blob_case == "admitted-tenth" else 10
+    
+        caught = await _capture_tool_batch_rejection(
+            composer_service_with_real_sessions,
+            session_id=result_session_id,
+            response=_tool_batch_response(
+                *(
+                    (f"call_blob_boundary_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}})
+                    for index in range(change_count)
+                ),
+                ("call_approval_required_blob_only", "delete_blob", arguments),
+            ),
+        )
+    
+        expected_ids = {f"call_blob_boundary_proposal_{index}" for index in range(change_count)}
+        if blob_case == "admitted-eleventh":
+            assert type(caught) is ComposerConvergenceError
+            assert dict(caught.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
+            assert [inv.tool_call_id for inv in caught.tool_invocations] == [f"call_blob_boundary_proposal_{index}" for index in range(10)]
+            assert all(inv.version_before == inv.version_after == 1 for inv in caught.tool_invocations)
+        else:
+            assert caught is None
+            if blob_case == "admitted-tenth":
+                expected_ids.add("call_approval_required_blob_only")
+        with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+            assert (
+                set(
+                    conn.execute(
+                        select(composition_proposals_table.c.tool_call_id).where(composition_proposals_table.c.session_id == result_session_id)
+                    ).scalars()
+                )
+                == expected_ids
+            )
+            assert (
+                len(conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).all()) == 10
+            )
+            blob_feedback = conn.execute(
+                select(chat_messages_table.c.content).where(
+                    chat_messages_table.c.session_id == result_session_id,
+                    chat_messages_table.c.role == "tool",
+                    chat_messages_table.c.tool_call_id == "call_approval_required_blob_only",
+                )
+            ).all()
+        if blob_case == "admitted-eleventh":
+            assert blob_feedback == []
+        else:
+            assert len(blob_feedback) == 1
+            payload = json.loads(blob_feedback[0].content)
+            if blob_case == "invalid-at-cap":
+                assert payload["error_class"] == "ToolArgumentError"
+            else:
+>               assert payload["status"] == "APPROVAL_REQUIRED"
+                       ^^^^^^^^^^^^^^^^^
+E               KeyError: 'status'
+
+tests/unit/web/composer/test_compose_loop_persistence.py:1574: KeyError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 16:38:25 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 16:38:25 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 16:38:25 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_d1_reviewed_bindings_preserve_policy_refusal_and_settlement_authority[policy] _
+
+fault = 'policy'
+
+    @pytest.mark.parametrize("fault", ("policy", "refusal-context", "refusal-callee", "refusal-cancellation", "settlement-reason"))
+    def test_d1_reviewed_bindings_preserve_policy_refusal_and_settlement_authority(fault: str) -> None:
+        """Actual recipe checks detect drift in the newly reviewed dependencies."""
+        canonical = fencing._production_units()
+>       assert fencing._reserve_recipe_failures(canonical) == []
+E       AssertionError: assert ['writer targ...ule-bindings'] == []
+E         
+E         Left contains one more item: 'writer target/field recipe changed src/elspeth/contracts/blobs.py:module-bindings'
+E         Use -v to get more diff
+
+tests/unit/architecture/test_web_reserve_reviewed_contracts.py:435: AssertionError
+_ test_d1_reviewed_bindings_preserve_policy_refusal_and_settlement_authority[refusal-context] _
+
+fault = 'refusal-context'
+
+    @pytest.mark.parametrize("fault", ("policy", "refusal-context", "refusal-callee", "refusal-cancellation", "settlement-reason"))
+    def test_d1_reviewed_bindings_preserve_policy_refusal_and_settlement_authority(fault: str) -> None:
+        """Actual recipe checks detect drift in the newly reviewed dependencies."""
+        canonical = fencing._production_units()
+>       assert fencing._reserve_recipe_failures(canonical) == []
+E       AssertionError: assert ['writer targ...ule-bindings'] == []
+E         
+E         Left contains one more item: 'writer target/field recipe changed src/elspeth/contracts/blobs.py:module-bindings'
+E         Use -v to get more diff
+
+tests/unit/architecture/test_web_reserve_reviewed_contracts.py:435: AssertionError
+_ test_d1_reviewed_bindings_preserve_policy_refusal_and_settlement_authority[refusal-callee] _
+
+fault = 'refusal-callee'
+
+    @pytest.mark.parametrize("fault", ("policy", "refusal-context", "refusal-callee", "refusal-cancellation", "settlement-reason"))
+    def test_d1_reviewed_bindings_preserve_policy_refusal_and_settlement_authority(fault: str) -> None:
+        """Actual recipe checks detect drift in the newly reviewed dependencies."""
+        canonical = fencing._production_units()
+>       assert fencing._reserve_recipe_failures(canonical) == []
+E       AssertionError: assert ['writer targ...ule-bindings'] == []
+E         
+E         Left contains one more item: 'writer target/field recipe changed src/elspeth/contracts/blobs.py:module-bindings'
+E         Use -v to get more diff
+
+tests/unit/architecture/test_web_reserve_reviewed_contracts.py:435: AssertionError
+_ test_d1_reviewed_bindings_preserve_policy_refusal_and_settlement_authority[refusal-cancellation] _
+
+fault = 'refusal-cancellation'
+
+    @pytest.mark.parametrize("fault", ("policy", "refusal-context", "refusal-callee", "refusal-cancellation", "settlement-reason"))
+    def test_d1_reviewed_bindings_preserve_policy_refusal_and_settlement_authority(fault: str) -> None:
+        """Actual recipe checks detect drift in the newly reviewed dependencies."""
+        canonical = fencing._production_units()
+>       assert fencing._reserve_recipe_failures(canonical) == []
+E       AssertionError: assert ['writer targ...ule-bindings'] == []
+E         
+E         Left contains one more item: 'writer target/field recipe changed src/elspeth/contracts/blobs.py:module-bindings'
+E         Use -v to get more diff
+
+tests/unit/architecture/test_web_reserve_reviewed_contracts.py:435: AssertionError
+_ test_d1_reviewed_bindings_preserve_policy_refusal_and_settlement_authority[settlement-reason] _
+
+fault = 'settlement-reason'
+
+    @pytest.mark.parametrize("fault", ("policy", "refusal-context", "refusal-callee", "refusal-cancellation", "settlement-reason"))
+    def test_d1_reviewed_bindings_preserve_policy_refusal_and_settlement_authority(fault: str) -> None:
+        """Actual recipe checks detect drift in the newly reviewed dependencies."""
+        canonical = fencing._production_units()
+>       assert fencing._reserve_recipe_failures(canonical) == []
+E       AssertionError: assert ['writer targ...ule-bindings'] == []
+E         
+E         Left contains one more item: 'writer target/field recipe changed src/elspeth/contracts/blobs.py:module-bindings'
+E         Use -v to get more diff
+
+tests/unit/architecture/test_web_reserve_reviewed_contracts.py:435: AssertionError
+=============================== warnings summary ===============================
+tests/integration/web/composer/test_composer_against_gateway.py::test_default_responses_bridge_is_refused_by_chat_only_gateway
+  /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates/.venv/lib/python3.12/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0 - 2024-11-09
+
+tests/integration/web/composer/test_composer_against_gateway.py::test_default_responses_bridge_is_refused_by_chat_only_gateway
+  /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates/.venv/lib/python3.12/site-packages/uvicorn/protocols/websockets/websockets_impl.py:17: DeprecationWarning: websockets.server.WebSocketServerProtocol is deprecated
+    from websockets.server import WebSocketServerProtocol
+
+tests/integration/web/composer/test_composer_against_gateway.py::test_default_responses_bridge_is_refused_by_chat_only_gateway
+  /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates/.venv/lib/python3.12/site-packages/pydantic/_internal/_generate_schema.py:1480: UserWarning: Item 'summary' on TypedDict class 'ChatCompletionReasoningItem' is using the `ReadOnly` qualifier. Pydantic will not protect items from any mutation on dictionary instances.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_cap_excludes_schema_errors_and_semantic_refusals
+FAILED tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[admitted-tenth]
+FAILED tests/unit/architecture/test_web_reserve_reviewed_contracts.py::test_d1_reviewed_bindings_preserve_policy_refusal_and_settlement_authority[policy]
+FAILED tests/unit/architecture/test_web_reserve_reviewed_contracts.py::test_d1_reviewed_bindings_preserve_policy_refusal_and_settlement_authority[refusal-context]
+FAILED tests/unit/architecture/test_web_reserve_reviewed_contracts.py::test_d1_reviewed_bindings_preserve_policy_refusal_and_settlement_authority[refusal-callee]
+FAILED tests/unit/architecture/test_web_reserve_reviewed_contracts.py::test_d1_reviewed_bindings_preserve_policy_refusal_and_settlement_authority[refusal-cancellation]
+FAILED tests/unit/architecture/test_web_reserve_reviewed_contracts.py::test_d1_reviewed_bindings_preserve_policy_refusal_and_settlement_authority[settlement-reason]
+=================== 7 failed, 4 passed, 3 warnings in 31.25s ===================

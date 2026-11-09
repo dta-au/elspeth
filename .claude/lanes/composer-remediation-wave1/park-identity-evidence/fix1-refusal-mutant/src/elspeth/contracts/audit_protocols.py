@@ -1,0 +1,240 @@
+"""Cross-layer audit protocols for plugin-facing audit operations.
+
+These protocols define the interface that plugins use to record audit events.
+They live in L0 (contracts/) so plugins (L3) can depend on them without
+importing L1 (core/) at runtime.
+
+Method-count budget: Do not exceed 20 methods.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+from elspeth.contracts import (
+    Call,
+    CallStatus,
+    CallType,
+    NodeState,
+    RoutingEvent,
+    RoutingMode,
+    RoutingReason,
+    RoutingSpec,
+)
+from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.call_data import CallPayload
+from elspeth.contracts.errors import ContractViolation, TransformErrorReason
+from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
+
+if TYPE_CHECKING:
+    from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+    from elspeth.contracts.scheduler import TokenWorkItem
+    from elspeth.contracts.schema_contract import PipelineRow
+
+
+class CallRecorder(Protocol):
+    """Narrow protocol for clients that record external calls.
+
+    AuditedClientBase and its subclasses (HTTP, LLM) only need these two
+    methods. This protocol is satisfied by both ExecutionRepository (direct
+    injection) and PluginAuditWriter (via adapter), eliminating the need
+    for type: ignore[arg-type] at plugin call sites.
+    """
+
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int: ...
+
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int: ...
+
+    def record_call(
+        self,
+        state_id: str,
+        call_index: int,
+        call_type: CallType,
+        status: CallStatus,
+        request_data: CallPayload,
+        response_data: CallPayload | None = None,
+        error: CallPayload | None = None,
+        latency_ms: float | None = None,
+        *,
+        request_ref: str | None = None,
+        response_ref: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
+    ) -> Call: ...
+
+    def record_operation_call(
+        self,
+        operation_id: str,
+        call_type: CallType,
+        status: CallStatus,
+        request_data: CallPayload,
+        response_data: CallPayload | None = None,
+        error: CallPayload | None = None,
+        latency_ms: float | None = None,
+        *,
+        call_index: int | None = None,
+        request_ref: str | None = None,
+        response_ref: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
+        coordination_token: CoordinationToken,
+    ) -> Call: ...
+
+
+@runtime_checkable
+class PluginAuditWriter(Protocol):
+    """Protocol for plugin-facing audit recording operations.
+
+    Composes methods from ExecutionRepository, DataFlowRepository, and
+    RunLifecycleRepository into a single interface that plugins can depend
+    on without importing core/.
+
+    Method-count budget: Do not exceed 20 methods.
+    """
+
+    # ── ExecutionRepository methods ──────────────────────────────────────
+
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int: ...
+
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int: ...
+
+    def record_call(
+        self,
+        state_id: str,
+        call_index: int,
+        call_type: CallType,
+        status: CallStatus,
+        request_data: CallPayload,
+        response_data: CallPayload | None = None,
+        error: CallPayload | None = None,
+        latency_ms: float | None = None,
+        *,
+        request_ref: str | None = None,
+        response_ref: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
+    ) -> Call: ...
+
+    def record_operation_call(
+        self,
+        operation_id: str,
+        call_type: CallType,
+        status: CallStatus,
+        request_data: CallPayload,
+        response_data: CallPayload | None = None,
+        error: CallPayload | None = None,
+        latency_ms: float | None = None,
+        *,
+        call_index: int | None = None,
+        request_ref: str | None = None,
+        response_ref: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
+        coordination_token: CoordinationToken,
+    ) -> Call: ...
+
+    def get_node_state(self, state_id: str) -> NodeState | None: ...
+
+    def record_routing_event(
+        self,
+        state_id: str,
+        edge_id: str,
+        mode: RoutingMode,
+        reason: RoutingReason | None = None,
+        *,
+        event_id: str | None = None,
+        routing_group_id: str | None = None,
+        ordinal: int = 0,
+        reason_ref: str | None = None,
+        member_token: WorkerMembershipToken,
+    ) -> RoutingEvent:
+        """Record one complete one-route decision; identity controls do not append."""
+        ...
+
+    def record_routing_events(
+        self,
+        state_id: str,
+        routes: list[RoutingSpec],
+        reason: RoutingReason | None = None,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
+    ) -> list[RoutingEvent]:
+        """Atomically record one complete fork/multi-destination decision."""
+        ...
+
+    # ── DataFlowRepository methods ───────────────────────────────────────
+
+    def record_validation_error(
+        self,
+        node_id: str | None,
+        row_data: Any,
+        error: str,
+        schema_mode: str,
+        destination: str,
+        *,
+        contract_violation: ContractViolation | None = None,
+        coordination_token: CoordinationToken,
+    ) -> str: ...
+
+    def record_transform_error(
+        self,
+        ref: TokenRef,
+        transform_id: str,
+        row_data: Mapping[str, object] | PipelineRow,
+        error_details: TransformErrorReason,
+        destination: str,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
+    ) -> str: ...
+
+    def update_node_output_contract(
+        self,
+        node_id: str,
+        contract: SchemaContract,
+        *,
+        member_token: WorkerMembershipToken,
+    ) -> None: ...
+
+    def get_node_contracts(
+        self,
+        run_id: str,
+        node_id: str,
+        *,
+        allow_missing: bool = False,
+    ) -> tuple[SchemaContract | None, SchemaContract | None]: ...
+
+    # ── RunLifecycleRepository methods ───────────────────────────────────
+
+    def get_source_field_resolution(self, run_id: str) -> dict[str, str] | None: ...
+
+    def record_readiness_check(
+        self,
+        *,
+        name: str,
+        collection: str,
+        reachable: bool,
+        count: int | None,
+        message: str,
+        member_token: WorkerMembershipToken,
+    ) -> None: ...

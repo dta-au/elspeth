@@ -1,0 +1,34 @@
+3.12.14 (main, Aug 25 2026, 14:00:49) [Clang 22.1.3 ]
+os.execv builtin doc: Execute an executable path with arguments, replacing current process.
+
+  path
+    Path of executable file.
+  argv
+    Tuple or list of strings.
+These excerpts are local CPython source inspection, not native Windows execution.
+
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/runpy.py
+82:                        __file__ = fname,
+83:                        __cached__ = cached,
+84:                        __doc__ = None,
+85:                        __loader__ = loader,
+86:                        __package__ = pkg_name,
+87:                        __spec__ = mod_spec)
+88:     exec(code, run_globals)
+89:     return run_globals
+90: 
+91: def _run_module_code(code, init_globals=None,
+92:                     mod_name=None, mod_spec=None,
+
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/subprocess.py
+1667:         def terminate(self):
+1668:             """Terminates the process."""
+1669:             # Don't terminate a process that we know has already died.
+1670:             if self.returncode is not None:
+1671:                 return
+1672:             try:
+1673:                 _winapi.TerminateProcess(self._handle, 1)
+1674:             except PermissionError:
+1675:                 # ERROR_ACCESS_DENIED (winerror 5) is received when the
+1676:                 # process already died.
+1677:                 rc = _winapi.GetExitCodeProcess(self._handle)

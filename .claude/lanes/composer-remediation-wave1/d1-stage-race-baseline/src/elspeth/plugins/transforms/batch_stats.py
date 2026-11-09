@@ -1,0 +1,637 @@
+"""Batch statistics transform plugin.
+
+Computes aggregate statistics (sum, count, mean) over batches of rows.
+Demonstrates batch-aware transform processing for aggregation pipelines.
+
+IMPORTANT: This transform uses is_batch_aware=True, meaning the engine
+will buffer rows and call process() with a list when the trigger fires.
+"""
+
+import math
+from decimal import Decimal
+from typing import Any
+
+from pydantic import Field, field_validator, model_validator
+
+from elspeth.contracts import Determinism
+from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.errors import RowErrorEntry, TransformErrorReason
+from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.plugins.infrastructure.base import BaseTransform
+from elspeth.plugins.infrastructure.config_base import TransformDataConfig
+from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError, require_scalar_group_key
+from elspeth.plugins.transforms._scalar_buckets import ScalarBucketKey, scalar_bucket_key
+
+type BatchStatsAggregateRow = dict[str, object]
+
+
+class BatchStatsConfig(TransformDataConfig):
+    """Configuration for batch statistics transform.
+
+    Requires a numeric field to aggregate. When group_by is configured, rows
+    are partitioned by that field and one aggregate row is emitted per group.
+    """
+
+    value_field: str = Field(description="Name of the numeric field to aggregate (sum/mean)")
+    group_by: str | None = Field(
+        default=None,
+        description=(
+            "Optional field that partitions the batch and emits one aggregate row per distinct value. "
+            "The group_by field is included in each output row."
+        ),
+    )
+    compute_mean: bool = Field(
+        default=True,
+        description="Whether to compute mean in addition to sum/count",
+    )
+
+    @field_validator("value_field")
+    @classmethod
+    def _reject_empty(cls, v: str) -> str:
+        if not v:
+            raise ValueError("value_field must not be empty")
+        return v
+
+    @field_validator("group_by")
+    @classmethod
+    def _reject_empty_group_by(cls, v: str | None) -> str | None:
+        if v is not None and not v.strip():
+            raise ValueError("group_by must not be empty")
+        return v
+
+    @model_validator(mode="after")
+    def _reject_group_by_collision(self) -> "BatchStatsConfig":
+        """Reject group_by names that collide with aggregate output keys.
+
+        The set of output keys is deterministic from compute_mean — no runtime
+        state needed. Moved from BatchStats.__init__ so that from_dict()
+        catches it (pre-validation / engine-validation agreement).
+        """
+        if self.group_by is None:
+            return self
+        stat_fields = {
+            "count",
+            "sum",
+            "batch_size",
+            "skipped_missing",
+            "skipped_missing_indices",
+            "skipped_non_finite",
+            "skipped_non_finite_indices",
+        }
+        if self.compute_mean:
+            stat_fields.add("mean")
+        if self.group_by in stat_fields:
+            raise ValueError(
+                f"group_by field '{self.group_by}' collides with aggregate output key. "
+                f"Choose a group_by field name that is not one of: {', '.join(sorted(stat_fields))}"
+            )
+        return self
+
+
+class BatchStats(BaseTransform):
+    """Compute aggregate statistics over a batch of rows.
+
+    This is a batch-aware transform that receives multiple rows at once
+    when an aggregation trigger fires. Without group_by, it emits one
+    aggregate row for the full batch. With group_by, it emits one aggregate
+    row per distinct group value. It computes:
+    - count: Number of finite, non-missing valid numeric values (int)
+    - sum: Sum of those finite, non-missing valid numeric values (declared
+      float: an exact int over int values, a float otherwise)
+    - mean: Average of those values, always a float (if compute_mean=True)
+    - batch_size: Number of input rows before missing or non-finite values are skipped (int)
+
+    Config options:
+        schema: Required. Schema for input validation
+        value_field: Required. Numeric field to aggregate
+        group_by: Optional. Field to partition by; included in each output row
+        compute_mean: Whether to compute mean (default: True)
+
+    Example YAML:
+        aggregations:
+          - name: daily_totals
+            plugin: batch_stats
+            trigger:
+              count: 100
+            options:
+              schema:
+                mode: observed
+              value_field: amount
+              group_by: category
+              compute_mean: true
+    """
+
+    name = "batch_stats"
+    determinism = Determinism.DETERMINISTIC
+    plugin_version = "1.0.0"
+    source_file_hash: str | None = "sha256:dc51745b4f352155"
+    config_model = BatchStatsConfig
+    is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
+    # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
+    flush_emits_one_row_per_buffered_row = False
+    usage_when_to_use: str = (
+        "Use to replace a window of rows with count, sum, and optional mean statistics over one numeric field. "
+        "Omit trigger or use trigger: {} for one bounded whole-source end-of-source aggregate; a count, timeout, "
+        "or condition trigger creates independent windows. "
+        "When configured, group_by partitions one flushed batch and never accumulates a group across windows."
+    )
+    usage_when_not_to_use: str = (
+        "Not for pass-through enrichment or unbounded whole-source buffering: original rows are replaced. Configure "
+        "an early trigger when the source cannot be safely held until end-of-source."
+    )
+    example_use: str = """aggregations:
+  - name: category_totals
+    plugin: batch_stats
+    input: sales_rows
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 100
+    output_mode: transform
+    options:
+      value_field: amount
+      group_by: category
+      compute_mean: true
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "aggregation", "statistics")
+
+    @classmethod
+    def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
+        if issue_code is None:
+            return PluginAssistance(
+                plugin_name=cls.name,
+                issue_code=None,
+                summary="Aggregates a numeric field into count, sum, and optional mean rows.",
+                composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
+                    "Use batch_stats under aggregations with a trigger; it is not a per-row transform.",
+                    "value_field must contain numeric int or float values; missing and non-finite values are skipped and reported.",
+                    "Output is derived summary row(s) and does not preserve original row fields.",
+                    "Set group_by only when you want one summary row per group; avoid names that collide with output fields.",
+                ),
+            )
+        return None
+
+    @classmethod
+    def probe_config(cls) -> dict[str, Any]:
+        """Minimal config for the ADR-009 backward invariant."""
+        return {
+            "schema": {"mode": "observed"},
+            "value_field": "batch_stats_probe_value",
+            "compute_mean": True,
+        }
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__(config)
+        cfg = BatchStatsConfig.from_dict(config, plugin_name=self.name)
+        self._initialize_declared_input_fields(cfg)
+        self._value_field = cfg.value_field
+        self._group_by = cfg.group_by
+        self._compute_mean = cfg.compute_mean
+
+        # Guaranteed output fields — always present in every successful result.
+        # skipped_non_finite/skipped_non_finite_indices are conditional (only when
+        # non-finite values exist) so they are NOT guaranteed. They are declared
+        # separately for collision detection at init time.
+        stat_fields: set[str] = {"count", "sum", "batch_size"}
+        if cfg.compute_mean:
+            stat_fields.add("mean")
+        # _all_possible_output_keys is stat fields + conditional fields (without group_by)
+        # used at runtime for field-set operations.
+        self._all_possible_output_keys = frozenset(
+            stat_fields
+            | {
+                "skipped_missing",
+                "skipped_missing_indices",
+                "skipped_non_finite",
+                "skipped_non_finite_indices",
+            }
+        )
+
+        # group_by collision is now caught by BatchStatsConfig._reject_group_by_collision
+        # model_validator — from_dict() above already enforced it.
+
+        # group_by is guaranteed on every successful result when configured.
+        # Added after the collision check so it doesn't self-collide.
+        if cfg.group_by is not None:
+            stat_fields.add(cfg.group_by)
+        self.declared_output_fields = frozenset(stat_fields)
+
+        # Declare every column process() reads as required input: value_field,
+        # and group_by when configured. The flush preflight enforces this set on
+        # every buffered row, so a row that omits one fails the batch as a routed
+        # contract violation instead of a KeyError inside process()
+        # (elspeth-5887fb7928 R1). It adds no build-time requirement: the DAG's
+        # edge check reads the authored config, not this rebuilt one, so an
+        # observed upstream still validates.
+        base_required = set(cfg.schema_config.required_fields or ())
+        base_required.add(cfg.value_field)
+        if cfg.group_by is not None:
+            base_required.add(cfg.group_by)
+        if base_required != set(cfg.schema_config.required_fields or ()):
+            schema_config = SchemaConfig(
+                mode=cfg.schema_config.mode,
+                fields=cfg.schema_config.fields,
+                guaranteed_fields=cfg.schema_config.guaranteed_fields,
+                audit_fields=cfg.schema_config.audit_fields,
+                required_fields=tuple(base_required),
+            )
+        else:
+            schema_config = cfg.schema_config
+
+        self._schema_config = schema_config
+
+        self.input_schema, self.output_schema = self._create_schemas(
+            schema_config,
+            "BatchStats",
+            adds_fields=True,
+        )
+        self._output_schema_config = self._build_output_schema_config(schema_config)
+
+    @property
+    def self_created_input_fields(self) -> frozenset[str]:
+        """Override: the demotion set is every key the aggregate may WRITE.
+
+        WIDER than ``declared_output_fields`` (elspeth-d6eeb3a71d): the
+        conditional ``skipped_missing`` / ``skipped_non_finite`` diagnostics are
+        written but not guaranteed, so the base default would leave them
+        demanded on input.
+
+        It also includes ``group_by``, which IS read from the input rows — that
+        is deliberate here, because ``consumed_input_fields`` subtracts every
+        column named by a config option (``group_by`` and ``value_field``
+        included) before anything is demoted. Creation and consumption are
+        tracked separately on purpose; this property answers only "what may this
+        transform write".
+        """
+        return self._all_possible_output_keys
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The plugin's declaration of every field it computes (ADR-050).
+
+        Concrete where the code fixes the type on every success path:
+        ``count`` and ``batch_size`` are lengths, ``mean`` is ``total / count``
+        (true division: a float even over int rows; a Decimal or bool never
+        reaches it, ``_aggregate_group`` fails the batch on any value whose
+        type is not exactly int or float). ``sum`` is ``sum(values)`` over
+        those same int and float values: an exact int over int rows (never
+        converted, so an integer total above 2**53 keeps every digit) and a
+        float otherwise, declared ``float`` because an int value satisfies a
+        float declaration (ADR-050 Decision 5, ruling C3: one number type).
+        ``group_by`` carries the group's row value, so its type is the data's
+        (``any``). The ``skipped_*`` diagnostics are written only when a row
+        was skipped, so they are optional: the counts are ints, the index
+        lists are lists the schema DSL has no type for.
+        """
+        created = [
+            FieldDefinition("count", "int"),
+            FieldDefinition("sum", "float"),
+            FieldDefinition("batch_size", "int"),
+            FieldDefinition("skipped_missing", "int", required=False),
+            FieldDefinition("skipped_missing_indices", "any", required=False),
+            FieldDefinition("skipped_non_finite", "int", required=False),
+            FieldDefinition("skipped_non_finite_indices", "any", required=False),
+        ]
+        if self._compute_mean:
+            created.append(FieldDefinition("mean", "float"))
+        if self._group_by is not None:
+            created.append(FieldDefinition(self._group_by, "any"))
+        return tuple(created)
+
+    def _build_output_schema_config(self, schema_config: SchemaConfig) -> SchemaConfig:
+        """Override (elspeth-f5f798f797): aggregation output is independent of input shape.
+
+        The user's ``schema:`` block describes the INPUT contract that batch_stats
+        consumes — what fields/types upstream produces and which the consumer
+        requires. The aggregation's OUTPUT is computed: stat fields plus an
+        optional group_by, typed by ``created_output_fields`` and stamped on the
+        emitted contract (ADR-050). It does not carry the user's input field
+        declarations.
+
+        The base class implementation copies ``fields``, ``required_fields``, and
+        the user's input-side ``guaranteed_fields`` into the output config, which
+        causes ``SchemaConfigModeViolation`` at runtime: ``get_effective_guaranteed_fields``
+        unions the input fields into the expected output, and the OBSERVED-typed
+        emission then misses fields like ``amount`` and mismatches metadata on
+        ``customer_tier`` (declared ``str``, observed ``object``).
+
+        Returns a config that honestly describes batch_stats output:
+          - ``mode='observed'`` — no operator-authored fields; the emitted
+            contract carries the plugin's own declaration through the stamp.
+          - ``fields=None`` — no explicit field declarations on output.
+          - ``guaranteed_fields`` — the actual emitted set (declared_output_fields).
+          - ``required_fields=None`` — input-only consumer requirement, irrelevant on output.
+          - ``audit_fields=None`` — input-side audit hints don't apply to derived output.
+        """
+        guaranteed = tuple(sorted(self.declared_output_fields)) if self.declared_output_fields else None
+        return SchemaConfig(
+            mode="observed",
+            fields=None,
+            guaranteed_fields=guaranteed,
+            required_fields=None,
+            audit_fields=None,
+        )
+
+    def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Exercise the real aggregate output path for the backward invariant."""
+        return [
+            self._augment_invariant_probe_row(
+                probe,
+                field_name=self._value_field,
+                value=1.0,
+            )
+        ]
+
+    @staticmethod
+    def _is_non_finite_group_key(value: object) -> bool:
+        if type(value) is float:
+            return not math.isfinite(value)
+        if type(value) is Decimal:
+            return not value.is_finite()
+        return False
+
+    def _non_finite_group_key_error(self, rows: list[PipelineRow]) -> TransformResult | None:
+        """Return an error if any row carries a non-finite group_by key (B4.5-d)."""
+        if self._group_by is None:
+            return None
+        row_errors: list[RowErrorEntry] = []
+        for row_index, row in enumerate(rows):
+            if self._is_non_finite_group_key(row[self._group_by]):
+                row_errors.append({"row_index": row_index, "reason": "non_finite_group_key"})
+        if not row_errors:
+            return None
+        reason: TransformErrorReason = {
+            "reason": "validation_failed",
+            "cause": "non_finite_group_key",
+            "field": self._group_by,
+            "row_errors": row_errors,
+        }
+        return TransformResult.error(reason, retryable=False)
+
+    def _group_rows(self, rows: list[PipelineRow]) -> list[tuple[Any, list[tuple[int, PipelineRow]]]]:
+        """Partition rows by group_by value while preserving first-seen order."""
+        if self._group_by is None:
+            return [(None, list(enumerate(rows)))]
+
+        groups: dict[ScalarBucketKey, tuple[Any, list[tuple[int, PipelineRow]]]] = {}
+        for row_index, row in enumerate(rows):
+            group_value = row[self._group_by]
+            # Groups are dict buckets, so the key must be one scalar value. A
+            # JSON object or array arrives deep-frozen (mappingproxy / tuple):
+            # an object is unhashable and used to abort the run with a bare
+            # TypeError, and an array is not a category. Either one fails the
+            # WHOLE batch with a recorded reason, the same disposition as a
+            # wrong-typed value_field (elspeth-d5034647f0); it is never bucketed
+            # by equality or stringified into a key. None stays a legal key.
+            require_scalar_group_key(group_value, field=self._group_by, row_index=row_index)
+            group_key = scalar_bucket_key(group_value)
+            grouped = groups.get(group_key)
+            if grouped is None:
+                groups[group_key] = (group_value, [(row_index, row)])
+            else:
+                grouped[1].append((row_index, row))
+        return list(groups.values())
+
+    def _aggregate_group(
+        self,
+        grouped_rows: list[tuple[int, PipelineRow]],
+        group_value: Any,
+    ) -> tuple[BatchStatsAggregateRow, TransformResult | None]:
+        """Aggregate one already-partitioned group."""
+        values: list[int | float] = []
+        skipped_missing_indices: list[int] = []
+        skipped_non_finite_indices: list[int] = []
+        for row_index, row in grouped_rows:
+            # Present on every row: declared required, enforced by the flush preflight.
+            raw_value = row[self._value_field]
+
+            # None is a missing value, not a type error: skip-and-report it the
+            # same way every sibling batch transform does (batch_distribution_profile
+            # et al.). Raising here would abort the whole run on recoverable Tier-2/3
+            # data — the polarity bug this fix closes (plugins review C2).
+            if raw_value is None:
+                skipped_missing_indices.append(row_index)
+                continue
+
+            # Contract enforcement: value_field must be numeric (int or float).
+            # A wrong type in Tier 2 row data fails the WHOLE batch (below);
+            # it is not a plugin crash.
+            # Use type() instead of isinstance() to reject bool (bool is subclass of int)
+            if type(raw_value) not in (int, float):
+                # BATCH-level failure, not a skip. The two branches around this
+                # one skip-and-report deliberately (a missing value and a
+                # non-finite float are documented as recoverable); a wrong TYPE
+                # is not, and John's ruling (elspeth-d5034647f0) fails the whole
+                # batch rather than publishing a statistic over a set the
+                # operator never specified. Raised here and converted in
+                # `process` because this helper returns values, not results —
+                # the shape `reference_join._coerce_key` already uses.
+                raise BatchRowTypeError(
+                    field=self._value_field,
+                    row_index=row_index,
+                    expected="numeric (int or float)",
+                    found=type(raw_value).__name__,
+                )
+
+            # NaN/Inf are type-valid floats but operation-unsafe — they produce
+            # garbage in arithmetic and crash downstream canonical JSON (RFC 8785).
+            # Integers are always finite — only check floats.
+            if isinstance(raw_value, float) and not math.isfinite(raw_value):
+                skipped_non_finite_indices.append(row_index)
+                continue
+
+            # Preserve original type: int stays int (arbitrary precision),
+            # float stays float. Avoids precision loss for ints > 2^53.
+            values.append(raw_value)
+
+        count = len(values)
+
+        # No aggregatable values is the same condition as an empty batch — no real
+        # data to aggregate. Fabricating sum=0/count=0 would produce phantom
+        # statistics indistinguishable from a legitimate computation over
+        # zero-valued data; an all-missing group would additionally hit mean=0/0
+        # (ZeroDivisionError) below. Return an audited error instead.
+        if count == 0 and (skipped_missing_indices or skipped_non_finite_indices):
+            # Missing values present: report each skipped row (sibling
+            # validation_failed shape). Pure non-finite preserves the historical
+            # all_non_finite reason its callers/tests already assert.
+            if skipped_missing_indices:
+                return {}, self._error_for_no_valid_values(
+                    grouped_rows,
+                    skipped_missing_indices,
+                    skipped_non_finite_indices,
+                )
+            reason: TransformErrorReason = {
+                "reason": "all_non_finite",
+                "batch_size": len(grouped_rows),
+                "skipped_non_finite": len(skipped_non_finite_indices),
+                "skipped_non_finite_indices": skipped_non_finite_indices,
+            }
+            self._locate_group(reason, grouped_rows)
+            return {}, TransformResult.error(
+                reason,
+                retryable=False,
+            )
+
+        # At this point, values is guaranteed non-empty: empty batch returns error
+        # before grouping, and all-non-finite returns error above. count > 0.
+        total = sum(values)
+
+        # Guard against overflow: summing many large-but-valid floats can produce inf.
+        # Integer sums use arbitrary precision and cannot overflow.
+        if isinstance(total, float) and not math.isfinite(total):
+            overflow_reason: TransformErrorReason = {
+                "reason": "float_overflow",
+                "batch_size": len(grouped_rows),
+                "valid_count": count,
+            }
+            self._locate_group(overflow_reason, grouped_rows)
+            return {}, TransformResult.error(overflow_reason, retryable=False)
+
+        result: BatchStatsAggregateRow = {
+            "count": count,
+            "sum": total,
+            "batch_size": len(grouped_rows),
+        }
+
+        if self._compute_mean:
+            try:
+                result["mean"] = total / count
+            except OverflowError:
+                mean_error_reason: TransformErrorReason = {
+                    "reason": "float_overflow",
+                    "operation": "mean",
+                    "batch_size": len(grouped_rows),
+                    "valid_count": count,
+                }
+                self._locate_group(mean_error_reason, grouped_rows)
+                return {}, TransformResult.error(mean_error_reason, retryable=False)
+
+        if skipped_missing_indices:
+            result["skipped_missing"] = len(skipped_missing_indices)
+            result["skipped_missing_indices"] = skipped_missing_indices
+
+        if skipped_non_finite_indices:
+            result["skipped_non_finite"] = len(skipped_non_finite_indices)
+            result["skipped_non_finite_indices"] = skipped_non_finite_indices
+
+        if self._group_by is not None:
+            result[self._group_by] = group_value
+
+        return result, None
+
+    def _error_for_no_valid_values(
+        self,
+        grouped_rows: list[tuple[int, PipelineRow]],
+        missing_indices: list[int],
+        non_finite_indices: list[int],
+    ) -> TransformResult:
+        """Audited error for a group with no aggregatable values.
+
+        Mirrors the sibling batch transforms' ``validation_failed`` shape so the
+        audit record names each skipped row instead of fabricating count=0/sum=0
+        or crashing on mean=0/0.
+        """
+        row_errors: list[RowErrorEntry] = []
+        for row_index in missing_indices:
+            row_errors.append({"row_index": row_index, "reason": "missing_value"})
+        for row_index in non_finite_indices:
+            row_errors.append({"row_index": row_index, "reason": "non_finite_value"})
+        reason: TransformErrorReason = {
+            "reason": "validation_failed",
+            "cause": "no_valid_values",
+            "batch_size": len(grouped_rows),
+            "valid_count": 0,
+            "skipped_count": len(missing_indices) + len(non_finite_indices),
+            "row_errors": row_errors,
+        }
+        self._locate_group(reason, grouped_rows)
+        return TransformResult.error(reason, retryable=False)
+
+    def _locate_group(self, reason: TransformErrorReason, grouped_rows: list[tuple[int, PipelineRow]]) -> None:
+        """Name the failing group in an error reason without recording its value.
+
+        The group_by VALUE is row content (a customer, a tenant, a label), and an
+        audit reason records row indices, never row bodies. The group is named
+        by its field and the batch row where it was first seen, which is how
+        `_group_rows` orders groups. The value still reaches the OUTPUT row of a
+        successful group, where it is data.
+        """
+        if self._group_by is None:
+            return
+        reason["group_by"] = self._group_by
+        reason["error"] = f"group {self._group_by!r} first seen in row {grouped_rows[0][0]}"
+
+    def process(  # type: ignore[override] # Batch signature: list[PipelineRow] instead of PipelineRow
+        self, rows: list[PipelineRow], ctx: TransformContext
+    ) -> TransformResult:
+        """Compute statistics over a batch of rows.
+
+        Args:
+            rows: List of input rows (batch-aware receives list[PipelineRow])
+            ctx: Plugin context
+
+        Returns:
+            TransformResult with aggregated statistics
+
+        Every row carries ``value_field`` (and ``group_by`` when configured):
+        both are declared required, and the flush preflight fails the batch
+        before this runs when a row omits one.
+        """
+        if not rows:
+            # Empty batch is an anomaly — return error, not fabricated statistics.
+            # Phantom sum=0/count=0/mean=None would flow to sinks as real data.
+            return TransformResult.error(
+                {"reason": "empty_batch"},
+                retryable=False,
+            )
+
+        non_finite_error = self._non_finite_group_key_error(rows)
+        if non_finite_error is not None:
+            return non_finite_error
+
+        try:
+            return self._aggregate_all_groups(rows)
+        except BatchRowTypeError as exc:
+            # Requirement 2 of the ruling: the batch records that it failed and
+            # WHY — which row, which field, what was found where a number was
+            # required. The structural caller owns disposition: an aggregation
+            # applies its declared on_error (AggregationExecutor._complete_error_flush
+            # records the reason and the DIVERT; RowProcessor.handle_timeout_flush
+            # sends every buffered row to the on_error sink, or records it
+            # discarded), while a collector turns this into a whole-group
+            # failure settled by scope policy and nesting.
+            return TransformResult.error(exc.as_reason(), retryable=False)
+
+    def _aggregate_all_groups(self, rows: list[PipelineRow]) -> TransformResult:
+        """Group, aggregate and assemble — the body `process` guards."""
+        results: list[BatchStatsAggregateRow] = []
+        for group_value, grouped_rows in self._group_rows(rows):
+            aggregate, error = self._aggregate_group(grouped_rows, group_value)
+            if error is not None:
+                return error
+            results.append(aggregate)
+
+        output_contract = self._batch_output_contract(key for result in results for key in result)
+        fields_added = [field.normalized_name for field in output_contract.fields]
+        pipeline_rows = [PipelineRow(result, output_contract) for result in results]
+
+        if len(pipeline_rows) > 1:
+            return TransformResult.success_multi(
+                pipeline_rows,
+                success_reason={"action": "processed", "fields_added": fields_added},
+            )
+
+        return TransformResult.success(
+            pipeline_rows[0],
+            success_reason={"action": "processed", "fields_added": fields_added},
+        )
+
+    def close(self) -> None:
+        """No resources to release."""
+        pass

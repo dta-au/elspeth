@@ -1,0 +1,13 @@
+{
+  "actual_sites_before": 17,
+  "actual_sites_after": 17,
+  "line_only_changes": 15,
+  "fingerprint_changes": 1,
+  "reviewed_matches": 15,
+  "known_unresolved_unchanged": [
+    "LandscapeDB._set_sqlite_schema_epoch",
+    "_run_locked"
+  ],
+  "identity_positive_control": "pass",
+  "moved_line_negative_control": "refused"
+}

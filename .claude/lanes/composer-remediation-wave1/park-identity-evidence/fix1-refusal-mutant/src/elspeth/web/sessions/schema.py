@@ -1,0 +1,674 @@
+"""Current-schema bootstrap for the web session database.
+
+ELSPETH is pre-release, so the web session database has no migration
+pathway. Fresh databases are created directly from the current
+SQLAlchemy metadata. Existing databases must already match that current
+schema; preserve unsupported stores and select an explicitly new store.
+"""
+
+from __future__ import annotations
+
+from threading import Lock
+from typing import Any, NoReturn, final
+
+from sqlalchemy import Connection, Engine, insert, inspect, text
+from sqlalchemy.engine.reflection import Inspector
+
+from elspeth.core.schema_identity import (
+    SCHEMA_IDENTITY_APPLICATION_ID,
+    SCHEMA_IDENTITY_SINGLETON_ID,
+    SCHEMA_IDENTITY_TABLE_NAME,
+    read_schema_identities,
+    schema_identity_mismatch,
+)
+from elspeth.core.schema_shape import _connection_target_is_empty, collect_metadata_shape_issues
+from elspeth.web.sessions.models import (
+    SESSION_DB_APPLICATION_ID,
+    SESSION_SCHEMA_EPOCH,
+    metadata,
+    schema_identity_table,
+)
+
+_SQLITE_INTERNAL_TABLES: frozenset[str] = frozenset({"sqlite_sequence"})
+_SESSION_METADATA_CREATE_LOCK = Lock()
+
+# Coupled cut: sparse proposal display, structured stored validation errors,
+# timestamp-leading quota scan indexes, and durable fork failure diagnostics.
+# Epoch 68 admits compose_checkpoint and ordinary_proposal_checkpoint reasons
+# in persisted proposal.rebased events. Earlier readers reject these closed
+# vocabulary additions, so this semantic JSON cut requires a new store.
+# Epoch 69 adds immutable freeform message ingress receipts and their same-session
+# bindings. Existing session stores cannot satisfy the new admission contract.
+# Epoch 70 replaces the persisted tutorial Build stage's old label with build.
+# Epoch 74 adds graph recovery parks and checkpoint operation ownership.
+# Epoch 75 adds durable auth families and derived-token revocation bindings.
+# Epoch 76 requires effective graph-review facts from committed terminal
+# cohorts. Epoch-75 readers ignore them and cannot preserve completion blocks.
+# Epoch 77 retains that semantic authority, separates container storage from
+# identity allowances, and fixes the active container policy singleton across
+# actors. Neither distinct epoch-76 predecessor is this combined contract.
+# Incompatible stores require a separately reviewed compatibility disposition.
+_COORDINATION_HARD_CUT_EPOCH = 78
+_COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
+    "auth_session_families": "ix_auth_session_families_expires_at",
+    "web_instances": "ix_web_instances_lease_expires_at",
+    "session_operation_fences": "ix_session_operation_fences_lease_expires_at",
+    "session_read_admissions": "ix_session_read_admissions_expires_at",
+    "run_start_permits": "ix_run_start_permits_retention_expires_at",
+    "websocket_tickets": "ix_websocket_tickets_expires_at",
+    "composer_inflight_requests": "ix_composer_inflight_requests_expires_at",
+    "composer_progress_snapshots": "ix_composer_progress_snapshots_expires_at",
+    "rate_limit_buckets": "ix_rate_limit_buckets_expires_at",
+    "rate_limit_events": "ix_rate_limit_events_expires_at",
+    "sessions_cleanup_claims": "ix_sessions_cleanup_claims_lease_expires_at",
+}
+_COORDINATION_HARD_CUT_TABLES: frozenset[str] = frozenset({*_COORDINATION_HARD_CUT_EXPIRY_INDEXES, "run_execution_inputs"})
+
+# Required audit triggers. Both supported database dialects install these
+# stable trigger names to enforce invariants
+# that cannot be expressed as table CHECK constraints:
+#
+# * ``trg_interpretation_events_immutable_resolved`` — resolved
+#   ``interpretation_events`` rows cannot be retroactively edited.
+# * ``trg_interpretation_events_no_delete_resolved`` — resolved
+#   ``interpretation_events`` rows cannot be deleted directly, while
+#   unresolved PENDING rows remain deletable for orphan recovery and
+#   whole-session archival can still cascade session-scoped rows.
+# * ``trg_composer_completion_events_no_update`` — Phase 6A: every
+#   completion-gesture row (mark_ready_for_review, export_yaml) is a
+#   permanent audit fact. Unconditional UPDATE ABORT, no PENDING-row
+#   carve-out (completion events have no recovery path).
+# * ``trg_composer_completion_events_no_delete`` — same posture for DELETE.
+#   Both triggers ship from day 1 — completion events have no recovery
+#   path, unlike the ``interpretation_events`` PENDING-row carve-out.
+# * ``trg_chat_messages_immutable_content`` — ``chat_messages.content`` is
+#   append-only once written.
+# * ``trg_chat_messages_no_delete`` — ``chat_messages`` rows cannot be
+#   deleted directly because they anchor the ``blobs.created_from_message_id``
+#   lineage walk. Whole-session archival remains the bounded lifecycle
+#   purge path and is implemented by deleting the owning ``sessions`` row,
+#   allowing schema-owned cascades to remove session-scoped children.
+# * ``trg_message_ingress_receipts_no_update`` / ``no_delete`` — accepted
+#   freeform request IDs remain bound to one user row and original requested
+#   state. Whole-session deletion can cascade them with the owning session.
+# * ``trg_session_operation_receipts_terminal_immutable`` protects terminal
+#   fork/revert replay descriptors; receipt events are append-only except for
+#   whole-session lifecycle cascades.
+#
+# The validator catches the case where schema bootstrap succeeded but the
+# trigger DDL failed silently (e.g., if the DDL event listener was removed
+# or reordered). Live validation against each dialect's system catalogue
+# means a dropped or disabled trigger is caught at startup, not at the first
+# attempt to mutate the protected rows.
+_REQUIRED_AUDIT_TRIGGERS: frozenset[str] = frozenset(
+    {
+        "trg_composer_async_operations_transition_guard",
+        "trg_composer_async_operations_no_delete_live",
+        "trg_interpretation_events_immutable_resolved",
+        "trg_interpretation_events_no_delete_resolved",
+        "trg_composer_completion_events_no_update",
+        "trg_composer_completion_events_no_delete",
+        "trg_chat_messages_immutable_content",
+        "trg_chat_messages_no_delete",
+        "trg_message_ingress_receipts_no_update",
+        "trg_message_ingress_receipts_no_delete",
+        "trg_session_operation_receipts_terminal_immutable",
+        "trg_session_operation_receipt_events_no_update",
+        "trg_session_operation_receipt_events_no_delete",
+    }
+)
+
+
+class SessionSchemaError(RuntimeError):
+    """Raised when a session database does not match the current schema epoch.
+
+    Preserve the original store and configure an explicitly new database.
+    Pre-release ELSPETH has no migration pathway for session DBs.
+    """
+
+
+def _create_session_tables(bind: Engine | Connection, *, checkfirst: bool = True) -> None:
+    """Create session tables without leaking SQLAlchemy's dialect-local state.
+
+    PostgreSQL breaks the session metadata's foreign-key cycles with ALTER
+    statements and temporarily annotates those constraints via the private
+    ``_create_rule`` attribute. SQLAlchemy leaves those annotations on the
+    shared metadata object after ``create_all``; a later SQLite bootstrap in
+    the same process would then omit the affected inline foreign keys.
+
+    Snapshotting and restoring the exact prior values keeps the module-level
+    metadata reusable across database dialects without weakening either
+    schema.
+    """
+    with _SESSION_METADATA_CREATE_LOCK:
+        create_rules: list[tuple[Any, object]] = []
+        for table in metadata.tables.values():
+            for constraint in table.constraints:
+                create_rules.append((constraint, constraint._create_rule))
+
+        try:
+            metadata.create_all(bind=bind, checkfirst=checkfirst)
+        finally:
+            for constraint, create_rule in create_rules:
+                constraint._create_rule = create_rule
+
+
+def initialize_session_schema(engine: Engine) -> None:
+    """Create or validate the current web session database schema.
+
+    Empty databases are initialized from ``sessions.models.metadata``.
+    Non-empty databases are validated in place and are never altered.
+    Unsupported stores are preserved; this build has no migration path.
+    """
+
+    inspector = inspect(engine)
+    existing_tables = _user_tables(inspector)
+    if not existing_tables:
+        assert_empty_session_target(engine)
+        # Fresh DB: build the tables, THEN stamp the schema-version
+        # sentinels. Stamping before ``create_all`` would let a partial
+        # failure (e.g. SQL syntax error in a model) leave a DB on disk
+        # that claims the current epoch but has no tables. Stamping after
+        # ``create_all`` succeeds binds the sentinel to "schema actually
+        # present at this epoch."
+        _create_session_tables(engine)
+        _stamp_schema_sentinels(engine)
+        _validate_current_schema(engine)
+        return
+
+    # Check identity before the deeper column/FK/constraint validation.
+    _assert_schema_sentinels(engine)
+    _validate_current_schema(engine)
+
+
+def assert_empty_session_target(bind: Engine | Connection) -> None:
+    """Admit only an object-free, unstamped target for fresh creation."""
+    if isinstance(bind, Connection):
+        _assert_empty_session_connection(bind)
+    else:
+        with bind.connect() as connection:
+            _assert_empty_session_connection(connection)
+
+
+def _assert_empty_session_connection(connection: Connection) -> None:
+    if not _connection_target_is_empty(connection):
+        _schema_error("fresh creation requires an unstamped, object-free target")
+
+
+def probe_current_schema(bind: Engine | Connection) -> bool:
+    """Return whether ``bind`` already carries the current session schema.
+
+    This is a read-only probe: it neither creates objects nor stamps schema
+    sentinels.  A supplied ``Connection`` is used directly, so callers holding
+    the only connection in a bounded pool cannot deadlock on a second checkout.
+    """
+
+    # The partial-index dialect-symmetry check is a MODEL-layer contract on
+    # our own Index declarations — it inspects no database state. Run it
+    # outside the probe's verdict handler so a first-party declaration bug
+    # crashes here instead of being converted into a "stale DB" verdict that
+    # incorrectly classifies a healthy session DB as unsupported.
+    _validate_partial_index_dialect_symmetry()
+    supplied_connection = bind if isinstance(bind, Connection) else None
+    supplied_connection_was_idle = supplied_connection is not None and not supplied_connection.in_transaction()
+    try:
+        _assert_schema_sentinels(bind)
+        _validate_current_schema(bind)
+    except SessionSchemaError:
+        # The probe's declared negative verdict: the DATABASE does not carry
+        # the current schema (missing sentinels, table/column drift). Model
+        # declaration bugs cannot reach this handler — the symmetry check
+        # above already ran un-guarded.
+        return False
+    finally:
+        if supplied_connection_was_idle and supplied_connection is not None and supplied_connection.in_transaction():
+            supplied_connection.rollback()
+    return True
+
+
+def explain_non_current_schema(bind: Engine | Connection) -> NoReturn:
+    """Raise the reason ``probe_current_schema`` collapsed into ``False``.
+
+    The precise diagnosis is not missing from this module — it is COMPUTED and
+    then discarded. ``_validate_current_schema`` builds a message naming the
+    table, the constraint and both sides of the mismatch; ``probe_current_schema``
+    catches it to answer a yes/no question, and three frames later the
+    initializer raises a sentence that names nothing. A real defect
+    (elspeth-d0e62aea41: one CHECK constraint whose PostgreSQL-reflected form
+    had no reverse) therefore reached operators as "did not produce the
+    current schema", and diagnosing it meant rebuilding the schema against a
+    container by hand and diffing ``pg_get_constraintdef`` against the model.
+
+    So this runs the same validators UN-guarded and lets the first one raise.
+    Re-validating is deliberate: every caller is on a path that is already
+    fatal, so the cost of a second pass is irrelevant and the loss of the
+    reason is not. ``probe_current_schema`` keeps its boolean contract, which
+    its callers depend on.
+
+    Returning is not a valid outcome. If both validators pass, the probe and
+    the explainer disagree about the same database — which is a defect in one
+    of them, not a healthy schema — so that case gets its own message rather
+    than silently reusing the vague one it was written to replace.
+    """
+    _assert_schema_sentinels(bind)
+    _validate_current_schema(bind)
+    raise SessionSchemaError(
+        "Session database schema was reported as not current, but re-validating it found nothing wrong. "
+        "The probe and the schema validator disagree about the same database, which is a defect in one of "
+        f"them rather than a schema an operator can repair. SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}."
+    )
+
+
+@final
+class SessionSchemaAuthority:
+    """The session store's schema-management authority (P4-D6 family S).
+
+    Owns the three schema-management operations on the session database and
+    nothing else: stamping the schema sentinels after creation, asserting
+    them on an existing database, and validating the required audit
+    triggers. It is a nominal type (ADR-032): the writer inventory binds
+    these methods, and only these, to ``elspeth_schema_identity`` and the
+    SQLite header sentinels, so no other symbol in the tree may stamp them.
+    Construct it on the bind the caller already holds -- a supplied
+    ``Connection`` is used directly so a caller holding the only connection
+    of a bounded pool cannot deadlock on a second checkout; an ``Engine``
+    opens one connection per operation and releases it.
+    """
+
+    __slots__ = ("_bind",)
+
+    def __init__(self, bind: Engine | Connection) -> None:
+        self._bind = bind
+
+    def stamp_sentinels(self) -> None:
+        """Write the SQLite header sentinels and the identity row of a freshly created schema."""
+        if isinstance(self._bind, Connection):
+            self._stamp_on(self._bind)
+        else:
+            with self._bind.begin() as connection:
+                self._stamp_on(connection)
+
+    def _stamp_on(self, connection: Connection) -> None:
+        if SCHEMA_IDENTITY_TABLE_NAME not in _user_tables(inspect(connection)):
+            # Distinct wording from the initializer's post-verify failure in
+            # ``schema_probe``. Both once said "initialization did not produce the
+            # current schema", which made two unrelated faults indistinguishable
+            # in a log: this one is "create_all ran and the table set is still
+            # wrong", a first-party defect; that one is "the tables exist and
+            # their SHAPE does not match", which is drift.
+            raise SessionSchemaError(
+                f"Session database initialization created no {SCHEMA_IDENTITY_TABLE_NAME} table, so the "
+                f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH} sentinels cannot be stamped. The table set is "
+                "incomplete after create_all rather than merely out of date, which is a defect in this build "
+                "and not a database an operator can fix by deleting."
+            )
+        if connection.dialect.name == "sqlite":
+            connection.execute(text(f"PRAGMA application_id = {SESSION_DB_APPLICATION_ID}"))
+            connection.execute(text(f"PRAGMA user_version = {SESSION_SCHEMA_EPOCH}"))
+        # Duplicate stamps fail closed on the singleton primary key.
+        connection.execute(
+            insert(schema_identity_table).values(
+                singleton_id=SCHEMA_IDENTITY_SINGLETON_ID,
+                application_id=SCHEMA_IDENTITY_APPLICATION_ID,
+                store_kind="session",
+                schema_epoch=SESSION_SCHEMA_EPOCH,
+            )
+        )
+
+    def assert_sentinels(self) -> None:
+        """Crash with an actionable message unless the sentinels match this build."""
+        if isinstance(self._bind, Connection):
+            self._assert_on(self._bind)
+        else:
+            with self._bind.connect() as connection:
+                self._assert_on(connection)
+
+    def _assert_on(self, connection: Connection) -> None:
+        inspector = inspect(connection)
+        tables = _user_tables(inspector)
+
+        if connection.dialect.name == "sqlite":
+            app_id = connection.execute(text("PRAGMA application_id")).scalar_one()
+            user_ver = connection.execute(text("PRAGMA user_version")).scalar_one()
+            if app_id not in {0, SESSION_DB_APPLICATION_ID}:
+                raise SessionSchemaError(
+                    f"Session DB has unexpected application_id={app_id:#010x}. "
+                    f"Expected {SESSION_DB_APPLICATION_ID:#010x} (ELSP) or 0 (new database). "
+                    f"This SQLite file does not belong to ELSPETH. "
+                    f"Preserve this store unchanged and configure an explicitly new session database."
+                )
+            if user_ver not in {0, SESSION_SCHEMA_EPOCH}:
+                raise SessionSchemaError(
+                    f"Session DB schema version {user_ver} does not match "
+                    f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. Pre-release ELSPETH "
+                    f"does not migrate session databases. "
+                    f"Preserve this store unchanged and configure an explicitly new session database."
+                )
+
+        if SCHEMA_IDENTITY_TABLE_NAME not in tables:
+            if tables:
+                raise SessionSchemaError(
+                    f"Session DB is missing {SCHEMA_IDENTITY_TABLE_NAME} for "
+                    f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. Pre-release ELSPETH "
+                    "does not migrate session databases. Preserve this store unchanged and configure an explicitly new session database."
+                )
+            return
+
+        # Validate the live identity-table shape BEFORE selecting from it:
+        # ``read_schema_identities`` selects the declared model columns, so a
+        # missing or renamed column would otherwise leak a raw SQLAlchemy
+        # OperationalError instead of the actionable delete-and-restart error
+        # (elspeth-5cf1ca2852). Column presence is all the read requires; type
+        # drift is classified by ``read_schema_identities`` itself and full-shape
+        # drift by the downstream schema validator.
+        live_identity_columns = {column["name"] for column in inspector.get_columns(SCHEMA_IDENTITY_TABLE_NAME)}
+        missing_identity_columns = {column.name for column in schema_identity_table.columns} - live_identity_columns
+        if missing_identity_columns:
+            raise SessionSchemaError(
+                f"Session DB {SCHEMA_IDENTITY_TABLE_NAME} table is missing column(s) "
+                f"{', '.join(sorted(missing_identity_columns))} for "
+                f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. Pre-release ELSPETH "
+                "does not migrate session databases. Preserve this store unchanged and configure an explicitly new session database."
+            )
+
+        rows = read_schema_identities(connection, schema_identity_table)
+        mismatch = schema_identity_mismatch(rows, store_kind="session", schema_epoch=SESSION_SCHEMA_EPOCH)
+        if mismatch is not None:
+            raise SessionSchemaError(
+                f"Session DB schema identity mismatch ({mismatch}) for "
+                f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. Pre-release ELSPETH "
+                "does not migrate session databases. Preserve this store unchanged and configure an explicitly new session database."
+            )
+
+    def validate_required_triggers(self) -> None:
+        """Confirm the required audit triggers are present in the live database."""
+        if self._bind.dialect.name == "sqlite":
+            query = text("SELECT name FROM sqlite_master WHERE type='trigger'")
+        elif self._bind.dialect.name == "postgresql":
+            query = text(
+                """
+                SELECT trigger.tgname
+                FROM pg_catalog.pg_trigger AS trigger
+                JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger.tgrelid
+                JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+                WHERE NOT trigger.tgisinternal
+                  AND trigger.tgenabled IN ('O', 'A')
+                  AND namespace.nspname = current_schema()
+                  AND (
+                    (relation.relname = 'interpretation_events' AND trigger.tgname IN (
+                      'trg_interpretation_events_immutable_resolved',
+                      'trg_interpretation_events_no_delete_resolved'
+                    ))
+                    OR (relation.relname = 'composer_completion_events' AND trigger.tgname IN (
+                      'trg_composer_completion_events_no_update',
+                      'trg_composer_completion_events_no_delete'
+                    ))
+                    OR (relation.relname = 'chat_messages' AND trigger.tgname IN (
+                      'trg_chat_messages_immutable_content',
+                      'trg_chat_messages_no_delete'
+                    ))
+                    OR (relation.relname = 'composer_async_operations' AND trigger.tgname IN (
+                      'trg_composer_async_operations_transition_guard',
+                      'trg_composer_async_operations_no_delete_live'
+                    ))
+                    OR (relation.relname = 'message_ingress_receipts' AND trigger.tgname IN (
+                      'trg_message_ingress_receipts_no_update',
+                      'trg_message_ingress_receipts_no_delete'
+                    ))
+                    OR (relation.relname = 'session_operation_receipts' AND trigger.tgname IN (
+                      'trg_session_operation_receipts_terminal_immutable'
+                    ))
+                    OR (relation.relname = 'session_operation_receipt_events' AND trigger.tgname IN (
+                      'trg_session_operation_receipt_events_no_update',
+                      'trg_session_operation_receipt_events_no_delete'
+                    ))
+                  )
+                """
+            )
+        else:
+            _schema_error(
+                "audit trigger validation unsupported dialect",
+                expected=["postgresql", "sqlite"],
+                actual=[self._bind.dialect.name],
+            )
+        if isinstance(self._bind, Connection):
+            present = {str(row[0]) for row in self._bind.execute(query)}
+        else:
+            with self._bind.connect() as connection:
+                present = {str(row[0]) for row in connection.execute(query)}
+        missing = _REQUIRED_AUDIT_TRIGGERS - present
+        if missing:
+            _schema_error(
+                "missing audit trigger(s)",
+                expected=sorted(_REQUIRED_AUDIT_TRIGGERS),
+                actual=sorted(present),
+            )
+
+
+def _stamp_schema_sentinels(bind: Engine | Connection) -> None:
+    """Write the SQLite PRAGMAs and cross-dialect identity row after creation.
+
+    The identity insert is intentionally not an upsert: this function is for a
+    freshly-created schema, and any pre-existing row is evidence that creation
+    ordering or target selection is wrong.
+    """
+    SessionSchemaAuthority(bind).stamp_sentinels()
+
+
+def _assert_schema_sentinels(bind: Engine | Connection) -> None:
+    """Crash with an actionable message if the session DB schema-version
+    sentinels do not match the values this build expects.
+
+    Mechanical enforcement of the incompatible-store refusal policy: without
+    this guard, a stale DB silently fails in obscure SQLAlchemy errors
+    the first time a new code path touches a column/table that does not
+    exist. With it, the operator gets preservation guidance before use.
+
+    SQLite keeps its header-level ``application_id`` / ``user_version`` proof.
+    Both SQLite and PostgreSQL additionally require exactly one
+    ``elspeth_schema_identity`` row with the expected application, store kind,
+    and epoch. This catches semantic-only schema bumps on PostgreSQL, where no
+    PRAGMA equivalent exists.
+
+    - Wrong SQLite ``application_id`` (non-zero, non-ELSP): the configured DB
+      file belongs to some other application entirely. We refuse to
+      touch it.
+    - Wrong SQLite ``user_version`` (non-zero, not the current epoch): the
+      file is ours but predates this release's schema. The operator
+      must preserve it and select a new store (there is no migration pathway).
+    - Missing, malformed, or mismatched identity rows fail closed on either
+      dialect.
+
+    The zero values are accepted in both cases because a brand-new
+    SQLite file starts with ``application_id=0`` and ``user_version=0``;
+    that state is indistinguishable from "empty DB about to be
+    initialised" and is handled by the fresh-DB branch upstream.
+    """
+    SessionSchemaAuthority(bind).assert_sentinels()
+
+
+def _user_tables(inspector: Inspector) -> frozenset[str]:
+    tables = frozenset(inspector.get_table_names())
+    if inspector.bind.dialect.name == "sqlite":
+        return tables - _SQLITE_INTERNAL_TABLES
+    return tables
+
+
+def _validate_current_schema(bind: Engine | Connection) -> None:
+    # Static partial-index symmetry check fires before any inspector-driven
+    # validation. Catches the elspeth-obs-2ef48619d5 drift class at app-
+    # start time (or import time when called from a hot-reload loop), which
+    # is strictly better than waiting for a per-test fresh-DB creation.
+    # This remains a distinct model-layer guard even though the shared
+    # collector now also compares each live index predicate: a one-sided
+    # sqlite_where/postgresql_where declaration cannot be discovered by
+    # inspecting only the current runtime dialect.
+    _validate_coordination_hard_cut_metadata()
+    _validate_partial_index_dialect_symmetry()
+
+    inspector = inspect(bind)
+    expected_tables = frozenset(metadata.tables)
+    actual_tables = _user_tables(inspector)
+    if actual_tables != expected_tables:
+        _schema_error(
+            "table set mismatch",
+            expected=sorted(expected_tables),
+            actual=sorted(actual_tables),
+        )
+
+    issues = collect_metadata_shape_issues(
+        inspector,
+        metadata,
+        dialect=bind.dialect,
+        present_tables=actual_tables,
+    )
+    if issues:
+        first = issues[0]
+        _schema_error(first.subject, expected=first.expected, actual=first.actual)
+
+    _validate_required_triggers(bind)
+
+
+def _validate_coordination_hard_cut_metadata() -> None:
+    """Pin the hard-cut authority tables independently of reflected shape.
+
+    The generic metadata/live-schema comparison catches deployment drift, but
+    cannot catch an accidental edit that removes the same table or expiry index
+    from the declared metadata. The coordination substrate landed at epoch 51
+    (the multi-replica hard cut, 44 then 48 on the original lane), the
+    pluggable-SSO identity substrate took 52 in the same release, and the
+    per-admission read records (``session_read_admissions``) took 53. This constant
+    tracks ``SESSION_SCHEMA_EPOCH`` by exact equality, so it moves with every
+    epoch bump: it names the CURRENT declared schema, not the release in which
+    coordination first shipped. Leaving it behind an epoch is why the check is
+    strict — a stale value stops every session DB from opening on any dialect,
+    which is the loudest possible signal and the intended one.
+    """
+
+    if SESSION_SCHEMA_EPOCH != _COORDINATION_HARD_CUT_EPOCH:
+        _schema_error("coordination schema epoch mismatch", expected=_COORDINATION_HARD_CUT_EPOCH, actual=SESSION_SCHEMA_EPOCH)
+    missing_tables = _COORDINATION_HARD_CUT_TABLES - set(metadata.tables)
+    if missing_tables:
+        _schema_error(
+            "coordination hard-cut table set mismatch",
+            expected=sorted(_COORDINATION_HARD_CUT_TABLES),
+            actual=sorted(_COORDINATION_HARD_CUT_TABLES - missing_tables),
+        )
+    deleted_identity_tables = sorted(name for name in metadata.tables if "deleted" in name and "session" in name)
+    if deleted_identity_tables:
+        _schema_error("deleted-session registry is forbidden", expected=[], actual=deleted_identity_tables)
+
+    for table_name, expiry_index_name in _COORDINATION_HARD_CUT_EXPIRY_INDEXES.items():
+        table = metadata.tables[table_name]
+        index_names = {index.name for index in table.indexes}
+        if expiry_index_name not in index_names:
+            _schema_error(
+                f"{table_name} expiry index mismatch",
+                expected=expiry_index_name,
+                actual=sorted(name for name in index_names if name is not None),
+            )
+
+
+def _validate_required_triggers(bind: Engine | Connection) -> None:
+    """Confirm the required audit triggers are present in the live DB.
+
+    Catches the case where ``metadata.create_all`` succeeded but a trigger
+    listener was bypassed or removed, OR where a trigger on an existing DB
+    was dropped (manually or by a faulty migration). Without this check, a
+    silently-missing trigger means the audit invariants it enforces are not
+    actually being enforced — a Tier-1 audit integrity failure that would
+    otherwise only surface the next time someone tried to mutate a
+    protected row (which may be never on a quiescent DB).
+    """
+    SessionSchemaAuthority(bind).validate_required_triggers()
+
+
+def _validate_partial_index_dialect_symmetry() -> None:
+    """Enforce the partial-index dialect-symmetry contract at the model layer.
+
+    For every ``Index`` whose ``dialect_options`` contain a ``where`` predicate
+    under any dialect, BOTH ``sqlite_where`` AND ``postgresql_where`` MUST be
+    set, AND they MUST compile to the same SQL text under their respective
+    dialects.
+
+    Closes elspeth-obs-2ef48619d5: the pre-fix validator only compared
+    index NAMES, so an index declared with ``sqlite_where=`` only (or with
+    a different ``postgresql_where=`` predicate) would pass schema
+    validation while silently enforcing different invariants across
+    dialects. Concrete prior incident: ``uq_runs_one_active_per_session``
+    originally had only ``sqlite_where=``, which on Postgres silently
+    became a non-partial unique index — over-restricting "at most one
+    ACTIVE run per session" to "at most one run per session ever."
+
+    This static model check complements the shared runtime shape collector:
+    each runtime can validate its live predicate, while only this check can
+    prove both dialect declarations remain paired before either DDL is emitted.
+    """
+    from sqlalchemy.dialects import postgresql, sqlite
+
+    sqlite_dialect = sqlite.dialect()
+    postgresql_dialect = postgresql.dialect()  # type: ignore[no-untyped-call]
+
+    for table_name, table in metadata.tables.items():
+        for index in table.indexes:
+            if index.name is None:
+                continue
+            sqlite_where = _dialect_where(index, "sqlite")
+            postgres_where = _dialect_where(index, "postgresql")
+
+            if sqlite_where is None and postgres_where is None:
+                continue
+
+            # One-sided declaration is the original drift class.
+            if sqlite_where is None or postgres_where is None:
+                _schema_error(
+                    f"{table_name}.{index.name} partial-index dialect asymmetry",
+                    expected="both sqlite_where= and postgresql_where= set",
+                    actual=f"sqlite_where={'set' if sqlite_where is not None else 'unset'}, "
+                    f"postgresql_where={'set' if postgres_where is not None else 'unset'}",
+                )
+
+            # Both set — compile under their respective dialects and
+            # compare the literal-bound SQL text. Mismatched predicates
+            # are the second drift class: silently divergent invariants
+            # under the same name.
+            sqlite_text = str(sqlite_where.compile(dialect=sqlite_dialect, compile_kwargs={"literal_binds": True}))
+            postgres_text = str(postgres_where.compile(dialect=postgresql_dialect, compile_kwargs={"literal_binds": True}))
+            if sqlite_text != postgres_text:
+                _schema_error(
+                    f"{table_name}.{index.name} partial-index WHERE clause text diverges between dialects",
+                    expected=sqlite_text,
+                    actual=postgres_text,
+                )
+
+
+def _dialect_where(index: Any, dialect_key: str) -> Any:
+    """Return the ``where`` predicate for ``dialect_key`` on ``index``, or
+    ``None`` when the index declared no kwargs for that dialect or the
+    dialect declared no ``where`` predicate.
+
+    Direct dictionary access rather than ``.get()`` to satisfy the
+    Tier-1 defensive-programming gate (``enforce_tier_model``). The
+    DialectKWArgs container's ``__contains__`` semantics are the
+    canonical absence test; ``in`` is the offensive equivalent of
+    ``.get(..., None)`` here.
+    """
+    if dialect_key not in index.dialect_options:
+        return None
+    options = index.dialect_options[dialect_key]
+    if "where" not in options:
+        return None
+    return options["where"]
+
+
+def _schema_error(detail: str, *, expected: object | None = None, actual: object | None = None) -> NoReturn:
+    message = (
+        f"Session database schema does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. "
+        "Preserve this store unchanged and configure an explicitly new session database; pre-release ELSPETH "
+        f"does not migrate web session databases. Detail: {detail}."
+    )
+    if expected is not None:
+        message = f"{message} Expected: {expected!r}."
+    if actual is not None:
+        message = f"{message} Found: {actual!r}."
+    raise SessionSchemaError(message)

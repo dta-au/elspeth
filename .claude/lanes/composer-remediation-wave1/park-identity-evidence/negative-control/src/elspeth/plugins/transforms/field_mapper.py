@@ -1,0 +1,954 @@
+"""FieldMapper transform plugin.
+
+Renames, selects, and reorganizes row fields.
+
+IMPORTANT: Transforms use allow_coercion=False to catch upstream bugs.
+If the source outputs wrong types, the transform crashes immediately.
+"""
+
+from __future__ import annotations
+
+import copy
+from dataclasses import replace
+from types import MappingProxyType
+from typing import Annotated, Any
+
+from pydantic import Field, model_validator
+
+from elspeth.contracts import Determinism
+from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.contract_propagation import narrow_contract_to_output
+from elspeth.contracts.emitted_option import EmittedToOutput
+from elspeth.contracts.errors import HeaderSpelledDeclarationViolation, PluginContractViolation
+from elspeth.contracts.field_spelling import DeclaredSpellings
+from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_missing_guaranteed_fields
+from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.plugins.infrastructure.base import BaseTransform
+from elspeth.plugins.infrastructure.config_base import TransformDataConfig
+from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.infrastructure.sentinels import MISSING
+from elspeth.plugins.infrastructure.utils import get_nested_field
+from elspeth.plugins.sources.field_normalization import ExternalHeaderError, is_normalized_field_name, normalize_field_name
+
+
+def _names_a_row_key(name: str) -> bool:
+    """Whether ``name`` is the key a row actually carries that field under.
+
+    A header-reading source derives a row key with ``normalize_field_name``, so
+    the literals that reliably name a row key are that function's FIXED POINTS.
+    ``str.isidentifier`` is not that test and was the defect
+    (elspeth-f262a8c678): normalization also LOWERCASES and keyword-suffixes,
+    so ``'B'``, ``'Name'``, ``'userID'`` and ``'class'`` are identifiers that a
+    normalized header never yields — they reach ``process`` through
+    ``contract.resolve_name``, exactly like ``'First Name'``.
+
+    This is a MAY-NOT predicate, not a proof of absence, and the name overstates
+    it. A non-fixed-point CAN be a row key in its own right: headerless
+    ``columns`` are used as authored and a source's ``field_mapping`` values are
+    identifier-checked but never lowercased (``resolve_field_names``), so a row
+    really can carry ``'B'``. Construction cannot tell the two readings apart,
+    so a non-fixed-point is treated as unnameable and the declaration ABSTAINS —
+    safe under either reading, which a positive claim would not be.
+    ``_canonical_row_key`` fails closed on the same ambiguity for the overlap
+    rule (elspeth-bb470636d1).
+
+    A literal that normalizes to nothing names no field at all: the source
+    boundary rejects such a header, so no contract can carry one. That mirrors
+    ``value_transform._row_key_aliases``, whose handling this matches
+    deliberately — ``ExternalHeaderError`` is answered, a bare ``ValueError``
+    from an algorithm bug propagates, so the error class a bad mapping key
+    raises at construction is unchanged.
+    """
+    return is_normalized_field_name(name)
+
+
+def _is_static_normalized_source(source: str) -> bool:
+    """Return True when config-time contract math can use ``source``.
+
+    Only a normalization fixed point names a row key config time can state; see
+    ``_names_a_row_key``. Dotted sources are nested reads, not row keys, so they
+    are excluded here and in every complement of this predicate.
+
+    Module-level because BOTH the config model and the transform ask it —
+    ``FieldMapperConfig.declared_input_fields`` derives the node's input
+    requirement from the mapping, and ``FieldMapper`` does its constructor
+    contract math — and the two must never drift into disagreeing about which
+    sources are nameable. ``FieldMapper._is_static_normalized_source`` delegates
+    here rather than restating the test.
+    """
+    return "." not in source and _names_a_row_key(source)
+
+
+def _declared_input_field_for_source(source: str) -> str | None:
+    """Project a mapping source onto the flat input-contract vocabulary.
+
+    A plain normalization fixed point names its row field directly.  A dotted
+    source is a nested read, but the flat contract can still assert the
+    top-level container needed for that read (``meta.origin`` requires
+    ``meta``).  Original-header spellings remain unprojectable: their actual
+    normalized row key is resolved from runtime lineage, and guessing it here
+    would false-reject rows produced through an explicit source field mapping.
+
+    This is deliberately a different predicate from
+    ``_is_static_normalized_source``.  Output/removal math needs the complete
+    source name and must abstain for every dotted read; the input declaration
+    only needs the root field that makes the read possible.
+    """
+    root = source.split(".", 1)[0]
+    return root if _names_a_row_key(root) else None
+
+
+def _canonical_row_key(name: str) -> str:
+    """The row key a mapping literal collapses to when ``process`` uses it.
+
+    Config validation and ``process`` name fields in two different spaces, and
+    that disagreement was the defect (elspeth-bb470636d1). ``process`` starts
+    from ``row.to_dict()``, whose keys are the NORMALIZED names, then deletes a
+    renamed source by whichever of two keys the row answers to — the literal
+    when it is already in the output dict, else ``contract.resolve_name`` —
+    while writing ``output[target]`` under the LITERAL target. Comparing config
+    literals therefore cannot see that ``'B'`` and ``'b'`` are one field.
+
+    This key ADDS a rejection limb; it does not replace the literal one, and
+    canonicalising the identity guard alone would be a REGRESSION. A row can
+    carry ``'B'`` and ``'b'`` as two distinct keys: a source's ``field_mapping``
+    values bypass ``normalize_field_name`` (``resolve_field_names`` validates
+    them with ``isidentifier()`` only) and headerless ``columns`` are taken as
+    already-clean identifiers. So a literal ``'B'`` source may name a row key in
+    its own right, and ``{'B': 'b', 'b': 'y'}`` is a real two-field rename chain
+    that destroys one value — a canonical identity guard would wave it through
+    as a no-op. Reject on EITHER limb: literals as before, canonical keys as
+    well.
+
+    The canonical limb rejects a non-canonical target that collides with another
+    source's key (``{'a': 'B', 'b': 'c'}``) even though that shape is MEASURABLY
+    lossless — two keys in, two keys out, in either order. It has to: with no
+    contract at construction there is no way to know whether the row keys that
+    field under ``'B'`` or under ``'b'``, and the ``'b'`` reading is
+    ``{'a': 'B', 'B': 'c'}``, which does destroy a value. Fail closed.
+
+    Two literals are keyed by themselves rather than normalized. A DOTTED name
+    is a nested read, never a row key, and ``normalize_field_name`` would fold
+    its dot into an underscore and invent an overlap with an unrelated sibling.
+    A name that normalizes to nothing raises ``ExternalHeaderError`` and names
+    no field at all, so it can alias nothing; answering that error the way
+    ``_names_a_row_key`` does keeps a bad mapping key raising the same class it
+    always has, and returning the literal keeps two such keys distinct. The two
+    helpers differ only in their error branch, and must: ``_names_a_row_key``
+    asks whether a literal IS a row key, so an unnormalizable name is False,
+    while this asks which key it stands for, which is itself.
+
+    LIMIT — this narrows the class, it does not close it. ``resolve_name`` is an
+    ``original_name`` index lookup, not a call to ``normalize_field_name``, so a
+    source whose ``field_mapping`` renames a header off its normalized form
+    still resolves to a key no config literal predicts — raw header
+    ``'Weird Header'`` under ``field_mapping: {'weird_header': 'b'}`` yields the
+    row key ``'b'`` (``field_mapping`` is keyed by the EFFECTIVE name, not the
+    raw one), while ``normalize_field_name('Weird Header')`` is
+    ``'weird_header'``. Only a contract present at construction could see that,
+    and none is.
+    """
+    if "." in name:
+        return name
+    try:
+        return normalize_field_name(name)
+    except ExternalHeaderError:
+        return name
+
+
+class FieldMapperConfig(TransformDataConfig):
+    """Configuration for field mapper transform.
+
+    Requires 'schema' in config to define input/output expectations.
+    Use 'schema: {mode: observed}' for dynamic field handling.
+    """
+
+    mapping: Annotated[
+        dict[str, str],
+        EmittedToOutput("field_mapper uses mapping values as output row keys and downstream artifact columns"),
+    ] = Field(
+        default_factory=dict,
+        description="Mapping keys locate existing input fields (header aliases may resolve when the source carries them); values create output names. An explicit target-only schema declaration can type a created target, but never converts its value.",
+    )
+    select_only: bool = Field(default=False, description="When true, emit only fields named in the mapping.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_retired_strict(cls, data: Any) -> Any:
+        """Refuse the retired ``strict`` option with the rule that replaced it.
+
+        ``strict`` decided only whether ``process`` skipped a missing mapping
+        source, and the engine never let a row reach ``process`` without one
+        (measured: ``strict: true`` and ``strict: false`` ran identically). The
+        option therefore promised a tolerance that did not exist. ``extra:
+        forbid`` would refuse it anyway; this names why.
+        """
+        if type(data) is not dict or "strict" not in data:
+            return data
+        raise ValueError(
+            "field_mapper has no 'strict' option: every mapping source is a required input, and a row missing "
+            "one routes to on_error as missing_field. Remove 'strict'."
+        )
+
+    @property
+    def declared_input_fields(self) -> frozenset[str]:
+        """Mapping SOURCES are input fields this transform requires.
+
+        Configuring ``mapping: {source: target}`` IS the author's assertion that
+        ``source`` arrives on the row — the mapping names the field exactly, so
+        the requirement is DERIVED here rather than restated by hand in
+        ``required_input_fields`` (elspeth-d4ae04b374). Without it a mapping
+        naming a field that never arrives produced no error and no quarantine:
+        ``process`` skipped a ``MISSING`` source, so the column simply vanished
+        from the output.
+
+        Joining ``declared_input_fields`` — rather than the explicit
+        ``required_input_fields`` option — is what makes that enforceable.
+        ``validate_transform_declared_input_fields`` (and the composer's mirror
+        of it) gate on the producer's ``EffectiveGuaranteeVote.participated``,
+        so an OBSERVED or otherwise abstaining upstream, which promises nothing
+        because nothing was declared rather than because the field is absent,
+        stays runnable and enforced per-row by the executor's pre-emission
+        check. The explicit option routes instead through ``validate_edge_schemas``
+        Phase 1, a bare set subtraction that fails closed against exactly those
+        upstreams — right for a promise the author wrote by hand, wrong for one
+        inferred from a rename.
+
+        A DOTTED source contributes its normalization-stable top-level
+        container: the flat contract cannot state ``meta.origin``, but it can
+        and must state ``meta``. A non-fixed-point of ``normalize_field_name``
+        still abstains because it reaches ``process`` through
+        ``contract.resolve_name``, so which normalized key it names is
+        unknowable until a row arrives (elspeth-f262a8c678). Missing sources in
+        that unrepresentable class route at runtime; abstention is not
+        permission to drop a configured output.
+
+        Note the DIRECTION. This requires mapping SOURCES only. Requiring rename
+        TARGETS on input is the elspeth-d6eeb3a71d trap — they are fields this
+        node CREATES, which is why ``self_created_input_fields`` demotes every
+        one of them.
+        """
+        derived = frozenset(declared for source in self.mapping if (declared := _declared_input_field_for_source(source)) is not None)
+        return super().declared_input_fields | derived
+
+    @model_validator(mode="after")
+    def _reject_duplicate_targets(self) -> FieldMapperConfig:
+        """Reject mappings where multiple sources map to the same target.
+
+        Duplicate targets cause silent data loss: the last write wins,
+        overwriting the value from the earlier mapping without any error.
+        This also produces incorrect contract metadata (type/original_name
+        lineage from the wrong source field).
+        """
+        if not self.mapping:
+            return self
+        targets: list[str] = list(self.mapping.values())
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for target in targets:
+            if target in seen:
+                duplicates.add(target)
+            seen.add(target)
+        if duplicates:
+            # Build source->target details for the error message
+            collisions: dict[str, list[str]] = {}
+            for source, target in self.mapping.items():
+                if target in duplicates:
+                    collisions.setdefault(target, []).append(source)
+            msg = (
+                f"Mapping has duplicate target field names: "
+                f"{', '.join(f'{t!r} <- {srcs}' for t, srcs in sorted(collisions.items()))}. "
+                f"Multiple sources mapping to the same target causes silent data loss."
+            )
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _reject_overlapping_rename_graphs(self) -> FieldMapperConfig:
+        """Reject mappings whose targets are also sources.
+
+        FieldMapper preserves audit lineage for renames. Swaps/chains require
+        target fields to carry metadata from a different source while also
+        existing as source fields themselves, which is ambiguous without a more
+        expressive contract model.
+
+        Rejects on EITHER of two readings of the mapping, because ``process``
+        picks between exactly those two names when it deletes a renamed source:
+        the config LITERALS, and the ``_canonical_row_key`` values. The literal
+        limb is the one that has always been here — a literal like ``'B'`` can be
+        a row key in its own right, so it must keep being compared as written.
+        The canonical limb is what makes ``{'a': 'b', 'B': 'c'}`` the same rename
+        chain as ``{'a': 'b', 'b': 'c'}``, rejected identically, when ``'B'``
+        resolves to ``'b'`` instead (elspeth-bb470636d1).
+        """
+        if not self.mapping:
+            return self
+
+        sources = set(self.mapping)
+        source_keys = {_canonical_row_key(source) for source in self.mapping}
+        overlaps: dict[str, list[str]] = {}
+        for source, target in self.mapping.items():
+            target_key = _canonical_row_key(target)
+            literal_overlap = source != target and target in sources
+            canonical_overlap = _canonical_row_key(source) != target_key and target_key in source_keys
+            if literal_overlap or canonical_overlap:
+                described = target if literal_overlap or target_key == target else f"{target} (row key {target_key!r})"
+                if described not in overlaps:
+                    overlaps[described] = []
+                overlaps[described].append(source)
+
+        if overlaps:
+            details = ", ".join(f"{target!r} is both target for {srcs} and source" for target, srcs in sorted(overlaps.items()))
+            raise ValueError(
+                "Mapping contains an overlapping rename graph: "
+                f"{details}. Targets that are also sources are order-dependent and can cause silent data loss. "
+                "Names are compared both as written and as the row keys they normalize to, so a source and a target "
+                "that normalize alike — a case variant, a keyword, a digit-prefixed header — count as one name."
+            )
+
+        return self
+
+
+class FieldMapper(BaseTransform):
+    """Map, rename, and select row fields.
+
+    Config options:
+        schema: Required. Schema for input/output (use {mode: observed} for any fields)
+        mapping: Dict of source_field -> target_field
+            - Simple: {"old": "new"} renames old to new
+            - Nested: {"meta.source": "origin"} extracts nested field
+        select_only: If True, only include mapped fields (default: False)
+
+    Every mapping source is a required input: a row missing one routes to
+    ``on_error`` as ``missing_field``; a configured mapping is never skipped.
+    The strict option has been removed; missing mapping sources always route.
+    """
+
+    name = "field_mapper"
+    determinism = Determinism.DETERMINISTIC
+    preserves_input_values = True
+    plugin_version = "1.0.0"
+    source_file_hash: str | None = "sha256:9f4e287978efe335"
+    config_model = FieldMapperConfig
+    usage_when_to_use: str = (
+        "Use to rename, select, or drop known row fields into a stable downstream shape, including "
+        "selecting only the mapped fields when an explicit projection is required."
+    )
+    usage_when_not_to_use: str = (
+        "Not for expression evaluation or type coercion: use value_transform for calculated values "
+        "and type_coerce when field values need explicit type normalization."
+    )
+    example_use: str = """transform:
+  plugin: field_mapper
+  options:
+    mapping:
+      id: application_id
+      applicant: applicant_name
+      notes: notes
+    select_only: true
+    schema:
+      mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("fields", "mapping", "rename", "cleanup")
+
+    @classmethod
+    def probe_config(cls) -> dict[str, Any]:
+        """Minimal config for the ADR-009 backward invariant."""
+        return {
+            "schema": {"mode": "observed"},
+            "mapping": {
+                "field_mapper_probe_source": "field_mapper_probe_target",
+            },
+        }
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__(config)
+        cfg = FieldMapperConfig.from_dict(config, plugin_name=self.name)
+        self._initialize_declared_input_fields(cfg)
+        self._mapping: dict[str, str] = cfg.mapping
+        self._select_only: bool = cfg.select_only
+        self._schema_config = cfg.schema_config
+
+        self.declared_output_fields = self._derive_declared_output_fields(cfg)
+        authored_fields = cfg.schema_config.fields
+        authored_names = frozenset() if authored_fields is None else frozenset(field.name for field in authored_fields)
+        # A flat rename whose declaration the author wrote against the EMITTED
+        # name carries the operator's contract, not the source field's, so it
+        # is not a carried field: the engine must check its value (ADR-050).
+        self._flat_renames_declared_on_target = frozenset(
+            target
+            for source, target in cfg.mapping.items()
+            if "." not in source and self._declaration_is_authored_on_target(source, target, authored_names)
+        )
+
+        # Rename targets are created here, never required on input. Requiring
+        # one is the elspeth-d6eeb3a71d trap, so every target written under a
+        # key the input row did not carry it under demotes from the node's
+        # derived input requirements — including an identity by an original
+        # header, which writes the literal header key (``_writes_target_key``).
+        self._self_created_input_fields = frozenset(
+            target for source, target in cfg.mapping.items() if self._writes_target_key(source, target)
+        )
+
+        # Field-forwarding declaration for the extras direction
+        # (elspeth-15c72686f2). Without select_only, process() deep-copies the
+        # whole input row and then renames within it, so every unmapped column
+        # survives onto the output — including an upstream llm's
+        # <response_field>_usage / _model, which a locked downstream consumer
+        # rejects per-row.
+        #
+        # A source is REMOVED only under the exact condition process() removes
+        # it: not select_only, no dot (a dotted source is a nested read that
+        # leaves its root field in place), and renamed to a different target.
+        # An unresolved original header removes a normalized name that only
+        # `contract.resolve_name` knows at runtime, so it cannot be named
+        # here — the whole declaration abstains rather than under-state the
+        # removal set, which is the only direction that could produce a FALSE
+        # build-time rejection of a working rename pipeline. That class is
+        # every non-fixed-point of `normalize_field_name`, not just the
+        # visibly messy "First Name": a case variant like "Name" or "userID"
+        # deletes `name` / `userid` just as unnameably (elspeth-f262a8c678).
+        # Identity mappings are NOT exempt: {"First Name": "First Name"}
+        # still deletes the normalized key and writes the literal header key,
+        # so the removal is equally unnameable here.
+        #
+        # Deliberately WITHOUT `_build_field_mapper_output_schema_config`'s
+        # `source in admitted_on_input` filter: that set is the node's own
+        # AUTHORED guarantees, whereas this rule is applied to fields proven
+        # present by the upstream walk, which the authored config never names.
+        self.forwards_input_fields = not cfg.select_only and not any(self._is_unresolved_original_source(source) for source in cfg.mapping)
+        # Empty unless forwarding: a removal set is a subtraction from what this
+        # node forwards, so carrying one while forwarding nothing describes
+        # nothing. NodeInfo rejects the pairing at graph construction rather
+        # than letting it sit unread.
+        self.removed_input_fields = (
+            frozenset(source for source, target in cfg.mapping.items() if source != target and self._is_static_normalized_source(source))
+            if self.forwards_input_fields
+            else frozenset()
+        )
+
+        # Every flat mapping moves the field its source names to the target and
+        # the output contract carries the field's recorded original name there
+        # (``process`` passes exactly these to ``narrow_contract_to_output``),
+        # so a lookup of any spelling of the old field reads the target. A
+        # dotted source is a nested extraction, not a rename: its root field
+        # stays where it is.
+        self.renamed_input_fields = MappingProxyType({source: target for source, target in cfg.mapping.items() if "." not in source})
+
+        # Every mapping target is a created name (the field-name spelling rule,
+        # operator ruling 2026-09-25). Where this node forwards its input but
+        # the executor's preflight cannot name what it removes (an unresolved
+        # original-header source), ``process`` checks a target against the row
+        # it forwards; the candidates are fixed by config, so they are
+        # computed once.
+        self._target_spellings = DeclaredSpellings.of(reads=(), creates=cfg.mapping.values())
+
+        self.input_schema, self.output_schema = self._create_schemas(
+            cfg.schema_config,
+            "FieldMapper",
+            adds_fields=True,
+        )
+        self._output_schema_config = self._build_field_mapper_output_schema_config(cfg)
+
+    @staticmethod
+    def _is_static_normalized_source(source: str) -> bool:
+        """Return True when constructor-time contract math can use source.
+
+        Only a normalization fixed point names a row key this constructor can
+        state; see ``_names_a_row_key``. Dotted sources are nested reads, not
+        row keys, so they are excluded here and in the complement below.
+        """
+        return _is_static_normalized_source(source)
+
+    @staticmethod
+    def _is_unresolved_original_source(source: str) -> bool:
+        """Return True when source may be an original header resolved only at runtime.
+
+        The exact complement of ``_is_static_normalized_source`` over
+        non-dotted sources: a literal that is not the row's own key reaches
+        ``process`` through ``contract.resolve_name``, so which normalized name
+        it deletes is unknowable until a row arrives.
+        """
+        return "." not in source and not _names_a_row_key(source)
+
+    @classmethod
+    def _writes_target_key(cls, source: str, target: str) -> bool:
+        """Whether ``process`` writes ``target`` under a key the input row did not carry it under.
+
+        Every rename does. So does an identity mapping by an unresolved
+        original header (``{"Name": "Name"}``): the source is a row LOOKUP
+        (``contract.resolve_name``), so ``process`` deletes the normalized key
+        (``name``) and writes the literal header key, one the input row never
+        had — a rename ``name`` -> ``Name`` that happens to be spelled the same
+        on both sides of the mapping. Only a normalized identity rewrites a key
+        the input already carries. The spelling of a lookup must not decide
+        whether its target is created (operator ruling 2026-09-25: lookups
+        resolve either spelling), so ``{"Name": "Name"}`` and
+        ``{"name": "Name"}`` are one shape here.
+
+        The one predicate behind the created set (``self_created_input_fields``,
+        hence the spelling rule's create surface and input demotion) and the
+        carried set (``carried_output_fields``), so the two cannot disagree
+        about which targets this node writes.
+        """
+        return source != target or cls._is_unresolved_original_source(source)
+
+    @property
+    def self_created_input_fields(self) -> frozenset[str]:
+        """Override: every target written under a new key is created by this node (``_writes_target_key``)."""
+        return self._self_created_input_fields
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """A dotted extraction's target is created ``any``: the nested value's type is in no contract (ADR-050).
+
+        A flat rename is NOT declared here — it carries the source field's
+        contract (``carried_output_fields``), or, when the author declared
+        only its target, the output config's projection of that declaration.
+        """
+        return tuple(
+            FieldDefinition(name=target, field_type="any", required=True, nullable=True)
+            for source, target in self._mapping.items()
+            if "." in source
+        )
+
+    def carried_output_sources(self) -> dict[str, str]:
+        """A flat rename target carries the source field's contract; the stamp leaves it alone.
+
+        Mapped to the rename source (the key ``carried_output_fields()``
+        derives from, and the name the build follows the carried value's type
+        upstream under).
+
+        Except a target the author declared by its EMITTED name while leaving
+        the source undeclared (``_declaration_is_authored_on_target``): its
+        contract is the operator's declaration of the target, which no input
+        check ever held the value to, so it is not carried and the engine's
+        value check sees it (ADR-050). A source-declared rename stays carried:
+        the strict input check admitted the value under the declaration the
+        target inherits.
+
+        An identity mapping by an unresolved original header
+        (``{"Name": "Name"}``) writes a new key (``_writes_target_key``), so it
+        is carried like any rename, holding the source's value under the
+        source's contract (``narrow_contract_to_output`` resolves it), unless
+        the author declared the header literal: that declaration is the
+        TARGET's, like any target-declared rename. Only a normalized identity
+        rewrites a key the input already carries, so only it is left out. Such
+        a target is not in ``declared_output_fields``, the collision surface,
+        which excludes every identity mapping.
+        """
+        return {
+            target: source
+            for source, target in self._mapping.items()
+            if "." not in source and self._writes_target_key(source, target) and target not in self._flat_renames_declared_on_target
+        }
+
+    @classmethod
+    def _declaration_is_authored_on_target(cls, source: str, target: str, authored_names: frozenset[str]) -> bool:
+        """Whether a rename's emitted declaration is the author's declaration of the TARGET, not the source's.
+
+        The one predicate behind both the output projection's fallback limb
+        (``_project_field_declarations_onto_output``) and the carried set
+        (``carried_output_fields``), so the two cannot disagree about whose
+        contract a rename target carries.
+
+        An identity mapping by an unresolved original header whose literal the
+        author declared (``{"Name": "Name"}`` with ``Name: str?``) is one: the
+        input row is keyed ``name``, so the literal names only the key
+        ``process`` writes, and no input check held the value to it. That
+        declaration is a created name, not a header-spelled read
+        (``_writes_target_key``); the output projection reads the same
+        declaration for it either way, because both sides share one literal.
+        """
+        if source == target:
+            return cls._is_unresolved_original_source(source) and target in authored_names
+        return source not in authored_names and target in authored_names
+
+    @classmethod
+    def _derive_declared_output_fields(cls, cfg: FieldMapperConfig) -> frozenset[str]:
+        """Derive the rename targets this node GUARANTEES on every successful row.
+
+        ``declared_output_fields`` is an honest guarantee claim, nothing more:
+        the collision consumers (``TransformExecutor._run_preflight``, the
+        build-time twin in ``core/dag/schema_validation.py``, composer Rule D)
+        are capability-keyed on ``can_overwrite_input_fields`` — they arm only
+        when the write path preserves the input row — so this declaration no
+        longer needs to be narrowed to keep ``select_only`` alive
+        (elspeth-6ea3619737; the narrowing-vs-arming history is
+        elspeth-892161b2d5).
+
+        The mapping itself is now the promise. Normalization-stable sources and
+        dotted roots are asserted through ``declared_input_fields`` and checked
+        before ``process()``; unresolved original-header aliases and dotted
+        leaves route a missing value to error.
+        Consequently every successful row contains every mapped target. This
+        is independent of how (or whether) the input schema repeats the source.
+
+        Identity mappings are excluded because ``declared_output_fields`` is
+        also the collision surface: rewriting a field to itself creates no new
+        field. The output schema below still guarantees identity targets.
+        """
+        return frozenset(target for source, target in cfg.mapping.items() if source != target)
+
+    def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Exercise value preservation with the configured rename source present."""
+        return self.backward_invariant_probe_rows(probe)
+
+    def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Exercise the real rename/drop path for the backward invariant."""
+        return [
+            self._augment_invariant_probe_row(
+                probe,
+                field_name="field_mapper_probe_source",
+                value="mapped",
+            )
+        ]
+
+    @classmethod
+    def _project_field_declarations_onto_output(cls, cfg: FieldMapperConfig) -> tuple[FieldDefinition, ...] | None:
+        """Re-express the AUTHORED INPUT field declarations as the EMITTED shape.
+
+        ``cfg.schema_config`` is the INPUT contract — see
+        ``BaseTransform._build_output_schema_config``, whose ``schema_config``
+        argument is documented as "the transform's input schema config (base
+        fields)". field_mapper is REDUCTIVE: ``process`` keeps only the mapping
+        targets under ``select_only``, and deletes a renamed source in BOTH
+        modes. Copying the authored declarations onto the output therefore left
+        consumed-but-never-emitted fields marked ``required`` on output;
+        ``get_effective_guaranteed_fields`` unions required declared fields in,
+        so the transform's own contract rejected its own emitted row with
+        ``SchemaConfigModeViolation`` (elspeth-a2bf676e6f). That is the
+        reductive-override obligation ``BaseTransform._build_output_schema_config``
+        documents, and the same defect ``BatchStats`` closed for aggregations
+        (elspeth-f5f798f797).
+
+        A rename moves the value unchanged, so the target INHERITS the source's
+        authored declaration instead of degrading to the ``any``-typed
+        placeholder ``declare_missing_guaranteed_fields`` would otherwise append.
+
+        Returns ``None`` for observed-style schemas, which carry no explicit
+        declarations to project.
+        """
+        fields = cfg.schema_config.fields
+        if fields is None:
+            return None
+
+        authored = {field.name: field for field in fields}
+        authored_names = frozenset(authored)
+        projected: dict[str, FieldDefinition] = {}
+
+        # Emitted targets first, so a target that collides with an unmapped
+        # field of the same name is described by the value that lands there —
+        # which for a rename is the SOURCE's value, hence the source's
+        # declaration. An author may declare either side, so a declaration
+        # written against the emitted name is the fallback when the source
+        # carries none.
+        for source, target in cfg.mapping.items():
+            if source == target:
+                declaration = authored[source] if source in authored else None
+            elif cls._declaration_is_authored_on_target(source, target, authored_names):
+                declaration = authored[target]
+            else:
+                declaration = replace(authored[source], name=target) if source in authored else None
+            if declaration is not None:
+                projected[target] = declaration
+
+        # The deep-copy branch forwards every unmapped column.
+        if not cfg.select_only:
+            # An unresolved original header deletes a normalized key this
+            # constructor cannot name, so we cannot say WHICH forwarded column
+            # stopped being emitted. Dropping them all is NOT the safe
+            # direction: ``fields`` feeds two opposed limbs — declared-REQUIRED
+            # names union into ``get_effective_guaranteed_fields`` (so
+            # over-declaring promises rows that may not arrive), while the
+            # declared NAMES are the fixed-mode extras allow-list in
+            # ``verify_schema_config_mode._allowed_declared_fields`` (so
+            # under-declaring rejects rows that do). Declaring the forwarded
+            # columns OPTIONAL satisfies both: the name stays admissible, the
+            # guarantee is not made.
+            unnameable_removal = any(cls._is_unresolved_original_source(source) for source in cfg.mapping)
+            renamed_away = {source for source, target in cfg.mapping.items() if source != target}
+            for field in fields:
+                if field.name in projected or field.name in renamed_away:
+                    continue
+                projected[field.name] = replace(field, required=False) if unnameable_removal else field
+
+        return tuple(projected.values())
+
+    def _build_field_mapper_output_schema_config(self, cfg: FieldMapperConfig) -> SchemaConfig:
+        """Build output schema config reflecting the mapped output shape.
+
+        FieldMapper is shape-changing: it removes source fields and adds target fields.
+        The base _build_output_schema_config() incorrectly copies input fields into
+        output guarantees. This method builds the correct output field set.
+
+        When select_only=True, the guarantee set is exactly the mapping targets.
+        When select_only=False, it is the node-local passthrough lower bound
+        minus nameable removed sources, plus every mapping target. Inherited
+        fields are carried separately by the forwarding/removal declarations.
+        """
+        # On the open branch this is only the node-local passthrough lower
+        # bound. Effective fixed-schema declarations must not be mistaken for
+        # a complete open emit set; inherited fields travel through the graph
+        # walk's forwarding channel instead.
+        admitted_on_input = set(cfg.schema_config.guaranteed_fields or ())
+        # The mapping is the required-read authority. Every successful row has
+        # every target: representable sources are checked before ``process()``,
+        # while unresolved aliases and dotted leaves route on a miss. No
+        # schema guarantee is needed to restate that promise
+        # (elspeth-d4ae04b374).
+        guaranteed_targets = set(cfg.mapping.values())
+
+        if cfg.select_only:
+            # Only mapped targets appear in output
+            output_fields = guaranteed_targets
+        else:
+            # Input fields minus removed sources plus new targets.
+            # A source is removed from output when it's renamed to a different
+            # target — or identity-mapped from an original header, which
+            # deletes the normalized key and rewrites the literal header key,
+            # removing a field this constructor cannot name.
+            has_unresolved_original_removal = any(self._is_unresolved_original_source(source) for source in cfg.mapping)
+            if has_unresolved_original_removal:
+                passthrough_fields: set[str] = set()
+            else:
+                removed_sources = {
+                    source
+                    for source, target in cfg.mapping.items()
+                    if source != target and self._is_static_normalized_source(source) and source in admitted_on_input
+                }
+                passthrough_fields = admitted_on_input - removed_sources
+            output_fields = passthrough_fields | guaranteed_targets
+
+        # ``guaranteed_targets`` is a lower bound on both branches, not a claim
+        # that the open branch's complete emit set is known. Passthrough fields
+        # still travel through ``forwards_input_fields`` / ``removed_input_fields``.
+
+        # Preserve None-vs-empty-tuple semantics: None = abstain, () = explicitly empty.
+        # If upstream declared guarantees or we computed non-empty output, declare explicitly.
+        upstream_declared = cfg.schema_config.guaranteed_fields is not None
+        if upstream_declared or output_fields:
+            guaranteed_fields_result = tuple(sorted(output_fields))
+        else:
+            guaranteed_fields_result = None
+
+        return SchemaConfig(
+            mode=cfg.schema_config.mode,
+            # Mapping targets are guaranteed on output but absent from the
+            # authored input fields; declare them so the config satisfies the
+            # guaranteed-fields-are-declared invariant (elspeth-97487736ca).
+            # The projection below is what makes those authored declarations
+            # describe the EMITTED shape rather than the consumed one
+            # (elspeth-a2bf676e6f).
+            fields=declare_missing_guaranteed_fields(
+                self._project_field_declarations_onto_output(cfg),
+                guaranteed_fields_result,
+            ),
+            guaranteed_fields=guaranteed_fields_result,
+            audit_fields=cfg.schema_config.audit_fields,
+            required_fields=cfg.schema_config.required_fields,
+        )
+
+    def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
+        """Apply field mapping to row.
+
+        Args:
+            row: Input row data
+            ctx: Plugin context
+
+        Returns:
+            TransformResult with mapped row data
+
+        Raises:
+            PluginContractViolation: Raised by executor if row fails input schema
+                validation. This indicates a bug in the upstream source/transform.
+        """
+        # Keep a normalized dict view only for validation and dotted-path lookups.
+        row_data = row.to_dict()
+
+        # The generic executor collision gate handles every statically
+        # nameable open-branch rename. An original-header source is the one
+        # class it cannot adjudicate: construction cannot know whether lineage
+        # resolves it to the target itself (a runtime identity) or to another
+        # row key (a destructive overwrite). Decide that distinction against
+        # this row before mutating the copied payload. This also catches a
+        # rename graph hidden by source ``field_mapping`` — a later original
+        # header resolving to an earlier target — before mapping order can
+        # delete a target the output contract guarantees.
+        if not self._select_only:
+            collisions: set[str] = set()
+            for source, target in self._mapping.items():
+                if target not in row_data or source not in row:
+                    continue
+                if "." in source:
+                    # Dotted reads never consume the flat target field.
+                    collisions.add(target)
+                    continue
+                try:
+                    resolved_source = row.contract.resolve_name(source)
+                except KeyError:
+                    # OBSERVED/FLEXIBLE extras are addressed by their literal
+                    # payload key, matching PipelineRow.__getitem__.
+                    resolved_source = source
+                if resolved_source != target:
+                    collisions.add(target)
+            if collisions:
+                raise PluginContractViolation(
+                    f"Transform '{self.name}' would overwrite existing input fields "
+                    f"{sorted(collisions)}. This is a pipeline configuration error — the transform's "
+                    f"output fields collide with fields already present in the row."
+                )
+
+            # The spelling twin of the check above, for the same unnameable
+            # class: the executor preflight checks created names against what a
+            # node forwards only where ``removed_input_fields`` names it, and an
+            # original-header source abstains from that. So a target that is a
+            # header spelling of a field this row keeps (``{Name: ID}`` over
+            # header ``ID``: ``ID`` would land beside ``id``) is found here,
+            # against the exact removal ``process`` is about to make, before
+            # the payload is touched, with the rule's one predicate.
+            if not self.forwards_input_fields and self._target_spellings.creates:
+                removed = {
+                    source if source in row_data else row.contract.resolve_name(source)
+                    for source in self._mapping
+                    if "." not in source and source in row
+                }
+                forwarded = frozenset(row_data) - removed
+                spellings = self._target_spellings.in_row(row_keys=forwarded, forwarded_keys=forwarded, contract=row.contract)
+                if spellings:
+                    raise HeaderSpelledDeclarationViolation(component=f"Transform '{self.name}'", spellings=spellings)
+
+        # Start with empty or copy depending on select_only
+        if self._select_only:
+            output: dict[str, Any] = {}
+        else:
+            output = copy.deepcopy(row_data)
+
+        # Apply mappings
+        applied_mappings: dict[str, str] = {}
+        for source, target in self._mapping.items():
+            if "." in source:
+                # Dotted-path navigation is an operation on Tier-2 row values, not a
+                # type-contract check. Contracts are flat (no nested-shape guarantee),
+                # so a PRESENT non-dict intermediate (e.g. ``user`` is a str when the
+                # mapping expects ``user.name``) is operation-unsafe data, not an
+                # upstream type-contract violation. Route the offending row to on_error
+                # — recorded and attributable — rather than raising and crashing the
+                # whole run on a single malformed nested value. A genuinely absent
+                # intermediate still returns MISSING, which the handling below
+                # routes so a configured target cannot disappear from a
+                # successful row.
+                try:
+                    value = get_nested_field(row_data, source)
+                except TypeError as exc:
+                    return TransformResult.error(
+                        {
+                            "reason": "type_mismatch",
+                            "field": source,
+                            "error": str(exc),
+                            "message": f"Dotted-path field '{source}' is not navigable on this row: {exc}",
+                        }
+                    )
+            elif source in row:
+                value = row[source]
+            else:
+                value = MISSING
+
+            if value is MISSING:
+                # Every mapping source is required. Normalized top-level
+                # sources are asserted through declared_input_fields, so in a
+                # pipeline the executor settles their miss before process().
+                # Dotted leaves and original-header aliases cannot be stated in
+                # that flat contract and are settled here. Either way a
+                # configured mapping never silently disappears from a row.
+                return TransformResult.error(
+                    {"reason": "missing_field", "field": source, "message": f"Required field '{source}' not found in row"}
+                )
+
+            # Remove old key if it exists (for rename within same dict)
+            if not self._select_only and "." not in source and source in row:
+                if source in output:
+                    del output[source]
+                else:
+                    normalized_source = row.contract.resolve_name(source)
+                    if normalized_source in output:
+                        del output[normalized_source]
+
+            output[target] = value
+            applied_mappings[source] = target
+
+        # Track field changes
+        fields_modified: list[str] = []
+        fields_added: list[str] = []
+        for target in applied_mappings.values():
+            if target in row:
+                fields_modified.append(target)
+            else:
+                fields_added.append(target)
+
+        # Update contract to reflect field mapping (renames and removals).
+        # Dotted sources are nested extractions, not renames: the root field
+        # survives in the output and the extracted value's type is unrelated
+        # to the root's contract, so those targets must be inferred from the
+        # output value. Contracts are flat — presenting "meta.source" as a
+        # rename source would (correctly) fail narrow_contract_to_output's
+        # unknown-source invariant. The renames passed are the declared ones
+        # (``renamed_input_fields``) this row applied, so the identity the
+        # contract carries and the one the build resolves cannot diverge.
+        renamed_fields = {source: target for source, target in applied_mappings.items() if source in self.renamed_input_fields}
+        output_contract = narrow_contract_to_output(
+            input_contract=row.contract,
+            output_row=output,
+            renamed_fields=renamed_fields,
+        )
+        output_contract = self._apply_declared_output_field_contracts(output_contract)
+        output_contract = self._align_output_contract(output_contract)
+
+        return TransformResult.success(
+            PipelineRow(output, output_contract),
+            success_reason={
+                "action": "mapped",
+                "fields_modified": fields_modified,
+                "fields_added": fields_added,
+            },
+        )
+
+    def close(self) -> None:
+        """No resources to release."""
+        pass
+
+    @classmethod
+    def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
+        if issue_code is None:
+            return PluginAssistance(
+                plugin_name="field_mapper",
+                issue_code=None,
+                summary="Rename, drop, or reorder row fields. Stateless and shape-changing; schema can declare created target output types.",
+                composer_hints=(
+                    "Config keys are 'mapping' (dict of source->target), 'select_only' (bool, default false), plus 'schema'. Rename with {old: new}; keep a field with {x: x}; drop a field by omitting it under select_only: true.",
+                    "Every mapping source is required: a row missing one routes to on_error as missing_field.",
+                    "The strict option is gone; remove it. Mapping keys locate existing inputs, including reachable source header aliases; values create new row names. A target-only schema declaration types its output but never converts a value.",
+                    "A dotted mapping source extracts a nested result typed any unless the target has an explicit output declaration; any conflicts with a concrete shared field type at a union coalesce.",
+                    "field_mapper has no 'drop'/'include'/'rename_only' keys — dropping is done by omitting the field under select_only: true.",
+                    "Use select_only: true when cleanup means 'save only these fields'; with select_only true, mapping should whitelist exactly the saved output fields.",
+                    "A select_only whitelist must preserve every field required by the downstream sink; include each required field as a mapping target before routing the mapper to that sink.",
+                    "For scraped-content cleanup before a user-facing sink, field_mapper is the only utility transform that actually removes raw fields. Place it immediately before the sink and omit raw content and fingerprint fields from mapping.",
+                    "For web_scrape content enriched by an LLM and saved without raw page bodies, the final topology is source -> web_scrape -> llm -> field_mapper(cleanup) -> sink. A JSON sink named cleanup is not a cleanup transform.",
+                    "A validator-valid direct route from web_scrape or an LLM to the sink is still incomplete when raw scraped-content cleanup is required; insert or restore this field_mapper immediately before the sink.",
+                    "A cleanup stream name is not a cleanup node; if an upstream producer points to a cleanup stream, create a field_mapper that consumes it before stopping, and do not offer to repair it later.",
+                    "For final cleanup routing, set the upstream LLM or scraper on_success to the cleanup mapper, and set the cleanup mapper on_success to the sink.",
+                    "If an LLM routes directly to a JSON sink whose name sounds like cleanup, cleanup is still missing; the LLM passes through raw scrape fields until this field_mapper whitelists them.",
+                    "If a final cleanup field_mapper points to an intermediate stream with no downstream node, route the mapper directly to the existing sink by setting on_success to the sink name or by using an on_success edge.",
+                    "When a final cleanup field_mapper points to an intermediate stream with no downstream node, do not remove the cleanup mapper or output to clear the validation error.",
+                    "A field_mapper before web_scrape or before raw scraped fields exist cannot satisfy scraped-content cleanup; source-shaping mappers are separate from final cleanup.",
+                    "Final cleanup should preserve requested enrichment, extraction, scoring, or LLM response fields unless the user explicitly asked to drop them.",
+                    "If the user already asked to remove, drop, exclude, or avoid saving raw scrape fields, that request is the authorization and requirement to add the cleanup field_mapper; do not ask whether to add cleanup later.",
+                    "For scraped-content cleanup review, use user_term 'drop_raw_html_fields' even when the configured raw body field is named content, html, raw_html, or another page-body field.",
+                    "When field_mapper implements a cleanup, retention, drop, or output-shaping choice that the user did not spell out mechanically, stage a pipeline_decision interpretation requirement on that field_mapper node before set_pipeline and request its review after mutation succeeds.",
+                    "The pipeline_decision review records the row-shaping decision for audit; it is not permission to omit the cleanup node.",
+                    "naming a sink or output like cleanup, filtered, or final does not clean data; only a field_mapper row-shaping transform changes which fields reach the sink.",
+                    "Renames are pure transformations — no coercion happens here. Use type_coerce for type changes.",
+                    "If the downstream consumer expects a specific field name not in the source, field_mapper is the right tool.",
+                ),
+            )
+        return None

@@ -1,0 +1,16 @@
+ M src/elspeth/composer_mcp/__init__.py
+ M src/elspeth/composer_mcp/portable_supervisor.py
+ M src/elspeth/composer_mcp/server.py
+ M src/elspeth/web/async_workers.py
+ M src/elspeth/web/required_executor.py
+ M tests/conftest.py
+ M tests/fixtures/required_executor.py
+ M tests/unit/composer_mcp/test_server.py
+?? docs/guides/composer-mcp-lifecycle.md
+?? src/elspeth/composer_mcp/runner.py
+?? src/elspeth/composer_mcp/standalone.py
+?? tests/helpers/composer_lifecycle_probe.py
+?? tests/helpers/composer_parent_death_probe.py
+?? tests/helpers/composer_stdio_probe.py
+?? tests/unit/composer_mcp/test_standalone_lifecycle.py
+?? tests/unit/web/test_async_worker_settlement.py

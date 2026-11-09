@@ -1,0 +1,20 @@
+{
+  "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-wave1",
+  "argv": [
+    "/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/python",
+    "-m",
+    "pytest",
+    "-m",
+    "testcontainer",
+    "-n",
+    "0",
+    "-o",
+    "pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src",
+    "tests/testcontainer/web/test_blob_mutation_admission_postgres.py"
+  ],
+  "runtime": {
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src:/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src",
+    "PATH": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/runtime-deps/caddy:/workspace/elspeth/.claude/lanes/composer-remediation-wave1/runtime-deps/sqlite3/bin:/home/agent/.local/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/override:/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/node/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin:/opt/codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/agent/.local/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/fallback",
+    "PLAYWRIGHT_BROWSERS_PATH": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/playwright-browsers"
+  }
+}

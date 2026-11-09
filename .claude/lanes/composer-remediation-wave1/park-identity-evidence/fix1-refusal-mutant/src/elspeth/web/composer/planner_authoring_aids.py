@@ -1,0 +1,2807 @@
+"""Live-rendered planner authoring aids: worked exemplars from the live catalog.
+
+The static skill pack deliberately carries no deployment plugin inventory (the
+``no_deployment_plugin_facts`` gate enforces this), so worked ``set_pipeline``
+exemplars — which must name real plugins — are rendered here at prompt-build
+from the policy-visible catalog and ride in the planner's reviewed-context
+user message. The exact flat canonical documents nested in the provider
+envelopes rendered into the prompt are validated through
+``build_set_pipeline_candidate`` in
+``tests/unit/web/composer/test_planner_authoring_aids.py``; an exemplar the
+current validator rejects fails CI rather than teaching planners a dead shape.
+
+Evidence base: the 2026-07-22 pack stress test (0/6 cold planners converged;
+5/6 fabricated a ``blob_id``, 1/6 missed the source options contract). See
+``scratch/planner-skill-pack-assessment.md``.
+
+Exemplars are structural teaching, not solutions: they demonstrate wiring
+(gate/fork/coalesce), custody binding, and review-row shapes in a neutral
+domain deliberately disjoint from every live acceptance test. If a live
+test's domain vocabulary ever appears in an exemplar, that test stops
+measuring planner capability and starts measuring pack-lookup — the exemplar
+has become the test's answer key and the acceptance signal is contaminated.
+The rules text states principles generically and never names the exemplar's
+domain fields as if they were required.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+from collections.abc import Mapping
+from copy import deepcopy
+from dataclasses import dataclass
+from enum import StrEnum
+from threading import Lock
+from typing import Any, Final, NotRequired, Required, TypedDict, cast, get_args
+
+from rfc8785 import CanonicalizationError
+
+from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields
+from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.value_source import get_catalog_values
+from elspeth.plugins.infrastructure.manager import untrusted_content_transform_names
+
+# The explicit model-catalog projection uses the same accessors as
+# ``list_models``. It remains available to callers, but is not injected into
+# every authoring request: profile-bound authors need only the live aliases.
+from elspeth.plugins.sources.llm.config import LLMSourceConfig
+from elspeth.plugins.transforms.llm.base import LLMConfig
+from elspeth.plugins.transforms.llm.model_catalog import (
+    MODEL_CATALOG_OPENROUTER,
+    OPENROUTER_LITELLM_PREFIX,
+    read_litellm_model_list,
+)
+from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo, PluginSummary
+from elspeth.web.composer._schema_response_grammar import (
+    _JSON_SCHEMA_MAP_KEYS,
+    _JSON_SCHEMA_PROSE_KEYS,
+    _JSON_SCHEMA_SCALAR_KEYS,
+    _JSON_SCHEMA_SCHEMA_LIST_KEYS,
+    _JSON_SCHEMA_SINGLE_SCHEMA_KEYS,
+    SchemaKeywordInvalid,
+    validate_json_schema_scalar,
+)
+from elspeth.web.composer.plugin_policy_disclosure import ProhibitedPluginDisclosure, prohibited_plugin_section
+from elspeth.web.composer.tools._generation_schema_response import PluginSchemaSnapshot
+from elspeth.web.composer.tools.generation import get_expression_grammar
+
+# The registered shield-review constants are the contract's single source of
+# truth. The untrusted-producer vocabulary comes from plugin declarations via
+# the shared manager, so the taught row cannot drift from admission.
+from elspeth.web.interpretation_state import (
+    PROMPT_SHIELD_AVAILABLE_DRAFT,
+    PROMPT_SHIELD_USER_TERM,
+    PROMPT_SHIELD_WARNING_DRAFT,
+    RAW_HTML_CLEANUP_REVIEW_DRAFT,
+    RAW_HTML_CLEANUP_USER_TERM,
+    REGISTERED_PIPELINE_DECISION_USER_TERMS,
+)
+from elspeth.web.provider_config_policy import WEB_LLM_SEQUENTIAL_MULTI_QUERY_MAX_RETRY_SECONDS
+
+# The prompt never models a fabricated identifier — provenance is the lesson.
+PLACEHOLDER_BLOB_ID: Final[str] = "<blob_id copied verbatim from a list_blobs or create_blob result>"
+
+# Prompt-injection exposure follows every untrusted-content producer, but
+# the raw-HTML/fingerprint cleanup contract is specific to web_scrape output.
+# Keeping these producer sets separate prevents document extraction plugins
+# such as Textract from inheriting a factually false audit-card draft.
+_RAW_HTML_CLEANUP_PRODUCER_PLUGINS: Final[frozenset[str]] = frozenset({"web_scrape"})
+
+
+class _OmittedPublicText(TypedDict):
+    """Disclosure that public selection prose moved to JIT discovery."""
+
+    sha256: str
+    details_via: str
+
+
+class _PluginDigestEntry(TypedDict):
+    """Closed policy-visible plugin summary rendered into the planner prompt.
+
+    ``not_for`` carries the plugin's ``usage_when_not_to_use``; ``purpose`` and
+    ``required_options`` likewise rename ``description`` and the required
+    ``config_fields``. The digest names each field for what the planner does
+    with it, so a parity sweep over the catalog vocabulary should grep this
+    module rather than the field names alone.
+    """
+
+    name: str
+    purpose: NotRequired[str]
+    required_options: list[str]
+    not_for: NotRequired[str]
+    purpose_omitted: NotRequired[_OmittedPublicText]
+    not_for_omitted: NotRequired[_OmittedPublicText]
+    capability_tags: NotRequired[list[str]]
+    aggregation_output_modes: NotRequired[list[str]]
+    profile_aliases: NotRequired[list[str]]
+
+
+class _DiscoveryDigestBudget(TypedDict):
+    max_canonical_bytes: int
+    canonical_bytes_used: int
+    omitted_public_text_count: int
+
+
+class _ProhibitedPluginDigest(TypedDict):
+    sources: list[ProhibitedPluginDisclosure]
+    transforms: list[ProhibitedPluginDisclosure]
+    sinks: list[ProhibitedPluginDisclosure]
+
+
+class _DiscoveryDigest(TypedDict):
+    """Closed plugin-kind inventory rendered from one catalog snapshot."""
+
+    sources: list[_PluginDigestEntry]
+    transforms: list[_PluginDigestEntry]
+    sinks: list[_PluginDigestEntry]
+    prohibited: _ProhibitedPluginDigest
+    budget: _DiscoveryDigestBudget
+
+
+class _SchemaContractEvidenceEntry(TypedDict):
+    """One whole, current, policy-visible plugin contract."""
+
+    plugin_id: str
+    policy_hash: str
+    snapshot_hash: str
+    schema_hash: str
+    json_schema: dict[str, object]
+    knob_schema: dict[str, object]
+    aggregation_output_modes: list[str]
+
+
+class _SchemaContractEvidenceOmission(TypedDict):
+    """Closed reason that a tracked or referenced contract is not present."""
+
+    plugin_id: str
+    reason: str
+
+
+class _SchemaContractEvidence(TypedDict):
+    """Bounded current-request schema evidence rendered for the planner."""
+
+    policy_hash: str
+    snapshot_hash: str
+    max_entries: int
+    max_omissions: int
+    max_canonical_bytes: int
+    canonical_bytes_used: int
+    schemas: list[_SchemaContractEvidenceEntry]
+    omitted: list[_SchemaContractEvidenceOmission]
+    omissions_withheld_count: int
+
+
+class _ExemplarSource(TypedDict, total=False):
+    """Source subset used by the worked set-pipeline exemplars."""
+
+    plugin: Required[str]
+    on_success: Required[str]
+    options: Required[dict[str, Any]]
+    on_validation_failure: Required[str]
+    inline_blob: dict[str, str]
+    blob_id: str
+
+
+class _ExemplarNode(TypedDict, total=False):
+    """Union of node fields used by the worked set-pipeline exemplars."""
+
+    id: Required[str]
+    node_type: Required[str]
+    plugin: str
+    input: Required[str]
+    on_success: str
+    on_error: str
+    options: dict[str, Any]
+    condition: str
+    routes: dict[str, str]
+    fork_to: list[str]
+    branches: dict[str, str]
+    policy: str
+    merge: str
+    timeout_seconds: float
+
+
+class _ExemplarEdge(TypedDict):
+    """Optional UI edge shape accepted by set_pipeline exemplars."""
+
+    id: str
+    from_node: str
+    to_node: str
+    edge_type: str
+    label: str | None
+
+
+class _ExemplarOutput(TypedDict):
+    """Sink subset used by the worked set-pipeline exemplars."""
+
+    sink_name: str
+    plugin: str
+    options: dict[str, Any]
+    on_write_failure: str
+
+
+class _ExemplarMetadata(TypedDict):
+    """Metadata carried by each worked set-pipeline exemplar."""
+
+    name: str
+    description: str
+
+
+class _SetPipelineExemplar(TypedDict):
+    """Closed flat canonical document nested in worked provider arguments."""
+
+    source: _ExemplarSource
+    nodes: list[_ExemplarNode]
+    edges: list[_ExemplarEdge]
+    outputs: list[_ExemplarOutput]
+    metadata: _ExemplarMetadata
+
+
+class _SetPipelineProviderArguments(TypedDict):
+    """Provider envelope around one flat canonical set-pipeline document."""
+
+    pipeline: _SetPipelineExemplar
+
+
+class _SourceCustodyAid(TypedDict):
+    rules: list[str]
+    set_pipeline_exemplar_inline_blob: _SetPipelineProviderArguments
+    existing_blob_source_binding: _ExemplarSource
+
+
+class _ForkCoalesceAid(TypedDict):
+    rules: list[str]
+    set_pipeline_exemplar: _SetPipelineProviderArguments
+
+
+class _ForkRowUnionAid(TypedDict):
+    rules: list[str]
+    set_pipeline_exemplar: _SetPipelineProviderArguments
+
+
+class _RulesAid(TypedDict):
+    rules: list[str]
+
+
+class _ReviewRegistryAid(TypedDict):
+    registered_pipeline_decision_user_terms: list[str]
+    rules: list[str]
+
+
+class _DiscoveryDigestAid(TypedDict):
+    guidance: str
+    plugins: _DiscoveryDigest
+
+
+class _OmittedModelIdentifiers(TypedDict):
+    """Disclosure that one authorable provider's model ids moved to JIT discovery."""
+
+    provider: str
+    model_count: int
+    details_via: str
+
+
+class _ModelCatalogBudget(TypedDict):
+    max_canonical_bytes: int
+    canonical_bytes_used: int
+    omitted_provider_count: int
+
+
+class _ModelCatalog(TypedDict):
+    """Closed projection of the model catalog the models listing serves.
+
+    ``provider_model_counts`` and ``total_models`` are the tool's unfiltered
+    mode verbatim; ``models_by_provider`` carries the per-provider identifier
+    lists in the exact form its filtered mode returns them.
+    """
+
+    provider_model_counts: dict[str, int]
+    total_models: int
+    authorable_providers: list[str]
+    models_by_provider: dict[str, list[str]]
+    models_omitted: list[_OmittedModelIdentifiers]
+    budget: _ModelCatalogBudget
+
+
+class _ModelCatalogAid(TypedDict):
+    guidance: str
+    catalog: _ModelCatalog
+
+
+class _ExpressionGrammarBudget(TypedDict):
+    max_canonical_bytes: int
+    canonical_bytes_used: int
+
+
+class _ExpressionGrammarAid(TypedDict, total=False):
+    guidance: Required[str]
+    budget: Required[_ExpressionGrammarBudget]
+    grammar: str
+    grammar_omitted: _OmittedPublicText
+
+
+class _PlannerAuthoringAids(TypedDict, total=False):
+    """Closed section vocabulary for the live planner-authoring payload."""
+
+    purpose: Required[str]
+    user_disclosure: Required[_RulesAid]
+    source_custody: _SourceCustodyAid
+    fork_coalesce: _ForkCoalesceAid
+    fork_row_union: _ForkRowUnionAid
+    model_custody: _RulesAid
+    llm_output_contract: _RulesAid
+    llm_source_generation: _RulesAid
+    review_registry: _ReviewRegistryAid
+    prompt_shield: _RulesAid
+    content_safety: _RulesAid
+    raw_html_cleanup: _RulesAid
+    web_scrape_http_identity: _RulesAid
+    discovery_digest: _DiscoveryDigestAid
+    model_catalog: _ModelCatalogAid
+    expression_grammar: _ExpressionGrammarAid
+
+
+_SOURCE_CUSTODY_RULES: Final[tuple[str, ...]] = (
+    "A blob_id comes ONLY from blob-tool output in this session (list_blobs, "
+    "list_composer_blobs, create_blob, get_blob_metadata). Copy it verbatim.",
+    "If no tool returned the identifier, bind the data with source.inline_blob "
+    "(filename, mime_type, content) or create_blob first. Never fabricate a "
+    "blob_id, secret reference, model identifier, or any other identifier.",
+    "inline_blob.content must be verbatim source data. Usually that is the "
+    "user's data exactly as it appears in their message; custody records it "
+    "against that message. The ONLY exception is content you generated "
+    "because the user explicitly requested planner-authored sample data; "
+    "bind it through inline_blob and follow the invented_source provenance "
+    "rule below.",
+    "Custody owns the storage binding: author schema.mode and on_validation_failure on a blob-bound source, never path or blob_ref.",
+    "A file the user NAMES but never uploaded, whose content is not in the "
+    "conversation, has NO legal binding: source paths must resolve to real "
+    "session-blob storage, so an invented path is always rejected. Discover "
+    "first (list_blobs / list_composer_blobs); if nothing matches, ask one "
+    "narrow upload/selection question — or, on a surface with no question "
+    "channel, decline with a named gap. Never fabricate a path, blob id, or "
+    "stand-in rows.",
+    # run-2 G4: the digest hands a discovered blobs/<name> PATH but nothing
+    # said which slot it binds to; sims put it in blob_id (UUID-typed) and died.
+    "A DISCOVERED operator file path (a blobs/<name> the session's discovery "
+    "facts or blob metadata handed you) binds through source options.path, "
+    "copied verbatim. source.blob_id accepts ONLY the UUID a blob tool "
+    "returned this session — a path in blob_id is always rejected.",
+    # Session 891b7b1e turn 2: the planner sent source: null intending
+    # 'keep the existing source' and burned a repair turn on the rejection.
+    "set_pipeline is a FULL replacement: source: null never means 'keep "
+    "the current source'. Re-supply the source explicitly. Plugin-backed "
+    "sources must be preserved in that shape; "
+    "do not assume the current source is blob-bound. Retain source.blob_id "
+    "only for an existing singular blob-bound source whose block carries "
+    "one; use source.inline_blob only when intentionally supplying new "
+    "literal data.",
+    "ORDINARY/FREEFORM MUTATION SURFACE: when inspection and mutation tools "
+    "are advertised, re-supply the complete existing `source` configuration "
+    "or named `sources` map from "
+    "get_pipeline_state(component='set_pipeline_arguments'). If that reports "
+    "round_trip_unavailable, never fabricate or rebind source custody: use an "
+    "advertised narrow patch tool when the requested task permits, otherwise "
+    "surface the named gap.",
+    "PROPOSAL PLANNER SURFACE: read the current-state context and use only "
+    "tools advertised in this request. Re-supply an existing source only "
+    "when that context carries its exact authorable source binding. If the "
+    "authoritative binding is absent, redacted, diagnostic-only, or named/"
+    "multiple blob custody cannot round-trip, surface an exact-source/"
+    "round-trip gap and stop instead of guessing; never invoke an "
+    "unadvertised inspection or mutation tool, and never fabricate or rebind "
+    "source custody.",
+    # Session 891b7b1e turn 1: the planner fabricated rows at the user's
+    # request, then narrated its own content as 'the system auto-generated
+    # placeholder content' — a provenance inversion in an audit-grade tool.
+    "Content YOU fabricated at the user's request ('make up N rows', "
+    "'invent sample complaints') is planner-authored, not discovered: bind "
+    "it via inline_blob, stage the invented_source interpretation review, "
+    "and narrate it in FIRST PERSON — 'I generated this content as you "
+    "asked' — never as something 'the system' produced or you found. "
+    "Reading a blob you authored this turn back through get_blob_content or read_attachment "
+    "does not make its content external.",
+)
+
+_INLINE_EXEMPLAR_FILENAME: Final[str] = "stock_levels.csv"
+_INLINE_EXEMPLAR_MIME: Final[str] = "text/csv"
+_INLINE_EXEMPLAR_CONTENT: Final[str] = "sku,on_hand\nAX-100,12\nBX-204,7\n"
+
+_FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
+    # run-3 E1: the old unconditional fork-over-queries preference produced a
+    # wrong-topology V-pass and 0/3 multi_query adoption where it fit. Shape
+    # SELECTION is decided by what varies per assessment, not by preference.
+    "SHAPE SELECTION: for several assessments of the SAME row using "
+    "compatible node-wide model, system prompt and sampling settings, prefer "
+    "a SINGLE llm node with named queries when separate nodes were not requested. "
+    "For a sequence, use a queries list and query_input_mode: ordered; later queries may explicitly bind earlier validated outputs. "
+    "Each query remains a separate model call. Preserve "
+    "requested separate branches even when their input is the same. Use "
+    "fork/coalesce when branch settings, inputs or processing chains differ.",
+    "When the user explicitly asks for separate branches or one model call per "
+    "branch, fork with a gate fanning out to one branch transform per branch, "
+    "rejoined by a coalesce; do not compact away the requested topology.",
+    "Key the coalesce branches map by FORK BRANCH NAME; each value names the "
+    "connection arriving at the coalesce after that branch's transforms.",
+    "When branches rejoin at a coalesce, each branch transform MUST publish "
+    "the connection named in the coalesce's branches values. A branch "
+    "transform must never publish to a sink — only the coalesce's downstream "
+    "path reaches sinks.",
+    "A coalesce publishes its merged rows under its own node id — the "
+    "downstream consumer sets input to the coalesce id. Do not author "
+    "on_success on a coalesce unless it routes directly to a sink.",
+    "Give each branch transform its own output field (an llm node's response_field) so the union merge carries every branch's result on one row.",
+    "A field shared by union branches must have one compatible actual type on every branch; any is a type, not a wildcard. A provable rewrite can retain that type; otherwise use a new field or declare compatible output types on the branches' last nodes. Declarations do not convert values.",
+    # Session 60ab6a67: this exemplar modelled llm branches with a user prompt
+    # only, and a planner asked for an A/B of two prompts cloned it key for
+    # key — both arms shipped with no system prompt.
+    "Every llm node needs BOTH prompt roles: options.system_prompt (the "
+    "model's role and task constraints) and an effective user template for "
+    "the row data and requested reply. In single-prompt mode use "
+    "options.prompt_template. In multi_query, each query's template may "
+    "supply the user role, with options.prompt_template as the fallback; a "
+    "node-level template is unnecessary when every query supplies its own. "
+    "Validation rejects missing effective roles. When the user supplies only "
+    "one role, keep theirs verbatim and "
+    "author the other from the task, or ask. Arms that differ only in role or "
+    "persona keep the SAME prompt_template and vary system_prompt — which is "
+    "itself a reason to fork: system_prompt is shared by every query on a "
+    "node, so a per-arm system prompt cannot be expressed as multi_query.",
+    "For a single-variable A/B comparison, vary only the requested experimental variable. "
+    "Keep model/profile, sampling settings, input rows, prompt_template, response_format, "
+    "and output_fields constraints equal unless one is the requested variable. Both arms "
+    "use the same enum values and extraction rules; output field names may differ to keep "
+    "results distinct. Structured output on one arm and free text on the other changes "
+    "the experiment. Compare the saved branch options before claiming only one variable differs.",
+    "Cleanup field_mapper mapping keys are existing INPUT fields; values are the desired OUTPUT names. "
+    "Its schema inherits arriving fields by their carried names and may also declare created target output types. Declare an arriving name as rows carry it (normally the normalized header or source mapping target); a target declaration does not convert its value.",
+    "Do not author interpretation_requirements rows for llm_prompt_template "
+    "or llm_model_choice — required LLM reviews auto-stage on every llm "
+    "node. Author rows only for the planner-owned kinds (vague_term wired "
+    "via prompt_template_parts, registered pipeline_decision, "
+    "invented_source), each in the short form {kind, user_term, draft} with "
+    "user_term mandatory.",
+    "Composer-authored coalesces support policy require_all, best_effort "
+    "(requires timeout_seconds), or first, and merge union or nested. Engine "
+    "quorum/select require fields this surface cannot author. Use best_effort "
+    "with an explicit timeout when partial branch arrival is intended; it "
+    "merges arriving branches where require_all would drop an incomplete row.",
+    "A coalesce consumes ONLY the connections named in its branches values. "
+    "Its input field is required by the schema but is not a consuming "
+    "binding — set it to the first branch's arriving connection by "
+    "convention, never to a name nothing publishes.",
+)
+
+_FORK_EXEMPLAR_CONTENT: Final[str] = "ticket_id,body\nT-1001,Cannot log in since the update\nT-1002,Invoice totals look wrong\n"
+_ROW_UNION_EXEMPLAR_CONTENT: Final[str] = "case_id,variant_text\nC-1001,Control copy\nC-1002,Treatment copy\n"
+
+_FORK_ROW_UNION_RULES: Final[tuple[str, ...]] = (
+    "Use row_union for require_all N-to-N reconvergence: every fork branch contributes its original rows, "
+    "and the barrier releases all of them in declared branch order without merging fields.",
+    "Key branches by the upstream gate's fork_to branch names. Each value is the unique connection published "
+    "by that branch's final transform.",
+    "Set input to the first branch connection exactly. It is an adapter placeholder; all branches values are the real consuming bindings.",
+    "Set on_success to a downstream processing connection, never directly to a sink. Omit plugin, options, "
+    "on_error, policy, merge, gate routing, and aggregation fields.",
+    "timeout_seconds is optional; when present it must be finite and greater than zero.",
+)
+
+
+def _prompt_shield_rules(
+    *,
+    shield_plugin: str | None,
+    shield_required: bool = False,
+    shield_auto_wired: bool = False,
+    untrusted_producers: tuple[str, ...],
+) -> list[str]:
+    """Shield-staging rules quoting the registered review constants verbatim.
+
+    Required mode is auto-wired server-side (R2-F10, elspeth-f99655f540):
+    ``required_controls.wire_required_controls`` splices the selected shield
+    onto any uncovered llm input at proposal time and stages a
+    ``required_control_auto_wired`` disclosure card, so the aids teach the
+    guarantee instead of demanding manual wiring — and drop the
+    shield-recommendation row, whose exposure the wired shield removes.
+    Recommend mode stages the advisory review row whether or not an
+    implementation is selected, using the deployment-available draft when it
+    is. The review is ADVISORY end-to-end (warnings only, excluded from the
+    blocking contract), so no rejection code ever teaches it on a repair
+    turn — these aids are the only lever. Tutorial finalizer battery (dim_c
+    under-flag): the replan planner non-deterministically omitted the row on
+    the scrape→summarize llm node. Constants are imported from
+    ``interpretation_state`` so the taught row can never drift from the
+    contract (the 52322ebe1 discipline); the draft is chosen by the LIVE
+    snapshot's shield selection, mirroring the warning→available upgrade the
+    server itself applies, and memoizes correctly because the aids cache is
+    keyed by snapshot hash.
+    """
+    producers = " or ".join(sorted(untrusted_producers))
+    if shield_plugin is not None and shield_required and shield_auto_wired:
+        return [
+            f"This deployment REQUIRES a prompt-injection shield and has selected {shield_plugin}. "
+            "You do not need to wire it yourself: when a proposal's llm input is not already "
+            f"covered, ELSPETH automatically splices a {shield_plugin} transform onto that input "
+            "edge and stages a required_control_auto_wired disclosure card for the operator to "
+            f"acknowledge. You MAY wire a {shield_plugin} transform explicitly (between the "
+            f"{producers} producer and the llm node) when you want to control its placement; the "
+            "auto-wire pass leaves a covered graph untouched.",
+            "Auto-wiring can only scope the shield to PROVABLE prompt fields: keep every prompt "
+            "row access static ('{{ row.field }}', never '{{ row[key] }}') so the protected field "
+            "set can be derived.",
+            f"Do NOT stage the {PROMPT_SHIELD_USER_TERM} review row on those llm nodes — with the "
+            "shield wired (by you or by the auto-wire pass) the exposure it warns about no longer "
+            "exists.",
+        ]
+    if shield_plugin is not None and shield_required:
+        # REQUIRED and selected, but not auto-wirable: the selection is
+        # alias-less and its required service bindings only exist as
+        # placeholder exemplars, which must never become real node config. The
+        # manual-wiring mandate stays the teaching for this posture.
+        return [
+            f"An authorized prompt-injection shield is available in this deployment: {shield_plugin}. "
+            f"When an llm transform consumes untrusted or externally controlled upstream content (any path from a {producers} "
+            f"output reaches its input), WIRE a {shield_plugin} transform between that producer node and "
+            "the llm node — its input is the producer node's on_success connection, and its on_success "
+            "is the llm node's input. This is required, not advisory: untrusted text must not "
+            "reach the model unshielded.",
+            "Load the shield's schema and assistance through the capability catalog before authoring "
+            "it, and configure it from that schema alone.",
+            f"With the shield wired, do NOT also stage the {PROMPT_SHIELD_USER_TERM} review row — the "
+            "exposure it warns about no longer exists.",
+        ]
+    draft = PROMPT_SHIELD_AVAILABLE_DRAFT if shield_plugin is not None else PROMPT_SHIELD_WARNING_DRAFT
+    availability = (
+        f"The selected deployment implementation is {shield_plugin}. "
+        if shield_plugin is not None
+        else "No deployment implementation is selected. "
+    )
+    return [
+        availability,
+        f"When an llm transform consumes untrusted or externally controlled upstream content (any path from a {producers} "
+        "output reaches its input), stage the prompt-injection shield review ON THAT LLM NODE: "
+        "add one pending pipeline_decision entry to its options.interpretation_requirements "
+        "(a sibling of the node's other options).",
+        f'Use exactly: {{"kind": "pipeline_decision", "user_term": "{PROMPT_SHIELD_USER_TERM}", "draft": "{draft}"}} '
+        "— copy the user_term and draft strings verbatim.",
+        "The WARNING is advisory, but a staged row costs a mandatory operator acknowledgement "
+        "before /execute — stage it only when untrusted or externally controlled upstream content actually reaches the llm.",
+        "Never stage this untrusted-content draft on an llm fed only operator-supplied content; the "
+        "validator's warning already carries the correct local-content wording there.",
+        "Skip the row only when an authorized prompt-injection shield transform is already wired between that producer node and the llm node.",
+    ]
+
+
+def _content_safety_rules(*, safety_plugin: str, auto_wired: bool = True) -> list[str]:
+    """Wiring rules for the content-safety control this deployment selected.
+
+    Same regime as the shield's available branch, on the other side of the
+    model: the shield protects what goes IN, content safety screens what
+    comes OUT. Only the available branch exists today — there is no
+    registered ``pipeline_decision`` term for an absent content-safety
+    control, so a deployment without one gets no acknowledge card (unlike
+    the shield). That asymmetry is a known gap, not a decision.
+
+    Coverage is checked over EVERY output edge of the llm node, not just
+    ``on_success``, so the on_success-only framing this used to carry was a
+    half-truth that produced an unrepairable rejection: an author who wired the
+    control exactly as told and quarantined failures to a sink was rejected for
+    an edge these rules never mentioned.
+
+    Like the shield's required branch, the on_success edge is auto-wired
+    server-side (R2-F10) when the selection is actually deployable (an
+    operator profile alias, or direct options fully bound to real
+    deployment values): the aids then teach the guarantee and keep only the
+    on_error discipline, which the auto-wire pass cannot repair — no control
+    can sit on an error branch, so a quarantine sink stays an operator
+    decision. A selection whose required bindings only exist as placeholder
+    exemplars cannot be auto-wired, so that posture keeps the manual-wiring
+    mandate. The common controlled-error rules retain the eligible enclosing
+    closer exception and the operator tradeoff without suggesting policy evasion.
+    """
+    on_error_rule = _llm_on_error_rules(output_control=safety_plugin)
+    if auto_wired:
+        return [
+            f"This deployment REQUIRES the {safety_plugin} content-safety control on every path "
+            "carrying llm output. You do not need to wire it yourself: when a proposal's llm "
+            f"on_success path is not already covered, ELSPETH automatically splices a {safety_plugin} "
+            "transform onto that edge and stages a required_control_auto_wired disclosure card for "
+            f"the operator to acknowledge. You MAY wire a {safety_plugin} transform explicitly when "
+            "you want to control its placement; the auto-wire pass leaves a covered graph untouched.",
+            *on_error_rule,
+        ]
+    return [
+        f"An authorized content-safety control is available in this deployment: {safety_plugin}. "
+        f"WIRE a {safety_plugin} transform on the llm node's on_success output — its input is the "
+        "llm node's on_success connection, and its on_success carries the screened rows onward. "
+        "This is required, not advisory: model-generated content must be screened before it is "
+        "written out.",
+        *on_error_rule,
+        "Load its schema and assistance through the capability catalog before authoring it, and configure it from that schema alone.",
+    ]
+
+
+def _raw_html_cleanup_rules(*, untrusted_producers: tuple[str, ...]) -> list[str]:
+    """Teach the structured review identity and a descriptive draft example."""
+    producers = " or ".join(sorted(untrusted_producers))
+    return [
+        f"When a field_mapper with select_only=true drops {producers} raw fields "
+        "(raw content / fingerprint) before the sink, stage the cleanup review ON "
+        "THAT field_mapper node: one pending pipeline_decision entry in its "
+        "options.interpretation_requirements (a SIBLING of mapping, never inside it).",
+        f"Use kind 'pipeline_decision' and user_term {RAW_HTML_CLEANUP_USER_TERM!r} exactly. "
+        "Write the draft in your own words to describe the fields being dropped. "
+        f'Example review row: {{"kind": "pipeline_decision", "user_term": "{RAW_HTML_CLEANUP_USER_TERM}", "draft": "{RAW_HTML_CLEANUP_REVIEW_DRAFT}"}}.',
+        "An explicit user instruction to drop the fields does NOT waive the row — it records that decision for the audit trail.",
+    ]
+
+
+_USER_DISCLOSURE_RULES: Final[tuple[str, ...]] = (
+    "Separate observations, hypotheses, and verified causes when explaining a run. "
+    "Saved configuration does not prove the provider request bytes, and provider receipt does not prove model compliance. "
+    "If wire or execution evidence is unavailable, say which claim cannot be checked; do not conclude that one prompt "
+    "role overrode another or that a sampling setting caused an output without evidence that isolates that cause.",
+    "Preserve supplied literal prompts character-for-character, including capitalization, punctuation, and whitespace. "
+    "Do not silently normalize or improve them. If a required adaptation would change the supplied literal, "
+    "explain the needed change and obtain the user's decision before making it.",
+    "In your user-facing reply, answer the user's design questions as well as explaining what you authored, "
+    "including when the turn stops at review cards. Compare the actual saved prompt text with the user's words "
+    "before describing it: say 'verbatim' or 'exactly as written' only for unchanged text. Adding row variables, "
+    "rewording a question, or adding output instructions is an adaptation. Name those adaptations and distinguish "
+    "them from an unchanged system prompt; a review card does not replace this explanation.",
+    "Disclose each LLM node's selected profile alias, or its discovery-backed literal model. Name the concrete "
+    "model behind a profile only when the current session's served evidence supplies that binding; otherwise "
+    "say the profile is operator-managed and the concrete model is not exposed here. Never infer a model or "
+    "version from an alias. Operator custody exempts a profile from model-choice approval, not disclosure.",
+    "Explain effective saved failure policies before asking the user to proceed. Discard routing can omit rows; "
+    "inspect the selected plugin's schema and assistance before declaring a requested retention policy unsupported. "
+    "CSV require_all_rows=true makes row refusal fail preparation; on_write_failure is still required, and discard does not override it. "
+    "A route named fail is not a stop enum. "
+    "include_audit_context=true requires require_all_rows=true, observed schema, normalized/default headers and mode=write. "
+    "It retains actual run/row/token identity, outcome/path, an audit error reference and the complete carried row_json; "
+    "It synthesizes no readable business reason. Author required readable reasons only from evidence available "
+    "through a supported producer and processing path. If a failure path exposes only an audit reference, "
+    "disclose that gap; do not invent a reason or claim full retention/report compliance. "
+    "Neither option rolls back prior publications. A require_all merge needs every "
+    "branch: if one branch is lost, that input has a recorded failed merge and no combined output row. "
+    "Do not promise all input rows reach the CSV when those policies permit missing rows. Describe a named "
+    "failure sink instead when that is the configured policy; do not claim quarantine exists when it does not.",
+    "If consistent presentation is needed, author explicit prompt instructions for plain text, Markdown, "
+    "hex-code case, and explanatory suffixes as appropriate to the user's request, and disclose additions "
+    "as your formatting choices on the review card. 'One short phrase' alone does not prohibit Markdown. "
+    "Prompt instructions are not a guarantee of exact formatting: use a supported structured contract when "
+    "exact values are required. Do not silently rewrite approved prompts or normalize audited responses.",
+)
+
+
+def _model_custody_rules(profile_alias: str | None) -> list[str]:
+    """Model-provisioning custody with the sanctioned alternative rendered live.
+
+    Suite run 1 G2 (8/8 problems): the pack's never-invent-a-slug rule had no
+    sanctioned alternative — obeying it (omitting the model binding) was
+    validator-fatal while inventing a literal slug passed. The operator-profile
+    path is that alternative: ``options.profile`` binds the model through
+    operator policy and exempts the ``llm_model_choice`` review
+    (``interpretation_state.materialize_state_for_execution`` derives the
+    exemption from the profile binding). The live alias is rendered here so the
+    rule is actionable offline, not a demand for aliases the deployment does
+    not serve.
+    """
+    rules: list[str] = []
+    if profile_alias is not None:
+        rules.append(
+            f"This deployment serves the llm operator profile alias '{profile_alias}'. "
+            "Author llm nodes with options.profile set to that alias and OMIT "
+            "model/provider/credential options entirely: operator policy supplies "
+            "the concrete model, and a profile-bound node carries NO "
+            "llm_model_choice review card."
+        )
+    else:
+        rules.append(
+            "No llm operator profile is currently usable in this deployment: "
+            "bind a model only through a literal slug from a fresh list_models "
+            "result in THIS session."
+        )
+    rules.append(
+        "Author options.model ONLY with a slug from a fresh list_models result, "
+        "never invented or recalled from training. A literal slug "
+        "auto-stages the llm_model_choice review, which must be surfaced and "
+        "resolved before the pipeline can run."
+    )
+    rules.append(
+        "Omitting the model binding entirely is not compliance — an llm node "
+        "needs either options.profile or a discovery-served options.model."
+    )
+    return rules
+
+
+# run-2 G9: web policy rejects sequential (pool_size 1) multi_query llm nodes
+# with unbounded capacity retries; the ceiling is imported so the taught
+# number can never drift from provider_config_policy.
+# run-3 P2 correction: the previous unconditional form of this rule steered
+# PROFILE-bound authors into an operator-private option (pool_size /
+# max_capacity_retry_seconds) and a profile_unavailable rejection — the
+# operator layer auto-injects the web-safe retry bound on profile-bound
+# multi_query nodes (profiles.lower_options). The rule is form-conditional.
+_WEB_MULTI_QUERY_RETRY_RULE: Final[str] = (
+    "On a PROFILE-bound llm node (options.profile), never author pacing or "
+    "retry options — pool_size and max_capacity_retry_seconds are "
+    "operator-private and the profile layer injects the web-safe retry bound "
+    "for queries automatically. Only a provider-form llm node must bound "
+    f"sequential multi_query retries itself: max_capacity_retry_seconds <= {WEB_LLM_SEQUENTIAL_MULTI_QUERY_MAX_RETRY_SECONDS} "
+    "or pool_size > 1."
+)
+
+# The on_error advice is control-mode conditional. Taught unconditionally, it
+# contradicted the required-output-control gate: it steered planners to route an
+# llm node's failures to a quarantine sink, which required_control_coverage then
+# (correctly) rejects as an uncontrolled write path. The two variants are
+# module constants so the gating is testable without asserting prose.
+_LLM_ON_ERROR_QUARANTINE_RULE: Final[str] = (
+    "on_error='discard' removes failed rows from output while retaining their audit outcomes. Disclose this choice. When the user needs "
+    "failures retained or inspected, route on_error to a dedicated "
+    "quarantine sink instead of discard."
+)
+
+# Direct error-to-sink routes before the selected output control bypass it.
+# The enclosing-closer exception does not waive topology or control coverage.
+_LLM_ON_ERROR_CONTROLLED_RULE_TEMPLATE: Final[str] = (
+    "This deployment REQUIRES the {control} control on every path carrying llm "
+    "output. Before that control, use on_error='discard' rather than a direct "
+    "quarantine sink: that sink would be an uncontrolled write path and is rejected. "
+    "An arbitrary processing transform cannot consume an on_error route, so do not "
+    "try to insert {control} directly on that route. A transform or gate inside a "
+    "valid bound region may divert loss to its enclosing closer; this exception "
+    "still must satisfy topology and required-control coverage and does not "
+    "authorize an uncontrolled sink. The same coverage rule applies to transforms "
+    "between the llm node and {control}. Downstream OF that control, or for "
+    "transforms that never carry llm output, a quarantine sink may be eligible."
+)
+
+# Name the tradeoff when the supported controlled topology requires discard.
+_LLM_ON_ERROR_CONTROLLED_TRADEOFF_TEMPLATE: Final[str] = (
+    "'discard' costs the failed row's CONTENT, not the record of it: nothing "
+    "reaches a sink to inspect later, while the audit trail still records the "
+    "row's terminal outcome and content hash. If failed llm rows must be "
+    "preserved and no supported topology satisfies the required {control} "
+    "coverage, disclose that limitation and ask the operator for a supported "
+    "workflow or an explicit policy decision. Never relax the control or switch "
+    "execution surfaces to evade it. Do not keep re-attempting rejected quarantine shapes."
+)
+
+
+def _llm_on_error_rules(*, output_control: str | None) -> list[str]:
+    """Pick the on_error rules the deployment's control posture makes authorable."""
+    if output_control is None:
+        return [_LLM_ON_ERROR_QUARANTINE_RULE]
+    return [
+        _LLM_ON_ERROR_CONTROLLED_RULE_TEMPLATE.format(control=output_control),
+        _LLM_ON_ERROR_CONTROLLED_TRADEOFF_TEMPLATE.format(control=output_control),
+    ]
+
+
+_LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
+    "In single-prompt mode an llm node writes the raw reply to options.response_field "
+    "(default llm_response). Asking for JSON or named keys in free text alone does NOT "
+    "create row fields. Configured output_fields extracts and types the named fields.",
+    "options.required_input_fields names upstream columns and bounds the row visible to templates. "
+    "Node-level required_input_fields names only upstream inputs; ordered query input_fields may bind earlier generated outputs internally. The plugin derives generated "
+    "field names and types from response_field and output_fields. options.schema.fields can declare "
+    "output types (ADR-050); schema alone does not extract fields from a reply. Upstream pass-through "
+    "guarantees come from the upstream producer.",
+    "Downstream nodes may require the actual generated fields and fields passed through from upstream. "
+    "To obtain named typed results, use the plugin's queries mechanism with per-query output_fields, "
+    "or — in single-prompt mode — the top-level response_format + output_fields pair, whose extracted fields land "
+    "UNPREFIXED: each entry becomes a row field named exactly its suffix.",
+    "Preserve downstream requirements for fields those consumers use. Do not erase them or widen "
+    "their schema to any/flexible to silence a contradiction in the plugin's output contract; "
+    "report that contradiction with the configured output_fields and the exact downstream names.",
+    # Session 891b7b1e: a free-text 'reply with only the category word'
+    # prompt fed reference_join key_field with on_miss:fail + on_error:
+    # discard — one 'Billing.' or lowercase reply silently drops the row.
+    # The API-native constraint exists and was untaught.
+    "When an llm node's output field must match a known CLOSED STRING "
+    "VOCABULARY — for example a reference_join label key or an exact-label "
+    "gate condition — declare that field via "
+    "output_fields with type: 'enum' and the closed values list, and set "
+    "response_format: 'structured' to request a native schema where the "
+    "provider supports it. ELSPETH validates the reply and rejects invalid "
+    "values; do not assume off-vocabulary replies are impossible. Numeric "
+    "threshold fields retain their numeric type; open-domain identifiers "
+    "retain their actual schema type rather than an invented enum. Validate "
+    "them and choose a suitable miss policy. Never rely only "
+    "on a free-text prompt instruction for a closed label another node matches "
+    "exactly: reference_join has no normalization option, so one "
+    "mis-spelled, punctuated, or re-cased reply can miss the lookup. The "
+    "reference_join on_miss policy chooses fail, null or default; with fail, "
+    "the row follows on_error, and discard is audited row loss.",
+    # Session 891b7b1e: hitting an Any/str edge mismatch, the planner
+    # widened field_mapper AND the sink's fixed schema to 'any' instead of
+    # narrowing once at a type_coerce.
+    "A value_transform target has its authored schema.fields output type, or the type its expression proves over declared inputs; an unresolved result is any. "
+    "A json_explode or blob_json_expand element is any: narrow it by inserting a type_coerce "
+    "transform (options.conversions: [{field, to}]) with its defined "
+    "per-conversion error path — never by widening every downstream "
+    "consumer's declared type to 'any', which erases the contract the "
+    "consumers rely on.",
+    # ── multi_query QueryDefinition contract (run-2 G2: the blessed-shape
+    # mandate above shipped without the shape's contract) ─────────────────
+    "queries is a mapping of query name to a query OBJECT (list form needs "
+    "name in each entry). Every query object REQUIRES input_fields — a "
+    "mapping of template variable name to row column name, e.g. "
+    '{"field_a": "field_a", "field_b": "field_b"} — a query without '
+    "input_fields is rejected.",
+    "The per-query prompt key is 'template' (a Jinja2 override), NOT "
+    "prompt_template. The top-level options.prompt_template is the fallback for queries without "
+    "a template; it is optional when every query supplies its own template. Keep BOTH prompt roles: "
+    "one shared system_prompt plus each query's effective user template.",
+    # run-3 E2: the output contract — each query KEY prefixes its output row
+    # fields, so downstream nodes can require them by exact name.
+    "Each query key names its output row fields by PREFIX: the raw reply "
+    "lands in <query_key>_<response_field>, and each typed output_fields "
+    "entry defaults to <query_key>_<suffix>. Per-query structured_output_prefix null/omitted keeps that default; "
+    "empty string publishes the bare suffix; a nonempty ASCII identifier stem (at most 64 characters) publishes <stem>_<suffix>. "
+    "This changes only structured row-field names, never response JSON keys or raw/usage/model names. "
+    "Any non-null override requires unique final generated names across ALL queries, including raw/usage/model fields. "
+    "Downstream mappers and sinks reference the exact published names.",
+    # run-4 E1: the CLOSED per-query key set + namespace arbitration.
+    # run-5 P2 correction: the run-4 set omitted response_format, max_tokens,
+    # and list-form name — all valid QueryDefinition keys — so the rule
+    # forbade supported configuration by omission and steered planners to
+    # drop it or produce a nameless list entry validation rejects.
+    "The per-query keys you author are input_fields (REQUIRED), template, "
+    "output_fields, structured_output_prefix, response_format ('standard' or 'structured'; default "
+    "standard), and max_tokens (a per-query override of the node-level "
+    "max_tokens). In mapping form the mapping key supplies the query name; "
+    "in LIST form each entry additionally REQUIRES its own name key. There "
+    "is NO per-query response_field or schema — output naming comes "
+    "from the query-key prefix (or explicit structured_output_prefix for structured outputs) and output_fields suffix. Node-level schema output declarations use "
+    "the exact generated names and must admit the configured output_fields types.",
+    "For example, two queries good_colour_pair and approximate_hex can each map input_fields "
+    "{shade: colour} and declare output_fields [{suffix: answer, type: string}]. The LLM input "
+    "required_input_fields is [colour]; good_colour_pair_answer and approximate_hex_answer are generated "
+    "outputs that downstream contracts may require, never this node's upstream input requirements.",
+    # run-4 P4: no interpretation delivery exists for per-query templates.
+    "NEVER put {{interpretation:...}} tokens inside a queries.*.template — "
+    "review resolution rewrites only the node-level prompt_template/"
+    "prompt_template_parts, so a per-query token survives resolution and is "
+    "rejected at the compose gate. Reviewed slots belong in the node-level "
+    "template. A per-query template sees only 'row' and 'lookup': reference "
+    "each of its input_fields variables as {{ row.<variable> }} (a source column is {{ row.source_row.<column> }} only when the node declares it in required_input_fields; lookups are "
+    "{{ lookup.<key> }}); a bare {{ <variable> }} is rejected by the plugin "
+    "schema as an undefined name (session 94f6f00c: the planner's first "
+    "set_pipeline followed the old bare-name teaching and was rejected).",
+    "Sink hygiene: the auto-appended <response_field>_usage / _model operational row "
+    "fields ride the row automatically — do not map or require them into "
+    "sinks unless the user asked for token/model reporting. If <response_field>_usage is declared, its type is any.",
+    # elspeth-15b400881f: the live planner named the three business columns in
+    # its reply but left the CSV sink observed, so the first accepted row — not
+    # reviewed configuration — chose the persisted header.  Keep the ownership
+    # distinctions in the same rule: an LLM plugin owns its emitted-field
+    # guarantee, a structural coalesce has no schema option to annotate, and a
+    # sink's fields are a consumer/output-shape declaration rather than a
+    # producer guarantee.
+    "When the user-facing output has known named business columns, declare "
+    "them in sink schema.fields with their types and carried names; do NOT leave that sink in "
+    "mode: observed after promising those columns, because an observed CSV "
+    "sink locks its header from the first accepted row. If the user asked for "
+    "exactly those columns, put a schema-proven select-only projection "
+    "immediately before the sink and use mode: fixed in the requested column "
+    "order; use mode: flexible only when additional columns are intentional. "
+    "Do not copy producer contracts onto structural components: a plugin-free coalesce "
+    "derives its effective guarantees from its branches and has no authored "
+    "schema option, while guaranteed_fields on a sink is not a header "
+    "declaration because a sink consumes rows rather than producing them.",
+)
+
+
+def _llm_output_contract_rules(*, output_control: str | None) -> list[str]:
+    """The llm output contract with its control-mode-conditional on_error rule."""
+    return [
+        *_LLM_OUTPUT_CONTRACT_RULES,
+        *_llm_on_error_rules(output_control=output_control),
+        _WEB_MULTI_QUERY_RETRY_RULE,
+    ]
+
+
+_REVIEW_REGISTRY_RULES: Final[tuple[str, ...]] = (
+    "On a surface advertising request_interpretation_review, use currently pending review sites "
+    "assigned to the planner in the review ownership matrix. For kinds backed by persisted requirements, use current state or the latest "
+    "mutation echo, not historical tool calls. If the matching requirement is already resolved, skip it; "
+    "do not re-stage unchanged content to obtain another approval. After a missing-pending-site rejection, "
+    "reconcile current status before retrying; absence alone does not authorize inventing a review row.",
+    "source_data_contract is a computed review site: current missing source fields establish the demand, "
+    "with no persisted interpretation_requirements row needed before the call. For a source the composer "
+    "cannot preflight, request that review using the source target and user_term='source_data_contract'; "
+    "omit llm_draft so the server computes it. Do not author a row or field list, and do not call it when "
+    "there is no current missing-field demand or the source content is composer-authored.",
+    "pipeline_decision user_term values are a CLOSED registry — choose ONLY "
+    "from registered_pipeline_decision_user_terms above. A minted term is "
+    "unresolvable and poisons its review card.",
+    "A decision outside the registry is not reviewable as a "
+    "pipeline_decision: record it in metadata.description instead — never "
+    "invent a new user_term for it.",
+    "A registered pipeline_decision demanded by policy or the pack is NEVER "
+    "waived because the user's instruction already made the decision — the "
+    "row RECORDS that decision for the audit trail. User authorship changes "
+    "the draft's provenance, not whether the row is staged.",
+    "Do not author rows for llm_prompt_template or llm_model_choice — "
+    "required LLM reviews auto-stage on every llm node. The planner-owned "
+    "kinds are vague_term (wired via prompt_template_parts), registered "
+    "pipeline_decision, and invented_source.",
+    "Only the llm_prompt_template review auto-surfaces through ordinary "
+    "no-tool finalization at TURN END against the final frozen pipeline "
+    "skeleton — an "
+    "intermediate valid=True preview mid-turn is not a completion signal; "
+    "finish mutating and let the backend surface that prompt-template review.",
+    "NEVER author a pipeline_decision row with user_term "
+    "required_control_auto_wired — that disclosure is staged exclusively by "
+    "the server's required-control auto-wire pass, and a hand-authored row "
+    "forges a policy_required entry in the audit disclosure.",
+    # The staging half is unconditional; the CALL half is not. These aids ride
+    # on two surfaces with different palettes — the planner request, whose
+    # palette carries no request_interpretation_review (obeying an
+    # unconditional instruction to call it lands on the DISCOVERY_ONLY terminal
+    # guard), and the compose-loop catalog context, whose palette does carry
+    # it. The scoping clause borrows the capability core's phrasing — the two
+    # texts ride in the same context, so where they overlap they must not
+    # disagree. A test pins the overlapping phrases against the live core.
+    "When YOU chose a gate's threshold, cutoff, category literal, or route "
+    "direction — rather than carrying a value the user stated verbatim or a "
+    "reviewed schema fact established — stage a pipeline_decision row with "
+    "user_term gate_condition_authored ON THAT GATE NODE. Where your palette "
+    "carries request_interpretation_review, also call it for that row; where "
+    "it does not, the staged requirement rides in that gate node's own options "
+    "inside the terminal proposal and its review card is surfaced from the "
+    "sealed proposal. The row is valid only on a gate node; the review pins "
+    "the gate's condition and every route destination.",
+)
+
+
+def _usable_llm_profile_alias(catalog: PolicyCatalogView, *, kind: PluginKind = "transform") -> str | None:
+    """Return the selected (else first usable) llm operator-profile alias."""
+    snapshot = catalog.snapshot
+    llm_id = next(
+        (
+            plugin_id
+            for plugin_id, aliases in snapshot.usable_profile_aliases
+            if plugin_id.kind == kind and plugin_id.name == "llm" and aliases
+        ),
+        None,
+    )
+    if llm_id is None:
+        return None
+    # Availability construction records a selection (possibly None) for
+    # every profiled plugin. A missing pair is an inconsistent snapshot.
+    selected = dict(snapshot.selected_profile_aliases)[llm_id]
+    if selected is not None:
+        return selected
+    return dict(snapshot.usable_profile_aliases)[llm_id][0]
+
+
+def _selected_control_profile(catalog: PolicyCatalogView, capability: PluginCapability) -> tuple[str, str | None] | None:
+    """Return the selected control plugin only when policy requires it.
+
+    Recommended controls must never mutate a worked topology merely because an
+    implementation is selected. Returns ``None`` for recommend mode or no
+    selection. A selected plugin with no operator profile aliases (direct
+    user-configurable controls) is returned with ``alias=None`` — a required
+    control must still appear in the worked exemplar, or the exemplar teaches
+    a topology this deployment's coverage validator rejects.
+
+    The usable-alias read is membership-then-index rather than a defaulted
+    lookup because ``build_plugin_snapshot`` is the control that decides which
+    plugins appear at all: it records a ``usable_profile_aliases`` pair only
+    for a plugin whose ``web_config_authority`` is
+    ``WebConfigAuthority.OPERATOR_PROFILED``, so absence is the positive fact
+    "this control is direct-config, not operator-profiled" and ``()`` is the
+    RESTRICTIVE answer to it — the same reading, on the same field, that
+    ``PolicyCatalogView._usable_profile_aliases`` documents in full. Never
+    widen that branch beyond ``()``: crediting a control with aliases the
+    snapshot did not grant it would hand an unprofiled plugin the operator's
+    private binding.
+    """
+    snapshot = catalog.snapshot
+    modes = dict(snapshot.control_modes)
+    # control_modes is a genuinely partial mapping: the policy compiler copies
+    # only the capabilities the operator configured, and the trained-operator
+    # snapshot carries none. Absence is the first-class fact "not configured",
+    # so the RECOMMEND default is synthesized explicitly after membership,
+    # never via a defaulted lookup that would also mask a broken read.
+    mode = modes[capability] if capability in modes else ControlMode.RECOMMEND
+    if mode is not ControlMode.REQUIRED:
+        return None
+    # ``selected`` is partial by contract: the two shipped constructors emit
+    # every PluginCapability, but ``PluginAvailabilitySnapshot.create`` admits
+    # any subset (default ``()``) and restricted policy views build such
+    # snapshots. Absence is therefore the first-class "no selection" state,
+    # synthesized explicitly after membership — never via a defaulted lookup.
+    selected_by_capability = dict(snapshot.selected)
+    plugin_id = selected_by_capability[capability] if capability in selected_by_capability else None
+    if plugin_id is None:
+        return None
+    # selected_profile_aliases is genuinely partial (empty for the trained-
+    # operator snapshot; populated only for alias-carrying plugins), so
+    # absence is the first-class "no alias" state, synthesized explicitly.
+    alias_by_plugin = dict(snapshot.selected_profile_aliases)
+    alias = alias_by_plugin[plugin_id] if plugin_id in alias_by_plugin else None
+    if alias is None:
+        usable_by_plugin = dict(snapshot.usable_profile_aliases)
+        aliases = usable_by_plugin[plugin_id] if plugin_id in usable_by_plugin else ()
+        alias = aliases[0] if aliases else None
+    return plugin_id.name, alias
+
+
+# Deployment-owned service bindings a direct-config control still requires.
+# Placeholder values that pass option prevalidation, in the same spirit as
+# PLACEHOLDER_BLOB_ID — the planner substitutes the deployment's real binding
+# supplied by the user.
+_DIRECT_CONTROL_OPTION_EXEMPLARS: Final[dict[str, dict[str, object]]] = {
+    "azure_prompt_shield": {"endpoint": "https://your-resource.cognitiveservices.azure.com"},
+    "azure_content_safety": {
+        "endpoint": "https://your-resource.cognitiveservices.azure.com",
+        # The plugin's documented example thresholds — an effective blocking
+        # posture (all-6 thresholds are a no-op the coverage validator rejects).
+        "thresholds": {"hate": 2, "violence": 2, "sexual": 2, "self_harm": 0},
+    },
+}
+
+
+def _direct_control_options(summaries: Mapping[str, list[PluginSummary]], plugin_name: str) -> dict[str, object]:
+    """Required direct-config options for an alias-less control node.
+
+    A required control selected without operator profile aliases is authored
+    directly, so the exemplar must carry the plugin's remaining required
+    options or ``set_pipeline`` prevalidation rejects it. Declared credential
+    fields are wired as ``{"secret_ref": NAME}`` markers using the plugin's
+    canonical inventory candidate — the supported inline new-node form; the
+    remaining required service bindings come from the placeholder table.
+    """
+    plugin = next(entry for entry in summaries["transform"] if entry.name == plugin_name)
+    declared_candidates = {requirement.field: requirement.candidates for requirement in plugin.secret_requirements}
+    # Membership in this map IS "a canonical secret_ref exists for this field".
+    # A requirement that declares no inventory candidate names no deployment
+    # binding, so it is dropped here rather than read back through a default.
+    candidates_by_field = {name: candidates for name, candidates in declared_candidates.items() if candidates}
+    placeholders = _DIRECT_CONTROL_OPTION_EXEMPLARS[plugin_name] if plugin_name in _DIRECT_CONTROL_OPTION_EXEMPLARS else {}
+    options: dict[str, object] = {}
+    for field in plugin.config_fields:
+        if not field.required:
+            continue
+        if field.name in candidates_by_field:
+            options[field.name] = {"secret_ref": candidates_by_field[field.name][0]}
+        elif field.name in placeholders:
+            options[field.name] = placeholders[field.name]
+    return options
+
+
+def _direct_control_options_are_deployable(summaries: Mapping[str, list[PluginSummary]], plugin_name: str) -> bool:
+    """Whether an alias-less control's required options are REAL deployment bindings.
+
+    ``_direct_control_options`` fills required fields from two sources: the
+    plugin's canonical secret-ref inventory (real deployment bindings — the
+    ref must exist for the plugin to be available) and the
+    ``_DIRECT_CONTROL_OPTION_EXEMPLARS`` placeholder table, which exists ONLY
+    so worked exemplars prevalidate — the planner is expected to substitute
+    the deployment's real value. A placeholder must never become persisted
+    node config: Azure endpoint validation is suffix-only, so a wired
+    ``https://your-resource...`` endpoint clears every gate while pointing a
+    live secret_ref at a third-party-registrable resource. Returns False when
+    any required field (beyond the ones the caller authors itself: fields /
+    schema / source) would come from the placeholder table or be left
+    unfilled — the auto-wire pass then treats the selection as
+    REQUIRED-but-unselected and the aids keep teaching manual wiring.
+    """
+    plugin = next(entry for entry in summaries["transform"] if entry.name == plugin_name)
+    declared_candidates = {requirement.field: requirement.candidates for requirement in plugin.secret_requirements}
+    # Same membership contract as ``_direct_control_options``: a field is
+    # backed by a real deployment binding exactly when it survives this filter.
+    candidates_by_field = {name: candidates for name, candidates in declared_candidates.items() if candidates}
+    caller_authored = {"fields", "schema", "source"}
+    for field in plugin.config_fields:
+        if not field.required or field.name in caller_authored:
+            continue
+        if field.name in candidates_by_field:
+            continue
+        return False
+    return True
+
+
+def _plugin_declares_field(summaries: Mapping[str, list[PluginSummary]], plugin_name: str, field_name: str) -> bool:
+    """Return True when the named transform declares that config field."""
+    return any(
+        field.name == field_name for plugin in summaries["transform"] if plugin.name == plugin_name for field in plugin.config_fields
+    )
+
+
+def _plugin_summaries(catalog: PolicyCatalogView) -> dict[str, list[PluginSummary]]:
+    """One catalog sweep shared by every aid — the expensive step of a build."""
+    return {
+        "source": catalog.list_sources(),
+        "transform": catalog.list_transforms(),
+        "sink": catalog.list_sinks(),
+    }
+
+
+def _visible_plugin_names(
+    catalog: PolicyCatalogView, summaries: Mapping[str, list[PluginSummary]] | None = None
+) -> dict[str, frozenset[str]]:
+    if summaries is None:
+        summaries = _plugin_summaries(catalog)
+    return {kind: frozenset(plugin.name for plugin in plugins) for kind, plugins in summaries.items()}
+
+
+# The evidence rides in one dynamic prompt message, so it must be bounded even
+# when a deployment installs many rich plugins. Entries are indivisible: a
+# contract that does not fit is reported as omitted, never sliced into a shape
+# that could be mistaken for the plugin's whole option contract.
+_SCHEMA_EVIDENCE_MAX_ENTRIES: Final[int] = 8
+_SCHEMA_EVIDENCE_MAX_OMISSIONS: Final[int] = 16
+_SCHEMA_EVIDENCE_MAX_CANONICAL_BYTES: Final[int] = 96 * 1024
+
+
+class _SchemaContractProjectionUnsupported(ValueError):
+    """A schema carries semantics this bounded projection cannot preserve."""
+
+
+# Public name for callers that must fail closed without depending on an
+# implementation-private spelling. The private alias remains the trust-tier
+# boundary's established exception identity.
+SchemaContractProjectionUnsupported = _SchemaContractProjectionUnsupported
+
+_PLANNER_CONTRACT_MAX_DEPTH: Final[int] = 32
+_PLANNER_CONTRACT_MAX_NODES: Final[int] = 4096
+_PLANNER_CONTRACT_MAX_CANONICAL_BYTES: Final[int] = 48 * 1024
+_DISCOVERY_DIGEST_MAX_CANONICAL_BYTES: Final[int] = 28 * 1024
+_DISCOVERY_DIGEST_MAX_PUBLIC_TEXT_BYTES: Final[int] = 1024
+# The planner request is append-only and carries no cache markers, so every
+# aid byte is re-sent on every turn of one plan. That is why the model-catalog
+# aid carries identifier lists only for the providers an llm node can actually
+# declare: the whole litellm inventory canonicalizes to ~57 KiB, which costs
+# more across a multi-turn plan than the discovery turns it would save. The
+# initial-scaffold gate leaves 10,516 bytes for this aid on the measured
+# LiteLLM 1.102 request (119,398 total cap minus 108,882 other bytes). Allocate
+# 8 KiB to the catalog itself, leaving room for its guidance/wrapper. Catalog
+# growth must defer complete provider lists, not grow every planner request.
+_MODEL_CATALOG_MAX_CANONICAL_BYTES: Final[int] = 8 * 1024
+_EXPRESSION_GRAMMAR_MAX_CANONICAL_BYTES: Final[int] = 8 * 1024
+
+
+def _contract_json_schema_scalar(key: str, value: object) -> object:
+    """Use the neutral keyword domains, retaining policy refusal identity."""
+    try:
+        validate_json_schema_scalar(key, value)
+    except SchemaKeywordInvalid as exc:
+        raise _SchemaContractProjectionUnsupported from exc
+    return deepcopy(value)
+
+
+def _assert_projection_input_bounds(value: object) -> None:
+    """Reject recursive or oversized provider shapes before projection."""
+    pending: list[tuple[object, int]] = [(value, 0)]
+    visited = 0
+    scalar_bytes = 0
+    while pending:
+        item, depth = pending.pop()
+        visited += 1
+        if depth > _PLANNER_CONTRACT_MAX_DEPTH or visited > _PLANNER_CONTRACT_MAX_NODES:
+            raise _SchemaContractProjectionUnsupported
+        if type(item) is dict:
+            if any(type(key) is not str for key in item):
+                raise _SchemaContractProjectionUnsupported
+            scalar_bytes += sum(len(key.encode("utf-8")) for key in item)
+            pending.extend((child, depth + 1) for child in item.values())
+        elif type(item) is list or type(item) is tuple:
+            pending.extend((child, depth + 1) for child in item)
+        elif type(item) is str:
+            scalar_bytes += len(item.encode("utf-8"))
+        elif issubclass(type(item), StrEnum):
+            scalar_bytes += len(cast(StrEnum, item).value.encode("utf-8"))
+        elif item is None or type(item) in {bool, int}:
+            continue
+        elif type(item) is float:
+            if not math.isfinite(item):
+                raise _SchemaContractProjectionUnsupported
+        else:
+            raise _SchemaContractProjectionUnsupported
+        if scalar_bytes > _PLANNER_CONTRACT_MAX_CANONICAL_BYTES:
+            raise _SchemaContractProjectionUnsupported
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerPluginContract:
+    """Owned bounded planner projection of one admitted plugin schema."""
+
+    plugin_id: str
+    schema_hash: str
+    json_schema: Mapping[str, object]
+    knob_schema: Mapping[str, object]
+    composer_hints: tuple[str, ...]
+    aggregation_output_modes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "json_schema", "knob_schema", "composer_hints")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "plugin_id": self.plugin_id,
+            "schema_hash": self.schema_hash,
+            "json_schema": deep_thaw(self.json_schema),
+            "knob_schema": deep_thaw(self.knob_schema),
+            "composer_hints": list(self.composer_hints),
+            "aggregation_output_modes": list(self.aggregation_output_modes),
+        }
+
+
+def planner_plugin_contract(schema: PluginSchemaInfo) -> PlannerPluginContract:
+    """Project one admitted schema into the planner's bounded JIT contract."""
+    if type(schema) is not PluginSchemaInfo:
+        raise TypeError("schema must be an admitted PluginSchemaInfo")
+    return _planner_plugin_contract(
+        schema.plugin_type, schema.name, schema.json_schema, schema.knob_schema, schema.composer_hints, schema.aggregation_output_modes
+    )
+
+
+def planner_plugin_contract_from_snapshot(schema: PluginSchemaSnapshot) -> PlannerPluginContract:
+    """Project canonical admitted schema leaves without reopening producer data."""
+    if type(schema) is not PluginSchemaSnapshot:
+        raise TypeError("schema must be an admitted PluginSchemaSnapshot")
+    return _planner_plugin_contract(
+        schema.plugin_type,
+        schema.name,
+        schema.json_schema.to_wire(),
+        schema.knob_schema.to_wire(),
+        schema.composer_hints,
+        schema.aggregation_output_modes,
+    )
+
+
+def _planner_plugin_contract(
+    plugin_type: PluginKind,
+    name: str,
+    raw_json_schema: Mapping[str, object],
+    raw_knob_schema: Mapping[str, object],
+    composer_hints: tuple[str, ...],
+    aggregation_output_modes: tuple[str, ...] = (),
+) -> PlannerPluginContract:
+    _assert_projection_input_bounds(raw_json_schema)
+    _assert_projection_input_bounds(raw_knob_schema)
+    _assert_projection_input_bounds(composer_hints)
+    _assert_projection_input_bounds(aggregation_output_modes)
+    json_schema = _contract_json_schema(raw_json_schema)
+    knob_schema = _contract_knob_schema(raw_knob_schema)
+    if type(json_schema) is bool:
+        raise _SchemaContractProjectionUnsupported
+    projected = {
+        "plugin_id": f"{plugin_type}/{name}",
+        "json_schema": json_schema,
+        "knob_schema": knob_schema,
+        "composer_hints": list(composer_hints),
+        "aggregation_output_modes": list(aggregation_output_modes),
+    }
+    try:
+        projected_size = len(canonical_json(projected).encode("utf-8"))
+    except (CanonicalizationError, TypeError, ValueError) as exc:
+        raise _SchemaContractProjectionUnsupported from exc
+    if projected_size > _PLANNER_CONTRACT_MAX_CANONICAL_BYTES:
+        raise _SchemaContractProjectionUnsupported
+    contract_shape = {"json_schema": json_schema, "knob_schema": knob_schema, "aggregation_output_modes": list(aggregation_output_modes)}
+    return PlannerPluginContract(
+        plugin_id=f"{plugin_type}/{name}",
+        schema_hash=stable_hash(contract_shape),
+        json_schema=deep_freeze(json_schema),
+        knob_schema=deep_freeze(knob_schema),
+        composer_hints=tuple(composer_hints),
+        aggregation_output_modes=tuple(aggregation_output_modes),
+    )
+
+
+@trust_boundary(
+    tier=3,
+    source="Plugin-declared JSON Schema 'discriminator' fragment (raw ConfigModel.model_json_schema() output)",
+    source_param="raw",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises _SchemaContractProjectionUnsupported unless raw is a dict containing only "
+        "propertyName (str) and/or mapping (dict[str, str]) keys"
+    ),
+    test_ref="tests/unit/web/composer/test_schema_contract_projection_boundaries.py::test_contract_discriminator_rejects_unknown_key",
+    test_fingerprint="4b5ad940600ffcc92ca815af3d0415e09da1dc9df7104550cae9f0a41be917f6",
+)
+def _contract_discriminator(raw: object) -> dict[str, object]:
+    if not isinstance(raw, dict) or set(raw) - {"propertyName", "mapping"}:
+        raise _SchemaContractProjectionUnsupported
+    projected: dict[str, object] = {}
+    property_name = raw.get("propertyName")
+    if property_name is not None:
+        if not isinstance(property_name, str):
+            raise _SchemaContractProjectionUnsupported
+        projected["propertyName"] = property_name
+    mapping = raw.get("mapping")
+    if mapping is not None:
+        if not isinstance(mapping, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in mapping.items()):
+            raise _SchemaContractProjectionUnsupported
+        projected["mapping"] = deepcopy(mapping)
+    return projected
+
+
+@trust_boundary(
+    tier=3,
+    source="Plugin-declared JSON Schema fragment (raw ConfigModel.model_json_schema() output; recursive)",
+    source_param="raw",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises _SchemaContractProjectionUnsupported on any JSON Schema KEYWORD outside the closed "
+        "projected vocabulary, and on any container-valued keyword whose value shape is wrong; the "
+        "boolean schema forms (true/false) pass through unchanged. Known scalar keywords are validated "
+        "against their JSON Schema domains before they are copied into the owned projection"
+    ),
+    test_ref="tests/unit/web/composer/test_schema_contract_projection_boundaries.py::test_contract_json_schema_rejects_non_dict_non_bool",
+    test_fingerprint="88f4d910a5b39715fd50c60330e587e198eddfef3263c5101ed6461593ef561c",
+)
+def _contract_json_schema(raw: object) -> dict[str, object] | bool:
+    """Project all known JSON Schema semantics while excluding only prose."""
+    if isinstance(raw, bool):
+        return raw
+    if not isinstance(raw, dict):
+        raise _SchemaContractProjectionUnsupported
+    raw_properties = raw.get("properties")
+    hidden_properties: set[str] = set()
+    if isinstance(raw_properties, dict):
+        hidden_properties = {
+            name
+            for name, schema in raw_properties.items()
+            if isinstance(name, str) and isinstance(schema, dict) and schema.get("composer_hidden") is True
+        }
+    projected: dict[str, object] = {}
+    for key, value in raw.items():
+        if key in _JSON_SCHEMA_PROSE_KEYS or key == "composer_required_when":
+            continue
+        if key == "composer_hidden":
+            if not isinstance(value, bool) or value:
+                raise _SchemaContractProjectionUnsupported
+            continue
+        if key == "required":
+            if not isinstance(value, list) or any(not isinstance(name, str) for name in value):
+                raise _SchemaContractProjectionUnsupported
+            projected[key] = [name for name in value if name not in hidden_properties]
+        elif key == "dependentRequired":
+            if not isinstance(value, dict):
+                raise _SchemaContractProjectionUnsupported
+            dependent: dict[str, list[str]] = {}
+            for name, required_names in value.items():
+                if (
+                    not isinstance(name, str)
+                    or not isinstance(required_names, list)
+                    or any(not isinstance(required_name, str) for required_name in required_names)
+                ):
+                    raise _SchemaContractProjectionUnsupported
+                if name not in hidden_properties:
+                    dependent[name] = [required_name for required_name in required_names if required_name not in hidden_properties]
+            projected[key] = dependent
+        elif key in _JSON_SCHEMA_SCALAR_KEYS:
+            projected[key] = _contract_json_schema_scalar(key, value)
+        elif key in _JSON_SCHEMA_MAP_KEYS and isinstance(value, dict):
+            if any(not isinstance(name, str) for name in value):
+                raise _SchemaContractProjectionUnsupported
+            projected[key] = {
+                name: _contract_json_schema(schema)
+                for name, schema in value.items()
+                if not (key == "properties" and name in hidden_properties)
+            }
+        elif key in _JSON_SCHEMA_SINGLE_SCHEMA_KEYS:
+            projected[key] = _contract_json_schema(value)
+        elif key in _JSON_SCHEMA_SCHEMA_LIST_KEYS and isinstance(value, list):
+            projected[key] = [_contract_json_schema(branch) for branch in value]
+        elif key == "discriminator":
+            projected[key] = _contract_discriminator(value)
+        else:
+            raise _SchemaContractProjectionUnsupported
+    return projected
+
+
+@trust_boundary(
+    tier=3,
+    source="Plugin-declared ELSPETH knob-schema fragment (PolicyCatalogView.get_schema knob_schema; recursive)",
+    source_param="raw",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises _SchemaContractProjectionUnsupported on any field shape outside the closed "
+        "{name,kind,type,required,nullable,default,enum,choices,item_kind,visible_when,required_when,"
+        "item_schema,items} plus prose-key vocabulary, when the top-level shape is not exactly {'fields'}, "
+        "or when a projected field body does not canonicalize; the admitted fields are then emitted in "
+        "first-occurrence order with each set of per-variant repeats that covers its discriminator's whole "
+        "enum collapsed to one predicate-free copy"
+    ),
+    test_ref="tests/unit/web/composer/test_schema_contract_projection_boundaries.py::test_contract_knob_schema_rejects_missing_fields_key",
+    test_fingerprint="7cd806e3678d6f8e15df19954921cf662441218973bd39795dbb74726592442e",
+)
+def _contract_knob_schema(raw: object) -> dict[str, object]:
+    """Project the one-knob schema to executable field facts, excluding UI prose."""
+    if not isinstance(raw, dict) or set(raw) != {"fields"}:
+        raise _SchemaContractProjectionUnsupported
+    raw_fields = raw.get("fields")
+    if not isinstance(raw_fields, list):
+        raise _SchemaContractProjectionUnsupported
+    fields: list[dict[str, object]] = []
+    prose_keys = {"label", "description", "placeholder", "tier"}
+    scalar_key_order = ("name", "kind", "type", "required", "nullable", "default", "enum", "choices", "item_kind")
+    structural_keys = set(scalar_key_order) | {"visible_when", "required_when", "item_schema", "items"}
+    for raw_field in raw_fields:
+        if not isinstance(raw_field, dict):
+            raise _SchemaContractProjectionUnsupported
+        if set(raw_field) - prose_keys - structural_keys:
+            raise _SchemaContractProjectionUnsupported
+        if not isinstance(raw_field.get("name"), str) or not isinstance(raw_field.get("required"), bool):
+            raise _SchemaContractProjectionUnsupported
+        if not isinstance(raw_field.get("kind") or raw_field.get("type"), str):
+            raise _SchemaContractProjectionUnsupported
+        if "kind" in raw_field and not isinstance(raw_field["kind"], str):
+            raise _SchemaContractProjectionUnsupported
+        if "type" in raw_field and not isinstance(raw_field["type"], str):
+            raise _SchemaContractProjectionUnsupported
+        if "nullable" in raw_field and not isinstance(raw_field["nullable"], bool):
+            raise _SchemaContractProjectionUnsupported
+        for enum_key in ("enum", "choices"):
+            if enum_key in raw_field and (
+                not isinstance(raw_field[enum_key], list) or any(not isinstance(choice, str) for choice in raw_field[enum_key])
+            ):
+                raise _SchemaContractProjectionUnsupported
+        if "enum" in raw_field and "choices" in raw_field and raw_field["enum"] != raw_field["choices"]:
+            raise _SchemaContractProjectionUnsupported
+        if "item_kind" in raw_field and not isinstance(raw_field["item_kind"], str):
+            raise _SchemaContractProjectionUnsupported
+        field: dict[str, object] = {key: deepcopy(raw_field[key]) for key in scalar_key_order if key in raw_field}
+        if "choices" in field:
+            # ``enum`` and ``choices`` are one fact under two spellings, and a
+            # field carrying both with different values was already rejected
+            # above — so the projection keeps ``enum`` and drops ``choices``.
+            if "enum" not in field:
+                field["enum"] = field["choices"]
+            del field["choices"]
+        for predicate_key in ("visible_when", "required_when"):
+            if predicate_key not in raw_field:
+                continue
+            predicate = raw_field[predicate_key]
+            if not isinstance(predicate, dict) or set(predicate) != {"field", "equals"} or not isinstance(predicate["field"], str):
+                raise _SchemaContractProjectionUnsupported
+            field[predicate_key] = {"field": predicate["field"], "equals": deepcopy(predicate["equals"])}
+        if "item_schema" in raw_field:
+            field["item_schema"] = _contract_knob_schema(raw_field["item_schema"])
+        if "items" in raw_field:
+            items = raw_field["items"]
+            field["items"] = _contract_json_schema(items)
+        fields.append(field)
+    return {"fields": _collapse_uniform_variant_fields(fields)}
+
+
+def _uniform_variant_group_key(body: Mapping[str, object]) -> str:
+    """Canonicalize one projected field body into its grouping key.
+
+    A body the canonical encoder cannot represent cannot ride the contract
+    either — ``planner_plugin_contract`` already turns that into
+    ``_SchemaContractProjectionUnsupported`` when it encodes the whole
+    projection — so it raises the same refusal here rather than letting a bare
+    ``TypeError`` escape a projection whose callers catch only that one class.
+    """
+    try:
+        return canonical_json(body)
+    except (CanonicalizationError, TypeError, ValueError) as exc:
+        raise _SchemaContractProjectionUnsupported from exc
+
+
+def _collapse_uniform_variant_fields(fields: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Collapse a discriminated union's per-variant repeats of one shared knob.
+
+    ``web/catalog/knob_schema`` lowers a discriminated union to a FLAT form by
+    re-emitting every shared knob once per variant, separated only by
+    ``visible_when`` (``knob_schema.py:522``). On the planner
+    contract it is repetition the model gains nothing from: the ``llm``
+    transform lowers to 114 fields carrying 36 distinct bodies, 39,093 bytes of
+    a 49,152-byte budget the whole selection shares (elspeth-623c69c59f).
+
+    A knob whose projected body is identical under EVERY variant of its
+    discriminator applies whichever variant is chosen, so one copy with no
+    predicate states the same fact. Partial coverage is a real fact about the
+    plugin — ``region_name`` exists only under ``bedrock`` — and survives
+    untouched, one entry per variant with its predicate intact.
+
+    The variant set is READ FROM the discriminator field's own ``enum`` in this
+    same field list, never restated here: a union whose discriminator this
+    projection cannot see does not collapse, and neither does one whose
+    predicate compares against a non-string, since such a value can match no
+    member of a projected ``enum``. Every refusal is one-directional — they can
+    only leave the lowered form as it stands.
+
+    Order is first-occurrence stable, because ``schema_hash`` canonicalizes
+    this list.
+    """
+    # A lowered union re-emits its discriminator per variant too, so one name
+    # can carry several enums. Agreement is what makes it an authority: a name
+    # whose enums disagree names no single variant set and is dropped rather
+    # than resolved by position. An optional or nullable enum is no authority
+    # either — unset, it satisfies none of its own members, so covering every
+    # member is not the same as always applying.
+    variants_by_discriminator: dict[str, frozenset[str]] = {}
+    ambiguous_discriminators: set[str] = set()
+    for field in fields:
+        if "enum" not in field or field["required"] is not True:
+            continue
+        if "nullable" in field and field["nullable"] is not False:
+            continue
+        enum_values = field["enum"]
+        assert type(enum_values) is list
+        name = field["name"]
+        assert type(name) is str
+        declared = frozenset(value for value in enum_values if type(value) is str)
+        if name in variants_by_discriminator and variants_by_discriminator[name] != declared:
+            ambiguous_discriminators.add(name)
+        variants_by_discriminator[name] = declared
+    for name in ambiguous_discriminators:
+        del variants_by_discriminator[name]
+
+    group_order: list[tuple[str, str | None]] = []
+    group_members: dict[tuple[str, str | None], list[dict[str, object]]] = {}
+    group_coverage: dict[tuple[str, str | None], set[str]] = {}
+    collapsible: dict[tuple[str, str | None], bool] = {}
+    for field in fields:
+        discriminator: str | None = None
+        variant: object = None
+        if "visible_when" in field:
+            predicate = field["visible_when"]
+            assert type(predicate) is dict
+            assert type(predicate["field"]) is str
+            discriminator = predicate["field"]
+            variant = predicate["equals"]
+        body = {key: value for key, value in field.items() if key != "visible_when"}
+        group = (_uniform_variant_group_key(body), discriminator)
+        if group not in group_members:
+            group_order.append(group)
+            group_members[group] = []
+            group_coverage[group] = set()
+            collapsible[group] = discriminator is not None
+        group_members[group].append(field)
+        if type(variant) is str:
+            group_coverage[group].add(variant)
+        else:
+            collapsible[group] = False
+
+    collapsed: list[dict[str, object]] = []
+    for group in group_order:
+        members = group_members[group]
+        discriminator = group[1]
+        if (
+            collapsible[group]
+            and discriminator is not None
+            and discriminator in variants_by_discriminator
+            and group_coverage[group] == variants_by_discriminator[discriminator]
+        ):
+            collapsed.append({key: value for key, value in members[0].items() if key != "visible_when"})
+            continue
+        collapsed.extend(members)
+    return collapsed
+
+
+def _schema_pair_label(pair: tuple[str, str]) -> str:
+    return f"{pair[0]}/{pair[1]}"
+
+
+def _schema_evidence_envelope(
+    *,
+    policy_hash: str,
+    snapshot_hash: str,
+    schemas: list[_SchemaContractEvidenceEntry],
+    omitted: list[_SchemaContractEvidenceOmission],
+    omissions_withheld_count: int,
+) -> _SchemaContractEvidence:
+    """Build an envelope whose byte count includes every emitted field."""
+    evidence: _SchemaContractEvidence = {
+        "policy_hash": policy_hash,
+        "snapshot_hash": snapshot_hash,
+        "max_entries": _SCHEMA_EVIDENCE_MAX_ENTRIES,
+        "max_omissions": _SCHEMA_EVIDENCE_MAX_OMISSIONS,
+        "max_canonical_bytes": _SCHEMA_EVIDENCE_MAX_CANONICAL_BYTES,
+        "canonical_bytes_used": 0,
+        "schemas": schemas,
+        "omitted": omitted,
+        "omissions_withheld_count": omissions_withheld_count,
+    }
+    while True:
+        rendered_size = len(canonical_json(evidence).encode("utf-8"))
+        if evidence["canonical_bytes_used"] == rendered_size:
+            return evidence
+        evidence["canonical_bytes_used"] = rendered_size
+
+
+def build_schema_contract_evidence(
+    catalog: PolicyCatalogView,
+    *,
+    schemas_loaded: frozenset[tuple[str, str]],
+    referenced: set[tuple[str, str]],
+) -> tuple[_SchemaContractEvidence, frozenset[tuple[str, str]]]:
+    """Rehydrate whole current contracts for previously discovered identities.
+
+    ``schemas_loaded`` is historical identity evidence only. Schema bytes are
+    always fetched again through the current request's ``PolicyCatalogView``;
+    policy rotation, profile projection, schema drift, and unavailability can
+    therefore never inherit stale bytes from an earlier tool result.
+    """
+    snapshot = catalog.snapshot
+    available = frozenset((plugin_id.kind, plugin_id.name) for plugin_id in snapshot.available)
+    loaded_pairs = frozenset(pair for pair in schemas_loaded if pair[0] in {"source", "transform", "sink"})
+    ordered_loaded = sorted(loaded_pairs, key=lambda pair: (pair not in referenced, pair[0], pair[1]))
+    # Reserve the digit width of the worst-case withheld count while admitting
+    # schemas. Final omission details are admitted separately below, but even
+    # if none fit, growing ``omissions_withheld_count`` must not push an
+    # otherwise boundary-sized final envelope over the byte cap.
+    omission_count_upper_bound = len(referenced - loaded_pairs) + len(ordered_loaded)
+    omission_candidates: list[_SchemaContractEvidenceOmission] = [
+        {"plugin_id": _schema_pair_label(pair), "reason": "not_loaded_this_session"} for pair in sorted(referenced - loaded_pairs)
+    ]
+    entries: list[_SchemaContractEvidenceEntry] = []
+    evidenced: set[tuple[str, str]] = set()
+
+    for pair in ordered_loaded:
+        label = _schema_pair_label(pair)
+        if pair not in available:
+            # A historical success is not authority to redisclose an identity
+            # hidden by the current policy. A referenced identity is already
+            # present in current_state, so naming its closed omission adds no
+            # new disclosure and keeps the gap actionable.
+            if pair in referenced:
+                omission_candidates.append({"plugin_id": label, "reason": "unavailable_in_current_policy"})
+            continue
+        if len(entries) >= _SCHEMA_EVIDENCE_MAX_ENTRIES:
+            omission_candidates.append({"plugin_id": label, "reason": "entry_budget_exceeded"})
+            continue
+        kind = pair[0]
+        # Availability is settled against this same snapshot above and
+        # get_schema re-derives it before touching first-party catalog and
+        # profile code, so a ValueError escaping here is an internal defect
+        # — it propagates rather than being recorded as an omission.
+        schema = catalog.get_schema(kind, pair[1])
+        if schema.plugin_type != kind or schema.name != pair[1]:
+            omission_candidates.append({"plugin_id": label, "reason": "schema_identity_mismatch"})
+            continue
+        try:
+            projected_contract = planner_plugin_contract(schema)
+        except _SchemaContractProjectionUnsupported:
+            omission_candidates.append({"plugin_id": label, "reason": "schema_projection_unsupported"})
+            continue
+        json_schema = deep_thaw(projected_contract.json_schema)
+        knob_schema = deep_thaw(projected_contract.knob_schema)
+        entry: _SchemaContractEvidenceEntry = {
+            "plugin_id": label,
+            "policy_hash": snapshot.policy_hash,
+            "snapshot_hash": snapshot.snapshot_hash,
+            "schema_hash": projected_contract.schema_hash,
+            "json_schema": json_schema,
+            "knob_schema": knob_schema,
+            "aggregation_output_modes": list(projected_contract.aggregation_output_modes),
+        }
+        prospective = _schema_evidence_envelope(
+            policy_hash=snapshot.policy_hash,
+            snapshot_hash=snapshot.snapshot_hash,
+            schemas=[*entries, entry],
+            omitted=[],
+            omissions_withheld_count=omission_count_upper_bound,
+        )
+        if prospective["canonical_bytes_used"] > _SCHEMA_EVIDENCE_MAX_CANONICAL_BYTES:
+            omission_candidates.append({"plugin_id": label, "reason": "canonical_byte_budget_exceeded"})
+            continue
+        entries.append(entry)
+        evidenced.add(pair)
+
+    omitted: list[_SchemaContractEvidenceOmission] = []
+    for omission in omission_candidates:
+        if len(omitted) >= _SCHEMA_EVIDENCE_MAX_OMISSIONS:
+            break
+        prospective_omitted = [*omitted, omission]
+        prospective = _schema_evidence_envelope(
+            policy_hash=snapshot.policy_hash,
+            snapshot_hash=snapshot.snapshot_hash,
+            schemas=entries,
+            omitted=prospective_omitted,
+            omissions_withheld_count=len(omission_candidates) - len(prospective_omitted),
+        )
+        if prospective["canonical_bytes_used"] <= _SCHEMA_EVIDENCE_MAX_CANONICAL_BYTES:
+            omitted.append(omission)
+
+    evidence = _schema_evidence_envelope(
+        policy_hash=snapshot.policy_hash,
+        snapshot_hash=snapshot.snapshot_hash,
+        schemas=entries,
+        omitted=omitted,
+        omissions_withheld_count=len(omission_candidates) - len(omitted),
+    )
+    if evidence["canonical_bytes_used"] > _SCHEMA_EVIDENCE_MAX_CANONICAL_BYTES:
+        raise RuntimeError("schema_contract_evidence_budget_invariant")
+    return evidence, frozenset(evidenced)
+
+
+def _digest_entries(plugins: list[PluginSummary]) -> list[_PluginDigestEntry]:
+    """Render one compact selection entry per policy-visible plugin.
+
+    ``not_for`` is the plugin's ``usage_when_not_to_use`` — its own stated
+    prohibition, already profile-projected when it reaches this function,
+    because an operator-profiled summary rewrites the field in the catalog view
+    itself (``plugin_policy.profiles``). It carried
+    the ``text`` sink's "not for multiline values" rule that a planner authored
+    straight past (elspeth-afdf55a17c), because until now the only tier that
+    stated it was a ``list_sinks`` result the planner is told it rarely needs.
+
+    Reference content is carried whole or not at all. A sliced prohibition
+    ("Do not use for multi-field, nested, binary, or multi…") reads as a
+    narrower rule than the one the plugin declared, and dropping the entry is
+    not available either: ``prompts.py`` retired its duplicate ``plugin_hints``
+    block on the strength of this digest being a strict superset, so every
+    policy-visible plugin must appear.
+
+    ``example_use`` is deliberately not carried. It is YAML, while this surface
+    authors through ``set_pipeline``; it is not validated against the live
+    catalog, unlike every worked exemplar this module renders; and it is the
+    largest of the reference fields. ``usage_when_to_use`` is not carried
+    either — ``purpose`` and ``capability_tags`` already say what a plugin is
+    for. Both stay reachable through ``list_sources``/``list_transforms``/
+    ``list_sinks``, which return the whole ``PluginSummary``.
+    """
+    entries: list[_PluginDigestEntry] = []
+    for plugin in plugins:
+        entry: _PluginDigestEntry = {
+            "name": plugin.name,
+            "purpose": plugin.description,
+            "required_options": [field.name for field in plugin.config_fields if field.required],
+        }
+        # PluginSummary is a strict Tier-1 response model: the catalog service
+        # is the boundary that already rejected a non-str prohibition or a
+        # non-tuple tag set, so presence is the only question left here.
+        if plugin.usage_when_not_to_use is not None:
+            entry["not_for"] = plugin.usage_when_not_to_use
+        if plugin.capability_tags:
+            entry["capability_tags"] = list(plugin.capability_tags)
+        if plugin.aggregation_output_modes:
+            entry["aggregation_output_modes"] = list(plugin.aggregation_output_modes)
+        entries.append(entry)
+    return entries
+
+
+def _digest_size(digest: _DiscoveryDigest) -> int:
+    """Settle the self-describing canonical byte count."""
+    while True:
+        rendered_size = len(canonical_json(digest).encode("utf-8"))
+        if digest["budget"]["canonical_bytes_used"] == rendered_size:
+            return rendered_size
+        digest["budget"]["canonical_bytes_used"] = rendered_size
+
+
+def _omit_digest_text(entry: _PluginDigestEntry, field: str, *, details_via: str) -> bool:
+    """Replace one whole prose fact with a deterministic JIT disclosure."""
+    if field == "purpose":
+        if "purpose" not in entry:
+            return False
+        value = entry.pop("purpose")
+    else:
+        if "not_for" not in entry:
+            return False
+        value = entry.pop("not_for")
+    omission: _OmittedPublicText = {
+        "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+        "details_via": details_via,
+    }
+    if field == "purpose":
+        entry["purpose_omitted"] = omission
+    else:
+        entry["not_for_omitted"] = omission
+    return True
+
+
+def discovery_digest(
+    catalog: PolicyCatalogView,
+    *,
+    summaries: Mapping[str, list[PluginSummary]] | None = None,
+) -> _DiscoveryDigest:
+    """Per-plugin digest of the policy-visible catalog for the planner prompt.
+
+    Targets ``planner_code=DISCOVERY_CYCLE`` churn: a significant share of
+    planner calls were ``list_*``/``get_plugin_schema`` rounds re-learning the
+    same catalog every session. Each entry carries the plugin's name, one-line
+    purpose, required-knob names, its stated prohibition (``not_for``) and
+    its ``capability_tags``. This is selection
+    and coaching metadata, not the plugin's option contract; types, optional
+    knobs, defaults, enums, and conditional rules remain schema facts.
+
+    Because the planner is told it rarely needs ``list_*``, a selection fact
+    that lives only in a ``list_*`` result is a fact it will usually not read.
+    That is why the prohibition belongs here and not only in the catalog tier.
+    """
+    if summaries is None:
+        summaries = _plugin_summaries(catalog)
+    digest: _DiscoveryDigest = {
+        "sources": _digest_entries(summaries["source"]),
+        "transforms": _digest_entries(summaries["transform"]),
+        "sinks": _digest_entries(summaries["sink"]),
+        "prohibited": {
+            "sources": list(prohibited_plugin_section(catalog.list_prohibited_sources())),
+            "transforms": list(prohibited_plugin_section(catalog.list_prohibited_transforms())),
+            "sinks": list(prohibited_plugin_section(catalog.list_prohibited_sinks())),
+        },
+        "budget": {
+            "max_canonical_bytes": _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES,
+            "canonical_bytes_used": 0,
+            "omitted_public_text_count": 0,
+        },
+    }
+
+    # Every operator-profiled component carries its live alias enum and public
+    # required set. Kind-qualified identity prevents same-name source and
+    # transform profiles from borrowing each other's contract.
+    digest_by_kind: dict[PluginKind, list[_PluginDigestEntry]] = {
+        "source": digest["sources"],
+        "transform": digest["transforms"],
+        "sink": digest["sinks"],
+    }
+    for plugin_id, aliases in catalog.snapshot.usable_profile_aliases:
+        if not aliases:
+            continue
+        public_schema = catalog.get_schema(plugin_id.kind, plugin_id.name)
+        # knob_schema is Tier-1 catalog output: every cached schema passed
+        # validate_knob_schema at catalog load, "fields" is a required
+        # KnobSchema key and "required" a required KnobField key, so direct
+        # access is the honest read — a malformed schema crashes rather than
+        # publishing an incomplete required_options set.
+        public_required = [field["name"] for field in public_schema.knob_schema["fields"] if field["required"]]
+        for entry in digest_by_kind[plugin_id.kind]:
+            if entry["name"] == plugin_id.name:
+                entry["profile_aliases"] = sorted(aliases)
+                entry["required_options"] = public_required
+                break
+    ordered_sections = (
+        (digest["sources"], "list_sources"),
+        (digest["transforms"], "list_transforms"),
+        (digest["sinks"], "list_sinks"),
+    )
+    for entries, details_via in ordered_sections:
+        for entry in entries:
+            for field in ("purpose", "not_for"):
+                if field == "purpose":
+                    value = entry["purpose"] if "purpose" in entry else None
+                else:
+                    value = entry["not_for"] if "not_for" in entry else None
+                if (
+                    type(value) is str
+                    and len(value.encode("utf-8")) > _DISCOVERY_DIGEST_MAX_PUBLIC_TEXT_BYTES
+                    and _omit_digest_text(entry, field, details_via=details_via)
+                ):
+                    digest["budget"]["omitted_public_text_count"] += 1
+    if _digest_size(digest) > _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES:
+        for entries, details_via in ordered_sections:
+            for entry in entries:
+                for field in ("purpose", "not_for"):
+                    if _omit_digest_text(entry, field, details_via=details_via):
+                        digest["budget"]["omitted_public_text_count"] += 1
+        _digest_size(digest)
+    if _digest_size(digest) > _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES:
+        raise RuntimeError("discovery_digest_budget_invariant")
+    return digest
+
+
+def discovery_digest_detail_tools(authoring_aids: _PlannerAuthoringAids) -> tuple[str, ...]:
+    """Return the exact inventory tools needed to rehydrate omitted prose."""
+    digest = authoring_aids["discovery_digest"]["plugins"]
+    section_tools = (
+        (digest["sources"], "list_sources"),
+        (digest["transforms"], "list_transforms"),
+        (digest["sinks"], "list_sinks"),
+    )
+    required: set[str] = set()
+    for entries, expected_tool in section_tools:
+        for entry in entries:
+            purpose_omission = entry["purpose_omitted"] if "purpose_omitted" in entry else None
+            prohibition_omission = entry["not_for_omitted"] if "not_for_omitted" in entry else None
+            for omission in (purpose_omission, prohibition_omission):
+                if omission is None:
+                    continue
+                if omission["details_via"] != expected_tool:
+                    raise RuntimeError("discovery_digest_details_tool_invariant")
+                required.add(expected_tool)
+    return tuple(tool for tool in ("list_sinks", "list_sources", "list_transforms") if tool in required)
+
+
+_DISCOVERY_DIGEST_GUIDANCE: Final[str] = (
+    "This digest is rendered from the live policy-visible catalog at prompt "
+    "build and is current for this deployment. For plugin selection, plan directly from it; "
+    "it is the complete selection and hints only index, "
+    "not a full option contract: required-option names are incomplete without "
+    "types, optional knobs, defaults, enums, and conditional rules. Author "
+    "options only from schema_contract_evidence for this request or a current "
+    "get_plugin_schema result. Detailed composer hints are disclosed only in "
+    "the bounded contract for a chosen plugin. An entry's not_for is that plugin's own stated "
+    "prohibition and is binding on selection: when the value you intend to "
+    "write matches it, choose a different plugin or reshape the value upstream "
+    "first. capability_tags is the plugin's declared capability vocabulary; aggregation_output_modes lists class-derived batch admission modes. "
+    "A config_fields summary may show a named enum alias as object; use get_plugin_schema's current enum values for the chosen plugin. "
+    "The budget block reports canonical_bytes_used and omitted_public_text_count. "
+    "When public purpose or prohibition prose is omitted, its whole sha256 and details_via marker "
+    "replace it; follow details_via before selecting that plugin because omitted prohibition text is still binding. "
+    "Entries carry no worked example; the worked shapes validated for this "
+    "deployment are the other authoring_aids sections. "
+    "You rarely need list_sources/list_transforms/"
+    "list_sinks calls. Literal model identifiers come only from a fresh "
+    "list_models result, never from training. Usable operator-profile aliases "
+    "are already listed for each plugin; profile-bound authoring needs no "
+    "model-catalog lookup. Blob/secret "
+    "discovery is unchanged. Use "
+    "get_plugin_assistance and explain_validation_error for structured "
+    "repair when a proposal is rejected."
+)
+
+_MODEL_CATALOG_DETAILS_VIA: Final[str] = "list_models"
+
+
+def _authorable_llm_provider_names() -> tuple[str, ...]:
+    """Return the provider vocabulary an llm node may actually declare.
+
+    Both llm surfaces carry their own closed ``provider`` literal; the union is
+    taken so a variant added to one and not yet the other still reaches the
+    aid. This bounds which identifier lists are worth carrying: a provider
+    outside this set cannot be named by an llm node at all, so its identifiers
+    would be prompt weight the author can never spend.
+    """
+    return tuple(
+        sorted(
+            {
+                *get_args(LLMConfig.model_fields["provider"].annotation),
+                *get_args(LLMSourceConfig.model_fields["provider"].annotation),
+            }
+        )
+    )
+
+
+def _model_catalog_size(catalog: _ModelCatalog) -> int:
+    """Settle the self-describing canonical byte count."""
+    while True:
+        rendered_size = len(canonical_json(catalog).encode("utf-8"))
+        if catalog["budget"]["canonical_bytes_used"] == rendered_size:
+            return rendered_size
+        catalog["budget"]["canonical_bytes_used"] = rendered_size
+
+
+def planner_model_catalog() -> _ModelCatalog:
+    """Explicit compatibility projection of the process model catalog.
+
+    This helper is retained for callers that explicitly request the projection;
+    it no longer rides in every authoring request. Literal-model authoring uses
+    ``list_models``; profile-bound authoring uses policy-visible aliases.
+    ``provider_model_counts``/``total_models`` retain the unfiltered listing's
+    counts, and ``models_by_provider`` retains its filtered identifier lists.
+
+    Identifiers are grouped on the same ``provider/`` segment the unfiltered
+    mode groups on, which is what keeps each carried list exactly as long as
+    the count beside it. (A filtered call is a bare prefix match, so
+    ``provider="azure"`` there also returns ``azure_ai/`` entries; a grouping
+    that disagreed with its own counts would teach the author a catalog it
+    could not reconcile.) OpenRouter's slugs come from the live catalog
+    accessor, not the bundled litellm slice, because that accessor is what a
+    filtered call returns AND what the value-source walker validates a bound
+    slug against — one source of truth, so the composer cannot recommend a
+    model its own preflight then rejects.
+    """
+    authorable_providers = _authorable_llm_provider_names()
+    all_models = list(read_litellm_model_list())
+    grouped: dict[str, list[str]] = {}
+    for identifier in all_models:
+        prefix = identifier.split("/", 1)[0] if "/" in identifier else ""
+        # ``grouped`` is our own freshly-built accumulator, so the slot is
+        # initialized explicitly rather than read defensively.
+        if prefix not in grouped:
+            grouped[prefix] = []
+        grouped[prefix].append(identifier)
+    provider_model_counts = {prefix: len(identifiers) for prefix, identifiers in grouped.items()}
+    openrouter_key = OPENROUTER_LITELLM_PREFIX.rstrip("/")
+    live_openrouter = get_catalog_values(MODEL_CATALOG_OPENROUTER)
+    if openrouter_key in provider_model_counts:
+        total_models = len(all_models) - provider_model_counts[openrouter_key] + len(live_openrouter)
+    else:
+        total_models = len(all_models) + len(live_openrouter)
+    provider_model_counts[openrouter_key] = len(live_openrouter)
+    grouped[openrouter_key] = sorted(live_openrouter)
+
+    models_by_provider: dict[str, list[str]] = {}
+    for provider in authorable_providers:
+        # A provider the catalog knows nothing about carries no key at all: an
+        # empty list would assert that this deployment serves no model for it,
+        # which is a claim about the operator's runtime, not about the catalog.
+        if provider in grouped and grouped[provider]:
+            models_by_provider[provider] = list(grouped[provider])
+
+    catalog: _ModelCatalog = {
+        "provider_model_counts": provider_model_counts,
+        "total_models": total_models,
+        "authorable_providers": list(authorable_providers),
+        "models_by_provider": models_by_provider,
+        "models_omitted": [],
+        "budget": {
+            "max_canonical_bytes": _MODEL_CATALOG_MAX_CANONICAL_BYTES,
+            "canonical_bytes_used": 0,
+            "omitted_provider_count": 0,
+        },
+    }
+    # Defer the largest whole lists first so growth in one provider does not
+    # erase smaller providers' usable inventory. Never carry a sliced list:
+    # the exact complete inventory remains reachable through list_models.
+    for provider, identifiers in sorted(
+        models_by_provider.items(), key=lambda item: (-len(canonical_json(item[1]).encode("utf-8")), item[0])
+    ):
+        if _model_catalog_size(catalog) <= _MODEL_CATALOG_MAX_CANONICAL_BYTES:
+            break
+        catalog["models_omitted"].append(
+            {
+                "provider": provider,
+                "model_count": len(identifiers),
+                "details_via": _MODEL_CATALOG_DETAILS_VIA,
+            }
+        )
+        del catalog["models_by_provider"][provider]
+        catalog["budget"]["omitted_provider_count"] = len(catalog["models_omitted"])
+    catalog["models_omitted"].sort(key=lambda omission: omission["provider"])
+    if _model_catalog_size(catalog) > _MODEL_CATALOG_MAX_CANONICAL_BYTES:
+        raise RuntimeError("model_catalog_budget_invariant")
+    return catalog
+
+
+_EXPRESSION_GRAMMAR_GUIDANCE: Final[str] = (
+    "This is the expression syntax reference for gate conditions and "
+    "value_transform expressions, verbatim from the same reference the "
+    "get_expression_grammar tool returns. It is deployment-static: author gate "
+    "and fork conditions directly from it with no discovery call. When "
+    "grammar_omitted replaces it, its whole sha256 and details_via marker "
+    "stand in its place and the syntax must be fetched before authoring a "
+    "condition."
+)
+
+
+def _expression_grammar_size(aid: _ExpressionGrammarAid) -> int:
+    """Settle the self-describing canonical byte count."""
+    while True:
+        rendered_size = len(canonical_json(aid).encode("utf-8"))
+        if aid["budget"]["canonical_bytes_used"] == rendered_size:
+            return rendered_size
+        aid["budget"]["canonical_bytes_used"] = rendered_size
+
+
+def planner_expression_grammar() -> _ExpressionGrammarAid:
+    """Carry the authoring reference for gate and value_transform expressions.
+
+    The grammar is static public text with no policy projection, yet every gate
+    or fork shape paid a discovery turn to fetch it. It is carried whole: the
+    reference is entirely authoring material, and a hand-picked subset would be
+    a second, unvalidated statement of a syntax the parser alone defines.
+    """
+    grammar = get_expression_grammar()
+    aid: _ExpressionGrammarAid = {
+        "guidance": _EXPRESSION_GRAMMAR_GUIDANCE,
+        "grammar": grammar,
+        "budget": {
+            "max_canonical_bytes": _EXPRESSION_GRAMMAR_MAX_CANONICAL_BYTES,
+            "canonical_bytes_used": 0,
+        },
+    }
+    if _expression_grammar_size(aid) > _EXPRESSION_GRAMMAR_MAX_CANONICAL_BYTES:
+        del aid["grammar"]
+        aid["grammar_omitted"] = {
+            "sha256": hashlib.sha256(grammar.encode("utf-8")).hexdigest(),
+            "details_via": "get_expression_grammar",
+        }
+        _expression_grammar_size(aid)
+    if _expression_grammar_size(aid) > _EXPRESSION_GRAMMAR_MAX_CANONICAL_BYTES:
+        raise RuntimeError("expression_grammar_budget_invariant")
+    return aid
+
+
+def _llm_source_generation_rules(*, output_control: str) -> list[str]:
+    """Retain the deployment-specific source failure rule beside JIT schemas."""
+    return [
+        f"This deployment REQUIRES the {output_control} Content Safety control for generated output. Set "
+        "options.on_validation_failure to 'discard': a non-discard source validation exit cannot be placed downstream "
+        "of the control and is rejected as an uncontrolled output path.",
+    ]
+
+
+def source_custody_exemplar_args(
+    catalog: PolicyCatalogView,
+    *,
+    blob_id: str | None = None,
+    visible: Mapping[str, frozenset[str]] | None = None,
+) -> _SetPipelineExemplar | None:
+    """Complete ``set_pipeline`` args showing one legal source custody binding.
+
+    With ``blob_id=None`` the source binds literal user data via
+    ``inline_blob``; passing a ``blob_id`` (the prompt passes
+    :data:`PLACEHOLDER_BLOB_ID`; the validation test passes a real created
+    blob's id) shows the existing-blob binding instead. Everything outside
+    ``source`` is byte-identical between the variants. Returns ``None`` when
+    the plugins the exemplar names are not policy-visible. ``visible`` lets
+    the payload builder share one catalog sweep across every exemplar.
+    """
+    if visible is None:
+        visible = _visible_plugin_names(catalog)
+    if "csv" not in visible["source"] or "json" not in visible["sink"]:
+        return None
+    source: _ExemplarSource = {
+        "plugin": "csv",
+        "on_success": "main",
+        "options": {"schema": {"mode": "observed"}},
+        "on_validation_failure": "discard",
+    }
+    if blob_id is None:
+        source["inline_blob"] = {
+            "filename": _INLINE_EXEMPLAR_FILENAME,
+            "mime_type": _INLINE_EXEMPLAR_MIME,
+            "content": _INLINE_EXEMPLAR_CONTENT,
+            "description": "Literal rows the user pasted into chat",
+        }
+    else:
+        source["blob_id"] = blob_id
+    exemplar: _SetPipelineExemplar = {
+        "source": source,
+        "nodes": [],
+        "edges": [],
+        "outputs": [
+            {
+                "sink_name": "main",
+                "plugin": "json",
+                "options": {
+                    "path": "outputs/stock_levels.json",
+                    "format": "json",
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                "on_write_failure": "discard",
+            }
+        ],
+        "metadata": {
+            "name": "Save pasted rows",
+            "description": "Bind user-provided rows through blob custody and write them to one JSON output.",
+        },
+    }
+    return exemplar
+
+
+def _renderable_branch_plugins(transforms: list[PluginSummary]) -> list[str]:
+    """Non-LLM transforms authorable with only the universal ``schema`` option.
+
+    The profile-less exemplar variant needs branch transforms it can configure
+    generically: a plugin whose required options go beyond ``schema`` would
+    demand invented values, and a batch-aware plugin authored as
+    ``node_type='transform'`` needs the aggregation path (or extra row-mode
+    options) the exemplar cannot generically supply. Sorted so the pick is
+    deterministic per snapshot; plugin classes are static per process, so the
+    batch-aware sweep cannot drift within a memo entry's lifetime.
+    """
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    batch_aware = frozenset(cls.name for cls in get_shared_plugin_manager().get_transforms() if cls.is_batch_aware)
+    return sorted(
+        plugin.name
+        for plugin in transforms
+        if plugin.name != "llm"
+        and plugin.name not in batch_aware
+        and {field.name for field in plugin.config_fields if field.required} <= {"schema"}
+    )
+
+
+def fork_coalesce_exemplar_args(
+    catalog: PolicyCatalogView,
+    *,
+    visible: Mapping[str, frozenset[str]] | None = None,
+    summaries: Mapping[str, list[PluginSummary]] | None = None,
+) -> _SetPipelineExemplar | None:
+    """Complete ``set_pipeline`` args for the fork -> branches -> coalesce shape.
+
+    The operator-ruled A/B topology: a gate fans identical rows out to two
+    branches, each branch runs its own transform, a coalesce rejoins them
+    under ``require_all``/``union``, one cleanup transform consumes the
+    coalesce id, and a sink receives the tidied rows. The WIRING is pure
+    topology and renders regardless of LLM availability; only the branch
+    contents vary. With a usable llm operator profile the branches are two
+    llm transforms (own prompt, own ``response_field``, short-form
+    interpretation_requirements); without one the SAME topology renders with
+    one policy-visible non-LLM transform under two distinct node ids. Reusing
+    one transform/configuration keeps both union branches on the same runtime
+    schema mode; ``passthrough`` is preferred when visible, otherwise the
+    first alphabetic candidate whose only required option is ``schema`` is
+    used. Returns ``None``
+    only when the fixed plugins (csv/json/field_mapper) or every branch
+    candidate are policy-hidden — an exemplar must never model an invented
+    identifier.
+    """
+    if summaries is None:
+        summaries = _plugin_summaries(catalog)
+    if visible is None:
+        visible = _visible_plugin_names(catalog, summaries)
+    if "csv" not in visible["source"] or "json" not in visible["sink"]:
+        return None
+    if "field_mapper" not in visible["transform"]:
+        return None
+    profile_alias = _usable_llm_profile_alias(catalog) if "llm" in visible["transform"] else None
+
+    def _branch_llm(
+        node_id: str,
+        branch: str,
+        response_field: str,
+        system_prompt: str,
+        question: str,
+        *,
+        prompt_template_parts: list[dict[str, Any]] | None = None,
+        interpretation_requirements: list[dict[str, Any]] | None = None,
+    ) -> _ExemplarNode:
+        options: dict[str, Any] = {
+            "profile": profile_alias,
+            # BOTH prompt roles, on every llm node. This exemplar once modelled
+            # a user prompt only; session 60ab6a67 (an A/B of two prompts)
+            # cloned it key for key and shipped both arms with no system
+            # prompt. The role and reply constraints live here; the row data
+            # and the question live in prompt_template.
+            "system_prompt": system_prompt,
+            "prompt_template": question,
+            "required_input_fields": ["ticket_id", "body"],
+            "response_field": response_field,
+            "schema": {"mode": "observed"},
+            # llm_prompt_template and llm_model_choice reviews are backend
+            # auto-staged on every llm node — never hand-authored. Planner-
+            # owned kinds (vague_term, registered pipeline_decision,
+            # invented_source) ARE authored when the node calls for them:
+            # the urgency branch below authors category semantics and must
+            # stage its own wired vague_term review (run-3 E6: an exemplar
+            # demonstrating an un-reviewed classification was imported as
+            # precedent to skip review-staging).
+        }
+        if prompt_template_parts is not None:
+            options["prompt_template_parts"] = prompt_template_parts
+        if interpretation_requirements is not None:
+            options["interpretation_requirements"] = interpretation_requirements
+        return {
+            "id": node_id,
+            "node_type": "transform",
+            "plugin": "llm",
+            "input": branch,
+            "on_success": f"{response_field}_done",
+            "on_error": "discard",
+            "options": options,
+        }
+
+    _URGENCY_RUBRIC = (
+        "urgency categories: blocking = the user cannot work at all; degraded = "
+        "work continues with a broken feature; routine = a question or cosmetic issue"
+    )
+
+    metadata: _ExemplarMetadata
+    if profile_alias is not None:
+        branch_nodes: list[_ExemplarNode] = [
+            _branch_llm(
+                "assess_sentiment",
+                "branch_a",
+                "sentiment",
+                "You assess the sentiment of customer support tickets. Reply with one short phrase and nothing else.",
+                "What is the sentiment of support ticket {{ row.ticket_id }}: {{ row.body }}? Reply with one short phrase.",
+            ),
+            _branch_llm(
+                "assess_urgency",
+                "branch_b",
+                "urgency",
+                "You triage customer support tickets by urgency. Reply with the single category word and nothing else.",
+                # Authored CLASSIFICATION semantics: the category set is the
+                # planner's invention, so the vague_term review is staged and
+                # wired below — the review-staging pattern in miniature.
+                f"Classify the urgency of support ticket {{{{ row.ticket_id }}}}: {{{{ row.body }}}} using these {_URGENCY_RUBRIC}. Reply with the single category word.",
+                prompt_template_parts=[
+                    {"kind": "text", "text": "Classify the urgency of support ticket {{ row.ticket_id }}: {{ row.body }} using these "},
+                    {"kind": "interpretation_ref", "requirement_id": "urgency:assess_urgency"},
+                    {"kind": "text", "text": ". Reply with the single category word."},
+                ],
+                interpretation_requirements=[
+                    {
+                        "kind": "vague_term",
+                        "user_term": "urgency",
+                        "draft": _URGENCY_RUBRIC,
+                    }
+                ],
+            ),
+        ]
+        coalesce_branches = {"branch_a": "sentiment_done", "branch_b": "urgency_done"}
+        # A REAL rename, deliberately: field_mapper's mapping reads
+        # {source: target}, and an all-identity exemplar is direction-blind —
+        # the one authoring aid built for this task never demonstrated which
+        # side names the EXISTING field, so a planner wrote the desired output
+        # name as the key and a column silently vanished (elspeth-d4ae04b374).
+        # The keys below are the llm arms' response fields (what arrives);
+        # the values are the tidied output names (what leaves).
+        tidy_mapping = {
+            "ticket_id": "ticket_id",
+            "body": "body",
+            "sentiment": "ticket_sentiment",
+            "urgency": "ticket_urgency",
+        }
+        metadata = {
+            "name": "Per-branch LLM assessment",
+            "description": "Fan rows out to one llm transform per branch, rejoin with a coalesce, tidy, and save.",
+        }
+    else:
+        branch_pool = _renderable_branch_plugins(summaries["transform"])
+        if not branch_pool:
+            return None
+        branch_plugin = "passthrough" if "passthrough" in branch_pool else branch_pool[0]
+        branch_nodes = [
+            {
+                "id": "process_branch_a",
+                "node_type": "transform",
+                "plugin": branch_plugin,
+                "input": "branch_a",
+                "on_success": "branch_a_done",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
+            {
+                "id": "process_branch_b",
+                "node_type": "transform",
+                "plugin": branch_plugin,
+                "input": "branch_b",
+                "on_success": "branch_b_done",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
+        ]
+        coalesce_branches = {"branch_a": "branch_a_done", "branch_b": "branch_b_done"}
+        tidy_mapping = {"ticket_id": "ticket_id", "body": "body"}
+        metadata = {
+            "name": "Per-branch fan-out and rejoin",
+            "description": "Fan rows out to one transform per branch, rejoin with a coalesce, tidy, and save.",
+        }
+    # ``schema`` on a field_mapper is its INPUT contract, so it names the
+    # mapping SOURCES; the sink's fixed schema names the emitted TARGETS. An
+    # identity mapping makes the two lists coincide and hides the distinction —
+    # which is exactly how the direction was mis-taught (elspeth-d4ae04b374).
+    tidy_sources = list(tidy_mapping)
+    tidy_fields = list(tidy_mapping.values())
+    tidy_schema = {
+        "mode": "flexible",
+        "fields": [f"{field}: str" for field in tidy_sources],
+        "guaranteed_fields": tidy_sources,
+    }
+
+    # Required-control coverage is proved per LLM node: the shield must dominate
+    # the node's prompt inputs and content safety must dominate every one of its
+    # output streams. A forked exemplar that modelled two bare llm branches would
+    # therefore teach a topology this deployment's validator rejects, so the
+    # controls are wired here whenever the deployment selected one. Placement is
+    # chosen so ONE node covers both branches: the shield sits upstream of the
+    # fork, content safety downstream of the rejoin. Only the LLM-branch variant
+    # needs them — the non-LLM fallback has no LLM node to cover.
+    gate_input = "rows"
+    tidy_input = "merge_branches"
+    control_nodes_before: list[_ExemplarNode] = []
+    control_nodes_after: list[_ExemplarNode] = []
+    if profile_alias is not None:
+        shield_control = _selected_control_profile(catalog, PluginCapability.PROMPT_SHIELD)
+        if shield_control is not None:
+            shield_plugin, shield_alias = shield_control
+            gate_input = "shielded_rows"
+            shield_options: dict[str, Any] = {
+                # Fields are exactly the branches' prompt inputs.
+                "fields": ["ticket_id", "body"],
+                "schema": {"mode": "observed"},
+            }
+            if shield_alias is not None:
+                # The operator-owned control binding stays behind the alias.
+                shield_options["profile"] = shield_alias
+            else:
+                shield_options.update(_direct_control_options(summaries, shield_plugin))
+            control_nodes_before.append(
+                {
+                    "id": "shield_ticket_text",
+                    "node_type": "transform",
+                    "plugin": shield_plugin,
+                    "input": "rows",
+                    "on_success": "shielded_rows",
+                    "on_error": "discard",
+                    "options": shield_options,
+                }
+            )
+        safety_control = _selected_control_profile(catalog, PluginCapability.CONTENT_SAFETY)
+        if safety_control is not None:
+            safety_plugin, safety_alias = safety_control
+            tidy_input = "screened_rows"
+            safety_options: dict[str, Any] = {
+                # Both branches' response fields — one node, both output streams.
+                "fields": ["sentiment", "urgency"],
+                "schema": {"mode": "observed"},
+            }
+            if safety_alias is not None:
+                # The operator-owned control binding stays behind the alias.
+                safety_options["profile"] = safety_alias
+            else:
+                safety_options.update(_direct_control_options(summaries, safety_plugin))
+            if _plugin_declares_field(summaries, safety_plugin, "source"):
+                safety_options["source"] = "OUTPUT"
+            control_nodes_after.append(
+                {
+                    "id": "screen_assessments",
+                    "node_type": "transform",
+                    "plugin": safety_plugin,
+                    "input": "merge_branches",
+                    "on_success": "screened_rows",
+                    "on_error": "discard",
+                    "options": safety_options,
+                }
+            )
+
+    exemplar: _SetPipelineExemplar = {
+        "source": {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": {
+                "schema": {
+                    "mode": "flexible",
+                    "fields": ["ticket_id: str", "body: str"],
+                    "guaranteed_fields": ["ticket_id", "body"],
+                }
+            },
+            "on_validation_failure": "discard",
+            "inline_blob": {
+                "filename": "support_tickets.csv",
+                "mime_type": "text/csv",
+                "content": _FORK_EXEMPLAR_CONTENT,
+                "description": "Literal rows the user pasted into chat",
+            },
+        },
+        "nodes": [
+            *control_nodes_before,
+            {
+                "id": "fan_out",
+                "node_type": "gate",
+                "input": gate_input,
+                "condition": "True",
+                "routes": {"true": "fork", "false": "fork"},
+                "fork_to": ["branch_a", "branch_b"],
+            },
+            *branch_nodes,
+            {
+                "id": "merge_branches",
+                "node_type": "coalesce",
+                # input is schema-required but not a consuming binding for a
+                # coalesce (consumption is the branches values) — first
+                # branch's arriving connection, by convention.
+                "input": next(iter(coalesce_branches.values())),
+                "branches": coalesce_branches,
+                "policy": "require_all",
+                "merge": "union",
+                # Structural CoalesceSettings owns no plugin schema.  A
+                # NodeSpec options.schema here is inert composer metadata and
+                # yaml_generator intentionally drops it at runtime lowering.
+                "options": {},
+            },
+            *control_nodes_after,
+            {
+                "id": "tidy_columns",
+                "node_type": "transform",
+                "plugin": "field_mapper",
+                "input": tidy_input,
+                "on_success": "main",
+                "on_error": "discard",
+                "options": {
+                    "schema": tidy_schema,
+                    "mapping": tidy_mapping,
+                    "select_only": True,
+                },
+            },
+        ],
+        "edges": [],
+        "outputs": [
+            {
+                "sink_name": "main",
+                "plugin": "json",
+                "options": {
+                    "path": "outputs/ticket_assessments.json",
+                    "format": "json",
+                    "schema": {"mode": "fixed", "fields": [f"{field}: str" for field in tidy_fields]},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                "on_write_failure": "discard",
+            }
+        ],
+        "metadata": metadata,
+    }
+    return exemplar
+
+
+def fork_row_union_exemplar_args(
+    catalog: PolicyCatalogView,
+    *,
+    visible: Mapping[str, frozenset[str]] | None = None,
+) -> _SetPipelineExemplar | None:
+    """Complete ``set_pipeline`` args for forked rows released by row_union."""
+    if visible is None:
+        visible = _visible_plugin_names(catalog, _plugin_summaries(catalog))
+    if (
+        "csv" not in visible["source"]
+        or "json" not in visible["sink"]
+        or "passthrough" not in visible["transform"]
+        or "field_mapper" not in visible["transform"]
+    ):
+        return None
+
+    branches = {"branch_a": "branch_a_done", "branch_b": "branch_b_done"}
+    return {
+        "source": {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": {
+                "schema": {
+                    "mode": "flexible",
+                    "fields": ["case_id: str", "variant_text: str"],
+                    "guaranteed_fields": ["case_id", "variant_text"],
+                }
+            },
+            "on_validation_failure": "discard",
+            "inline_blob": {
+                "filename": "experiment_variants.csv",
+                "mime_type": "text/csv",
+                "content": _ROW_UNION_EXEMPLAR_CONTENT,
+                "description": "Literal rows the user pasted into chat",
+            },
+        },
+        "nodes": [
+            {
+                "id": "fan_out_variants",
+                "node_type": "gate",
+                "input": "rows",
+                "condition": "True",
+                "routes": {"true": "fork", "false": "fork"},
+                "fork_to": list(branches),
+            },
+            {
+                "id": "process_control",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "branch_a",
+                "on_success": "branch_a_done",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
+            {
+                "id": "process_treatment",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "branch_b",
+                "on_success": "branch_b_done",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
+            {
+                "id": "variant_union",
+                "node_type": "row_union",
+                "input": next(iter(branches.values())),
+                "branches": branches,
+                "on_success": "unioned_rows",
+                "timeout_seconds": 30.0,
+            },
+            {
+                "id": "tidy_unioned_rows",
+                "node_type": "transform",
+                "plugin": "field_mapper",
+                "input": "unioned_rows",
+                "on_success": "main",
+                # Deliberately NOT 'discard': the aids corpus must carry at
+                # least one validated non-discard failure route, or every
+                # worked exemplar teaches silent row loss as the house style
+                # (elspeth-0aace271b4 I2). 'discard' costs the failed row's
+                # CONTENT — the audit trail keeps only the record of the
+                # drop — so the retention-shaped edge routes to a declared
+                # quarantine sink instead.
+                "on_error": "failed_rows",
+                "options": {
+                    "schema": {
+                        "mode": "flexible",
+                        "fields": ["case_id: str", "variant_text: str"],
+                        "guaranteed_fields": ["case_id", "variant_text"],
+                    },
+                    "mapping": {"case_id": "case_id", "variant_text": "variant_text"},
+                    "select_only": True,
+                },
+            },
+        ],
+        "edges": [],
+        "outputs": [
+            {
+                "sink_name": "main",
+                "plugin": "json",
+                "options": {
+                    "path": "outputs/row_union_variants.json",
+                    "format": "json",
+                    "schema": {"mode": "fixed", "fields": ["case_id: str", "variant_text: str"]},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                "on_write_failure": "discard",
+            },
+            {
+                "sink_name": "failed_rows",
+                "plugin": "json",
+                "options": {
+                    "path": "outputs/row_union_failed_rows.json",
+                    "format": "json",
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                "on_write_failure": "discard",
+            },
+        ],
+        "metadata": {
+            "name": "Fork and release row variants",
+            "description": "Fan rows through two independent branches, then release every correlated row with row_union.",
+        },
+    }
+
+
+# Payload memo keyed by plugin-policy snapshot hash. Plugin classes are static
+# per process; visibility, profile aliases and control bindings are covered by
+# the snapshot. Model catalogs are discovered on demand and are not memoized
+# here. Callers receive a deep copy so they cannot poison the cached payload.
+_AIDS_MEMO: dict[str, _PlannerAuthoringAids] = {}
+_AIDS_MEMO_MAX: Final[int] = 8
+_AIDS_MEMO_LOCK = Lock()
+
+
+def build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthoringAids:
+    """Assemble the live authoring-aids payload for one planner call.
+
+    Rendered from the policy-visible catalog and memoized per snapshot hash.
+    Sections whose plugins are policy-hidden are omitted rather than rendered
+    with invented names.
+    """
+    key = catalog.snapshot.snapshot_hash
+    with _AIDS_MEMO_LOCK:
+        cached = _AIDS_MEMO.get(key)
+    if cached is None:
+        built = _build_planner_authoring_aids(catalog)
+        with _AIDS_MEMO_LOCK:
+            # Another worker may have populated this snapshot while the
+            # catalog sweep ran. Prefer that value and mutate/evict only while
+            # holding the cache lock.
+            cached = _AIDS_MEMO.get(key)
+            if cached is None:
+                if len(_AIDS_MEMO) >= _AIDS_MEMO_MAX:
+                    _AIDS_MEMO.pop(next(iter(_AIDS_MEMO)))
+                _AIDS_MEMO[key] = cached = built
+    return deepcopy(cached)
+
+
+def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthoringAids:
+    summaries = _plugin_summaries(catalog)
+    visible = _visible_plugin_names(catalog, summaries)
+    aids: _PlannerAuthoringAids = {
+        "user_disclosure": {"rules": list(_USER_DISCLOSURE_RULES)},
+        "purpose": (
+            "Server-rendered worked exemplars and catalog digest from the live "
+            "policy-visible catalog. These shapes validate against the current deployment. "
+            "Each set_pipeline_exemplar* value is a provider tool-argument envelope: "
+            "its pipeline field contains the flat canonical set-pipeline document "
+            "used directly by internal and MCP consumers."
+        ),
+    }
+    custody = source_custody_exemplar_args(catalog, visible=visible)
+    custody_blob_variant = source_custody_exemplar_args(catalog, blob_id=PLACEHOLDER_BLOB_ID, visible=visible)
+    if custody is not None and custody_blob_variant is not None:
+        aids["source_custody"] = {
+            "rules": list(_SOURCE_CUSTODY_RULES),
+            "set_pipeline_exemplar_inline_blob": {"pipeline": custody},
+            "existing_blob_source_binding": custody_blob_variant["source"],
+        }
+    fork_coalesce = fork_coalesce_exemplar_args(catalog, visible=visible, summaries=summaries)
+    if fork_coalesce is not None:
+        aids["fork_coalesce"] = {
+            "rules": list(_FORK_COALESCE_RULES),
+            "set_pipeline_exemplar": {"pipeline": fork_coalesce},
+        }
+    fork_row_union = fork_row_union_exemplar_args(catalog, visible=visible)
+    if fork_row_union is not None:
+        aids["fork_row_union"] = {
+            "rules": list(_FORK_ROW_UNION_RULES),
+            "set_pipeline_exemplar": {"pipeline": fork_row_union},
+        }
+    # Resolved before the llm aids because the on_error rule they carry is
+    # control-mode conditional. ``_selected_control_profile`` returns None for
+    # recommend mode or no selection, so this is the same gate the
+    # content_safety aid uses. Memo safety: control_modes feeds
+    # PluginAvailabilitySnapshot's canonical payload and therefore
+    # snapshot_hash, which keys _AIDS_MEMO — one deployment's posture can never
+    # be served to another.
+    required_safety = _selected_control_profile(catalog, PluginCapability.CONTENT_SAFETY)
+    required_output_control = required_safety[0] if required_safety is not None else None
+    # Auto-wirability mirrors required_controls.wire_required_controls exactly:
+    # an alias-backed selection, or a direct-config selection whose required
+    # bindings are all real (never placeholder exemplars), is auto-wired; the
+    # aids must not claim the guarantee for any other posture.
+    required_shield = _selected_control_profile(catalog, PluginCapability.PROMPT_SHIELD)
+    shield_auto_wired = required_shield is not None and (
+        required_shield[1] is not None or _direct_control_options_are_deployable(summaries, required_shield[0])
+    )
+    safety_auto_wired = required_safety is not None and (
+        required_safety[1] is not None or _direct_control_options_are_deployable(summaries, required_safety[0])
+    )
+    if "llm" in visible["transform"]:
+        aids["model_custody"] = {
+            "rules": _model_custody_rules(_usable_llm_profile_alias(catalog)),
+        }
+        aids["llm_output_contract"] = {"rules": _llm_output_contract_rules(output_control=required_output_control)}
+    if "llm" in visible["source"] and required_output_control is not None:
+        aids["llm_source_generation"] = {"rules": _llm_source_generation_rules(output_control=required_output_control)}
+    aids["review_registry"] = {
+        # Imported from interpretation_state so the taught vocabulary can
+        # never drift from the resolve-time registry (52322ebe1 discipline).
+        "registered_pipeline_decision_user_terms": sorted(REGISTERED_PIPELINE_DECISION_USER_TERMS),
+        "rules": list(_REVIEW_REGISTRY_RULES),
+    }
+    visible_untrusted_producers = tuple(sorted(untrusted_content_transform_names() & visible["transform"]))
+    visible_raw_html_producers = tuple(sorted(_RAW_HTML_CLEANUP_PRODUCER_PLUGINS & visible["transform"]))
+    control_modes = dict(catalog.snapshot.control_modes)
+    if visible_untrusted_producers and "llm" in visible["transform"]:
+        # Both ``selected`` and ``control_modes`` are partial mappings by
+        # contract (PluginAvailabilitySnapshot.create admits any subset), so
+        # absence is first-class — "no shield selected" / "not configured" —
+        # and each default is synthesized explicitly after membership.
+        selected_by_capability = dict(catalog.snapshot.selected)
+        selected_shield = (
+            selected_by_capability[PluginCapability.PROMPT_SHIELD] if PluginCapability.PROMPT_SHIELD in selected_by_capability else None
+        )
+        shield_mode = (
+            control_modes[PluginCapability.PROMPT_SHIELD] if PluginCapability.PROMPT_SHIELD in control_modes else ControlMode.RECOMMEND
+        )
+        aids["prompt_shield"] = {
+            "rules": _prompt_shield_rules(
+                # Whichever shield THIS deployment selected (aws_bedrock_prompt_shield,
+                # azure_prompt_shield, …) — never a hardcoded vendor.
+                shield_plugin=selected_shield.name if selected_shield else None,
+                shield_required=shield_mode is ControlMode.REQUIRED,
+                shield_auto_wired=shield_auto_wired,
+                untrusted_producers=visible_untrusted_producers,
+            ),
+        }
+    if "llm" in visible["transform"] and required_output_control is not None:
+        aids["content_safety"] = {"rules": _content_safety_rules(safety_plugin=required_output_control, auto_wired=safety_auto_wired)}
+    if visible_raw_html_producers and "field_mapper" in visible["transform"]:
+        aids["raw_html_cleanup"] = {"rules": _raw_html_cleanup_rules(untrusted_producers=visible_raw_html_producers)}
+    aids["discovery_digest"] = {
+        "guidance": _DISCOVERY_DIGEST_GUIDANCE,
+        "plugins": discovery_digest(catalog, summaries=summaries),
+    }
+    # Profile aliases remain in the complete discovery digest. Literal model
+    # identifiers and optional plugin guides are discovered through existing
+    # list_models, get_plugin_schema and get_plugin_assistance tools.
+    # Gate conditions are structural, so the expression reference is
+    # authorable on every deployment regardless of which plugins are visible.
+    aids["expression_grammar"] = planner_expression_grammar()
+    return aids
+
+
+__all__ = [
+    "PLACEHOLDER_BLOB_ID",
+    "PlannerPluginContract",
+    "SchemaContractProjectionUnsupported",
+    "build_planner_authoring_aids",
+    "build_schema_contract_evidence",
+    "discovery_digest",
+    "discovery_digest_detail_tools",
+    "fork_coalesce_exemplar_args",
+    "fork_row_union_exemplar_args",
+    "planner_expression_grammar",
+    "planner_model_catalog",
+    "planner_plugin_contract",
+    "source_custody_exemplar_args",
+]

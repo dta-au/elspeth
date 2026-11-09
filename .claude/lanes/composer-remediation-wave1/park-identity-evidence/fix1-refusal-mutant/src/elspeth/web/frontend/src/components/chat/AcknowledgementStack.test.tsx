@@ -1,0 +1,426 @@
+
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { axe, toHaveNoViolations } from "jest-axe";
+import { AcknowledgementStack } from "./AcknowledgementStack";
+import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
+import { useSessionStore } from "@/stores/sessionStore";
+import { resetStore } from "@/test/store-helpers";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
+import type {
+  InterpretationEvent,
+  InterpretationResolveResponse,
+} from "@/types/interpretation";
+import type { CompositionState, NodeSpec } from "@/types/index";
+import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+
+expect.extend(toHaveNoViolations);
+
+vi.mock("@/api/client", () => ({
+  listInterpretationEvents: vi.fn(),
+  resolveInterpretation: vi.fn(),
+  optOutOfInterpretations: vi.fn(),
+  getInterpretationOptOutSummary: vi.fn(),
+}));
+
+import * as api from "@/api/client";
+
+const SID = "11111111-1111-1111-1111-111111111111";
+
+function makeEvent(
+  id: string,
+  overrides: Partial<InterpretationEvent> = {},
+): InterpretationEvent {
+  return {
+    id,
+    session_id: SID,
+    composition_state_id: "22222222-2222-2222-2222-222222222222",
+    affected_node_id: "node-1",
+    tool_call_id: "tool-1",
+    user_term: "cool",
+    kind: "vague_term",
+    llm_draft: "interesting and engaging",
+    accepted_value: null,
+    choice: "pending",
+    created_at: "2026-06-22T00:00:00Z",
+    resolved_at: null,
+    actor: "system:composer",
+    interpretation_source: "user_approved",
+    model_identifier: "anthropic/claude-opus-4-7",
+    model_version: "20260518",
+    provider: "anthropic",
+    composer_skill_hash: "0".repeat(64),
+    arguments_hash: null,
+    hash_domain_version: null,
+    runtime_model_identifier_at_resolve: null,
+    runtime_model_version_at_resolve: null,
+    approved_prompt_artifact_hash: null,
+    ...overrides,
+  };
+}
+
+function makeNode(id: string, plugin: string): NodeSpec {
+  return {
+    id,
+    node_type: "transform",
+    plugin,
+    input: "rows",
+    on_success: null,
+    on_error: null,
+    options: {},
+  };
+}
+
+function makeCompositionState(nodes: NodeSpec[]): CompositionState {
+  return {
+    id: "state-1",
+    ...compositionStateAuthorityFields,
+    version: 1,
+    sources: {},
+    nodes,
+    edges: [],
+    outputs: [],
+    metadata: { name: null, description: null },
+  };
+}
+
+function seedPending(events: InterpretationEvent[]): void {
+  const map: Record<string, InterpretationEvent> = {};
+  for (const event of events) map[event.id] = event;
+  useInterpretationEventsStore.setState({ pendingBySession: { [SID]: map } });
+}
+
+beforeEach(() => {
+  resetStore(useInterpretationEventsStore);
+  vi.clearAllMocks();
+  useSessionStore.setState({ compositionState: null });
+});
+
+describe("AcknowledgementStack — projection", () => {
+  it("renders pending decisions as native rows in the labelled approvals section", () => {
+    seedPending([makeEvent("e1"), makeEvent("e2")]);
+    render(<AcknowledgementStack sessionId={SID} />);
+    const approvals = screen.getByRole("region", { name: "Interpretation approvals" });
+    const list = within(approvals).getByRole("list");
+    expect(list.tagName).toBe("UL");
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows).toHaveLength(2);
+    expect(rows.every((row) => row.tagName === "LI")).toBe(true);
+  });
+
+  it("renders one card per pending user_approved event with a count header", () => {
+    seedPending([makeEvent("e1"), makeEvent("e2")]);
+    render(<AcknowledgementStack sessionId={SID} />);
+
+    expect(screen.getAllByTestId("acknowledgement-card")).toHaveLength(2);
+    expect(
+      screen.getByText("2 decisions the LLM made — acknowledge each"),
+    ).toBeTruthy();
+  });
+
+  it("renders nothing when there are no pending events", () => {
+    useInterpretationEventsStore.setState({ pendingBySession: { [SID]: {} } });
+    const { container } = render(<AcknowledgementStack sessionId={SID} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("ignores opt-out / no-surface rows (only user_approved pending)", () => {
+    seedPending([
+      makeEvent("e1"),
+      makeEvent("e2", { interpretation_source: "auto_interpreted_opt_out" }),
+    ]);
+    render(<AcknowledgementStack sessionId={SID} />);
+    expect(screen.getAllByTestId("acknowledgement-card")).toHaveLength(1);
+  });
+});
+
+describe("AcknowledgementStack — ordering", () => {
+  it("orders cards by pipeline step, then created_at", () => {
+    useSessionStore.setState({
+      compositionState: makeCompositionState([
+        makeNode("llm", "llm"),
+        makeNode("web_scrape", "web_scrape"),
+      ]),
+    });
+    // e1 targets node "web_scrape" (later step) but was created earlier; e2
+    // targets node "llm" (earlier step). Step order must win → llm
+    // (Summarise) before web_scrape (Fetch). Both ids are trivially their own
+    // plugin name, so they resolve via the plugin verb, not their id (R2-F8b:
+    // every id is author-chosen — there is no Composer id generator — so a
+    // real author-given name like `extract_invoice` would be title-cased
+    // instead; see interpretationStepLabel.test.ts).
+    seedPending([
+      makeEvent("e1", {
+        affected_node_id: "web_scrape",
+        kind: "llm_model_choice",
+        created_at: "2026-06-20T00:00:00Z",
+      }),
+      makeEvent("e2", {
+        affected_node_id: "llm",
+        kind: "llm_model_choice",
+        created_at: "2026-06-22T00:00:00Z",
+      }),
+    ]);
+    render(<AcknowledgementStack sessionId={SID} />);
+
+    const titles = screen
+      .getAllByTestId("acknowledgement-card")
+      .map((card) => card.querySelector(".ack-card-title")?.textContent);
+    expect(titles).toEqual(["Summarise step · model", "Fetch step · model"]);
+  });
+});
+
+describe("AcknowledgementStack — accessibility", () => {
+  it("does not host its own role='status' announce (the decision panel owns it)", () => {
+    // The stack returns null when empty, so a live region mounted INSIDE it
+    // would be inserted with its content already present on the 0->1
+    // transition — the documented-unreliable polite-announce pattern. The
+    // count announce is therefore the decision panel's
+    // job (covered below). This guards against regressing to an in-stack status.
+    seedPending([makeEvent("e1"), makeEvent("e2")]);
+    render(<AcknowledgementStack sessionId={SID} />);
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("does NOT move focus on mount (persistent stack must not yank focus)", () => {
+    seedPending([makeEvent("e1")]);
+    render(<AcknowledgementStack sessionId={SID} />);
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  it("has no axe violations", async () => {
+    seedPending([makeEvent("e1")]);
+    const { container } = render(<AcknowledgementStack sessionId={SID} />);
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
+describe("AcknowledgementStack — foot-of-stack opt-out", () => {
+  it("renders exactly one opt-out link", () => {
+    seedPending([makeEvent("e1"), makeEvent("e2")]);
+    render(<AcknowledgementStack sessionId={SID} />);
+    expect(
+      screen.getAllByRole("button", {
+        name: /stop reviewing interpretations this session/i,
+      }),
+    ).toHaveLength(1);
+  });
+
+  it("opens a session-scope confirm, then calls optOut and fires onResolved(null, null)", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.optOutOfInterpretations).mockResolvedValue({
+      session_id: SID,
+      interpretation_review_disabled: true,
+      opted_out_at: "2026-06-22T01:00:00Z",
+    });
+    const onResolved = vi.fn();
+    seedPending([makeEvent("e1")]);
+    render(<AcknowledgementStack sessionId={SID} onResolved={onResolved} />);
+
+    await user.click(
+      screen.getByRole("button", {
+        name: /stop reviewing interpretations this session/i,
+      }),
+    );
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog.textContent).toMatch(/this session/i);
+    await user.click(
+      screen.getByRole("button", { name: /stop reviewing for this session/i }),
+    );
+
+    await waitFor(() => {
+      expect(api.optOutOfInterpretations).toHaveBeenCalledWith(SID);
+    });
+    expect(onResolved).toHaveBeenCalledWith(null, null);
+  });
+
+  it("maps an opt-out failure to an error banner", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.optOutOfInterpretations).mockRejectedValue({
+      status: 500,
+      detail: "boom",
+    });
+    seedPending([makeEvent("e1")]);
+    render(<AcknowledgementStack sessionId={SID} />);
+
+    await user.click(
+      screen.getByRole("button", {
+        name: /stop reviewing interpretations this session/i,
+      }),
+    );
+    await user.click(
+      screen.getByRole("button", { name: /stop reviewing for this session/i }),
+    );
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/could not resolve interpretation/i);
+  });
+});
+
+describe("AcknowledgementStack — compositionState threading", () => {
+  // Truth test, not an existence test: the card can only render the accepted
+  // sibling value if the stack actually passes its subscribed
+  // compositionState down (elspeth-990f5ea562).
+  it("threads the live compositionState into each card so resolved slot values render", async () => {
+    const user = userEvent.setup();
+    const promptNode: NodeSpec = {
+      ...makeNode("llm", "llm"),
+      options: {
+        prompt_template_parts: [
+          { kind: "text", text: "Summarise " },
+          { kind: "interpretation_ref", requirement_id: "req-1" },
+          { kind: "text", text: " for an auditor." },
+        ],
+        interpretation_requirements: [
+          {
+            id: "req-1",
+            kind: "vague_term",
+            user_term: "punchy",
+            status: "resolved",
+            draft: "short and direct",
+            event_id: "evt-vague-1",
+            accepted_value: "concise and neutral",
+            accepted_artifact_hash: null,
+            approved_prompt_artifact_hash: null,
+          },
+        ],
+      },
+    };
+    useSessionStore.setState({
+      compositionState: makeCompositionState([promptNode]),
+    });
+    seedPending([
+      makeEvent("e1", {
+        kind: "llm_prompt_template",
+        affected_node_id: "llm",
+        user_term: null,
+        llm_draft: "Summarise pending interpretation for an auditor.",
+      }),
+    ]);
+    render(<AcknowledgementStack sessionId={SID} />);
+
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const region = screen.getByRole("region", {
+      name: /prompt template review/i,
+    });
+    // The PRIMARY render (first pre) carries the substitution; the frozen
+    // mask survives only inside the 'View original template' disclosure.
+    const primaryPre = region.querySelector("pre.ack-card-prompt-pre");
+    expect(primaryPre?.textContent).toContain("concise and neutral");
+    expect(primaryPre?.textContent).not.toContain("pending interpretation");
+  });
+});
+
+describe("AcknowledgementStack — removed node label (elspeth-93f5621f18)", () => {
+  it("names a deleted node by the step it was, and keeps the raw id on a data attribute", () => {
+    // An event whose affected node is absent from the loaded composition.
+    useSessionStore.setState({ compositionState: makeCompositionState([]) });
+    seedPending([makeEvent("e-ghost", { kind: "llm_prompt_template", affected_node_id: "ghost_node" })]);
+    const { container } = render(<AcknowledgementStack sessionId={SID} />);
+    expect(
+      screen.getByRole("heading", { name: "Removed step (was Ghost Node) · prompt" }),
+    ).toBeInTheDocument();
+    const card = screen.getByTestId("acknowledgement-card");
+    expect(card).toHaveAttribute("data-affected-node-id", "ghost_node");
+    // The ghost id is the author's own NAME for the step, so title-casing it
+    // into the heading is not an identifier leak — the raw form still lives
+    // only on data-affected-node-id.
+    expect(card).not.toHaveTextContent("ghost_node");
+    // The wave's acceptance gate, on the surface this task most changes: the
+    // raw id survives ONLY on data-affected-node-id, which the pin does not
+    // inspect (it reads text nodes and aria-labels).
+    expectNoIdentifiersInDefaultDom(container);
+  });
+
+  it("gives two cards for two different removed nodes distinct titles (ux M-2)", () => {
+    // The defect: both read "Removed step · prompt", with the only
+    // disambiguator on data-affected-node-id — a forensic home invisible to
+    // every audience, so a user with two pending cards could not tell which
+    // deleted step each was about.
+    useSessionStore.setState({ compositionState: makeCompositionState([]) });
+    seedPending([
+      makeEvent("e-one", { kind: "llm_prompt_template", affected_node_id: "extract_invoice" }),
+      makeEvent("e-two", { kind: "llm_prompt_template", affected_node_id: "rate_coolness" }),
+    ]);
+    const { container } = render(<AcknowledgementStack sessionId={SID} />);
+
+    expect(
+      screen.getByRole("heading", { name: "Removed step (was Extract Invoice) · prompt" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Removed step (was Rate Coolness) · prompt" }),
+    ).toBeInTheDocument();
+    expectNoIdentifiersInDefaultDom(container);
+  });
+});
+
+describe("AcknowledgementStack — focus restoration", () => {
+  it("wraps focus to the first remaining row when the last row resolves", async () => {
+    const user = userEvent.setup();
+    const first = makeEvent("e1", { user_term: "first" });
+    const last = makeEvent("e2", { user_term: "last" });
+    seedPending([first, last]);
+    vi.mocked(api.resolveInterpretation).mockResolvedValue({
+      event: { ...last, choice: "accepted_as_drafted", accepted_value: last.llm_draft },
+      new_state: makeCompositionState([]),
+    });
+    render(<AcknowledgementStack sessionId={SID} />);
+    await user.click(screen.getByRole("button", { name: /acknowledge the llm's interpretation of last/i }));
+    await waitFor(() => expect(screen.getAllByTestId("acknowledgement-card")).toHaveLength(1));
+    expect(screen.getByRole("button", { name: /acknowledge the llm's interpretation of first/i })).toHaveFocus();
+  });
+
+  it("returns focus to the parent fallback after the final approval", async () => {
+    const user = userEvent.setup();
+    const last = makeEvent("e1");
+    seedPending([last]);
+    vi.mocked(api.resolveInterpretation).mockResolvedValue({
+      event: { ...last, choice: "accepted_as_drafted", accepted_value: last.llm_draft },
+      new_state: makeCompositionState([]),
+    });
+    const onFocusFallback = vi.fn();
+    render(<AcknowledgementStack sessionId={SID} onFocusFallback={onFocusFallback} />);
+    await user.click(screen.getByRole("button", { name: /acknowledge the llm's interpretation of cool/i }));
+    await waitFor(() => expect(onFocusFallback).toHaveBeenCalledTimes(1));
+  });
+
+  // Pins the comment-documented fallback (stack effect: disabled button →
+  // section): after a sibling resolves, a still-gated prompt card's Approve
+  // is disabled, so focus lands on the card's labelled <section>.
+  it("falls back to a still-gated prompt card's section after a sibling resolves", async () => {
+    const user = userEvent.setup();
+    const first = makeEvent("e1", { created_at: "2026-06-20T00:00:00Z" });
+    const gated = makeEvent("e2", {
+      kind: "llm_prompt_template",
+      user_term: null,
+      llm_draft: "Classify {{ x }}.",
+      created_at: "2026-06-22T00:00:00Z",
+    });
+    seedPending([first, gated]);
+    const response: InterpretationResolveResponse = {
+      event: {
+        ...first,
+        choice: "accepted_as_drafted",
+        accepted_value: first.llm_draft,
+        resolved_at: "2026-06-22T01:00:00Z",
+      },
+      new_state: makeCompositionState([]),
+    };
+    vi.mocked(api.resolveInterpretation).mockResolvedValue(response);
+    render(<AcknowledgementStack sessionId={SID} />);
+
+    await user.click(
+      screen.getByRole("button", {
+        name: /acknowledge the llm's interpretation of cool/i,
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("acknowledgement-card")).toHaveLength(1);
+    });
+    expect(document.activeElement).toBe(
+      document.getElementById("ack-card-e2"),
+    );
+  });
+});

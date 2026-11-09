@@ -1,0 +1,466 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-lifecycle-foundations
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 41 items / 31 deselected / 10 selected
+
+tests/unit/web/test_process_watchdog.py FFF                              [ 30%]
+tests/unit/web/execution/test_runtime_preflight_coordinator.py FFFFFFF   [100%]
+
+=================================== FAILURES ===================================
+______________ test_recovery_uses_semantic_owner_operations[None] ______________
+
+failure = None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", [None, "ack", "monitor"])
+    async def test_recovery_uses_semantic_owner_operations(failure):
+        """Recovery must work with an owner that has no Unix signal authority."""
+        class SemanticOwner(OwnedTestProcessWatchdog):
+            def __init__(self, draining):
+                super().__init__(draining)
+                self.operations = []
+    
+            async def begin_recovery(self, reason):
+                if failure == "ack":
+                    raise original
+                result = await super().begin_recovery(reason)
+                self.operations.append("ack")
+                return result
+    
+            def request_graceful_termination(self):
+                self.operations.append("graceful")
+    
+            def force_termination(self):
+                self.operations.append("force")
+    
+            def request_signal(self, sig):
+                raise AssertionError("portable recovery attempted Unix signal dispatch")
+    
+        original = ProcessWatchdogFailure("semantic owner failed")
+        draining = threading.Event()
+        owner = SemanticOwner(draining)
+        recovery = ProcessRecovery(watchdog=owner, instance_draining=draining)
+        if failure == "monitor":
+            recovery.start_monitor()
+            owner.fail(original)
+            with pytest.raises(ProcessWatchdogFailure) as caught:
+                await recovery.join_monitor_after_completion()
+            assert caught.value is original
+            assert owner.operations == ["force"]
+        else:
+            recovery.request_shutdown()
+            recovery.request_shutdown()
+            if failure == "ack":
+                with pytest.raises(ProcessWatchdogFailure) as caught:
+                    await recovery.join_escalation()
+                assert caught.value is original
+                assert owner.operations == ["force"]
+            else:
+>               await recovery.join_escalation()
+
+tests/unit/web/test_process_watchdog.py:255: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/process_recovery.py:92: in join_escalation
+    await self._join_owned(self._escalation_task)
+src/elspeth/web/process_recovery.py:82: in _join_owned
+    task.result()
+src/elspeth/web/process_recovery.py:48: in _escalate
+    self.watchdog.request_signal(signal.SIGTERM)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <tests.unit.web.test_process_watchdog.test_recovery_uses_semantic_owner_operations.<locals>.SemanticOwner object at 0x7ff12147a630>
+sig = <Signals.SIGTERM: 15>
+
+    def request_signal(self, sig):
+>       raise AssertionError("portable recovery attempted Unix signal dispatch")
+E       AssertionError: portable recovery attempted Unix signal dispatch
+
+tests/unit/web/test_process_watchdog.py:233: AssertionError
+______________ test_recovery_uses_semantic_owner_operations[ack] _______________
+
+self = <tests.unit.web.test_process_watchdog.test_recovery_uses_semantic_owner_operations.<locals>.SemanticOwner object at 0x7ff12147b0b0>
+reason = <RecoveryReason.REQUIRED_WORKER_LOST: 'REQUIRED_WORKER_LOST'>
+
+    async def begin_recovery(self, reason):
+        if failure == "ack":
+>           raise original
+E           elspeth.web.process_watchdog.ProcessWatchdogFailure: semantic owner failed
+
+tests/unit/web/test_process_watchdog.py:221: ProcessWatchdogFailure
+
+During handling of the above exception, another exception occurred:
+
+failure = 'ack'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", [None, "ack", "monitor"])
+    async def test_recovery_uses_semantic_owner_operations(failure):
+        """Recovery must work with an owner that has no Unix signal authority."""
+        class SemanticOwner(OwnedTestProcessWatchdog):
+            def __init__(self, draining):
+                super().__init__(draining)
+                self.operations = []
+    
+            async def begin_recovery(self, reason):
+                if failure == "ack":
+                    raise original
+                result = await super().begin_recovery(reason)
+                self.operations.append("ack")
+                return result
+    
+            def request_graceful_termination(self):
+                self.operations.append("graceful")
+    
+            def force_termination(self):
+                self.operations.append("force")
+    
+            def request_signal(self, sig):
+                raise AssertionError("portable recovery attempted Unix signal dispatch")
+    
+        original = ProcessWatchdogFailure("semantic owner failed")
+        draining = threading.Event()
+        owner = SemanticOwner(draining)
+        recovery = ProcessRecovery(watchdog=owner, instance_draining=draining)
+        if failure == "monitor":
+            recovery.start_monitor()
+            owner.fail(original)
+            with pytest.raises(ProcessWatchdogFailure) as caught:
+                await recovery.join_monitor_after_completion()
+            assert caught.value is original
+            assert owner.operations == ["force"]
+        else:
+            recovery.request_shutdown()
+            recovery.request_shutdown()
+            if failure == "ack":
+                with pytest.raises(ProcessWatchdogFailure) as caught:
+>                   await recovery.join_escalation()
+
+tests/unit/web/test_process_watchdog.py:251: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/process_recovery.py:92: in join_escalation
+    await self._join_owned(self._escalation_task)
+src/elspeth/web/process_recovery.py:82: in _join_owned
+    task.result()
+src/elspeth/web/process_recovery.py:45: in _escalate
+    self.watchdog.request_signal(signal.SIGKILL)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <tests.unit.web.test_process_watchdog.test_recovery_uses_semantic_owner_operations.<locals>.SemanticOwner object at 0x7ff12147b0b0>
+sig = <Signals.SIGKILL: 9>
+
+    def request_signal(self, sig):
+>       raise AssertionError("portable recovery attempted Unix signal dispatch")
+E       AssertionError: portable recovery attempted Unix signal dispatch
+
+tests/unit/web/test_process_watchdog.py:233: AssertionError
+____________ test_recovery_uses_semantic_owner_operations[monitor] _____________
+
+self = <elspeth.web.process_recovery.ProcessRecovery object at 0x7ff12147d250>
+
+    async def _monitor(self) -> None:
+        try:
+>           await self.watchdog.observe_helper_outcome()
+
+src/elspeth/web/process_recovery.py:35: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <tests.unit.web.test_process_watchdog.test_recovery_uses_semantic_owner_operations.<locals>.SemanticOwner object at 0x7ff12147d070>
+
+    async def observe_helper_outcome(self) -> None:
+        await self._outcome.wait()
+        if self.failure is not None:
+>           raise self.failure
+E           elspeth.web.process_watchdog.ProcessWatchdogFailure: semantic owner failed
+
+tests/fixtures/process_watchdog.py:73: ProcessWatchdogFailure
+
+During handling of the above exception, another exception occurred:
+
+failure = 'monitor'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", [None, "ack", "monitor"])
+    async def test_recovery_uses_semantic_owner_operations(failure):
+        """Recovery must work with an owner that has no Unix signal authority."""
+        class SemanticOwner(OwnedTestProcessWatchdog):
+            def __init__(self, draining):
+                super().__init__(draining)
+                self.operations = []
+    
+            async def begin_recovery(self, reason):
+                if failure == "ack":
+                    raise original
+                result = await super().begin_recovery(reason)
+                self.operations.append("ack")
+                return result
+    
+            def request_graceful_termination(self):
+                self.operations.append("graceful")
+    
+            def force_termination(self):
+                self.operations.append("force")
+    
+            def request_signal(self, sig):
+                raise AssertionError("portable recovery attempted Unix signal dispatch")
+    
+        original = ProcessWatchdogFailure("semantic owner failed")
+        draining = threading.Event()
+        owner = SemanticOwner(draining)
+        recovery = ProcessRecovery(watchdog=owner, instance_draining=draining)
+        if failure == "monitor":
+            recovery.start_monitor()
+            owner.fail(original)
+            with pytest.raises(ProcessWatchdogFailure) as caught:
+>               await recovery.join_monitor_after_completion()
+
+tests/unit/web/test_process_watchdog.py:243: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/process_recovery.py:96: in join_monitor_after_completion
+    await self._join_owned(self._monitor_task)
+src/elspeth/web/process_recovery.py:82: in _join_owned
+    task.result()
+src/elspeth/web/process_recovery.py:38: in _monitor
+    self.watchdog.request_signal(signal.SIGKILL)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <tests.unit.web.test_process_watchdog.test_recovery_uses_semantic_owner_operations.<locals>.SemanticOwner object at 0x7ff12147d070>
+sig = <Signals.SIGKILL: 9>
+
+    def request_signal(self, sig):
+>       raise AssertionError("portable recovery attempted Unix signal dispatch")
+E       AssertionError: portable recovery attempted Unix signal dispatch
+
+tests/unit/web/test_process_watchdog.py:233: AssertionError
+_____________ test_worker_cancellation_preserves_original_identity _____________
+
+    @pytest.mark.asyncio
+    async def test_worker_cancellation_preserves_original_identity() -> None:
+        coordinator = RuntimePreflightCoordinator()
+        original = asyncio.CancelledError("worker cancelled itself")
+    
+        async def worker() -> ValidationResult:
+            raise original
+    
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await coordinator.run(RuntimePreflightKey("cancel", 1, "state", "settings"), worker)
+>       assert caught.value is original
+E       AssertionError: assert CancelledError() is CancelledError('worker cancelled itself')
+E        +  where CancelledError() = <ExceptionInfo CancelledError() tblen=2>.value
+
+tests/unit/web/execution/test_runtime_preflight_coordinator.py:283: AssertionError
+_____________ test_seal_joins_admitted_worker_and_refuses_new_work _____________
+
+    @pytest.mark.asyncio
+    async def test_seal_joins_admitted_worker_and_refuses_new_work() -> None:
+        coordinator = RuntimePreflightCoordinator()
+        key = RuntimePreflightKey("seal", 1, "state", "settings")
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+        expected = _passing_preflight()
+    
+        async def worker() -> ValidationResult:
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return expected
+    
+        caller = asyncio.create_task(coordinator.run(key, worker))
+        await started.wait()
+>       join = asyncio.create_task(coordinator.seal_and_join())
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'RuntimePreflightCoordinator' object has no attribute 'seal_and_join'
+
+tests/unit/web/execution/test_runtime_preflight_coordinator.py:304: AttributeError
+_ test_seal_observes_failure_racing_completed_eviction_without_duplicate_delivery[False] _
+
+abandoned = False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("abandoned", [False, True])
+    async def test_seal_observes_failure_racing_completed_eviction_without_duplicate_delivery(abandoned: bool) -> None:
+        coordinator = RuntimePreflightCoordinator()
+        key = RuntimePreflightKey("failure", 1, "state", "settings")
+        release = asyncio.Event()
+        started = asyncio.Event()
+        original = ValueError("preflight failed")
+    
+        async def worker() -> ValidationResult:
+            started.set()
+            await release.wait()
+            raise original
+    
+        caller = asyncio.create_task(coordinator.run(key, worker))
+        await started.wait()
+        if abandoned:
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+        release.set()
+        if abandoned:
+            # Eviction runs before the join: close must still own its failure.
+            for _ in range(4):
+                await asyncio.sleep(0)
+            with pytest.raises(ValueError) as caught:
+                await coordinator.seal_and_join()
+            assert caught.value is original
+        else:
+            result = await caller
+            assert isinstance(result, RuntimePreflightFailure)
+            assert result.original_exc is original
+>           await coordinator.seal_and_join()
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'RuntimePreflightCoordinator' object has no attribute 'seal_and_join'
+
+tests/unit/web/execution/test_runtime_preflight_coordinator.py:350: AttributeError
+_ test_seal_observes_failure_racing_completed_eviction_without_duplicate_delivery[True] _
+
+abandoned = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("abandoned", [False, True])
+    async def test_seal_observes_failure_racing_completed_eviction_without_duplicate_delivery(abandoned: bool) -> None:
+        coordinator = RuntimePreflightCoordinator()
+        key = RuntimePreflightKey("failure", 1, "state", "settings")
+        release = asyncio.Event()
+        started = asyncio.Event()
+        original = ValueError("preflight failed")
+    
+        async def worker() -> ValidationResult:
+            started.set()
+            await release.wait()
+            raise original
+    
+        caller = asyncio.create_task(coordinator.run(key, worker))
+        await started.wait()
+        if abandoned:
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+        release.set()
+        if abandoned:
+            # Eviction runs before the join: close must still own its failure.
+            for _ in range(4):
+                await asyncio.sleep(0)
+            with pytest.raises(ValueError) as caught:
+>               await coordinator.seal_and_join()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^
+E               AttributeError: 'RuntimePreflightCoordinator' object has no attribute 'seal_and_join'
+
+tests/unit/web/execution/test_runtime_preflight_coordinator.py:344: AttributeError
+_ test_seal_retains_repeated_caller_cancellation_until_actual_completion[False] _
+
+fail = False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fail", [False, True])
+    async def test_seal_retains_repeated_caller_cancellation_until_actual_completion(fail: bool) -> None:
+        coordinator = RuntimePreflightCoordinator()
+        release = asyncio.Event()
+        started = asyncio.Event()
+        original = ValueError("abandoned failure")
+    
+        async def worker() -> ValidationResult:
+            started.set()
+            await release.wait()
+            if fail:
+                raise original
+            return _passing_preflight()
+    
+        caller = asyncio.create_task(coordinator.run(RuntimePreflightKey("join", 1, "s", "k"), worker))
+        await started.wait()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+>       join = asyncio.create_task(coordinator.seal_and_join())
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'RuntimePreflightCoordinator' object has no attribute 'seal_and_join'
+
+tests/unit/web/execution/test_runtime_preflight_coordinator.py:373: AttributeError
+_ test_seal_retains_repeated_caller_cancellation_until_actual_completion[True] _
+
+fail = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fail", [False, True])
+    async def test_seal_retains_repeated_caller_cancellation_until_actual_completion(fail: bool) -> None:
+        coordinator = RuntimePreflightCoordinator()
+        release = asyncio.Event()
+        started = asyncio.Event()
+        original = ValueError("abandoned failure")
+    
+        async def worker() -> ValidationResult:
+            started.set()
+            await release.wait()
+            if fail:
+                raise original
+            return _passing_preflight()
+    
+        caller = asyncio.create_task(coordinator.run(RuntimePreflightKey("join", 1, "s", "k"), worker))
+        await started.wait()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+>       join = asyncio.create_task(coordinator.seal_and_join())
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'RuntimePreflightCoordinator' object has no attribute 'seal_and_join'
+
+tests/unit/web/execution/test_runtime_preflight_coordinator.py:373: AttributeError
+___________ test_seal_joins_real_worker_in_fresh_explicit_lifecycle ____________
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-201/test_seal_joins_real_worker_in0')
+
+    def test_seal_joins_real_worker_in_fresh_explicit_lifecycle(tmp_path: Path) -> None:
+        log = tmp_path / "worker-child.log"
+        with log.open("w", encoding="utf-8") as output:
+            process = subprocess.Popen(
+                [sys.executable, "-c", "from tests.unit.web.execution.test_runtime_preflight_coordinator import _run_real_worker_join_child; _run_real_worker_join_child()"],
+                env=os.environ.copy(),
+                stdout=output,
+                stderr=subprocess.STDOUT,
+            )
+            try:
+                code = process.wait(timeout=15)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+>       assert code == 0, log.read_text(encoding="utf-8")
+E       AssertionError: Traceback (most recent call last):
+E           File "<string>", line 1, in <module>
+E           File "/workspace/elspeth/.claude/worktrees/composer-remediation-lifecycle-foundations/tests/unit/web/execution/test_runtime_preflight_coordinator.py", line 449, in _run_real_worker_join_child
+E             asyncio.run(main())
+E           File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/runners.py", line 195, in run
+E             return runner.run(main)
+E                    ^^^^^^^^^^^^^^^^
+E           File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/runners.py", line 118, in run
+E             return self._loop.run_until_complete(task)
+E                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/base_events.py", line 691, in run_until_complete
+E             return future.result()
+E                    ^^^^^^^^^^^^^^^
+E           File "/workspace/elspeth/.claude/worktrees/composer-remediation-lifecycle-foundations/tests/unit/web/execution/test_runtime_preflight_coordinator.py", line 433, in main
+E             join = asyncio.create_task(coordinator.seal_and_join())
+E                                        ^^^^^^^^^^^^^^^^^^^^^^^^^
+E         AttributeError: 'RuntimePreflightCoordinator' object has no attribute 'seal_and_join'
+E         
+E       assert 1 == 0
+
+tests/unit/web/execution/test_runtime_preflight_coordinator.py:467: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/web/test_process_watchdog.py::test_recovery_uses_semantic_owner_operations[None]
+FAILED tests/unit/web/test_process_watchdog.py::test_recovery_uses_semantic_owner_operations[ack]
+FAILED tests/unit/web/test_process_watchdog.py::test_recovery_uses_semantic_owner_operations[monitor]
+FAILED tests/unit/web/execution/test_runtime_preflight_coordinator.py::test_worker_cancellation_preserves_original_identity
+FAILED tests/unit/web/execution/test_runtime_preflight_coordinator.py::test_seal_joins_admitted_worker_and_refuses_new_work
+FAILED tests/unit/web/execution/test_runtime_preflight_coordinator.py::test_seal_observes_failure_racing_completed_eviction_without_duplicate_delivery[False]
+FAILED tests/unit/web/execution/test_runtime_preflight_coordinator.py::test_seal_observes_failure_racing_completed_eviction_without_duplicate_delivery[True]
+FAILED tests/unit/web/execution/test_runtime_preflight_coordinator.py::test_seal_retains_repeated_caller_cancellation_until_actual_completion[False]
+FAILED tests/unit/web/execution/test_runtime_preflight_coordinator.py::test_seal_retains_repeated_caller_cancellation_until_actual_completion[True]
+FAILED tests/unit/web/execution/test_runtime_preflight_coordinator.py::test_seal_joins_real_worker_in_fresh_explicit_lifecycle
+====================== 10 failed, 31 deselected in 7.14s =======================

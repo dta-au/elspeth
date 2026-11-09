@@ -1,0 +1,610 @@
+"""LineExplode deaggregation transform.
+
+Transforms one row containing a string field into multiple rows, one for each
+line in that string. This is a deterministic 1-to-N expansion for scraped HTML,
+plain text files, and other text payloads that need line-oriented downstream
+processing.
+
+THREE-TIER TRUST MODEL COMPLIANCE:
+
+Per the plugin protocol, transforms distinguish contract violations from bad row data:
+- A missing source field is an upstream contract violation and raises ``KeyError``
+- A non-string source value is returned as a non-retryable row error so the
+  executor can apply the configured ``on_error`` route without coercing data
+- Empty strings are valid string values but cannot be deaggregated into rows, so
+  they are returned as non-retryable data errors
+"""
+
+from __future__ import annotations
+
+import copy
+import sys
+from typing import TYPE_CHECKING, Any
+
+from pydantic import Field, field_validator, model_validator
+
+from elspeth.contracts import Determinism
+from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.contract_propagation import narrow_contract_to_output
+from elspeth.contracts.errors import PluginContractViolation
+from elspeth.contracts.field_collision import detect_field_collisions
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.core.canonical import canonical_json
+from elspeth.plugins.infrastructure.base import BaseTransform
+from elspeth.plugins.infrastructure.config_base import TransformDataConfig
+from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.sources.field_normalization import is_normalized_field_name
+
+if TYPE_CHECKING:
+    from elspeth.contracts.plugin_assistance import PluginAssistance
+    from elspeth.contracts.plugin_semantics import InputSemanticRequirements, OutputSemanticDeclaration
+
+
+DEFAULT_MAX_LINES = 10_000
+HARD_MAX_LINES = 100_000
+DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024 * 1024
+_LINE_BOUNDARY_CHARS = frozenset(("\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"))
+
+
+class LineExplodeConfig(TransformDataConfig):
+    """Configuration for line-oriented string deaggregation."""
+
+    source_field: str = Field(..., description="Name of the string field to split into lines")
+    output_field: str = Field(default="line", description="Name for each emitted line")
+    include_index: bool = Field(default=True, description="Whether to include a line index field")
+    index_field: str = Field(default="line_index", description="Name for the emitted line index")
+    max_lines: int = Field(
+        default=DEFAULT_MAX_LINES,
+        gt=0,
+        le=HARD_MAX_LINES,
+        description="Maximum number of output lines this transform may emit for one input row",
+    )
+    max_output_bytes: int = Field(
+        default=DEFAULT_MAX_OUTPUT_BYTES,
+        gt=0,
+        le=DEFAULT_MAX_OUTPUT_BYTES,
+        description="Maximum estimated size of all rows emitted for one input row (serialized bytes plus copied-container memory)",
+    )
+
+    @field_validator("source_field", "output_field", "index_field")
+    @classmethod
+    def _reject_empty_field_names(cls, v: str, info: Any) -> str:
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError(f"{info.field_name} must be non-empty")
+        return stripped
+
+    @field_validator("output_field", "index_field")
+    @classmethod
+    def _validate_output_identifiers(cls, v: str, info: Any) -> str:
+        if not v.isidentifier():
+            raise ValueError(f"{info.field_name} must be a valid Python identifier, got {v!r}")
+        return v
+
+    @model_validator(mode="after")
+    def _reject_field_collisions(self) -> LineExplodeConfig:
+        if self.output_field == self.source_field:
+            raise ValueError(f"output_field and source_field must differ, both are '{self.output_field}'")
+        if self.include_index:
+            if self.index_field == self.source_field:
+                raise ValueError(f"index_field and source_field must differ, both are '{self.index_field}'")
+            if self.index_field == self.output_field:
+                raise ValueError(f"index_field and output_field must differ, both are '{self.index_field}'")
+        return self
+
+    @model_validator(mode="after")
+    def _require_statically_resolvable_source_field_when_output_contract_depends_on_it(self) -> LineExplodeConfig:
+        """Fail closed when static output-contract derivation cannot resolve aliases."""
+        static_output_inputs: set[str] = set(self.schema_config.guaranteed_fields or ())
+        if self.schema_config.fields is not None:
+            static_output_inputs.update(field.name for field in self.schema_config.fields)
+
+        if static_output_inputs and self.source_field not in static_output_inputs:
+            raise ValueError(
+                "source_field must use the normalized field name when schema declares "
+                "guaranteed_fields or explicit fields for output-contract propagation. "
+                f"Got {self.source_field!r}; known normalized fields are {sorted(static_output_inputs)!r}."
+            )
+
+        return self
+
+
+def _line_explode_added_output_fields(
+    *,
+    output_field: str,
+    include_index: bool,
+    index_field: str,
+) -> tuple[FieldDefinition, ...]:
+    """Return the typed fields LineExplode guarantees on successful output rows."""
+    fields = [
+        FieldDefinition(name=output_field, field_type="str", required=True),
+    ]
+    if include_index:
+        fields.append(FieldDefinition(name=index_field, field_type="int", required=True))
+    return tuple(fields)
+
+
+def _build_line_explode_output_schema_config(cfg: LineExplodeConfig) -> SchemaConfig:
+    """Build output schema config excluding the consumed source field."""
+    field_by_name: dict[str, FieldDefinition] = {}
+    if cfg.schema_config.fields is not None:
+        field_by_name.update((field.name, field) for field in cfg.schema_config.fields if field.name != cfg.source_field)
+
+    added_fields = _line_explode_added_output_fields(
+        output_field=cfg.output_field,
+        include_index=cfg.include_index,
+        index_field=cfg.index_field,
+    )
+    field_by_name.update((field.name, field) for field in added_fields)
+
+    base_guaranteed = set(cfg.schema_config.guaranteed_fields or ())
+    base_guaranteed.discard(cfg.source_field)
+    output_guaranteed = base_guaranteed | {field.name for field in added_fields}
+
+    return SchemaConfig(
+        mode=cfg.schema_config.mode if cfg.schema_config.fields is not None else "flexible",
+        fields=tuple(field_by_name.values()),
+        guaranteed_fields=tuple(sorted(output_guaranteed)),
+        audit_fields=cfg.schema_config.audit_fields,
+        required_fields=cfg.schema_config.required_fields,
+    )
+
+
+def _build_line_explode_input_requirements(
+    *,
+    source_field: str,
+) -> InputSemanticRequirements:
+    from elspeth.contracts.plugin_semantics import (
+        FieldSemanticRequirement,
+        InputSemanticRequirements,
+        TextFraming,
+        UnknownSemanticPolicy,
+    )
+
+    return InputSemanticRequirements(
+        fields=(
+            # Constrain ONE dimension: framing. splitlines() cares where the
+            # line boundaries are, not what the text MEANS, so content_kind is
+            # deliberately unconstrained (the shape json_explode already uses).
+            # Every producer this requirement should block conflicts on framing
+            # alone — web_scrape's compact text declares COMPACT — so
+            # constraining content_kind blocked nothing extra, while
+            # downgrading to UNKNOWN every producer that declares
+            # framing but honestly abstains on kind (an LLM: prose or markdown
+            # is not statically decidable). It was also wrong in one real case:
+            # JSON_STRUCTURED + NEWLINE_FRAMED is JSONL, and splitting JSONL
+            # into one object per row is correct rather than a defect. NOT_TEXT
+            # — a positive claim that the value is not text at all — stays
+            # excluded; note web_scrape's raw html is NOT that (it declares
+            # UNCONSTRAINED, elspeth-24c04df25f), and splitting fetched text
+            # into line rows is as legitimate as splitting generated text.
+            FieldSemanticRequirement(
+                field_name=source_field,
+                accepted_content_kinds=frozenset(),
+                accepted_text_framings=frozenset(
+                    {
+                        TextFraming.NEWLINE_FRAMED,
+                        TextFraming.LINE_COMPATIBLE,
+                        # Splitting unconstrained free text is legitimate: it is
+                        # how generated multiline text becomes one row per line,
+                        # which is the only correct way to write it to a file.
+                        TextFraming.UNCONSTRAINED,
+                    },
+                ),
+                requirement_code="line_explode.source_field.line_framed_text",
+                severity="high",
+                # WARN, not FAIL. line_explode is a USEFULNESS guard, not a
+                # correctness one: compact text yields a single row holding the
+                # whole value — a no-op, not data loss. Contrast TextSink, which
+                # DISCARDS the row, and so earns a hard requirement.
+                #
+                # Nothing genuinely wrong is unblocked by this. A wrong producer
+                # declares a conflicting framing, and CONFLICT short-circuits
+                # ahead of UNKNOWN in compare_semantic, so it stays blocked
+                # under every policy. FAIL was blocking exactly one class:
+                # producers that did not DECLARE. That included both LLM
+                # plugins, which made `llm -> line_explode -> text` unauthorable
+                # and left "write generated text to a file" with no correct
+                # spelling at all (elspeth-b6d9f04827, ADR-039).
+                unknown_policy=UnknownSemanticPolicy.WARN,
+                configured_by=("source_field",),
+            ),
+        ),
+    )
+
+
+def _build_line_explode_output_semantics(
+    *,
+    output_field: str,
+) -> OutputSemanticDeclaration:
+    """Declare what one emitted line provably is.
+
+    ``text_framing=COMPACT`` is a fact this transform mechanically knows, not
+    an estimate. ``_splitlines_bounded`` cuts the source at every ``\\r``,
+    ``\\r\\n`` and every member of ``_LINE_BOUNDARY_CHARS``, and emits only the
+    slices BETWEEN those cuts. So no emitted value can contain a line-boundary
+    character of any kind — strictly stronger than the "no CR or LF" that
+    ``TextSink``'s one-record-per-row invariant actually needs.
+
+    Declaring it is the point. Without this, ``llm -> line_explode -> text``
+    — the ONE correct spelling of "write generated multiline text to a file",
+    and the composition ADR-039 §Consequences claims is SATISFIED — resolved to
+    UNKNOWN, making the RECOMMENDED shape indistinguishable from an undeclared
+    one and leaving ``TextSink``'s requirement satisfied by nothing in the
+    registry.
+
+    ``value_type=STR``: ``process`` returns an error for a non-``str`` source,
+    while every successful output is a slice of a ``str`` and therefore a
+    ``str``.
+
+    ``content_kind=UNKNOWN`` is an honest ABSTENTION, not an omission.
+    Splitting changes where the line boundaries are, never what the text MEANS,
+    so one line of markdown is still markdown and one line of prose is still
+    prose — this transform cannot know which it forwarded. The input
+    requirement above deliberately leaves ``accepted_content_kinds`` empty for
+    the same reason, so there is nothing to forward even in principle.
+    Claiming PLAIN_TEXT here would manufacture false conflicts against any
+    future consumer constraining that dimension.
+    """
+    from elspeth.contracts.plugin_semantics import (
+        ContentKind,
+        FieldSemanticFacts,
+        OutputSemanticDeclaration,
+        SemanticValueType,
+        TextFraming,
+    )
+
+    return OutputSemanticDeclaration(
+        fields=(
+            FieldSemanticFacts(
+                field_name=output_field,
+                content_kind=ContentKind.UNKNOWN,
+                text_framing=TextFraming.COMPACT,
+                value_type=SemanticValueType.STR,
+                fact_code="line_explode.output_field.compact_line",
+                configured_by=("output_field",),
+            ),
+        ),
+    )
+
+
+#: Allowance on top of sys.getsizeof() for each container deepcopy() rebuilds:
+#: GC header, allocator slack and the per-object memo entry it keeps while
+#: copying. Calibrated against traced peaks (an empty dict copies at ~190 B).
+_COPIED_CONTAINER_OVERHEAD_BYTES = 128
+
+#: Container copies each emitted row holds at peak: process() deep-copies the
+#: retained fields, then PipelineRow deep-freezes its own copy while the
+#: deep-copied rows are still alive.
+_CONTAINER_COPIES_PER_EMITTED_ROW = 2
+
+
+def _copied_container_bytes(value: Any) -> int:
+    """Approximate memory one deepcopy() of a thawed row value allocates.
+
+    deepcopy() rebuilds every dict, list and tuple but shares immutable
+    scalars, so one copy costs each container's own size; the caller charges
+    scalar content through the canonical-bytes term.
+    """
+    total = 0
+    pending: list[Any] = [value]
+    while pending:
+        current = pending.pop()
+        if type(current) is dict:
+            pending.extend(current.values())
+        elif type(current) is list or type(current) is tuple:
+            pending.extend(current)
+        else:
+            continue
+        total += sys.getsizeof(current) + _COPIED_CONTAINER_OVERHEAD_BYTES
+    return total
+
+
+def _splitlines_bounded(source_value: str, *, max_lines: int) -> tuple[list[str] | None, int]:
+    """Split like str.splitlines(), stopping once the configured cap is exceeded."""
+    lines: list[str] = []
+    line_start = 0
+    index = 0
+    length = len(source_value)
+
+    while index < length:
+        char = source_value[index]
+        separator_length = 0
+        if char == "\r":
+            separator_length = 2 if index + 1 < length and source_value[index + 1] == "\n" else 1
+        elif char in _LINE_BOUNDARY_CHARS:
+            separator_length = 1
+
+        if separator_length == 0:
+            index += 1
+            continue
+
+        lines.append(source_value[line_start:index])
+        if len(lines) > max_lines:
+            return None, len(lines)
+        index += separator_length
+        line_start = index
+
+    if line_start < length:
+        lines.append(source_value[line_start:])
+        if len(lines) > max_lines:
+            return None, len(lines)
+
+    return lines, len(lines)
+
+
+class LineExplode(BaseTransform):
+    """Explode a string field into one output row per line."""
+
+    # source_field is the INPUT column being split; the other two are emitted.
+    output_naming_config_keys = frozenset({"output_field", "index_field"})
+    name = "line_explode"
+    determinism = Determinism.DETERMINISTIC
+    plugin_version = "1.0.0"
+    source_file_hash: str | None = "sha256:9650af524c9f0b51"
+    config_model = LineExplodeConfig
+    usage_when_to_use: str = (
+        "Use to split one newline-framed text field into rows while preserving the rest of the input "
+        "row and, when requested, recording each emitted line's index."
+    )
+    usage_when_not_to_use: str = (
+        "Not for reading lines from a file or parsing CSV records: use the text source for a file, "
+        "or blob_csv_expand for CSV content already stored as a payload blob."
+    )
+    example_use: str = """transform:
+  plugin: line_explode
+  options:
+    source_field: content
+    output_field: line
+    include_index: true
+    index_field: line_index
+    max_lines: 1000
+    schema:
+      mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("text", "lines", "fan-out", "deaggregation")
+    creates_tokens = True
+    preserves_input_values = True
+
+    @classmethod
+    def probe_config(cls) -> dict[str, Any]:
+        """Minimal config for the ADR-009 backward invariant."""
+        return {
+            "schema": {"mode": "observed"},
+            "source_field": "line_explode_text",
+        }
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__(config)
+        cfg = LineExplodeConfig.from_dict(config, plugin_name=self.name)
+        self._initialize_declared_input_fields(cfg)
+
+        self._source_field = cfg.source_field
+        self._output_field = cfg.output_field
+        self._include_index = cfg.include_index
+        self._index_field = cfg.index_field
+        self._max_lines = cfg.max_lines
+        self._max_output_bytes = cfg.max_output_bytes
+
+        # process() copies the whole input row minus the consumed source field
+        # onto every emitted line, so the row's other columns — including an
+        # upstream llm's <response_field>_usage / _model — really do reach the
+        # next consumer. `passes_through_input` cannot say that (source_field
+        # is dropped), which is what hid those columns from the extras firewall
+        # (elspeth-15c72686f2). An original-header spelling cannot name the
+        # normalized key removed at runtime, so the static declaration
+        # abstains while process() resolves that key from row lineage.
+        self.forwards_input_fields = is_normalized_field_name(cfg.source_field)
+        self.removed_input_fields = frozenset({cfg.source_field}) if self.forwards_input_fields else frozenset()
+
+        fields = [cfg.output_field]
+        if cfg.include_index:
+            fields.append(cfg.index_field)
+        self.declared_output_fields = frozenset(fields)
+
+        self.input_schema, self.output_schema = self._create_schemas(
+            cfg.schema_config,
+            "LineExplode",
+            adds_fields=True,
+        )
+        self._output_schema_config = _build_line_explode_output_schema_config(cfg)
+
+    def input_semantic_requirements(self) -> InputSemanticRequirements:
+        return _build_line_explode_input_requirements(
+            source_field=self._source_field,
+        )
+
+    def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Inject one valid line so the value-preservation harness reaches emission."""
+        return [self._augment_invariant_probe_row(probe, field_name=self._source_field, value="only-line")]
+
+    def output_semantics(self) -> OutputSemanticDeclaration:
+        return _build_line_explode_output_semantics(
+            output_field=self._output_field,
+        )
+
+    @classmethod
+    def get_agent_assistance(
+        cls,
+        *,
+        issue_code: str | None = None,
+    ) -> PluginAssistance | None:
+        from elspeth.contracts.plugin_assistance import PluginAssistance
+
+        if issue_code is None:
+            return PluginAssistance(
+                plugin_name="line_explode",
+                issue_code=None,
+                summary="Deaggregate a string field by splitting on line boundaries — emits one row per line; blank lines are retained.",
+                composer_hints=(
+                    "source_field must contain newline-framed, line-compatible, or unconstrained free text — compact text yields a single row with the whole content.",
+                    "Producer compatibility: web_scrape with format: 'markdown' or text_separator: '\\n' works; format: 'text' with whitespace separator does NOT.",
+                    "Generated text qualifies: put line_explode between an llm producer and a text sink, because the text sink writes one line per row and diverts any value containing CR or LF.",
+                    "If you need to split on a non-newline delimiter, use field_mapper + value_transform first to insert newlines.",
+                ),
+            )
+        if issue_code != "line_explode.source_field.line_framed_text":
+            return None
+        return PluginAssistance(
+            plugin_name="line_explode",
+            issue_code="line_explode.source_field.line_framed_text",
+            summary=(
+                "line_explode calls splitlines() on the configured source_field. "
+                "Compact text (a single string with no newlines) emits one row "
+                "containing the whole content — the opposite of line "
+                "deaggregation. The producer must emit newline-framed, "
+                "line-compatible, or unconstrained free text.\n"
+                "\n"
+                "A GENERATIVE producer (the llm source or transform) declares "
+                "text_framing=unconstrained and SATISFIES this requirement — "
+                "whether a model emits a newline is not knowable before the "
+                "run, and splitting that text is legitimate rather than a "
+                "compromise. It is how generated multiline text reaches a "
+                "file, because the text sink writes one line per row and "
+                "diverts any value containing CR or LF. So if you are reading "
+                "this for an llm producer, the fix is not to remove "
+                "line_explode."
+            ),
+            suggested_fixes=(
+                "Configure the upstream producer to emit newline-framed text "
+                "(for web_scrape: text_separator: '\\n', or use format: markdown).",
+                "Choose a producer whose output_semantics() declares a text_framing of newline_framed, line_compatible, or unconstrained.",
+                "Writing generated text to a file: author llm -> line_explode -> text, "
+                "with line_explode's source_field set to the llm response_field and the "
+                "text sink's field set to line_explode's output_field.",
+            ),
+        )
+
+    def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Exercise the real source-field consumption path for the backward invariant."""
+        return [
+            self._augment_invariant_probe_row(
+                probe,
+                field_name=self._source_field,
+                value="only-line",
+            )
+        ]
+
+    def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
+        """Explode a string field into multiple rows."""
+        source_value = row[self._source_field]
+        if type(source_value) is not str:
+            # A ROW-level fact, so it takes the same routable exit as the
+            # empty-string and too-many-lines rejections below rather than
+            # aborting the run. ADR-008 §"TIER_1 registration is load-bearing"
+            # (Correction 2026-08-21, elspeth-181db83da7): only a RETURNED
+            # error reaches the `result.status == "error"` branch that honours
+            # `on_error`; a raised exception escapes every catch site.
+            # Not coerced: `str(value)` would invent a text reading of a
+            # non-text value and then explode it into lines the operator never
+            # supplied. A number has no lines.
+            return TransformResult.error(
+                {
+                    "reason": "invalid_input",
+                    "field": self._source_field,
+                    "error_type": "wrong_type",
+                    "error": f"must be a string, got {type(source_value).__name__}",
+                },
+                retryable=False,
+            )
+
+        lines, line_count = _splitlines_bounded(source_value, max_lines=self._max_lines)
+        if lines is None:
+            return TransformResult.error(
+                {
+                    "reason": "too_many_lines",
+                    "field": self._source_field,
+                    "line_count": line_count,
+                    "max_lines": self._max_lines,
+                },
+                retryable=False,
+            )
+        if len(lines) == 0:
+            return TransformResult.error(
+                {"reason": "invalid_input", "field": self._source_field, "error": "empty string"},
+                retryable=False,
+            )
+
+        row_data = row.to_dict()
+        if self._source_field in row_data:
+            normalized_source_field = self._source_field
+        else:
+            normalized_source_field = row.contract.resolve_name(self._source_field)
+        collisions = detect_field_collisions(set(row_data) - {normalized_source_field}, self.declared_output_fields)
+        if collisions:
+            raise PluginContractViolation(
+                f"Transform '{self.name}' would overwrite existing input fields {collisions}. "
+                "This is a pipeline configuration error — the transform's output fields collide with fields already present in the row."
+            )
+        base = {k: v for k, v in row_data.items() if k != normalized_source_field}
+
+        # Refuse the amplification before deepcopy() materializes it.  A line
+        # count alone is not a memory bound: every output retains a full copy
+        # of the other fields, so a modest nested value multiplied by thousands
+        # of lines can exhaust the process.  Each emitted row is charged its
+        # canonical bytes (what serializing it downstream costs) plus the
+        # memory of every container rebuilt for it (by deepcopy() here and
+        # again by PipelineRow's freeze) — scalars are shared, containers are
+        # not, so canonical bytes alone undercount a container-heavy value
+        # (``{}`` is 2 bytes of JSON but ~190 bytes per copy).  The per-row
+        # allowance covers the emitted field and index.
+        retained_bytes = len(canonical_json(base).encode("utf-8"))
+        copied_container_bytes = _copied_container_bytes(base)
+        emitted_line_bytes = sum(len(line.encode("utf-8")) for line in lines)
+        estimated_output_bytes = (retained_bytes + _CONTAINER_COPIES_PER_EMITTED_ROW * copied_container_bytes + 64) * len(
+            lines
+        ) + emitted_line_bytes
+        if estimated_output_bytes > self._max_output_bytes:
+            return TransformResult.error(
+                {
+                    "reason": "output_too_large",
+                    "field": self._source_field,
+                    "estimated_output_bytes": estimated_output_bytes,
+                    "max_output_bytes": self._max_output_bytes,
+                    "line_count": len(lines),
+                },
+                retryable=False,
+            )
+
+        output_rows: list[dict[str, Any]] = []
+        for i, line in enumerate(lines):
+            output = copy.deepcopy(base)
+            output[self._output_field] = line
+            if self._include_index:
+                output[self._index_field] = i
+            output_rows.append(output)
+
+        first_keys = set(output_rows[0].keys())
+        for i, output_row in enumerate(output_rows[1:], start=1):
+            row_keys = set(output_row.keys())
+            if row_keys != first_keys:
+                raise ValueError(
+                    f"Multi-row output has heterogeneous schema: "
+                    f"row 0 has fields {sorted(first_keys)}, "
+                    f"row {i} has fields {sorted(row_keys)}"
+                )
+
+        output_contract = narrow_contract_to_output(
+            input_contract=row.contract,
+            output_row=output_rows[0],
+        )
+        output_contract = self._apply_declared_output_field_contracts(output_contract)
+        output_contract = self._align_output_contract(output_contract)
+
+        fields_added = [self._output_field]
+        if self._include_index:
+            fields_added.append(self._index_field)
+
+        return TransformResult.success_multi(
+            [PipelineRow(r, output_contract) for r in output_rows],
+            success_reason={
+                "action": "transformed",
+                "fields_added": fields_added,
+                "fields_removed": [self._source_field],
+            },
+        )
+
+    def close(self) -> None:
+        """No resources to release."""
+        pass

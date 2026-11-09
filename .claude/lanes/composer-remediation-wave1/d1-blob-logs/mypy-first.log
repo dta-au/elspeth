@@ -1,0 +1,3 @@
+src/elspeth/web/blobs/service.py:2929: error: Incompatible types in assignment (expression has type "tuple[Path, Path, Path, Path]", variable has type "tuple[Path] | tuple[Path, Path]")  [assignment]
+pyproject.toml: note: unused section(s): module = ['claude_agent_sdk', 'claude_agent_sdk.*', 'dynaconf', 'dynaconf.*', 'elspeth.tui.*', 'examples.*', 'ijson.*', 'pypdfium2', 'pypdfium2.*', 'pypdfium2_raw', 'pypdfium2_raw.*', 'scripts.*', 'tests.*']
+Found 1 error in 1 file (checked 7 source files)

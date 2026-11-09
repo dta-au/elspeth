@@ -1,0 +1,7 @@
+full source src/elspeth/web/sessions/protocol.py 66362e7215018900c42e15495ba0fa673f0e47f83a073c0803abd5589db6db28 -> 9267f0c4d773254d72723b332d8941182c8c64c08065bd6263431bab47886684
+full source src/elspeth/web/sessions/proposal_authority.py b0c369242b2c7c963e3048154a219503ad7efaf91a56a7f550475a4dfbbeb4c3 -> 8129b0b767f94cf7cb461024accaaaf3fe3b2b29105154f5b0c8436b4333bc9b
+Traceback (most recent call last):
+  File "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-gate-bindings.py", line 47, in <module>
+    assert writers[key] == stable_ast_dump(node(path, symbol, True)), key
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: src/elspeth/web/sessions/routes/composer/proposals.py:accept_composition_proposal

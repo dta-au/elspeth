@@ -1,0 +1,277 @@
+I001 [*] Import block is un-sorted or un-formatted
+   --> tests/testcontainer/web/test_composer_operations_postgres.py:3:1
+    |
+  1 |   """PostgreSQL durable composer controls on a private bounded test cluster."""
+  2 |
+  3 | / from __future__ import annotations
+  4 | |
+  5 | | from datetime import timedelta
+  6 | | from uuid import uuid4
+  7 | |
+  8 | | import pytest
+  9 | | import structlog
+ 10 | | from sqlalchemy.engine import make_url
+ 11 | | from tests.fixtures.identities import ensure_test_identity
+ 12 | | from tests.helpers.postgres_target import postgres_test_target
+ 13 | | from tests.testcontainer.web.test_session_operation_fence_postgres import _register_instance
+ 14 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 15 | |     test_admission_binding_conflict_precedes_missing_base_membership as test_admission_binding_conflict_precedes_missing_base_members…
+ 16 | | )
+ 17 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 18 | |     test_admission_replay_conflict_active_owner_and_provider as test_admission_replay_conflict_active_owner_and_provider,
+ 19 | | )
+ 20 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 21 | |     test_cancel_refuses_business_but_sealed_failure_can_settle as test_cancel_refuses_business_but_sealed_failure_can_settle,
+ 22 | | )
+ 23 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 24 | |     test_cancelled_terminal_awaiter_joins_actual_sql_and_returns_committed_terminal as test_cancelled_terminal_awaiter_joins_actual_s…
+ 25 | | )
+ 26 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 27 | |     test_changed_stop_state_prevents_exact_retry as test_changed_stop_state_prevents_exact_retry,
+ 28 | | )
+ 29 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 30 | |     test_claim_is_queue_only_and_running_never_requeued as test_claim_is_queue_only_and_running_never_requeued,
+ 31 | | )
+ 32 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 33 | |     test_concurrent_same_id_is_one_immutable_admission as test_concurrent_same_id_is_one_immutable_admission,
+ 34 | | )
+ 35 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 36 | |     test_direct_sql_child_cancel_waits_for_actual_thread_completion as test_direct_sql_child_cancel_waits_for_actual_thread_completio…
+ 37 | | )
+ 38 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 39 | |     test_distinct_ids_race_has_one_active_winner as test_distinct_ids_race_has_one_active_winner,
+ 40 | | )
+ 41 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 42 | |     test_driver_commit_fault_reconciles_one_immutable_terminal as test_driver_commit_fault_reconciles_one_immutable_terminal,
+ 43 | | )
+ 44 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 45 | |     test_each_status_bundle_constraints_are_unmasked_and_null_closed as test_each_status_bundle_constraints_are_unmasked_and_null_clo…
+ 46 | | )
+ 47 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 48 | |     test_exact_retry_preserves_entire_assistant_audit_and_response_bundle as test_exact_retry_preserves_entire_assistant_audit_and_re…
+ 49 | | )
+ 50 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 51 | |     test_expired_job_refuses_business_write_at_database_clock as test_expired_job_refuses_business_write_at_database_clock,
+ 52 | | )
+ 53 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 54 | |     test_failed_fresh_writer_read_preserves_unknown_terminal_custody as test_failed_fresh_writer_read_preserves_unknown_terminal_cust…
+ 55 | | )
+ 56 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 57 | |     test_failed_terminal_has_one_exact_immutable_retry as test_failed_terminal_has_one_exact_immutable_retry,
+ 58 | | )
+ 59 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 60 | |     test_failed_terminal_prewrite_fence_refusal_preserves_recovery_authority as test_failed_terminal_prewrite_fence_refusal_preserves…
+ 61 | | )
+ 62 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 63 | |     test_final_job_actor_delete_has_unmasked_restrict_control as test_final_job_actor_delete_has_unmasked_restrict_control,
+ 64 | | )
+ 65 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 66 | |     test_final_job_base_delete_is_restricted_but_session_cascade_succeeds as test_final_job_base_delete_is_restricted_but_session_cas…
+ 67 | | )
+ 68 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 69 | |     test_final_job_user_delete_guard_and_foreign_key_are_independent as test_final_job_user_delete_guard_and_foreign_key_are_independ…
+ 70 | | )
+ 71 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 72 | |     test_fresh_recovery_requires_persisted_compose_and_owned_instance as test_fresh_recovery_requires_persisted_compose_and_owned_ins…
+ 73 | | )
+ 74 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 75 | |     test_independent_process_admission_converges_on_one_action as test_independent_process_admission_converges_on_one_action,
+ 76 | | )
+ 77 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 78 | |     test_new_job_actor_and_base_foreign_keys_have_unmasked_negative_controls as test_new_job_actor_and_base_foreign_keys_have_unmaske…
+ 79 | | )
+ 80 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 81 | |     test_queued_cancel_settles_without_a_claim_and_retains_immutable_body as test_queued_cancel_settles_without_a_claim_and_retains_i…
+ 82 | | )
+ 83 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 84 | |     test_queued_provider_admission_cancellation_does_not_create_attempt as test_queued_provider_admission_cancellation_does_not_creat…
+ 85 | | )
+ 86 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 87 | |     test_queued_settlement_rechecks_priority_under_owned_claim_lock as test_queued_settlement_rechecks_priority_under_owned_claim_loc…
+ 88 | | )
+ 89 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 90 | |     test_real_schema_cross_session_and_cross_operation_bindings_are_rejected as test_real_schema_cross_session_and_cross_operation_bi…
+ 91 | | )
+ 92 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 93 | |     test_recompose_tool_prefix_is_eligible_bare_narration_is_not as test_recompose_tool_prefix_is_eligible_bare_narration_is_not,
+ 94 | | )
+ 95 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 96 | |     test_required_audit_sql_failure_preserves_canonical_integrity_classification as test_required_audit_sql_failure_preserves_canonic…
+ 97 | | )
+ 98 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+ 99 | |     test_required_ingress_cancellation_retains_actual_sql_until_binding_commit as test_required_ingress_cancellation_retains_actual_s…
+100 | | )
+101 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+102 | |     test_required_intermediate_cancellation_joins_actual_sql as test_required_intermediate_cancellation_joins_actual_sql,
+103 | | )
+104 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+105 | |     test_required_provider_sql_cancellation_joins_committed_evidence as test_required_provider_sql_cancellation_joins_committed_evide…
+106 | | )
+107 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+108 | |     test_running_bundle_rejects_nullability_and_fence_holes as test_running_bundle_rejects_nullability_and_fence_holes,
+109 | | )
+110 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+111 | |     test_stale_claim_cannot_release_or_renew_reclaimed_work as test_stale_claim_cannot_release_or_renew_reclaimed_work,
+112 | | )
+113 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+114 | |     test_start_refusal_rolls_back_fence_and_has_no_user_side_effect as test_start_refusal_rolls_back_fence_and_has_no_user_side_effec…
+115 | | )
+116 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+117 | |     test_stop_between_fresh_read_and_retry_lock_refuses_success as test_stop_between_fresh_read_and_retry_lock_refuses_success,
+118 | | )
+119 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+120 | |     test_terminal_atomic_publication_and_immutability as test_terminal_atomic_publication_and_immutability,
+121 | | )
+122 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+123 | |     test_terminal_projection_error_replays_committed_terminal as test_terminal_projection_error_replays_committed_terminal,
+124 | | )
+125 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+126 | |     test_terminal_read_rejects_tampering_after_named_guard_removed as test_terminal_read_rejects_tampering_after_named_guard_removed,
+127 | | )
+128 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+129 | |     test_terminal_transaction_fault_windows_keep_one_bundle as test_terminal_transaction_fault_windows_keep_one_bundle,
+130 | | )
+131 | | from tests.unit.web.coordination.test_composer_operation_authority import (
+132 | |     test_unchanged_state_retries_once_after_actual_sql_completion as test_unchanged_state_retries_once_after_actual_sql_completion,
+133 | | )
+134 | | from tests.unit.web.coordination.test_graph_recovery_persistence import (
+135 | |     test_explicit_restore_uses_parked_identity_across_turns as test_explicit_restore_uses_parked_identity_across_turns,
+136 | | )
+137 | | from tests.unit.web.coordination.test_graph_recovery_persistence import (
+138 | |     test_explicit_unavailable_target_is_terminal_refusal as test_explicit_unavailable_target_is_terminal_refusal,
+139 | | )
+140 | | from tests.unit.web.coordination.test_graph_recovery_persistence import (
+141 | |     test_foreign_intermediate_checkpoint_refuses_recovery as test_foreign_intermediate_checkpoint_refuses_recovery,
+142 | | )
+143 | | from tests.unit.web.coordination.test_graph_recovery_persistence import (
+144 | |     test_malformed_gate_metadata_is_quarantined as test_malformed_gate_metadata_is_quarantined,
+145 | | )
+146 | | from tests.unit.web.coordination.test_graph_recovery_persistence import (
+147 | |     test_park_preserves_current_unpersisted_candidate as test_park_preserves_current_unpersisted_candidate,
+148 | | )
+149 | | from tests.unit.web.coordination.test_graph_recovery_persistence import (
+150 | |     test_safe_checkpoint_skips_lossy_unknown_graph_fields as test_safe_checkpoint_skips_lossy_unknown_graph_fields,
+151 | | )
+152 | | from tests.unit.web.coordination.test_graph_recovery_persistence import (
+153 | |     test_safe_reset_empty_fallback_and_terminal_are_atomic as test_safe_reset_empty_fallback_and_terminal_are_atomic,
+154 | | )
+155 | | from tests.unit.web.coordination.test_graph_recovery_persistence import (
+156 | |     test_target_is_frozen_and_current_head_cas_refuses_newer_work as test_target_is_frozen_and_current_head_cas_refuses_newer_work,
+157 | | )
+158 | | from tests.unit.web.coordination.test_graph_recovery_persistence import (
+159 | |     test_terminal_response_failure_rolls_back_graph_and_receipts as test_terminal_response_failure_rolls_back_graph_and_receipts,
+160 | | )
+161 | | from tests.unit.web.coordination.test_graph_recovery_persistence import (
+162 | |     test_unsaveable_candidate_never_blocks_reset as test_unsaveable_candidate_never_blocks_reset,
+163 | | )
+164 | | from tests.unit.web.sessions.test_composer_recovery_security import (
+165 | |     test_completed_restore_refusal_preserves_head_and_pending_proposal as test_completed_restore_refusal_preserves_head_and_pending_p…
+166 | | )
+167 | | from tests.unit.web.sessions.test_composer_recovery_security import (
+168 | |     test_restore_other_session_park_matches_unknown_refusal_and_preserves_head as test_restore_other_session_park_matches_unknown_ref…
+169 | | )
+170 | | from tests.unit.web.sessions.test_atomic_pipeline_review_evidence import (
+171 | |     test_atomic_candidate_supersedes_older_identical_pending_review as test_atomic_candidate_supersedes_older_identical_pending_revie…
+172 | | )
+173 | | from tests.unit.web.sessions.test_atomic_pipeline_review_evidence import (
+174 | |     test_atomic_opt_out_binds_candidate_derived_head_and_assistant as test_atomic_opt_out_binds_candidate_derived_head_and_assistant,
+175 | | )
+176 | | from tests.unit.web.sessions.test_atomic_pipeline_review_evidence import (
+177 | |     test_atomic_pipeline_replay_has_no_dml_and_ignores_later_head as test_atomic_pipeline_replay_has_no_dml_and_ignores_later_head,
+178 | | )
+179 | | from tests.unit.web.sessions.test_atomic_pipeline_review_evidence import (
+180 | |     test_atomic_pipeline_required_ticket_refusal_is_completed_without_sql as test_atomic_pipeline_required_ticket_refusal_is_complete…
+181 | | )
+182 | | from tests.unit.web.sessions.test_atomic_pipeline_review_evidence import (
+183 | |     test_atomic_pipeline_review_fault_rolls_back_candidate_and_assistant as test_atomic_pipeline_review_fault_rolls_back_candidate_an…
+184 | | )
+185 | | from tests.unit.web.sessions.test_atomic_pipeline_review_evidence import (
+186 | |     test_atomic_pipeline_review_is_candidate_bound as test_atomic_pipeline_review_is_candidate_bound,
+187 | | )
+188 | | from tests.unit.web.sessions.test_atomic_pipeline_review_evidence import (
+189 | |     test_sealed_trust_revocation_crosses_signal_only_for_exact_authority as test_sealed_trust_revocation_crosses_signal_only_for_exac…
+190 | | )
+191 | | from tests.unit.web.sessions.test_atomic_pipeline_review_evidence import (
+192 | |     test_state_checkpoint_required_ticket_observes_actual_completion as test_state_checkpoint_required_ticket_observes_actual_complet…
+193 | | )
+194 | | from tests.unit.web.sessions.test_atomic_pipeline_review_evidence import (
+195 | |     test_terminal_failure_required_coordinator_observes_each_actual_attempt as test_terminal_failure_required_coordinator_observes_ea…
+196 | | )
+197 | |
+198 | | from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+199 | | from elspeth.web.coordination.repository import PostgresSessionOperationRepository
+200 | | from elspeth.web.sessions.engine import create_session_engine
+201 | | from elspeth.web.sessions.schema import initialize_session_schema
+202 | | from elspeth.web.sessions.service import SessionServiceImpl
+203 | | from elspeth.web.sessions.telemetry import build_sessions_telemetry
+    | |___________________________________________________________________^
+204 |
+205 |   pytestmark = pytest.mark.testcontainer
+    |
+help: Organize imports
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> tests/unit/web/coordination/test_graph_recovery_persistence.py:3:1
+   |
+ 1 |   """Transactional recovery proofs with real session storage and no providers."""
+ 2 |
+ 3 | / from dataclasses import replace
+ 4 | | from uuid import UUID, uuid4
+ 5 | |
+ 6 | | import pytest
+ 7 | | from sqlalchemy import func, select, text, update
+ 8 | | from tests.unit.web.coordination.test_composer_operation_authority import response, start
+ 9 | |
+10 | | from elspeth.web.composer.graph_recovery import GraphRecoveryIntent
+11 | | from elspeth.web.composer.state import PipelineMetadata
+12 | | from elspeth.web.sessions.composer_operations import ComposerOperationAssistantWrite
+13 | | from elspeth.web.sessions.graph_recovery import checkpoint_data, empty_recovery_state
+14 | | from elspeth.web.sessions.models import chat_messages_table, composition_graph_parks_table, composition_states_table
+15 | | from elspeth.web.sessions.protocol import StaleComposeStateError
+16 | | from elspeth.web.sessions.schemas import SendMessageRequest
+17 | | from tests.fixtures.resource_identity import PARK_UUID_SPELLINGS, park_uuid_spelling
+   | |____________________________________________________________________________________^
+18 |
+19 |   pytest_plugins = ["tests.unit.web.coordination.test_composer_operation_authority"]
+   |
+help: Organize imports
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> tests/unit/web/sessions/test_graph_recovery_turn.py:3:1
+   |
+ 1 |   """Recovery crosses real admission, turn ownership and atomic terminal storage."""
+ 2 |
+ 3 | / from __future__ import annotations
+ 4 | |
+ 5 | | import json
+ 6 | | from dataclasses import replace
+ 7 | | from unittest.mock import create_autospec
+ 8 | | from uuid import uuid4
+ 9 | |
+10 | | import pytest
+11 | | from httpx import ASGITransport, AsyncClient
+12 | | from sqlalchemy import select, update
+13 | |
+14 | | from elspeth.contracts.composer_llm_audit import ToolContractDialect
+15 | | from elspeth.web.composer.availability import ComposerAvailability
+16 | | from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
+17 | | from elspeth.web.composer.graph_recovery import GraphRecoveryIntent
+18 | | from elspeth.web.composer.protocol import ComposerResult, ComposerService, GraphRecoveryResponse
+19 | | from elspeth.web.composer.service import ComposerServiceImpl
+20 | | from elspeth.web.composer.state import CompositionState, PipelineMetadata
+21 | | from elspeth.web.sessions.graph_recovery import checkpoint_data
+22 | | from elspeth.web.sessions.models import composition_states_table
+23 | | from elspeth.web.sessions.schemas import MessageWithStateResponse
+24 | | from tests.fixtures.resource_identity import PARK_UUID_SPELLINGS, park_uuid_spelling
+25 | | from tests.unit.web.composer._helpers import _make_settings
+26 | | from tests.unit.web.composer.test_compose_loop_interpretation_review_dispatch import _build_composer
+27 | | from tests.unit.web.composer.test_compose_loop_persistence import _tool_batch_response
+28 | | from tests.unit.web.sessions.test_routes import _EMPTY_STATE, _make_app
+29 | | from tests.unit.web.sessions.test_run_composer_turn import _run, _running_job, _seed_output_only_draft
+30 | | from tests.unit.web.sessions.test_composer_recovery_security import _park
+   | |_________________________________________________________________________^
+   |
+help: Organize imports
+
+Found 3 errors.
+[*] 3 fixable with the `--fix` option.

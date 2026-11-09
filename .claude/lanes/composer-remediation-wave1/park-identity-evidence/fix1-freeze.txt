@@ -1,0 +1,6 @@
+Frozen fix1 candidate: HEAD, complete binary patch digest, and empty untracked inventory unchanged across final checks and controls.
+HEAD=05bcab93955b2070ffdc90e72eddd7368502d2c1
+full_patch_sha256=227c9c2795c1c426ee5eba865bd524ef0085c35590fe613efd50a9a71e3e8dca
+fix_delta_sha256=f216c0000b189cac0bf65cd09062009c500098538bc2b282b6520b783ba1043f
+original_review_patch_sha256=1a9999a08b9983d0cfb7a88cc508f1f9fab3518226d5c8e1487f55579c7a8616
+Production graph_recovery.py remains byte-identical to the reviewed candidate.

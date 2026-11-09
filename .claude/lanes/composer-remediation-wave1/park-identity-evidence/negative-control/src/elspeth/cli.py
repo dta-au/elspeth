@@ -1,0 +1,5301 @@
+"""ELSPETH Command Line Interface.
+
+Entry point for the elspeth CLI tool.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from collections.abc import Callable, Collection, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, cast, get_args
+
+import typer
+import yaml
+from dynaconf.vendor.ruamel.yaml.parser import ParserError as YamlParserError
+from dynaconf.vendor.ruamel.yaml.scanner import ScannerError as YamlScannerError
+from pydantic import TypeAdapter, ValidationError
+
+import elspeth.contracts.errors as contract_errors
+from elspeth import __version__
+from elspeth.config_loading import load_settings
+from elspeth.contracts import ExecutionResult, SecretResolutionInput
+from elspeth.contracts.auth import AuthProviderType
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import (
+    AbandonRefusedError,
+    CommencementGateFailedError,
+    DependencyFailedError,
+    EmptyResumeStateError,
+    GracefulShutdownError,
+    IncompleteSourceResumeError,
+    RunWorkerEvictedError,
+    VerificationMismatchError,
+    WriteLockHeldError,
+)
+from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.preflight import PreflightResult
+from elspeth.contracts.types import AggregationName
+from elspeth.core.checkpoint.recovery import NonResumableRunError
+from elspeth.core.config import ElspethSettings, resolve_config
+from elspeth.core.dag import ExecutionGraph, GraphValidationError
+from elspeth.core.security.config_secrets import SecretLoadError, load_secrets_from_config
+from elspeth.core.template_materialization import TemplateFileError
+from elspeth.engine.orchestrator.preflight import SinkEffectCapabilityError
+
+if TYPE_CHECKING:
+    from sqlalchemy.engine import Engine
+
+    from elspeth.contracts import SinkProtocol
+    from elspeth.contracts.coordination import WorkerMembershipToken
+    from elspeth.contracts.payload_store import PayloadStore
+    from elspeth.contracts.plugin_context import PluginContext
+    from elspeth.contracts.run_result import RunResult
+    from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
+    from elspeth.core.config import SecretsConfig
+    from elspeth.core.landscape import LandscapeDB
+    from elspeth.core.rate_limit import RateLimitRegistry
+    from elspeth.engine import Orchestrator, PipelineConfig
+    from elspeth.engine.orchestrator import RowPlugin
+    from elspeth.plugins.infrastructure.power_automate_nonlive import PowerAutomateNonliveConstruction
+    from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
+    from elspeth.telemetry import TelemetryManager
+    from elspeth.web.auth.audit import AuthAuditRecorder
+    from elspeth.web.auth.local import LocalAuthProvider, RetireIdentity
+    from elspeth.web.coordination.identity_authority import IdentityRetired
+__all__ = [
+    "app",
+    "load_settings",  # Re-exported from config for convenience
+]
+
+app = typer.Typer(
+    name="elspeth",
+    help="ELSPETH: Auditable Sense/Decide/Act pipelines.",
+    no_args_is_help=True,
+)
+composer_app = typer.Typer(help="Composer web UI commands.")
+composer_users_app = typer.Typer(help="Local composer user management commands.")
+doctor_app = typer.Typer(help="Deployment readiness checks.")
+audit_export_app = typer.Typer(help="Verify delivered audit-export evidence.")
+app.add_typer(composer_app, name="composer")
+composer_app.add_typer(composer_users_app, name="users")
+app.add_typer(doctor_app, name="doctor")
+app.add_typer(audit_export_app, name="audit-export")
+
+
+def _parse_audit_export_key_references(values: list[str] | None) -> dict[str, str]:
+    """Parse exact signer-to-environment references without reading secrets."""
+    import re
+
+    from elspeth.contracts.audit_export import validate_credential_free_identifier
+
+    environment_reference = re.compile(r"[A-Z_][A-Z0-9_]*\Z")
+    references: dict[str, str] = {}
+    for value in values or ():
+        if value.count("=") != 1:
+            raise typer.BadParameter(
+                "each key reference must be SIGNER_KEY_ID=ENVIRONMENT_VARIABLE",
+                param_hint="--key-ref",
+            )
+        signer_key_id, reference = value.split("=", 1)
+        try:
+            validate_credential_free_identifier(signer_key_id, "signer_key_id")
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--key-ref") from exc
+        if environment_reference.fullmatch(reference) is None:
+            raise typer.BadParameter(
+                "key reference values must be environment variable names",
+                param_hint="--key-ref",
+            )
+        if signer_key_id in references:
+            raise typer.BadParameter(
+                f"duplicate key reference for signer {signer_key_id!r}",
+                param_hint="--key-ref",
+            )
+        references[signer_key_id] = reference
+    return references
+
+
+@audit_export_app.command("verify")
+def verify_delivered_audit_export(
+    path: Path = typer.Argument(..., help="Delivered JSON file or portable CSV bundle directory."),
+    key_ref: list[str] | None = typer.Option(
+        None,
+        "--key-ref",
+        metavar="SIGNER_KEY_ID=ENVIRONMENT_VARIABLE",
+        help="Retained signing-key reference. Repeat for every historical signer that may be verified.",
+    ),
+    allow_unsigned: bool = typer.Option(
+        False,
+        "--allow-unsigned",
+        help="Allow an integrity-only result for a deliberately unsigned export.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit one stable JSON result object."),
+) -> None:
+    """Verify the manifest, record chain, content hashes, and delivered files."""
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.core.audit_export_verifier import (
+        AuditExportVerificationError,
+        environment_audit_export_verification_key_resolver,
+        verify_audit_export,
+    )
+
+    references = _parse_audit_export_key_references(key_ref)
+    resolver = environment_audit_export_verification_key_resolver(references) if references else None
+    try:
+        report = verify_audit_export(
+            path,
+            key_resolver=resolver,
+            require_authenticated=not allow_unsigned,
+        )
+    except AuditExportVerificationError as exc:
+        failure_code = exc.code
+        failure_message = str(exc)
+    except (AuditIntegrityError, OSError) as exc:
+        failure_code = "invalid_export"
+        failure_message = str(exc)
+    else:
+        payload = {
+            "authenticated": report.authenticated,
+            "artifact_digest": report.artifact_digest,
+            "chunk_content_hashes": list(report.chunk_content_hashes),
+            "chunk_count": report.chunk_count,
+            "code": "ok",
+            "format": report.format,
+            "manifest_content_hash": report.manifest_content_hash,
+            "record_count": report.record_count,
+            "run_id": report.run_id,
+            "signer_key_id": report.signer_key_id,
+            "snapshot_id": report.snapshot_id,
+            "status": "verified",
+            "total_bytes": report.total_bytes,
+        }
+        if json_output:
+            typer.echo(json.dumps(payload, sort_keys=True))
+        else:
+            authentication = "authenticated" if report.authenticated else "integrity-only (authenticated: false)"
+            typer.echo(
+                f"VERIFIED {authentication}: format={report.format} run_id={report.run_id} "
+                f"snapshot_id={report.snapshot_id} signer={report.signer_key_id} "
+                f"artifact_digest={report.artifact_digest}"
+            )
+        return
+
+    failure = {
+        "authenticated": False,
+        "code": failure_code,
+        "message": failure_message,
+        "status": "failed",
+    }
+    if json_output:
+        typer.echo(json.dumps(failure, sort_keys=True))
+    else:
+        typer.echo(f"FAILED [{failure_code}]: {failure_message}", err=True)
+    raise typer.Exit(1)
+
+
+def _preflight_follower_sink_effects(
+    sinks: Mapping[str, SinkProtocol],
+    configured_modes: Mapping[str, str],
+    *,
+    runtime_bindings: Mapping[str, SinkEffectRuntimeBinding] | None = None,
+) -> object:
+    """Fail closed over resolved follower sinks before any startup work."""
+    from elspeth.contracts.sink_effects import SinkEffectInputKind
+    from elspeth.engine.orchestrator.preflight import validate_pipeline_sink_effect_capabilities
+
+    return validate_pipeline_sink_effect_capabilities(
+        sinks,
+        configured_modes=configured_modes,
+        required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+        runtime_bindings=runtime_bindings,
+    )
+
+
+def _start_follower_plugin_lifecycle(
+    *,
+    transforms: Collection[RowPlugin],
+    sinks: Mapping[str, SinkProtocol],
+    configured_modes: Mapping[str, str],
+    admission: object,
+    ctx: PluginContext,
+    started_transforms: list[RowPlugin] | None = None,
+    started_sinks: dict[str, SinkProtocol] | None = None,
+    runtime_bindings: Mapping[str, SinkEffectRuntimeBinding] | None = None,
+) -> None:
+    """Consume admission and optionally record successfully-started plugins."""
+    from elspeth.contracts.sink_effects import SinkEffectInputKind
+    from elspeth.engine.orchestrator.preflight import require_sink_effect_admission
+
+    require_sink_effect_admission(
+        sinks,
+        configured_modes=configured_modes,
+        required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+        admission=admission,
+        runtime_bindings=runtime_bindings,
+        run_mode=ctx.run_mode,
+    )
+    for transform in transforms:
+        transform.on_start(ctx)
+        if started_transforms is not None:
+            started_transforms.append(transform)
+    for sink_name, sink in sinks.items():
+        sink.on_start(ctx)
+        if started_sinks is not None:
+            started_sinks[sink_name] = sink
+
+
+def _instantiate_plugins_for_runtime_preflight(
+    settings: ElspethSettings,
+    *,
+    purpose: object | None = None,
+    power_automate_nonlive: PowerAutomateNonliveConstruction | None = None,
+) -> PluginBundle:
+    """Construct runtime plugins under the constructor-safe preflight posture."""
+    from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
+    from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_from_config
+
+    resolved_purpose = SinkEffectExecutionPurpose.FRESH if purpose is None else purpose
+    if not isinstance(resolved_purpose, SinkEffectExecutionPurpose):
+        raise TypeError("Runtime preflight purpose must be exact SinkEffectExecutionPurpose")
+    if power_automate_nonlive is not None:
+        return instantiate_plugins_from_config(
+            settings,
+            preflight_mode=True,
+            sink_effect_purpose=resolved_purpose,
+            power_automate_nonlive=power_automate_nonlive,
+        )
+    return instantiate_plugins_from_config(
+        settings,
+        preflight_mode=True,
+        sink_effect_purpose=resolved_purpose,
+    )
+
+
+def _join_after_follower_sink_preflight(
+    orchestrator: Orchestrator,
+    run_id: str,
+    settings: ElspethSettings,
+) -> tuple[WorkerMembershipToken, PluginBundle, Mapping[str, SinkProtocol], Mapping[str, str], object]:
+    """Join only after the exact follower execution sinks earn admission."""
+    from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
+
+    plugins = _instantiate_plugins_for_runtime_preflight(settings, purpose=SinkEffectExecutionPurpose.FOLLOWER)
+    execution_sinks, execution_sink_modes, admission = _preflight_execution_sinks(
+        settings,
+        plugins,
+        purpose=SinkEffectExecutionPurpose.FOLLOWER,
+    )
+    member_token = orchestrator.join_run(run_id, settings)
+    return member_token, plugins, execution_sinks, execution_sink_modes, admission
+
+
+def _run_doctor_command(
+    collector: Callable[..., list[Any]],
+    *,
+    init_schema: bool,
+    json_output: bool,
+) -> None:
+    """Run one deployment collector behind the shared redacted CLI boundary."""
+    from dataclasses import asdict
+
+    from elspeth.web.config import settings_from_env
+    from elspeth.web.deployment_contract import ContractCheck
+    from elspeth.web.doctor import sanitize_error
+
+    if json_output:
+        # In --json mode stdout IS the report (parsed by the ECS/ACA acceptance
+        # drivers and the PostgreSQL doctor proofs). configure_logging() targets
+        # stdout for container capture, and settings load below can emit a
+        # WARNING (WebSettings' composer_turn_budget_underfunded disclosure,
+        # elspeth-f159d2394b), so the log channel moves to stderr FIRST. The
+        # disclosure stays a log line by design — it is not a ContractCheck
+        # (a binary check cannot carry a disclosure honestly; elspeth-4b27604bb7).
+        from elspeth.core.logging import route_elspeth_logs_to_stderr
+
+        route_elspeth_logs_to_stderr()
+
+    try:
+        settings = settings_from_env()
+    except Exception as exc:
+        checks = [ContractCheck("settings_load", False, sanitize_error("web settings could not be loaded", exc))]
+    else:
+        try:
+            checks = collector(settings, init_schema=init_schema)
+        except Exception as exc:
+            checks = [ContractCheck("doctor_internal_error", False, sanitize_error("doctor collection failed", exc))]
+
+    if json_output:
+        typer.echo(json.dumps([asdict(check) for check in checks]))
+    else:
+        for check in checks:
+            status = "OK" if check.ok else "FAIL"
+            typer.echo(f"{status} {check.name}: {check.detail}")
+
+    if not all(check.ok for check in checks):
+        raise typer.Exit(1)
+
+
+@doctor_app.command("deployment")
+def doctor_deployment(
+    init_schema: bool = typer.Option(
+        False,
+        "--init-schema",
+        help="Initialize only eligible missing or repairable PostgreSQL schemas.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit a bare ordered JSON check list."),
+) -> None:
+    """Check the provider-neutral external PostgreSQL deployment contract."""
+    from elspeth.web.doctor import collect_deployment_checks
+
+    _run_doctor_command(
+        collect_deployment_checks,
+        init_schema=init_schema,
+        json_output=json_output,
+    )
+
+
+@doctor_app.command("aws-ecs")
+def doctor_aws_ecs(
+    init_schema: bool = typer.Option(
+        False,
+        "--init-schema",
+        help="Initialize only eligible missing or repairable PostgreSQL schemas.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit a bare ordered JSON check list."),
+) -> None:
+    """Check whether this environment satisfies the AWS ECS contract."""
+    from elspeth.web.doctor import collect_checks
+
+    _run_doctor_command(
+        collect_checks,
+        init_schema=init_schema,
+        json_output=json_output,
+    )
+
+
+def version_callback(value: bool) -> None:
+    """Print version and exit."""
+    if value:
+        typer.echo(f"elspeth version {__version__}")
+        raise typer.Exit()
+
+
+def _load_dotenv(env_file: Path | None = None) -> bool:
+    """Load environment variables from .env file.
+
+    Args:
+        env_file: Explicit path to .env file. If None, searches for .env
+                 in current directory and parent directories.
+
+    Returns:
+        True if .env was found and loaded, False otherwise.
+
+    Raises:
+        typer.Exit: If explicit env_file path doesn't exist.
+    """
+    from dotenv import find_dotenv, load_dotenv
+
+    if env_file is not None:
+        if not env_file.exists():
+            typer.secho(
+                f"Error: .env file not found: {env_file}",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(1)
+        return load_dotenv(env_file, override=False)
+
+    # Search upward from the working directory. A bare ``load_dotenv()``
+    # searches upward from the *calling file* -- this module -- so an editable
+    # checkout loaded the checkout's ``.env`` from any cwd and a wheel install
+    # ignored the operator's cwd ``.env`` (GitHub issue #353).
+    discovered = find_dotenv(usecwd=True)
+    if not discovered:
+        return False
+    return load_dotenv(discovered, override=False)  # Don't override existing env vars
+
+
+def _emit_schema_compatibility_error(
+    error: Exception,
+    output_format: Literal["console", "json"] = "console",
+    *,
+    operation: str,
+) -> None:
+    """Emit stale/incompatible Landscape schema errors without a traceback."""
+    if output_format == "json":
+        import json as json_module
+
+        typer.echo(
+            json_module.dumps(
+                {
+                    "event": "schema_compatibility_error",
+                    "error_type": type(error).__name__,
+                    "message": str(error),
+                }
+            ),
+            err=True,
+        )
+        return
+
+    typer.secho(
+        f"Landscape database schema compatibility error during {operation}.",
+        fg=typer.colors.RED,
+        err=True,
+    )
+    typer.echo(str(error), err=True)
+
+
+def _emit_worker_evicted_event(error: RunWorkerEvictedError, output_format: Literal["console", "json"]) -> None:
+    """Carry observed coordination loss to both CLI consumers."""
+    if output_format == "json":
+        payload = {
+            "event": "evicted",
+            "run_id": error.run_id,
+            "worker_id": error.worker_id,
+            "message": str(error),
+        }
+        if error.reason is not None:
+            payload["reason"] = error.reason
+        typer.echo(json.dumps(payload), err=True)
+    else:
+        typer.echo(str(error), err=True)
+
+
+@app.callback()
+def main(
+    version: bool | None = typer.Option(
+        None,
+        "--version",
+        "-V",
+        callback=version_callback,
+        is_eager=True,
+        help="Show version and exit.",
+    ),
+    no_dotenv: bool = typer.Option(
+        False,
+        "--no-dotenv",
+        help="Skip loading .env file.",
+    ),
+    env_file: Path | None = typer.Option(
+        None,
+        "--env-file",
+        help="Path to .env file (skips automatic search).",
+        exists=False,  # We handle existence check ourselves for better error message
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Enable verbose/debug logging.",
+    ),
+    json_logs: bool = typer.Option(
+        False,
+        "--json-logs",
+        help="Output structured JSON logs (for machine processing).",
+    ),
+) -> None:
+    """ELSPETH: Auditable Sense/Decide/Act pipelines."""
+    # Configure logging at entry point (before any subcommands run)
+    # CRITICAL: This must be called early so container logs appear in stdout
+    from elspeth.core.logging import configure_logging
+
+    log_level = "DEBUG" if verbose else "INFO"
+    configure_logging(json_output=json_logs, level=log_level)
+
+    if not no_dotenv:
+        _load_dotenv(env_file=env_file)
+    elif env_file is not None:
+        typer.secho(
+            "Warning: --env-file ignored because --no-dotenv is set.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+
+
+def _ensure_output_directories(
+    config: ElspethSettings,
+    *,
+    execution_sink_names: Collection[str] | None = None,
+    include_sink_directories: bool = True,
+) -> list[str]:
+    """Ensure required output directories exist, creating them if needed.
+
+    Creates directories BEFORE attempting to create databases or files,
+    providing clear error messages if creation fails.
+
+    Args:
+        config: Validated ElspethSettings
+
+    Returns:
+        List of error messages (empty if all directories exist or were created)
+    """
+    from sqlalchemy.engine.url import make_url
+
+    errors: list[str] = []
+
+    # 1. Ensure Landscape database directory exists (for SQLite)
+    db_url = config.landscape.url
+    parsed_url = make_url(db_url)
+
+    if parsed_url.drivername.startswith("sqlite"):
+        # Extract the file path from SQLite URL
+        # SQLite URLs: sqlite:///./path/to/file.db or sqlite:////absolute/path.db
+        db_path = parsed_url.database
+        if db_path:
+            # Handle relative paths (./foo) and absolute paths (/foo)
+            db_file = Path(db_path)
+            parent_dir = db_file.parent
+
+            # Resolve to absolute path for clearer error messages
+            resolved_parent = parent_dir.resolve()
+
+            if not parent_dir.exists():
+                try:
+                    parent_dir.mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    errors.append(f"Cannot create Landscape database directory: {resolved_parent}\n  Database URL: {db_url}\n  Error: {e}")
+            elif not parent_dir.is_dir():
+                errors.append(f"Landscape database path exists but is not a directory: {resolved_parent}\n  Database URL: {db_url}")
+            elif not os.access(parent_dir, os.W_OK):
+                errors.append(f"Landscape database directory is not writable: {resolved_parent}\n  Database URL: {db_url}")
+
+    # 2. Ensure payload store directory exists
+    payload_path = config.payload_store.base_path
+    if not payload_path.exists():
+        try:
+            # FilesystemPayloadStore rejects group/world-writable roots. mkdir()
+            # mode is still filtered through umask, so normalize only the root
+            # this preflight creates instead of weakening validation later.
+            payload_path.mkdir(mode=0o700, parents=True, exist_ok=False)
+            if os.name != "nt":
+                # Bind permission normalization to the directory we created.
+                # O_NOFOLLOW prevents a raced symlink replacement from redirecting
+                # fchmod() to another path owned by this user.
+                payload_fd = os.open(payload_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    os.fchmod(payload_fd, 0o700)
+                finally:
+                    os.close(payload_fd)
+        except FileExistsError as e:
+            if not payload_path.exists():
+                errors.append(f"Cannot create payload store directory: {payload_path.resolve()}\n  Error: {e}")
+        except OSError as e:
+            errors.append(f"Cannot create payload store directory: {payload_path.resolve()}\n  Error: {e}")
+    if payload_path.exists() and not payload_path.is_dir():
+        errors.append(f"Payload store path exists but is not a directory: {payload_path.resolve()}")
+    elif payload_path.exists() and not os.access(payload_path, os.W_OK):
+        errors.append(f"Payload store directory is not writable: {payload_path.resolve()}")
+
+    # 3. Ensure sink output directories exist (for file-based sinks)
+    if not include_sink_directories:
+        return errors
+    for sink_name, sink_config in config.sinks.items():
+        if execution_sink_names is not None and sink_name not in execution_sink_names:
+            continue
+        # SinkSettings.options is always dict[str, Any]; "path" key present for file-based sinks
+        sink_path = sink_config.options.get("path")
+        if sink_path:
+            sink_file = Path(sink_path)
+            sink_parent = sink_file.parent
+
+            if sink_parent and str(sink_parent) != ".":
+                resolved_sink_parent = sink_parent.resolve()
+                if not sink_parent.exists():
+                    try:
+                        sink_parent.mkdir(parents=True, exist_ok=True)
+                    except OSError as e:
+                        errors.append(
+                            f"Cannot create sink '{sink_name}' output directory: {resolved_sink_parent}\n  Output path: {sink_path}\n  Error: {e}"
+                        )
+                elif not sink_parent.is_dir():
+                    errors.append(f"Sink '{sink_name}' output path parent exists but is not a directory: {resolved_sink_parent}")
+
+    return errors
+
+
+def _admit_cli_nonlive_run(config: ElspethSettings) -> None:
+    """Check source-run authority before plugin construction or preflight I/O."""
+    if config.run_mode is RunMode.LIVE:
+        return
+    from elspeth.cli_helpers import resolve_audit_passphrase
+    from elspeth.contracts.call_mode import RuntimeRunMode
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.engine.orchestrator.run_modes import admit_nonlive_settings, admit_source_run
+    from elspeth.plugins.infrastructure.run_mode_capabilities import (
+        admit_nonlive_plugin_classes,
+        precheck_nonlive_plugin_names,
+    )
+
+    admit_nonlive_settings(config)
+    precheck_nonlive_plugin_names(config)
+    passphrase = resolve_audit_passphrase(config.landscape)
+    db = LandscapeDB.from_url(
+        config.landscape.url,
+        passphrase=passphrase,
+        create_tables=False,
+        read_only=True,
+    )
+    try:
+        admit_source_run(db, RuntimeRunMode(config.run_mode, config.replay_from))
+    finally:
+        db.close()
+    admit_nonlive_plugin_classes(config)
+
+
+def _admit_raw_cli_nonlive_run(settings_path: Path) -> tuple[RunMode, frozenset[str], object | None]:
+    """Check source-run authority before secrets, file templates, or plugins."""
+    from sqlalchemy.engine.url import make_url
+
+    from elspeth.cli_helpers import resolve_audit_passphrase
+    from elspeth.contracts.call_mode import RuntimeRunMode
+    from elspeth.core.config import ConcurrencySettings, LandscapeSettings, TelemetrySettings
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.factory import RecorderFactory
+    from elspeth.engine.orchestrator.run_modes import admit_source_run
+    from elspeth.plugins.infrastructure.run_mode_capabilities import precheck_nonlive_plugin_names_from_raw
+
+    raw_config = _load_raw_yaml(settings_path)
+    mode = _raw_run_mode_before_secrets(raw_config)
+    if mode is RunMode.LIVE:
+        return mode, frozenset(), None
+
+    # Dynaconf can change invocation authority via environment overrides.
+    # Require these fields in YAML so source-run admission uses the same DB and
+    # ID that the subsequent full settings load will see.
+    if any(name in os.environ for name in ("ELSPETH_REPLAY_FROM", "ELSPETH_LANDSCAPE", "ELSPETH_LANDSCAPE__URL")):
+        raise ValueError("Replay/verify source run and Landscape must be literal YAML settings")
+    forbidden_env_prefixes = (
+        "ELSPETH_CONCURRENCY",
+        "ELSPETH_DEPENDS_ON",
+        "ELSPETH_COLLECTION_PROBES",
+        "ELSPETH_COMMENCEMENT_GATES",
+        "ELSPETH_TELEMETRY",
+        "ELSPETH_SOURCES",
+        "ELSPETH_TRANSFORMS",
+        "ELSPETH_AGGREGATIONS",
+        "ELSPETH_COLLECTORS",
+        "ELSPETH_SINKS",
+    )
+    if any(name == prefix or name.startswith(f"{prefix}__") for name in os.environ for prefix in forbidden_env_prefixes):
+        raise ValueError("Replay/verify admission fields must be literal YAML settings")
+    secrets_config = _parse_raw_secrets_config(raw_config)
+    if secrets_config.source == "keyvault":
+        raise ValueError("Replay/verify cannot fetch Key Vault secrets")
+    requested_plugins = precheck_nonlive_plugin_names_from_raw(raw_config)
+    try:
+        replay_from = TypeAdapter(str).validate_python(raw_config.get("replay_from"), strict=True)
+    except ValidationError as exc:
+        raise ValueError("Replay/verify requires a literal replay_from run ID") from exc
+    if not replay_from.strip():
+        raise ValueError("Replay/verify requires a literal replay_from run ID")
+    raw_landscape = raw_config.get("landscape", {})
+    landscape = LandscapeSettings.model_validate(raw_landscape)
+    if landscape.export.enabled:
+        raise ValueError("Replay/verify with Landscape export is unsupported")
+    raw_concurrency = raw_config.get("concurrency", {})
+    if ConcurrencySettings.model_validate(raw_concurrency).max_workers != 1:
+        raise ValueError("Replay/verify requires concurrency.max_workers=1")
+    raw_telemetry = raw_config.get("telemetry", {})
+    if TelemetrySettings.model_validate(raw_telemetry).enabled:
+        raise ValueError("Replay/verify with telemetry exporters is unsupported")
+    for side_channel in ("depends_on", "collection_probes", "commencement_gates"):
+        if raw_config.get(side_channel):
+            raise ValueError(f"Replay/verify with {side_channel} is unsupported")
+    parsed_url = make_url(landscape.url)
+    if (
+        parsed_url.get_backend_name() == "sqlite"
+        and parsed_url.database is not None
+        and parsed_url.database != ":memory:"
+        and not parsed_url.database.startswith("file:")
+        and not Path(parsed_url.database).exists()
+    ):
+        raise contract_errors.OrchestrationInvariantError(f"Replay/verify source run {replay_from!r} does not exist")
+    db = LandscapeDB.from_url(
+        landscape.url,
+        passphrase=resolve_audit_passphrase(landscape),
+        create_tables=False,
+        read_only=True,
+    )
+    try:
+        admit_source_run(db, RuntimeRunMode(mode, replay_from))
+        from elspeth.contracts.json_parser import parse_json_strict
+
+        source = RecorderFactory.read_only(db).run_lifecycle.get_run(replay_from)
+        if source is None:
+            raise ValueError(f"Replay/verify source run {replay_from!r} disappeared during admission")
+        source_settings, parse_error = parse_json_strict(source.settings_json)
+        if parse_error is not None or type(source_settings) is not dict:
+            raise ValueError(f"Replay/verify source run {replay_from!r} has invalid settings_json")
+        from elspeth.plugins.infrastructure.power_automate_nonlive import (
+            admit_power_automate_archive,
+            has_power_automate_components,
+            project_power_automate_nonlive,
+        )
+
+        if has_power_automate_components(raw_config) or has_power_automate_components(source_settings):
+            archive = admit_power_automate_archive(RecorderFactory.read_only(db), replay_from)
+            project_power_automate_nonlive(raw_config, archive)
+            source_settings = archive
+    finally:
+        db.close()
+    return mode, requested_plugins, source_settings
+
+
+def _install_nonlive_plugin_scope(mode: RunMode, requested_plugins: frozenset[str]) -> None:
+    """Keep exact built-in discovery active through the CLI command."""
+    if mode is RunMode.LIVE:
+        return
+    from contextlib import ExitStack
+
+    import click
+
+    from elspeth.plugins.infrastructure.manager import scoped_plugin_manager
+    from elspeth.plugins.infrastructure.run_mode_capabilities import build_nonlive_plugin_manager
+
+    context = click.get_current_context()
+    manager = build_nonlive_plugin_manager(requested_plugins)
+    stack = ExitStack()
+    stack.enter_context(scoped_plugin_manager(manager))
+    context.call_on_close(stack.close)
+
+
+def _refuse_cli_nonlive_resume(settings_path: Path, run_id: str, database: str | None) -> None:
+    """Check persisted mode before resume can resolve secrets or build plugins."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from elspeth.cli_helpers import resolve_audit_passphrase
+    from elspeth.core.config import LandscapeSettings
+    from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
+    from elspeth.engine.orchestrator.run_modes import refuse_nonlive_resume
+
+    raw_config = _load_raw_yaml(settings_path)
+    mode = _raw_run_mode_before_secrets(raw_config)
+    if mode is not RunMode.LIVE:
+        raise ValueError("Replay/verify runs cannot be resumed until mode-aware resume is implemented")
+    raw_landscape = raw_config.get("landscape", {})
+    landscape = LandscapeSettings.model_validate(raw_landscape)
+    if database is not None:
+        database_path = Path(database).expanduser().resolve()
+        if not database_path.exists():
+            return  # The ordinary resume path reports the existing CLI error.
+        db_url = f"sqlite:///{database_path}"
+    else:
+        if "${" in landscape.url:
+            raise ValueError("Resume requires a literal Landscape URL before secret resolution")
+        db_url = landscape.url
+    try:
+        db = LandscapeDB.from_url(
+            db_url,
+            passphrase=resolve_audit_passphrase(landscape) if landscape.backend == "sqlcipher" else None,
+            create_tables=False,
+            read_only=True,
+        )
+    except (OSError, RuntimeError, SQLAlchemyError, SchemaCompatibilityError):
+        return  # Normal resume diagnostics handle inaccessible or stale DBs.
+    try:
+        try:
+            refuse_nonlive_resume(db, run_id)
+        except (ValueError, SQLAlchemyError, SchemaCompatibilityError):
+            return  # Corrupt/foreign audit state is classified by resume.
+    finally:
+        db.close()
+
+
+def _validate_existing_sqlite_db_url(db_url: str, *, source: str) -> None:
+    """Fail fast when a file-backed SQLite URL points to a missing file."""
+    from urllib.parse import unquote, urlsplit
+
+    from sqlalchemy.engine.url import make_url
+
+    parsed_url = make_url(db_url)
+    if not parsed_url.drivername.startswith("sqlite"):
+        return
+
+    db_path = parsed_url.database
+    if db_path is None:
+        return
+
+    query = parsed_url.query
+    raw_uri = query.get("uri")
+    uri_enabled = False
+    if raw_uri is not None:
+        uri_value = raw_uri if isinstance(raw_uri, str) else raw_uri[0]
+        uri_enabled = uri_value.lower() in ("1", "true", "yes", "on")
+
+    raw_mode = query.get("mode")
+    if raw_mode is not None:
+        mode_value = raw_mode if isinstance(raw_mode, str) else raw_mode[0]
+        if mode_value == "memory":
+            return
+
+    if db_path == ":memory:" or db_path.startswith("file::memory:"):
+        return
+
+    if uri_enabled and db_path.startswith("file:"):
+        split = urlsplit(db_path)
+        path_part = unquote(split.path)
+        if split.netloc and split.netloc != "localhost":
+            path_part = f"//{split.netloc}{path_part}"
+        if not path_part:
+            return
+        resolved = Path(path_part).expanduser().resolve()
+    else:
+        resolved = Path(db_path).expanduser().resolve()
+
+    if not resolved.exists():
+        typer.echo(f"Error: Database file not found ({source}): {resolved}", err=True)
+        raise typer.Exit(1) from None
+
+
+def _load_raw_yaml(config_path: Path) -> dict[str, Any]:
+    """Load YAML without environment variable resolution.
+
+    This is used to extract the secrets config before loading secrets.
+    The secrets config MUST use literal values (no ${VAR}) because
+    secrets are loaded before environment variable resolution.
+
+    Raises:
+        ValueError: Parsed YAML root is not a mapping/object.
+    """
+    with open(config_path) as f:
+        raw_config = yaml.safe_load(f)
+
+    if raw_config is None:
+        return {}
+    if not isinstance(raw_config, dict):
+        actual_type = type(raw_config).__name__
+        raise ValueError(f"Settings YAML root must be a mapping/object, got {actual_type} (in {config_path}).")
+    return raw_config
+
+
+def _raw_run_mode_before_secrets(raw_config: Mapping[str, Any]) -> RunMode:
+    """Resolve mode with the same case-insensitive key semantics as settings loading."""
+    mode_keys = [key for key in raw_config if type(key) is str and key.casefold() == "run_mode"]
+    if len(mode_keys) > 1:
+        raise ValueError("Ambiguous run_mode keys before secret resolution")
+    raw_mode = raw_config[mode_keys[0]] if mode_keys else RunMode.LIVE
+    try:
+        mode = RunMode(raw_mode)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Unsupported run_mode before secret resolution: {raw_mode!r}") from exc
+    env_modes = [value for key, value in os.environ.items() if key.casefold() == "elspeth_run_mode"]
+    if len(env_modes) > 1 or (env_modes and env_modes[0] != mode.value):
+        raise ValueError("run_mode environment override must match the literal YAML value before execution")
+    return mode
+
+
+def _parse_raw_secrets_config(raw_config: Mapping[str, Any]) -> SecretsConfig:
+    """Extract and validate the literal ``secrets`` block from raw (unexpanded) YAML.
+
+    Shared by the raw sink-effect preflight and the settings loader so both
+    read one authoritative interpretation of which environment variables the
+    secret-loading phase will populate.
+    """
+    from elspeth.core.config import SecretsConfig
+
+    secrets_obj = raw_config.get("secrets", {})
+    if secrets_obj is None:
+        secrets_dict: dict[str, Any] = {}
+    else:
+        if not isinstance(secrets_obj, Mapping):
+            raise ValueError(f"'secrets' must be a mapping/object, got {type(secrets_obj).__name__}")
+        secrets_dict = dict(secrets_obj)
+    return SecretsConfig(**secrets_dict)
+
+
+def _load_settings_with_secrets(
+    settings_path: Path,
+    *,
+    source_settings: object | None = None,
+) -> tuple[ElspethSettings, list[SecretResolutionInput]]:
+    """Load settings with Key Vault secret resolution.
+
+    Three-phase loading pattern:
+    1. Raw YAML parse (no ${VAR} resolution) - extract secrets config
+    2. Secret injection from Key Vault (if configured) - populate os.environ
+    3. Full Dynaconf loading (resolves ${VAR}) - now has secrets available
+
+    This function encapsulates the secret-loading flow used by run, resume,
+    and validate commands to ensure Key Vault-backed pipelines work consistently.
+
+    Args:
+        settings_path: Path to settings YAML file (must exist)
+
+    Returns:
+        Tuple of (validated ElspethSettings, list of secret resolution records)
+        Resolution records are for deferred audit recording and contain:
+        env_var_name, source, vault_url, secret_name, timestamp, latency_ms,
+        secret_value (for fingerprinting - NOT for storage)
+
+    Raises:
+        FileNotFoundError: Settings file not found
+        yaml.YAMLError: YAML syntax error
+        ValueError: Settings YAML root is not a mapping/object
+        ValidationError: Pydantic validation error (secrets config or full config)
+        SecretLoadError: Key Vault secret loading failed
+    """
+    # Phase 1: Parse YAML to extract secrets config (no ${VAR} resolution yet)
+    # NOTE: vault_url must be literal per design - ${VAR} not supported
+    raw_config = _load_raw_yaml(settings_path)
+
+    # Extract and validate secrets config
+    secrets_config = _parse_raw_secrets_config(raw_config)
+
+    # A non-live run must never contact Key Vault before mode admission. The
+    # raw mode is literal here: secret expansion has not happened yet, and an
+    # unknown value cannot safely be treated as live for this early boundary.
+    run_mode = _raw_run_mode_before_secrets(raw_config)
+    if run_mode is not RunMode.LIVE and secrets_config.source == "keyvault":
+        raise ValueError("Replay/verify cannot fetch Key Vault secrets")
+    from elspeth.config_loading import load_nonlive_settings
+    from elspeth.plugins.infrastructure.power_automate_nonlive import PowerAutomateArchive, has_power_automate_components
+
+    if type(source_settings) is PowerAutomateArchive:
+        loaded = load_nonlive_settings(settings_path, archive=source_settings)
+        return loaded.settings, []
+    if run_mode is not RunMode.LIVE and has_power_automate_components(raw_config):
+        raise ValueError("Power Automate nonlive loading requires admitted archive context")
+
+    # Phase 2: Load secrets from Key Vault if configured
+    # Returns resolution records for later audit recording
+    secret_resolutions = load_secrets_from_config(secrets_config)
+
+    # Phase 3: Full config loading with Dynaconf (resolves ${VAR})
+    # Now that secrets are in os.environ, Dynaconf can resolve them
+    config = load_settings(settings_path, source_settings=source_settings)
+
+    return config, secret_resolutions
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedCLISettings:
+    settings: ElspethSettings
+    secret_resolutions: tuple[SecretResolutionInput, ...]
+    power_automate_nonlive: PowerAutomateNonliveConstruction | None = None
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "secret_resolutions")
+
+
+def _load_runtime_settings_with_secrets(settings_path: Path, *, source_settings: object | None = None) -> LoadedCLISettings:
+    """Carry explicit offline construction authority beside ordinary settings."""
+    from elspeth.config_loading import load_nonlive_settings
+    from elspeth.plugins.infrastructure.power_automate_nonlive import PowerAutomateArchive
+
+    if type(source_settings) is PowerAutomateArchive:
+        loaded = load_nonlive_settings(settings_path, archive=source_settings)
+        return LoadedCLISettings(loaded.settings, (), loaded.power_automate_nonlive)
+    config, resolutions = _load_settings_with_secrets(settings_path, source_settings=source_settings)
+    return LoadedCLISettings(config, tuple(resolutions))
+
+
+def _execution_sinks_for_graph(
+    config: ElspethSettings,
+    sinks: Mapping[str, SinkProtocol],
+) -> Mapping[str, SinkProtocol]:
+    """Return the canonical pipeline-execution sink projection."""
+    from elspeth.engine.orchestrator.preflight import execution_sinks_for_runtime
+
+    return execution_sinks_for_runtime(config, sinks)
+
+
+def _preflight_execution_sinks(
+    config: ElspethSettings,
+    plugins: PluginBundle,
+    *,
+    purpose: object | None = None,
+) -> tuple[Mapping[str, SinkProtocol], Mapping[str, str], object]:
+    """Validate the one executable pipeline sink lane and return its receipt."""
+    from elspeth.contracts.sink_effects import SinkEffectInputKind
+    from elspeth.engine.orchestrator.preflight import (
+        SinkEffectExecutionPurpose,
+        execution_sink_bindings_for_runtime,
+        execution_sinks_for_runtime,
+        sink_effect_modes_from_runtime_bindings,
+        validate_pipeline_sink_effect_capabilities,
+    )
+
+    resolved_purpose = SinkEffectExecutionPurpose.FRESH if purpose is None else purpose
+    if not isinstance(resolved_purpose, SinkEffectExecutionPurpose):
+        raise TypeError("Sink effect preflight purpose must be exact SinkEffectExecutionPurpose")
+    sinks = execution_sinks_for_runtime(config, plugins.sinks)
+    bindings = execution_sink_bindings_for_runtime(config, plugins.sink_effect_bindings)
+    modes = sink_effect_modes_from_runtime_bindings(
+        sinks,
+        bindings,
+        purpose=resolved_purpose,
+        configured_options={name: config.sinks[name].options for name in sinks},
+    )
+    admission = validate_pipeline_sink_effect_capabilities(
+        sinks,
+        configured_modes=modes,
+        required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+        runtime_bindings=bindings,
+        run_mode=config.run_mode,
+    )
+    return sinks, modes, admission
+
+
+def _configure_execution_sinks_for_resume(execution_sinks: Mapping[str, SinkProtocol]) -> None:
+    """Switch live execution sinks to their resume (append) mode.
+
+    Must run BEFORE sink-effect admission is issued so the admission receipt
+    and the durable effect identity bind the mode resume actually executes
+    (elspeth-fc9906e398). Uses the polymorphic resume capability: each sink
+    self-configures via configure_for_resume().
+    """
+    for sink_name, sink in execution_sinks.items():
+        if not sink.supports_resume:
+            typer.echo(
+                f"Error: Cannot resume with sink '{sink_name}' (plugin: {sink.name}). "
+                f"This sink does not support resume/append mode.\n"
+                f"Hint: Use a different sink type or start a new run.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        try:
+            sink.configure_for_resume()
+        except NotImplementedError as e:
+            typer.echo(f"Error: {e}", err=True)
+            raise typer.Exit(1) from None
+
+
+def _preflight_raw_settings_sink_effects(settings_path: Path, *, purpose: object, source_settings: object | None = None) -> None:
+    """Run adapter-class eligibility before secrets or other startup work."""
+    from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
+    from elspeth.plugins.infrastructure.runtime_factory import (
+        validate_landscape_export_settings_from_raw_config,
+        validate_sink_effect_eligibility_from_raw_config,
+    )
+
+    if not isinstance(purpose, SinkEffectExecutionPurpose):
+        raise TypeError("Raw sink effect preflight purpose must be exact SinkEffectExecutionPurpose")
+    raw_config = _load_raw_yaml(settings_path)
+    from elspeth.plugins.infrastructure.power_automate_nonlive import (
+        PowerAutomateArchive,
+        has_power_automate_components,
+        project_power_automate_nonlive,
+    )
+
+    projected_nonlive = type(source_settings) is PowerAutomateArchive
+    if type(source_settings) is PowerAutomateArchive:
+        raw_config, _ = project_power_automate_nonlive(raw_config, source_settings)
+    elif has_power_automate_components(raw_config) and _raw_run_mode_before_secrets(raw_config) is not RunMode.LIVE:
+        raise ValueError("Power Automate nonlive preflight requires admitted archive context")
+    # Supported ${VAR} expansion must complete before configuration-dependent
+    # mode/URL/dialect resolution (elspeth-19f2382cf4). Key Vault-mapped
+    # variables are only populated by the later secret-loading phase, so sinks
+    # referencing them are deferred to the post-expansion admission gates.
+    secrets_config = _parse_raw_secrets_config(raw_config)
+    deferrable_env_vars = frozenset(secrets_config.mapping) if secrets_config.source == "keyvault" else frozenset()
+    validate_sink_effect_eligibility_from_raw_config(
+        raw_config,
+        purpose=purpose,
+        expand_env_placeholders=not projected_nonlive,
+        deferrable_env_vars=deferrable_env_vars,
+    )
+    if purpose is SinkEffectExecutionPurpose.FRESH:
+        export_settings = validate_landscape_export_settings_from_raw_config(raw_config)
+        if export_settings.enabled:
+            validate_sink_effect_eligibility_from_raw_config(
+                raw_config,
+                purpose=SinkEffectExecutionPurpose.AUDIT_EXPORT,
+                expand_env_placeholders=not projected_nonlive,
+                deferrable_env_vars=deferrable_env_vars,
+            )
+
+
+def _require_marked_export(config: ElspethSettings) -> None:
+    """Reject unmarked export settings before run or resume side effects."""
+    export_config = config.landscape.export
+    if not export_config.enabled:
+        return
+    export_config.public_snapshot_config()
+
+
+@app.command()
+def run(
+    settings: str = typer.Option(
+        ...,
+        "--settings",
+        "-s",
+        help="Path to settings YAML file.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        "-n",
+        help="Validate and show what would run without executing.",
+    ),
+    execute: bool = typer.Option(
+        False,
+        "--execute",
+        "-x",
+        help="Actually execute the pipeline (required for safety).",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Show detailed output.",
+    ),
+    output_format: Literal["console", "json"] = typer.Option(
+        "console",
+        "--format",
+        "-f",
+        help="Output format: 'console' (human-readable) or 'json' (structured JSON).",
+    ),
+) -> None:
+    """Execute a pipeline run.
+
+    Requires --execute flag to actually run (safety feature).
+    Use --dry-run to validate configuration without executing.
+    """
+    settings_path = Path(settings).expanduser()
+
+    # Load and validate config with Key Vault secrets (same flow as other commands)
+    try:
+        mode, requested_plugins, source_settings = _admit_raw_cli_nonlive_run(settings_path)
+        _install_nonlive_plugin_scope(mode, requested_plugins)
+        if execute and not dry_run:
+            from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
+
+            _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH, source_settings=source_settings)
+        loaded_settings = _load_runtime_settings_with_secrets(settings_path, source_settings=source_settings)
+        config, secret_resolutions = loaded_settings.settings, list(loaded_settings.secret_resolutions)
+        _require_marked_export(config)
+    except FileNotFoundError:
+        typer.echo(f"Error: Settings file not found: {settings}", err=True)
+        raise typer.Exit(1) from None
+    except (YamlParserError, YamlScannerError) as e:
+        typer.echo(f"YAML syntax error in {settings}: {e.problem if e.problem is not None else e}", err=True)
+        raise typer.Exit(1) from None
+    except yaml.YAMLError as e:
+        typer.echo(f"YAML syntax error in {settings}: {e}", err=True)
+        raise typer.Exit(1) from None
+    except ValidationError as e:
+        typer.echo("Configuration errors:", err=True)
+        for error in e.errors():
+            loc = ".".join(str(x) for x in error["loc"])
+            typer.echo(f"  - {loc}: {error['msg']}", err=True)
+        raise typer.Exit(1) from None
+    except SinkEffectCapabilityError as e:
+        typer.echo(f"Sink effect preflight failed: {e}", err=True)
+        raise typer.Exit(1) from None
+    except (ValueError, TemplateFileError, contract_errors.OrchestrationInvariantError) as e:
+        typer.echo(f"Configuration error: {e}", err=True)
+        raise typer.Exit(1) from None
+    except SecretLoadError as e:
+        typer.echo(f"Error loading secrets: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Non-live admission precedes plugin construction, which may initialize
+    # SDK clients or credentials. A missing source run cannot reach either.
+    try:
+        _admit_cli_nonlive_run(config)
+    except (OSError, RuntimeError, ValueError, contract_errors.OrchestrationInvariantError) as e:
+        typer.echo(f"Replay/verify admission failed: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Instantiate plugins before graph construction
+    try:
+        if loaded_settings.power_automate_nonlive is None:
+            plugins = _instantiate_plugins_for_runtime_preflight(config)
+        else:
+            plugins = _instantiate_plugins_for_runtime_preflight(config, power_automate_nonlive=loaded_settings.power_automate_nonlive)
+    except contract_errors.TIER_1_ERRORS:
+        raise  # Tier 1 errors must crash with full traceback, not Exit(1)
+    except Exception as e:
+        typer.echo(f"Error instantiating plugins: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Build and validate graph from plugin instances
+    # Exclude export sink from graph - it's used post-run, not during pipeline execution.
+    # The export sink receives audit records after the run completes, not pipeline data.
+    execution_sinks = _execution_sinks_for_graph(config, plugins.sinks)
+
+    try:
+        graph = ExecutionGraph.from_plugin_instances(
+            sources=plugins.sources,
+            source_settings_map=plugins.source_settings_map,
+            transforms=plugins.transforms,
+            sinks=execution_sinks,
+            aggregations=plugins.aggregations,
+            gates=list(config.gates),
+            coalesce_settings=list(config.coalesce) if config.coalesce else None,
+            queues=config.queues,
+            row_union_settings=list(config.row_unions) if config.row_unions else None,
+            collectors=plugins.collectors,
+            scope_settings=list(config.scopes) if config.scopes else None,
+            max_bound_region_depth=config.max_bound_region_depth,
+        )
+        graph.validate()
+    except GraphValidationError as e:
+        typer.echo(f"Pipeline graph error: {e}", err=True)
+        raise typer.Exit(1) from None
+    except ValueError as e:
+        # Schema compatibility errors raised during graph construction (PHASE 2)
+        typer.echo(f"Schema validation error: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Console-only messages (don't emit in JSON mode to keep stream clean)
+    if output_format == "console":
+        if verbose:
+            typer.echo(f"Graph validated: {graph.node_count} nodes, {graph.edge_count} edges")
+
+        if dry_run:
+            typer.echo("Dry run mode - would execute:")
+            typer.echo(f"  Sources: {', '.join(f'{name}={s.plugin}' for name, s in config.sources.items())}")
+            typer.echo(f"  Transforms: {len(config.transforms)}")
+            typer.echo(f"  Sinks: {', '.join(config.sinks.keys())}")
+            return
+
+        # Safety check: require explicit --execute flag
+        if not execute:
+            typer.echo("Pipeline configuration valid.")
+            typer.echo(f"  Sources: {', '.join(f'{name}={s.plugin}' for name, s in config.sources.items())}")
+            typer.echo("")
+            typer.echo("To execute, add --execute (or -x) flag:", err=True)
+            typer.echo(f"  elspeth run -s {settings} --execute", err=True)
+            raise typer.Exit(1)
+    else:
+        # JSON mode: early exits without console output
+        if dry_run or not execute:
+            raise typer.Exit(1)
+
+    # Executable admission: validate the projected pipeline sinks before any
+    # output/payload/database directory can be created. Dry-run/configuration
+    # assembly above remains free of sink publication preflight.
+    try:
+        execution_sinks, execution_sink_modes, sink_effect_admission = _preflight_execution_sinks(config, plugins)
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except Exception as e:
+        typer.echo(f"Sink effect preflight failed: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Ensure output directories exist BEFORE attempting to create resources
+    # Creates directories automatically, only errors if creation fails
+    # NOTE: Only when actually executing (not dry-run or validation-only)
+    dir_errors = _ensure_output_directories(
+        config,
+        execution_sink_names=execution_sinks,
+        include_sink_directories=config.run_mode is RunMode.LIVE,
+    )
+    if dir_errors:
+        typer.echo("Output directory errors:", err=True)
+        for dir_error in dir_errors:
+            typer.echo(f"\n{dir_error}", err=True)
+        raise typer.Exit(1)
+
+    # Resolve SQLCipher passphrase (if backend=sqlcipher)
+    from elspeth.cli_helpers import resolve_audit_passphrase
+
+    try:
+        passphrase = resolve_audit_passphrase(config.landscape)
+    except RuntimeError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Resolve dependencies and commencement gates before pipeline execution
+    from elspeth.core.landscape.database import SchemaCompatibilityError
+    from elspeth.engine.bootstrap import resolve_preflight
+    from elspeth.plugins.infrastructure.probe_factory import build_collection_probes
+
+    try:
+        if config.run_mode is RunMode.LIVE:
+            probes = build_collection_probes(config.collection_probes) if config.collection_probes else []
+            preflight = resolve_preflight(config, settings_path, probes=probes, runner=bootstrap_and_run)
+        else:
+            preflight = PreflightResult(dependency_runs=(), gate_results=())
+    except (DependencyFailedError, CommencementGateFailedError, ValueError) as e:
+        typer.echo(f"Pre-flight check failed: {e}", err=True)
+        raise typer.Exit(1) from None
+    except SchemaCompatibilityError as e:
+        _emit_schema_compatibility_error(e, output_format, operation="pre-flight check")
+        raise typer.Exit(1) from None
+    except contract_errors.TIER_1_ERRORS as e:
+        import traceback
+
+        typer.echo(f"\nFATAL — {type(e).__name__}: {e}", err=True)
+        typer.echo(traceback.format_exc(), err=True)
+        raise typer.Exit(4) from e
+    except Exception as e:
+        import traceback
+
+        typer.echo(f"\nFATAL — Unexpected pre-flight error ({type(e).__name__}): {e}", err=True)
+        typer.echo(traceback.format_exc(), err=True)
+        raise typer.Exit(4) from e
+
+    # Execute pipeline with pre-instantiated plugins
+    try:
+        execution_result = _execute_pipeline_with_instances(
+            config,
+            graph,
+            plugins,
+            verbose=verbose,
+            output_format=output_format,
+            secret_resolutions=secret_resolutions,
+            passphrase=passphrase,
+            preflight_results=preflight,
+            sink_effect_modes=execution_sink_modes,
+            sink_effect_admission=sink_effect_admission,
+        )
+    except GracefulShutdownError as e:
+        if output_format == "json":
+            import json as json_mod
+
+            typer.echo(
+                json_mod.dumps(
+                    {
+                        "event": "interrupted",
+                        "run_id": e.run_id,
+                        "rows_processed": e.rows_processed,
+                        "message": str(e),
+                    }
+                )
+            )
+        else:
+            typer.echo(f"\nPipeline interrupted after {e.rows_processed} rows.")
+            _emit_interrupted_resume_guidance_from_url(config.landscape.url, passphrase, e.run_id)
+        raise typer.Exit(3)  # noqa: B904 -- distinct exit code: 0=success, 1=error, 3=interrupted
+    except RunWorkerEvictedError as e:
+        _emit_worker_evicted_event(e, output_format)
+        raise typer.Exit(3)  # noqa: B904 — eviction is an interrupted-style exit
+    except WriteLockHeldError as e:
+        _emit_write_lock_held(e, output_format)
+        raise typer.Exit(1) from e
+    except SchemaCompatibilityError as e:
+        _emit_schema_compatibility_error(e, output_format, operation="pipeline execution")
+        raise typer.Exit(1) from None
+    except VerificationMismatchError as e:
+        if output_format == "json":
+            import json as json_mod
+
+            typer.echo(json_mod.dumps({"event": "verification_mismatch", "error": str(e), "error_type": type(e).__name__}), err=True)
+        else:
+            typer.echo(f"Verification mismatch: {e}", err=True)
+        raise typer.Exit(2) from None
+    except contract_errors.TIER_1_ERRORS as e:
+        # Tier 1 violations and framework bugs MUST be clearly distinguishable
+        # from config errors. These indicate database corruption, tampering,
+        # or bugs in ELSPETH itself — not operator mistakes.
+        import traceback
+
+        if output_format == "json":
+            import json
+
+            typer.echo(
+                json.dumps(
+                    {
+                        "event": "fatal",
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "traceback": traceback.format_exc(),
+                    }
+                ),
+                err=True,
+            )
+        else:
+            typer.echo(f"\nFATAL — {type(e).__name__}: {e}", err=True)
+            typer.echo(traceback.format_exc(), err=True)
+        raise typer.Exit(4) from e  # Exit 4: audit integrity / framework bug
+    except Exception as e:
+        # Always emit the full traceback — hiding it makes debugging impossible.
+        # The AggregationName NameError hid for days because this block swallowed it.
+        import traceback
+
+        if output_format == "json":
+            import json
+
+            typer.echo(
+                json.dumps(
+                    {
+                        "event": "error",
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "traceback": traceback.format_exc(),
+                    }
+                ),
+                err=True,
+            )
+        else:
+            typer.echo(f"Error during pipeline execution: {e}", err=True)
+            typer.echo(traceback.format_exc(), err=True)
+        raise typer.Exit(4) from e  # Exit 4: unknown errors during execution are likely framework bugs
+
+    # F17 (elspeth-83ad093154): propagate the engine's terminal status to the
+    # process exit code. The taxonomy is owned by cli_completion_for()
+    # (0=completed/empty, 1=partial, 2=failed, 3=interrupted) and was already
+    # emitted on the RunSummary event — but the command previously returned
+    # normally, so a run where every row failed still exited 0 and CI/cron/ECS
+    # wrappers banked total failure as success.
+    from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+    _, exit_code = cli_completion_for(execution_result["status"])
+
+    # Emit final execution summary in JSON mode for machine consumption
+    if output_format == "json":
+        import json
+
+        typer.echo(json.dumps({"event": "execution_result", **execution_result, "exit_code": exit_code}))
+
+    if exit_code != 0:
+        raise typer.Exit(exit_code)
+
+
+@app.command()
+def explain(
+    run_id: str = typer.Option(
+        ...,
+        "--run",
+        "-r",
+        help="Run ID to explain (or 'latest').",
+    ),
+    row: str | None = typer.Option(
+        None,
+        "--row",
+        help="Row ID to explain.",
+    ),
+    token: str | None = typer.Option(
+        None,
+        "--token",
+        "-t",
+        help="Token ID for precise lineage.",
+    ),
+    database: str | None = typer.Option(
+        None,
+        "--database",
+        "-d",
+        help="Path to Landscape database file (SQLite). Required for explain.",
+    ),
+    settings: str | None = typer.Option(
+        None,
+        "--settings",
+        "-s",
+        help="Path to settings YAML file.",
+    ),
+    sink: str | None = typer.Option(
+        None,
+        "--sink",
+        help="Sink name to disambiguate when row has multiple terminal tokens.",
+    ),
+    no_tui: bool = typer.Option(
+        False,
+        "--no-tui",
+        help="Output text instead of interactive TUI.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Output as JSON.",
+    ),
+) -> None:
+    """Explain lineage for a row or token.
+
+    Use --no-tui for text output or --json for JSON output.
+    Without these flags, launches an interactive TUI.
+
+    Examples:
+
+        # JSON output for a specific token
+        elspeth explain --run latest --token tok-abc --json --database ./audit.db
+
+        # Text output for a row
+        elspeth explain --run run-123 --row row-456 --no-tui --database ./audit.db
+
+        # Interactive TUI
+        elspeth explain --run latest --database ./audit.db
+    """
+    import json as json_module
+
+    from elspeth.cli_helpers import resolve_database_url, resolve_run_id
+    from elspeth.core.landscape import (
+        LandscapeDB,
+    )
+    from elspeth.core.landscape import explain as explain_lineage
+    from elspeth.core.landscape.factory import RecorderFactory
+    from elspeth.core.landscape.lineage_text import LineageTextFormatter
+    from elspeth.core.landscape.serialization import dataclass_to_dict
+
+    if database is None:
+        message = "--database is required for explain."
+        if json_output:
+            typer.echo(json_module.dumps({"error": message}))
+        else:
+            typer.echo(f"Error: {message}", err=True)
+        raise typer.Exit(1) from None
+
+    # Resolve database URL
+    settings_path = Path(settings) if settings else None
+    try:
+        db_url, config = resolve_database_url(database, settings_path)
+    except ValueError as e:
+        if json_output:
+            typer.echo(json_module.dumps({"error": str(e)}))
+        else:
+            typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Resolve SQLCipher passphrase.
+    # When --database is provided without --settings, config is None because
+    # the CLI path overrides settings-based URL. If --settings was provided,
+    # resolve_database_url() loads it for passphrase resolution.
+    # Keep the fallback for older callers that may still return config=None.
+    from elspeth.cli_helpers import resolve_audit_passphrase
+
+    explain_settings = config
+    landscape_settings = config.landscape if config else None
+    if landscape_settings is None and settings_path is not None and settings_path.exists():
+        try:
+            settings_for_passphrase, _ = _load_settings_with_secrets(Path(settings_path).expanduser())
+            explain_settings = settings_for_passphrase
+            landscape_settings = settings_for_passphrase.landscape
+        except (FileNotFoundError, yaml.YAMLError, YamlParserError, YamlScannerError) as e:
+            # User explicitly provided --settings (guarded by settings_path is not None
+            # on line above), so YAML errors are fatal — don't silently proceed
+            # with passphrase=None.
+            if json_output:
+                typer.echo(json_module.dumps({"error": f"Settings YAML error: {e}"}))
+            else:
+                typer.echo(f"Error loading settings: {e}", err=True)
+            raise typer.Exit(1) from None
+        except (ValidationError, SecretLoadError) as e:
+            # Settings loaded but failed validation or secret resolution.
+            # User explicitly provided --settings, so surface the error.
+            if json_output:
+                typer.echo(json_module.dumps({"error": f"Settings loading failed: {e}"}))
+            else:
+                typer.echo(f"Error loading settings: {e}", err=True)
+            raise typer.Exit(1) from None
+
+    try:
+        passphrase = resolve_audit_passphrase(landscape_settings)
+    except RuntimeError as e:
+        if json_output:
+            typer.echo(json_module.dumps({"error": str(e)}))
+        else:
+            typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Connect to database
+    # Initialize db = None for proper cleanup in finally block
+    db: LandscapeDB | None = None
+    try:
+        db = LandscapeDB.from_url(db_url, passphrase=passphrase, create_tables=False)
+    except Exception as e:
+        if json_output:
+            typer.echo(json_module.dumps({"error": f"Database connection failed: {e}"}))
+        else:
+            typer.echo(f"Error connecting to database: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    try:
+        payload_store = None
+        if explain_settings is not None:
+            from elspeth.core.payload_store import FilesystemPayloadStore
+
+            payload_path = explain_settings.payload_store.base_path
+            if payload_path.exists():
+                payload_store = FilesystemPayloadStore(payload_path)
+
+        factory = RecorderFactory(db) if payload_store is None else RecorderFactory(db, payload_store=payload_store)
+
+        # Resolve 'latest' run_id
+        resolved_run_id = resolve_run_id(run_id, factory)
+        if resolved_run_id is None:
+            if json_output:
+                typer.echo(json_module.dumps({"error": "No runs found in database"}))
+            else:
+                typer.echo("Error: No runs found in database", err=True)
+            raise typer.Exit(1) from None
+
+        # Must provide either token or row for JSON/no-tui modes
+        if (json_output or no_tui) and token is None and row is None:
+            if json_output:
+                typer.echo(json_module.dumps({"error": "Must provide either --token or --row"}))
+            else:
+                typer.echo("Error: Must provide either --token or --row", err=True)
+            raise typer.Exit(1) from None
+
+        # Query lineage (only for JSON/no-tui modes)
+        if json_output or no_tui:
+            try:
+                lineage_result = explain_lineage(
+                    factory.query,
+                    factory.data_flow,
+                    run_id=resolved_run_id,
+                    token_id=token,
+                    row_id=row,
+                    sink=sink,
+                )
+            except ValueError as e:
+                # Ambiguous row (multiple tokens) or invalid args
+                if json_output:
+                    typer.echo(json_module.dumps({"error": str(e)}))
+                else:
+                    typer.echo(f"Error: {e}", err=True)
+                raise typer.Exit(1) from None
+
+            if lineage_result is None:
+                if json_output:
+                    typer.echo(json_module.dumps({"error": "Token or row not found, or no terminal tokens exist yet"}))
+                else:
+                    typer.echo("Token or row not found, or no terminal tokens exist yet.", err=True)
+                raise typer.Exit(1) from None
+
+            verification_decisions = factory.execution.get_verification_decisions_for_calls(
+                resolved_run_id, {call.call_id for call in lineage_result.calls}
+            )
+
+            # Output based on mode
+            if json_output:
+                lineage_data = dataclass_to_dict(lineage_result)
+                lineage_data["verification_decisions"] = [dataclass_to_dict(decision) for decision in verification_decisions]
+                typer.echo(json_module.dumps(lineage_data, indent=2))
+                raise typer.Exit(0)
+
+            if no_tui:
+                formatter = LineageTextFormatter()
+                typer.echo(formatter.format(lineage_result))
+                if verification_decisions:
+                    typer.echo("--- Verification decisions ---")
+                    for decision in verification_decisions:
+                        verdict = "UNAVAILABLE" if decision.is_match is None else "MATCH" if decision.is_match else "MISMATCH"
+                        typer.echo(
+                            f"  {decision.current_call_id}: {verdict}; "
+                            f"source run={decision.source_run_id} call={decision.source_call_id}; "
+                            f"differences={decision.differences_json}"
+                        )
+                raise typer.Exit(0)
+
+        # TUI mode
+        from elspeth.tui.explain_app import ExplainApp
+
+        tui_app = ExplainApp(
+            db=db,
+            run_id=resolved_run_id,
+            token_id=token,
+            row_id=row,
+            sink=sink,
+        )
+        tui_app.run()
+
+    finally:
+        if db is not None:
+            import sys
+
+            _close_landscape_db(db, pending_exc=sys.exc_info()[1])
+
+
+@dataclass(frozen=True, slots=True)
+class _OrchestratorContext:
+    """Shared context yielded by _orchestrator_context()."""
+
+    pipeline_config: PipelineConfig
+    orchestrator: Orchestrator
+
+
+class _Closeable(Protocol):
+    def close(self) -> None: ...
+
+
+def _close_orchestrator_resources(
+    rate_limit_registry: _Closeable | None,
+    telemetry_manager: _Closeable | None,
+    *,
+    pending_exc: BaseException | None,
+) -> None:
+    """Close orchestrator teardown resources without masking an in-flight pipeline exception.
+
+    Mirrors the db.close() teardown guard used in the run/resume finally blocks:
+    Tier-1/audit-integrity errors always propagate (audit corruption outranks
+    even the primary failure); any other close failure is logged and suppressed
+    when a pipeline exception is already pending, and surfaced when the run was
+    otherwise clean. Both resources are always attempted so a failure closing the
+    first does not leak the second (elspeth-5310f58a2b).
+    """
+    import structlog
+
+    teardown_error: Exception | None = None
+    for resource, name in (
+        (rate_limit_registry, "rate_limit_registry"),
+        (telemetry_manager, "telemetry_manager"),
+    ):
+        if resource is None:
+            continue
+        try:
+            resource.close()
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except Exception as close_exc:
+            # Teardown close failure must not mask the original pipeline exception.
+            structlog.get_logger(__name__).warning(
+                "Orchestrator teardown close failed",
+                component=name,
+                pipeline_exception_pending=pending_exc is not None,
+                close_error=f"{type(close_exc).__name__}: {close_exc}",
+            )
+            if teardown_error is None:
+                teardown_error = close_exc
+    if teardown_error is not None and pending_exc is None:
+        raise teardown_error
+
+
+def _close_landscape_db(db: _Closeable, *, pending_exc: BaseException | None) -> None:
+    """Close LandscapeDB without masking an in-flight pipeline exception."""
+    import structlog
+
+    try:
+        db.close()
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except Exception as close_exc:
+        # db.close() failure must not mask the original pipeline exception.
+        if pending_exc is not None:
+            structlog.get_logger(__name__).warning(
+                "db.close() failed during exception cleanup — suppressed",
+                close_error=f"{type(close_exc).__name__}: {close_exc}",
+            )
+        else:
+            raise
+
+
+@contextmanager
+def _orchestrator_context(
+    config: ElspethSettings,
+    graph: ExecutionGraph,
+    plugins: PluginBundle,
+    *,
+    db: LandscapeDB,
+    formatter_prefix: str = "Run",
+    output_format: Literal["console", "json", "none"] = "console",
+    checkpoint_always: bool = False,
+    sink_effect_modes: Mapping[str, str] | None = None,
+    sink_effect_admission: object | None = None,
+) -> Iterator[_OrchestratorContext]:
+    """Shared orchestrator setup and teardown for run/resume CLI paths.
+
+    Handles:
+    - Plugin unpacking and aggregation wiring
+    - PipelineConfig construction
+    - EventBus + formatter subscription
+    - Runtime*Config creation (rate_limit, concurrency, checkpoint, telemetry)
+    - RateLimitRegistry, CheckpointManager, TelemetryManager lifecycle
+    - Orchestrator construction
+
+    Teardown (always runs): closes rate_limit_registry and telemetry_manager.
+
+    Args:
+        config: Validated ElspethSettings
+        graph: Validated ExecutionGraph (schemas populated)
+        plugins: Pre-instantiated PluginBundle from instantiate_plugins_from_config()
+        db: LandscapeDB connection (caller owns close lifecycle)
+        formatter_prefix: Prefix for console formatters ("Run" or "Resume")
+        output_format: 'console', 'json', or 'none' for programmatic execution
+        checkpoint_always: If True, always create CheckpointManager (resume needs it).
+            If False, only create when checkpoint config is enabled (normal run).
+
+    Yields:
+        _OrchestratorContext with pipeline_config and orchestrator
+    """
+    from elspeth.cli_formatters import create_console_formatters, create_json_formatters, subscribe_formatters
+    from elspeth.contracts.config.runtime import (
+        RuntimeCheckpointConfig,
+        RuntimeConcurrencyConfig,
+        RuntimeRateLimitConfig,
+        RuntimeTelemetryConfig,
+    )
+    from elspeth.core import EventBus, EventBusProtocol, NullEventBus
+    from elspeth.core.checkpoint import CheckpointManager
+    from elspeth.core.config import AggregationSettings
+    from elspeth.core.rate_limit import RateLimitRegistry
+    from elspeth.engine import Orchestrator as _Orchestrator
+    from elspeth.engine import PipelineConfig as _PipelineConfig
+    from elspeth.engine.orchestrator.preflight import execution_sink_modes_for_runtime
+    from elspeth.telemetry import create_telemetry_manager
+
+    # Unpack pre-instantiated plugins
+    sinks: Mapping[str, SinkProtocol] = _execution_sinks_for_graph(config, plugins.sinks)
+    configured_sink_effect_modes = plugins.sink_effect_modes if sink_effect_modes is None else sink_effect_modes
+    effective_sink_effect_modes = execution_sink_modes_for_runtime(config, configured_sink_effect_modes)
+
+    # Build transforms list: row_plugins + aggregations (with node_id)
+    transforms: list[RowPlugin] = [wired.plugin for wired in plugins.transforms]
+
+    agg_id_map = graph.get_aggregation_id_map()
+    aggregation_settings: dict[str, AggregationSettings] = {}
+
+    for agg_name, (transform, agg_config) in plugins.aggregations.items():
+        node_id = agg_id_map[AggregationName(agg_name)]
+        aggregation_settings[node_id] = agg_config
+        transform.node_id = node_id
+        transforms.append(transform)
+
+    # Build PipelineConfig
+    from elspeth.engine.orchestrator.preflight import execution_sink_bindings_for_runtime
+
+    pipeline_config = _PipelineConfig(
+        sources=plugins.sources,
+        transforms=transforms,
+        sinks=sinks,
+        config=resolve_config(config),
+        gates=list(config.gates),
+        aggregation_settings=aggregation_settings,
+        coalesce_settings=(list(config.coalesce) if config.coalesce else []),
+        sink_effect_modes=effective_sink_effect_modes,
+        sink_effect_admission=sink_effect_admission,
+        sink_effect_bindings=execution_sink_bindings_for_runtime(config, plugins.sink_effect_bindings),
+        escalation_fixpoint_bound=graph.escalation_fixpoint_bound,
+    )
+
+    # EventBus + formatters. Programmatic dependency execution uses the
+    # explicit no-output mode so sub-pipelines cannot pollute parent CLI output.
+    if output_format == "none":
+        event_bus: EventBusProtocol = NullEventBus()
+    else:
+        event_bus = EventBus()
+        formatters = create_json_formatters() if output_format == "json" else create_console_formatters(prefix=formatter_prefix)
+        subscribe_formatters(event_bus, formatters)
+
+    # Runtime configs
+    rate_limit_config = RuntimeRateLimitConfig.from_settings(config.rate_limit)
+    concurrency_config = RuntimeConcurrencyConfig.from_settings(config.concurrency)
+    checkpoint_config = RuntimeCheckpointConfig.from_settings(config.checkpoint)
+    telemetry_config = RuntimeTelemetryConfig.from_settings(config.telemetry)
+
+    rate_limit_registry: RateLimitRegistry | None = None
+    telemetry_manager = None
+
+    try:
+        rate_limit_registry = RateLimitRegistry(rate_limit_config)
+        telemetry_manager = create_telemetry_manager(telemetry_config)
+
+        # Checkpoint manager: always for resume, conditional for run
+        checkpoint_manager = CheckpointManager(db) if checkpoint_always or checkpoint_config.enabled else None
+
+        orchestrator = _Orchestrator(
+            db,
+            event_bus=event_bus,
+            rate_limit_registry=rate_limit_registry,
+            concurrency_config=concurrency_config,
+            checkpoint_manager=checkpoint_manager,
+            checkpoint_config=checkpoint_config,
+            telemetry_manager=telemetry_manager,
+        )
+
+        yield _OrchestratorContext(
+            pipeline_config=pipeline_config,
+            orchestrator=orchestrator,
+        )
+    finally:
+        import sys
+
+        _close_orchestrator_resources(
+            rate_limit_registry,
+            telemetry_manager,
+            pending_exc=sys.exc_info()[1],
+        )
+
+
+def _execute_pipeline_with_instances(
+    config: ElspethSettings,
+    graph: ExecutionGraph,
+    plugins: PluginBundle,
+    verbose: bool = False,
+    output_format: Literal["console", "json"] = "console",
+    secret_resolutions: list[SecretResolutionInput] | None = None,
+    passphrase: str | None = None,
+    preflight_results: PreflightResult | None = None,
+    sink_effect_modes: Mapping[str, str] | None = None,
+    sink_effect_admission: object | None = None,
+) -> ExecutionResult:
+    """Execute pipeline using pre-instantiated plugin instances.
+
+    Args:
+        config: Validated ElspethSettings
+        graph: Validated ExecutionGraph (schemas populated)
+        plugins: Pre-instantiated PluginBundle from instantiate_plugins_from_config()
+        verbose: Show detailed output
+        output_format: 'console' or 'json'
+        secret_resolutions: Optional list of secret resolution records from
+            load_secrets_from_config(). Passed to orchestrator for audit recording.
+        passphrase: Optional SQLCipher passphrase for encrypted audit DB
+        preflight_results: Optional PreflightResult from dependency resolution
+            and commencement gates. Passed to orchestrator for audit recording.
+
+    Returns:
+        ExecutionResult with run_id, status, rows_processed
+    """
+    from elspeth.core.landscape import LandscapeDB
+
+    # Warn if JSONL journal is enabled alongside SQLCipher — journal is plaintext
+    if passphrase is not None and config.landscape.dump_to_jsonl:
+        import structlog
+
+        structlog.get_logger().warning(
+            "JSONL journal is not encrypted",
+            hint="The JSONL change journal is written in plaintext even when the audit database is encrypted with SQLCipher.",
+        )
+
+    db = LandscapeDB.from_url(
+        config.landscape.url,
+        passphrase=passphrase,
+        dump_to_jsonl=config.landscape.dump_to_jsonl,
+        dump_to_jsonl_path=config.landscape.dump_to_jsonl_path,
+        dump_to_jsonl_fail_on_error=config.landscape.dump_to_jsonl_fail_on_error,
+        dump_to_jsonl_include_payloads=config.landscape.dump_to_jsonl_include_payloads,
+        dump_to_jsonl_payload_base_path=(
+            str(config.payload_store.base_path)
+            if config.landscape.dump_to_jsonl_payload_base_path is None
+            else config.landscape.dump_to_jsonl_payload_base_path
+        ),
+    )
+
+    # Create payload store for audit compliance
+    from elspeth.core.payload_store import FilesystemPayloadStore
+
+    if config.payload_store.backend != "filesystem":
+        typer.echo(
+            f"Error: Unsupported payload store backend '{config.payload_store.backend}'. Only 'filesystem' is currently supported.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    payload_store = FilesystemPayloadStore(config.payload_store.base_path)
+
+    audit_export_content_store = None
+    audit_export_content_store_resolver = None
+    export_settings = config.landscape.export
+    if export_settings.enabled:
+        from elspeth.core.audit_export_content_store import create_audit_export_content_store
+
+        audit_export_content_store, audit_export_content_store_resolver = create_audit_export_content_store(export_settings)
+
+    try:
+        if verbose:
+            typer.echo("Starting pipeline execution...")
+
+        with _orchestrator_context(
+            config,
+            graph,
+            plugins,
+            db=db,
+            formatter_prefix="Run",
+            output_format=output_format,
+            sink_effect_modes=sink_effect_modes,
+            sink_effect_admission=sink_effect_admission,
+        ) as ctx:
+            from elspeth.plugins.infrastructure.runtime_factory import make_sink_factory
+            from elspeth.plugins.transforms.llm.model_catalog import read_openrouter_catalog_snapshot_id
+
+            # CLI path: no FastAPI lifespan, so the live OpenRouter probe
+            # never ran. ``read_openrouter_catalog_snapshot_id()`` returns
+            # the bundled fallback ``(sha256, "bundled")`` — recorded into
+            # the run row so an auditor can distinguish CLI runs (always
+            # bundled) from web runs (live when the probe succeeded).
+            catalog_sha, catalog_source = read_openrouter_catalog_snapshot_id()
+            result = ctx.orchestrator.run(
+                ctx.pipeline_config,
+                graph=graph,
+                settings=config,
+                payload_store=payload_store,
+                audit_export_content_store=audit_export_content_store,
+                audit_export_content_store_resolver=audit_export_content_store_resolver,
+                secret_resolutions=secret_resolutions,
+                preflight_results=preflight_results,
+                sink_factory=make_sink_factory(config),
+                openrouter_catalog_sha256=catalog_sha,
+                openrouter_catalog_source=catalog_source,
+            )
+
+            return {
+                "run_id": result.run_id,
+                "status": result.status,  # RunStatus enum (str subclass)
+                "rows_processed": result.rows_processed,
+            }
+    finally:
+        import sys
+
+        _close_landscape_db(db, pending_exc=sys.exc_info()[1])
+
+
+def bootstrap_and_run(settings_path: Path) -> RunResult:
+    """Run a dependency pipeline under exact discovery when non-live."""
+    from elspeth.plugins.infrastructure.manager import scoped_plugin_manager
+    from elspeth.plugins.infrastructure.run_mode_capabilities import build_nonlive_plugin_manager
+
+    mode, requested_plugins, source_settings = _admit_raw_cli_nonlive_run(settings_path)
+    if mode is RunMode.LIVE:
+        return _bootstrap_and_run_impl(settings_path)
+    with scoped_plugin_manager(build_nonlive_plugin_manager(requested_plugins)):
+        return _bootstrap_and_run_impl(settings_path, source_settings=source_settings)
+
+
+def _bootstrap_and_run_impl(settings_path: Path, *, source_settings: object | None = None) -> RunResult:
+    """Load config, instantiate plugins, build graph, and run a sub-pipeline.
+
+    This is the programmatic equivalent of ``elspeth run --execute`` used by
+    dependency resolution. It lives in the CLI layer because it intentionally
+    shares CLI secret loading and output-directory preparation.
+    """
+    from elspeth.cli_helpers import resolve_audit_passphrase
+    from elspeth.core.landscape import LandscapeDB
+    from elspeth.core.payload_store import FilesystemPayloadStore
+    from elspeth.engine.bootstrap import resolve_preflight
+    from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
+    from elspeth.plugins.infrastructure.probe_factory import build_collection_probes
+    from elspeth.plugins.infrastructure.runtime_factory import make_sink_factory
+
+    _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH, source_settings=source_settings)
+    loaded_settings = _load_runtime_settings_with_secrets(settings_path, source_settings=source_settings)
+    config, secret_resolutions = loaded_settings.settings, list(loaded_settings.secret_resolutions)
+    _require_marked_export(config)
+    _admit_cli_nonlive_run(config)
+
+    if loaded_settings.power_automate_nonlive is None:
+        plugins = _instantiate_plugins_for_runtime_preflight(config)
+    else:
+        plugins = _instantiate_plugins_for_runtime_preflight(config, power_automate_nonlive=loaded_settings.power_automate_nonlive)
+    execution_sinks, execution_sink_modes, sink_effect_admission = _preflight_execution_sinks(config, plugins)
+
+    graph = ExecutionGraph.from_plugin_instances(
+        sources=plugins.sources,
+        source_settings_map=plugins.source_settings_map,
+        transforms=plugins.transforms,
+        sinks=execution_sinks,
+        aggregations=plugins.aggregations,
+        gates=list(config.gates),
+        queues=config.queues,
+        coalesce_settings=list(config.coalesce) if config.coalesce else None,
+        row_union_settings=list(config.row_unions) if config.row_unions else None,
+        collectors=plugins.collectors,
+        scope_settings=list(config.scopes) if config.scopes else None,
+        max_bound_region_depth=config.max_bound_region_depth,
+    )
+    graph.validate()
+
+    dir_errors = _ensure_output_directories(
+        config,
+        execution_sink_names=execution_sinks,
+        include_sink_directories=config.run_mode is RunMode.LIVE,
+    )
+    if dir_errors:
+        raise ValueError(f"Failed to create output directories: {'; '.join(dir_errors)}")
+
+    if config.run_mode is RunMode.LIVE:
+        probes = build_collection_probes(config.collection_probes) if config.collection_probes else []
+        preflight = resolve_preflight(config, settings_path, probes=probes, runner=bootstrap_and_run)
+    else:
+        preflight = PreflightResult(dependency_runs=(), gate_results=())
+
+    passphrase = resolve_audit_passphrase(config.landscape)
+    if passphrase is not None and config.landscape.dump_to_jsonl:
+        import structlog
+
+        structlog.get_logger().warning(
+            "JSONL journal is not encrypted",
+            hint="The JSONL change journal is written in plaintext even when the audit database is encrypted with SQLCipher.",
+        )
+
+    db = LandscapeDB.from_url(
+        config.landscape.url,
+        passphrase=passphrase,
+        dump_to_jsonl=config.landscape.dump_to_jsonl,
+        dump_to_jsonl_path=config.landscape.dump_to_jsonl_path,
+        dump_to_jsonl_fail_on_error=config.landscape.dump_to_jsonl_fail_on_error,
+        dump_to_jsonl_include_payloads=config.landscape.dump_to_jsonl_include_payloads,
+        dump_to_jsonl_payload_base_path=(
+            str(config.payload_store.base_path)
+            if config.landscape.dump_to_jsonl_payload_base_path is None
+            else config.landscape.dump_to_jsonl_payload_base_path
+        ),
+    )
+
+    if config.payload_store.backend != "filesystem":
+        raise ValueError(f"Unsupported payload store backend '{config.payload_store.backend}'. Only 'filesystem' is currently supported.")
+    payload_store = FilesystemPayloadStore(config.payload_store.base_path)
+
+    audit_export_content_store = None
+    audit_export_content_store_resolver = None
+    if config.landscape.export.enabled:
+        from elspeth.core.audit_export_content_store import create_audit_export_content_store
+
+        audit_export_content_store, audit_export_content_store_resolver = create_audit_export_content_store(config.landscape.export)
+
+    try:
+        with _orchestrator_context(
+            config,
+            graph,
+            plugins,
+            db=db,
+            output_format="none",
+            sink_effect_modes=execution_sink_modes,
+            sink_effect_admission=sink_effect_admission,
+        ) as ctx:
+            from elspeth.plugins.transforms.llm.model_catalog import read_openrouter_catalog_snapshot_id
+
+            catalog_sha, catalog_source = read_openrouter_catalog_snapshot_id()
+            return ctx.orchestrator.run(
+                ctx.pipeline_config,
+                graph=graph,
+                settings=config,
+                payload_store=payload_store,
+                audit_export_content_store=audit_export_content_store,
+                audit_export_content_store_resolver=audit_export_content_store_resolver,
+                preflight_results=preflight,
+                secret_resolutions=secret_resolutions,
+                sink_factory=make_sink_factory(config),
+                openrouter_catalog_sha256=catalog_sha,
+                openrouter_catalog_source=catalog_source,
+            )
+    finally:
+        import sys
+
+        _close_landscape_db(db, pending_exc=sys.exc_info()[1])
+
+
+def _format_validation_error(
+    title: str,
+    message: str,
+    hint: str | None = None,
+    details: list[str] | None = None,
+) -> None:
+    """Display a formatted validation error with optional hint and details."""
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+
+    console = Console(stderr=True)
+
+    # Build error content
+    content = Text()
+    content.append(message, style="white")
+
+    if details:
+        content.append("\n\n")
+        for detail in details:
+            content.append(f"  • {detail}\n", style="dim")
+
+    if hint:
+        content.append("\n")
+        content.append("Hint: ", style="yellow bold")
+        content.append(hint, style="yellow")
+
+    panel = Panel(
+        content,
+        title=f"[red bold]❌ {title}[/]",
+        border_style="red",
+        padding=(0, 1),
+    )
+    console.print(panel)
+
+
+@app.command()
+def validate(
+    settings: str = typer.Option(
+        ...,
+        "--settings",
+        "-s",
+        help="Path to settings YAML file.",
+    ),
+) -> None:
+    """Validate pipeline configuration without running."""
+    from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_from_config
+
+    settings_path = Path(settings).expanduser()
+
+    # Share run's admission before secrets, file templates, or plugin imports.
+    try:
+        mode, requested_plugins, source_settings = _admit_raw_cli_nonlive_run(settings_path)
+        _install_nonlive_plugin_scope(mode, requested_plugins)
+        loaded_settings = _load_runtime_settings_with_secrets(settings_path, source_settings=source_settings)
+        config, _secret_resolutions = loaded_settings.settings, loaded_settings.secret_resolutions
+        _admit_cli_nonlive_run(config)
+    except (YamlParserError, YamlScannerError) as e:
+        # YAML syntax errors from Dynaconf/ruamel (malformed YAML) - show helpful message
+        _format_validation_error(
+            title="YAML Syntax Error",
+            message=f"Failed to parse {settings_path.name}",
+            details=[str(e.problem)] if e.problem is not None else None,
+            hint="Check for unclosed brackets, incorrect indentation, or invalid characters.",
+        )
+        raise typer.Exit(1) from None
+    except yaml.YAMLError as e:
+        # YAML syntax errors from PyYAML (used in _load_raw_yaml) - show helpful message
+        _format_validation_error(
+            title="YAML Syntax Error",
+            message=f"Failed to parse {settings_path.name}",
+            details=[str(e)],
+            hint="Check for unclosed brackets, incorrect indentation, or invalid characters.",
+        )
+        raise typer.Exit(1) from None
+    except FileNotFoundError:
+        _format_validation_error(
+            title="File Not Found",
+            message=f"Settings file does not exist: {settings}",
+            hint="Check the path and ensure the file exists.",
+        )
+        raise typer.Exit(1) from None
+    except SecretLoadError as e:
+        # Key Vault secret loading errors - show helpful message
+        _format_validation_error(
+            title="Secret Loading Failed",
+            message=str(e),
+            hint="Check your Azure credentials and Key Vault configuration.",
+        )
+        raise typer.Exit(1) from None
+    except ValidationError as e:
+        # Pydantic validation errors (must be before ValueError - ValidationError inherits from it!)
+        details = []
+        for error in e.errors():
+            loc = ".".join(str(x) for x in error["loc"])
+            details.append(f"{loc}: {error['msg']}")
+        _format_validation_error(
+            title="Configuration Validation Failed",
+            message=f"Invalid settings in {settings_path.name}",
+            details=details,
+            hint="Check field names, types, and required values.",
+        )
+        raise typer.Exit(1) from None
+    except (ValueError, contract_errors.OrchestrationInvariantError) as e:
+        # Environment variable expansion errors (must be AFTER ValidationError!)
+        error_msg = str(e)
+        if "environment variable" in error_msg.lower():
+            # Extract variable name from error message if possible
+            import re
+
+            match = re.search(r"'(\w+)'", error_msg)
+            var_name = match.group(1) if match else "VARIABLE"
+            _format_validation_error(
+                title="Missing Environment Variable",
+                message=error_msg,
+                hint=f'Set the variable: export {var_name}="your-value"\n         Or use optional syntax: ${{{var_name}:-default}}',
+            )
+        else:
+            _format_validation_error(
+                title="Configuration Error",
+                message=error_msg,
+            )
+        raise typer.Exit(1) from None
+
+    # NOTE: _secret_resolutions captured but not used for validation
+    # Validation is a dry-run check, no audit recording needed
+
+    # Instantiate plugins BEFORE graph construction
+    try:
+        if loaded_settings.power_automate_nonlive is None:
+            plugins = instantiate_plugins_from_config(config)
+        else:
+            plugins = instantiate_plugins_from_config(config, power_automate_nonlive=loaded_settings.power_automate_nonlive)
+    except ValueError as e:
+        # Plugin configuration errors (e.g., invalid schema for sink type)
+        error_msg = str(e)
+        _format_validation_error(
+            title="Plugin Configuration Error",
+            message=error_msg,
+            hint="Check plugin options match the plugin's requirements.",
+        )
+        raise typer.Exit(1) from None
+    except contract_errors.TIER_1_ERRORS:
+        raise  # Tier 1 errors must crash with full traceback, not Exit(1)
+    except Exception as e:
+        _format_validation_error(
+            title="Plugin Instantiation Failed",
+            message=str(e),
+            hint="Check that all plugin options are valid and dependencies are available.",
+        )
+        raise typer.Exit(1) from None
+
+    # Build and validate graph from plugin instances
+    execution_sinks = _execution_sinks_for_graph(config, plugins.sinks)
+    try:
+        graph = ExecutionGraph.from_plugin_instances(
+            sources=plugins.sources,
+            source_settings_map=plugins.source_settings_map,
+            transforms=plugins.transforms,
+            sinks=execution_sinks,
+            aggregations=plugins.aggregations,
+            gates=list(config.gates),
+            coalesce_settings=list(config.coalesce) if config.coalesce else None,
+            queues=config.queues,
+            row_union_settings=list(config.row_unions) if config.row_unions else None,
+            collectors=plugins.collectors,
+            scope_settings=list(config.scopes) if config.scopes else None,
+            max_bound_region_depth=config.max_bound_region_depth,
+        )
+        graph.validate()
+    except GraphValidationError as e:
+        _format_validation_error(
+            title="Pipeline Graph Error",
+            message=str(e),
+            hint="Check for cycles, missing sinks, or invalid routing.",
+        )
+        raise typer.Exit(1) from None
+    except ValueError as e:
+        # Schema compatibility errors raised during graph construction
+        _format_validation_error(
+            title="Schema Validation Error",
+            message=str(e),
+            hint="Ensure upstream nodes provide fields required by downstream nodes.",
+        )
+        raise typer.Exit(1) from None
+
+    typer.echo("✅ Pipeline configuration valid!")
+    typer.echo(f"  Sources: {', '.join(f'{name}={s.plugin}' for name, s in config.sources.items())}")
+    typer.echo(f"  Transforms: {len(config.transforms)}")
+    typer.echo(f"  Aggregations: {len(config.aggregations)}")
+    typer.echo(f"  Sinks: {', '.join(config.sinks.keys())}")
+    typer.echo(f"  Graph: {graph.node_count} nodes, {graph.edge_count} edges")
+
+
+# Plugins subcommand group
+plugins_app = typer.Typer(help="Plugin management commands.")
+app.add_typer(plugins_app, name="plugins")
+
+
+@plugins_app.command("list")
+def plugins_list(
+    plugin_type: str | None = typer.Option(
+        None,
+        "--type",
+        "-t",
+        help="Filter by plugin type (source, transform, sink).",
+    ),
+    output_format: str = typer.Option(
+        "text",
+        "--format",
+        help="Output format (text, json).",
+    ),
+) -> None:
+    """List available plugins."""
+    from elspeth.cli_plugins import format_plugins_list_text, list_plugins_payload, list_plugins_text_payload, parse_plugin_kind
+
+    if output_format not in {"text", "json"}:
+        typer.echo(f"Error: Invalid format '{output_format}'.", err=True)
+        typer.echo("Valid formats: text, json", err=True)
+        raise typer.Exit(1)
+
+    try:
+        parsed_type = parse_plugin_kind(plugin_type) if plugin_type is not None else None
+        payload = list_plugins_payload(parsed_type) if output_format == "json" else list_plugins_text_payload(parsed_type)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    if output_format == "json":
+        typer.echo(json.dumps(payload, sort_keys=True))
+        return
+
+    typer.echo(format_plugins_list_text(payload), nl=False)
+
+
+@plugins_app.command("inspect")
+def plugins_inspect(
+    plugin_type: str = typer.Argument(..., help="Plugin type (source, transform, sink)."),
+    name: str = typer.Argument(..., help="Plugin name."),
+    output_format: str = typer.Option(
+        "text",
+        "--format",
+        help="Output format (text, json).",
+    ),
+) -> None:
+    """Inspect one plugin's catalog schema."""
+    from elspeth.cli_plugins import format_plugin_inspect_text, inspect_plugin_payload, parse_plugin_kind
+
+    if output_format not in {"text", "json"}:
+        typer.echo(f"Error: Invalid format '{output_format}'.", err=True)
+        typer.echo("Valid formats: text, json", err=True)
+        raise typer.Exit(1)
+
+    try:
+        parsed_type = parse_plugin_kind(plugin_type)
+        payload = inspect_plugin_payload(parsed_type, name)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    if output_format == "json":
+        typer.echo(json.dumps(payload, sort_keys=True))
+        return
+
+    typer.echo(format_plugin_inspect_text(payload), nl=False)
+
+
+def _resolve_composer_auth_db(*, data_dir: Path, auth_db: Path | None) -> Path:
+    path = auth_db if auth_db is not None else data_dir / "auth.db"
+    return path.expanduser().resolve()
+
+
+def _resolve_composer_session_db_url(*, data_dir: Path, session_db_url: str | None) -> str:
+    """The sessions store these commands retire identities in.
+
+    Same rule as the web app (``WebSettings.get_session_db_url``): an explicit
+    URL wins, then the ``ELSPETH_WEB__SESSION_DB_URL`` the container exports,
+    then ``data_dir/sessions.db``. The environment read is by the same name
+    ``settings_from_env`` would read it under, so a shell inside a deployed
+    container reaches the deployment's store without restating it.
+    """
+    from elspeth.web.config import resolve_session_db_url
+
+    configured = session_db_url if session_db_url is not None else os.environ.get("ELSPETH_WEB__SESSION_DB_URL")
+    return resolve_session_db_url(data_dir=data_dir.expanduser().resolve(), session_db_url=configured)
+
+
+def _resolve_composer_landscape_url(*, data_dir: Path, landscape_url: str | None) -> str:
+    """The Landscape the retirement audit row goes to, by the web app's rule.
+
+    Explicit URL, then the ``ELSPETH_WEB__LANDSCAPE_URL`` the container
+    exports, then ``data_dir/runs/audit.db`` -- the same resolution as
+    ``WebSettings.get_landscape_url``, read through the same module-level
+    function rather than a copy of it.
+    """
+    from elspeth.web.config import resolve_landscape_url
+
+    configured = landscape_url if landscape_url is not None else os.environ.get("ELSPETH_WEB__LANDSCAPE_URL")
+    return resolve_landscape_url(data_dir=data_dir.expanduser().resolve(), landscape_url=configured)
+
+
+def _composer_auth_audit_recorder(landscape_url: str) -> AuthAuditRecorder:
+    """The CLI's Landscape auth-audit writer, resolved from the same URL rule app.py uses."""
+    from sqlalchemy.engine.url import make_url
+
+    from elspeth.web.auth.audit import AuthAuditRecorder
+    from elspeth.web.compartments import is_compartment_id
+
+    compartment_id = os.environ.get("ELSPETH_WEB__COMPARTMENT_ID")
+    if compartment_id is not None and not is_compartment_id(compartment_id):
+        typer.echo("Error: compartment_id must match [a-z0-9][a-z0-9-]{0,62}", err=True)
+        raise typer.Exit(1)
+
+    parsed = make_url(landscape_url)
+    sqlite_landscape = parsed.drivername.split("+", 1)[0] == "sqlite"
+    sqlite_file = parsed.database if sqlite_landscape else None
+    if sqlite_file is not None and sqlite_file != ":memory:":
+        # The web app creates data_dir/runs at boot; a CLI that writes the
+        # first audit row of a fresh data dir must do the same, or SQLite
+        # refuses to create the file.
+        Path(sqlite_file).parent.mkdir(parents=True, exist_ok=True)
+    return AuthAuditRecorder(
+        landscape_url=landscape_url,
+        landscape_passphrase=os.environ.get("ELSPETH_WEB__LANDSCAPE_PASSPHRASE"),
+        # Mirrors AuthAuditRecorder.from_settings: only a SQLite Landscape is
+        # created on first write; an external store is provisioned by doctor.
+        create_tables=sqlite_landscape,
+        compartment_id=compartment_id,
+    )
+
+
+def _composer_retirement_recorder(recorder: AuthAuditRecorder) -> Callable[[IdentityRetired], None]:
+    """The CLI's audit sink for a retirement: the SAME Landscape row app.py writes.
+
+    A credential deletion disables the identity and retires its binding, and
+    the authority invokes this INSIDE that transaction -- a retirement the
+    Landscape cannot hold does not commit, the rule every identity mutation
+    follows. The CLI is a surface whose audit trail matters (it deletes
+    accounts), so it does not take the "audits nothing" no-op the authority
+    allows; it writes ``identity_disabled`` with ``cause=credential_deleted``
+    through the same recorder, resolved from the same URL rule.
+    """
+
+    def record(outcome: IdentityRetired) -> None:
+        recorder.record_identity_retired(
+            provider="local",
+            identity_id=outcome.record.identity_id,
+            username=outcome.record.username,
+            retired_subject=outcome.record.subject,
+            reason=outcome.reason,
+        )
+
+    return record
+
+
+def _composer_session_engine(session_db_url: str) -> Engine:
+    """Open the sessions store the way the web app opens it (PRAGMAs, pool)."""
+    from elspeth.web.schema_probe import postgres_engine_kwargs
+    from elspeth.web.sessions.engine import create_session_engine
+
+    return create_session_engine(session_db_url, **postgres_engine_kwargs(session_db_url))
+
+
+def _deferred_identity_retirer(session_db_url: str, landscape_url: str) -> RetireIdentity:
+    """A retirer that opens the stores only if it is ever asked to retire.
+
+    ``add`` never deletes, but the provider's retirer is required -- a
+    provider that cannot retire is the inheritance defect, not a smaller
+    provider -- and opening the stores eagerly is not free: the engine
+    probes its PRAGMAs on construction, which creates an empty
+    ``sessions.db`` beside an ``auth.db`` the operator only meant to add a
+    user to. So ``add`` binds the real authority, with the real audit sink,
+    behind a first-call open.
+    """
+    from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+    from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
+
+    def retire(
+        username: str,
+        operator_reason: str,
+        credential_exists: Callable[[], bool],
+        delete_credential: Callable[[], None],
+    ) -> bool:
+        engine = _composer_session_engine(session_db_url)
+        try:
+            with _composer_auth_audit_recorder(landscape_url) as recorder:
+                return local_identity_retirer(
+                    RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply),
+                    _composer_retirement_recorder(recorder),
+                )(username, operator_reason, credential_exists, delete_credential)
+        finally:
+            engine.dispose()
+
+    return retire
+
+
+def _composer_auth_provider(auth_db: Path, *, retire_identity: RetireIdentity) -> LocalAuthProvider:
+    """Open auth.db for ACCOUNT administration, bound to a retirement authority.
+
+    These commands create and delete local accounts. Neither mints a session
+    token, so no token issuer or admission path is built. Deleting DOES
+    reach the identity substrate: a local credential's identity is keyed on
+    its username, and a deletion that leaves the identity in place hands
+    its admission, quota and history to the next holder of that username
+    (elspeth-9c171c00fa). The retirer is the same authority the web app
+    binds, ``local_identity_retirer``, never a CLI copy of it.
+
+    The old ``ELSPETH_WEB__SECRET_KEY`` read is gone with the argument it fed.
+    It defaulted to the literal ``"composer-cli-user-management"``, which was
+    already meaningless here: no token was ever signed on this path, so the
+    key was read, passed, and never used.
+    """
+    from elspeth.web.auth.local import LocalAuthProvider
+
+    auth_db.parent.mkdir(parents=True, exist_ok=True)
+    return LocalAuthProvider.for_account_administration(auth_db, retire_identity=retire_identity)
+
+
+@composer_users_app.command("add")
+def composer_users_add(
+    username: str = typer.Argument(..., help="Local composer username to create."),
+    password: str = typer.Option(
+        ...,
+        "--password",
+        prompt=True,
+        confirmation_prompt=True,
+        hide_input=True,
+        help="Initial password for the local composer user.",
+    ),
+    display_name: str | None = typer.Option(
+        None,
+        "--display-name",
+        help="Display name. Defaults to the username.",
+    ),
+    email: str | None = typer.Option(None, "--email", help="Optional user email."),
+    data_dir: Path = typer.Option(
+        Path("data"),
+        "--data-dir",
+        help="Web data directory containing auth.db.",
+    ),
+    auth_db: Path | None = typer.Option(
+        None,
+        "--auth-db",
+        help="Explicit auth.db path; overrides --data-dir.",
+    ),
+) -> None:
+    """Add a local user for the Composer web interface."""
+    db_path = _resolve_composer_auth_db(data_dir=data_dir, auth_db=auth_db)
+    provider = _composer_auth_provider(
+        db_path,
+        retire_identity=_deferred_identity_retirer(
+            _resolve_composer_session_db_url(data_dir=data_dir, session_db_url=None),
+            _resolve_composer_landscape_url(data_dir=data_dir, landscape_url=None),
+        ),
+    )
+    try:
+        provider.create_user(
+            username,
+            password,
+            display_name=display_name or username,
+            email=email,
+            email_verified=True,
+        )
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"Added composer user {username} in {db_path}")
+
+
+@composer_users_app.command("remove")
+def composer_users_remove(
+    username: str = typer.Argument(..., help="Local composer username to remove."),
+    reason: str = typer.Option(
+        ...,
+        "--reason",
+        help="Why the account is being removed. Recorded in the audit trail, as People & access records it.",
+    ),
+    data_dir: Path = typer.Option(
+        Path("data"),
+        "--data-dir",
+        help="Web data directory containing auth.db.",
+    ),
+    auth_db: Path | None = typer.Option(
+        None,
+        "--auth-db",
+        help="Explicit auth.db path; overrides --data-dir.",
+    ),
+    session_db_url: str | None = typer.Option(
+        None,
+        "--session-db-url",
+        help="Sessions store URL; defaults to ELSPETH_WEB__SESSION_DB_URL, then <data-dir>/sessions.db.",
+    ),
+    landscape_url: str | None = typer.Option(
+        None,
+        "--landscape-url",
+        help="Landscape URL for the retirement audit row; defaults to ELSPETH_WEB__LANDSCAPE_URL, then <data-dir>/runs/audit.db.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Remove without an interactive confirmation prompt.",
+    ),
+) -> None:
+    """Remove a local Composer web user and retire the identity it was bound to."""
+    from elspeth.web.auth.local import LocalAuthCredentialChanged
+    from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+    from elspeth.web.coordination.identity_authority import (
+        LOCAL_DELETION_REASON_MAX_LENGTH,
+        LastActiveAdminProtected,
+        RepositoryIdentityAuthority,
+        local_identity_retirer,
+    )
+    from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
+
+    # Checked before anything is opened: a refusal here touches neither store.
+    if not reason.strip():
+        typer.echo("Error: --reason must say why the account is being removed.", err=True)
+        raise typer.Exit(1)
+    if len(reason.strip()) > LOCAL_DELETION_REASON_MAX_LENGTH:
+        typer.echo(f"Error: --reason must be at most {LOCAL_DELETION_REASON_MAX_LENGTH} characters.", err=True)
+        raise typer.Exit(1)
+    db_path = _resolve_composer_auth_db(data_dir=data_dir, auth_db=auth_db)
+    if not db_path.exists():
+        typer.echo(f"Error: composer auth database not found: {db_path}", err=True)
+        raise typer.Exit(1)
+    if not yes and not typer.confirm(f"Remove composer user {username} from {db_path}?"):
+        typer.echo("Aborted.")
+        raise typer.Exit(1)
+    resolved_session_db_url = _resolve_composer_session_db_url(data_dir=data_dir, session_db_url=session_db_url)
+    try:
+        session_engine = _composer_session_engine(resolved_session_db_url)
+    except SessionSchemaError as exc:
+        typer.echo(f"Error: sessions store at {resolved_session_db_url} is not at the current schema: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    # The store must carry the current schema BEFORE the credential goes:
+    # a deletion whose retirement then fails is the inheritance defect with
+    # extra steps. Same create-or-validate rule the web app applies to this
+    # URL at boot -- an empty store is initialised, a stale one is refused
+    # unaltered, and the credential is untouched either way until this
+    # returns.
+    try:
+        if session_engine.dialect.name == "sqlite":
+            sqlite_store = session_engine.url.database
+            if sqlite_store is not None and sqlite_store != ":memory:":
+                Path(sqlite_store).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            initialize_session_schema(session_engine)
+        except SessionSchemaError as exc:
+            typer.echo(f"Error: sessions store at {resolved_session_db_url} is not at the current schema: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        with _composer_auth_audit_recorder(_resolve_composer_landscape_url(data_dir=data_dir, landscape_url=landscape_url)) as recorder:
+            provider = _composer_auth_provider(
+                db_path,
+                retire_identity=local_identity_retirer(
+                    RepositoryIdentityAuthority(session_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply),
+                    _composer_retirement_recorder(recorder),
+                ),
+            )
+            try:
+                deletion = provider.delete_user(username, reason=reason)
+            except LocalAuthCredentialChanged as exc:
+                typer.echo(f"Error: {exc}", err=True)
+                raise typer.Exit(1) from exc
+            except LastActiveAdminProtected as exc:
+                # Refused before the credential was touched. ``bootstrap-admin``
+                # only answers when NO active administrator exists, so it is
+                # not the way to make the second one.
+                typer.echo(
+                    f"Error: {username} is the last active administrator, and removing this account would leave "
+                    "the deployment with nobody able to administer it. Nothing was removed.\n"
+                    "Give another person the admin role first (People & access, Roles), then run this command again.",
+                    err=True,
+                )
+                raise typer.Exit(1) from exc
+            if not deletion.removed_anything:
+                typer.echo(f"Error: composer user not found: {username}", err=True)
+                raise typer.Exit(1)
+    finally:
+        session_engine.dispose()
+    typer.echo(f"Removed composer user {username} from {db_path}")
+
+
+_AUTH_PROVIDER_NAMES: frozenset[str] = frozenset(get_args(AuthProviderType))
+"""The ``AuthProviderType`` members, as strings a CLI argument can be checked against."""
+
+
+@composer_users_app.command("bootstrap-admin")
+def composer_users_bootstrap_admin(
+    provider: str = typer.Argument(..., help="Identity provider of the subject: local, oidc, entra, vanguard or google."),
+    subject: str = typer.Argument(..., help="The IdP subject (``sub``) of the person who becomes the first admin."),
+    username: str | None = typer.Option(None, "--username", help="Username for a row that does not exist yet; defaults to the subject."),
+    organisation_id: str | None = typer.Option(None, "--organisation-id", help="Organisation ID for a row that does not exist yet."),
+    note: str = typer.Option(..., "--note", help="Why this bootstrap is happening; written to the activation's audit row."),
+    data_dir: Path = typer.Option(Path("data"), "--data-dir", help="Web data directory."),
+    session_db_url: str | None = typer.Option(
+        None,
+        "--session-db-url",
+        help="Sessions store URL; defaults to ELSPETH_WEB__SESSION_DB_URL, then <data-dir>/sessions.db.",
+    ),
+    landscape_url: str | None = typer.Option(
+        None,
+        "--landscape-url",
+        help="Landscape URL for the activation audit rows; defaults to ELSPETH_WEB__LANDSCAPE_URL, then <data-dir>/runs/audit.db.",
+    ),
+    quota_tokens_per_day: int | None = typer.Option(
+        None, "--quota-tokens-per-day", min=1, max=2**63 - 1, help="The D31 allowance row; both quota options or neither."
+    ),
+    quota_storage_bytes: int | None = typer.Option(
+        None, "--quota-storage-bytes", min=1, max=2**63 - 1, help="The D31 allowance row; both quota options or neither."
+    ),
+) -> None:
+    """Make the first administrator, once: the operator's lockout recovery (spec D20).
+
+    Writes the whole state in one audited transaction -- the identity row
+    is created or bound, made active, granted a deployment-wide ``admin``
+    with no workload role, and given its quota row -- and is refused once
+    an active human admin exists. Adding a subject to
+    ``sso_admin_subjects`` does nothing after that point; this command is
+    the only path.
+    """
+    from elspeth.web.auth.models import IdentityClaims
+    from elspeth.web.coordination.identity_authority import (
+        AdminAlreadyBootstrapped,
+        IdentityActivated,
+        IdentityAlreadyDisabled,
+        RepositoryIdentityAuthority,
+        RoleForbiddenForIdentity,
+    )
+    from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
+
+    if provider not in _AUTH_PROVIDER_NAMES:
+        typer.echo(f"Error: unknown provider {provider!r}; expected one of {', '.join(sorted(_AUTH_PROVIDER_NAMES))}", err=True)
+        raise typer.Exit(2)
+    if (quota_tokens_per_day is None) != (quota_storage_bytes is None):
+        typer.echo("Error: --quota-tokens-per-day and --quota-storage-bytes go together", err=True)
+        raise typer.Exit(2)
+    # Narrowed by the closed-set check above; the Literal cannot be
+    # constructed from a str any other way.
+    provider_type = cast("AuthProviderType", provider)
+    claims = IdentityClaims(
+        provider=provider_type,
+        subject=subject,
+        username=subject if username is None else username,
+        organisation_id=organisation_id,
+    )
+    resolved_session_db_url = _resolve_composer_session_db_url(data_dir=data_dir, session_db_url=session_db_url)
+    session_engine = _composer_session_engine(resolved_session_db_url)
+    recorder = _composer_auth_audit_recorder(_resolve_composer_landscape_url(data_dir=data_dir, landscape_url=landscape_url))
+
+    def record(event: IdentityActivated) -> None:
+        # Inside the authority's transaction: a bootstrap the trail cannot
+        # hold does not commit.
+        recorder.record_identity_activated(
+            None,
+            provider=provider_type,
+            identity_id=event.record.identity_id,
+            username=event.record.username,
+            actor_identity_id=None,
+            cause="bootstrap",
+            note=event.note,
+            role=None if event.role is None else event.role.role,
+            role_id=None if event.role is None else event.role.role_id,
+            # The grants the bound row already held. ``bootstrap_admin``
+            # binds an existing identity as well as creating one, and since
+            # R9 that row can be a re-pended administrator whose deployment
+            # ``admin`` never lapsed -- in which case this command grants
+            # nothing and the trail says so here rather than nowhere.
+            retained_roles=tuple((grant.role, grant.scope) for grant in event.retained_roles),
+            tokens_per_day=quota_tokens_per_day if event.quota_written else None,
+            storage_bytes=quota_storage_bytes if event.quota_written else None,
+            on_behalf_of=event.on_behalf_of,
+            console_request_id=event.console_request_id,
+        )
+
+    try:
+        recorder.start()
+        if session_engine.dialect.name == "sqlite":
+            sqlite_store = session_engine.url.database
+            if sqlite_store is not None and sqlite_store != ":memory:":
+                Path(sqlite_store).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            initialize_session_schema(session_engine)
+        except SessionSchemaError as exc:
+            typer.echo(f"Error: sessions store at {resolved_session_db_url} is not at the current schema: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        try:
+            from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+
+            activated = RepositoryIdentityAuthority(
+                session_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply
+            ).bootstrap_admin(
+                claims=claims,
+                note=note,
+                quota_tokens_per_day=quota_tokens_per_day,
+                quota_storage_bytes=quota_storage_bytes,
+                record=record,
+            )
+        except AdminAlreadyBootstrapped as exc:
+            typer.echo("Error: an active human admin already exists; grant roles through the admin API instead", err=True)
+            raise typer.Exit(1) from exc
+        except IdentityAlreadyDisabled as exc:
+            typer.echo(f"Error: the identity for {provider}:{subject} is disabled; enable it through the admin API first", err=True)
+            raise typer.Exit(1) from exc
+        except RoleForbiddenForIdentity as exc:
+            typer.echo(f"Error: the identity for {provider}:{subject} is a service identity; admin is a human role", err=True)
+            raise typer.Exit(1) from exc
+    finally:
+        try:
+            recorder.close()
+        finally:
+            session_engine.dispose()
+    typer.echo(f"Bootstrapped admin {activated.record.username} ({activated.record.identity_id}) for {provider}:{subject}")
+
+
+@app.command()
+def purge(
+    database: str | None = typer.Option(
+        None,
+        "--database",
+        "-d",
+        help="Path to Landscape database file (SQLite).",
+    ),
+    payload_dir: str | None = typer.Option(
+        None,
+        "--payload-dir",
+        "-p",
+        help="Path to payload storage directory.",
+    ),
+    retention_days: int | None = typer.Option(
+        None,
+        "--retention-days",
+        "-r",
+        help="Delete payloads older than this many days (default: from config or 90).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show what would be deleted without deleting.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip confirmation prompt.",
+    ),
+) -> None:
+    """Purge old payloads to free storage.
+
+    Deletes PayloadStore blobs older than retention period.
+    Landscape metadata (hashes) is preserved for audit trail.
+
+    Examples:
+
+        # See what would be deleted
+        elspeth purge --dry-run --database ./landscape.db
+
+        # Delete payloads older than 30 days
+        elspeth purge --retention-days 30 --yes --database ./landscape.db
+    """
+    from elspeth.core.landscape import LandscapeDB
+    from elspeth.core.payload_store import FilesystemPayloadStore
+    from elspeth.core.retention.purge import PurgeManager
+
+    # Try to load settings from settings.yaml if database not provided
+    db_url: str | None = None
+    payload_path: Path | None = None
+    effective_retention_days: int = 90  # Fallback default
+    config: ElspethSettings | None = None
+
+    # Try loading settings.yaml first (for payload_store config)
+    # Uses _load_settings_with_secrets to support Key Vault-backed configs
+    settings_path = Path("settings.yaml")
+    if settings_path.exists():
+        try:
+            config, _secret_resolutions = _load_settings_with_secrets(settings_path)
+        except (YamlParserError, YamlScannerError) as e:
+            problem = e.problem if e.problem is not None else str(e)
+            if not database:
+                typer.echo(f"YAML syntax error in settings.yaml: {problem}", err=True)
+                typer.echo("Specify --database to provide path directly.", err=True)
+                raise typer.Exit(1) from None
+            typer.echo(f"Warning: YAML syntax error in settings.yaml: {problem}", err=True)
+        except yaml.YAMLError as e:
+            if not database:
+                typer.echo(f"YAML error in settings.yaml: {e}", err=True)
+                typer.echo("Specify --database to provide path directly.", err=True)
+                raise typer.Exit(1) from None
+            typer.echo(f"Warning: YAML error in settings.yaml: {e}", err=True)
+        except ValidationError as e:
+            if not database:
+                typer.echo("Configuration errors in settings.yaml:", err=True)
+                for error in e.errors():
+                    loc = ".".join(str(x) for x in error["loc"])
+                    typer.echo(f"  - {loc}: {error['msg']}", err=True)
+                typer.echo("Specify --database to provide path directly.", err=True)
+                raise typer.Exit(1) from None
+            typer.echo("Warning: Configuration errors in settings.yaml (continuing with --database)", err=True)
+        except ValueError as e:
+            if not database:
+                typer.echo(f"Configuration error in settings.yaml: {e}", err=True)
+                typer.echo("Specify --database to provide path directly.", err=True)
+                raise typer.Exit(1) from None
+            typer.echo(f"Warning: Configuration error in settings.yaml: {e}", err=True)
+        except SecretLoadError as e:
+            if not database:
+                typer.echo(f"Error loading secrets: {e}", err=True)
+                typer.echo("Specify --database to provide path directly.", err=True)
+                raise typer.Exit(1) from None
+            typer.echo(f"Warning: Could not load secrets: {e}", err=True)
+
+    if database:
+        db_path = Path(database).expanduser().resolve()
+        # Fail fast with clear error if file doesn't exist
+        # (prevents silent creation of empty DB on typoed paths)
+        if not db_path.exists():
+            typer.echo(f"Error: Database file not found: {db_path}", err=True)
+            raise typer.Exit(1) from None
+        db_url = f"sqlite:///{db_path}"
+    elif config:
+        db_url = config.landscape.url
+        _validate_existing_sqlite_db_url(db_url, source="settings.yaml")
+        typer.echo(f"Using database from settings.yaml: {db_url}")
+    else:
+        typer.echo("Error: No settings.yaml found and --database not provided.", err=True)
+        typer.echo("Specify --database to provide path to Landscape database.", err=True)
+        raise typer.Exit(1) from None
+
+    # Determine payload path: CLI override > config > default
+    if payload_dir:
+        payload_path = Path(payload_dir).expanduser()
+    elif config:
+        # Use config's payload_store.base_path
+        payload_path = config.payload_store.base_path.expanduser()
+        # Verify backend is supported
+        if config.payload_store.backend != "filesystem":
+            typer.echo(
+                f"Error: Payload store backend '{config.payload_store.backend}' is not supported for purge. "
+                f"Only 'filesystem' backend is currently implemented.",
+                err=True,
+            )
+            raise typer.Exit(1) from None
+        typer.echo(f"Using payload directory from config: {payload_path}")
+    else:
+        # Default to ./payloads relative to database location
+        if database:
+            payload_path = Path(database).parent / "payloads"
+        else:
+            payload_path = Path("payloads")
+
+    # Determine retention days: CLI override > config > default (90)
+    if retention_days is not None:
+        if retention_days <= 0:
+            typer.echo("Error: --retention-days must be greater than 0.", err=True)
+            raise typer.Exit(1)
+        effective_retention_days = retention_days
+    elif config:
+        effective_retention_days = config.payload_store.retention_days
+        typer.echo(f"Using retention_days from config: {effective_retention_days}")
+    # else: use the fallback default of 90
+
+    # Resolve SQLCipher passphrase
+    from elspeth.cli_helpers import resolve_audit_passphrase
+
+    try:
+        passphrase = resolve_audit_passphrase(config.landscape if config else None)
+    except RuntimeError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Initialize database and payload store
+    # Note: purge is read-only for audit data, no JSONL journaling needed
+    try:
+        db = LandscapeDB.from_url(db_url, passphrase=passphrase, create_tables=False)
+    except Exception as e:
+        typer.echo(f"Error connecting to database: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    try:
+        payload_store = FilesystemPayloadStore(payload_path)
+        purge_manager = PurgeManager(db, payload_store)
+
+        # Find all expired payload refs (rows, calls, routing reasons)
+        expired_refs = purge_manager.find_expired_payload_refs(effective_retention_days)
+
+        if not expired_refs:
+            typer.echo(f"No payloads older than {effective_retention_days} days found.")
+            return
+
+        if dry_run:
+            typer.echo(f"Would delete {len(expired_refs)} payload(s) older than {effective_retention_days} days:")
+            for ref in expired_refs[:10]:  # Show first 10
+                exists = payload_store.exists(ref)
+                status = "exists" if exists else "already deleted"
+                typer.echo(f"  {ref[:16]}... ({status})")
+            if len(expired_refs) > 10:
+                typer.echo(f"  ... and {len(expired_refs) - 10} more")
+            return
+
+        # Confirm unless --yes
+        if not yes:
+            confirm = typer.confirm(f"Delete {len(expired_refs)} payload(s) older than {effective_retention_days} days?")
+            if not confirm:
+                typer.echo("Aborted.")
+                raise typer.Exit(1)
+
+        # Execute purge
+        result = purge_manager.purge_payloads(expired_refs)
+
+        typer.echo(f"Purge completed in {result.duration_seconds:.2f}s:")
+        typer.echo(f"  Deleted: {result.deleted_count}")
+        typer.echo(f"  Skipped (not found): {result.skipped_count}")
+        if result.failed_refs:
+            typer.echo(f"  Failed: {len(result.failed_refs)}")
+            for ref in result.failed_refs[:5]:
+                typer.echo(f"    {ref[:16]}...")
+        if result.grade_update_failures:
+            typer.echo(f"  Grade update failures: {len(result.grade_update_failures)} (runs may have stale reproducibility grades)")
+            for run_id in result.grade_update_failures[:5]:
+                typer.echo(f"    {run_id}")
+    finally:
+        import sys
+
+        _close_landscape_db(db, pending_exc=sys.exc_info()[1])
+
+
+def _execute_resume_with_instances(
+    config: ElspethSettings,
+    graph: ExecutionGraph,
+    plugins: PluginBundle,
+    resume_point: Any,
+    payload_store: PayloadStore | None,
+    db: LandscapeDB,
+    output_format: Literal["console", "json"] = "console",
+    sink_effect_modes: Mapping[str, str] | None = None,
+    sink_effect_admission: object | None = None,
+) -> Any:  # Returns RunResult from orchestrator.resume()
+    """Execute resume using pre-instantiated plugins.
+
+    Args:
+        config: Validated ElspethSettings
+        graph: Validated ExecutionGraph
+        plugins: Pre-instantiated original plugins for compatibility validation
+        resume_point: Resume point information
+        payload_store: Payload store for retrieving row data
+        db: LandscapeDB connection (caller owns close lifecycle)
+        output_format: 'console' or 'json'
+
+    Returns:
+        RunResult from orchestrator.resume()
+    """
+    if payload_store is None:
+        raise ValueError("payload_store is required for resume operations")
+
+    with _orchestrator_context(
+        config,
+        graph,
+        plugins,
+        db=db,
+        formatter_prefix="Resume",
+        output_format=output_format,
+        checkpoint_always=True,
+        sink_effect_modes=sink_effect_modes,
+        sink_effect_admission=sink_effect_admission,
+    ) as ctx:
+        return ctx.orchestrator.resume(
+            resume_point=resume_point,
+            config=ctx.pipeline_config,
+            graph=graph,
+            payload_store=payload_store,
+            settings=config,
+        )
+
+
+def _build_resume_graph(
+    settings_config: ElspethSettings,
+    plugins: PluginBundle,
+) -> ExecutionGraph:
+    """Build one validated graph for resume admission and execution.
+
+    Resume reads row data from stored payloads. Both phases use the original
+    source topology and plugin identities without binding the same one-shot
+    plugin input types twice.
+    """
+    gate_settings = list(settings_config.gates)
+    coalesce_settings = list(settings_config.coalesce) if settings_config.coalesce else None
+    row_union_settings = list(settings_config.row_unions) if settings_config.row_unions else None
+    scope_settings = list(settings_config.scopes) if settings_config.scopes else None
+
+    # The resume graph uses the ORIGINAL source topology to match the topology
+    # hash and source node IDs computed during the original run. The runtime
+    # Source instances also remain original for implementation compatibility;
+    # the resume lifecycle does not reopen or invoke those sources.
+    execution_sinks = _execution_sinks_for_graph(settings_config, plugins.sinks)
+    graph = ExecutionGraph.from_plugin_instances(
+        sources=plugins.sources,
+        source_settings_map=plugins.source_settings_map,
+        transforms=plugins.transforms,
+        sinks=execution_sinks,
+        aggregations=plugins.aggregations,
+        gates=gate_settings,
+        coalesce_settings=coalesce_settings,
+        queues=settings_config.queues,
+        row_union_settings=row_union_settings,
+        collectors=plugins.collectors,
+        scope_settings=scope_settings,
+        max_bound_region_depth=settings_config.max_bound_region_depth,
+    )
+    graph.validate()
+    return graph
+
+
+def _emit_interrupted_resume_guidance(db: LandscapeDB, run_id: str) -> None:
+    """Suggest ``elspeth resume`` after an interrupt only when it can succeed.
+
+    elspeth-1f5b83cd28 (observation elspeth-obs-d8958eb450): a graceful
+    shutdown that lands mid-source records an incomplete source lifecycle,
+    and both the advisory gate and ``resume()`` refuse such runs — an
+    unconditional "Resume with: ... --execute" here is a false promise.
+    Consult the shared source-lifecycle gate plus the resume-baseline row
+    and print the refuse reason instead when the run is not resumable.
+    Graph-dependent checks (topology, contract integrity) stay with the
+    resume pre-flight: they need the rebuilt validation graph, and
+    evaluating them here could refuse falsely.
+
+    Never raises: the interrupted exit contract (exit 3) must survive a
+    guidance failure, so errors degrade to the dry-run probe suggestion
+    with the failure surfaced.
+    """
+    from elspeth.core.checkpoint import CheckpointManager
+    from elspeth.core.checkpoint.recovery import check_source_lifecycle_resumable
+
+    try:
+        gate = check_source_lifecycle_resumable(db, run_id)
+        if not gate.check.can_resume:
+            typer.echo(f"This run cannot be resumed: {gate.check.reason}")
+            return
+        if CheckpointManager(db).get_latest_checkpoint(run_id) is None:
+            typer.echo("This run cannot be resumed: no resume baseline exists (checkpointing was disabled). Start a fresh run.")
+            return
+    except Exception as exc:  # guidance must not mask the interrupted exit (see docstring)
+        typer.echo(f"Resumability check failed ({type(exc).__name__}: {exc}); probe with: elspeth resume {run_id}")
+        return
+    typer.echo(f"Resume with: elspeth resume {run_id} --execute")
+
+
+def _emit_interrupted_resume_guidance_from_url(db_url: str, passphrase: str | None, run_id: str) -> None:
+    """Open the audit DB and emit interrupted-resume guidance, never raising.
+
+    Used by the ``run`` command's shutdown handler, which has no open
+    LandscapeDB in scope; the ``resume`` command passes its open handle to
+    :func:`_emit_interrupted_resume_guidance` directly.
+    """
+    from elspeth.core.landscape import LandscapeDB
+
+    try:
+        guidance_db = LandscapeDB.from_url(db_url, passphrase=passphrase, create_tables=False)
+    except Exception as exc:  # guidance must not mask the interrupted exit
+        typer.echo(f"Resumability check failed ({type(exc).__name__}: {exc}); probe with: elspeth resume {run_id}")
+        return
+    try:
+        _emit_interrupted_resume_guidance(guidance_db, run_id)
+    finally:
+        _close_landscape_db(guidance_db, pending_exc=None)
+
+
+def _leaderless_abandon_hint(db: LandscapeDB, run_id: str) -> str | None:
+    """The ``elspeth abandon`` hint, or ``None`` when the run is not leaderless.
+
+    elspeth-5dd23f4df9: a run whose leader died mid-run is RUNNING with an
+    expired seat; ``resume`` refuses it on the incomplete source lifecycle
+    and no other verb reaches it. Only that state earns the hint — a
+    live-led run should be joined, and a terminal run is already finalized
+    (abandon would refuse it). Consults the SAME preflight ``abandon``
+    itself runs, so the hint is offered exactly when the verb would proceed.
+    """
+    from elspeth.engine.orchestrator.abandon import inspect_leaderless_run
+
+    if inspect_leaderless_run(db, run_id).admissible:
+        return f"elspeth abandon {run_id} --execute"
+    return None
+
+
+def _leaderless_abandon_hint_or_failure(db: LandscapeDB, run_id: str) -> tuple[str | None, str | None]:
+    """``(hint, failure)`` — the hint lookup is advisory and must never raise.
+
+    A refused resume is a clean exit 1; a failure while deciding whether to
+    offer ``abandon`` is reported alongside it, never allowed to replace it.
+    """
+    try:
+        return _leaderless_abandon_hint(db, run_id), None
+    except Exception as exc:  # advisory only: a refused resume must stay a clean exit 1
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _echo_leaderless_abandon_hint(run_id: str, hint: str | None, hint_failure: str | None) -> None:
+    """Console arm of the abandon hint after a resume refusal (stderr)."""
+    if hint is not None:
+        typer.echo(f"The run has no live leader. Finalize it with: {hint}", err=True)
+    if hint_failure is not None:
+        typer.echo(f"Leaderless-run check failed ({hint_failure}); probe with: elspeth abandon {run_id}", err=True)
+
+
+def _emit_leaderless_run_guidance(db: LandscapeDB, run_id: str) -> None:
+    """Direct the operator of a leaderless run at the verb that can succeed.
+
+    Printed when a follower exits because the leader seat died (design §B.1
+    step 5). ADR-030 §C.3 names ``elspeth resume`` as the recovery, but the
+    source-lifecycle gate refuses resume for almost the whole life of a run
+    (EXHAUSTED is recorded only after the last row's traversal returns), so an
+    unconditional "use elspeth resume" is a false promise (elspeth-5dd23f4df9).
+    Consult the shared gates: resumable ⇒ ``resume``; refused ⇒ print the
+    reason and offer ``abandon``, which takes the dead seat and finalizes the
+    run honestly (ADR-038 abandonment of the undecided tokens).
+
+    Never raises: the seat-dead exit contract (exit 2) must survive a
+    guidance failure, so errors degrade to the dry-run probe suggestion with
+    the failure surfaced.
+    """
+    from elspeth.engine.orchestrator.abandon import inspect_leaderless_run
+
+    try:
+        preflight = inspect_leaderless_run(db, run_id)
+        if preflight.resume_check.can_resume:
+            typer.echo(f"Take over the run with: elspeth resume {run_id} --execute")
+            return
+        typer.echo(f"This run cannot be resumed: {preflight.resume_check.reason}")
+        if preflight.admissible:
+            typer.echo(f"Finalize the leaderless run with: elspeth abandon {run_id} --execute")
+    except Exception as exc:  # guidance must not mask the seat-dead exit (see docstring)
+        typer.echo(f"Resumability check failed ({type(exc).__name__}: {exc}); probe with: elspeth resume {run_id}")
+
+
+class _RegisteredWorkerDiagnostic(TypedDict):
+    worker_id: str
+    role: str
+    status: str
+    hostname: str | None
+    pid: int | None
+
+
+class _WriteLockHeldEvent(TypedDict):
+    event: Literal["write_lock_held"]
+    run_id: str
+    message: str
+    registered_workers: list[_RegisteredWorkerDiagnostic]
+    lock_owner_identified: Literal[False]
+    guidance: str
+
+
+def _emit_write_lock_held(error: WriteLockHeldError, output_format: str) -> None:
+    """Present registration candidates to the authorized local CLI operator.
+
+    The registry is not lock-owner detection. Generic exception messages and
+    server consumers deliberately omit this local operational roster.
+    """
+    guidance = (
+        "Registration records may be stale and PIDs may be reused; the actual lock holder may not be listed. "
+        "Verify the process identity on the recorded host/container and in its PID namespace before stopping it; "
+        "retry after the lock is released."
+    )
+    if not error.workers:
+        guidance = "No registered worker candidates available; the registry may be empty or unreadable. " + guidance
+    if output_format == "json":
+        payload: _WriteLockHeldEvent = {
+            "event": "write_lock_held",
+            "run_id": error.run_id,
+            "message": str(error),
+            "registered_workers": [
+                {
+                    "worker_id": worker.worker_id,
+                    "role": worker.role,
+                    "status": worker.status,
+                    "hostname": worker.hostname,
+                    "pid": worker.pid,
+                }
+                for worker in error.workers
+            ],
+            "lock_owner_identified": False,
+            "guidance": guidance,
+        }
+        typer.echo(json.dumps(payload), err=True)
+    else:
+        typer.echo(str(error), err=True)
+        if error.workers:
+            typer.echo("Registered worker candidates (not confirmed lock holders):", err=True)
+            for worker in error.workers:
+                typer.echo(
+                    f"  worker={worker.worker_id!r} role={worker.role!r} status={worker.status!r} "
+                    f"hostname={worker.hostname!r} pid={worker.pid!r}",
+                    err=True,
+                )
+        typer.echo(guidance, err=True)
+
+
+def _emit_not_resumable_event(
+    error: EmptyResumeStateError | IncompleteSourceResumeError | NonResumableRunError,
+    output_format: str,
+    *,
+    db: LandscapeDB | None = None,
+) -> None:
+    """Emit the operator-facing ``not_resumable`` event for a refused resume.
+
+    Shared by the ``resume`` command's outer and inner exception handlers so
+    the operator surface is identical regardless of where the clean refuse
+    originated (``can_resume()`` at recovery time vs. ``Orchestrator.resume()``
+    at execute time).
+
+    When ``db`` is given and the refused run is leaderless (RUNNING with a
+    dead seat), the event also carries the ``elspeth abandon`` hint — the
+    only verb that can finalize such a run (elspeth-5dd23f4df9). The hint is
+    advisory and must never turn a clean refuse into a traceback, so a
+    failed hint lookup is reported inline rather than raised.
+
+    Per ADR-025 §3, empty-state resume is the interpretable "nothing to
+    resume, start fresh" outcome — distinct from the broader Tier-1
+    invariant traceback path. The caller must invoke this *before* the
+    broader ``TIER_1_ERRORS`` handler (when sharing a try block) because
+    :class:`EmptyResumeStateError` is a subclass of
+    ``OrchestrationInvariantError`` and would otherwise be swallowed by
+    the fatal-traceback path.
+
+    :class:`NonResumableRunError` carries the cause selected by the actual
+    status, checkpoint or leadership admission decision. Advisory checks and
+    enforcing guards share this surface, including a second check that
+    refuses after the first preflight passed. Later hint queries must not
+    replace that observed cause.
+    """
+    if isinstance(error, NonResumableRunError):
+        reason = error.cause.value
+        # str(error) already carries the "Cannot resume run ..." prefix;
+        # use the bare reason so neither output path doubles it up.
+        message = error.reason
+    elif type(error) is IncompleteSourceResumeError:
+        reason = "source_not_exhausted"
+        message = str(error)
+    else:
+        reason = "no_recorded_work"
+        message = str(error)
+    hint: str | None = None
+    hint_failure: str | None = None
+    if db is not None:
+        hint, hint_failure = _leaderless_abandon_hint_or_failure(db, error.run_id)
+    if output_format == "json":
+        payload: dict[str, str] = {
+            "event": "not_resumable",
+            "run_id": error.run_id,
+            "reason": reason,
+            "message": message,
+        }
+        if hint is not None:
+            payload["hint"] = hint
+        if hint_failure is not None:
+            payload["hint_failure"] = hint_failure
+        typer.echo(json.dumps(payload), err=True)
+    else:
+        typer.echo(f"\nCannot resume run {error.run_id}: {message}", err=True)
+        _echo_leaderless_abandon_hint(error.run_id, hint, hint_failure)
+
+
+@app.command()
+def resume(
+    run_id: str = typer.Argument(..., help="Run ID to resume"),
+    database: str | None = typer.Option(
+        None,
+        "--database",
+        "-d",
+        help="Path to Landscape database file (SQLite).",
+    ),
+    settings_file: str | None = typer.Option(
+        None,
+        "--settings",
+        "-s",
+        help="Path to settings YAML file (default: settings.yaml).",
+    ),
+    execute: bool = typer.Option(
+        False,
+        "--execute",
+        "-x",
+        help="Actually execute the resume (default is dry-run).",
+    ),
+    output_format: Literal["console", "json"] = typer.Option(
+        "console",
+        "--format",
+        "-f",
+        help="Output format: 'console' (human-readable) or 'json' (structured JSON).",
+    ),
+) -> None:
+    """Resume a failed run from its last checkpoint.
+
+    By default, shows what WOULD happen (dry run). Use --execute to
+    actually resume processing.
+
+    Examples:
+
+        # Dry run - show resume info
+        elspeth resume run-abc123
+
+        # Actually resume processing
+        elspeth resume run-abc123 --execute
+
+        # Resume with explicit database path
+        elspeth resume run-abc123 --database ./landscape.db --execute
+    """
+    from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
+    from elspeth.core.landscape import LandscapeDB
+
+    # Settings are REQUIRED for topology validation
+    settings_path = Path(settings_file).expanduser() if settings_file else Path("settings.yaml")
+
+    if not settings_path.exists():
+        typer.echo(f"Error: Settings file not found: {settings_path}", err=True)
+        typer.echo("Settings are required to validate checkpoint compatibility.", err=True)
+        raise typer.Exit(1)
+
+    # Load settings with Key Vault secrets (same flow as 'run' command)
+    # This ensures ${VAR} placeholders are resolved correctly for keyvault-backed configs
+    try:
+        if execute:
+            from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
+
+            _refuse_cli_nonlive_resume(settings_path, run_id, database)
+            _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.RESUME)
+        settings_config, _secret_resolutions = _load_settings_with_secrets(settings_path)
+    except FileNotFoundError:
+        typer.echo(f"Error: Settings file not found: {settings_path}", err=True)
+        raise typer.Exit(1) from None
+    except yaml.YAMLError as e:
+        typer.echo(f"YAML syntax error in {settings_path}: {e}", err=True)
+        raise typer.Exit(1) from None
+    except ValidationError as e:
+        typer.echo("Configuration errors:", err=True)
+        for error in e.errors():
+            loc = ".".join(str(x) for x in error["loc"])
+            typer.echo(f"  - {loc}: {error['msg']}", err=True)
+        raise typer.Exit(1) from None
+    except SinkEffectCapabilityError as e:
+        typer.echo(f"Sink effect preflight failed: {e}", err=True)
+        raise typer.Exit(1) from None
+    except (ValueError, contract_errors.OrchestrationInvariantError) as e:
+        typer.echo(f"Configuration error: {e}", err=True)
+        raise typer.Exit(1) from None
+    except SecretLoadError as e:
+        typer.echo(f"Error loading secrets: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # NOTE: _secret_resolutions captured but not used for resume
+    # Resume inherits the original run's secret resolution audit records
+
+    from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
+
+    try:
+        plugins = _instantiate_plugins_for_runtime_preflight(
+            settings_config,
+            purpose=SinkEffectExecutionPurpose.RESUME,
+        )
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except Exception as e:
+        typer.echo(f"Sink effect preflight failed: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    if execute:
+        # Resume executes sinks in their post-resume live mode. Switch the
+        # live instances BEFORE admission is issued so the admission receipt
+        # and the durable effect identity bind the mode resume actually uses
+        # (elspeth-fc9906e398).
+        _configure_execution_sinks_for_resume(_execution_sinks_for_graph(settings_config, plugins.sinks))
+        try:
+            execution_sinks, execution_sink_modes, sink_effect_admission = _preflight_execution_sinks(
+                settings_config,
+                plugins,
+                purpose=SinkEffectExecutionPurpose.RESUME,
+            )
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except Exception as e:
+            typer.echo(f"Sink effect preflight failed: {e}", err=True)
+            raise typer.Exit(1) from None
+
+    # Resolve database URL
+    if database:
+        db_path = Path(database).expanduser().resolve()
+        # Fail fast with clear error if file doesn't exist
+        # (prevents silent creation of empty DB on typoed paths)
+        if not db_path.exists():
+            typer.echo(f"Error: Database file not found: {db_path}", err=True)
+            raise typer.Exit(1) from None
+        db_url = f"sqlite:///{db_path}"
+    else:
+        db_url = settings_config.landscape.url
+        _validate_existing_sqlite_db_url(db_url, source="settings.yaml")
+        # Informational banner only — suppress in JSON mode so stdout stays a
+        # clean JSON/JSONL stream for programmatic callers.
+        if output_format != "json":
+            typer.echo(f"Using database from settings.yaml: {db_url}")
+
+    # Resolve SQLCipher passphrase
+    from elspeth.cli_helpers import resolve_audit_passphrase
+
+    try:
+        passphrase = resolve_audit_passphrase(settings_config.landscape)
+    except RuntimeError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Initialize database and recovery manager
+    try:
+        db = LandscapeDB.from_url(db_url, passphrase=passphrase, create_tables=False)
+    except Exception as e:
+        typer.echo(f"Error connecting to database: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Verify database has Landscape schema (resume requires existing tables).
+    # With create_tables=False, tables are NOT created — so an existing file
+    # without Landscape tables (empty DB, wrong file) would crash later with
+    # "OperationalError: no such table: runs". Validate upfront.
+    from sqlalchemy import inspect as sa_inspect
+
+    try:
+        inspector = sa_inspect(db.engine)
+        existing_tables = set(inspector.get_table_names())
+    except Exception as e:
+        typer.echo(f"Error inspecting database schema: {e}", err=True)
+        _close_landscape_db(db, pending_exc=e)
+        raise typer.Exit(1) from None
+
+    required_tables = {"runs", "tokens", "node_states"}
+    missing_tables = required_tables - existing_tables
+    if missing_tables:
+        typer.echo(
+            f"Error: Database exists but is not a Landscape database "
+            f"(missing tables: {', '.join(sorted(missing_tables))}). "
+            f"Check the database path.",
+            err=True,
+        )
+        exit_exc = typer.Exit(1)
+        _close_landscape_db(db, pending_exc=exit_exc)
+        raise exit_exc from None
+
+    try:
+        checkpoint_manager = CheckpointManager(db)
+        recovery_manager = RecoveryManager(db, checkpoint_manager)
+
+        # Use the validated graph for admission and execution.
+        try:
+            execution_graph = _build_resume_graph(settings_config, plugins)
+        except contract_errors.TIER_1_ERRORS:
+            raise  # Tier 1 errors must crash with full traceback, not Exit(1)
+        except Exception as e:
+            typer.echo(f"Error building validation graph: {e}", err=True)
+            raise typer.Exit(1) from None
+
+        # Check if run can be resumed (with topology validation)
+        check = recovery_manager.can_resume(run_id, execution_graph)
+
+        if not check.can_resume:
+            assert check.reason is not None and check.cause is not None
+            raise NonResumableRunError(run_id, check.reason, cause=check.cause)
+
+        # Get resume point information
+        resume_point = recovery_manager.get_resume_point(run_id, execution_graph)
+
+        # Resume re-drives the run's durable scheduler work; it never
+        # re-derives a source row.
+        scheduler_work_items = recovery_manager.count_active_scheduler_work(run_id)
+
+        # F1: buffered barrier tokens live in the scheduler journal, not the
+        # checkpoint — "what will be restored" is the journal's BLOCKED
+        # barrier rows plus the checkpoint's scalar barrier metadata.
+        blocked_barrier_rows = recovery_manager.count_blocked_barrier_items(run_id)
+
+        # Display resume point information
+        resume_info = {
+            "run_id": run_id,
+            "can_resume": True,
+            "resume_point": {
+                "sequence_number": resume_point.sequence_number,
+                "has_barrier_scalars": resume_point.barrier_scalars is not None,
+                "blocked_barrier_rows": blocked_barrier_rows,
+            },
+            "scheduler_work_items": scheduler_work_items,
+        }
+
+        if output_format == "json" and not execute:
+            import json as json_module
+
+            resume_info["dry_run"] = True
+            typer.echo(json_module.dumps(resume_info, indent=2))
+            return
+
+        if output_format != "json":
+            typer.echo(f"Run {run_id} can be resumed.")
+            typer.echo("\nResume point:")
+            typer.echo(f"  Sequence number: {resume_point.sequence_number}")
+            if resume_point.barrier_scalars is not None:
+                typer.echo("  Has barrier scalars: Yes")
+            else:
+                typer.echo("  Has barrier scalars: No")
+            typer.echo(f"  Blocked barrier rows (journal): {blocked_barrier_rows}")
+            typer.echo(f"  Scheduler work items (to re-drive): {scheduler_work_items}")
+
+        if not execute:
+            if output_format != "json":
+                typer.echo("\nDry run - use --execute to actually resume processing.")
+                typer.echo("Topology validation passed - checkpoint is compatible with current config.")
+            return
+
+        # Execute resume (graph already built above for validation)
+        if output_format != "json":
+            typer.echo(f"\nResuming run {run_id}...")
+
+        # Get payload store from settings
+        from elspeth.core.payload_store import FilesystemPayloadStore
+
+        if settings_config.payload_store.backend != "filesystem":
+            typer.echo(
+                f"Error: Unsupported payload store backend '{settings_config.payload_store.backend}'. "
+                f"Only 'filesystem' is currently supported.",
+                err=True,
+            )
+            raise typer.Exit(1)
+
+        payload_path = settings_config.payload_store.base_path
+        if not payload_path.exists():
+            typer.echo(f"Error: Payload directory not found: {payload_path}", err=True)
+            raise typer.Exit(1)
+
+        payload_store = FilesystemPayloadStore(payload_path)
+
+        # CRITICAL: Validate sink output targets for resume mode.
+        # The sinks were already switched to their resume (append) mode by
+        # _configure_execution_sinks_for_resume BEFORE admission was issued,
+        # so the admission receipt binds the live post-resume mode
+        # (elspeth-fc9906e398).
+        resume_sinks = {}
+
+        for sink_name, sink in execution_sinks.items():
+            # For sinks with headers: original, provide field resolution
+            # mapping BEFORE validation so they can correctly compare display names
+            if sink.needs_resume_field_resolution:
+                from elspeth.core.landscape.factory import RecorderFactory
+
+                factory = RecorderFactory(db)
+                try:
+                    field_resolution = factory.run_lifecycle.get_resume_field_resolution(run_id)
+                except contract_errors.AuditIntegrityError as e:
+                    typer.echo(f"Error: Cannot resume with sink '{sink_name}' (plugin: {sink.name}). {e}", err=True)
+                    raise typer.Exit(1) from None
+                if field_resolution is None:
+                    typer.echo(
+                        f"Error: Cannot resume with sink '{sink_name}' (plugin: {sink.name}). "
+                        "This sink uses headers: original but the source field-resolution mapping "
+                        "is missing from the audit trail.",
+                        err=True,
+                    )
+                    raise typer.Exit(1)
+                try:
+                    sink.set_resume_field_resolution(field_resolution)
+                except (NotImplementedError, ValueError) as e:
+                    typer.echo(f"Error: Cannot resume with sink '{sink_name}': {e}", err=True)
+                    raise typer.Exit(1) from None
+
+            # Validate output target schema compatibility
+            validation = sink.validate_output_target()
+            if not validation.valid:
+                typer.echo(
+                    f"\nError: Cannot resume with sink '{sink_name}'.\nOutput target schema mismatch: {validation.error_message}",
+                    err=True,
+                )
+                if validation.missing_fields:
+                    typer.echo(f"  Missing fields: {list(validation.missing_fields)}", err=True)
+                if validation.extra_fields:
+                    typer.echo(f"  Extra fields: {list(validation.extra_fields)}", err=True)
+                if validation.order_mismatch:
+                    typer.echo(
+                        "  Note: Fields present but in wrong order (strict mode)",
+                        err=True,
+                    )
+                typer.echo(
+                    "\nHint: Either fix the output file to match schema, or start a new run.",
+                    err=True,
+                )
+                raise typer.Exit(1)
+
+            resume_sinks[sink_name] = sink
+
+        # Keep original source implementations for the enforcing resume
+        # compatibility check. Resume skips source start/load/cleanup and
+        # obtains rows from persisted payloads, so substitution is unnecessary
+        # and would compare the original audit evidence against another plugin.
+        from dataclasses import replace
+
+        resume_plugins = replace(
+            plugins,
+            sinks=resume_sinks,  # Use append-mode sinks
+        )
+
+        # Execute resume from persisted rows with the original plugin evidence.
+        try:
+            result = _execute_resume_with_instances(
+                config=settings_config,
+                graph=execution_graph,
+                plugins=resume_plugins,
+                resume_point=resume_point,
+                payload_store=payload_store,
+                db=db,
+                output_format=output_format,
+                sink_effect_modes=execution_sink_modes,
+                sink_effect_admission=sink_effect_admission,
+            )
+        except GracefulShutdownError as e:
+            if output_format == "json":
+                import json as json_mod
+
+                typer.echo(
+                    json_mod.dumps(
+                        {
+                            "event": "interrupted",
+                            "run_id": e.run_id,
+                            "rows_processed": e.rows_processed,
+                            "message": str(e),
+                        }
+                    )
+                )
+            else:
+                typer.echo(f"\nResume interrupted after {e.rows_processed} rows.")
+                _emit_interrupted_resume_guidance(db, e.run_id)
+            raise typer.Exit(3)  # noqa: B904 -- distinct exit code: 0=success, 1=error, 3=interrupted
+        except (EmptyResumeStateError, IncompleteSourceResumeError, NonResumableRunError) as e:
+            # ADR-025 §3: this catch MUST precede the TIER_1_ERRORS
+            # handler because EmptyResumeStateError is a subclass of
+            # OrchestrationInvariantError. See _emit_not_resumable_event
+            # for the operator-facing contract. NonResumableRunError is
+            # the resume() entry guard's race-window refusal (status
+            # changed between the can_resume pre-flight and --execute).
+            _emit_not_resumable_event(e, output_format, db=db)
+            raise typer.Exit(1) from e
+        except RunWorkerEvictedError as e:
+            _emit_worker_evicted_event(e, output_format)
+            raise typer.Exit(3)  # noqa: B904 — eviction is an interrupted-style exit
+        except WriteLockHeldError as e:
+            _emit_write_lock_held(e, output_format)
+            raise typer.Exit(1) from e
+        except contract_errors.TIER_1_ERRORS as e:
+            # Tier 1 violations and framework bugs MUST be clearly distinguishable
+            # from config errors — same pattern as the `run` command handler.
+            import traceback
+
+            if output_format == "json":
+                import json as json_mod_fatal
+
+                typer.echo(
+                    json_mod_fatal.dumps(
+                        {
+                            "event": "fatal",
+                            "error": str(e),
+                            "error_type": type(e).__name__,
+                            "traceback": traceback.format_exc(),
+                        }
+                    ),
+                    err=True,
+                )
+            else:
+                typer.echo(f"\nFATAL — {type(e).__name__}: {e}", err=True)
+                typer.echo(traceback.format_exc(), err=True)
+            raise typer.Exit(4) from e  # Exit 4: audit integrity / framework bug
+        except Exception as e:
+            import traceback
+
+            if output_format == "json":
+                import json as json_mod_err
+
+                typer.echo(
+                    json_mod_err.dumps(
+                        {
+                            "event": "error",
+                            "error": str(e),
+                            "error_type": type(e).__name__,
+                            "traceback": traceback.format_exc(),
+                        }
+                    ),
+                    err=True,
+                )
+            else:
+                typer.echo(f"Error during resume: {e}", err=True)
+                typer.echo(traceback.format_exc(), err=True)
+            raise typer.Exit(4) from e  # Exit 4: unknown errors during execution are likely framework bugs
+
+        # F17 (elspeth-83ad093154): same exit-code propagation as the `run`
+        # command — the resumed run's terminal status maps through the
+        # engine-owned taxonomy (0=completed/empty, 1=partial, 2=failed,
+        # 3=interrupted) instead of unconditionally exiting 0.
+        from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+        _, resume_exit_code = cli_completion_for(result.status)
+
+        if output_format == "json":
+            import json as json_module
+
+            typer.echo(
+                json_module.dumps(
+                    {
+                        **resume_info,
+                        "result": {
+                            "rows_processed": result.rows_processed,
+                            "rows_succeeded": result.rows_succeeded,
+                            "rows_failed": result.rows_failed,
+                            "collector_groups_failed": result.collector_groups_failed,
+                            "status": result.status.value,
+                            "exit_code": resume_exit_code,
+                        },
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            typer.echo("\nResume complete:")
+            typer.echo(f"  Rows processed: {result.rows_processed}")
+            typer.echo(f"  Rows succeeded: {result.rows_succeeded}")
+            typer.echo(f"  Rows failed: {result.rows_failed}")
+            typer.echo(f"  Collector groups failed: {result.collector_groups_failed}")
+            typer.echo(f"  Status: {result.status.value}")
+
+        if resume_exit_code != 0:
+            raise typer.Exit(resume_exit_code)
+
+    except (EmptyResumeStateError, IncompleteSourceResumeError, NonResumableRunError) as e:
+        # ADR-025 §3: catches the empty-state raise from recovery's
+        # ``verify_contract_integrity()`` (reached via ``can_resume``
+        # at line 1780 — dry-run and pre-execute paths). The inner
+        # ``try`` at line 1955 catches the orchestrator-level raise
+        # during ``--execute``. Both deliver the identical
+        # operator-facing surface via ``_emit_not_resumable_event``;
+        # without this outer handler the recovery-time raise would
+        # bubble unhandled and the operator would see a Tier-1
+        # invariant traceback for a benign outcome
+        # (elspeth-241608388f).
+        _emit_not_resumable_event(e, output_format, db=db)
+        raise typer.Exit(1) from e
+    finally:
+        import sys
+
+        _close_landscape_db(db, pending_exc=sys.exc_info()[1])
+
+
+@app.command("export-resume")
+def export_resume(
+    run_id: str = typer.Argument(..., help="Finalized run whose audit export should be resumed."),
+    database: str | None = typer.Option(
+        None,
+        "--database",
+        "-d",
+        help="Path to Landscape database file (SQLite).",
+    ),
+    settings_file: str | None = typer.Option(
+        None,
+        "--settings",
+        "-s",
+        help="Path to settings YAML file (default: settings.yaml).",
+    ),
+    execute: bool = typer.Option(
+        False,
+        "--execute",
+        "-x",
+        help="Actually execute the export resume (default is dry-run).",
+    ),
+    output_format: Literal["console", "json"] = typer.Option(
+        "console",
+        "--format",
+        "-f",
+        help="Output format: 'console' (human-readable) or 'json' (structured JSON).",
+    ),
+) -> None:
+    """Resume a finalized run's unfinished audit export.
+
+    Production recovery path for the window after run finalization where a
+    crash or transient sink failure left the run's export PENDING/FAILED and
+    its durable sink effect PREPARED/IN_FLIGHT. The immutable snapshot winner
+    is reused (never re-derived) and the durable effect is reconciled, so
+    publication happens exactly once.
+
+    By default, shows eligibility (dry run). Use --execute to actually
+    resume the export.
+
+    Examples:
+
+        # Dry run - show export status and eligibility
+        elspeth export-resume run-abc123
+
+        # Actually resume the export
+        elspeth export-resume run-abc123 --execute
+    """
+    from elspeth.core.landscape import LandscapeDB
+    from elspeth.engine.orchestrator.export import audit_export_resume_refusal, resume_audit_export
+
+    settings_path = Path(settings_file).expanduser() if settings_file else Path("settings.yaml")
+    if not settings_path.exists():
+        typer.echo(f"Error: Settings file not found: {settings_path}", err=True)
+        raise typer.Exit(1)
+
+    try:
+        settings_config, _secret_resolutions = _load_settings_with_secrets(settings_path)
+    except FileNotFoundError:
+        typer.echo(f"Error: Settings file not found: {settings_path}", err=True)
+        raise typer.Exit(1) from None
+    except yaml.YAMLError as e:
+        typer.echo(f"YAML syntax error in {settings_path}: {e}", err=True)
+        raise typer.Exit(1) from None
+    except ValidationError as e:
+        typer.echo("Configuration errors:", err=True)
+        for error in e.errors():
+            loc = ".".join(str(x) for x in error["loc"])
+            typer.echo(f"  - {loc}: {error['msg']}", err=True)
+        raise typer.Exit(1) from None
+    except ValueError as e:
+        typer.echo(f"Configuration error: {e}", err=True)
+        raise typer.Exit(1) from None
+    except SecretLoadError as e:
+        typer.echo(f"Error loading secrets: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    export_settings = settings_config.landscape.export
+    if not export_settings.enabled:
+        typer.echo(
+            "Error: landscape.export is not enabled in settings; there is no audit export to resume.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    try:
+        _require_marked_export(settings_config)
+    except ValueError as exc:
+        typer.echo(f"Configuration error: {exc}", err=True)
+        raise typer.Exit(1) from None
+
+    # Resolve database URL (same discipline as `resume`)
+    if database:
+        db_path = Path(database).expanduser().resolve()
+        if not db_path.exists():
+            typer.echo(f"Error: Database file not found: {db_path}", err=True)
+            raise typer.Exit(1) from None
+        db_url = f"sqlite:///{db_path}"
+    else:
+        db_url = settings_config.landscape.url
+        _validate_existing_sqlite_db_url(db_url, source="settings.yaml")
+        if output_format != "json":
+            typer.echo(f"Using database from settings.yaml: {db_url}")
+
+    from elspeth.cli_helpers import resolve_audit_passphrase
+
+    try:
+        passphrase = resolve_audit_passphrase(settings_config.landscape)
+    except RuntimeError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    try:
+        db = LandscapeDB.from_url(db_url, passphrase=passphrase, create_tables=False)
+    except Exception as e:
+        typer.echo(f"Error connecting to database: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    try:
+        from sqlalchemy import inspect as sa_inspect
+
+        try:
+            inspector = sa_inspect(db.engine)
+            existing_tables = set(inspector.get_table_names())
+        except Exception as e:
+            typer.echo(f"Error inspecting database schema: {e}", err=True)
+            raise typer.Exit(1) from None
+        if "runs" not in existing_tables:
+            typer.echo(
+                "Error: Database exists but is not a Landscape database (missing table: runs). Check the database path.",
+                err=True,
+            )
+            raise typer.Exit(1)
+
+        from elspeth.core.landscape.factory import RecorderFactory
+
+        run = RecorderFactory(db).run_lifecycle.get_run(run_id)
+        refusal = audit_export_resume_refusal(run, run_id)
+
+        export_info: dict[str, Any] = {
+            "run_id": run_id,
+            "run_status": run.status.value if run is not None else None,
+            "export_status": (run.export_status.value if run is not None and run.export_status is not None else None),
+            "export_error": run.export_error if run is not None else None,
+            "eligible": refusal.can_resume,
+            "reason": refusal.reason,
+        }
+
+        if output_format != "json":
+            typer.echo(f"Run status: {export_info['run_status']}")
+            typer.echo(f"Export status: {export_info['export_status']}")
+            if export_info["export_error"]:
+                typer.echo(f"Export error: {export_info['export_error']}")
+
+        if not refusal.can_resume:
+            assert refusal.cause is not None
+            if output_format == "json":
+                import json as json_module
+
+                typer.echo(
+                    json_module.dumps({**export_info, "event": "export_resume_refused", "cause": refusal.cause.value}, indent=2),
+                    err=True,
+                )
+            else:
+                typer.echo(f"Cannot resume export for run {run_id}: {refusal.reason}", err=True)
+            raise typer.Exit(1)
+
+        if not execute:
+            if output_format == "json":
+                import json as json_module
+
+                export_info["dry_run"] = True
+                typer.echo(json_module.dumps(export_info, indent=2))
+            else:
+                typer.echo(f"Run {run_id} export can be resumed.")
+                typer.echo("\nDry run - use --execute to actually resume the export.")
+            return
+
+        # Build the same export resources the run path uses.
+        from elspeth.core.payload_store import FilesystemPayloadStore
+
+        if settings_config.payload_store.backend != "filesystem":
+            typer.echo(
+                f"Error: Unsupported payload store backend '{settings_config.payload_store.backend}'. "
+                f"Only 'filesystem' is currently supported.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        payload_path = settings_config.payload_store.base_path
+        if not payload_path.exists():
+            typer.echo(f"Error: Payload directory not found: {payload_path}", err=True)
+            raise typer.Exit(1)
+        payload_store = FilesystemPayloadStore(payload_path)
+
+        from elspeth.contracts.coordination import mint_worker_id
+        from elspeth.core.audit_export_content_store import create_audit_export_content_store
+        from elspeth.plugins.infrastructure.runtime_factory import make_sink_factory
+
+        audit_export_content_store, audit_export_content_store_resolver = create_audit_export_content_store(export_settings)
+
+        if output_format != "json":
+            typer.echo(f"\nResuming audit export for run {run_id}...")
+
+        try:
+            resume_audit_export(
+                db,
+                run_id,
+                settings_config,
+                make_sink_factory(settings_config),
+                payload_store=payload_store,
+                audit_export_content_store=audit_export_content_store,
+                audit_export_content_store_resolver=audit_export_content_store_resolver,
+                worker_id=mint_worker_id(run_id),
+            )
+        except WriteLockHeldError as e:
+            _emit_write_lock_held(e, output_format)
+            raise typer.Exit(1) from e
+        except NonResumableRunError as e:
+            if output_format == "json":
+                typer.echo(
+                    json.dumps(
+                        {
+                            "event": "export_resume_refused",
+                            "run_id": run_id,
+                            "reason": e.reason,
+                            "cause": e.cause.value,
+                            "preflight": export_info,
+                        }
+                    ),
+                    err=True,
+                )
+            else:
+                typer.echo(f"Cannot resume export for run {run_id}: {e.reason}", err=True)
+            raise typer.Exit(1) from e
+        except contract_errors.TIER_1_ERRORS:
+            raise  # Tier 1 errors must crash with full traceback, not Exit(1)
+        except Exception as e:
+            if output_format == "json":
+                import json as json_module
+
+                typer.echo(
+                    json_module.dumps({**export_info, "event": "error", "error": str(e), "error_type": type(e).__name__}),
+                    err=True,
+                )
+            else:
+                typer.echo(f"Error during export resume: {e}", err=True)
+            raise typer.Exit(1) from e
+
+        if output_format == "json":
+            import json as json_module
+
+            typer.echo(json_module.dumps({**export_info, "export_status": "completed", "resumed": True}, indent=2))
+        else:
+            typer.echo(f"Export resumed successfully for run {run_id}: export status is now 'completed'.")
+    finally:
+        import sys
+
+        _close_landscape_db(db, pending_exc=sys.exc_info()[1])
+
+
+class _AbandonPreflightPayload(TypedDict):
+    """``elspeth abandon --format json`` dry-run event."""
+
+    event: str
+    run_id: str
+    run_status: str | None
+    leader_worker_id: str | None
+    seat_expires_at: str | None
+    seat_live: bool
+    source_lifecycle: dict[str, str]
+    work_item_counts: dict[str, int]
+    undecided_tokens: int
+    resumable: bool
+    resume_reason: str | None
+    admissible: bool
+    refusal: str | None
+
+
+@app.command()
+def abandon(
+    run_id: str = typer.Argument(..., help="Run ID of the leaderless run to finalize"),
+    database: str | None = typer.Option(
+        None,
+        "--database",
+        "-d",
+        help="Path to Landscape database file (SQLite).",
+    ),
+    settings_file: str | None = typer.Option(
+        None,
+        "--settings",
+        "-s",
+        help="Path to settings YAML file (default: settings.yaml).",
+    ),
+    execute: bool = typer.Option(
+        False,
+        "--execute",
+        "-x",
+        help="Actually take the dead leader's seat and finalize the run (default is dry-run).",
+    ),
+    output_format: Literal["console", "json"] = typer.Option(
+        "console",
+        "--format",
+        "-f",
+        help="Output format: 'console' (human-readable) or 'json' (structured JSON).",
+    ),
+) -> None:
+    """Finalize a run whose leader died, recording its undecided work as abandoned.
+
+    When a multi-worker leader is killed mid-run the run stays RUNNING with an
+    expired seat. `elspeth resume` refuses it while any source is still
+    loading (resume replays only persisted rows, so unread source rows may
+    exist), and nothing else can reach it. This verb takes the dead seat
+    through the same takeover CAS resume uses and finalizes the run as
+    INTERRUPTED under it: every token nothing will ever decide is recorded
+    ABANDONED (ADR-038), open sink effects are failed, followers are departed,
+    and the seat is vacated. A run the gates still consider resumable is
+    finalized without abandoning anything and stays resumable.
+
+    By default, shows what WOULD happen (dry run). Use --execute to act.
+
+    Examples:
+
+        # Dry run - show the leaderless state and whether resume would work instead
+        elspeth abandon run-abc123
+
+        # Take the seat and finalize
+        elspeth abandon run-abc123 --execute
+
+        # Explicit database path
+        elspeth abandon run-abc123 --database ./landscape.db --execute
+    """
+    from elspeth.core.landscape import LandscapeDB
+    from elspeth.engine.orchestrator.abandon import abandon_leaderless_run, inspect_leaderless_run
+
+    settings_path = Path(settings_file).expanduser() if settings_file else Path("settings.yaml")
+    if not settings_path.exists():
+        typer.echo(f"Error: Settings file not found: {settings_path}", err=True)
+        raise typer.Exit(1)
+
+    try:
+        settings_config, _secret_resolutions = _load_settings_with_secrets(settings_path)
+    except FileNotFoundError:
+        typer.echo(f"Error: Settings file not found: {settings_path}", err=True)
+        raise typer.Exit(1) from None
+    except yaml.YAMLError as e:
+        typer.echo(f"YAML syntax error in {settings_path}: {e}", err=True)
+        raise typer.Exit(1) from None
+    except ValidationError as e:
+        typer.echo("Configuration errors:", err=True)
+        for error in e.errors():
+            loc = ".".join(str(x) for x in error["loc"])
+            typer.echo(f"  - {loc}: {error['msg']}", err=True)
+        raise typer.Exit(1) from None
+    except ValueError as e:
+        typer.echo(f"Configuration error: {e}", err=True)
+        raise typer.Exit(1) from None
+    except SecretLoadError as e:
+        typer.echo(f"Error loading secrets: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Resolve database URL (same discipline as `resume` / `export-resume`)
+    if database:
+        db_path = Path(database).expanduser().resolve()
+        if not db_path.exists():
+            typer.echo(f"Error: Database file not found: {db_path}", err=True)
+            raise typer.Exit(1) from None
+        db_url = f"sqlite:///{db_path}"
+    else:
+        db_url = settings_config.landscape.url
+        _validate_existing_sqlite_db_url(db_url, source="settings.yaml")
+        if output_format != "json":
+            typer.echo(f"Using database from settings.yaml: {db_url}")
+
+    from elspeth.cli_helpers import resolve_audit_passphrase
+
+    try:
+        passphrase = resolve_audit_passphrase(settings_config.landscape)
+    except RuntimeError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    try:
+        db = LandscapeDB.from_url(db_url, passphrase=passphrase, create_tables=False)
+    except Exception as e:
+        typer.echo(f"Error connecting to database: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    try:
+        preflight = inspect_leaderless_run(db, run_id)
+        preflight_payload: _AbandonPreflightPayload = {
+            "event": "abandon_preflight",
+            "run_id": run_id,
+            "run_status": None if preflight.run_status is None else preflight.run_status.value,
+            "leader_worker_id": preflight.leader_worker_id,
+            "seat_expires_at": None if preflight.seat_expires_at is None else preflight.seat_expires_at.isoformat(),
+            "seat_live": preflight.seat_live,
+            "source_lifecycle": dict(preflight.source_lifecycle),
+            "work_item_counts": dict(preflight.work_item_counts),
+            "undecided_tokens": preflight.undecided_tokens,
+            "resumable": preflight.resume_check.can_resume,
+            "resume_reason": preflight.resume_check.reason,
+            "admissible": preflight.admissible,
+            "refusal": preflight.refusal,
+        }
+        if not preflight.admissible:
+            assert preflight.refusal_cause is not None
+            if output_format == "json":
+                typer.echo(
+                    json.dumps(
+                        {"event": "abandon_refused", "run_id": run_id, "reason": preflight.refusal, "cause": preflight.refusal_cause.value}
+                    ),
+                    err=True,
+                )
+            else:
+                typer.echo(f"\nCannot abandon run {run_id}: {preflight.refusal}", err=True)
+            raise typer.Exit(1)
+
+        if output_format == "json":
+            if not execute:
+                typer.echo(json.dumps(preflight_payload))
+        else:
+            run_status = preflight.run_status.value if preflight.run_status is not None else "absent"
+            seat = "vacant" if preflight.leader_worker_id is None else f"{preflight.leader_worker_id} (expired {preflight.seat_expires_at})"
+            sources = ", ".join(f"{name}={state}" for name, state in sorted(preflight.source_lifecycle.items())) or "none recorded"
+            work = ", ".join(f"{status}={count}" for status, count in sorted(preflight.work_item_counts.items())) or "none"
+            typer.echo(f"\nRun {run_id}")
+            typer.echo(f"  Status: {run_status}")
+            typer.echo(f"  Leader seat: {seat}")
+            typer.echo(f"  Sources: {sources}")
+            typer.echo(f"  Scheduler work items: {work}")
+            typer.echo(f"  Undecided tokens: {preflight.undecided_tokens}")
+            if preflight.resume_check.can_resume:
+                typer.echo(f"  Resumable: yes — prefer `elspeth resume {run_id} --execute`; abandon keeps its tokens pending")
+            else:
+                typer.echo(f"  Resumable: no — this run cannot be resumed: {preflight.resume_check.reason}")
+            if not execute:
+                typer.echo("\nDry run - use --execute to take the dead leader's seat and finalize the run as interrupted.")
+                if not preflight.resume_check.can_resume:
+                    typer.echo(f"  {preflight.undecided_tokens} undecided token(s) would be recorded as abandoned (ADR-038).")
+
+        if not execute:
+            return
+
+        try:
+            outcome = abandon_leaderless_run(db, run_id)
+        except WriteLockHeldError as e:
+            _emit_write_lock_held(e, output_format)
+            raise typer.Exit(1) from e
+        except AbandonRefusedError as e:
+            # Preserve the verb's second preflight decision, including races
+            # with finalization, disappearance or a newly live leader.
+            if output_format == "json":
+                typer.echo(json.dumps({"event": "abandon_refused", "run_id": run_id, "reason": e.reason, "cause": e.cause.value}), err=True)
+            else:
+                typer.echo(f"\nCannot abandon run {run_id}: {e.reason}", err=True)
+            raise typer.Exit(1) from e
+        except NonResumableRunError as e:
+            # Preserve the enforcing admission's cause without inferring it
+            # from the exception class or querying the seat again.
+            if output_format == "json":
+                typer.echo(json.dumps({"event": "abandon_refused", "run_id": run_id, "reason": e.reason, "cause": e.cause.value}), err=True)
+            else:
+                typer.echo(f"\nCannot abandon run {run_id}: {e.reason}", err=True)
+            raise typer.Exit(1) from e
+
+        if output_format == "json":
+            typer.echo(
+                json.dumps(
+                    {
+                        "event": "abandoned",
+                        "run_id": outcome.run_id,
+                        "run_status": outcome.run_status.value,
+                        "worker_id": outcome.worker_id,
+                        "leader_epoch": outcome.leader_epoch,
+                        "abandoned_tokens": outcome.abandoned_tokens,
+                    }
+                )
+            )
+        else:
+            typer.echo(
+                f"\nRun {outcome.run_id} finalized as {outcome.run_status.value} by {outcome.worker_id} (epoch {outcome.leader_epoch})."
+            )
+            typer.echo(f"  Tokens abandoned: {outcome.abandoned_tokens}")
+            if outcome.abandoned_tokens:
+                typer.echo("Start a fresh run to reprocess the source; the abandoned work is recorded in the audit trail.")
+    finally:
+        import sys
+
+        _close_landscape_db(db, pending_exc=sys.exc_info()[1])
+
+
+@app.command()
+def join(
+    run_id: str = typer.Argument(..., help="Run ID to join as a follower worker."),
+    database: str | None = typer.Option(
+        None,
+        "--database",
+        "-d",
+        help="Path to Landscape database file (SQLite).",
+    ),
+    settings_file: str | None = typer.Option(
+        None,
+        "--settings",
+        "-s",
+        help="Path to settings YAML file (default: settings.yaml).",
+    ),
+    output_format: Literal["console", "json"] = typer.Option(
+        "console",
+        "--format",
+        "-f",
+        help="Output format: 'console' (human-readable) or 'json' (structured JSON).",
+    ),
+) -> None:
+    """Attach to a running pipeline as a follower worker (ADR-030 §B.1).
+
+    The joining process uses the same settings file as the leader to verify
+    pipeline config-hash compatibility.  Settings are REQUIRED — a missing or
+    divergent settings file results in an admission refusal.
+
+    On clean departure (run completed) exits 0.  On refusal exits 1 with an
+    actionable message.  On SIGINT or leader-seat loss exits 3.
+
+    Examples:
+
+        # Attach as a follower (settings.yaml in cwd)
+        elspeth join run-abc123
+
+        # Attach with explicit settings and database
+        elspeth join run-abc123 --settings ./settings.yaml --database ./landscape.db
+    """
+    import traceback
+
+    from elspeth.contracts.errors import FollowerSeatDeadError, JoinRefusedError
+    from elspeth.core.landscape import LandscapeDB
+
+    # Settings are REQUIRED — the joiner must produce the same config_hash
+    # as the leader (stable_hash(resolve_config(settings))).
+    settings_path = Path(settings_file).expanduser() if settings_file else Path("settings.yaml")
+
+    if not settings_path.exists():
+        typer.echo(f"Error: Settings file not found: {settings_path}", err=True)
+        typer.echo("Settings are required to validate pipeline config-hash compatibility.", err=True)
+        raise typer.Exit(1)
+
+    # Load settings with Key Vault secrets (same flow as 'run' and 'resume' commands).
+    try:
+        from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
+
+        _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FOLLOWER)
+        settings_config, _secret_resolutions = _load_settings_with_secrets(settings_path)
+    except FileNotFoundError:
+        typer.echo(f"Error: Settings file not found: {settings_path}", err=True)
+        raise typer.Exit(1) from None
+    except yaml.YAMLError as e:
+        typer.echo(f"YAML syntax error in {settings_path}: {e}", err=True)
+        raise typer.Exit(1) from None
+    except ValidationError as e:
+        typer.echo("Configuration errors:", err=True)
+        for error in e.errors():
+            loc = ".".join(str(x) for x in error["loc"])
+            typer.echo(f"  - {loc}: {error['msg']}", err=True)
+        raise typer.Exit(1) from None
+    except SinkEffectCapabilityError as e:
+        typer.echo(f"Sink effect preflight failed: {e}", err=True)
+        raise typer.Exit(1) from None
+    except ValueError as e:
+        typer.echo(f"Configuration error: {e}", err=True)
+        raise typer.Exit(1) from None
+    except SecretLoadError as e:
+        typer.echo(f"Error loading secrets: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Followers have a separate context and external-call lifecycle. Until
+    # replay/verify carry a shared comparison authority across workers, a
+    # follower must not enter a run that suppresses external sink effects.
+    if settings_config.run_mode is not RunMode.LIVE:
+        typer.echo("Follower join is unavailable for replay and verify runs; use one worker.", err=True)
+        raise typer.Exit(1)
+
+    try:
+        plugins = _instantiate_plugins_for_runtime_preflight(
+            settings_config,
+            purpose=SinkEffectExecutionPurpose.FOLLOWER,
+        )
+        execution_sinks, execution_sink_modes, sink_effect_admission = _preflight_execution_sinks(
+            settings_config,
+            plugins,
+            purpose=SinkEffectExecutionPurpose.FOLLOWER,
+        )
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except Exception as e:
+        typer.echo(f"Sink effect preflight failed: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Resolve database URL.
+    if database:
+        db_path = Path(database).expanduser().resolve()
+        if not db_path.exists():
+            typer.echo(f"Error: Database file not found: {db_path}", err=True)
+            raise typer.Exit(1) from None
+        db_url = f"sqlite:///{db_path}"
+    else:
+        db_url = settings_config.landscape.url
+        _validate_existing_sqlite_db_url(db_url, source="settings.yaml")
+        # Informational banner only — suppress in JSON mode so stdout stays a
+        # clean JSON/JSONL stream for programmatic callers (the join command
+        # emits structured events on stdout in --format json).
+        if output_format != "json":
+            typer.echo(f"Using database from settings.yaml: {db_url}")
+
+    # Resolve SQLCipher passphrase.
+    from elspeth.cli_helpers import resolve_audit_passphrase
+
+    try:
+        passphrase = resolve_audit_passphrase(settings_config.landscape)
+    except RuntimeError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Open the database (create_tables=False — existing run must already have schema).
+    try:
+        db = LandscapeDB.from_url(db_url, passphrase=passphrase, create_tables=False)
+    except Exception as e:
+        typer.echo(f"Error connecting to database: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Verify the database has a Landscape schema (same guard as resume).
+    from sqlalchemy import inspect as sa_inspect
+
+    try:
+        inspector = sa_inspect(db.engine)
+        existing_tables = set(inspector.get_table_names())
+    except Exception as e:
+        typer.echo(f"Error inspecting database schema: {e}", err=True)
+        db.close()
+        raise typer.Exit(1) from None
+
+    required_tables = {"runs", "tokens", "node_states"}
+    missing_tables = required_tables - existing_tables
+    if missing_tables:
+        typer.echo(
+            f"Error: Database exists but is not a Landscape database "
+            f"(missing tables: {', '.join(sorted(missing_tables))}). "
+            f"Check the database path.",
+            err=True,
+        )
+        db.close()
+        raise typer.Exit(1) from None
+
+    follower_db: LandscapeDB | None = None
+    follower_rate_limit_registry: RateLimitRegistry | None = None
+    follower_telemetry_manager: TelemetryManager | None = None
+    try:
+        import threading
+
+        from elspeth.contracts.config.runtime import (
+            RuntimeConcurrencyConfig,
+            RuntimeRateLimitConfig,
+            RuntimeTelemetryConfig,
+        )
+        from elspeth.core.rate_limit import RateLimitRegistry
+        from elspeth.telemetry import create_telemetry_manager
+
+        follower_concurrency_config = RuntimeConcurrencyConfig.from_settings(settings_config.concurrency)
+        follower_rate_limit_registry = RateLimitRegistry(RuntimeRateLimitConfig.from_settings(settings_config.rate_limit))
+        follower_telemetry_manager = create_telemetry_manager(RuntimeTelemetryConfig.from_settings(settings_config.telemetry))
+        follower_shutdown_event = threading.Event()
+
+        def emit_follower_telemetry(event: Any) -> None:
+            if follower_telemetry_manager is not None:
+                follower_telemetry_manager.handle_event(event)
+
+        # Admission: Orchestrator.join_run does the filesystem preflight and the
+        # atomic BEGIN IMMEDIATE admission transaction (§B.1 steps 0-2).
+        from elspeth.engine import Orchestrator
+
+        orchestrator = Orchestrator(db)
+
+        try:
+            member_token = orchestrator.join_run(run_id, settings_config)
+        except JoinRefusedError as e:
+            if output_format == "json":
+                import json as json_mod
+
+                typer.echo(
+                    json_mod.dumps(
+                        {
+                            "event": "join_refused",
+                            "run_id": run_id,
+                            "reason": e.reason,
+                        }
+                    ),
+                    err=True,
+                )
+            else:
+                typer.echo(f"Cannot join run {run_id}: {e.reason}", err=True)
+            raise typer.Exit(1) from None
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except Exception as e:
+            typer.echo(f"Sink effect preflight failed: {e}", err=True)
+            raise typer.Exit(1) from None
+
+        # The registered identity IS the membership token's worker_id (§A.1);
+        # derive the per-worker hex suffix from it (format: worker:{run_id}:{HEX}).
+        worker_id = member_token.worker_id
+        worker_hex = worker_id.split(":")[-1]
+
+        # Emit admission line.
+        if output_format == "json":
+            import json as json_mod
+
+            typer.echo(
+                json_mod.dumps(
+                    {
+                        "event": "joined",
+                        "run_id": run_id,
+                        "worker_id": worker_id,
+                    }
+                )
+            )
+        else:
+            typer.echo(f"Joined run {run_id} as follower {worker_id}")
+            typer.echo("Draining available work…")
+
+        # Build the execution graph for the follower (needed to recognise
+        # barrier / sink nodes for hand-off routing).
+        try:
+            execution_graph = _build_resume_graph(settings_config, plugins)
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except Exception as e:
+            typer.echo(f"Error building execution graph: {e}", err=True)
+            raise typer.Exit(1) from None
+
+        # Get payload store.
+        from elspeth.core.payload_store import FilesystemPayloadStore
+
+        if settings_config.payload_store.backend != "filesystem":
+            typer.echo(
+                f"Error: Unsupported payload store backend '{settings_config.payload_store.backend}'. "
+                f"Only 'filesystem' is currently supported.",
+                err=True,
+            )
+            raise typer.Exit(1)
+
+        payload_path = settings_config.payload_store.base_path
+        if not payload_path.exists():
+            typer.echo(f"Error: Payload directory not found: {payload_path}", err=True)
+            raise typer.Exit(1)
+
+        payload_store = FilesystemPayloadStore(payload_path)
+
+        # Open a per-worker journal-enabled DB handle when JSONL journaling is
+        # configured.  We open a *second* handle (with the per-worker suffix) so
+        # the follower writes to its own distinct file alongside the leader.
+        if settings_config.landscape.dump_to_jsonl:
+            follower_db = LandscapeDB.from_url(
+                db_url,
+                passphrase=passphrase,
+                create_tables=False,
+                dump_to_jsonl=True,
+                dump_to_jsonl_path=settings_config.landscape.dump_to_jsonl_path,
+                dump_to_jsonl_fail_on_error=settings_config.landscape.dump_to_jsonl_fail_on_error,
+                dump_to_jsonl_include_payloads=settings_config.landscape.dump_to_jsonl_include_payloads,
+                dump_to_jsonl_payload_base_path=(
+                    str(settings_config.payload_store.base_path)
+                    if settings_config.landscape.dump_to_jsonl_payload_base_path is None
+                    else settings_config.landscape.dump_to_jsonl_payload_base_path
+                ),
+                dump_to_jsonl_worker_suffix=worker_hex,
+            )
+
+        active_db = follower_db if follower_db is not None else db
+
+        # Build and run the follower processor.
+        from elspeth.contracts.config import RuntimeRetryConfig
+        from elspeth.contracts.plugin_context import PluginContext
+        from elspeth.core.config import AggregationSettings as _AggregationSettings
+        from elspeth.core.landscape.factory import RecorderFactory
+        from elspeth.engine.orchestrator.follower import build_follower_processor
+        from elspeth.engine.orchestrator.types import PipelineConfig
+
+        factory = RecorderFactory(active_db, payload_store=payload_store)
+
+        # Build PipelineConfig from settings (same shape as _orchestrator_context).
+        # Extract raw TransformProtocol instances from WiredTransform wrappers.
+        follower_transforms: list[RowPlugin] = [wired.plugin for wired in plugins.transforms]
+
+        agg_id_map = execution_graph.get_aggregation_id_map()
+        follower_agg_settings: dict[str, _AggregationSettings] = {}
+        for agg_name, (agg_transform, agg_config) in plugins.aggregations.items():
+            from elspeth.contracts.types import AggregationName as _AggregationName
+
+            node_id = agg_id_map[_AggregationName(agg_name)]
+            follower_agg_settings[node_id] = agg_config
+            agg_transform.node_id = node_id
+            follower_transforms.append(agg_transform)
+
+        from elspeth.engine.orchestrator.preflight import execution_sink_bindings_for_runtime
+
+        execution_sink_bindings = execution_sink_bindings_for_runtime(settings_config, plugins.sink_effect_bindings)
+        pipeline_config = PipelineConfig(
+            config=resolve_config(settings_config),
+            sources=plugins.sources,
+            transforms=follower_transforms,
+            sinks=execution_sinks,
+            gates=list(settings_config.gates),
+            aggregation_settings=follower_agg_settings,
+            coalesce_settings=(list(settings_config.coalesce) if settings_config.coalesce else []),
+            sink_effect_modes=execution_sink_modes,
+            sink_effect_admission=sink_effect_admission,
+            sink_effect_bindings=execution_sink_bindings,
+            escalation_fixpoint_bound=execution_graph.escalation_fixpoint_bound,
+        )
+
+        follower_proc = build_follower_processor(
+            factory=factory,
+            member_token=member_token,
+            graph=execution_graph,
+            config=pipeline_config,
+            payload_store=payload_store,
+            concurrency_config=follower_concurrency_config,
+            telemetry=follower_telemetry_manager,
+            retry_config=RuntimeRetryConfig.from_settings(settings_config.retry),
+        )
+
+        ctx = PluginContext(
+            run_id=run_id,
+            config=resolve_config(settings_config),
+            landscape=factory.plugin_audit_writer(),
+            payload_store=payload_store,
+            rate_limit_registry=follower_rate_limit_registry,
+            concurrency_config=follower_concurrency_config,
+            shutdown_event=follower_shutdown_event,
+            telemetry_emit=emit_follower_telemetry,
+            member_token=member_token,
+        )
+
+        # Call on_start for all transforms and sinks — mirrors the leader's
+        # _build_run_context lifecycle.  Without this, plugins raise
+        # PluginContractViolation("Transform 'X' was called before on_start()")
+        # on the first process() call.
+        follower_run_entered = False
+        started_follower_transforms: list[RowPlugin] = []
+        started_follower_sinks: dict[str, SinkProtocol] = {}
+        cleanup_pending_exc: BaseException | None = None
+        try:
+            _start_follower_plugin_lifecycle(
+                transforms=follower_transforms,
+                sinks=execution_sinks,
+                configured_modes=execution_sink_modes,
+                admission=sink_effect_admission,
+                ctx=ctx,
+                started_transforms=started_follower_transforms,
+                started_sinks=started_follower_sinks,
+                runtime_bindings=execution_sink_bindings,
+            )
+
+            follower_run_entered = True
+            follower_proc.run(ctx)
+        except RunWorkerEvictedError as e:
+            try:
+                _emit_worker_evicted_event(e, output_format)
+                raise typer.Exit(3)
+            except BaseException as pending_exc:
+                cleanup_pending_exc = pending_exc
+                raise
+        except FollowerSeatDeadError as e:
+            try:
+                # Design §B.1 step 5: leader seat died mid-drain. The follower
+                # departed cleanly but the run is incomplete — the operator
+                # takes it over with `resume` when the shared gates admit it,
+                # or finalizes it with `abandon` when they refuse
+                # (elspeth-5dd23f4df9: an unconditional "use resume" was
+                # unreachable advice for almost the whole life of a run).
+                if output_format == "json":
+                    import json as json_mod
+
+                    typer.echo(
+                        json_mod.dumps(
+                            {
+                                "event": "seat_dead",
+                                "run_id": run_id,
+                                "worker_id": e.worker_id,
+                                "message": str(e),
+                                "hint": f"elspeth resume {run_id}",
+                                "abandon_hint": f"elspeth abandon {run_id}",
+                            }
+                        ),
+                        err=True,
+                    )
+                else:
+                    typer.echo(f"\nFollower {e.worker_id} detected no live leader for run {run_id}.", err=True)
+                    typer.echo("The run is incomplete.", err=True)
+                    _emit_leaderless_run_guidance(db, run_id)
+                raise typer.Exit(2)
+            except BaseException as pending_exc:
+                cleanup_pending_exc = pending_exc
+                raise
+        except KeyboardInterrupt:
+            try:
+                if output_format == "json":
+                    import json as json_mod
+
+                    typer.echo(
+                        json_mod.dumps(
+                            {
+                                "event": "interrupted",
+                                "run_id": run_id,
+                                "worker_id": worker_id,
+                            }
+                        )
+                    )
+                else:
+                    typer.echo(f"\nFollower {worker_id} interrupted (SIGINT). Departed from run {run_id}.")
+                raise typer.Exit(3)
+            except BaseException as pending_exc:
+                cleanup_pending_exc = pending_exc
+                raise
+        except BaseException as pending_exc:
+            cleanup_pending_exc = pending_exc
+            raise
+        finally:
+            if not follower_run_entered:
+                from elspeth.engine._best_effort import best_effort
+
+                with best_effort("Follower depart after startup failure", run_id=run_id, worker_id=worker_id):
+                    factory.run_coordination.depart_worker(member_token=member_token)
+
+            # Mirror the leader's teardown via the canonical cleanup_plugins:
+            # on_complete then close, each hook individually guarded so one
+            # plugin's failure does not block the others — BUT TIER_1_ERRORS
+            # (AuditIntegrityError / FrameworkBugError) PROPAGATE (cleanup.py
+            # re-raises them before the broad catch), and every swallowed
+            # non-Tier-1 failure is LOGGED with plugin name + phase.  The bare
+            # `except Exception: pass` this replaces silently hid Tier-1
+            # audit-integrity corruption during follower teardown.
+            #
+            # include_source=False: the follower is a drain-only worker — it
+            # never opened/on_start'd sources (the on_start loop above covers
+            # only transforms + sinks), so source teardown must be skipped
+            # (mirrors the resume path's include_source=False).
+            from elspeth.engine.orchestrator.cleanup import cleanup_plugins as _cleanup_plugins
+
+            _cleanup_plugins(
+                pipeline_config,
+                ctx,
+                include_source=False,
+                pending_exc=cleanup_pending_exc,
+                started_transforms=started_follower_transforms,
+                started_sinks=started_follower_sinks,
+            )
+
+        # Clean departure (run reached terminal state).
+        if output_format == "json":
+            import json as json_mod
+
+            typer.echo(
+                json_mod.dumps(
+                    {
+                        "event": "departed",
+                        "run_id": run_id,
+                        "worker_id": worker_id,
+                        "message": "run completed, departed cleanly",
+                    }
+                )
+            )
+        else:
+            typer.echo(f"\nJoined run {run_id} as follower {worker_id}, run completed, departed cleanly.")
+
+    except contract_errors.TIER_1_ERRORS as e:
+        if output_format == "json":
+            import json as json_mod
+
+            typer.echo(
+                json_mod.dumps(
+                    {
+                        "event": "fatal",
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "traceback": traceback.format_exc(),
+                    }
+                ),
+                err=True,
+            )
+        else:
+            typer.echo(f"\nFATAL — {type(e).__name__}: {e}", err=True)
+            typer.echo(traceback.format_exc(), err=True)
+        raise typer.Exit(4) from e  # Exit 4: audit integrity / framework bug
+    except typer.Exit:
+        # typer.Exit is a click.exceptions.Exit (subclass of Exception) — must be
+        # re-raised before the bare Exception handler catches and rewraps it as Exit 4.
+        raise
+    except Exception as e:
+        if output_format == "json":
+            import json as json_mod
+
+            typer.echo(
+                json_mod.dumps(
+                    {
+                        "event": "error",
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "traceback": traceback.format_exc(),
+                    }
+                ),
+                err=True,
+            )
+        else:
+            typer.echo(f"Error during join: {e}", err=True)
+            typer.echo(traceback.format_exc(), err=True)
+        raise typer.Exit(4) from e  # Exit 4: unknown errors are likely framework bugs
+    finally:
+        import sys
+
+        try:
+            _close_orchestrator_resources(
+                follower_rate_limit_registry,
+                follower_telemetry_manager,
+                pending_exc=sys.exc_info()[1],
+            )
+        finally:
+            if follower_db is not None:
+                follower_db.close()
+            db.close()
+
+
+@app.command()
+def health(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        "-j",
+        help="Output as JSON.",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Include detailed check information.",
+    ),
+    host: str | None = typer.Option(
+        None,
+        "--host",
+        help="Web server host to check. Defaults to ELSPETH_WEB__HOST or 127.0.0.1.",
+    ),
+    port: int | None = typer.Option(
+        None,
+        "--port",
+        "-p",
+        help="Web server port to check. Defaults to ELSPETH_WEB__PORT or 8451.",
+    ),
+    skip_web: bool = typer.Option(
+        True,
+        "--skip-web/--check-web",
+        help="Skip web interface check. Default: skip (batch containers). Use --check-web to probe.",
+    ),
+) -> None:
+    """Check system health for deployment verification.
+
+    Verifies that ELSPETH is properly configured and can connect to
+    required services. Used by deployment scripts and container health checks.
+
+    Examples:
+
+        # Basic health check (batch/CLI containers — skips web by default)
+        elspeth health
+
+        # JSON output for automation
+        elspeth health --json
+
+        # Check web server (for web containers)
+        elspeth health --check-web
+
+        # Check web server on custom port
+        elspeth health --check-web --port 9000
+
+        # Verbose with details
+        elspeth health --verbose
+    """
+    import json as json_module
+    import subprocess
+    import sys
+
+    from click.core import ParameterSource
+
+    # Infer web checking from explicit host/port arguments.
+    # If user provides --host or --port, they likely want web checking.
+    # BUT: honor explicit --skip-web even when host/port are supplied, so
+    # wrappers can always pass host/port but conditionally suppress the check.
+    skip_web_source = ctx.get_parameter_source("skip_web")
+    skip_web_was_default = skip_web_source == ParameterSource.DEFAULT
+    if (host is not None or port is not None) and skip_web and skip_web_was_default:
+        skip_web = False
+
+    # Health check results
+    checks: dict[str, dict[str, str | bool]] = {}
+    overall_healthy = True
+
+    # Check 1: Version (always passes if we got here)
+    checks["version"] = {
+        "status": "ok",
+        "value": __version__,
+    }
+
+    # Check 2: Git commit SHA (if available)
+    git_sha = os.environ.get("GIT_COMMIT_SHA", "")
+    if not git_sha:
+        # Try to get from git
+        try:
+            git_result = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if git_result.returncode == 0:
+                git_sha = git_result.stdout.strip()
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            git_sha = "unavailable"
+
+    checks["commit"] = {
+        "status": "ok" if git_sha and git_sha != "unavailable" else "warn",
+        "value": git_sha or "unavailable",
+    }
+
+    # Check 3: Python version
+    python_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    checks["python"] = {
+        "status": "ok",
+        "value": python_version,
+    }
+
+    # Check 4: Database connectivity (if DATABASE_URL is set)
+    db_url = os.environ.get("DATABASE_URL", "")
+    if db_url:
+        try:
+            from sqlalchemy import create_engine, text
+
+            engine = create_engine(db_url)
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            checks["database"] = {
+                "status": "ok",
+                "value": "connected",
+            }
+        except Exception as e:
+            checks["database"] = {
+                "status": "error",
+                "value": str(e),
+            }
+            overall_healthy = False
+    else:
+        checks["database"] = {
+            "status": "skip",
+            "value": "DATABASE_URL not set",
+        }
+
+    # Check 5: Config directory readable (container path)
+    config_paths = ["/app/config", "./config"]
+    config_readable = False
+    config_path_used = ""
+    for path in config_paths:
+        if os.path.isdir(path) and os.access(path, os.R_OK):
+            config_readable = True
+            config_path_used = path
+            break
+
+    if config_readable:
+        checks["config_dir"] = {
+            "status": "ok",
+            "value": config_path_used,
+        }
+    else:
+        checks["config_dir"] = {
+            "status": "warn",
+            "value": "not found or not readable",
+        }
+
+    # Check 6: Output directory writable (container path)
+    output_paths = ["/app/output", "./output"]
+    output_writable = False
+    output_path_used = ""
+    for path in output_paths:
+        if os.path.isdir(path) and os.access(path, os.W_OK):
+            output_writable = True
+            output_path_used = path
+            break
+
+    if output_writable:
+        checks["output_dir"] = {
+            "status": "ok",
+            "value": output_path_used,
+        }
+    else:
+        checks["output_dir"] = {
+            "status": "warn",
+            "value": "not found or not writable",
+        }
+
+    # Check 7: Plugins loaded
+    try:
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        manager = get_shared_plugin_manager()
+        source_count = len(manager.get_sources())
+        transform_count = len(manager.get_transforms())
+        sink_count = len(manager.get_sinks())
+        checks["plugins"] = {
+            "status": "ok",
+            "value": f"{source_count} sources, {transform_count} transforms, {sink_count} sinks",
+        }
+    except Exception as e:
+        checks["plugins"] = {
+            "status": "error",
+            "value": str(e),
+        }
+        overall_healthy = False
+
+    # Check 8: Web interface reachable
+    # Priority: CLI flags > env vars > defaults
+    # Note: env vars must be set externally (e.g., docker -e) — they are NOT
+    # automatically propagated from `elspeth web` which runs in a separate process.
+    if skip_web:
+        checks["web"] = {
+            "status": "skip",
+            "value": "skipped via --skip-web",
+        }
+    else:
+        import urllib.error
+        import urllib.request
+
+        web_host_resolved = host or os.environ.get("ELSPETH_WEB__HOST", "127.0.0.1")
+        # Wildcard bind addresses (0.0.0.0, ::) are listen-all addresses, not
+        # connectable destinations. Translate to loopback for probing.
+        _wildcard_to_loopback = {"0.0.0.0": "127.0.0.1", "::": "::1"}
+        probe_host = _wildcard_to_loopback.get(web_host_resolved, web_host_resolved)
+        # RFC 3986: IPv6 literals in URIs must be bracketed to distinguish
+        # port separator from address colons. "::1" → "[::1]".
+        host_for_url = f"[{probe_host}]" if ":" in probe_host else probe_host
+        try:
+            # Parse port inside try so malformed env var produces unhealthy check,
+            # not CLI crash. Health probes must distinguish "misconfigured" from "crashed".
+            web_port_resolved = port or int(os.environ.get("ELSPETH_WEB__PORT", "8451"))
+            web_url = f"http://{host_for_url}:{web_port_resolved}/api/health"
+
+            # Bypass HTTP_PROXY/HTTPS_PROXY only for loopback self-checks.
+            # Corporate environments set proxy env vars for outbound traffic,
+            # but routing localhost probes through a proxy causes false unhealthy
+            # reports. Remote probes must still honor proxy settings.
+            is_loopback = probe_host == "localhost" or probe_host == "::1" or probe_host.startswith("127.")
+            if is_loopback:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            else:
+                opener = urllib.request.build_opener()  # Default: honors proxy env vars
+            with opener.open(web_url, timeout=5) as response:
+                body = response.read().decode("utf-8")
+                data = json_module.loads(body)
+                if data.get("status") == "ok":
+                    checks["web"] = {
+                        "status": "ok",
+                        "value": f"{web_host_resolved}:{web_port_resolved}",
+                    }
+                else:
+                    checks["web"] = {
+                        "status": "error",
+                        "value": f"unexpected response: {data}",
+                    }
+                    overall_healthy = False
+        except urllib.error.URLError as e:
+            checks["web"] = {
+                "status": "error",
+                "value": f"connection failed: {e.reason}",
+            }
+            overall_healthy = False
+        except Exception as e:
+            checks["web"] = {
+                "status": "error",
+                "value": str(e),
+            }
+            overall_healthy = False
+
+    # Determine overall status
+    status = "healthy" if overall_healthy else "unhealthy"
+
+    # Output results
+    if json_output:
+        result = {
+            "status": status,
+            "version": __version__,
+            "commit": git_sha,
+            "checks": checks,
+        }
+        typer.echo(json_module.dumps(result, indent=2))
+    else:
+        typer.echo(f"Status: {status}")
+        typer.echo(f"Version: {__version__}")
+        typer.echo(f"Commit: {git_sha}")
+
+        if verbose:
+            typer.echo("\nChecks:")
+            for name, info in checks.items():
+                check_status = info["status"]
+                if check_status == "ok":
+                    status_icon = "✓"
+                elif check_status in ("warn", "skip"):
+                    status_icon = "⚠"
+                else:
+                    status_icon = "✗"
+                typer.echo(f"  {status_icon} {name}: {info['value']}")
+
+    # Exit with appropriate code
+    if not overall_healthy:
+        raise typer.Exit(1)
+
+
+@app.command()
+def web(
+    port: int = typer.Option(8451, help="Port to listen on"),
+    host: str = typer.Option("127.0.0.1", help="Host to bind to"),
+    auth: str | None = typer.Option(None, help="Auth provider: local, oidc, entra, vanguard, google"),
+    reload: bool = typer.Option(False, help="Enable auto-reload for development"),
+) -> None:
+    """Start the ELSPETH web application."""
+    try:
+        import uvicorn
+    except ImportError:
+        typer.echo(
+            "Error: Web UI requires the [webui] extra. Install with: uv pip install -e '.[webui]'",
+            err=True,
+        )
+        raise typer.Exit(1) from None
+
+    # Fail-fast guard: non-local host with no explicit secret key is always wrong.
+    # Full validation happens in create_app(), but this catches the obvious case
+    # before uvicorn starts — deployments that set ELSPETH_WEB__SECRET_KEY pass.
+    _local_hosts = {"127.0.0.1", "localhost", "::1"}
+    if host not in _local_hosts and "ELSPETH_WEB__SECRET_KEY" not in os.environ:
+        typer.echo(
+            "Error: Non-local host requires an explicit secret_key. "
+            "Set ELSPETH_WEB__SECRET_KEY or use --host 127.0.0.1 for local development.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    # Reject an unknown provider here rather than letting it reach
+    # ``WebSettings`` inside the uvicorn factory, where the failure surfaces
+    # as a worker that will not boot. The registry is the authority for what
+    # an operator may select, so the list cannot drift from what actually
+    # exists.
+    from elspeth.web.auth.providers import registered_provider_names
+
+    # An explicit CLI choice takes precedence; otherwise preserve the provider
+    # supplied to the app factory through its normal environment settings.
+    selected_auth = auth if auth is not None else os.environ.get("ELSPETH_WEB__AUTH_PROVIDER")
+    selectable = registered_provider_names()
+    if selected_auth is not None and selected_auth not in selectable:
+        typer.echo(f"Error: unknown auth provider {selected_auth!r}. Choose one of: {', '.join(selectable)}", err=True)
+        raise typer.Exit(1)
+
+    # Bridge CLI args to create_app() via environment variables.
+    # uvicorn's factory protocol calls create_app() with no arguments,
+    # so we set ELSPETH_WEB__* env vars that settings_from_env() reads.
+    os.environ["ELSPETH_WEB__HOST"] = host
+    os.environ["ELSPETH_WEB__PORT"] = str(port)
+    if selected_auth is not None:
+        os.environ["ELSPETH_WEB__AUTH_PROVIDER"] = selected_auth
+
+    from elspeth.web.config import trusted_proxy_hosts_from_env
+
+    try:
+        trusted_proxy_hosts = trusted_proxy_hosts_from_env()
+    except ValueError:
+        typer.echo(
+            "Error: ELSPETH_WEB__TRUSTED_PROXY_HOSTS must be a JSON array of explicit numeric IP addresses or CIDR networks.",
+            err=True,
+        )
+        raise typer.Exit(1) from None
+
+    uvicorn.run(
+        "elspeth.web.app:create_app",
+        host=host,
+        port=port,
+        reload=reload,
+        factory=True,
+        access_log=False,
+        proxy_headers=bool(trusted_proxy_hosts),
+        forwarded_allow_ips=list(trusted_proxy_hosts),
+    )
+
+
+if __name__ == "__main__":
+    app()

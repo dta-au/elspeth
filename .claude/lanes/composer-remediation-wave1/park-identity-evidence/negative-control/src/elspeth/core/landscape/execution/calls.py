@@ -1,0 +1,1399 @@
+"""External call audit persistence (split from ``ExecutionRepository``).
+
+Owns every write and read of the ``calls`` table — both node-state-parented
+and operation-parented calls — plus thread-safe call index allocation
+(one Lock + per-state and per-operation dicts), database-owned collision
+recovery across independent recorders, and payload staging / post-insert
+materialization into the payload store.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections import OrderedDict
+from collections.abc import Collection, Iterator
+from concurrent.futures import Future
+from datetime import datetime
+from threading import Lock
+from typing import TYPE_CHECKING, NamedTuple
+
+import structlog
+from sqlalchemy import func, or_, select
+from sqlalchemy.engine import Connection
+from sqlalchemy.exc import SQLAlchemyError
+
+from elspeth.contracts import Call, CallStatus, CallType, FrameworkBugError
+from elspeth.contracts.audit import CallVerification, validate_approved_prompt_artifact_hash
+from elspeth.contracts.call_data import CallPayload, LLMCallResponse
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import RunMode, RunStatus
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json_loads
+from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityError
+from elspeth.contracts.payload_store import PayloadNotFoundError
+from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
+from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.core.ids import generate_id
+from elspeth.core.landscape._database_ops import DatabaseOps
+from elspeth.core.landscape._helpers import now
+from elspeth.core.landscape.errors import LandscapePostCommitError, LandscapeRecordError
+from elspeth.core.landscape.execution.sink_effect_identity import MAX_LINEAGE_DEPTH, MAX_LINEAGE_NODES_PER_MEMBER, MAX_LINEAGE_PARENTS
+from elspeth.core.landscape.item_fencing import fenced_item_transaction
+from elspeth.core.landscape.model_loaders import CallLoader
+from elspeth.core.landscape.row_data import CallDataResult, CallDataState
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+from elspeth.core.landscape.schema import (
+    call_verifications_table,
+    calls_table,
+    node_states_table,
+    operations_table,
+    rows_table,
+    runs_table,
+    token_lineage_frames_table,
+    token_parents_table,
+    tokens_table,
+)
+from elspeth.core.landscape.verification_reads import (
+    get_verification_decision,
+    get_verification_decisions_for_calls,
+    get_verification_decisions_for_run,
+    iter_verification_decisions_for_run,
+)
+
+if TYPE_CHECKING:
+    from elspeth.contracts.payload_store import PayloadStore
+    from elspeth.core.landscape.database import LandscapeDB
+
+
+logger = structlog.get_logger(__name__)
+
+
+class _PreparedCallData(NamedTuple):
+    """Intermediate result from _prepare_call_payloads.
+
+    Carries stable hashes plus any payload bytes that still need post-insert
+    materialization into the payload store.
+    """
+
+    request_hash: str
+    request_ref: str | None
+    response_hash: str | None
+    response_ref: str | None
+    error_json: str | None
+    request_bytes: bytes | None
+    response_bytes: bytes | None
+
+
+class _LineageParent(NamedTuple):
+    parent_token_id: str
+    ordinal: int
+    run_id: str
+
+
+class _LineageEvidence(NamedTuple):
+    run_id: str
+    row_id: str
+    join_group_id: str | None
+    parents: tuple[_LineageParent, ...]
+    has_frame: bool
+
+
+def _reject_non_finite_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant {value!r}")
+
+
+class CallAuditRepository:
+    """External call recording and call index allocation for the audit trail."""
+
+    def __init__(
+        self,
+        db: LandscapeDB,
+        ops: DatabaseOps,
+        *,
+        call_loader: CallLoader,
+        payload_store: PayloadStore | None = None,
+    ) -> None:
+        self._db = db
+        self._ops = ops
+        self._call_loader = call_loader
+        self._payload_store = payload_store
+
+        # Thread-safe call index allocation (internal state, not injected)
+        self._call_indices: dict[str, int] = {}
+        self._call_index_lock = Lock()
+        self._operation_call_indices: dict[str, int] = {}
+        self._pending_call_indices: set[tuple[str, int]] = set()
+        self._pending_operation_call_indices: set[tuple[str, int]] = set()
+        # Source runs are immutable once completed. Retain a small number of
+        # validated source-row indexes across sibling call lookups; live runs
+        # are never cached. The limit bounds repository lifetime memory.
+        self._source_parent_indices: OrderedDict[tuple[str, str, int, int, str, int], dict[str, tuple[str, ...]]] = OrderedDict()
+        self._source_parent_builds: dict[tuple[str, str, int, int, str, int], Future[dict[str, tuple[str, ...]]]] = {}
+        self._source_parent_index_lock = Lock()
+        self._source_parent_index_limit = 16
+
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
+        """Allocate a proposal only for this worker's current claimed state."""
+        with fenced_item_transaction(
+            self._db.engine,
+            member_token=member_token,
+            work_item=work_item,
+            verb="allocate_call_index",
+        ) as conn:
+            self._verify_state_parent(conn, state_id=state_id, run_id=member_token.run_id, token_id=work_item.token_id)
+            return self._allocate_call_index_on(conn, state_id)
+
+    def _allocate_call_index_on(self, conn: Connection, state_id: str) -> int:
+        """Allocate next call index for a state_id (thread-safe).
+
+        Provides centralized call index allocation ensuring UNIQUE(state_id, call_index)
+        across all client types (HTTP, LLM) and retry attempts.
+
+        This is the single source of truth for call numbering. All AuditedClient
+        instances MUST delegate to this method rather than maintaining their own counters.
+
+        Thread Safety:
+            Uses a lock to prevent race conditions when multiple threads allocate
+            indices concurrently. Safe for pooled execution scenarios.
+
+        Persistence:
+            Counter seeds from the database on first access per state_id,
+            so it survives recorder recreation (e.g., on resume). Subsequent
+            allocations are process-local proposals. ``record_call`` remembers
+            which proposals came from this repository and atomically remaps a
+            uniqueness collision at INSERT time, after the external effect,
+            without asking the caller to repeat that effect.
+
+        Args:
+            state_id: Node state ID to allocate index for
+
+        Returns:
+            Sequential call index (0-based), unique within this state_id
+
+        Example:
+            # Two different client types, same state_id
+            http_client = AuditedHTTPClient(recorder, state_id="state-001")
+            llm_client = AuditedLLMClient(recorder, state_id="state-001")
+
+            # Both delegate to same recorder - indices coordinate correctly
+            http_client.post(...)  # allocates index 0
+            llm_client.query(...)   # allocates index 1 (not 0!)
+        """
+        with self._call_index_lock:
+            if state_id not in self._call_indices:
+                # Slow path (once per state_id): seed from database to survive
+                # recorder recreation on resume. Without this, a new recorder
+                # would restart indices at 0 for any state_id that already has
+                # recorded calls, causing UNIQUE(state_id, call_index) violations.
+                # The DB query is serialized under the lock — acceptable because
+                # it only fires once per state_id per recorder lifetime. All
+                # subsequent allocations hit the fast path (no DB access).
+                row = conn.execute(select(func.max(calls_table.c.call_index)).where(calls_table.c.state_id == state_id)).fetchone()
+                existing_max = row[0] if row is not None and row[0] is not None else -1
+                self._call_indices[state_id] = existing_max + 1
+            # Fast path: allocate from in-memory counter (no DB access)
+            idx = self._call_indices[state_id]
+            self._call_indices[state_id] += 1
+            self._pending_call_indices.add((state_id, idx))
+            return idx
+
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
+        """Allocate a proposal for an operation in the current leader's run."""
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="allocate_operation_call_index",
+        ) as conn:
+            self._verify_operation_parent(conn, operation_id=operation_id, run_id=coordination_token.run_id)
+            return self._allocate_operation_call_index_on(conn, operation_id)
+
+    def _allocate_operation_call_index_on(self, conn: Connection, operation_id: str) -> int:
+        """Allocate next call index for an operation_id (thread-safe).
+
+        Provides process-local call index proposals within each operation.
+        ``record_operation_call`` resolves a cross-process proposal collision
+        at the database INSERT boundary. Parallel to ``allocate_call_index``
+        for node states.
+
+        Args:
+            operation_id: Operation ID to allocate index for
+
+        Returns:
+            Sequential call index (0-based), unique within this operation_id
+        """
+        with self._call_index_lock:  # Reuse existing lock
+            if operation_id not in self._operation_call_indices:
+                # Slow path (once per operation_id): seed from database to survive
+                # recorder recreation on resume. Serialized under lock — acceptable
+                # because it fires only once per operation_id per recorder lifetime.
+                row = conn.execute(select(func.max(calls_table.c.call_index)).where(calls_table.c.operation_id == operation_id)).fetchone()
+                existing_max = row[0] if row is not None and row[0] is not None else -1
+                self._operation_call_indices[operation_id] = existing_max + 1
+            # Fast path: allocate from in-memory counter (no DB access)
+            idx = self._operation_call_indices[operation_id]
+            self._operation_call_indices[operation_id] += 1
+            self._pending_operation_call_indices.add((operation_id, idx))
+            return idx
+
+    def _insert_allocated_call(
+        self,
+        conn: Connection,
+        values: dict[str, object],
+        *,
+        parent_column: str,
+        parent_id: str,
+        allocation_is_owned: bool,
+        preserve_call_id: bool = False,
+    ) -> dict[str, object]:
+        """Insert under the parent lock, remapping an owned proposal collision."""
+        proposed_index = values["call_index"]
+        if type(proposed_index) is not int:
+            raise FrameworkBugError("prepared call_index must be an exact integer")
+
+        try:
+            candidate_values = dict(values)
+            if allocation_is_owned:
+                # The caller locked the durable parent before entering this
+                # helper. All call writers use that same lock, so inspecting
+                # the proposal and choosing its replacement are atomic.
+                existing_max, proposal_count = conn.execute(
+                    select(
+                        func.max(calls_table.c.call_index),
+                        func.count().filter(calls_table.c.call_index == proposed_index),
+                    ).where(calls_table.c[parent_column] == parent_id)
+                ).one()
+                if proposal_count:
+                    candidate = existing_max + 1
+                    candidate_values["call_index"] = candidate
+                    if parent_column == "operation_id" and not preserve_call_id:
+                        candidate_values["call_id"] = f"call_{parent_id}_{candidate}"
+            conn.execute(calls_table.insert().values(**candidate_values))
+            return candidate_values
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(
+                f"record_call failed for {parent_column}={parent_id!r} — database rejected audit write: {type(exc).__name__}"
+            ) from exc
+
+    def _allocation_context(
+        self,
+        *,
+        parent_id: str,
+        call_index: int,
+        operation: bool,
+    ) -> bool:
+        """Return whether this repository allocated the proposed index."""
+        with self._call_index_lock:
+            pending = self._pending_operation_call_indices if operation else self._pending_call_indices
+            return (parent_id, call_index) in pending
+
+    def _finish_allocation(
+        self,
+        *,
+        parent_id: str,
+        proposed_index: int,
+        recorded_index: int | None,
+        operation: bool,
+    ) -> None:
+        """Release the local reservation and advance the cache past remaps."""
+        with self._call_index_lock:
+            pending = self._pending_operation_call_indices if operation else self._pending_call_indices
+            pending.discard((parent_id, proposed_index))
+            if recorded_index is None:
+                return
+            counters = self._operation_call_indices if operation else self._call_indices
+            if parent_id in counters:
+                current_index = counters[parent_id]
+            else:
+                current_index = 0
+            next_recorded_index = recorded_index + 1
+            if current_index < next_recorded_index:
+                current_index = next_recorded_index
+            counters[parent_id] = current_index
+
+    def _prepare_call_payloads(
+        self,
+        request_data: CallPayload,
+        response_data: CallPayload | None,
+        error: CallPayload | None,
+        request_ref: str | None,
+        response_ref: str | None,
+    ) -> _PreparedCallData:
+        """Serialize, hash, and stage call payloads for post-insert storage.
+
+        Shared logic for record_call() and record_operation_call(). Converts
+        CallPayload objects to dicts, computes stable hashes, prepares any
+        payload bytes that still need storing after the call row exists, and
+        serializes the error payload.
+        """
+        request_dict = request_data.to_dict()
+        response_dict = response_data.to_dict() if response_data is not None else None
+
+        request_hash = stable_hash(request_dict)
+        response_hash = stable_hash(response_dict) if response_dict is not None else None
+
+        request_bytes = None
+        response_bytes = None
+        if request_ref is None and self._payload_store is not None:
+            request_bytes = canonical_json(request_dict).encode("utf-8")
+        if response_dict is not None and response_ref is None and self._payload_store is not None:
+            response_bytes = canonical_json(response_dict).encode("utf-8")
+
+        error_json = canonical_json(error.to_dict()) if error is not None else None
+
+        return _PreparedCallData(
+            request_hash=request_hash,
+            request_ref=request_ref,
+            response_hash=response_hash,
+            response_ref=response_ref,
+            error_json=error_json,
+            request_bytes=request_bytes,
+            response_bytes=response_bytes,
+        )
+
+    def _materialize_call_ref_after_insert(
+        self,
+        *,
+        call_id: str,
+        column_name: str,
+        payload_bytes: bytes | None,
+    ) -> str | None:
+        """Store one payload outside SQL; the caller fences its metadata update."""
+        if payload_bytes is None:
+            return None
+        if self._payload_store is None:
+            raise FrameworkBugError(f"_materialize_call_ref_after_insert({call_id!r}, {column_name!r}) requires a payload store")
+
+        try:
+            payload_ref = self._payload_store.store(payload_bytes)
+        except Exception as exc:
+            raise LandscapePostCommitError(
+                f"Call {call_id} was recorded, but {column_name} materialization failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        return payload_ref
+
+    def _materialize_call_refs_after_insert(self, call_id: str, prepared: _PreparedCallData) -> tuple[str | None, str | None]:
+        """Store staged call payloads after the call row has been committed."""
+        request_ref = prepared.request_ref
+        response_ref = prepared.response_ref
+
+        materialized_request_ref = self._materialize_call_ref_after_insert(
+            call_id=call_id,
+            column_name="request_ref",
+            payload_bytes=prepared.request_bytes,
+        )
+        if materialized_request_ref is not None:
+            request_ref = materialized_request_ref
+
+        materialized_response_ref = self._materialize_call_ref_after_insert(
+            call_id=call_id,
+            column_name="response_ref",
+            payload_bytes=prepared.response_bytes,
+        )
+        if materialized_response_ref is not None:
+            response_ref = materialized_response_ref
+
+        return request_ref, response_ref
+
+    @staticmethod
+    def _verify_state_parent(conn: Connection, *, state_id: str, run_id: str, token_id: str) -> None:
+        parent = conn.execute(
+            select(node_states_table.c.run_id, node_states_table.c.token_id)
+            .where(node_states_table.c.state_id == state_id)
+            .with_for_update(of=node_states_table)
+        ).one_or_none()
+        if parent is None or parent.run_id != run_id or parent.token_id != token_id:
+            raise AuditIntegrityError("call parent state does not belong to the claimed work item")
+
+    @staticmethod
+    def _verify_operation_parent(conn: Connection, *, operation_id: str, run_id: str) -> None:
+        parent_run_id = conn.execute(
+            select(operations_table.c.run_id).where(operations_table.c.operation_id == operation_id).with_for_update(of=operations_table)
+        ).scalar_one_or_none()
+        if parent_run_id != run_id:
+            raise AuditIntegrityError("call parent operation does not belong to the authorized run")
+
+    @staticmethod
+    def _call_run_on(conn: Connection, call_id: str) -> tuple[str, CallType] | None:
+        call = conn.execute(
+            select(calls_table.c.state_id, calls_table.c.operation_id, calls_table.c.call_type).where(calls_table.c.call_id == call_id)
+        ).one_or_none()
+        if call is None:
+            return None
+        if call.state_id is not None:
+            run_id = conn.execute(select(node_states_table.c.run_id).where(node_states_table.c.state_id == call.state_id)).scalar_one()
+        else:
+            run_id = conn.execute(
+                select(operations_table.c.run_id).where(operations_table.c.operation_id == call.operation_id)
+            ).scalar_one()
+        return run_id, CallType(call.call_type)
+
+    @classmethod
+    def _verify_source_call(cls, conn: Connection, *, source_call_id: str | None, current_run_id: str, call_type: CallType) -> None:
+        if source_call_id is None:
+            return
+        source = cls._call_run_on(conn, source_call_id)
+        run = conn.execute(
+            select(runs_table.c.run_mode, runs_table.c.replay_from_run_id).where(runs_table.c.run_id == current_run_id)
+        ).one_or_none()
+        if (
+            source is None
+            or run is None
+            or run.run_mode == RunMode.LIVE.value
+            or source[0] != run.replay_from_run_id
+            or source[1] is not call_type
+        ):
+            raise AuditIntegrityError("source call is missing, outside the configured source run, or has a different call type")
+
+    @staticmethod
+    def _update_call_refs_on(conn: Connection, *, call_id: str, request_ref: str | None, response_ref: str | None) -> None:
+        result = conn.execute(
+            calls_table.update().where(calls_table.c.call_id == call_id).values(request_ref=request_ref, response_ref=response_ref)
+        )
+        if result.rowcount != 1:
+            raise AuditIntegrityError("call disappeared before payload materialization")
+
+    def _record_call_payload_refs(
+        self,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
+        state_id: str,
+        call_id: str,
+        request_ref: str | None,
+        response_ref: str | None,
+    ) -> None:
+        """Revalidate the item after storage before attaching payload references."""
+        with fenced_item_transaction(
+            self._db.engine,
+            member_token=member_token,
+            work_item=work_item,
+            verb="record_call_payload_refs",
+        ) as conn:
+            self._verify_state_parent(conn, state_id=state_id, run_id=member_token.run_id, token_id=work_item.token_id)
+            self._update_call_refs_on(conn, call_id=call_id, request_ref=request_ref, response_ref=response_ref)
+
+    def _record_operation_call_payload_refs(
+        self,
+        *,
+        coordination_token: CoordinationToken,
+        operation_id: str,
+        call_id: str,
+        request_ref: str | None,
+        response_ref: str | None,
+    ) -> None:
+        """Revalidate leadership after storage before attaching payload references."""
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="record_operation_call_payload_refs",
+        ) as conn:
+            self._verify_operation_parent(conn, operation_id=operation_id, run_id=coordination_token.run_id)
+            self._update_call_refs_on(conn, call_id=call_id, request_ref=request_ref, response_ref=response_ref)
+
+    def record_call(
+        self,
+        state_id: str,
+        call_index: int,
+        call_type: CallType,
+        status: CallStatus,
+        request_data: CallPayload,
+        response_data: CallPayload | None = None,
+        error: CallPayload | None = None,
+        latency_ms: float | None = None,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
+        request_ref: str | None = None,
+        response_ref: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
+    ) -> Call:
+        """Record an external call for a node state.
+
+        Args:
+            state_id: The node_state this call belongs to
+            call_index: 0-based index of this call within the state
+            call_type: Type of external call (LLM, HTTP, SQL, FILESYSTEM)
+            status: Outcome of the call (SUCCESS, ERROR)
+            request_data: Request payload (CallPayload — serialized internally)
+            response_data: Response payload (CallPayload — serialized internally, optional for errors)
+            error: Error payload if status is ERROR (CallPayload — serialized internally)
+            latency_ms: Call duration in milliseconds
+            token_usage: Admitted provider usage. Unreported measures stay NULL,
+                including failed calls. Only prompt, completion, cached prompt,
+                and reasoning measures have durable columns; provider totals
+                and Anthropic cache measures remain in response_data evidence.
+            request_ref: Optional payload store reference for request
+            response_ref: Optional payload store reference for response
+            approved_prompt_artifact_hash: Cross-DB hash anchor (Phase 5b Task 9).
+                When this LLM-transform call is downstream of an interpretation
+                event the L3 plugin forwards the SHA-256 of the resolved prompt
+                template string here; the value MUST equal
+                ``interpretation_events.approved_prompt_artifact_hash`` in the
+                session audit DB for the same resolved string. ``None`` for
+                non-LLM calls or for LLM transforms not downstream of an
+                interpretation event.
+
+        Returns:
+            The recorded Call model
+
+        Note:
+            A duplicate repository-allocated ``(state_id, call_index)`` is
+            remapped atomically because the represented external effect has
+            already occurred. A duplicate explicit index that bypassed this
+            repository's allocator remains an integrity error.
+            Invalid state_id will raise IntegrityError due to foreign key constraint.
+            Call indices should be allocated via allocate_call_index() for coordination.
+        """
+        # Validate the cross-DB prompt-hash anchor BEFORE inserting. The Call
+        # dataclass enforces the same invariant in __post_init__, but that runs
+        # AFTER execute_insert — a bad hash would commit to `calls` and only then
+        # raise. Checking here keeps the audit trail pristine (Tier 1): a bad
+        # hash leaves zero rows (elspeth-a94e626a36).
+        validate_approved_prompt_artifact_hash(call_type, approved_prompt_artifact_hash)
+        if not isinstance(token_usage, TokenUsage):
+            raise TypeError("token_usage must be TokenUsage")
+
+        explicit_call_id = call_id is not None
+        if explicit_call_id and (type(call_id) is not str or not call_id or len(call_id) > 64):
+            raise ValueError("Explicit call_id must be a non-empty string of at most 64 characters")
+        if explicit_call_id and (call_type is not CallType.LLM or source_call_id is not None):
+            raise ValueError("Explicit call_id is reserved for physical LLM outcomes")
+        call_id = generate_id() if call_id is None else call_id
+        returned_model = response_data.model if isinstance(response_data, LLMCallResponse) else None
+        if created_at is not None and (type(created_at) is not datetime or created_at.tzinfo is None):
+            raise ValueError("Explicit call created_at must be an aware datetime")
+        timestamp = now() if created_at is None else created_at
+        prepared = self._prepare_call_payloads(
+            request_data,
+            response_data,
+            error,
+            request_ref,
+            response_ref,
+        )
+
+        values: dict[str, object] = {
+            "call_id": call_id,
+            "state_id": state_id,
+            "operation_id": None,  # State call, not operation call
+            "call_index": call_index,
+            "call_type": call_type,
+            "status": status,
+            "request_hash": prepared.request_hash,
+            "request_ref": prepared.request_ref,
+            "response_hash": prepared.response_hash,
+            "response_ref": prepared.response_ref,
+            "returned_model": returned_model,
+            "source_call_id": source_call_id,
+            "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
+            "prompt_tokens": token_usage.prompt_tokens,
+            "completion_tokens": token_usage.completion_tokens,
+            "cached_prompt_tokens": token_usage.cached_prompt_tokens,
+            "reasoning_tokens": token_usage.reasoning_tokens,
+            "error_json": prepared.error_json,
+            "latency_ms": latency_ms,
+            "created_at": timestamp,
+        }
+
+        proposed_call_index = call_index
+        allocation_is_owned = self._allocation_context(
+            parent_id=state_id,
+            call_index=proposed_call_index,
+            operation=False,
+        )
+        recorded_index: int | None = None
+        try:
+            with fenced_item_transaction(
+                self._db.engine,
+                member_token=member_token,
+                work_item=work_item,
+                verb="record_call",
+            ) as conn:
+                self._verify_state_parent(conn, state_id=state_id, run_id=member_token.run_id, token_id=work_item.token_id)
+                self._verify_source_call(conn, source_call_id=source_call_id, current_run_id=member_token.run_id, call_type=call_type)
+                values = self._insert_allocated_call(
+                    conn,
+                    values,
+                    parent_column="state_id",
+                    parent_id=state_id,
+                    allocation_is_owned=allocation_is_owned,
+                    preserve_call_id=explicit_call_id,
+                )
+            call_id = str(values["call_id"])
+            recorded_value = values["call_index"]
+            if type(recorded_value) is not int:
+                raise FrameworkBugError("inserted state call returned a non-integer call_index")
+            recorded_index = recorded_value
+            call_index = recorded_index
+        finally:
+            self._finish_allocation(
+                parent_id=state_id,
+                proposed_index=proposed_call_index,
+                recorded_index=recorded_index,
+                operation=False,
+            )
+        request_ref, response_ref = self._materialize_call_refs_after_insert(call_id, prepared)
+        if prepared.request_bytes is not None or prepared.response_bytes is not None:
+            try:
+                self._record_call_payload_refs(
+                    member_token=member_token,
+                    work_item=work_item,
+                    state_id=state_id,
+                    call_id=call_id,
+                    request_ref=request_ref,
+                    response_ref=response_ref,
+                )
+            except SQLAlchemyError as exc:
+                raise LandscapePostCommitError(f"Call {call_id} was recorded, but payload reference update failed") from exc
+
+        return Call(
+            call_id=call_id,
+            call_index=call_index,
+            call_type=call_type,
+            status=status,
+            request_hash=prepared.request_hash,
+            created_at=timestamp,
+            state_id=state_id,
+            operation_id=None,
+            request_ref=request_ref,
+            response_hash=prepared.response_hash,
+            response_ref=response_ref,
+            returned_model=returned_model,
+            source_call_id=source_call_id,
+            error_json=prepared.error_json,
+            latency_ms=latency_ms,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
+            prompt_tokens=token_usage.prompt_tokens,
+            completion_tokens=token_usage.completion_tokens,
+            cached_prompt_tokens=token_usage.cached_prompt_tokens,
+            reasoning_tokens=token_usage.reasoning_tokens,
+        )
+
+    def record_operation_call(
+        self,
+        operation_id: str,
+        call_type: CallType,
+        status: CallStatus,
+        request_data: CallPayload,
+        response_data: CallPayload | None = None,
+        error: CallPayload | None = None,
+        latency_ms: float | None = None,
+        *,
+        coordination_token: CoordinationToken,
+        call_index: int | None = None,
+        request_ref: str | None = None,
+        response_ref: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
+    ) -> Call:
+        """Record an external call made during an operation.
+
+        This is the operation equivalent of record_call() - attributes calls
+        to operations instead of node_states.
+
+        Args:
+            operation_id: The operation this call belongs to
+            call_type: Type of external call (LLM, HTTP, SQL, FILESYSTEM)
+            status: Outcome of the call (SUCCESS, ERROR)
+            request_data: Request payload (CallPayload — serialized internally)
+            response_data: Response payload (CallPayload — serialized internally, optional for errors)
+            error: Error details if status is ERROR (stored as JSON)
+            latency_ms: Call duration in milliseconds
+            token_usage: Admitted provider usage with unknown measures stored
+                as NULL. Provider-specific additional measures remain in the
+                response payload, rather than being inferred or normalized.
+            request_ref: Optional payload store reference for request
+            response_ref: Optional payload store reference for response
+
+        Returns:
+            The recorded Call model
+        """
+        # Validate the cross-DB prompt-hash anchor BEFORE inserting (see the
+        # state-parented record_call for rationale): a bad hash must leave zero
+        # `calls` rows rather than commit and then raise from Call.__post_init__
+        # (elspeth-a94e626a36).
+        validate_approved_prompt_artifact_hash(call_type, approved_prompt_artifact_hash)
+        if not isinstance(token_usage, TokenUsage):
+            raise TypeError("token_usage must be TokenUsage")
+
+        if call_index is None:
+            call_index = self.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
+        explicit_call_id = call_id is not None
+        if explicit_call_id and (type(call_id) is not str or not call_id or len(call_id) > 64):
+            raise ValueError("Explicit call_id must be a non-empty string of at most 64 characters")
+        if explicit_call_id and (call_type is not CallType.LLM or source_call_id is not None):
+            raise ValueError("Explicit call_id is reserved for physical LLM outcomes")
+        call_id = f"call_{operation_id}_{call_index}" if call_id is None else call_id
+        returned_model = response_data.model if isinstance(response_data, LLMCallResponse) else None
+        if created_at is not None and (type(created_at) is not datetime or created_at.tzinfo is None):
+            raise ValueError("Explicit call created_at must be an aware datetime")
+        timestamp = now() if created_at is None else created_at
+        prepared = self._prepare_call_payloads(
+            request_data,
+            response_data,
+            error,
+            request_ref,
+            response_ref,
+        )
+
+        values: dict[str, object] = {
+            "call_id": call_id,
+            "state_id": None,  # NOT a node_state call
+            "operation_id": operation_id,  # Operation call
+            "call_index": call_index,
+            "call_type": call_type,
+            "status": status,
+            "request_hash": prepared.request_hash,
+            "request_ref": prepared.request_ref,
+            "response_hash": prepared.response_hash,
+            "response_ref": prepared.response_ref,
+            "returned_model": returned_model,
+            "source_call_id": source_call_id,
+            "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
+            "prompt_tokens": token_usage.prompt_tokens,
+            "completion_tokens": token_usage.completion_tokens,
+            "cached_prompt_tokens": token_usage.cached_prompt_tokens,
+            "reasoning_tokens": token_usage.reasoning_tokens,
+            "error_json": prepared.error_json,
+            "latency_ms": latency_ms,
+            "created_at": timestamp,
+        }
+
+        proposed_call_index = call_index
+        allocation_is_owned = self._allocation_context(
+            parent_id=operation_id,
+            call_index=proposed_call_index,
+            operation=True,
+        )
+        recorded_index = None
+        try:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="record_operation_call",
+            ) as conn:
+                self._verify_operation_parent(conn, operation_id=operation_id, run_id=coordination_token.run_id)
+                self._verify_source_call(conn, source_call_id=source_call_id, current_run_id=coordination_token.run_id, call_type=call_type)
+                values = self._insert_allocated_call(
+                    conn,
+                    values,
+                    parent_column="operation_id",
+                    parent_id=operation_id,
+                    allocation_is_owned=allocation_is_owned,
+                    preserve_call_id=explicit_call_id,
+                )
+            call_id = str(values["call_id"])
+            recorded_value = values["call_index"]
+            if type(recorded_value) is not int:
+                raise FrameworkBugError("inserted operation call returned a non-integer call_index")
+            recorded_index = recorded_value
+            call_index = recorded_index
+        finally:
+            self._finish_allocation(
+                parent_id=operation_id,
+                proposed_index=proposed_call_index,
+                recorded_index=recorded_index,
+                operation=True,
+            )
+        request_ref, response_ref = self._materialize_call_refs_after_insert(call_id, prepared)
+
+        if prepared.request_bytes is not None or prepared.response_bytes is not None:
+            try:
+                self._record_operation_call_payload_refs(
+                    coordination_token=coordination_token,
+                    operation_id=operation_id,
+                    call_id=call_id,
+                    request_ref=request_ref,
+                    response_ref=response_ref,
+                )
+            except SQLAlchemyError as exc:
+                raise LandscapePostCommitError(f"Call {call_id} was recorded, but payload reference update failed") from exc
+
+        return Call(
+            call_id=call_id,
+            call_index=call_index,
+            call_type=call_type,
+            status=status,
+            request_hash=prepared.request_hash,
+            created_at=timestamp,
+            state_id=None,
+            operation_id=operation_id,
+            request_ref=request_ref,
+            response_hash=prepared.response_hash,
+            response_ref=response_ref,
+            returned_model=returned_model,
+            source_call_id=source_call_id,
+            error_json=prepared.error_json,
+            latency_ms=latency_ms,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
+            prompt_tokens=token_usage.prompt_tokens,
+            completion_tokens=token_usage.completion_tokens,
+            cached_prompt_tokens=token_usage.cached_prompt_tokens,
+            reasoning_tokens=token_usage.reasoning_tokens,
+        )
+
+    def get_operation_calls(self, operation_id: str) -> list[Call]:
+        """Get external calls for an operation.
+
+        Args:
+            operation_id: Operation ID
+
+        Returns:
+            List of Call models, ordered by call_index
+        """
+        query = select(calls_table).where(calls_table.c.operation_id == operation_id).order_by(calls_table.c.call_index)
+        db_rows = self._ops.execute_fetchall(query)
+        return [self._call_loader.load(r) for r in db_rows]
+
+    def get_all_operation_calls_for_run(self, run_id: str) -> list[Call]:
+        """Get all operation-parented calls for a run (batch query).
+
+        Fetches all calls where operation_id is NOT NULL and the operation
+        belongs to the given run. This replaces per-operation get_operation_calls()
+        loops in the exporter.
+
+        Args:
+            run_id: Run ID
+
+        Returns:
+            List of Call models, ordered by operation_id then call_index
+        """
+        query = (
+            select(calls_table)
+            .join(operations_table, calls_table.c.operation_id == operations_table.c.operation_id)
+            .where(operations_table.c.run_id == run_id)
+            .order_by(calls_table.c.operation_id, calls_table.c.call_index)
+        )
+        db_rows = self._ops.execute_fetchall(query)
+        return [self._call_loader.load(r) for r in db_rows]
+
+    def get_all_calls_for_run(self, run_id: str) -> list[Call]:
+        """Enumerate both state and operation calls with a stable total order."""
+        query = (
+            select(calls_table)
+            .outerjoin(node_states_table, calls_table.c.state_id == node_states_table.c.state_id)
+            .outerjoin(operations_table, calls_table.c.operation_id == operations_table.c.operation_id)
+            .where(or_(node_states_table.c.run_id == run_id, operations_table.c.run_id == run_id))
+            .order_by(calls_table.c.created_at, calls_table.c.call_id)
+        )
+        return [self._call_loader.load(row) for row in self._ops.execute_fetchall(query)]
+
+    def record_verification_decision(
+        self,
+        *,
+        current_run_id: str,
+        current_call_id: str,
+        source_run_id: str,
+        source_call_id: str | None,
+        is_match: bool | None,
+        differences_json: str,
+        coordination_token: CoordinationToken,
+    ) -> CallVerification:
+        """Persist one comparison, checking both call owners in the same transaction."""
+        if type(is_match) not in (bool, type(None)):
+            raise TypeError("is_match must be bool or None")
+        try:
+            differences = json.loads(differences_json, parse_constant=_reject_non_finite_json_constant)
+        except ValueError as exc:
+            raise ValueError("differences_json must be valid finite JSON") from exc
+        if type(differences) is not dict:
+            raise ValueError("differences_json must encode an object")
+        if is_match is True and (source_call_id is None or differences):
+            raise ValueError("matching verification requires a source call and no differences")
+        if current_run_id == source_run_id:
+            raise AuditIntegrityError("verification source and current runs must differ")
+        recorded_at = now()
+        if coordination_token.run_id != current_run_id:
+            raise AuditIntegrityError("verification decision token does not belong to the current run")
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="record_verification_decision",
+        ) as conn:
+            run = conn.execute(
+                select(runs_table.c.run_mode, runs_table.c.replay_from_run_id).where(runs_table.c.run_id == current_run_id)
+            ).one_or_none()
+            if run is None or run.run_mode != RunMode.VERIFY.value or run.replay_from_run_id != source_run_id:
+                raise AuditIntegrityError("verification run does not name the configured source run")
+            current = self._call_run_on(conn, current_call_id)
+            if current is None or current[0] != current_run_id:
+                raise AuditIntegrityError("verification current call is missing or belongs to another run")
+            if source_call_id is not None:
+                source = self._call_run_on(conn, source_call_id)
+                if source is None or source[0] != source_run_id or source[1] is not current[1]:
+                    raise AuditIntegrityError("verification source call is missing, belongs to another run, or has another type")
+            conn.execute(
+                call_verifications_table.insert().values(
+                    current_call_id=current_call_id,
+                    current_run_id=coordination_token.run_id,
+                    source_run_id=run.replay_from_run_id,
+                    source_call_id=source_call_id,
+                    is_match=is_match,
+                    differences_json=canonical_json(differences),
+                    recorded_at=recorded_at,
+                )
+            )
+        return CallVerification(
+            current_call_id=current_call_id,
+            current_run_id=current_run_id,
+            source_run_id=source_run_id,
+            source_call_id=source_call_id,
+            is_match=is_match,
+            differences_json=canonical_json(differences),
+            recorded_at=recorded_at,
+        )
+
+    def get_verification_decision(self, current_call_id: str) -> CallVerification | None:
+        with self._db.read_only_connection() as conn:
+            return get_verification_decision(conn, current_call_id)
+
+    def get_verification_decisions_for_run(self, current_run_id: str) -> list[CallVerification]:
+        with self._db.read_only_connection() as conn:
+            return get_verification_decisions_for_run(conn, current_run_id)
+
+    def iter_verification_decisions_for_run(self, current_run_id: str, *, batch_size: int) -> Iterator[CallVerification]:
+        with self._db.read_only_connection() as conn:
+            yield from iter_verification_decisions_for_run(conn, current_run_id, batch_size=batch_size)
+
+    def get_verification_decisions_for_calls(self, current_run_id: str, current_call_ids: Collection[str]) -> list[CallVerification]:
+        with self._db.read_only_connection() as conn:
+            return get_verification_decisions_for_calls(conn, current_run_id, current_call_ids)
+
+    def find_call_by_request_hash(
+        self,
+        run_id: str,
+        call_type: CallType,
+        request_hash: str,
+        *,
+        sequence_index: int = 0,
+    ) -> Call | None:
+        """Find a call by its request hash within a run.
+
+        Used for replay mode to look up previously recorded calls by
+        the hash of their request data.
+
+        Args:
+            run_id: Run ID to search within
+            call_type: Type of call (llm, http, etc.)
+            request_hash: SHA-256 hash of the canonical request data
+            sequence_index: 0-based index for duplicate request hashes.
+                When the same request is made multiple times in a run
+                (e.g., retries, loops), use sequence_index to get the
+                Nth occurrence (0=first, 1=second, etc.).
+
+        Returns:
+            Call model if found, None otherwise
+
+        Note:
+            Calls are ordered chronologically by created_at. The sequence_index
+            parameter allows disambiguation when the same request was made
+            multiple times (each returning a different response).
+        """
+        # Join to node_states to filter by run_id
+        # NOTE: Use node_states.run_id directly (denormalized column) instead of
+        # joining through nodes table. The nodes table has composite PK (node_id, run_id),
+        # so joining on node_id alone would be ambiguous when node_id is reused across runs.
+        query = (
+            select(calls_table)
+            .join(
+                node_states_table,
+                calls_table.c.state_id == node_states_table.c.state_id,
+            )
+            .where(node_states_table.c.run_id == run_id)
+            .where(calls_table.c.call_type == call_type)
+            .where(calls_table.c.request_hash == request_hash)
+            .order_by(calls_table.c.created_at, calls_table.c.call_id)
+            .limit(1)
+            .offset(sequence_index)
+        )
+        row = self._ops.execute_fetchone(query)
+        if row is None:
+            return None
+        return self._call_loader.load(row)
+
+    def _token_lineage_hash(
+        self,
+        token_id: str,
+        run_id: str,
+        row_id: str,
+        *,
+        evidence_cache: dict[str, _LineageEvidence] | None = None,
+    ) -> str:
+        """Normalize durable parent ordinals, never run-local token/group IDs.
+
+        A fork/expansion's sole parent relation carries its member ordinal;
+        joins carry ordered parent slots. Recursing preserves nested member
+        identity even after a collector removes its open lineage frames.
+        Unlike sink membership's retained lineage JSON, call matching only
+        needs equality: hashing each level bounds shared-parent DAG evidence.
+        """
+        memo: dict[str, str] = {}
+        visiting: set[str] = set()
+        if evidence_cache is None:
+            evidence_cache = {}
+
+        def walk(current_id: str, depth: int) -> str:
+            if current_id in visiting:
+                raise AuditIntegrityError("cycle in call parent token lineage")
+            if depth > MAX_LINEAGE_DEPTH:
+                raise AuditIntegrityError("call parent token lineage exceeds depth bound")
+            if current_id in memo:
+                return memo[current_id]
+            if len(memo) + len(visiting) >= MAX_LINEAGE_NODES_PER_MEMBER:
+                raise AuditIntegrityError("call parent token lineage exceeds node bound")
+            if current_id in evidence_cache:
+                evidence = evidence_cache[current_id]
+            else:
+                token = self._ops.execute_fetchone(select(tokens_table).where(tokens_table.c.token_id == current_id))
+                if token is None:
+                    raise AuditIntegrityError("call parent token lineage has missing or cross-run/row token")
+                raw_parents = self._ops.execute_fetchall(
+                    select(token_parents_table)
+                    .where(token_parents_table.c.token_id == current_id)
+                    .order_by(token_parents_table.c.ordinal)
+                    .limit(MAX_LINEAGE_PARENTS + 1)
+                )
+                has_frame = False
+                if not raw_parents:
+                    has_frame = (
+                        self._ops.execute_fetchone(
+                            select(token_lineage_frames_table.c.token_id)
+                            .where(token_lineage_frames_table.c.token_id == current_id)
+                            .limit(1)
+                        )
+                        is not None
+                    )
+                evidence = _LineageEvidence(
+                    run_id=token.run_id,
+                    row_id=token.row_id,
+                    join_group_id=token.join_group_id,
+                    parents=tuple(_LineageParent(parent.parent_token_id, parent.ordinal, parent.run_id) for parent in raw_parents),
+                    has_frame=has_frame,
+                )
+                evidence_cache[current_id] = evidence
+            if evidence.run_id != run_id or evidence.row_id != row_id:
+                raise AuditIntegrityError("call parent token lineage has missing or cross-run/row token")
+            parents = evidence.parents
+            if len(parents) > MAX_LINEAGE_PARENTS:
+                raise AuditIntegrityError("call parent token lineage exceeds parent bound")
+            ordinals = [parent.ordinal for parent in parents]
+            if any(parent.run_id != run_id for parent in parents) or any(type(ordinal) is not int or ordinal < 0 for ordinal in ordinals):
+                raise AuditIntegrityError("call parent token lineage has invalid parent relation")
+            if len(parents) > 1 and ordinals != list(range(len(parents))):
+                raise AuditIntegrityError("call parent token lineage has non-dense parent ordinals")
+            if len({parent.parent_token_id for parent in parents}) != len(parents):
+                raise AuditIntegrityError("call parent token lineage repeats a parent")
+            if not parents and (evidence.join_group_id is not None or evidence.has_frame):
+                raise AuditIntegrityError("call parent token claims lineage without parent relations")
+            visiting.add(current_id)
+            identity = stable_hash([(parent.ordinal, walk(parent.parent_token_id, depth + 1)) for parent in parents])
+            visiting.remove(current_id)
+            memo[current_id] = identity
+            return identity
+
+        return walk(token_id, 0)
+
+    def _source_parent_index(
+        self,
+        *,
+        source_run_id: str,
+        node_id: str,
+        step_index: int,
+        attempt: int,
+        source_node_id: str,
+        source_row_index: int,
+    ) -> dict[str, tuple[str, ...]]:
+        """Index every matching source parent before considering call fields.
+
+        A completed run's audit rows cannot change through repository writes.
+        For a still-running source (used by direct repository callers), build
+        afresh so subsequent writes remain visible. The small LRU also keeps
+        unrelated source rows from accumulating for the repository's lifetime.
+        """
+        key = (source_run_id, node_id, step_index, attempt, source_node_id, source_row_index)
+        run = self._ops.execute_fetchone(select(runs_table.c.status, runs_table.c.completed_at).where(runs_table.c.run_id == source_run_id))
+        completed = (
+            run is not None
+            and run.status
+            in {
+                RunStatus.COMPLETED.value,
+                RunStatus.COMPLETED_WITH_FAILURES.value,
+                RunStatus.EMPTY.value,
+            }
+            and run.completed_at is not None
+        )
+        pending: Future[dict[str, tuple[str, ...]]] | None = None
+        build_here = True
+        if completed:
+            with self._source_parent_index_lock:
+                if key in self._source_parent_indices:
+                    self._source_parent_indices.move_to_end(key)
+                    return self._source_parent_indices[key]
+                if key in self._source_parent_builds:
+                    pending = self._source_parent_builds[key]
+                    build_here = False
+                else:
+                    pending = Future()
+                    self._source_parent_builds[key] = pending
+            if not build_here:
+                return pending.result()
+
+        try:
+            parent_query = (
+                select(node_states_table.c.state_id, node_states_table.c.token_id, tokens_table.c.row_id)
+                .join(tokens_table, node_states_table.c.token_id == tokens_table.c.token_id)
+                .join(rows_table, tokens_table.c.row_id == rows_table.c.row_id)
+                .where(
+                    node_states_table.c.run_id == source_run_id,
+                    node_states_table.c.node_id == node_id,
+                    node_states_table.c.step_index == step_index,
+                    node_states_table.c.attempt == attempt,
+                    rows_table.c.source_node_id == source_node_id,
+                    rows_table.c.source_row_index == source_row_index,
+                    rows_table.c.run_id == source_run_id,
+                )
+            )
+            source_parents = self._ops.execute_fetchall(parent_query)
+            evidence_cache: dict[str, _LineageEvidence] = {}
+            token_hashes = {
+                parent.token_id: self._token_lineage_hash(parent.token_id, source_run_id, parent.row_id, evidence_cache=evidence_cache)
+                for parent in {parent.token_id: parent for parent in source_parents}.values()
+            }
+            grouped: dict[str, list[str]] = {}
+            for parent in source_parents:
+                grouped.setdefault(token_hashes[parent.token_id], []).append(parent.state_id)
+            index = {lineage: tuple(state_ids) for lineage, state_ids in grouped.items()}
+        except BaseException as exc:
+            if pending is not None:
+                pending.set_exception(exc)
+                with self._source_parent_index_lock:
+                    self._source_parent_builds.pop(key)
+            raise
+        if completed:
+            with self._source_parent_index_lock:
+                self._source_parent_indices[key] = index
+                if len(self._source_parent_indices) > self._source_parent_index_limit:
+                    self._source_parent_indices.popitem(last=False)
+            if pending is not None:
+                pending.set_result(index)
+                with self._source_parent_index_lock:
+                    self._source_parent_builds.pop(key)
+        return index
+
+    def list_source_calls_for_current_parent(
+        self,
+        *,
+        source_run_id: str,
+        call_type: CallType,
+        current_state_id: str | None,
+        current_operation_id: str | None,
+        call_index: int | None = None,
+    ) -> list[Call]:
+        """List source calls bound to the current parent identity.
+
+        State calls bind to the node, source row, stable token lineage,
+        step and attempt. Operation calls bind to node and operation type.
+        A repeated operation with identical request/index is ambiguous and
+        must be refused rather than selected by timestamp order.
+        """
+        if (current_state_id is None) == (current_operation_id is None):
+            raise ValueError("exactly one current call parent is required")
+        if current_state_id is not None:
+            current = self._ops.execute_fetchone(
+                select(
+                    node_states_table.c.token_id,
+                    node_states_table.c.run_id,
+                    tokens_table.c.row_id,
+                    node_states_table.c.node_id,
+                    node_states_table.c.step_index,
+                    node_states_table.c.attempt,
+                    rows_table.c.source_node_id,
+                    rows_table.c.source_row_index,
+                    rows_table.c.run_id.label("row_run_id"),
+                )
+                .join(tokens_table, node_states_table.c.token_id == tokens_table.c.token_id)
+                .join(rows_table, tokens_table.c.row_id == rows_table.c.row_id)
+                .where(node_states_table.c.state_id == current_state_id)
+            )
+            if current is None:
+                raise AuditIntegrityError("current state is missing for call replay lookup")
+            if current.row_run_id != current.run_id:
+                raise AuditIntegrityError("current call parent has a cross-run source row")
+            current_lineage = self._token_lineage_hash(current.token_id, current.run_id, current.row_id)
+            source_index = self._source_parent_index(
+                source_run_id=source_run_id,
+                node_id=current.node_id,
+                step_index=current.step_index,
+                attempt=current.attempt,
+                source_node_id=current.source_node_id,
+                source_row_index=current.source_row_index,
+            )
+            matching_parents = source_index[current_lineage] if current_lineage in source_index else ()
+            # Identity is a property of the parent, independent of whether its
+            # calls have the requested type, request hash or local index.
+            if len(matching_parents) > 1:
+                raise AuditIntegrityError("ambiguous source call parent token lineage")
+            if not matching_parents:
+                return []
+            query = select(calls_table).where(calls_table.c.state_id == matching_parents[0])
+        else:
+            current = self._ops.execute_fetchone(
+                select(
+                    operations_table.c.node_id,
+                    operations_table.c.operation_type,
+                    operations_table.c.input_data_hash,
+                    operations_table.c.occurrence_index,
+                ).where(operations_table.c.operation_id == current_operation_id)
+            )
+            if current is None:
+                raise AuditIntegrityError("current operation is missing for call replay lookup")
+            query = (
+                select(calls_table)
+                .join(operations_table, calls_table.c.operation_id == operations_table.c.operation_id)
+                .where(
+                    operations_table.c.run_id == source_run_id,
+                    operations_table.c.node_id == current.node_id,
+                    operations_table.c.operation_type == current.operation_type,
+                    operations_table.c.input_data_hash == current.input_data_hash,
+                )
+            )
+            if current.operation_type in ("source_load", "runtime_preflight") and current.occurrence_index is not None:
+                query = query.where(operations_table.c.occurrence_index == current.occurrence_index)
+        query = query.where(calls_table.c.call_type == call_type)
+        if call_index is not None:
+            query = query.where(calls_table.c.call_index == call_index)
+        candidates = self._ops.execute_fetchall(query.order_by(calls_table.c.call_index, calls_table.c.call_id))
+        return [self._call_loader.load(row) for row in candidates]
+
+    def find_call_for_current_parent(
+        self,
+        *,
+        source_run_id: str,
+        call_type: CallType,
+        request_hash: str | None,
+        current_state_id: str | None,
+        current_operation_id: str | None,
+        current_call_index: int,
+    ) -> Call | None:
+        """Find an exact parent-local occurrence without a timestamp offset."""
+        if type(current_call_index) is not int or current_call_index < 0:
+            raise ValueError("current_call_index must be a nonnegative integer")
+        candidates = [
+            call
+            for call in self.list_source_calls_for_current_parent(
+                source_run_id=source_run_id,
+                call_type=call_type,
+                current_state_id=current_state_id,
+                current_operation_id=current_operation_id,
+                call_index=current_call_index,
+            )
+            if call.call_index == current_call_index and (request_hash is None or call.request_hash == request_hash)
+        ]
+        if len(candidates) > 1:
+            raise AuditIntegrityError("ambiguous source call for exact parent-local occurrence")
+        return candidates[0] if candidates else None
+
+    def get_call_request_data(self, call_id: str) -> CallDataResult:
+        """Retrieve an archived request object and prove it matches its hash."""
+        row = self._ops.execute_fetchone(select(calls_table).where(calls_table.c.call_id == call_id))
+        if row is None:
+            return CallDataResult(state=CallDataState.CALL_NOT_FOUND, data=None)
+        if row.request_ref is None:
+            return CallDataResult(state=CallDataState.HASH_ONLY, data=None)
+        if self._payload_store is None:
+            return CallDataResult(state=CallDataState.STORE_NOT_CONFIGURED, data=None)
+        try:
+            payload_bytes = self._payload_store.retrieve(row.request_ref)
+        except PayloadNotFoundError:
+            return CallDataResult(state=CallDataState.PURGED, data=None)
+        except (PayloadIntegrityError, OSError) as exc:
+            raise AuditIntegrityError(f"Call request payload retrieval failed for call_id={call_id}") from exc
+        try:
+            decoded = canonical_json_loads(payload_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise AuditIntegrityError(f"Corrupt call request payload for call_id={call_id}") from exc
+        if type(decoded) is not dict:
+            raise AuditIntegrityError(f"Call request payload is not a JSON object for call_id={call_id}")
+        if hashlib.sha256(payload_bytes).hexdigest() != row.request_hash:
+            raise AuditIntegrityError(f"Call request payload hash mismatch for call_id={call_id}")
+        return CallDataResult(state=CallDataState.AVAILABLE, data=decoded)
+
+    def get_call_response_data(self, call_id: str) -> CallDataResult:
+        """Retrieve the response data for a call with explicit state.
+
+        Returns a CallDataResult with explicit state indicating why data
+        may be unavailable. Callers match on state instead of guessing
+        why the previous `None` return occurred.
+
+        Args:
+            call_id: The call ID to get response data for
+
+        Returns:
+            CallDataResult with state and data (if available)
+        """
+        # Get the call record first
+        query = select(calls_table).where(calls_table.c.call_id == call_id)
+        row = self._ops.execute_fetchone(query)
+
+        if row is None:
+            return CallDataResult(state=CallDataState.CALL_NOT_FOUND, data=None)
+
+        if row.response_ref is None:
+            if row.response_hash is not None:
+                return CallDataResult(state=CallDataState.HASH_ONLY, data=None)
+            return CallDataResult(state=CallDataState.NEVER_STORED, data=None)
+
+        if self._payload_store is None:
+            return CallDataResult(state=CallDataState.STORE_NOT_CONFIGURED, data=None)
+
+        # Retrieve from payload store — PayloadNotFoundError means purged by
+        # retention policy, PayloadIntegrityError means hash mismatch
+        # (corruption/tampering), OSError means storage backend failure
+        # (permissions, disk, etc.). All non-purge paths translate to
+        # AuditIntegrityError with context, matching
+        # query_repository._retrieve_and_parse_payload().
+        try:
+            payload_bytes = self._payload_store.retrieve(row.response_ref)
+        except PayloadNotFoundError:
+            return CallDataResult(state=CallDataState.PURGED, data=None)
+        except PayloadIntegrityError as e:
+            raise AuditIntegrityError(f"Payload integrity check failed for call_id={call_id} (ref={row.response_ref}): {e}") from e
+        except OSError as e:
+            logger.warning(
+                "call_response_payload_retrieval_failed",
+                call_id=call_id,
+                response_ref=row.response_ref,
+                error_type=type(e).__name__,
+                exc_info=True,
+            )
+            raise AuditIntegrityError(f"Payload retrieval failed for call_id={call_id}: reason=payload_store_os_error") from e
+
+        # Everything below is Tier 1: our data, crash on anomaly
+        try:
+            decoded = canonical_json_loads(payload_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as e:
+            raise AuditIntegrityError(f"Corrupt call response payload for call_id={call_id} (ref={row.response_ref}): {e}") from e
+        if type(decoded) is not dict:
+            raise AuditIntegrityError(
+                f"Corrupt call response payload for call_id={call_id} (ref={row.response_ref}): "
+                f"expected JSON object, got {type(decoded).__name__}"
+            )
+        response_hash = row.response_hash
+        if response_hash is None:
+            raise AuditIntegrityError(f"Call response payload ref without response hash for call_id={call_id} (ref={row.response_ref})")
+        decoded_hash = hashlib.sha256(payload_bytes).hexdigest()
+        if decoded_hash != response_hash:
+            raise AuditIntegrityError(f"Call response payload hash mismatch for call_id={call_id} (ref={row.response_ref})")
+        return CallDataResult(state=CallDataState.AVAILABLE, data=decoded)

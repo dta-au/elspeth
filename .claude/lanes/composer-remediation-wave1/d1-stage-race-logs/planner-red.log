@@ -1,0 +1,607 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 25 items / 9 deselected / 16 selected
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py FFFFFFFFFFFFF [ 81%]
+FFF                                                                      [100%]
+
+=================================== FAILURES ===================================
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes0-False] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r0/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe56c43a0c0>, UUID('b96f0d2c-c54e-4f37-bd11-f16db9e8b607'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe56c838200>
+required = False, trust_modes = ('explicit_approve', 'explicit_approve')
+cancel_creation = False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [False, True])
+    @pytest.mark.parametrize("trust_modes", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")])
+    @pytest.mark.parametrize("cancel_creation", [False, True])
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+>       planner._sessions_service = service
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: property '_sessions_service' of 'PlanningApplication' object has no setter
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:477: AttributeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:13:56 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:13:56 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:13:56 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes0-True] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r1/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe56c3f1a90>, UUID('a6bcddf2-e23a-4956-b01e-1f6d07e381e1'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe56c838140>
+required = True, trust_modes = ('explicit_approve', 'explicit_approve')
+cancel_creation = False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [False, True])
+    @pytest.mark.parametrize("trust_modes", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")])
+    @pytest.mark.parametrize("cancel_creation", [False, True])
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+>       planner._sessions_service = service
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: property '_sessions_service' of 'PlanningApplication' object has no setter
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:477: AttributeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:13:57 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:13:57 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:13:57 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes1-False] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r2/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe56af098e0>, UUID('94e15055-240b-41d8-9918-e19b1f3a0e72'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r2')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe56b136780>
+required = False, trust_modes = ('auto_commit', 'auto_commit')
+cancel_creation = False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [False, True])
+    @pytest.mark.parametrize("trust_modes", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")])
+    @pytest.mark.parametrize("cancel_creation", [False, True])
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+>       planner._sessions_service = service
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: property '_sessions_service' of 'PlanningApplication' object has no setter
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:477: AttributeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:13:57 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:13:57 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:13:57 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes1-True] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r3/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe56a8b6090>, UUID('fb234aa1-8133-44f7-b731-6ee64ade6f39'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r3')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe56c62adb0>
+required = True, trust_modes = ('auto_commit', 'auto_commit')
+cancel_creation = False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [False, True])
+    @pytest.mark.parametrize("trust_modes", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")])
+    @pytest.mark.parametrize("cancel_creation", [False, True])
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+>       planner._sessions_service = service
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: property '_sessions_service' of 'PlanningApplication' object has no setter
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:477: AttributeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:13:58 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:13:58 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:13:58 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes2-False] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r4/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe56a821fa0>, UUID('2ae3b2be-2206-4e06-9fbd-13377646be7d'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r4')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe56ad285c0>
+required = False, trust_modes = ('auto_commit', 'explicit_approve')
+cancel_creation = False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [False, True])
+    @pytest.mark.parametrize("trust_modes", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")])
+    @pytest.mark.parametrize("cancel_creation", [False, True])
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+>       planner._sessions_service = service
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: property '_sessions_service' of 'PlanningApplication' object has no setter
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:477: AttributeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:13:59 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:13:59 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:13:59 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes2-True] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r5/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe56a802d50>, UUID('7a24dd24-0c4d-43c3-9690-e5fbde8edb9f'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r5')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe56ac04410>
+required = True, trust_modes = ('auto_commit', 'explicit_approve')
+cancel_creation = False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [False, True])
+    @pytest.mark.parametrize("trust_modes", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")])
+    @pytest.mark.parametrize("cancel_creation", [False, True])
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+>       planner._sessions_service = service
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: property '_sessions_service' of 'PlanningApplication' object has no setter
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:477: AttributeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:14:00 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:14:00 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:14:00 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes3-False] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r6/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe56ac28710>, UUID('01a2b133-5154-4424-9f1e-28a215fd20c2'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r6')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe56a191550>
+required = False, trust_modes = ('explicit_approve', 'auto_commit')
+cancel_creation = False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [False, True])
+    @pytest.mark.parametrize("trust_modes", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")])
+    @pytest.mark.parametrize("cancel_creation", [False, True])
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+>       planner._sessions_service = service
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: property '_sessions_service' of 'PlanningApplication' object has no setter
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:477: AttributeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:14:01 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:14:01 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:14:01 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes3-True] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r7/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe56aa909e0>, UUID('06416aaf-f813-4354-b7a9-afe8d9b0c2b4'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r7')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe56a4ef3b0>
+required = True, trust_modes = ('explicit_approve', 'auto_commit')
+cancel_creation = False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [False, True])
+    @pytest.mark.parametrize("trust_modes", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")])
+    @pytest.mark.parametrize("cancel_creation", [False, True])
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+>       planner._sessions_service = service
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: property '_sessions_service' of 'PlanningApplication' object has no setter
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:477: AttributeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:14:01 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:14:01 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:14:01 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes0-False] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r8/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe56b166720>, UUID('b7f62aeb-12b8-41c5-bd06-b59cce48436d'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r8')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe56abec8f0>
+required = False, trust_modes = ('explicit_approve', 'explicit_approve')
+cancel_creation = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [False, True])
+    @pytest.mark.parametrize("trust_modes", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")])
+    @pytest.mark.parametrize("cancel_creation", [False, True])
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+>       planner._sessions_service = service
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: property '_sessions_service' of 'PlanningApplication' object has no setter
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:477: AttributeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:14:02 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:14:02 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:14:02 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes0-True] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r9/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe56c2be240>, UUID('779053df-66c3-4d31-96f6-a813bb4de404'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r9')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe56afe4110>
+required = True, trust_modes = ('explicit_approve', 'explicit_approve')
+cancel_creation = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [False, True])
+    @pytest.mark.parametrize("trust_modes", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")])
+    @pytest.mark.parametrize("cancel_creation", [False, True])
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+>       planner._sessions_service = service
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: property '_sessions_service' of 'PlanningApplication' object has no setter
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:477: AttributeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:14:03 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:14:03 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:14:03 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes1-False] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r10/operations.db), <elspeth.web.coordi...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe56ada3560>, UUID('e405c4c4-8e7d-4034-b83c-6a0ead779afc'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r10')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe56afae600>
+required = False, trust_modes = ('auto_commit', 'auto_commit')
+cancel_creation = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [False, True])
+    @pytest.mark.parametrize("trust_modes", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")])
+    @pytest.mark.parametrize("cancel_creation", [False, True])
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+>       planner._sessions_service = service
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: property '_sessions_service' of 'PlanningApplication' object has no setter
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:477: AttributeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:14:04 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:14:04 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:14:04 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes1-True] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r11/operations.db), <elspeth.web.coordi...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe56ae80b00>, UUID('362c7dfe-974d-460e-8164-2deaff6c64ab'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r11')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe56afe6870>
+required = True, trust_modes = ('auto_commit', 'auto_commit')
+cancel_creation = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [False, True])
+    @pytest.mark.parametrize("trust_modes", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")])
+    @pytest.mark.parametrize("cancel_creation", [False, True])
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+>       planner._sessions_service = service
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: property '_sessions_service' of 'PlanningApplication' object has no setter
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:477: AttributeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:14:04 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:14:04 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:14:04 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes2-False] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r12/operations.db), <elspeth.web.coordi...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe56bfe3ce0>, UUID('8a9b2766-e456-4c2a-a4bf-9d28636f2563'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r12')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe56c099820>
+required = False, trust_modes = ('auto_commit', 'explicit_approve')
+cancel_creation = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [False, True])
+    @pytest.mark.parametrize("trust_modes", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")])
+    @pytest.mark.parametrize("cancel_creation", [False, True])
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+>       planner._sessions_service = service
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: property '_sessions_service' of 'PlanningApplication' object has no setter
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:477: AttributeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:14:06 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:14:06 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:14:06 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes2-True] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r13/operations.db), <elspeth.web.coordi...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe56a111f70>, UUID('f6d1fb10-15d2-4312-af81-b612b3386373'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r13')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe569ddb590>
+required = True, trust_modes = ('auto_commit', 'explicit_approve')
+cancel_creation = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [False, True])
+    @pytest.mark.parametrize("trust_modes", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")])
+    @pytest.mark.parametrize("cancel_creation", [False, True])
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+>       planner._sessions_service = service
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: property '_sessions_service' of 'PlanningApplication' object has no setter
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:477: AttributeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:14:06 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:14:06 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:14:06 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes3-False] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r14/operations.db), <elspeth.web.coordi...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe56c0380e0>, UUID('4fd4d787-ab43-4ca3-ab89-25efcd09065a'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r14')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe569e51070>
+required = False, trust_modes = ('explicit_approve', 'auto_commit')
+cancel_creation = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [False, True])
+    @pytest.mark.parametrize("trust_modes", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")])
+    @pytest.mark.parametrize("cancel_creation", [False, True])
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+>       planner._sessions_service = service
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: property '_sessions_service' of 'PlanningApplication' object has no setter
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:477: AttributeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:14:07 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:14:07 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:14:07 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes3-True] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r15/operations.db), <elspeth.web.coordi...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fe56c460590>, UUID('c0747f0e-3296-4be3-a85c-22aae601adb7'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-111/test_actual_planner_resource_r15')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe569b34ad0>
+required = True, trust_modes = ('explicit_approve', 'auto_commit')
+cancel_creation = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("required", [False, True])
+    @pytest.mark.parametrize("trust_modes", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")])
+    @pytest.mark.parametrize("cancel_creation", [False, True])
+    async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+        operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
+    
+        engine, repository, _authority, service, sid = operation_store
+        expected, running = await prepared_rejection(operation_store)
+        planner = _harness(tmp_path / "planner").service._planning_application
+>       planner._sessions_service = service
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: property '_sessions_service' of 'PlanningApplication' object has no setter
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:477: AttributeError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:14:08 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:14:08 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:14:08 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+=========================== short test summary info ============================
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes0-False]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes0-True]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes1-False]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes1-True]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes2-False]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes2-True]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes3-False]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[False-trust_modes3-True]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes0-False]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes0-True]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes1-False]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes1-True]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes2-False]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes2-True]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes3-False]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation[True-trust_modes3-True]
+====================== 16 failed, 9 deselected in 17.33s =======================

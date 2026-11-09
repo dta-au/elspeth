@@ -1,0 +1,651 @@
+"""Types, constants, and exceptions for DAG operations.
+
+Leaf module — no intra-package imports (prevents import cycles).
+Matches the orchestrator/types.py pattern.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+from elspeth.contracts.data import CompatibilityResult
+from elspeth.contracts.enums import NodeType
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
+from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.types import NODE_ID_MAX_LENGTH, CoalesceName, NodeID
+
+if TYPE_CHECKING:
+    from elspeth.contracts import PluginSchema
+    from elspeth.contracts.schema_contract import OutputFieldDeclaration
+
+
+class GraphValidationError(ValueError):
+    """Raised when graph validation fails.
+
+    Attributes:
+        component_id: The node ID responsible for the error (e.g. ``'gate_1'``,
+                      ``'transform_check'``), or None for structural errors
+                      (cycles, wrong source count, etc.) where no single node
+                      is at fault. Callers should read this instead of
+                      regex-parsing str(exc).
+        component_type: The node type (e.g. ``'gate'``, ``'transform'``,
+                        ``'coalesce'``), or None for structural errors.
+                        Set at the raise site where the type is known,
+                        avoiding fragile string-splitting of component_id.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        component_id: str | None = None,
+        component_type: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.component_id: str | None = component_id
+        self.component_type: str | None = component_type
+
+
+class EdgeContractError(GraphValidationError):
+    """Raised when graph edge schema compatibility fails.
+
+    Subclass of ``GraphValidationError`` carrying the structured
+    ``CompatibilityResult`` plus producer/consumer identity, so downstream
+    layers (composer runtime preflight error formatting) can build LLM-
+    actionable suggestions without re-parsing the prose form.
+
+    Why a subclass and not a separate exception:
+      - All existing callers that catch ``GraphValidationError`` keep working
+        without change (subclass IS-A parent).
+      - The downstream catch site can opportunistically narrow with
+        ``isinstance(exc, EdgeContractError)`` to access structured fields,
+        falling back to the prose ``str(exc)`` when other graph validation
+        paths raise the parent class.
+
+    Attributes:
+        from_node_id: Producer node ID (e.g. ``'web_scrape_a1b2c3'``).
+        to_node_id: Consumer node ID (e.g. ``'line_explode_d4e5f6'``).
+        producer_schema_name: Pydantic schema class name (e.g.
+            ``'WebScrapeOutput'``) — useful for naming the contract surface
+            to the LLM, but the per-field detail lives in
+            ``compatibility_result``.
+        consumer_schema_name: Pydantic schema class name (e.g.
+            ``'LineExplodeInput'``).
+        compatibility_result: The full structured incompatibility detail —
+            ``missing_fields``, ``type_mismatches[(field, expected, actual)]``,
+            ``extra_fields``, and ``constraint_mismatches``. The error-message
+            formatter walks this to produce actionable per-field guidance.
+        from_component_type: The PRODUCER's node type (e.g. ``'row_union'``),
+            when known at the raise site. The suggestion builder needs it to
+            pick producer-shaped advice (a plugin-free row_union has no
+            schema options to patch) even when the failure fires during graph
+            BUILD, where no graph exists to map the DAG id back to a composer
+            component (elspeth-41bcaa882e).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        from_node_id: str,
+        to_node_id: str,
+        producer_schema_name: str,
+        consumer_schema_name: str,
+        compatibility_result: CompatibilityResult,
+        component_type: str | None = None,
+        from_component_type: str | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            component_id=to_node_id,
+            component_type=component_type,
+        )
+        self.from_node_id: str = from_node_id
+        self.to_node_id: str = to_node_id
+        self.producer_schema_name: str = producer_schema_name
+        self.consumer_schema_name: str = consumer_schema_name
+        self.compatibility_result: CompatibilityResult = compatibility_result
+        self.from_component_type: str | None = from_component_type
+        # Captured from the graph's exact config-name maps before a failing
+        # build unwinds. Keep identities, not the graph or plugin instances.
+        self.from_config_name: str | None = None
+        self.to_config_name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GraphValidationWarning:
+    """Non-fatal warning emitted during graph construction.
+
+    Unlike GraphValidationError, warnings don't prevent graph construction.
+    They alert the operator to configurations that are technically valid but
+    likely to cause runtime surprises (e.g., rows silently lost).
+    """
+
+    code: str
+    message: str
+    node_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.code:
+            raise ValueError("GraphValidationWarning.code must not be empty")
+        if not self.message:
+            raise ValueError("GraphValidationWarning.message must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class BranchInfo:
+    """Properties of a fork branch that routes to a coalesce node.
+
+    Consolidates branch routing facts that used to be carried by several
+    builder-local structures: destination coalesce, producing gate, coalesce
+    input connection, and whether the branch goes through a transform chain.
+
+    The optional ``schema`` field stores the branch's producer schema,
+    enabling runtime tracking of which fields would have been contributed
+    by a branch that was lost (diverted to error sink). This supports
+    audit trail queries like "what fields were expected from lost branch X?"
+    """
+
+    coalesce_name: CoalesceName
+    gate_node_id: NodeID
+    input_connection: str = ""
+    uses_transform_chain: bool = False
+    schema: SchemaConfig | None = None
+
+    def __post_init__(self) -> None:
+        if not self.coalesce_name:
+            raise ValueError("BranchInfo.coalesce_name must not be empty")
+        if not self.gate_node_id:
+            raise ValueError("BranchInfo.gate_node_id must not be empty")
+
+
+_NODE_ID_MAX_LENGTH = NODE_ID_MAX_LENGTH
+
+
+# Config stored on graph nodes varies by node type:
+# - Source/Transform/Sink: raw plugin config dict (arbitrary keys per plugin)
+# - Gate: {routes, condition, fork_to?}
+# - Aggregation: {input_schema, trigger, output_mode, options}
+# - Coalesce: {branches, policy, merge, timeout_seconds?, quorum_count?, select_branch?}
+# Schema data is accessed via output_schema_config on NodeInfo, not the raw config
+# keys. Source/transform/sink nodes may retain either "schema" or "schema_config"
+# in config for hashing/audit fidelity; runtime semantics read the parsed
+# output_schema_config instead. Aggregations use "input_schema" on the wrapper
+# config to prevent add_node() from auto-populating output_schema_config (see
+# elspeth-c3a98c358c).
+# dict[str, Any] is intentional: plugin configs are validated by each plugin's
+# Pydantic model, not by the graph. The graph only hashes them for node IDs.
+type NodeConfig = dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class NodeInfo:
+    """Information about a node in the execution graph.
+
+    Frozen after construction — attribute reassignment is prevented to
+    guarantee audit trail consistency. Schemas are locked at launch and
+    never change during the run.
+
+    Schema Contracts:
+        input_schema_config and output_schema_config store the original
+        SchemaConfig from plugin configuration. These contain contract
+        declarations (guaranteed_fields, required_fields) used for DAG
+        validation. The input_schema and output_schema are the generated
+        Pydantic model types used for runtime validation.
+    """
+
+    node_id: NodeID
+    node_type: NodeType
+    plugin_name: str
+    config: NodeConfig = field(default_factory=dict)
+    input_schema: type[PluginSchema] | None = None
+    output_schema: type[PluginSchema] | None = None
+    input_schema_config: SchemaConfig | None = None
+    output_schema_config: SchemaConfig | None = None
+    # Populated only for SINK nodes by the builder from SinkProtocol.declared_required_fields.
+    # Used for build-time validation that upstream coalesce output guarantees the
+    # fields a sink requires. Empty frozenset for all non-sink nodes.
+    declared_required_fields: frozenset[str] = field(default_factory=frozenset)
+
+    # Populated only for TRANSFORM nodes by the builder from
+    # TransformProtocol.declared_output_fields — the fields the transform ADDS
+    # to each row. Used for build-time detection of the field collision the
+    # TransformExecutor preflight otherwise raises per-row
+    # (elspeth-cfcd333f83). Empty frozenset for all non-transform nodes.
+    #
+    # NOT derivable from output_schema_config: a pass-through transform's
+    # effective guaranteed fields include the input fields it forwards, so
+    # deriving this from guarantees would report every pass-through transform
+    # as colliding with its own upstream. Declaration only.
+    declared_output_fields: frozenset[str] = field(default_factory=frozenset)
+
+    # Populated only for TRANSFORM nodes by the builder from
+    # TransformProtocol.declared_input_fields — the fields the transform
+    # REQUIRES on each arriving row. Used for build-time detection of the
+    # violation DeclaredRequiredFieldsContract.pre_emission_check otherwise
+    # raises per-row, before process() ever runs (elspeth-ada5a60249). Empty
+    # frozenset for all non-transform nodes.
+    #
+    # Input-side sibling of declared_output_fields above, and NOT derivable
+    # from input_schema/input_schema_config for the same class of reason: six
+    # transform configs compute this as a property over their own options
+    # (web_scrape's url_field, blob_csv_expand's blob_ref_field, textract's
+    # key_field plus optionally bucket_field/version_field, ...), and the
+    # generated input model is built from the `schema:` block, which never
+    # folds those in. Declaration only.
+    #
+    # Deliberately a SEPARATE field rather than a widening of
+    # declared_required_fields: that one is SINK-only and fails closed at
+    # construction for every other node type (guard below), because sinks
+    # derive it from output_schema_config while transforms have no such
+    # derivation. Projecting transform input declarations onto it would trip
+    # that invariant at graph construction.
+    declared_input_fields: frozenset[str] = field(default_factory=frozenset)
+
+    # Populated only for AGGREGATION and COLLECTOR nodes by the builder from
+    # BatchTransformProtocol.schema_required_input_fields() — the fields every
+    # BUFFERED row must carry, which validate_batch_inputs enforces before a
+    # batch plugin runs. The batch seam's counterpart of declared_input_fields
+    # above, kept separate because a batch plugin never declares
+    # declared_input_fields (_initialize_declared_input_fields refuses it) and
+    # the transform-only build REFUSAL does not apply to it. Its only consumer
+    # is the declared-input PROOF (schema_validation.compute_declared_input_proof):
+    # the build publishes which of these fields every arriving row provably
+    # carries, so a runtime miss can be classified the same way at both seams
+    # (ADR-013 Amendment 2026-09-27). Empty frozenset for every other node.
+    batch_required_input_fields: frozenset[str] = field(default_factory=frozenset)
+
+    # Populated only for TRANSFORM nodes by the builder from
+    # TransformProtocol.declared_string_input_fields — the fields the transform
+    # requires to be PRESENT and STRING-VALUED on every arriving row, failing
+    # the row closed otherwise (the text-scanning family: Bedrock/Azure
+    # guardrails' `fields`, keyword_filter's named `fields`, document
+    # intelligence's `source_field`). Used for build-time detection of the
+    # provable 100%-fatal shape where a producer's schema declares such a field
+    # as int/float/bool (elspeth-b19dfe41fb). Empty frozenset for all
+    # non-transform nodes.
+    #
+    # Type-side sibling of declared_input_fields above, and NOT derivable from
+    # input_schema/input_schema_config for the same reason: the scan-field
+    # options never fold into the `schema:` block, which the auto-wire
+    # hard-codes to observed-mode anyway. Unlike declared_input_fields this
+    # surface has NO runtime consumer — the plugins enforce the contract in
+    # their own process paths — so it is not scoped by ADR-013's batch
+    # exclusion and batch-aware family members (the Azure pair) declare too.
+    declared_string_input_fields: frozenset[str] = field(default_factory=frozenset)
+
+    # The field-name spelling rule's declaration surface (operator ruling
+    # 2026-09-25, contracts.field_spelling). declared_read_fields: every name the
+    # node DECLARES it reads from an arriving row — populated for the
+    # plugin-bearing consumers TRANSFORM, AGGREGATION, COLLECTOR (from
+    # TransformProtocol.declared_read_fields) and SINK (from
+    # SinkProtocol.declared_read_fields). declared_created_fields: every name a
+    # TRANSFORM declares it writes as a field of its own. Their one consumer is
+    # validate_declared_field_spellings, which refuses a header spelling of a
+    # field a participating upstream carries. Declaration only.
+    #
+    # NOT derivable from the fields above: reads fold the schema's declared
+    # names together with declared_input_fields and schema.required_fields, and
+    # creates fold three plugin declarations (declared_output_fields,
+    # created_output_fields(), self_created_input_fields), because value_transform
+    # keeps declared_output_fields empty while creating every target.
+    declared_read_fields: frozenset[str] = field(default_factory=frozenset)
+    declared_created_fields: frozenset[str] = field(default_factory=frozenset)
+
+    # Pass-through contract flag (ADR-007). Populated only for TRANSFORM nodes
+    # by the builder from TransformProtocol.passes_through_input. When True,
+    # the validator walk propagates predecessor guarantees through this node
+    # when computing effective guaranteed fields. Always False for non-TRANSFORM
+    # nodes; non-False value on any non-TRANSFORM node raises GraphValidationError.
+    passes_through_input: bool = False
+
+    # Field-forwarding declaration (elspeth-15c72686f2).
+    # Populated for TRANSFORM and AGGREGATION nodes by the builder from
+    # TransformProtocol.forwards_input_fields / removed_input_fields. Both the
+    # presence and definite-emits walks propagate predecessor lower bounds
+    # through the named subtraction when the node's output contract allows
+    # extras; a fixed contract is a firewall. This is sound for permission
+    # consumers: every SUCCESS row carries those fields even when the transform
+    # may drop whole rows; it is not a completeness claim.
+    #
+    # Scoped like passes_through_input (TRANSFORM+AGGREGATION) rather than like
+    # declared_output_fields (TRANSFORM-only): batch_outlier_annotator is wired
+    # under `aggregations:` in YAML and is one of the four declarers.
+    forwards_input_fields: bool = False
+    removed_input_fields: frozenset[str] = field(default_factory=frozenset)
+
+    # Value-preservation declaration (elspeth-e6e552ce34). Populated for the
+    # plugin-bearing kinds — TRANSFORM, AGGREGATION, COLLECTOR — by the builder
+    # from TransformProtocol.preserves_input_values. True means process() never
+    # changes the VALUE of a surviving input field (adding NEW fields and the
+    # declared removals are fine) — the promise that lets
+    # resolve_guaranteed_field_type recurse through an undeclaring
+    # pass-through or forwarding node instead of abstaining. Scoped like
+    # passes_through_input rather than like declared_output_fields: the walk's
+    # abstention guard reads it at every pass-through-capable kind
+    # (elspeth-48aeea6ad9 widened it from TRANSFORM-only, where an
+    # AGGREGATION/COLLECTOR pass-through recursed unguarded).
+    preserves_input_values: bool = False
+
+    # Structural observed-cell type (elspeth-e6e552ce34). Populated only for
+    # SOURCE nodes by the builder from SourceProtocol.observed_value_type.
+    # Non-None means: under an OBSERVED schema this source emits every cell as
+    # this SchemaConfig base type by construction (csv: "str" — parsed cells
+    # are never coerced when no fields are declared). Consumed by
+    # resolve_guaranteed_field_type's structural source arm, which answers the
+    # type only for fields in the source's own guaranteed set.
+    observed_value_type: str | None = None
+
+    # The plugin's ADR-050 stamp table (TransformProtocol.output_field_declarations):
+    # every field the runtime stamp rewrites on an emitted row, with its
+    # declared contract and declarer (operator > plugin > any). Populated for
+    # the plugin-bearing kinds — TRANSFORM, AGGREGATION, COLLECTOR — by the
+    # builder, published VERBATIM from the constructed instance, so a
+    # build-time reader of "the type this node's rows carry" reads the table
+    # the runtime stamps from rather than re-deriving it. Its reader is
+    # resolve_guaranteed_field_type's union-merge mode (the union-coalesce
+    # refusal). NOT derivable from output_schema_config: an observed config
+    # carries no fields while the table types every created field, and a
+    # flexible config's name-only placeholders are ``any`` where the plugin
+    # types them. Any later build-time completion of the table (a bind of
+    # upstream-derived types) must republish it here through the builder's
+    # one publishing helper — a reader never sees a table captured earlier.
+    output_field_declarations: Mapping[str, OutputFieldDeclaration] = field(default_factory=dict)
+
+    # The plugin's carried output name -> copied input field map
+    # (TransformProtocol.carried_output_sources): a carried name's value IS the
+    # named input field's value under that field's contract (a field_mapper
+    # flat rename). Same scope and publishing rule as
+    # output_field_declarations; read by resolve_guaranteed_field_type's
+    # carried-rename arm, which follows the type upstream under the source name.
+    carried_output_sources: Mapping[str, str] = field(default_factory=dict)
+
+    # A source's renames, keyed the way the source keys them (normalized
+    # header, or a headerless column as written). Populated only for SOURCE
+    # nodes by the builder from SourceProtocol.field_renames. Consumed by
+    # validate_declared_field_spellings, which resolves a downstream
+    # declaration through the renames of every source whose rows reach it
+    # (field-name spelling rule): under field_mapping {name: b} the
+    # declaration 'Name' names 'b'.
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
+
+    # A transform's identity-carrying renames (source spelling -> new name).
+    # Populated only for TRANSFORM nodes by the builder from
+    # TransformProtocol.renamed_input_fields. Consumed by
+    # upstream_name_resolution, which follows each rename between the sources
+    # and a declaring node (field-name spelling rule): behind field_mapper
+    # {b: c} a spelling of b names c.
+    renamed_input_fields: Mapping[str, str] = field(default_factory=dict)
+
+    # A transform's header-spelled row lookups (literal -> declared field).
+    # Populated only for TRANSFORM nodes by the builder from
+    # TransformProtocol.header_spelled_lookups. Consumed by
+    # validate_spelled_row_lookups_reachable, which refuses a lookup no row
+    # arriving at the node can resolve (a field created fresh upstream).
+    header_spelled_lookups: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "renamed_input_fields", "header_spelled_lookups")
+        component_type = self.node_type.name.lower()
+        component_id = self.node_id or None
+        if not self.node_id:
+            raise GraphValidationError(
+                "NodeInfo.node_id must not be empty",
+                component_id=component_id,
+                component_type=component_type,
+            )
+        if not self.plugin_name or not self.plugin_name.strip():
+            raise GraphValidationError(
+                f"NodeInfo.plugin_name must not be empty for node {self.node_id!r}",
+                component_id=component_id,
+                component_type=component_type,
+            )
+        if len(self.node_id) > _NODE_ID_MAX_LENGTH:
+            msg = f"node_id exceeds {_NODE_ID_MAX_LENGTH} characters: '{self.node_id}' (length={len(self.node_id)})"
+            raise GraphValidationError(msg, component_id=self.node_id, component_type=component_type)
+        # Offensive programming: declared_required_fields is sink-specific.
+        # Catch the misuse at construction time rather than letting stray
+        # data sit on a non-sink node until a future validator widens its
+        # scope and produces mysterious errors.
+        if self.declared_required_fields and self.node_type != NodeType.SINK:
+            raise GraphValidationError(
+                f"NodeInfo.declared_required_fields is only meaningful for SINK nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name} "
+                f"with declared_required_fields={sorted(self.declared_required_fields)!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: declared_output_fields mirrors the
+        # declared_required_fields guard above. It is TRANSFORM-only rather
+        # than TRANSFORM+AGGREGATION (as passes_through_input is) because its
+        # only consumer — validate_transform_output_field_collisions — is
+        # scoped to TRANSFORM nodes, so an aggregation node would carry data
+        # with no reader.
+        #
+        # This boundary is a SCOPE decision, not a claim that aggregations
+        # cannot collide. BatchReplicate — which the passes_through_input
+        # comment below correctly notes is wired under `aggregations:` in YAML
+        # — hand-rolls the identical collision check in its own body
+        # (batch_replicate.py:273-279), as does batch_outlier_annotator. The
+        # reason for not widening is that aggregations are reductive: an
+        # upstream node's guarantees describe the rows entering the batch, not
+        # the row leaving it, so the intersection this check relies on is not
+        # sound there. See validate_transform_output_field_collisions'
+        # docstring for the full argument (elspeth-cfcd333f83).
+        if self.declared_output_fields and self.node_type != NodeType.TRANSFORM:
+            raise GraphValidationError(
+                f"NodeInfo.declared_output_fields is only meaningful for TRANSFORM nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name} "
+                f"with declared_output_fields={sorted(self.declared_output_fields)!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: declared_input_fields mirrors the
+        # declared_output_fields guard above and is TRANSFORM-only for the same
+        # reason — its only consumer, validate_transform_declared_input_fields,
+        # is scoped to TRANSFORM nodes, so any other node type would carry data
+        # with no reader.
+        #
+        # Sinks are not merely out of scope here, they are served by a
+        # different field: SINK input requirements live on
+        # declared_required_fields and are checked by
+        # validate_sink_required_fields. Aggregations are excluded because they
+        # are reductive — the executor's per-row declared-input contract does
+        # not apply to a batch flush the same way — so admitting them would
+        # need its own soundness argument (elspeth-ada5a60249).
+        if self.declared_input_fields and self.node_type != NodeType.TRANSFORM:
+            raise GraphValidationError(
+                f"NodeInfo.declared_input_fields is only meaningful for TRANSFORM nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name} "
+                f"with declared_input_fields={sorted(self.declared_input_fields)!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: the batch seam's presence requirement sits only
+        # on the two node kinds that run a batch plugin (NESTED_CONTRACT_OPTIONS_NODE_TYPES).
+        if self.batch_required_input_fields and self.node_type not in (NodeType.AGGREGATION, NodeType.COLLECTOR):
+            raise GraphValidationError(
+                f"NodeInfo.batch_required_input_fields is only meaningful for AGGREGATION and COLLECTOR nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name} "
+                f"with batch_required_input_fields={sorted(self.batch_required_input_fields)!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: declared_string_input_fields mirrors the
+        # declared_input_fields guard above and is TRANSFORM-only for the same
+        # reason — its only consumer,
+        # validate_transform_string_typed_input_fields, is scoped to TRANSFORM
+        # nodes, so any other node type would carry data with no reader
+        # (elspeth-b19dfe41fb).
+        if self.declared_string_input_fields and self.node_type != NodeType.TRANSFORM:
+            raise GraphValidationError(
+                f"NodeInfo.declared_string_input_fields is only meaningful for TRANSFORM nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name} "
+                f"with declared_string_input_fields={sorted(self.declared_string_input_fields)!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: the spelling rule's surfaces sit only on the node
+        # kinds whose plugin declares them, so a builder bug that projects one
+        # anywhere else surfaces here rather than as data no validator reads.
+        # Created names are TRANSFORM-only for the reason declared_output_fields
+        # is: an aggregation or collector is reductive, so what arrives at it
+        # does not describe what leaves it (elspeth-cfcd333f83).
+        if self.declared_read_fields and self.node_type not in (
+            NodeType.TRANSFORM,
+            NodeType.AGGREGATION,
+            NodeType.COLLECTOR,
+            NodeType.SINK,
+        ):
+            raise GraphValidationError(
+                f"NodeInfo.declared_read_fields is only meaningful for TRANSFORM, AGGREGATION, "
+                f"COLLECTOR or SINK nodes; node {self.node_id!r} has type {self.node_type.name} "
+                f"with declared_read_fields={sorted(self.declared_read_fields)!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        if self.declared_created_fields and self.node_type != NodeType.TRANSFORM:
+            raise GraphValidationError(
+                f"NodeInfo.declared_created_fields is only meaningful for TRANSFORM nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name} "
+                f"with declared_created_fields={sorted(self.declared_created_fields)!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: passes_through_input is for nodes that execute
+        # a TransformProtocol plugin — TRANSFORM, AGGREGATION, and COLLECTOR.
+        # Aggregations (including BatchReplicate wired under `aggregations:` in
+        # YAML) execute transform-class plugins and share the propagation
+        # semantics per ADR-007; a collector reuses that same batch-transform
+        # plugin contract (barrier-scopes spec §3) and shares it too. Setting
+        # it on source/coalesce/sink/gate indicates a builder bug or
+        # misrouted attribute assignment; surface at construction.
+        if self.passes_through_input and self.node_type not in (NodeType.TRANSFORM, NodeType.AGGREGATION, NodeType.COLLECTOR):
+            raise GraphValidationError(
+                f"NodeInfo.passes_through_input is only meaningful for TRANSFORM, "
+                f"AGGREGATION, or COLLECTOR nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: preserves_input_values mirrors the
+        # passes_through_input guard above — it is a promise about plugin
+        # process() behaviour, so it is meaningful exactly on the kinds that
+        # execute a TransformProtocol plugin: TRANSFORM, AGGREGATION,
+        # COLLECTOR. resolve_guaranteed_field_type's abstention guard reads it
+        # at all three (elspeth-e6e552ce34; widened by elspeth-48aeea6ad9).
+        if self.preserves_input_values and self.node_type not in (NodeType.TRANSFORM, NodeType.AGGREGATION, NodeType.COLLECTOR):
+            raise GraphValidationError(
+                f"NodeInfo.preserves_input_values is only meaningful for TRANSFORM, "
+                f"AGGREGATION, or COLLECTOR nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: observed_value_type is the structural
+        # observed-cell type of a SOURCE plugin; any other node type carrying
+        # it indicates misrouted attribute threading (elspeth-e6e552ce34).
+        if self.observed_value_type is not None and self.node_type != NodeType.SOURCE:
+            raise GraphValidationError(
+                f"NodeInfo.observed_value_type is only meaningful for SOURCE nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name} "
+                f"with observed_value_type={self.observed_value_type!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Same threading guard for the source's renames.
+        if self.field_renames.mapping and self.node_type != NodeType.SOURCE:
+            raise GraphValidationError(
+                f"NodeInfo.field_renames is only meaningful for SOURCE nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # And for a transform's renames.
+        if self.renamed_input_fields and self.node_type != NodeType.TRANSFORM:
+            raise GraphValidationError(
+                f"NodeInfo.renamed_input_fields is only meaningful for TRANSFORM nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # And for a transform's header-spelled lookups.
+        if self.header_spelled_lookups and self.node_type != NodeType.TRANSFORM:
+            raise GraphValidationError(
+                f"NodeInfo.header_spelled_lookups is only meaningful for TRANSFORM nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: the forwarding declaration shares
+        # passes_through_input's scope and rationale above — it too describes a
+        # node executing a TransformProtocol plugin. Checking removed_input_fields
+        # independently rather than only behind the flag catches a stray removal
+        # set left on a node that forwards nothing, which would otherwise sit
+        # unread until a future validator widened its scope.
+        if (self.forwards_input_fields or self.removed_input_fields) and self.node_type not in (
+            NodeType.TRANSFORM,
+            NodeType.AGGREGATION,
+            NodeType.COLLECTOR,
+        ):
+            raise GraphValidationError(
+                f"NodeInfo.forwards_input_fields/removed_input_fields are only meaningful for "
+                f"TRANSFORM, AGGREGATION, or COLLECTOR nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # A removal set names fields subtracted from what this node FORWARDS, so
+        # it is meaningless — and silently misleading — without the flag that
+        # turns forwarding on.
+        if self.removed_input_fields and not self.forwards_input_fields:
+            raise GraphValidationError(
+                f"NodeInfo.removed_input_fields on node {self.node_id!r} requires "
+                f"forwards_input_fields=True; got removed_input_fields="
+                f"{sorted(self.removed_input_fields)!r} with the flag unset.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: the stamp table and the carried map describe a
+        # TransformProtocol plugin's emissions, so they sit only on the kinds
+        # that execute one (passes_through_input's scope and rationale).
+        if (self.output_field_declarations or self.carried_output_sources) and self.node_type not in (
+            NodeType.TRANSFORM,
+            NodeType.AGGREGATION,
+            NodeType.COLLECTOR,
+        ):
+            raise GraphValidationError(
+                f"NodeInfo.output_field_declarations/carried_output_sources are only meaningful for "
+                f"TRANSFORM, AGGREGATION, or COLLECTOR nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        freeze_fields(self, "output_field_declarations", "carried_output_sources")
+        # NOTE: config is NOT frozen here because graph construction replaces
+        # NodeInfo payloads during schema propagation and final config freezing.
+        # Deep freeze is applied by build_execution_graph() after construction.
+
+
+@dataclass(frozen=True, slots=True)
+class _GateEntry:
+    """Internal gate metadata for coalesce and routing wiring."""
+
+    node_id: NodeID
+    name: str
+    fork_to: tuple[str, ...] | None
+    routes: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        if not self.node_id:
+            raise ValueError("_GateEntry.node_id must not be empty")
+        if not self.name:
+            raise ValueError("_GateEntry.name must not be empty")
+        if self.fork_to is not None and len(self.fork_to) == 0:
+            raise ValueError("_GateEntry.fork_to must not be empty tuple (use None for no fork)")
+        if len(self.routes) == 0:
+            raise ValueError("_GateEntry.routes must have at least one entry")
+        freeze_fields(self, "routes")
+
+
+def _suggest_similar(name: str, candidates: list[str]) -> list[str]:
+    """Suggest similar names for wiring validation errors."""
+    import difflib
+
+    return difflib.get_close_matches(name, candidates, n=3, cutoff=0.6)

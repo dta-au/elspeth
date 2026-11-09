@@ -1,0 +1,81 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 6 items
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py F [ 16%]
+.....                                                                    [100%]
+
+=================================== FAILURES ===================================
+_ test_auto_equal_shaped_candidate_with_profile_objection_retains_validation_precedence _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-148/test_auto_equal_shaped_candida0')
+
+    @pytest.mark.asyncio
+    async def test_auto_equal_shaped_candidate_with_profile_objection_retains_validation_precedence(tmp_path: Path) -> None:
+        harness = _harness(tmp_path)
+        await harness.sessions.update_composer_preferences(
+            UUID(harness.session_id),
+            trust_mode="auto_commit",
+            density_default="high",
+            actor="user:proposal-prevalidation-user",
+        )
+        arguments = _valid_pipeline_args(tmp_path, metadata_name="final-profile-reject")
+        state = CompositionState.from_dict(
+            {
+                **arguments,
+                "version": 7,
+                "metadata": {"description": "", **arguments["metadata"]},
+                "outputs": [{"name": output["sink_name"], **output} for output in arguments["outputs"]],
+            }
+        )
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.catalog)
+        catalog = _FinalRejectingCatalog.for_trained_operator(harness.catalog, snapshot)
+        llm = _ScriptedLLM(
+            _tool_turn("call_profile_equal", "set_pipeline", arguments), _fake_llm_response(content="Current policy still objects.")
+        )
+        with (
+            patch.object(harness.service._policy_context, "build", return_value=(snapshot, catalog)),
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as executor,
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Keep this pipeline.",
+                [],
+                state,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                user_message_id=harness.user_message_id,
+            )
+>       executor.assert_called_once()
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1790: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <MagicMock name='execute_tool' id='140554367253296'>
+
+    def assert_called_once(self):
+        """assert that the mock was called only once.
+        """
+        if not self.call_count == 1:
+            msg = ("Expected '%s' to have been called once. Called %s times.%s"
+                   % (self._mock_name or 'mock',
+                      self.call_count,
+                      self._calls_repr()))
+>           raise AssertionError(msg)
+E           AssertionError: Expected 'execute_tool' to have been called once. Called 0 times.
+
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/unittest/mock.py:928: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 14:10:30 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 14:10:32 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 14:10:32 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 14:10:32 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+=========================== short test summary info ============================
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_auto_equal_shaped_candidate_with_profile_objection_retains_validation_precedence
+========================= 1 failed, 5 passed in 7.34s ==========================

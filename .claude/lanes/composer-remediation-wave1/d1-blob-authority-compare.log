@@ -1,0 +1,6 @@
+repository old 80 new 80 equal_except_line True seconds 1.91
+service_and_composer old 25 new 25 equal_except_line True seconds 2.46
+service old 22 new 22 equal_except_line True seconds 2.15
+proposal_receipts old 90 new 90 equal_except_line True seconds 2.61
+other_changed_production old 0 new 0 equal_except_line True seconds 6.79
+observed_sources_frozen 13 True

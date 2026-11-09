@@ -1,0 +1,184 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 4 items
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py FFFF [100%]
+
+=================================== FAILURES ===================================
+______ test_equal_candidate_only_rejects_after_recovery_integrity[fresh] _______
+
+proposal = _Proposal(service=<elspeth.web.sessions.service.SessionServiceImpl object at 0x7f71f1ba0ec0>, engine=Engine(sqlite:///...1ad29834575f5d94b228c0a4eb88468b4'), root=PosixPath('/tmp/pytest-of-agent/pytest-131/test_equal_candidate_only_reje0'))
+recovery = 'fresh'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("recovery", ["fresh", "matching", "mismatch", "missing_pair"])
+    async def test_equal_candidate_only_rejects_after_recovery_integrity(proposal: _Proposal, recovery: str) -> None:
+        operations = proposal.service.session_operation_authority
+        context = operations.acquire(
+            session_id=proposal.authority.row.session_id,
+            operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=proposal.service.session_operation_owner_instance_id,
+            lease_seconds=300,
+        )
+        try:
+            prepared = await _prepare(proposal, context)
+            current = replace(prepared.result.updated_state, version=19)
+            recorder = BufferingRecorder()
+            binding = prepared.dispatch if recovery != "fresh" else None
+            executor_hash = prepared.executor_content_hash if recovery == "matching" else "0" * 64 if recovery == "mismatch" else None
+            expected_error = AuditIntegrityError if recovery == "missing_pair" else PipelineCommitError
+>           with pytest.raises(expected_error) as caught:
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           Failed: DID NOT RAISE <class 'elspeth.web.composer.pipeline_commit.PipelineCommitError'>
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:222: Failed
+_____ test_equal_candidate_only_rejects_after_recovery_integrity[matching] _____
+
+proposal = _Proposal(service=<elspeth.web.sessions.service.SessionServiceImpl object at 0x7f71f09572c0>, engine=Engine(sqlite:///...1ad29834575f5d94b228c0a4eb88468b4'), root=PosixPath('/tmp/pytest-of-agent/pytest-131/test_equal_candidate_only_reje1'))
+recovery = 'matching'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("recovery", ["fresh", "matching", "mismatch", "missing_pair"])
+    async def test_equal_candidate_only_rejects_after_recovery_integrity(proposal: _Proposal, recovery: str) -> None:
+        operations = proposal.service.session_operation_authority
+        context = operations.acquire(
+            session_id=proposal.authority.row.session_id,
+            operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=proposal.service.session_operation_owner_instance_id,
+            lease_seconds=300,
+        )
+        try:
+            prepared = await _prepare(proposal, context)
+            current = replace(prepared.result.updated_state, version=19)
+            recorder = BufferingRecorder()
+            binding = prepared.dispatch if recovery != "fresh" else None
+            executor_hash = prepared.executor_content_hash if recovery == "matching" else "0" * 64 if recovery == "mismatch" else None
+            expected_error = AuditIntegrityError if recovery == "missing_pair" else PipelineCommitError
+            with pytest.raises(expected_error) as caught:
+>               await _prepare(proposal, context, recorder=recorder, current_state=current,
+                               recovery_dispatch=binding, recovery_executor_content_hash=executor_hash)
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:223: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+proposal = _Proposal(service=<elspeth.web.sessions.service.SessionServiceImpl object at 0x7f71f09572c0>, engine=Engine(sqlite:///...1ad29834575f5d94b228c0a4eb88468b4'), root=PosixPath('/tmp/pytest-of-agent/pytest-131/test_equal_candidate_only_reje1'))
+context = SessionOperationContext(fence=SessionOperationFence(session_id='a848118d-73e3-4de7-be35-ba015002b431', operation_id='4...mofdErNZ7tZuv5-d400uhJlSM9O-eB3rqUuTg', operation_epoch=4), operation_kind=<SessionOperationKind.PROPOSAL: 'proposal'>)
+
+    async def _prepare(
+        proposal: _Proposal,
+        context: SessionOperationContext,
+        *,
+        recorder: BufferingRecorder | None = None,
+        current_state: CompositionState | None = None,
+        recovery_dispatch: pipeline_commit.PipelineDispatchAuditBinding | None = None,
+        recovery_executor_content_hash: str | None = None,
+    ) -> PreparedPipelineCommit:
+        result = await prepare_pipeline_proposal_commit(
+            authority=proposal.authority,
+            current_state=current_state if current_state is not None else CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+            current_state_id=None,
+            policy_catalog=proposal.policy,
+            plugin_snapshot=proposal.snapshot,
+            config=PipelineCommitConfig(
+                data_dir=str(proposal.root),
+                session_engine=proposal.engine,
+                session_operation_context=context,
+                session_operation_authority=proposal.service.session_operation_authority,
+                secret_service=None,
+                user_id="alice",
+                user_message_content=None,
+                max_blob_storage_per_session_bytes=1_000_000,
+                runtime_preflight=None,
+                timeout_seconds=5.0,
+            ),
+            recorder=recorder if recorder is not None else BufferingRecorder(),
+            actor="user:alice",
+            recovery_dispatch=recovery_dispatch,
+            recovery_executor_content_hash=recovery_executor_content_hash,
+        )
+>       assert isinstance(result, PreparedPipelineCommit)
+E       AssertionError: assert False
+E        +  where False = isinstance(RecoveredPipelineCommit(result=ToolResult(success=True, updated_state=CompositionState(nodes=(), edges=(), outputs=(Ou...602595f001f79eff4e86cc8506d1ab4256b8', result_hash='943d1754c6645f2e41133572e978aca4e87acf62ff877160891dcaa8b36f8216')), PreparedPipelineCommit)
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:201: AssertionError
+_____ test_equal_candidate_only_rejects_after_recovery_integrity[mismatch] _____
+
+proposal = _Proposal(service=<elspeth.web.sessions.service.SessionServiceImpl object at 0x7f71f0667650>, engine=Engine(sqlite:///...1ad29834575f5d94b228c0a4eb88468b4'), root=PosixPath('/tmp/pytest-of-agent/pytest-131/test_equal_candidate_only_reje2'))
+recovery = 'mismatch'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("recovery", ["fresh", "matching", "mismatch", "missing_pair"])
+    async def test_equal_candidate_only_rejects_after_recovery_integrity(proposal: _Proposal, recovery: str) -> None:
+        operations = proposal.service.session_operation_authority
+        context = operations.acquire(
+            session_id=proposal.authority.row.session_id,
+            operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=proposal.service.session_operation_owner_instance_id,
+            lease_seconds=300,
+        )
+        try:
+            prepared = await _prepare(proposal, context)
+            current = replace(prepared.result.updated_state, version=19)
+            recorder = BufferingRecorder()
+            binding = prepared.dispatch if recovery != "fresh" else None
+            executor_hash = prepared.executor_content_hash if recovery == "matching" else "0" * 64 if recovery == "mismatch" else None
+            expected_error = AuditIntegrityError if recovery == "missing_pair" else PipelineCommitError
+            with pytest.raises(expected_error) as caught:
+                await _prepare(proposal, context, recorder=recorder, current_state=current,
+                               recovery_dispatch=binding, recovery_executor_content_hash=executor_hash)
+            if isinstance(caught.value, PipelineCommitError):
+                assert caught.value.code == ("CANDIDATE_EXECUTOR_MISMATCH" if recovery == "mismatch" else "NO_CHANGE")
+                assert caught.value.dispatch is binding
+                assert caught.value.invocation is None
+>           assert recorder.invocations == []
+E           assert () == []
+E             
+E             Use -v to get more diff
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:229: AssertionError
+___ test_equal_candidate_only_rejects_after_recovery_integrity[missing_pair] ___
+
+proposal = _Proposal(service=<elspeth.web.sessions.service.SessionServiceImpl object at 0x7f71f1a1dac0>, engine=Engine(sqlite:///...1ad29834575f5d94b228c0a4eb88468b4'), root=PosixPath('/tmp/pytest-of-agent/pytest-131/test_equal_candidate_only_reje3'))
+recovery = 'missing_pair'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("recovery", ["fresh", "matching", "mismatch", "missing_pair"])
+    async def test_equal_candidate_only_rejects_after_recovery_integrity(proposal: _Proposal, recovery: str) -> None:
+        operations = proposal.service.session_operation_authority
+        context = operations.acquire(
+            session_id=proposal.authority.row.session_id,
+            operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=proposal.service.session_operation_owner_instance_id,
+            lease_seconds=300,
+        )
+        try:
+            prepared = await _prepare(proposal, context)
+            current = replace(prepared.result.updated_state, version=19)
+            recorder = BufferingRecorder()
+            binding = prepared.dispatch if recovery != "fresh" else None
+            executor_hash = prepared.executor_content_hash if recovery == "matching" else "0" * 64 if recovery == "mismatch" else None
+            expected_error = AuditIntegrityError if recovery == "missing_pair" else PipelineCommitError
+            with pytest.raises(expected_error) as caught:
+                await _prepare(proposal, context, recorder=recorder, current_state=current,
+                               recovery_dispatch=binding, recovery_executor_content_hash=executor_hash)
+            if isinstance(caught.value, PipelineCommitError):
+                assert caught.value.code == ("CANDIDATE_EXECUTOR_MISMATCH" if recovery == "mismatch" else "NO_CHANGE")
+                assert caught.value.dispatch is binding
+                assert caught.value.invocation is None
+>           assert recorder.invocations == []
+E           assert () == []
+E             
+E             Use -v to get more diff
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:229: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_pipeline_commit_operation_authority.py::test_equal_candidate_only_rejects_after_recovery_integrity[fresh]
+FAILED tests/unit/web/composer/test_pipeline_commit_operation_authority.py::test_equal_candidate_only_rejects_after_recovery_integrity[matching]
+FAILED tests/unit/web/composer/test_pipeline_commit_operation_authority.py::test_equal_candidate_only_rejects_after_recovery_integrity[mismatch]
+FAILED tests/unit/web/composer/test_pipeline_commit_operation_authority.py::test_equal_candidate_only_rejects_after_recovery_integrity[missing_pair]
+============================== 4 failed in 3.48s ===============================

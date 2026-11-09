@@ -1,0 +1,18 @@
+{
+  "baseline": 5220,
+  "final": 5220,
+  "added": [
+    [
+      "config/cicd/enforce_tier_model/web.yaml",
+      "trust_tier.tier_model",
+      "Tier-model per-file rule exceeded max_hits: web/composer/tool_batch.py matched 10/5"
+    ]
+  ],
+  "removed": [
+    [
+      "config/cicd/enforce_tier_model/web.yaml",
+      "trust_tier.tier_model",
+      "Tier-model per-file rule exceeded max_hits: web/composer/tool_batch.py matched 9/5"
+    ]
+  ]
+}

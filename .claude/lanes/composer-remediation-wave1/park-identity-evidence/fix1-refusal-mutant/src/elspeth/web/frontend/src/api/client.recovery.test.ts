@@ -1,0 +1,369 @@
+/**
+ * Recovery-specific API-client contract tests.
+ *
+ * These exercise the real client functions over a fetch spy so parseResponse
+ * and auth/query construction stay covered together.
+ */
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { fetchRecoveryTranscript, isDefinitiveComposerRefusal, parseResponse, submitComposerOperation } from "./client";
+import type { ApiError, CompositionState } from "@/types/api";
+import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+
+function makePartialState(): CompositionState {
+  return {
+    id: "state-1",
+    ...compositionStateAuthorityFields,
+    version: 7,
+    sources: {},
+    nodes: [],
+    edges: [],
+    outputs: [],
+    metadata: { name: "Recovered", description: null },
+  };
+}
+
+describe("api/client recovery contracts", () => {
+  const clientRequestId = "a1914bf9-9b4f-45b9-bdad-316a628362a5";
+  let fetchSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    fetchSpy = vi.spyOn(globalThis, "fetch");
+  });
+
+  afterEach(() => {
+    fetchSpy.mockRestore();
+  });
+
+  it.each(["rate_limited", "composer_queue_full"])("surfaces structured %s admission refusal with its retry delay", async (errorType) => {
+    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ detail: {
+      error_type: errorType, detail: "Retry later.", retry_after: 60,
+    } }), { status: 429, headers: { "Retry-After": "60" } }));
+    const error: unknown = await submitComposerOperation({
+      mode: "submitted", scope: { principalId: "alice", authProvider: "local" },
+      sessionId: "session-1", operationId: clientRequestId, kind: "compose_message", createdAt: Date.now(),
+      body: { operation_id: clientRequestId, content: "hello", state_id: null },
+    }).catch((failure: unknown) => failure);
+    expect(error).toMatchObject({ status: 429, error_type: errorType, retry_after: 60 });
+    expect(isDefinitiveComposerRefusal(error)).toBe(true);
+  });
+
+  it.each([{ status: 429 }, { status: 429, error_type: "gateway_overloaded" }, { status: 408 }, { status: 503, error_type: "rate_limited" }])("preserves uncertain custody for %j", (error) => {
+    expect(isDefinitiveComposerRefusal(error)).toBe(false);
+  });
+
+  it("sends immutable operation identity and parses a canonical active-operation refusal", async () => {
+    const activeId = "9c86f912-eaef-4873-8a53-575844ae5e66";
+    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ detail: {
+      error_type: "composer_operation_active", detail: "A composer operation is active",
+      operation_id: activeId, kind: "compose_message",
+    } }), { status: 409 }));
+    await expect(submitComposerOperation({
+      mode: "submitted", scope: { principalId: "alice", authProvider: "local" },
+      sessionId: "session-1", operationId: clientRequestId, kind: "compose_message", createdAt: Date.now(),
+      body: { operation_id: clientRequestId, content: "hello", state_id: null },
+    })).rejects.toMatchObject({ status: 409, error_type: "composer_operation_active", operation_id: activeId, kind: "compose_message" });
+    const request = fetchSpy.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(request.body as string)).toEqual({ content: "hello", operation_id: clientRequestId, state_id: null });
+  });
+
+  it("binds recompose admission to the expected last conversational user and state", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ operation_id: clientRequestId, kind: "compose_recompose", status: "queued", poll_after_ms: 1000 }), { status: 202 }));
+    await submitComposerOperation({
+      mode: "submitted", scope: { principalId: "alice", authProvider: "local" },
+      sessionId: "session-1", operationId: clientRequestId, kind: "compose_recompose", createdAt: Date.now(),
+      body: { operation_id: clientRequestId, expected_user_message_id: "canonical-user", state_id: null },
+    });
+    const request = fetchSpy.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(request.body as string)).toEqual({ operation_id: clientRequestId, expected_user_message_id: "canonical-user", state_id: null });
+  });
+
+  it("preserves static Composer retry guidance from a nested provider error", async () => {
+    const response = {
+      ok: false,
+      status: 502,
+      statusText: "Bad Gateway",
+      json: async () => ({
+        detail: {
+          error_type: "llm_unavailable",
+          detail: "BadGatewayError",
+          guidance: "Retry later; ask an administrator to investigate if this continues.",
+        },
+      }),
+    } as Response;
+    await expect(parseResponse(response)).rejects.toMatchObject({
+      error_type: "llm_unavailable",
+      detail: "BadGatewayError",
+      guidance: "Retry later; ask an administrator to investigate if this continues.",
+    });
+  });
+
+  it.each([
+    ["absent", undefined],
+    ["nonconforming", {}],
+  ])("omits snapshot metadata when response headers are %s", async (_label, headers) => {
+    const response = {
+      ok: false,
+      status: 500,
+      statusText: "Internal Server Error",
+      json: async () => ({ detail: "compose failed" }),
+      ...(headers === undefined ? {} : { headers }),
+    } as unknown as Response;
+
+    let error: ApiError | undefined;
+    try {
+      await parseResponse(response);
+    } catch (err) {
+      error = err as ApiError;
+    }
+
+    expect(error).toMatchObject({
+      status: 500,
+      detail: "compose failed",
+      snapshot_fingerprint: undefined,
+    });
+  });
+
+  it("preserves top-level composer recovery fields on ApiError", async () => {
+    const partialState = makePartialState();
+    fetchSpy.mockResolvedValue({
+      ok: false,
+      status: 500,
+      statusText: "Internal Server Error",
+      json: async () => ({
+        detail: "compose failed",
+        error_type: "composer_plugin_crash",
+        partial_state: partialState,
+        failed_turn: {
+          assistant_message_id: "assistant-1",
+          tool_calls_attempted: 3,
+          tool_responses_persisted: 2,
+          transcript_url: "/future/transcript",
+        },
+        partial_state_save_failed: false,
+        partial_state_save_error: null,
+      }),
+    } as Response);
+
+    let error: ApiError | undefined;
+    try {
+      await parseResponse(await globalThis.fetch("/controlled-terminal-error"));
+    } catch (err) {
+      error = err as ApiError;
+    }
+
+    expect(error).toMatchObject({
+      status: 500,
+      detail: "compose failed",
+      error_type: "composer_plugin_crash",
+      partial_state: partialState,
+      failed_turn: {
+        assistant_message_id: "assistant-1",
+        tool_calls_attempted: 3,
+        tool_responses_persisted: 2,
+        transcript_url: "/future/transcript",
+      },
+      partial_state_save_failed: false,
+      partial_state_save_error: null,
+    });
+  });
+
+  it("preserves nested FastAPI recovery fields including null transcript_url", async () => {
+    const partialState = makePartialState();
+    fetchSpy.mockResolvedValue({
+      ok: false,
+      status: 422,
+      statusText: "Unprocessable Entity",
+      json: async () => ({
+        detail: {
+          detail: "compose failed after tool call",
+          error_type: "composer_convergence",
+          partial_state: partialState,
+          failed_turn: {
+            assistant_message_id: "assistant-2",
+            tool_calls_attempted: 1,
+            tool_responses_persisted: 1,
+            transcript_url: null,
+          },
+          partial_state_save_failed: true,
+          partial_state_save_error: "audit unavailable",
+        },
+      }),
+    } as Response);
+
+    let error: ApiError | undefined;
+    try {
+      await parseResponse(await globalThis.fetch("/controlled-terminal-error"));
+    } catch (err) {
+      error = err as ApiError;
+    }
+
+    expect(error).toMatchObject({
+      status: 422,
+      detail: "compose failed after tool call",
+      error_type: "composer_convergence",
+      partial_state: partialState,
+      failed_turn: {
+        assistant_message_id: "assistant-2",
+        tool_calls_attempted: 1,
+        tool_responses_persisted: 1,
+        transcript_url: null,
+      },
+      partial_state_save_failed: true,
+      partial_state_save_error: "audit unavailable",
+    });
+  });
+
+  it("preserves the convergence taxonomy and elapsed budget from a timeout 422 (R2-F9)", async () => {
+    const partialState = makePartialState();
+    fetchSpy.mockResolvedValue({
+      ok: false,
+      status: 422,
+      statusText: "Unprocessable Entity",
+      json: async () => ({
+        detail: {
+          detail: "Composer did not converge within 6 turns (budget exhausted: timeout).",
+          error_type: "convergence",
+          reason: "convergence_wall_clock_timeout",
+          recovery_text: "Retry once the provider responds faster.",
+          timeout_seconds: 240,
+          turns_used: 6,
+          partial_state: partialState,
+          failed_turn: {
+            assistant_message_id: "assistant-9",
+            tool_calls_attempted: 3,
+            tool_responses_persisted: 3,
+            transcript_url: null,
+          },
+        },
+      }),
+    } as Response);
+
+    let error: ApiError | undefined;
+    try {
+      await parseResponse(await globalThis.fetch("/controlled-terminal-error"));
+    } catch (err) {
+      error = err as ApiError;
+    }
+
+    // Without these three the SPA cannot tell a timeout from a turn-budget
+    // exhaustion, and cannot name the budget that actually elapsed.
+    expect(error).toMatchObject({
+      status: 422,
+      error_type: "convergence",
+      reason: "convergence_wall_clock_timeout",
+      recovery_text: "Retry once the provider responds faster.",
+      timeout_seconds: 240,
+      partial_state: partialState,
+    });
+  });
+
+  it("drops a non-numeric timeout_seconds rather than rendering it", async () => {
+    fetchSpy.mockResolvedValue({
+      ok: false,
+      status: 422,
+      statusText: "Unprocessable Entity",
+      json: async () => ({
+        detail: {
+          detail: "timed out",
+          error_type: "convergence",
+          reason: "convergence_wall_clock_timeout",
+          timeout_seconds: "two hundred forty",
+        },
+      }),
+    } as Response);
+
+    let error: ApiError | undefined;
+    try {
+      await parseResponse(await globalThis.fetch("/controlled-terminal-error"));
+    } catch (err) {
+      error = err as ApiError;
+    }
+
+    expect(error?.reason).toBe("convergence_wall_clock_timeout");
+    expect(error?.timeout_seconds).toBeUndefined();
+  });
+
+  it("keeps existing provider validation and fanout error parsing", async () => {
+    const validationErrors = [
+      { component: "source", message: "missing path", severity: "error" },
+    ];
+    const fanoutGuard = {
+      token: "fanout-token",
+      provider: "openrouter",
+      model: "model-1",
+      row_count: 10,
+      estimated_provider_calls: null,
+      provider_calls_per_row: 2,
+      upstream_fanout: ["transform:explode"],
+    };
+    fetchSpy.mockResolvedValue({
+      ok: false,
+      status: 428,
+      statusText: "Precondition Required",
+      json: async () => ({
+        detail: {
+          detail: "fanout acknowledgement required",
+          error_type: "execution_fanout_ack_required",
+          provider_detail: "provider says no",
+          provider_status_code: 429,
+          validation_errors: validationErrors,
+          fanout_guard: fanoutGuard,
+        },
+      }),
+    } as Response);
+
+    let error: ApiError | undefined;
+    try {
+      await parseResponse(await globalThis.fetch("/controlled-terminal-error"));
+    } catch (err) {
+      error = err as ApiError;
+    }
+
+    expect(error).toMatchObject({
+      status: 428,
+      detail: "fanout acknowledgement required",
+      error_type: "execution_fanout_ack_required",
+      provider_detail: "provider says no",
+      provider_status_code: 429,
+      validation_errors: validationErrors,
+      fanout_guard: fanoutGuard,
+    });
+    expect(error?.partial_state).toBeUndefined();
+    expect(error?.failed_turn).toBeUndefined();
+  });
+
+  it("fetches recovery transcript from active session with tool rows and no raw content", async () => {
+    const rows = [
+      {
+        id: "assistant-1",
+        session_id: "session-4",
+        role: "assistant",
+        content: "working",
+        raw_content: null,
+        tool_calls: [],
+        created_at: "2026-05-14T00:00:00Z",
+        composition_state_id: null,
+        tool_call_id: null,
+        parent_assistant_id: null,
+        sequence_no: 1,
+      },
+    ];
+    fetchSpy.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => rows,
+    } as Response);
+
+    const result = await fetchRecoveryTranscript("session-4");
+
+    expect(result).toEqual(rows);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [url] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(
+      "/api/sessions/session-4/messages?include_tool_rows=true&limit=500&offset=0",
+    );
+    expect(url).not.toContain("since=");
+    expect(url).not.toContain("include_raw_content");
+  });
+});

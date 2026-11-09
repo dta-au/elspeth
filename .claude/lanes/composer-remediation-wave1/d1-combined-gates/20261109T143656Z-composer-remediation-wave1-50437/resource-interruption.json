@@ -1,0 +1,46 @@
+{
+  "reason": "Restart default12-worker run under measured4-CPU/16GiB limit after worker loss and memory pressure",
+  "processes": [
+    {
+      "pid": 50670,
+      "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-wave1",
+      "ppid": 1,
+      "args": [
+        "bash",
+        "/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/scripts/full-suite-gate.sh",
+        "--execute",
+        "--stages",
+        "ruff,mypy,contracts,lints,pytest,testcontainer",
+        "--root",
+        "/workspace/elspeth/.claude/worktrees/composer-remediation-wave1",
+        "--log-dir",
+        "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-combined-gates",
+        "--run-dir",
+        "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-combined-gates/20261109T143656Z-composer-remediation-wave1-50437",
+        "--workers",
+        "12"
+      ]
+    },
+    {
+      "pid": 52915,
+      "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-wave1",
+      "ppid": 50670,
+      "args": [
+        "/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/python",
+        "-m",
+        "pytest",
+        "tests/",
+        "-n",
+        "12",
+        "-o",
+        "pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src",
+        "-v",
+        "--junitxml=/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-combined-gates/20261109T143656Z-composer-remediation-wave1-50437/pytest-junit.xml"
+      ]
+    }
+  ],
+  "cpu_max": "400000 100000\n",
+  "memory_max": "17179869184\n",
+  "memory_current": "17172881408\n",
+  "memory_events": "low 0\nhigh 0\nmax 36112\noom 25\noom_kill 4\noom_group_kill 0\n"
+}

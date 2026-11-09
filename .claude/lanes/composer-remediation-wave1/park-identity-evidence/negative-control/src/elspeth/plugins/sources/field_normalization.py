@@ -1,0 +1,595 @@
+"""Field name normalization for external data sources.
+
+This module normalizes messy external headers (e.g., "CaSE Study1 !!!! xx!")
+to valid Python identifiers (e.g., "case_study1_xx") at the source boundary.
+
+Per ELSPETH's Three-Tier Trust Model, this is Tier 3 (external data) handling:
+- Sources ARE allowed to normalize/coerce external data
+- Transforms expect normalized names (no coercion downstream)
+
+Algorithm Stability:
+    The normalization algorithm is versioned and frozen per major version.
+    NORMALIZATION_ALGORITHM_VERSION is stored in the audit trail to enable
+    debugging cross-run field name drift when algorithm evolves. The algorithm
+    and its version live in ``elspeth.contracts.field_spelling``, beside the
+    field-name spelling rule that every downstream declaration surface applies
+    with it; this module is the source boundary's Tier-3 use of it.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from types import MappingProxyType
+
+from elspeth.contracts.field_spelling import (
+    NORMALIZATION_ALGORITHM_VERSION,
+    header_normalization_remedy,
+    header_spelling_canonical,
+    normalized_field_name_or_empty,
+)
+
+
+class ExternalHeaderError(ValueError):
+    """Raised when EXTERNAL header data (Tier 3) cannot be resolved to valid,
+    collision-free field names.
+
+    This is distinct from configuration errors (a bad ``field_mapping`` key or a
+    non-identifier mapping value) which are Tier-1 faults in code/config we own
+    and MUST crash the run. ExternalHeaderError marks failures *caused by the
+    external source's own header bytes* — empty headers, headers that collide
+    after normalization, duplicate raw headers — which a source catches at the
+    header boundary to record + quarantine/discard per ``on_validation_failure``,
+    exactly as it does for a malformed data row.
+
+    Subclasses ``ValueError`` so existing broad ``except ValueError`` callers keep
+    working; sources catch ``ExternalHeaderError`` *specifically* so config
+    ``ValueError``s still propagate and crash.
+    """
+
+
+class FieldMappingCollisionError(ValueError):
+    """Raised when field_mapping creates duplicate final field names.
+
+    The source boundary decides whether this is an owned config fault for fixed
+    headers, or a row-level external-data fault for sparse JSON-like records.
+    """
+
+
+def normalize_field_name(raw: str) -> str:
+    """Normalize messy header to valid Python identifier.
+
+    Rules applied in order:
+    1. Unicode NFC normalization (canonical composition)
+    2. Strip leading/trailing whitespace
+    3. Lowercase
+    4. Replace non-identifier chars with underscore
+    5. Collapse consecutive underscores
+    6. Strip leading/trailing underscores
+    7. Prefix with underscore if starts with digit
+    8. Append underscore if result is Python keyword
+    9. Raise error if result is empty
+
+    Args:
+        raw: Original messy header name
+
+    Returns:
+        Valid Python identifier
+
+    Raises:
+        ExternalHeaderError: If header normalizes to empty string.
+        ValueError: If the normalization algorithm produces an invalid identifier.
+    """
+    normalized = normalized_field_name_or_empty(raw)
+
+    # Step 9: Validate non-empty result
+    # Tier 3: an external header that normalizes away to nothing is bad source data.
+    if not normalized:
+        raise ExternalHeaderError(f"Header '{raw}' normalizes to empty string")
+
+    return normalized
+
+
+def is_normalized_field_name(name: str) -> bool:
+    """Return whether ``name`` is a normalization fixed point.
+
+    A fixed point names a row key construction-time contract math can state.
+    A non-fixed-point may instead be an original-header spelling whose actual
+    row key is known only from runtime lineage, so callers must abstain rather
+    than use the literal as a removal name. Headers that normalize to nothing
+    cannot name a row key and return ``False``.
+    """
+    try:
+        return normalize_field_name(name) == name
+    except ExternalHeaderError:
+        return False
+
+
+def check_normalization_collisions(raw_headers: list[str], normalized_headers: list[str]) -> None:
+    """Check for collisions after normalization.
+
+    Args:
+        raw_headers: Original header names
+        normalized_headers: Normalized header names (same order)
+
+    Raises:
+        ValueError: If multiple raw headers normalize to same value,
+                   with ALL colliding headers and their positions listed
+    """
+    seen: dict[str, list[tuple[int, str]]] = {}
+
+    for i, (raw, norm) in enumerate(zip(raw_headers, normalized_headers, strict=True)):
+        seen.setdefault(norm, []).append((i, raw))
+
+    collisions = {norm: sources for norm, sources in seen.items() if len(sources) > 1}
+
+    if collisions:
+        details = []
+        for norm, sources in sorted(collisions.items()):
+            source_desc = ", ".join(f"column {i} ('{raw}')" for i, raw in sources)
+            details.append(f"  '{norm}' <- {source_desc}")
+
+        raise ExternalHeaderError("Field name collision after normalization:\n" + "\n".join(details))
+
+
+def check_mapping_collisions(
+    pre_mapping: list[str],
+    post_mapping: list[str],
+    field_mapping: dict[str, str],
+) -> None:
+    """Check for collisions created by field_mapping.
+
+    Args:
+        pre_mapping: Headers before mapping applied
+        post_mapping: Headers after mapping applied
+        field_mapping: The mapping that was applied
+
+    Raises:
+        FieldMappingCollisionError: If mapping causes multiple fields to have
+            same final name.
+    """
+    if len(post_mapping) != len(set(post_mapping)):
+        # Build mapping from target to all sources (both mapped and passthrough)
+        target_to_sources: dict[str, list[str]] = {}
+        for source, target in zip(pre_mapping, post_mapping, strict=True):
+            target_to_sources.setdefault(target, []).append(source)
+
+        collisions = {t: s for t, s in target_to_sources.items() if len(s) > 1}
+
+        if collisions:
+            details = [f"  '{target}' <- {', '.join(repr(s) for s in sources)}" for target, sources in sorted(collisions.items())]
+            raise FieldMappingCollisionError("field_mapping creates collision:\n" + "\n".join(details))
+
+
+def check_duplicate_raw_headers(raw_headers: list[str]) -> None:
+    """Reject duplicate raw headers before passthrough mapping.
+
+    Duplicate names are ambiguous for both audit mapping and row dict construction:
+    dict(zip(...)) would silently overwrite earlier columns.
+
+    Args:
+        raw_headers: Original header names from source input.
+
+    Raises:
+        ValueError: If duplicate raw headers are present, with all duplicate
+            names and column positions listed.
+    """
+    positions_by_name: dict[str, list[int]] = {}
+    for index, header in enumerate(raw_headers):
+        if header in positions_by_name:
+            positions_by_name[header].append(index)
+        else:
+            positions_by_name[header] = [index]
+
+    duplicates = {header: positions for header, positions in positions_by_name.items() if len(positions) > 1}
+    if duplicates:
+        details = []
+        for header, positions in sorted(duplicates.items()):
+            source_desc = ", ".join(f"column {index} ('{raw_headers[index]}')" for index in positions)
+            details.append(f"  '{header}' <- {source_desc}")
+        raise ExternalHeaderError("Duplicate raw header names:\n" + "\n".join(details))
+
+
+@dataclass(frozen=True, slots=True)
+class FieldResolution:
+    """Result of field name resolution.
+
+    Attributes:
+        final_headers: List of final field names to use
+        resolution_mapping: Mapping from original -> final names (for audit trail)
+        normalization_version: Algorithm version used, or None if no normalization
+    """
+
+    final_headers: tuple[str, ...]
+    resolution_mapping: MappingProxyType[str, str]
+    normalization_version: str | None
+    effective_headers: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "final_headers", tuple(self.final_headers))
+        object.__setattr__(self, "resolution_mapping", MappingProxyType(dict(self.resolution_mapping)))
+        effective_headers = tuple(self.effective_headers) if self.effective_headers else tuple(self.final_headers)
+        object.__setattr__(self, "effective_headers", effective_headers)
+
+
+def resolve_field_names(
+    *,
+    raw_headers: list[str] | None,
+    field_mapping: dict[str, str] | None,
+    columns: list[str] | None,
+    require_all_mapping_keys: bool = True,
+) -> FieldResolution:
+    """Resolve final field names from raw headers and config.
+
+    Field normalization is mandatory for raw headers. Source field names are
+    normalized to valid Python identifiers at the source boundary. When
+    columns are provided (headerless mode), they are used as-is since they
+    are already clean identifiers validated at config time.
+
+    Args:
+        raw_headers: Headers from file, or None if using columns config
+        field_mapping: Optional mapping overrides (keys are effective names)
+        columns: Explicit column names for headerless mode
+        require_all_mapping_keys: When True (default), every field_mapping key must
+            be present in the resolved headers — correct for tabular sources with a
+            fixed header row (CSV), where a missing mapped column is a config error.
+            JSON-like sources with sparse, per-row-heterogeneous records pass False:
+            a mapped key absent from THIS record is simply not applied to it, instead
+            of quarantining an otherwise-valid row (elspeth-2ad0cebfcd and siblings).
+
+    Returns:
+        FieldResolution with final headers, audit mapping, and algorithm version
+
+    Raises:
+        ExternalHeaderError: On external header normalization failures.
+        FieldMappingCollisionError: On field_mapping-created duplicate final names.
+        ValueError: On invalid mapping key, invalid mapping output, or
+            configuration error.
+    """
+    # Determine source of headers
+    if columns is not None:
+        # Headerless mode - use explicit columns
+        original_names = columns
+        effective_headers = list(columns)
+        used_normalization = False
+    elif raw_headers is not None:
+        original_names = raw_headers
+        effective_headers = [normalize_field_name(h) for h in raw_headers]
+        check_normalization_collisions(raw_headers, effective_headers)
+        used_normalization = True
+    else:
+        raise ValueError("Either raw_headers or columns must be provided")
+
+    # Apply field mapping if provided
+    if field_mapping:
+        # Validate all mapping keys exist (tabular sources only; sparse JSON-like
+        # records legitimately omit optional mapped keys per row).
+        available = set(effective_headers)
+        missing = set(field_mapping.keys()) - available
+        if missing and require_all_mapping_keys:
+            raise ValueError(f"field_mapping keys not found in headers: {sorted(missing)}. Available: {sorted(available)}")
+
+        # Apply mapping: mapped headers use new name, unmapped pass through
+        # Explicit 'if in' check preferred over .get() per no-bug-hiding policy
+        final_headers = [field_mapping[h] if h in field_mapping else h for h in effective_headers]
+
+        # Validate mapping outputs are valid Python identifiers — field_mapping
+        # values bypass normalize_field_name(), so the source-boundary guarantee
+        # must be enforced here.
+        for mapped_name in field_mapping.values():
+            if not mapped_name.isidentifier():
+                raise ValueError(
+                    f"field_mapping value {mapped_name!r} is not a valid Python identifier. "
+                    f"All downstream field names must be valid identifiers after normalization."
+                )
+
+        # Check for collisions after mapping
+        check_mapping_collisions(effective_headers, final_headers, field_mapping)
+    else:
+        final_headers = effective_headers
+
+    # Build resolution mapping for audit trail
+    resolution_mapping = dict(zip(original_names, final_headers, strict=True))
+
+    return FieldResolution(
+        final_headers=tuple(final_headers),
+        resolution_mapping=MappingProxyType(resolution_mapping),
+        normalization_version=NORMALIZATION_ALGORITHM_VERSION if used_normalization else None,
+        effective_headers=tuple(effective_headers),
+    )
+
+
+def extend_field_resolution(
+    resolution: FieldResolution,
+    *,
+    raw_headers: list[str],
+    field_mapping: dict[str, str] | None,
+) -> FieldResolution:
+    """Extend a sparse source field resolution with newly seen raw headers.
+
+    This preserves first-seen union semantics without re-normalizing the full
+    historical key set every time a sparse JSON-like row introduces a field.
+    """
+    existing_mapping = dict(resolution.resolution_mapping)
+    new_raw_headers = [header for header in raw_headers if header not in existing_mapping]
+    if not new_raw_headers:
+        return resolution
+
+    new_effective_headers = [normalize_field_name(header) for header in new_raw_headers]
+    check_normalization_collisions(new_raw_headers, new_effective_headers)
+
+    existing_effective_headers = set(resolution.effective_headers)
+    if not existing_effective_headers and resolution.normalization_version is not None:
+        existing_effective_headers = {normalize_field_name(header) for header in existing_mapping}
+    for raw_header, effective_header in zip(new_raw_headers, new_effective_headers, strict=True):
+        if effective_header in existing_effective_headers:
+            raise ExternalHeaderError(
+                f"Field name collision after normalization:\n  '{effective_header}' <- previously seen field, current field '{raw_header}'"
+            )
+
+    if field_mapping:
+        for mapped_name in field_mapping.values():
+            if not mapped_name.isidentifier():
+                raise ValueError(
+                    f"field_mapping value {mapped_name!r} is not a valid Python identifier. "
+                    f"All downstream field names must be valid identifiers after normalization."
+                )
+        new_final_headers = [field_mapping[header] if header in field_mapping else header for header in new_effective_headers]
+    else:
+        new_final_headers = new_effective_headers
+
+    existing_final_headers = set(resolution.final_headers)
+    new_final_to_raw: dict[str, str] = {}
+    new_final_to_effective: dict[str, str] = {}
+    existing_final_to_effective = dict(zip(resolution.final_headers, resolution.effective_headers, strict=True))
+    for raw_header, effective_header, final_header in zip(new_raw_headers, new_effective_headers, new_final_headers, strict=True):
+        if final_header in existing_final_headers or final_header in new_final_to_raw:
+            previous = new_final_to_raw.get(final_header, "previously seen field")
+            existing_effective_header = existing_final_to_effective.get(final_header)
+            previous_new_effective_header = new_final_to_effective.get(final_header)
+            collision_uses_mapping = bool(
+                field_mapping
+                and (
+                    effective_header in field_mapping
+                    or (existing_effective_header is not None and existing_effective_header != final_header)
+                    or (previous_new_effective_header is not None and previous_new_effective_header in field_mapping)
+                )
+            )
+            if collision_uses_mapping:
+                raise FieldMappingCollisionError(f"field_mapping creates collision:\n  '{final_header}' <- {previous!r}, {raw_header!r}")
+            raise ExternalHeaderError(f"Field name collision after normalization:\n  '{final_header}' <- {previous!r}, {raw_header!r}")
+        new_final_to_raw[final_header] = raw_header
+        new_final_to_effective[final_header] = effective_header
+
+    extended_mapping = dict(existing_mapping)
+    extended_mapping.update(zip(new_raw_headers, new_final_headers, strict=True))
+
+    return FieldResolution(
+        final_headers=(*resolution.final_headers, *new_final_headers),
+        resolution_mapping=MappingProxyType(extended_mapping),
+        normalization_version=resolution.normalization_version,
+        effective_headers=(*resolution.effective_headers, *new_effective_headers),
+    )
+
+
+def check_declared_fields_reachable(
+    declared_names: Sequence[str],
+    *,
+    columns: Sequence[str] | None,
+    field_mapping: Mapping[str, str] | None,
+    header_kind: str = "headers",
+) -> None:
+    """Reject declared schema field names that resolution can never produce.
+
+    Sources that route external names through :func:`resolve_field_names` build
+    row keys as ``mapping[h] if h in mapping else h`` over ``normalize_field_name``
+    of each raw header (headered mode) or over ``columns`` verbatim (headerless
+    mode). Declared schema names are used verbatim, so a declared name outside
+    the producible set can never match a row: required fields silently discard
+    every row and optional fields crash contract inference with
+    ``Duplicate original_name`` (elspeth-3664e213c4). Both are config faults,
+    caught here at config-validation time.
+
+    Reachability per mode:
+
+    - Headerless (``columns`` provided): final names are exactly computable via
+      :func:`resolve_field_names`; a declared name must be a member.
+    - Headered (``columns is None``): a declared name ``n`` is reachable iff it
+      is a ``field_mapping`` value (mapping values bypass normalization), or it
+      is its own normalized form — ``normalize_field_name`` is idempotent, so
+      exactly the fixed points are producible by some header — AND it is not a
+      ``field_mapping`` key. A mapping key is renamed on every row where a
+      header produces it, so it never survives as a final name unless it is
+      also a mapping value.
+
+    Sparse JSON-like sources (``require_all_mapping_keys=False``) share this
+    predicate unchanged: relaxing the mapping-key presence check only allows a
+    mapped key to be absent from a given record — every path that introduces a
+    key (:func:`resolve_field_names`, :func:`extend_field_resolution`, and the
+    per-row late-key branches in the JSON-family sources) still applies
+    ``field_mapping`` after normalization, so a mapping key never appears as a
+    final name and mapping values remain reachable.
+
+    Args:
+        declared_names: Schema names the config commits to (declared fields
+            plus guaranteed_fields/required_fields entries), already validated
+            as Python identifiers.
+        columns: Explicit headerless column names, or None for headered mode.
+        field_mapping: Optional effective-name -> final-name overrides.
+        header_kind: Noun for error messages (e.g. "CSV headers",
+            "JSON object keys").
+
+    Raises:
+        ValueError: If any declared name is unreachable, listing every
+            unreachable name with the remedy that makes it reachable.
+    """
+    problems: list[str] = []
+
+    if columns is not None:
+        final_names = set(
+            resolve_field_names(
+                raw_headers=None,
+                field_mapping=dict(field_mapping) if field_mapping else None,
+                columns=list(columns),
+            ).final_headers
+        )
+        for name in declared_names:
+            if name in final_names:
+                continue
+            if field_mapping and name in field_mapping:
+                problems.append(
+                    f"declared field '{name}' can never appear on a row from this source: "
+                    f"field_mapping renames '{name}' to '{field_mapping[name]}'. "
+                    f"Declare '{field_mapping[name]}', or remove the field_mapping entry."
+                )
+            else:
+                resolved = ", ".join(f"'{header}'" for header in sorted(final_names))
+                problems.append(
+                    f"declared field '{name}' can never appear on a row from this source: "
+                    f"the resolved column names are {resolved}. "
+                    f"Declare one of the resolved names, or adjust columns/field_mapping."
+                )
+    else:
+        mapping_values = set(field_mapping.values()) if field_mapping else set()
+        for name in declared_names:
+            if name in mapping_values:
+                continue
+            if field_mapping and name in field_mapping:
+                problems.append(
+                    f"declared field '{name}' can never appear on a row from this source: "
+                    f"field_mapping renames '{name}' to '{field_mapping[name]}'. "
+                    f"Declare '{field_mapping[name]}', or remove the field_mapping entry."
+                )
+                continue
+            normalized = normalized_field_name_or_empty(name)
+            if not normalized:
+                # e.g. '_' — normalization strips it to nothing, so no external
+                # header can produce it and it is not a mapping value.
+                problems.append(
+                    f"declared field '{name}' can never appear on a row from this source: "
+                    f"no {header_kind[:-1] if header_kind.endswith('s') else header_kind} normalizes to it. "
+                    f"Use field_mapping to produce it."
+                )
+                continue
+            if normalized != name:
+                problems.append(
+                    f"declared field '{name}' can never appear on a row from this source: "
+                    f"{header_normalization_remedy(name, normalized, header_kind=header_kind)}, "
+                    f"or add field_mapping: {{{normalized}: {name}}} to preserve the original name."
+                )
+
+    if problems:
+        raise ValueError("\n".join(problems))
+
+
+def declarable_field_name(name: str) -> str | None:
+    """The ``required_input_fields`` entry that covers a template row field.
+
+    ``is_valid_field_name`` (the acceptance set ``validate_field_name`` applies
+    to a declaration entry) admits only a non-keyword Python identifier, while
+    a bracket read returns its literal verbatim — so
+    ``{{ row["Original Header"] }}`` reads a name no declaration can carry.
+    Returns the name itself when it is already declarable, else the canonical
+    row key it resolves to at render, else None when it has no declarable form
+    at all (``"!!!"`` normalizes to nothing and so names no field).
+
+    Whatever this returns, ``undeclared_row_fields`` must then accept: the two
+    are the repair and the check for one contract, and they disagreed once
+    already (elspeth-a9ba80cb0b).
+    """
+    from elspeth.contracts.identifiers import is_valid_field_name
+
+    if is_valid_field_name(name.strip()):
+        return name.strip()
+    canonical = normalized_field_name_or_empty(name)
+    if not canonical or not is_valid_field_name(canonical):
+        return None
+    return canonical
+
+
+def undeclared_row_fields(row_fields: Iterable[str], declared_fields: Iterable[str]) -> tuple[str, ...]:
+    """Row fields a template reads that a required-fields declaration does not cover.
+
+    The config-time half of the ``required_input_fields`` contract: a caller
+    passes the concrete row fields its template reads (from
+    ``extract_jinja2_field_usage``) and the names the node declared, and gets
+    back the sorted shortfall it may honestly report. Shared by
+    ``LLMConfig._validate_template_variable_bindings``, the multi-query column
+    check, ``RAGRetrievalConfig`` and the composer's twins so the authoring
+    surfaces cannot drift (elspeth-a9ba80cb0b).
+
+    A read is covered when it names a declared field by EITHER spelling
+    (ADR-051 (b)): the declared name itself, or a header spelling of it by the
+    field-name spelling rule's own predicate (``header_spelling_canonical``:
+    the literal is not declared and its normalized form is). At render
+    ``TemplateRow`` resolves a declared field by its canonical name and by the
+    original name its producer recorded, so ``row['Name']`` under
+    ``required_input_fields: [name]`` reads ``name`` from a source whose header
+    is ``Name`` — the same resolution ``PipelineRow`` lookups use. A
+    declaration is the other direction: there a header spelling is REFUSED and
+    the canonical name required (``check_declared_fields_reachable``, the
+    spelling rule), which is why the canonical name is the only thing this
+    check ever asks an author to declare.
+
+    Config time cannot see the header a row will carry, so whether a spelling
+    other than the canonical one matches it is Tier-3 data: a row whose header
+    is spelled otherwise (``NAME``) fails that row at render, routed, like any
+    other data-dependent miss. What config CAN prove is that a read names no
+    declared field under any spelling, and that is what is reported.
+
+    A literal with no declarable form at all (``"!!!"`` normalizes to nothing)
+    is dropped, not reported: there is nothing to ask for.
+
+    Dynamic accesses (``row[expr]``) never reach here — callers fail closed on
+    them separately, with their own opt-out.
+    """
+    declared_literals = {name.strip() for name in declared_fields}
+
+    undeclared: set[str] = set()
+    for field in row_fields:
+        covering = declarable_field_name(field)
+        if covering is None:
+            continue
+        if covering in declared_literals or header_spelling_canonical(field, declared_literals) is not None:
+            continue
+        undeclared.add(field)
+    return tuple(sorted(undeclared))
+
+
+def header_spelled_row_lookups(row_fields: Iterable[str], declared_fields: Iterable[str]) -> dict[str, str]:
+    """The reads ``undeclared_row_fields`` covers by a spelling other than the declared name: literal -> declared field.
+
+    Config time admits such a read because a row may carry the field under
+    that spelling (a source header). Whether one can is a fact about the
+    upstream, so the node publishes these (``TransformProtocol.header_spelled_lookups``)
+    and the build and the Web Composer refuse one no arriving row can resolve
+    (``contracts.field_spelling.unreachable_spelled_lookups``): a field a
+    transform upstream created records its own name as its original.
+    """
+    declared_literals = {name.strip() for name in declared_fields}
+    spelled: dict[str, str] = {}
+    for field in row_fields:
+        if field in declared_literals:
+            continue
+        covering = declarable_field_name(field)
+        if covering is None:
+            continue
+        canonical = covering if covering in declared_literals else header_spelling_canonical(field, declared_literals)
+        if canonical is not None:
+            spelled[field] = canonical
+    return spelled
+
+
+def describe_undeclared_row_fields(fields: Sequence[str]) -> str:
+    """Render an ``undeclared_row_fields`` shortfall, naming the declarable form.
+
+    A bracket literal is not a legal ``required_input_fields`` entry, so a
+    message naming only the literal advertises a repair rejected on
+    application — the same defect this change removed from the LLM
+    declared-fields validator's suggestion (elspeth-a9ba80cb0b).
+    """
+    parts: list[str] = []
+    for name in fields:
+        covering = declarable_field_name(name)
+        parts.append(f"'{name}' (declare as '{covering}')" if covering != name else f"'{name}'")
+    return ", ".join(parts)

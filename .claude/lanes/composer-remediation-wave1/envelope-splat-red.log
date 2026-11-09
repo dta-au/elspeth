@@ -1,0 +1,1848 @@
+.FFFFFFFFFFFFFFFFFFFFFFFFFFFF                                            [100%]
+=================================== FAILURES ===================================
+_ test_splat_walker_reads_inline_and_both_conditional_mappings[{**{'inline': {'leaf': 1}}}-expected0] _
+
+expression = "{**{'inline': {'leaf': 1}}}"
+expected = ['data.inline', 'data.inline.leaf']
+
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            ("{**{'inline': {'leaf': 1}}}", ["data.inline", "data.inline.leaf"]),
+            ("{**({'yes': 1} if flag else {})}", ["data.yes"]),
+            ("{**({} if flag else {'no': 1})}", ["data.no"]),
+            (
+                "{'first': 1, **({'yes': {'leaf': 1}} if flag else {'no': 1}), 'last': 1}",
+                ["data.first", "data.yes", "data.yes.leaf", "data.no", "data.last"],
+            ),
+            (
+                "{**({'yes': 1} if flag else {**({'nested': 1} if other else {'tail': 1})})}",
+                ["data.yes", "data.nested", "data.tail"],
+            ),
+        ],
+    )
+    def test_splat_walker_reads_inline_and_both_conditional_mappings(expression: str, expected: list[str]) -> None:
+        """Skipping either arm, nested mappings, or applying the outer prefix twice loses these paths."""
+        value = ast.parse(expression, mode="eval").body
+>       assert list(_dict_literal_keys(value, "data.", "splat-probe", {})) == expected
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1494: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.Dict object at 0x7fdd50782cd0>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of Dict(keys=[Constant(value='inline')], values=[Dict(keys=[Con inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+_ test_splat_walker_reads_inline_and_both_conditional_mappings[{**({'yes': 1} if flag else {})}-expected1] _
+
+expression = "{**({'yes': 1} if flag else {})}", expected = ['data.yes']
+
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            ("{**{'inline': {'leaf': 1}}}", ["data.inline", "data.inline.leaf"]),
+            ("{**({'yes': 1} if flag else {})}", ["data.yes"]),
+            ("{**({} if flag else {'no': 1})}", ["data.no"]),
+            (
+                "{'first': 1, **({'yes': {'leaf': 1}} if flag else {'no': 1}), 'last': 1}",
+                ["data.first", "data.yes", "data.yes.leaf", "data.no", "data.last"],
+            ),
+            (
+                "{**({'yes': 1} if flag else {**({'nested': 1} if other else {'tail': 1})})}",
+                ["data.yes", "data.nested", "data.tail"],
+            ),
+        ],
+    )
+    def test_splat_walker_reads_inline_and_both_conditional_mappings(expression: str, expected: list[str]) -> None:
+        """Skipping either arm, nested mappings, or applying the outer prefix twice loses these paths."""
+        value = ast.parse(expression, mode="eval").body
+>       assert list(_dict_literal_keys(value, "data.", "splat-probe", {})) == expected
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1494: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd50799550>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+_ test_splat_walker_reads_inline_and_both_conditional_mappings[{**({} if flag else {'no': 1})}-expected2] _
+
+expression = "{**({} if flag else {'no': 1})}", expected = ['data.no']
+
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            ("{**{'inline': {'leaf': 1}}}", ["data.inline", "data.inline.leaf"]),
+            ("{**({'yes': 1} if flag else {})}", ["data.yes"]),
+            ("{**({} if flag else {'no': 1})}", ["data.no"]),
+            (
+                "{'first': 1, **({'yes': {'leaf': 1}} if flag else {'no': 1}), 'last': 1}",
+                ["data.first", "data.yes", "data.yes.leaf", "data.no", "data.last"],
+            ),
+            (
+                "{**({'yes': 1} if flag else {**({'nested': 1} if other else {'tail': 1})})}",
+                ["data.yes", "data.nested", "data.tail"],
+            ),
+        ],
+    )
+    def test_splat_walker_reads_inline_and_both_conditional_mappings(expression: str, expected: list[str]) -> None:
+        """Skipping either arm, nested mappings, or applying the outer prefix twice loses these paths."""
+        value = ast.parse(expression, mode="eval").body
+>       assert list(_dict_literal_keys(value, "data.", "splat-probe", {})) == expected
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1494: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd50f11e90>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[], v inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+_ test_splat_walker_reads_inline_and_both_conditional_mappings[{'first': 1, **({'yes': {'leaf': 1}} if flag else {'no': 1}), 'last': 1}-expected3] _
+
+expression = "{'first': 1, **({'yes': {'leaf': 1}} if flag else {'no': 1}), 'last': 1}"
+expected = ['data.first', 'data.yes', 'data.yes.leaf', 'data.no', 'data.last']
+
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            ("{**{'inline': {'leaf': 1}}}", ["data.inline", "data.inline.leaf"]),
+            ("{**({'yes': 1} if flag else {})}", ["data.yes"]),
+            ("{**({} if flag else {'no': 1})}", ["data.no"]),
+            (
+                "{'first': 1, **({'yes': {'leaf': 1}} if flag else {'no': 1}), 'last': 1}",
+                ["data.first", "data.yes", "data.yes.leaf", "data.no", "data.last"],
+            ),
+            (
+                "{**({'yes': 1} if flag else {**({'nested': 1} if other else {'tail': 1})})}",
+                ["data.yes", "data.nested", "data.tail"],
+            ),
+        ],
+    )
+    def test_splat_walker_reads_inline_and_both_conditional_mappings(expression: str, expected: list[str]) -> None:
+        """Skipping either arm, nested mappings, or applying the outer prefix twice loses these paths."""
+        value = ast.parse(expression, mode="eval").body
+>       assert list(_dict_literal_keys(value, "data.", "splat-probe", {})) == expected
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1494: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd50cf7950>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+_ test_splat_walker_reads_inline_and_both_conditional_mappings[{**({'yes': 1} if flag else {**({'nested': 1} if other else {'tail': 1})})}-expected4] _
+
+expression = "{**({'yes': 1} if flag else {**({'nested': 1} if other else {'tail': 1})})}"
+expected = ['data.yes', 'data.nested', 'data.tail']
+
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            ("{**{'inline': {'leaf': 1}}}", ["data.inline", "data.inline.leaf"]),
+            ("{**({'yes': 1} if flag else {})}", ["data.yes"]),
+            ("{**({} if flag else {'no': 1})}", ["data.no"]),
+            (
+                "{'first': 1, **({'yes': {'leaf': 1}} if flag else {'no': 1}), 'last': 1}",
+                ["data.first", "data.yes", "data.yes.leaf", "data.no", "data.last"],
+            ),
+            (
+                "{**({'yes': 1} if flag else {**({'nested': 1} if other else {'tail': 1})})}",
+                ["data.yes", "data.nested", "data.tail"],
+            ),
+        ],
+    )
+    def test_splat_walker_reads_inline_and_both_conditional_mappings(expression: str, expected: list[str]) -> None:
+        """Skipping either arm, nested mappings, or applying the outer prefix twice loses these paths."""
+        value = ast.parse(expression, mode="eval").body
+>       assert list(_dict_literal_keys(value, "data.", "splat-probe", {})) == expected
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1494: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd50a49a10>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+________ test_conditional_splat_keeps_constant_local_and_helper_context ________
+
+    def test_conditional_splat_keeps_constant_local_and_helper_context() -> None:
+        """The conditional must not drop the dictionary reader's constants or handler-local resolver."""
+        source = """
+    from elspeth.web.composer.tools._common import _SOURCE_BLOB_REF_OPTION_KEY
+    MODULE_KEY = "module_key"
+    
+    def splat_context():
+        payload = {"local_key": {"inner": 1}}
+        return ToolResult(data={**({_SOURCE_BLOB_REF_OPTION_KEY: {MODULE_KEY: 1}, **payload} if flag else _blob_create_payload())})
+    """
+>       assert _probe_data_keys(source, "splat_context") == [
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+            "data.blob_ref",
+            "data.blob_ref.module_key",
+            "data.local_key",
+            "data.local_key.inner",
+            "data.blob_id",
+            "data.filename",
+            "data.mime_type",
+            "data.size_bytes",
+            "data.content_hash",
+            "data.originated_in",
+        ]
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1507: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1831: in _probe_data_keys
+    return list(_expr_keys(expr, fn=fn, tree=tree, path=COMMON, prefix="data.", site=f"probe:{fn_name}"))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2179: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd511b2250>, site = 'probe:splat_context'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fdd5098a7a0>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: probe:splat_context: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Name inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+_ test_conditional_splat_refuses_each_unreadable_arm[{dynamic_key: 1}-non-literal key-body] _
+
+arm = 'body', unreadable = '{dynamic_key: 1}', reason = 'non-literal key'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+        with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+>           list(_dict_literal_keys(value, "data.", "splat-probe", {}))
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1538: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd516604d0>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Name inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+arm = 'body', unreadable = '{dynamic_key: 1}', reason = 'non-literal key'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+>       with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'splat\\-probe:\\ non\\-literal\\ key'
+E         Actual message: "splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Name inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1537: AssertionError
+_ test_conditional_splat_refuses_each_unreadable_arm[{dynamic_key: 1}-non-literal key-orelse] _
+
+arm = 'orelse', unreadable = '{dynamic_key: 1}', reason = 'non-literal key'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+        with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+>           list(_dict_literal_keys(value, "data.", "splat-probe", {}))
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1538: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd5097b610>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+arm = 'orelse', unreadable = '{dynamic_key: 1}', reason = 'non-literal key'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+>       with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'splat\\-probe:\\ non\\-literal\\ key'
+E         Actual message: "splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1537: AssertionError
+_ test_conditional_splat_refuses_each_unreadable_arm[missing-** splat of Name(-body] _
+
+arm = 'body', unreadable = 'missing', reason = '** splat of Name('
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+        with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+>           list(_dict_literal_keys(value, "data.", "splat-probe", {}))
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1538: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd509eddd0>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Name(id='missin inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+arm = 'body', unreadable = 'missing', reason = '** splat of Name('
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+>       with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'splat\\-probe:\\ \\*\\*\\ splat\\ of\\ Name\\('
+E         Actual message: "splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Name(id='missin inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1537: AssertionError
+_ test_conditional_splat_refuses_each_unreadable_arm[missing-** splat of Name(-orelse] _
+
+arm = 'orelse', unreadable = 'missing', reason = '** splat of Name('
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+        with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+>           list(_dict_literal_keys(value, "data.", "splat-probe", {}))
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1538: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd50952c10>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+arm = 'orelse', unreadable = 'missing', reason = '** splat of Name('
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+>       with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'splat\\-probe:\\ \\*\\*\\ splat\\ of\\ Name\\('
+E         Actual message: "splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1537: AssertionError
+_ test_conditional_splat_refuses_each_unreadable_arm[unregistered_helper()-** splat built by unattributed helper 'unregistered_helper'-body] _
+
+arm = 'body', unreadable = 'unregistered_helper()'
+reason = "** splat built by unattributed helper 'unregistered_helper'"
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+        with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+>           list(_dict_literal_keys(value, "data.", "splat-probe", {}))
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1538: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd51149d10>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Call(func=Name( inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+arm = 'body', unreadable = 'unregistered_helper()'
+reason = "** splat built by unattributed helper 'unregistered_helper'"
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+>       with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: "splat\\-probe:\\ \\*\\*\\ splat\\ built\\ by\\ unattributed\\ helper\\ 'unregistered_helper'"
+E         Actual message: "splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Call(func=Name( inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1537: AssertionError
+_ test_conditional_splat_refuses_each_unreadable_arm[unregistered_helper()-** splat built by unattributed helper 'unregistered_helper'-orelse] _
+
+arm = 'orelse', unreadable = 'unregistered_helper()'
+reason = "** splat built by unattributed helper 'unregistered_helper'"
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+        with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+>           list(_dict_literal_keys(value, "data.", "splat-probe", {}))
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1538: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd519e7390>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+arm = 'orelse', unreadable = 'unregistered_helper()'
+reason = "** splat built by unattributed helper 'unregistered_helper'"
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+>       with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: "splat\\-probe:\\ \\*\\*\\ splat\\ built\\ by\\ unattributed\\ helper\\ 'unregistered_helper'"
+E         Actual message: "splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1537: AssertionError
+_ test_conditional_splat_refuses_each_unreadable_arm[left | right-** splat of BinOp(-body] _
+
+arm = 'body', unreadable = 'left | right', reason = '** splat of BinOp('
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+        with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+>           list(_dict_literal_keys(value, "data.", "splat-probe", {}))
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1538: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd50a136d0>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=BinOp(left=Name inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+arm = 'body', unreadable = 'left | right', reason = '** splat of BinOp('
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+>       with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'splat\\-probe:\\ \\*\\*\\ splat\\ of\\ BinOp\\('
+E         Actual message: "splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=BinOp(left=Name inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1537: AssertionError
+_ test_conditional_splat_refuses_each_unreadable_arm[left | right-** splat of BinOp(-orelse] _
+
+arm = 'orelse', unreadable = 'left | right', reason = '** splat of BinOp('
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+        with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+>           list(_dict_literal_keys(value, "data.", "splat-probe", {}))
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1538: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd50ef9150>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+arm = 'orelse', unreadable = 'left | right', reason = '** splat of BinOp('
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+>       with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'splat\\-probe:\\ \\*\\*\\ splat\\ of\\ BinOp\\('
+E         Actual message: "splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1537: AssertionError
+_ test_conditional_splat_refuses_each_unreadable_arm[cast(Payload, raw)-** splat built by unattributed helper 'cast'-body] _
+
+arm = 'body', unreadable = 'cast(Payload, raw)'
+reason = "** splat built by unattributed helper 'cast'"
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+        with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+>           list(_dict_literal_keys(value, "data.", "splat-probe", {}))
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1538: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd50b16e10>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Call(func=Name( inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+arm = 'body', unreadable = 'cast(Payload, raw)'
+reason = "** splat built by unattributed helper 'cast'"
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+>       with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: "splat\\-probe:\\ \\*\\*\\ splat\\ built\\ by\\ unattributed\\ helper\\ 'cast'"
+E         Actual message: "splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Call(func=Name( inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1537: AssertionError
+_ test_conditional_splat_refuses_each_unreadable_arm[cast(Payload, raw)-** splat built by unattributed helper 'cast'-orelse] _
+
+arm = 'orelse', unreadable = 'cast(Payload, raw)'
+reason = "** splat built by unattributed helper 'cast'"
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+        with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+>           list(_dict_literal_keys(value, "data.", "splat-probe", {}))
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1538: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd5178e450>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+arm = 'orelse', unreadable = 'cast(Payload, raw)'
+reason = "** splat built by unattributed helper 'cast'"
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+>       with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: "splat\\-probe:\\ \\*\\*\\ splat\\ built\\ by\\ unattributed\\ helper\\ 'cast'"
+E         Actual message: "splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1537: AssertionError
+_ test_conditional_splat_refuses_each_unreadable_arm[{'value': cast(Payload, raw)}-cast(...) hides the shape of value-body] _
+
+arm = 'body', unreadable = "{'value': cast(Payload, raw)}"
+reason = 'cast(...) hides the shape of value'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+        with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+>           list(_dict_literal_keys(value, "data.", "splat-probe", {}))
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1538: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd50c98fd0>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+arm = 'body', unreadable = "{'value': cast(Payload, raw)}"
+reason = 'cast(...) hides the shape of value'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+>       with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'splat\\-probe:\\ cast\\(\\.\\.\\.\\)\\ hides\\ the\\ shape\\ of\\ value'
+E         Actual message: "splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1537: AssertionError
+_ test_conditional_splat_refuses_each_unreadable_arm[{'value': cast(Payload, raw)}-cast(...) hides the shape of value-orelse] _
+
+arm = 'orelse', unreadable = "{'value': cast(Payload, raw)}"
+reason = 'cast(...) hides the shape of value'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+        with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+>           list(_dict_literal_keys(value, "data.", "splat-probe", {}))
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1538: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd51060490>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+arm = 'orelse', unreadable = "{'value': cast(Payload, raw)}"
+reason = 'cast(...) hides the shape of value'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize(
+        ("unreadable", "reason"),
+        [
+            ("{dynamic_key: 1}", "non-literal key"),
+            ("missing", "** splat of Name("),
+            ("unregistered_helper()", "** splat built by unattributed helper 'unregistered_helper'"),
+            ("left | right", "** splat of BinOp("),
+            ("cast(Payload, raw)", "** splat built by unattributed helper 'cast'"),
+            ("{'value': cast(Payload, raw)}", "cast(...) hides the shape of value"),
+        ],
+    )
+    def test_conditional_splat_refuses_each_unreadable_arm(arm: str, unreadable: str, reason: str) -> None:
+        """A readable sibling cannot hide an unreadable mapping, key, helper, or cast."""
+        body, orelse = (unreadable, "{'readable': 1}") if arm == "body" else ("{'readable': 1}", unreadable)
+        value = ast.parse(f"{{**({body} if flag else {orelse})}}", mode="eval").body
+>       with pytest.raises(AssertionError, match=re.escape(f"splat-probe: {reason}")):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'splat\\-probe:\\ cast\\(\\.\\.\\.\\)\\ hides\\ the\\ shape\\ of\\ value'
+E         Actual message: "splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1537: AssertionError
+_____ test_conditional_splat_forwards_dict_wrapper_cast_refusal[body-body] _____
+
+arm = 'body', cast_arm = 'body'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize("cast_arm", ["body", "orelse"])
+    def test_conditional_splat_forwards_dict_wrapper_cast_refusal(arm: str, cast_arm: str) -> None:
+        """Losing dict_forwarded at either splat recursion permits a cast hidden in a nested value."""
+        body, orelse = ("cast(Payload, raw)", "{}") if cast_arm == "body" else ("{}", "cast(Payload, raw)")
+        unreadable = f"{{'nested': {body} if inner_flag else {orelse}}}"
+        body, orelse = (unreadable, "{}") if arm == "body" else ("{}", unreadable)
+        value = ast.parse(f"dict({{**({body} if flag else {orelse})}})", mode="eval").body
+        with pytest.raises(AssertionError, match="splat-probe: cast inside dict wrapper hides the value's shape"):
+>           list(_nested_value_keys(value, "data.payload", "splat-probe", {}))
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1550: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:498: in _nested_value_keys
+    yield from _nested_value_keys(value.args[0], path, site, constants, resolve_name, element_of=element_of, dict_forwarded=True)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:478: in _nested_value_keys
+    yield from _dict_literal_keys(value, path + ".", site, constants, resolve_name, dict_forwarded=dict_forwarded)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd50de5410>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+arm = 'body', cast_arm = 'body'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize("cast_arm", ["body", "orelse"])
+    def test_conditional_splat_forwards_dict_wrapper_cast_refusal(arm: str, cast_arm: str) -> None:
+        """Losing dict_forwarded at either splat recursion permits a cast hidden in a nested value."""
+        body, orelse = ("cast(Payload, raw)", "{}") if cast_arm == "body" else ("{}", "cast(Payload, raw)")
+        unreadable = f"{{'nested': {body} if inner_flag else {orelse}}}"
+        body, orelse = (unreadable, "{}") if arm == "body" else ("{}", unreadable)
+        value = ast.parse(f"dict({{**({body} if flag else {orelse})}})", mode="eval").body
+>       with pytest.raises(AssertionError, match="splat-probe: cast inside dict wrapper hides the value's shape"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: "splat-probe: cast inside dict wrapper hides the value's shape"
+E         Actual message: "splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1549: AssertionError
+____ test_conditional_splat_forwards_dict_wrapper_cast_refusal[body-orelse] ____
+
+arm = 'orelse', cast_arm = 'body'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize("cast_arm", ["body", "orelse"])
+    def test_conditional_splat_forwards_dict_wrapper_cast_refusal(arm: str, cast_arm: str) -> None:
+        """Losing dict_forwarded at either splat recursion permits a cast hidden in a nested value."""
+        body, orelse = ("cast(Payload, raw)", "{}") if cast_arm == "body" else ("{}", "cast(Payload, raw)")
+        unreadable = f"{{'nested': {body} if inner_flag else {orelse}}}"
+        body, orelse = (unreadable, "{}") if arm == "body" else ("{}", unreadable)
+        value = ast.parse(f"dict({{**({body} if flag else {orelse})}})", mode="eval").body
+        with pytest.raises(AssertionError, match="splat-probe: cast inside dict wrapper hides the value's shape"):
+>           list(_nested_value_keys(value, "data.payload", "splat-probe", {}))
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1550: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:498: in _nested_value_keys
+    yield from _nested_value_keys(value.args[0], path, site, constants, resolve_name, element_of=element_of, dict_forwarded=True)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:478: in _nested_value_keys
+    yield from _dict_literal_keys(value, path + ".", site, constants, resolve_name, dict_forwarded=dict_forwarded)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd50e0e890>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[], v inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+arm = 'orelse', cast_arm = 'body'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize("cast_arm", ["body", "orelse"])
+    def test_conditional_splat_forwards_dict_wrapper_cast_refusal(arm: str, cast_arm: str) -> None:
+        """Losing dict_forwarded at either splat recursion permits a cast hidden in a nested value."""
+        body, orelse = ("cast(Payload, raw)", "{}") if cast_arm == "body" else ("{}", "cast(Payload, raw)")
+        unreadable = f"{{'nested': {body} if inner_flag else {orelse}}}"
+        body, orelse = (unreadable, "{}") if arm == "body" else ("{}", unreadable)
+        value = ast.parse(f"dict({{**({body} if flag else {orelse})}})", mode="eval").body
+>       with pytest.raises(AssertionError, match="splat-probe: cast inside dict wrapper hides the value's shape"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: "splat-probe: cast inside dict wrapper hides the value's shape"
+E         Actual message: "splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[], v inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1549: AssertionError
+____ test_conditional_splat_forwards_dict_wrapper_cast_refusal[orelse-body] ____
+
+arm = 'body', cast_arm = 'orelse'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize("cast_arm", ["body", "orelse"])
+    def test_conditional_splat_forwards_dict_wrapper_cast_refusal(arm: str, cast_arm: str) -> None:
+        """Losing dict_forwarded at either splat recursion permits a cast hidden in a nested value."""
+        body, orelse = ("cast(Payload, raw)", "{}") if cast_arm == "body" else ("{}", "cast(Payload, raw)")
+        unreadable = f"{{'nested': {body} if inner_flag else {orelse}}}"
+        body, orelse = (unreadable, "{}") if arm == "body" else ("{}", unreadable)
+        value = ast.parse(f"dict({{**({body} if flag else {orelse})}})", mode="eval").body
+        with pytest.raises(AssertionError, match="splat-probe: cast inside dict wrapper hides the value's shape"):
+>           list(_nested_value_keys(value, "data.payload", "splat-probe", {}))
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1550: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:498: in _nested_value_keys
+    yield from _nested_value_keys(value.args[0], path, site, constants, resolve_name, element_of=element_of, dict_forwarded=True)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:478: in _nested_value_keys
+    yield from _dict_literal_keys(value, path + ".", site, constants, resolve_name, dict_forwarded=dict_forwarded)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd510b89d0>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+arm = 'body', cast_arm = 'orelse'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize("cast_arm", ["body", "orelse"])
+    def test_conditional_splat_forwards_dict_wrapper_cast_refusal(arm: str, cast_arm: str) -> None:
+        """Losing dict_forwarded at either splat recursion permits a cast hidden in a nested value."""
+        body, orelse = ("cast(Payload, raw)", "{}") if cast_arm == "body" else ("{}", "cast(Payload, raw)")
+        unreadable = f"{{'nested': {body} if inner_flag else {orelse}}}"
+        body, orelse = (unreadable, "{}") if arm == "body" else ("{}", unreadable)
+        value = ast.parse(f"dict({{**({body} if flag else {orelse})}})", mode="eval").body
+>       with pytest.raises(AssertionError, match="splat-probe: cast inside dict wrapper hides the value's shape"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: "splat-probe: cast inside dict wrapper hides the value's shape"
+E         Actual message: "splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[Cons inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1549: AssertionError
+___ test_conditional_splat_forwards_dict_wrapper_cast_refusal[orelse-orelse] ___
+
+arm = 'orelse', cast_arm = 'orelse'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize("cast_arm", ["body", "orelse"])
+    def test_conditional_splat_forwards_dict_wrapper_cast_refusal(arm: str, cast_arm: str) -> None:
+        """Losing dict_forwarded at either splat recursion permits a cast hidden in a nested value."""
+        body, orelse = ("cast(Payload, raw)", "{}") if cast_arm == "body" else ("{}", "cast(Payload, raw)")
+        unreadable = f"{{'nested': {body} if inner_flag else {orelse}}}"
+        body, orelse = (unreadable, "{}") if arm == "body" else ("{}", unreadable)
+        value = ast.parse(f"dict({{**({body} if flag else {orelse})}})", mode="eval").body
+        with pytest.raises(AssertionError, match="splat-probe: cast inside dict wrapper hides the value's shape"):
+>           list(_nested_value_keys(value, "data.payload", "splat-probe", {}))
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1550: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:498: in _nested_value_keys
+    yield from _nested_value_keys(value.args[0], path, site, constants, resolve_name, element_of=element_of, dict_forwarded=True)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:478: in _nested_value_keys
+    yield from _dict_literal_keys(value, path + ".", site, constants, resolve_name, dict_forwarded=dict_forwarded)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd50f2e750>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[], v inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+arm = 'orelse', cast_arm = 'orelse'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize("cast_arm", ["body", "orelse"])
+    def test_conditional_splat_forwards_dict_wrapper_cast_refusal(arm: str, cast_arm: str) -> None:
+        """Losing dict_forwarded at either splat recursion permits a cast hidden in a nested value."""
+        body, orelse = ("cast(Payload, raw)", "{}") if cast_arm == "body" else ("{}", "cast(Payload, raw)")
+        unreadable = f"{{'nested': {body} if inner_flag else {orelse}}}"
+        body, orelse = (unreadable, "{}") if arm == "body" else ("{}", unreadable)
+        value = ast.parse(f"dict({{**({body} if flag else {orelse})}})", mode="eval").body
+>       with pytest.raises(AssertionError, match="splat-probe: cast inside dict wrapper hides the value's shape"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: "splat-probe: cast inside dict wrapper hides the value's shape"
+E         Actual message: "splat-probe: ** splat of IfExp(test=Name(id='flag', ctx=Load()), body=Dict(keys=[], v inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1549: AssertionError
+_ test_conditional_splat_does_not_treat_predicate_or_helper_inputs_as_payload_casts _
+
+    def test_conditional_splat_does_not_treat_predicate_or_helper_inputs_as_payload_casts() -> None:
+        value = ast.parse(
+            "dict({**({'yes': 1} if cast(bool, flag) else _blob_create_payload(cast(Input, raw)))})", mode="eval"
+        ).body
+>       assert list(_nested_value_keys(value, "data.payload", "splat-probe", {})) == [
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+            "data.payload.yes",
+            "data.payload.blob_id",
+            "data.payload.filename",
+            "data.payload.mime_type",
+            "data.payload.size_bytes",
+            "data.payload.content_hash",
+            "data.payload.originated_in",
+        ]
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:1557: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:498: in _nested_value_keys
+    yield from _nested_value_keys(value.args[0], path, site, constants, resolve_name, element_of=element_of, dict_forwarded=True)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:478: in _nested_value_keys
+    yield from _dict_literal_keys(value, path + ".", site, constants, resolve_name, dict_forwarded=dict_forwarded)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd50a09f50>, site = 'splat-probe'
+resolve_name = None
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: splat-probe: ** splat of IfExp(test=Call(func=Name(id='cast', ctx=Load()), args=[Name inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+____ test_real_diagnostic_conditional_splat_is_censused_at_its_constructor _____
+
+    def test_real_diagnostic_conditional_splat_is_censused_at_its_constructor() -> None:
+        path = TOOLS_DIR / "generation.py"
+        call, splat = _diagnostic_conditional_splat(_parse(path))
+        assert isinstance(splat.body, ast.Dict) and isinstance(splat.orelse, ast.Dict)
+>       rows = [row for row in _tool_data_sites([path]) if row.site == f"{_display(path)}:{call.lineno}"]
+                               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2537: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2328: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2179: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd5106c290>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fdd50a18ae0>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+_ test_real_diagnostic_conditional_splat_rejects_planted_keys[unexplained_diagnostic_splat_probe-body] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fdd515374d0>
+arm = 'body', key = 'unexplained_diagnostic_splat_probe'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize("key", ["unexplained_diagnostic_splat_probe", "success"])
+    def test_real_diagnostic_conditional_splat_rejects_planted_keys(monkeypatch: pytest.MonkeyPatch, arm: str, key: str) -> None:
+        """Skipping either actual branch must not hide an untaught key or nested envelope homonym."""
+>       test_real_diagnostic_conditional_splat_is_censused_at_its_constructor()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2550: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2537: in test_real_diagnostic_conditional_splat_is_censused_at_its_constructor
+    rows = [row for row in _tool_data_sites([path]) if row.site == f"{_display(path)}:{call.lineno}"]
+                           ^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2328: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2179: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd50a6a690>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fdd50816020>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+_ test_real_diagnostic_conditional_splat_rejects_planted_keys[unexplained_diagnostic_splat_probe-orelse] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fdd51475760>
+arm = 'orelse', key = 'unexplained_diagnostic_splat_probe'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize("key", ["unexplained_diagnostic_splat_probe", "success"])
+    def test_real_diagnostic_conditional_splat_rejects_planted_keys(monkeypatch: pytest.MonkeyPatch, arm: str, key: str) -> None:
+        """Skipping either actual branch must not hide an untaught key or nested envelope homonym."""
+>       test_real_diagnostic_conditional_splat_is_censused_at_its_constructor()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2550: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2537: in test_real_diagnostic_conditional_splat_is_censused_at_its_constructor
+    rows = [row for row in _tool_data_sites([path]) if row.site == f"{_display(path)}:{call.lineno}"]
+                           ^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2328: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2179: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd51209f90>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fdd50757b00>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+__ test_real_diagnostic_conditional_splat_rejects_planted_keys[success-body] ___
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fdd51475610>
+arm = 'body', key = 'success'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize("key", ["unexplained_diagnostic_splat_probe", "success"])
+    def test_real_diagnostic_conditional_splat_rejects_planted_keys(monkeypatch: pytest.MonkeyPatch, arm: str, key: str) -> None:
+        """Skipping either actual branch must not hide an untaught key or nested envelope homonym."""
+>       test_real_diagnostic_conditional_splat_is_censused_at_its_constructor()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2550: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2537: in test_real_diagnostic_conditional_splat_is_censused_at_its_constructor
+    rows = [row for row in _tool_data_sites([path]) if row.site == f"{_display(path)}:{call.lineno}"]
+                           ^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2328: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2179: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd5091ec10>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fdd5170e2a0>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+_ test_real_diagnostic_conditional_splat_rejects_planted_keys[success-orelse] __
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fdd51258620>
+arm = 'orelse', key = 'success'
+
+    @pytest.mark.parametrize("arm", ["body", "orelse"])
+    @pytest.mark.parametrize("key", ["unexplained_diagnostic_splat_probe", "success"])
+    def test_real_diagnostic_conditional_splat_rejects_planted_keys(monkeypatch: pytest.MonkeyPatch, arm: str, key: str) -> None:
+        """Skipping either actual branch must not hide an untaught key or nested envelope homonym."""
+>       test_real_diagnostic_conditional_splat_is_censused_at_its_constructor()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2550: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2537: in test_real_diagnostic_conditional_splat_is_censused_at_its_constructor
+    rows = [row for row in _tool_data_sites([path]) if row.site == f"{_display(path)}:{call.lineno}"]
+                           ^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2328: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2179: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fdd50de61d0>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fdd706b1260>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_splat_walker_reads_inline_and_both_conditional_mappings[{**{'inline': {'leaf': 1}}}-expected0]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_splat_walker_reads_inline_and_both_conditional_mappings[{**({'yes': 1} if flag else {})}-expected1]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_splat_walker_reads_inline_and_both_conditional_mappings[{**({} if flag else {'no': 1})}-expected2]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_splat_walker_reads_inline_and_both_conditional_mappings[{'first': 1, **({'yes': {'leaf': 1}} if flag else {'no': 1}), 'last': 1}-expected3]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_splat_walker_reads_inline_and_both_conditional_mappings[{**({'yes': 1} if flag else {**({'nested': 1} if other else {'tail': 1})})}-expected4]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_keeps_constant_local_and_helper_context
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_refuses_each_unreadable_arm[{dynamic_key: 1}-non-literal key-body]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_refuses_each_unreadable_arm[{dynamic_key: 1}-non-literal key-orelse]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_refuses_each_unreadable_arm[missing-** splat of Name(-body]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_refuses_each_unreadable_arm[missing-** splat of Name(-orelse]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_refuses_each_unreadable_arm[unregistered_helper()-** splat built by unattributed helper 'unregistered_helper'-body]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_refuses_each_unreadable_arm[unregistered_helper()-** splat built by unattributed helper 'unregistered_helper'-orelse]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_refuses_each_unreadable_arm[left | right-** splat of BinOp(-body]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_refuses_each_unreadable_arm[left | right-** splat of BinOp(-orelse]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_refuses_each_unreadable_arm[cast(Payload, raw)-** splat built by unattributed helper 'cast'-body]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_refuses_each_unreadable_arm[cast(Payload, raw)-** splat built by unattributed helper 'cast'-orelse]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_refuses_each_unreadable_arm[{'value': cast(Payload, raw)}-cast(...) hides the shape of value-body]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_refuses_each_unreadable_arm[{'value': cast(Payload, raw)}-cast(...) hides the shape of value-orelse]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_forwards_dict_wrapper_cast_refusal[body-body]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_forwards_dict_wrapper_cast_refusal[body-orelse]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_forwards_dict_wrapper_cast_refusal[orelse-body]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_forwards_dict_wrapper_cast_refusal[orelse-orelse]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_conditional_splat_does_not_treat_predicate_or_helper_inputs_as_payload_casts
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_real_diagnostic_conditional_splat_is_censused_at_its_constructor
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_real_diagnostic_conditional_splat_rejects_planted_keys[unexplained_diagnostic_splat_probe-body]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_real_diagnostic_conditional_splat_rejects_planted_keys[unexplained_diagnostic_splat_probe-orelse]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_real_diagnostic_conditional_splat_rejects_planted_keys[success-body]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_real_diagnostic_conditional_splat_rejects_planted_keys[success-orelse]
+28 failed, 1 passed, 182 deselected in 5.35s

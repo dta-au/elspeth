@@ -1,0 +1,333 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { RUN_STREAM_CLOSE_CODE, connectToRun } from "./websocket";
+
+class MockWebSocket {
+  static instances: MockWebSocket[] = [];
+
+  readonly url: string;
+  onopen: ((event: Event) => void) | null = null;
+  onmessage: ((event: MessageEvent) => void) | null = null;
+  onclose: ((event: CloseEvent) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
+
+  constructor(url: string) {
+    this.url = url;
+    MockWebSocket.instances.push(this);
+  }
+
+  close(): void {
+    this.onclose?.({ code: 1000 } as CloseEvent);
+  }
+
+  open(): void {
+    this.onopen?.(new Event("open"));
+  }
+
+  closeWith(code: number): void {
+    this.onclose?.({ code } as CloseEvent);
+  }
+}
+
+describe("connectToRun", () => {
+  it("resumes after the last delivered sequence and suppresses replay duplicates", async () => {
+    const handlers = callbacks();
+    connectToRun("run-1", vi.fn().mockResolvedValue("ticket"), handlers);
+    await flushPromises();
+    const event = { event_type: "progress", event_sequence: 3, data: {} };
+    MockWebSocket.instances[0].onmessage?.({ data: JSON.stringify(event) } as MessageEvent);
+    MockWebSocket.instances[0].closeWith(1006);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(new URL(MockWebSocket.instances[1].url).searchParams.get("after_sequence")).toBe("3");
+    MockWebSocket.instances[1].onmessage?.({ data: JSON.stringify(event) } as MessageEvent);
+    expect(handlers.onProgress).toHaveBeenCalledTimes(1);
+  });
+  function callbacks() {
+    return {
+      onProgress: vi.fn(),
+      onError: vi.fn(),
+      onComplete: vi.fn(),
+      onCancelled: vi.fn(),
+      onFailed: vi.fn(),
+      onAuthFailure: vi.fn(),
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      onRunUnavailable: vi.fn(),
+      onStreamEnded: vi.fn(),
+    };
+  }
+
+  async function flushPromises(): Promise<void> {
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    MockWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", MockWebSocket);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("requests a fresh opaque ticket for each socket URL", async () => {
+    const handlers = callbacks();
+    const getTicket = vi.fn()
+      .mockResolvedValueOnce("ticket-1")
+      .mockResolvedValueOnce("ticket-2");
+
+    connectToRun("run-1", getTicket, handlers);
+    await flushPromises();
+
+    expect(MockWebSocket.instances).toHaveLength(1);
+    let url = new URL(MockWebSocket.instances[0].url);
+    expect(url.pathname).toBe("/ws/runs/run-1");
+    expect(url.searchParams.get("ticket")).toBe("ticket-1");
+    expect(url.searchParams.has("token")).toBe(false);
+
+    MockWebSocket.instances[0].closeWith(1006);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+
+    expect(getTicket).toHaveBeenCalledTimes(2);
+    expect(MockWebSocket.instances).toHaveLength(2);
+    url = new URL(MockWebSocket.instances[1].url);
+    expect(url.searchParams.get("ticket")).toBe("ticket-2");
+    expect(url.searchParams.has("token")).toBe(false);
+  });
+
+  it("notifies callers when an abnormal close enters reconnect and when the socket opens again", async () => {
+    const handlers = callbacks();
+
+    connectToRun("run-1", vi.fn().mockResolvedValue("ticket-1"), handlers);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(1);
+
+    MockWebSocket.instances[0].open();
+    expect(handlers.onConnected).toHaveBeenCalledTimes(1);
+
+    MockWebSocket.instances[0].closeWith(1006);
+    expect(handlers.onDisconnected).toHaveBeenCalledTimes(1);
+    expect(MockWebSocket.instances).toHaveLength(1);
+
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(2);
+
+    MockWebSocket.instances[1].open();
+    expect(handlers.onConnected).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not reconnect after the run-not-found close code", async () => {
+    const handlers = callbacks();
+
+    connectToRun("missing-run", vi.fn().mockResolvedValue("ticket-1"), handlers);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(1);
+
+    MockWebSocket.instances[0].closeWith(4004);
+    expect(handlers.onDisconnected).not.toHaveBeenCalled();
+    expect(handlers.onAuthFailure).not.toHaveBeenCalled();
+    expect(handlers.onRunUnavailable).toHaveBeenCalledTimes(1);
+
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  // Stream-ended notification (polling audit 2026-09-22, finding 1). A close
+  // that neither reconnects nor hands the caller a terminal refusal leaves the
+  // caller with no further events at all; it has to be told so it can take
+  // over recovery itself.
+  it("notifies the caller that the stream ended after a server-error close", async () => {
+    const handlers = callbacks();
+
+    connectToRun("run-1", vi.fn().mockResolvedValue("ticket-1"), handlers);
+    await flushPromises();
+    MockWebSocket.instances[0].open();
+
+    MockWebSocket.instances[0].closeWith(1011);
+
+    expect(handlers.onStreamEnded).toHaveBeenCalledTimes(1);
+    expect(handlers.onDisconnected).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(30_000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it("notifies the caller that the stream ended after a normal close", async () => {
+    const handlers = callbacks();
+
+    connectToRun("run-1", vi.fn().mockResolvedValue("ticket-1"), handlers);
+    await flushPromises();
+    MockWebSocket.instances[0].open();
+
+    MockWebSocket.instances[0].closeWith(1000);
+
+    expect(handlers.onStreamEnded).toHaveBeenCalledTimes(1);
+    expect(handlers.onDisconnected).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(30_000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  // Transient-backend close (polling audit 2026-09-22, finding 1). 4503 and
+  // 1011 are the same event to a client that reads only "the server could not
+  // read the run" — the whole point of the separate code is that one is worth
+  // re-opening the socket for and the other is not.
+  it("reconnects after a transient backend close instead of ending the stream", async () => {
+    const handlers = callbacks();
+
+    connectToRun("run-1", vi.fn().mockResolvedValue("ticket-1"), handlers);
+    await flushPromises();
+    MockWebSocket.instances[0].open();
+
+    MockWebSocket.instances[0].closeWith(RUN_STREAM_CLOSE_CODE.BACKEND_UNAVAILABLE);
+
+    expect(handlers.onStreamEnded).not.toHaveBeenCalled();
+    expect(handlers.onDisconnected).toHaveBeenCalledTimes(1);
+    expect(handlers.onRunUnavailable).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(2);
+  });
+
+  it("backs off across open then backend-unavailable cycles until a healthy event arrives", async () => {
+    const handlers = callbacks();
+    connectToRun("run-1", vi.fn().mockResolvedValue("ticket"), handlers);
+    await flushPromises();
+
+    MockWebSocket.instances[0].open();
+    MockWebSocket.instances[0].closeWith(RUN_STREAM_CLOSE_CODE.BACKEND_UNAVAILABLE);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(2);
+
+    MockWebSocket.instances[1].open();
+    MockWebSocket.instances[1].closeWith(RUN_STREAM_CLOSE_CODE.BACKEND_UNAVAILABLE);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(2);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(3);
+
+    MockWebSocket.instances[2].open();
+    MockWebSocket.instances[2].onmessage?.({
+      data: JSON.stringify({ event_type: "progress", event_sequence: 1, data: {} }),
+    } as MessageEvent);
+    MockWebSocket.instances[2].closeWith(RUN_STREAM_CLOSE_CODE.BACKEND_UNAVAILABLE);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(4);
+    expect(handlers.onProgress).toHaveBeenCalledTimes(1);
+  });
+
+  it("also backs off across open then abnormal-network-close cycles", async () => {
+    connectToRun("run-1", vi.fn().mockResolvedValue("ticket"), callbacks());
+    await flushPromises();
+    MockWebSocket.instances[0].open();
+    MockWebSocket.instances[0].closeWith(1006);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(2);
+
+    MockWebSocket.instances[1].open();
+    MockWebSocket.instances[1].closeWith(1006);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(2);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(3);
+  });
+
+  it("ignores open and message callbacks from a closed socket handle", async () => {
+    const handlers = callbacks();
+    const connection = connectToRun("run-1", vi.fn().mockResolvedValue("ticket"), handlers);
+    await flushPromises();
+    const oldSocket = MockWebSocket.instances[0];
+    connection.close();
+
+    oldSocket.open();
+    oldSocket.onmessage?.({
+      data: JSON.stringify({ event_type: "progress", event_sequence: 1, data: {} }),
+    } as MessageEvent);
+
+    expect(handlers.onConnected).not.toHaveBeenCalled();
+    expect(handlers.onProgress).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(30_000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it("keeps reconnecting on a transient backend close when the ticket mint is also down", async () => {
+    // The outage that closes 4503 is the same outage that fails the mint, so
+    // a ticket rejection here must re-arm the ladder rather than end it —
+    // otherwise the reconnect dies on attempt 1 during exactly the window it
+    // exists to ride out.
+    const handlers = callbacks();
+    const getTicket = vi
+      .fn()
+      .mockResolvedValueOnce("ticket-1")
+      .mockRejectedValueOnce(new Error("503 database unavailable"))
+      .mockResolvedValueOnce("ticket-2");
+
+    connectToRun("run-1", getTicket, handlers);
+    await flushPromises();
+    MockWebSocket.instances[0].open();
+
+    MockWebSocket.instances[0].closeWith(RUN_STREAM_CLOSE_CODE.BACKEND_UNAVAILABLE);
+
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(1);
+
+    vi.advanceTimersByTime(2000);
+    await flushPromises();
+    expect(MockWebSocket.instances).toHaveLength(2);
+    expect(handlers.onStreamEnded).not.toHaveBeenCalled();
+    expect(handlers.onAuthFailure).not.toHaveBeenCalled();
+  });
+
+  it("does not report a stream end for an abnormal close that reconnects", async () => {
+    const handlers = callbacks();
+
+    connectToRun("run-1", vi.fn().mockResolvedValue("ticket-1"), handlers);
+    await flushPromises();
+    MockWebSocket.instances[0].open();
+
+    MockWebSocket.instances[0].closeWith(1006);
+
+    expect(handlers.onDisconnected).toHaveBeenCalledTimes(1);
+    expect(handlers.onStreamEnded).not.toHaveBeenCalled();
+  });
+
+  it("does not report a stream end for the run-unavailable refusal", async () => {
+    const handlers = callbacks();
+
+    connectToRun("missing-run", vi.fn().mockResolvedValue("ticket-1"), handlers);
+    await flushPromises();
+
+    MockWebSocket.instances[0].closeWith(4004);
+
+    expect(handlers.onRunUnavailable).toHaveBeenCalledTimes(1);
+    expect(handlers.onStreamEnded).not.toHaveBeenCalled();
+  });
+
+  it("does not report a stream end when the caller closes the connection itself", async () => {
+    const handlers = callbacks();
+
+    const connection = connectToRun("run-1", vi.fn().mockResolvedValue("ticket-1"), handlers);
+    await flushPromises();
+    MockWebSocket.instances[0].open();
+
+    connection.close();
+
+    expect(handlers.onStreamEnded).not.toHaveBeenCalled();
+  });
+});

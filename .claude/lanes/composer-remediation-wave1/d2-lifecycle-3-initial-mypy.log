@@ -1,0 +1,5 @@
+src/elspeth/composer_mcp/server.py:1105: error: Call to untyped function "main" in typed context  [no-untyped-call]
+src/elspeth/composer_mcp/standalone.py:50: error: Need type annotation for "task"  [var-annotated]
+src/elspeth/composer_mcp/standalone.py:50: error: Argument 1 to "create_task" has incompatible type "Awaitable[None]"; expected "Coroutine[Any, Any, Never]"  [arg-type]
+pyproject.toml: note: unused section(s): module = ['claude_agent_sdk', 'claude_agent_sdk.*', 'dynaconf', 'dynaconf.*', 'elspeth.tui.*', 'examples.*', 'ijson.*', 'pypdfium2', 'pypdfium2.*', 'pypdfium2_raw', 'pypdfium2_raw.*', 'scripts.*', 'tests.*']
+Found 3 errors in 2 files (checked 6 source files)

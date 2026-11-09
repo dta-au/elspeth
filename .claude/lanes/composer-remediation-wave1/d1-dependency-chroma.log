@@ -1,0 +1,220 @@
+Real Chroma ONNX cache: /workspace/elspeth/.claude/lanes/composer-remediation-wave1/runtime-deps/chroma/all-MiniLM-L6-v2
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 171 items
+
+tests/unit/plugins/infrastructure/clients/retrieval/test_chroma.py ..... [  2%]
+........................................................................ [ 45%]
+.............                                                            [ 52%]
+tests/integration/pipeline/test_rag_indexed_smoke.py ..                  [ 53%]
+tests/integration/pipeline/test_row_type_violation_routing.py .......... [ 59%]
+..F........
+
+=================================== FAILURES ===================================
+___ test_a_template_lookup_keyed_by_a_row_value_is_routed_without_that_value ___
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-173/test_a_template_lookup_keyed_b0')
+
+    def test_a_template_lookup_keyed_by_a_row_value_is_routed_without_that_value(tmp_path: Any) -> None:
+        """A template that computes a lookup key from the row fails the row, not the audit trail (RAG-F1).
+    
+        Jinja's own message quotes the key (``'dict object' has no attribute
+        '<the value>'``); before the shared renderer that text was the reason in
+        transform_errors, the FAILED node state and the pending error message.
+        The scan's one permitted hit, the row itself, is its positive control.
+        """
+        import json
+        import uuid
+    
+        import chromadb
+    
+        from elspeth.core.landscape.schema import transform_errors_table
+        from elspeth.plugins.transforms.rag.transform import RAGRetrievalTransform
+    
+        collection = f"template-key-routing-{uuid.uuid4().hex[:12]}"
+        chromadb.Client().get_or_create_collection(name=collection, metadata={"hnsw:space": "cosine"}).add(
+            documents=["Refunds are processed within 30 days."], ids=["doc-1"]
+        )
+        transform = RAGRetrievalTransform(
+            {
+                "output_prefix": "kb",
+                "query_field": "question",
+                "query_template": "{{ query }} {{ row[row.k] }}",
+                # A computed key is admitted only under the opt-out, the whole row (ADR-051).
+                "required_input_fields": [],
+                "provider": "chroma",
+                "provider_config": {"collection": collection, "mode": "ephemeral", "distance_function": "cosine"},
+                "schema_config": {"mode": "observed"},
+            }
+        )
+    
+        db = make_landscape_db()
+        row = {"id": 1, "question": "refunds", "k": _TEMPLATE_KEY_SENTINEL}
+        sinks, graph, settings, config = _build_pipeline(transform, row, on_error="quarantine")
+    
+>       result = Orchestrator(db).run(
+            config,
+            graph=graph,
+            settings=settings,
+            payload_store=FilesystemPayloadStore(tmp_path / "payloads"),
+            openrouter_catalog_sha256="0" * 64,
+            openrouter_catalog_source="bundled",
+        )
+
+tests/integration/pipeline/test_row_type_violation_routing.py:361: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/conftest.py:597: in wrapped_orch_run
+    return original_orch_run(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/engine/orchestrator/core.py:289: in run
+    return self._run_lifecycle.run(
+src/elspeth/engine/orchestrator/run_lifecycle.py:772: in run
+    raise failed_exc.original_error.with_traceback(failed_exc.original_traceback) from None
+src/elspeth/engine/orchestrator/leader_drain.py:216: in execute_run
+    loop_result = self._source_driver.run_main_processing_loop(
+src/elspeth/engine/orchestrator/source_iteration.py:887: in run_main_processing_loop
+    results = processor.process_row(
+src/elspeth/engine/processor.py:3008: in process_row
+    return self._drain_work_queue(initial_item, ctx, preclaimed=preclaimed)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/engine/processor.py:4035: in _drain_work_queue
+    return self._drain_durable_work_queue(initial_item, ctx, preclaimed=preclaimed)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/engine/processor.py:5143: in _drain_durable_work_queue
+    results = self._drain_scheduler_claims(
+src/elspeth/engine/processor.py:5294: in _drain_scheduler_claims
+    return self._scheduler_drain.drain_claims(
+src/elspeth/engine/scheduler_drain.py:639: in drain_claims
+    result, child_items = self._processor._process_single_token(
+src/elspeth/engine/processor.py:5470: in _process_single_token
+    return self._token_traversal.process_single_token(
+src/elspeth/engine/token_traversal.py:1271: in process_single_token
+    transform_outcome = self.handle_transform_node(
+src/elspeth/engine/token_traversal.py:155: in handle_transform_node
+    transform_result, current_token, error_sink = self._processor._execute_transform_with_retry(
+src/elspeth/engine/processor.py:2556: in _execute_transform_with_retry
+    return self._retry_manager.execute_with_retry(
+src/elspeth/engine/retry.py:127: in execute_with_retry
+    for attempt_state in Retrying(
+.venv/lib/python3.12/site-packages/tenacity/__init__.py:445: in __iter__
+    do = self.iter(retry_state=retry_state)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/tenacity/__init__.py:378: in iter
+    result = action(retry_state)
+             ^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/tenacity/__init__.py:400: in <lambda>
+    self._add_action_func(lambda rs: rs.outcome.result())
+                                     ^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:449: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/_base.py:401: in __get_result
+    raise self._exception
+src/elspeth/engine/retry.py:144: in execute_with_retry
+    return operation()
+           ^^^^^^^^^^^
+src/elspeth/engine/processor.py:2530: in execute_attempt
+    return self._transform_executor.execute_transform(
+src/elspeth/engine/executors/transform.py:946: in execute_transform
+    result = self._invoke_transform(
+src/elspeth/engine/executors/transform.py:627: in _invoke_transform
+    result = transform.process(token.row_data, ctx)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/plugins/transforms/rag/core.py:504: in process
+    query_result = self._query_builder.build(row)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/plugins/transforms/rag/query.py:103: in build
+    return self._build_template(extracted, row)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/plugins/transforms/rag/query.py:144: in _build_template
+    query = self._compiled_template.render(query=extracted, row=TemplateRow.project(row, self._row_projection))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/plugins/infrastructure/templates.py:1447: in render
+    return self._template.render(**context)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/plugins/infrastructure/templates.py:993: in render
+    return _run_template_worker(self._source, pickle.dumps(transport, protocol=5), value_free=self._value_free)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/plugins/infrastructure/templates.py:915: in _run_template_worker
+    entry = _start_worker(index)
+            ^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+index = 0
+
+    def _start_worker(index: int) -> tuple[Any, Any]:
+        """Spawn worker ``index`` and wait until it reports ready.
+    
+        The worker is registered before the wait, so a caller that fails here
+        retires it like any other worker whose exchange did not complete.
+        """
+        process_context = multiprocessing.get_context("spawn")
+        parent, child = process_context.Pipe(duplex=True)
+        process = cast("Any", process_context).Process(target=_template_worker, args=(child,))
+        process.daemon = True
+        # The child inherits this thread's signal mask: a stop signal during its
+        # interpreter start stays pending until the worker ignores it
+        # (``_template_worker``). multiprocessing starts its resource tracker on a
+        # process's first spawn and unblocks SIGINT and SIGTERM in this thread
+        # afterwards (bpo-33613), so it is started before the block, never inside it.
+        resource_tracker.ensure_running()
+        with _WORKER_SPAWN_LOCK:
+            if _INTERPRETER_EXITING.is_set():
+                parent.close()
+                child.close()
+                raise FrameworkBugError("A template render started after the interpreter began to exit")
+            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _RUN_STOP_SIGNALS)
+            try:
+                process.start()
+            except BaseException:
+                parent.close()
+                child.close()
+                raise
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            child.close()
+            _WORKERS[index] = (process, parent)
+        try:
+            if not parent.poll(_WORKER_START_TIMEOUT_SECONDS):
+>               raise FrameworkBugError(f"Template worker did not become ready within {_WORKER_START_TIMEOUT_SECONDS:g} s")
+E               elspeth.contracts.tier_registry.FrameworkBugError: Template worker did not become ready within 60 s
+
+src/elspeth/plugins/infrastructure/templates.py:880: FrameworkBugError
+----------------------------- Captured stdout call -----------------------------
+Real Chroma ONNX cache: /workspace/elspeth/.claude/lanes/composer-remediation-wave1/runtime-deps/chroma/all-MiniLM-L6-v2
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 171 items
+
+tests/unit/plugins/infrastructure/clients/retrieval/test_chroma.py ..... [  2%]
+........................................................................ [ 45%]
+.............                                                            [ 52%]
+tests/integration/pipeline/test_rag_indexed_smoke.py ..                  [ 53%]
+tests/integration/pipeline/test_row_type_violation_routing.py .......... [ 59%]
+..F...............................................
+=============================== warnings summary ===============================
+tests/integration/pipeline/test_rag_indexed_smoke.py::TestRAGIndexedSmoke::test_full_pipeline_sequence
+  /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/lib/python3.12/site-packages/typer/__init__.py:24: DeprecationWarning: 'click.utils.get_binary_stream' is deprecated and will be removed in Click 9.0.
+    from click.utils import get_binary_stream as get_binary_stream
+
+tests/integration/pipeline/test_rag_indexed_smoke.py::TestRAGIndexedSmoke::test_full_pipeline_sequence
+  /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/lib/python3.12/site-packages/typer/__init__.py:25: DeprecationWarning: 'click.utils.get_text_stream' is deprecated and will be removed in Click 9.0.
+    from click.utils import get_text_stream as get_text_stream
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/integration/pipeline/test_row_type_violation_routing.py::test_a_template_lookup_keyed_by_a_row_value_is_routed_without_that_value
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! KeyboardInterrupt !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/lib/python3.12/site-packages/sqlalchemy/sql/visitors.py:126: KeyboardInterrupt
+(to show a full traceback on KeyboardInterrupt use --full-trace)
+============= 1 failed, 112 passed, 2 warnings in 97.68s (0:01:37) =============

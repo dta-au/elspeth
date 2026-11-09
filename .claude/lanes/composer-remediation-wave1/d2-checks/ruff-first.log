@@ -1,0 +1,1162 @@
+I001 [*] Import block is un-sorted or un-formatted
+  --> src/elspeth/composer_mcp/server.py:11:1
+   |
+ 9 |   """
+10 |
+11 | / from __future__ import annotations
+12 | |
+13 | | import argparse
+14 | | import json
+15 | | import logging
+16 | | import time
+17 | | import uuid
+18 | | from collections.abc import Awaitable, Callable, Mapping
+19 | | from dataclasses import dataclass
+20 | | from datetime import UTC, datetime
+21 | | from pathlib import Path
+22 | | from typing import Any, TypedDict, cast
+23 | |
+24 | | from jsonschema import Draft202012Validator
+25 | | from mcp.server import Server
+26 | | from mcp.server.stdio import stdio_server
+27 | | from mcp.types import CallToolResult, TextContent, Tool
+28 | | from pydantic import BaseModel
+29 | |
+30 | | from elspeth.composer_mcp.audit import JsonlEventRecorder
+31 | | from elspeth.composer_mcp.session import (
+32 | |     InvalidSessionIdError,
+33 | |     SessionCheckout,
+34 | |     SessionCheckoutMismatchError,
+35 | |     SessionManager,
+36 | |     SessionNotFoundError,
+37 | |     _validate_session_id,
+38 | | )
+39 | | from elspeth.contracts.composer_audit import (
+40 | |     ComposerToolInvocation,
+41 | |     ComposerToolRecorder,
+42 | |     ComposerToolStatus,
+43 | |     ToolArgumentErrorCategory,
+44 | | )
+45 | | from elspeth.contracts.freeze import deep_thaw
+46 | | from elspeth.core.canonical import canonical_json, stable_hash
+47 | | from elspeth.web.async_workers import run_sync_in_worker
+48 | | from elspeth.web.catalog.policy_view import PolicyCatalogView
+49 | | from elspeth.web.catalog.protocol import CatalogService
+50 | | from elspeth.web.composer import yaml_generator
+51 | | from elspeth.web.composer.audit import build_canonicalization_sentinel
+52 | | from elspeth.web.composer.pipeline_proposal import composition_content_hash
+53 | | from elspeth.web.composer.protocol import ToolArgumentError
+54 | | from elspeth.web.composer.redaction import redact_source_storage_path
+55 | | from elspeth.web.composer.state import CompositionState, EdgeContractDict, PipelineMetadata, ValidationEntryDict
+56 | | from elspeth.web.composer.tools import (
+57 | |     _DISCOVERY_TOOLS,
+58 | |     _MUTATION_TOOLS,
+59 | |     RuntimePreflight,
+60 | |     _apply_merge_patch,
+61 | |     execute_tool,
+62 | |     get_tool_definitions,
+63 | |     validate_composer_file_sink_collision_policy,
+64 | | )
+65 | | from elspeth.web.composer.tools._dispatch import _validate_tool_arguments, require_arguments_conform_to_schema
+66 | | from elspeth.web.composer.yaml_generator import (
+67 | |     generate_public_composition_dict,
+68 | |     generate_public_yaml,
+69 | | )
+70 | | from elspeth.web.credential_guard import require_no_credential_material_for_tool, require_no_credential_material_in_state
+71 | | from elspeth.web.execution.preflight import runtime_preflight_settings_hash
+72 | | from elspeth.web.execution.runtime_preflight import (
+73 | |     RuntimePreflightCoordinator,
+74 | |     RuntimePreflightFailure,
+75 | |     RuntimePreflightKey,
+76 | | )
+77 | | from elspeth.web.execution.schemas import ValidationResult
+78 | | from elspeth.web.execution.validation import validate_pipeline
+79 | | from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+80 | | from elspeth.web.paths import McpConfiguredRootAuthority, require_mcp_root_context
+   | |__________________________________________________________________________________^
+81 |
+82 |   __all__ = ["create_server", "main"]
+   |
+help: Organize imports
+
+I001 [*] Import block is un-sorted or un-formatted
+   --> src/elspeth/web/composer/tools/_common.py:21:1
+    |
+ 19 |   """
+ 20 |
+ 21 | / from __future__ import annotations
+ 22 | |
+ 23 | | # Slice 4 — additional imports for shared validation/repair helpers.
+ 24 | | import json
+ 25 | | import re
+ 26 | | from collections.abc import Callable, Mapping, Sequence
+ 27 | | from dataclasses import dataclass, field, replace
+ 28 | | from enum import Enum
+ 29 | | from types import MappingProxyType
+ 30 | | from typing import Any, Final, Literal, NotRequired, TypedDict, cast
+ 31 | |
+ 32 | | from pydantic import BaseModel, ConfigDict, JsonValue
+ 33 | | from pydantic import ValidationError as PydanticValidationError
+ 34 | | from pydantic_core import ErrorDetails
+ 35 | | from sqlalchemy import Engine
+ 36 | |
+ 37 | | from elspeth.contracts.blobs_inline import is_widened_blob_ref
+ 38 | | from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+ 39 | | from elspeth.contracts.composer_interpretation import InterpretationKind
+ 40 | | from elspeth.contracts.emitted_option import emitted_option_values, env_placeholders_in
+ 41 | | from elspeth.contracts.errors import AuditIntegrityError
+ 42 | | from elspeth.contracts.freeze import deep_thaw, freeze_fields
+ 43 | | from elspeth.contracts.hashing import canonical_json, stable_hash
+ 44 | | from elspeth.contracts.plugin_capabilities import PluginCapability
+ 45 | | from elspeth.contracts.plugin_protocols import PluginConfigProtocol
+ 46 | | from elspeth.contracts.secrets import WebSecretResolver
+ 47 | | from elspeth.contracts.session_operation import SessionOperationContext
+ 48 | | from elspeth.contracts.sink import FILE_SINK_PLUGINS, FILE_SINK_REPAIR_EXTENSIONS
+ 49 | | from elspeth.contracts.trust_boundary import observation_boundary
+ 50 | | from elspeth.core.config import TriggerConfig
+ 51 | | from elspeth.core.secrets import (
+ 52 | |     collect_credential_field_violations,
+ 53 | |     collect_disallowed_secret_ref_markers,
+ 54 | |     parse_secret_ref_marker,
+ 55 | |     redact_secret_refs_for_validation,
+ 56 | | )
+ 57 | | from elspeth.engine.orchestrator.preflight import check_config_value_sources
+ 58 | | from elspeth.plugins.infrastructure.config_base import PluginConfig, PluginConfigError
+ 59 | | from elspeth.plugins.infrastructure.validation import (
+ 60 | |     UnknownPluginTypeError,
+ 61 | |     get_sink_config_model,
+ 62 | |     get_source_config_model,
+ 63 | |     get_transform_config_model,
+ 64 | | )
+ 65 | | from elspeth.web.catalog.policy_view import PolicyCatalogView
+ 66 | | from elspeth.web.catalog.protocol import CatalogService, PluginKind
+ 67 | | from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+ 68 | | from elspeth.web.composer._producer_resolver import published_success_connection
+ 69 | | from elspeth.web.composer._validation_probe import is_inline_content_reference
+ 70 | | from elspeth.web.composer.plugin_policy_disclosure import (
+ 71 | |     WEB_PROHIBITED_PLUGIN_EXPLANATION,
+ 72 | |     ProhibitedPluginDisclosure,
+ 73 | |     prohibited_plugin_section,
+ 74 | | )
+ 75 | | from elspeth.web.composer.protocol import ToolArgumentError
+ 76 | | from elspeth.web.composer.redaction import redact_source_storage_path
+ 77 | | from elspeth.web.composer.state import (
+ 78 | |     CandidateReviewReferenceFacts,
+ 79 | |     CompositionState,
+ 80 | |     EdgeSpec,
+ 81 | |     NodeSpec,
+ 82 | |     NodeType,
+ 83 | |     OutputSpec,
+ 84 | |     PipelineMetadata,
+ 85 | |     SourceSpec,
+ 86 | |     ValidationEntry,
+ 87 | |     ValidationSummary,
+ 88 | |     _coalesce_branch_connections,
+ 89 | |     _coalesce_branch_names,
+ 90 | |     _serialize_branches,
+ 91 | | )
+ 92 | | from elspeth.web.composer.tool_result_envelope import APPLIED_COMPONENT_KEYS, ValidationGuidance
+ 93 | | from elspeth.web.execution.schemas import ValidationResult
+ 94 | | from elspeth.web.interpretation_state import (
+ 95 | |     INTERPRETATION_REQUIREMENTS_KEY,
+ 96 | |     REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
+ 97 | |     SOURCE_AUTHORING_KEY,
+ 98 | |     SOURCE_COMPONENT_ID,
+ 99 | |     InterpretationRequirement,
+100 | |     ServerStagedRequiredControlUserTerm,
+101 | |     UnknownInterpretationRequirementError,
+102 | |     composer_pipeline_decision_user_term_error,
+103 | |     parse_interpretation_requirements,
+104 | |     project_planner_context_interpretation_requirement,
+105 | |     prompt_review_draft_from_options,
+106 | |     resolved_review_evidence_is_coherent,
+107 | |     serialize_authoring_review_options,
+108 | |     source_name_from_component_id,
+109 | |     strip_authoring_options,
+110 | | )
+111 | | from elspeth.web.paths import (
+112 | |     McpConfiguredRootAuthority,
+113 | |     is_local_path_value,
+114 | |     require_mcp_root_context,
+115 | |     NESTED_LOCAL_PATH_OPTION_KEYS,
+116 | |     SINK_LOCAL_PATH_OPTION_KEYS,
+117 | |     SOURCE_LOCAL_PATH_OPTION_KEYS,
+118 | |     allowed_sink_directories,
+119 | |     allowed_source_directories,
+120 | |     resolve_data_path,
+121 | |     resolve_sink_data_path,
+122 | | )
+123 | | from elspeth.web.plugin_policy.coverage import transform_plugin_has_capability
+124 | | from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
+125 | | from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error
+126 | | from elspeth.web.secrets.ref_policy import (
+127 | |     allowed_secret_ref_fields,
+128 | |     allowed_secret_ref_fields_text,
+129 | | )
+130 | | from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
+131 | | from elspeth.web.sessions.protocol import SessionOperationAuthority
+132 | | from elspeth.web.validation import (
+133 | |     INTERPRETATION_PLACEHOLDER_RE,
+134 | | )
+    | |_^
+    |
+help: Organize imports
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> src/elspeth/web/composer/tools/_dispatch.py:18:1
+   |
+16 |   """
+17 |
+18 | / from __future__ import annotations
+19 | |
+20 | | import asyncio
+21 | | from collections.abc import Mapping
+22 | | from dataclasses import replace
+23 | | from typing import Any, Final, cast
+24 | |
+25 | | from jsonschema import Draft202012Validator
+26 | | from jsonschema.exceptions import ValidationError
+27 | | from sqlalchemy import Engine
+28 | |
+29 | | from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+30 | | from elspeth.contracts.freeze import deep_freeze, deep_thaw
+31 | | from elspeth.contracts.secrets import WebSecretResolver
+32 | | from elspeth.contracts.session_operation import SessionOperationContext
+33 | | from elspeth.web.catalog.policy_view import PolicyCatalogView
+34 | | from elspeth.web.paths import McpConfiguredRootAuthority
+35 | | from elspeth.web.composer.protocol import (
+36 | |     REQUEST_INTERPRETATION_REVIEW_KIND_VALUES,
+37 | |     SCHEMA_VIOLATION_MAX_LOC_DEPTH,
+38 | |     SchemaViolation,
+39 | |     SchemaViolationCode,
+40 | |     ToolArgumentError,
+41 | | )
+42 | | from elspeth.web.composer.state import (
+43 | |     CompositionState,
+44 | |     ValidationSummary,
+45 | | )
+46 | | from elspeth.web.composer.tools._common import (
+47 | |     ReviewedSourceAuthority,
+48 | |     RuntimePreflight,
+49 | |     ToolContext,
+50 | |     ToolHandler,
+51 | |     ToolResult,
+52 | |     _composition_canonical_interpretation_requirement_error,
+53 | |     _failure_result,
+54 | |     _saved_graph_rejection_result,
+55 | |     build_plugin_schemas_for_failure,
+56 | |     normalize_tool_result_validation,
+57 | | )
+58 | | from elspeth.web.composer.tools._registry import (
+59 | |     _BLOB_DISCOVERY_TOOLS,
+60 | |     _BLOB_MUTATION_TOOL_NAMES,
+61 | |     _BLOB_MUTATION_TOOLS,
+62 | |     _DISCOVERY_TOOLS,
+63 | |     _MUTATION_TOOL_NAMES,
+64 | |     _MUTATION_TOOLS,
+65 | |     _REGISTERED_TOOLS,
+66 | |     _SECRET_DISCOVERY_TOOLS,
+67 | |     _SECRET_MUTATION_TOOL_NAMES,
+68 | |     _SECRET_MUTATION_TOOLS,
+69 | |     _TOOL_DEFS_BY_NAME,
+70 | |     ASYNC_TOOL_EFFECTS,
+71 | |     resolve_tool_effects,
+72 | |     should_augment_with_plugin_schemas,
+73 | | )
+74 | | from elspeth.web.composer.tools.declarations import EffectDomain, ToolEffects
+75 | | from elspeth.web.composer.tools.discovery import _SESSION_AWARE_TOOL_NAMES
+76 | | from elspeth.web.composer.tools.generation import build_validation_guidance
+77 | | from elspeth.web.composer.tools.sessions import (
+78 | |     _SESSION_AWARE_TOOL_HANDLERS,
+79 | |     ADVISOR_TRIGGER_VALUES,
+80 | | )
+81 | | from elspeth.web.credential_guard import require_no_credential_material_for_tool
+82 | | from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+83 | | from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
+84 | | from elspeth.web.sessions.protocol import SessionOperationAuthority
+   | |___________________________________________________________________^
+85 |
+86 |   __all__ = [
+   |
+help: Organize imports
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> src/elspeth/web/composer/tools/outputs.py:3:1
+   |
+ 1 |   """Composer outputs plane — output (sink-instance) mutation handlers."""
+ 2 |
+ 3 | / from __future__ import annotations
+ 4 | |
+ 5 | | from dataclasses import replace
+ 6 | | from typing import Any
+ 7 | |
+ 8 | | from pydantic import BaseModel, ConfigDict
+ 9 | | from pydantic import ValidationError as PydanticValidationError
+10 | |
+11 | | from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+12 | | from elspeth.contracts.sink import FILE_SINK_PLUGIN_SLASH_TEXT
+13 | | from elspeth.web.composer.protocol import ToolArgumentError
+14 | | from elspeth.web.composer.redaction import (
+15 | |     PatchOutputOptionsArgumentsModel,
+16 | | )
+17 | | from elspeth.web.composer.state import (
+18 | |     CompositionState,
+19 | |     OutputSpec,
+20 | | )
+21 | | from elspeth.web.composer.tools._common import (
+22 | |     _path_policy_refusal_message,
+23 | |     _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+24 | |     _STEP_DESCRIPTION_DESCRIPTION,
+25 | |     FailureRouteChoiceError,
+26 | |     ToolContext,
+27 | |     ToolResult,
+28 | |     _apply_merge_patch,
+29 | |     _attach_post_call_hints,
+30 | |     _mutation_result,
+31 | |     _plugin_selection_violation,
+32 | |     _post_mutation_invariant_error,
+33 | |     _prevalidate_sink,
+34 | |     _saved_graph_credential_wiring_contract_failure,
+35 | |     _saved_graph_plugin_policy_failure,
+36 | |     _saved_graph_rejection_result,
+37 | |     _validate_mutation_arguments,
+38 | |     _validate_sink_path,
+39 | |     resolve_failure_route_choice,
+40 | |     validate_composer_file_sink_collision_policy,
+41 | | )
+42 | | from elspeth.web.composer.tools.declarations import (
+43 | |     ToolDeclaration,
+44 | |     ToolKind,
+45 | | )
+46 | | from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
+   | |___________________________________________________________________________________^
+   |
+help: Organize imports
+
+I001 [*] Import block is un-sorted or un-formatted
+   --> src/elspeth/web/composer/tools/sessions.py:3:1
+    |
+  1 |   """Composer sessions plane — pipeline-state and interpretation-review handlers."""
+  2 |
+  3 | / from __future__ import annotations
+  4 | |
+  5 | | from collections.abc import Awaitable, Callable, Mapping, Sequence
+  6 | | from dataclasses import dataclass, replace
+  7 | | from datetime import UTC, datetime
+  8 | | from types import MappingProxyType
+  9 | | from typing import Annotated, Any, Final, Literal, NotRequired, TypedDict, cast
+ 10 | | from uuid import UUID
+ 11 | |
+ 12 | | from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
+ 13 | | from pydantic import ValidationError as PydanticValidationError
+ 14 | |
+ 15 | | from elspeth.contracts.blobs import ALLOWED_MIME_TYPES
+ 16 | | from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+ 17 | | from elspeth.contracts.composer_interpretation import (
+ 18 | |     InterpretationChoice,
+ 19 | |     InterpretationEventRecord,
+ 20 | |     InterpretationKind,
+ 21 | |     InterpretationSource,
+ 22 | | )
+ 23 | | from elspeth.contracts.enums import OutputMode, is_llm_authored_creation_modality
+ 24 | | from elspeth.contracts.freeze import deep_thaw
+ 25 | | from elspeth.contracts.sink import FILE_SINK_PLUGIN_SLASH_TEXT
+ 26 | | from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+ 27 | | from elspeth.core.canonical import stable_hash
+ 28 | | from elspeth.web.composer.path_canonicalization import canonical_sink_local_paths
+ 29 | | from elspeth.web.composer.protocol import (
+ 30 | |     INTERPRETATION_RATE_CAP_PER_SESSION_DAY_EXPECTATION,
+ 31 | |     INTERPRETATION_RATE_CAP_PER_TERM_EXPECTATION,
+ 32 | |     LLM_PROMPT_REVIEW_DRAFT_EXPECTATION,
+ 33 | |     REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
+ 34 | |     REQUEST_INTERPRETATION_REVIEW_KIND_VALUES,
+ 35 | |     REQUEST_INTERPRETATION_REVIEW_KINDS,
+ 36 | |     SOURCE_DATA_CONTRACT_DEMAND_EXPECTATION,
+ 37 | |     SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION,
+ 38 | |     SOURCE_DATA_CONTRACT_DRAFT_MISMATCH_ACTUAL_TYPE,
+ 39 | |     SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION,
+ 40 | |     SOURCE_DATA_CONTRACT_MISSING_SOURCE_ACTUAL_TYPE,
+ 41 | |     SOURCE_DATA_CONTRACT_TARGET_EXPECTATION,
+ 42 | |     ToolArgumentError,
+ 43 | | )
+ 44 | | from elspeth.web.composer.redaction import (
+ 45 | |     SetPipelineArgumentsModel,
+ 46 | |     _OmittableString,
+ 47 | |     redact_source_storage_path,
+ 48 | | )
+ 49 | | from elspeth.web.composer.source_demand import (
+ 50 | |     build_source_data_contract_draft,
+ 51 | |     sample_header_for_source,
+ 52 | | )
+ 53 | | from elspeth.web.composer.state import (
+ 54 | |     CandidateReviewReferenceFacts,
+ 55 | |     CompositionState,
+ 56 | |     EdgeSpec,
+ 57 | |     NodeSpec,
+ 58 | |     NodeType,
+ 59 | |     OutputSpec,
+ 60 | |     PipelineMetadata,
+ 61 | |     SourceSpec,
+ 62 | |     _batch_aware_placement_error,
+ 63 | |     _batch_aware_required_input_fields_error,
+ 64 | |     _validate_gate_expression,
+ 65 | |     _validate_gate_route_parity,
+ 66 | |     queue_node_contract_error,
+ 67 | | )
+ 68 | | from elspeth.web.composer.tools._common import (
+ 69 | |     _path_policy_refusal_message,
+ 70 | |     _ECHOED_REVIEW_METADATA_NOTE,
+ 71 | |     _ECHOED_SOURCE_AUTHORING_NOTE,
+ 72 | |     _FULL_STATE_COMPONENT_ALIAS_SET,
+ 73 | |     _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+ 74 | |     _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+ 75 | |     _STEP_DESCRIPTION_DESCRIPTION,
+ 76 | |     FailureRouteChoiceError,
+ 77 | |     PluginPolicyViolation,
+ 78 | |     ReviewedSourceAuthority,
+ 79 | |     ToolContext,
+ 80 | |     ToolResult,
+ 81 | |     _candidate_credential_wiring_contract_failure,
+ 82 | |     _candidate_plugin_policy_failure,
+ 83 | |     _candidate_rejection_result,
+ 84 | |     _canonical_interpretation_requirement_error,
+ 85 | |     _canonicalize_authored_interpretation_requirements,
+ 86 | |     _composition_canonical_interpretation_requirement_error,
+ 87 | |     _discovery_result,
+ 88 | |     _failure_result,
+ 89 | |     _merged_component_rejection_result,
+ 90 | |     _missing_output_options_repair_error,
+ 91 | |     _mutation_result,
+ 92 | |     _normalize_echoed_interpretation_requirements,
+ 93 | |     _normalize_trusted_legacy_interpretation_requirements,
+ 94 | |     _options_with_default_llm_reviews,
+ 95 | |     _post_mutation_invariant_error,
+ 96 | |     _prevalidate_sink,
+ 97 | |     _prevalidate_source_for_context,
+ 98 | |     _prevalidate_transform_for_context,
+ 99 | |     _RejectionOperation,
+100 | |     _resolver_owned_interpretation_requirement_error,
+101 | |     _row_union_node_contract_error,
+102 | |     _runtime_owned_llm_option_error,
+103 | |     _serialize_full_pipeline_state,
+104 | |     _serialize_node,
+105 | |     _serialize_output,
+106 | |     _serialize_set_pipeline_arguments,
+107 | |     _serialize_source,
+108 | |     _validate_mutation_arguments,
+109 | |     _validate_plugin_name,
+110 | |     _validate_sink_path,
+111 | |     _validate_source_path,
+112 | |     _validate_transform_provider_config_path,
+113 | |     _validate_transform_provider_config_policy,
+114 | |     normalize_tool_result_validation,
+115 | |     rejected_component_prefix,
+116 | |     resolve_failure_route_choice,
+117 | |     review_reconciliation_failure_message,
+118 | |     validate_composer_file_sink_collision_policy,
+119 | | )
+120 | | from elspeth.web.composer.tools.blobs import (
+121 | |     _blob_create_payload,
+122 | |     _blob_creation_provenance,
+123 | |     _llm_authored_inline_prompt_surface_error,
+124 | |     _persist_prepared_blob_create,
+125 | |     _prepare_blob_create,
+126 | |     _PreparedBlobCreate,
+127 | | )
+128 | | from elspeth.web.composer.tools.declarations import (
+129 | |     GRAPH_EFFECTS,
+130 | |     EffectDomain,
+131 | |     ToolDeclaration,
+132 | |     ToolEffects,
+133 | |     ToolKind,
+134 | | )
+135 | | from elspeth.web.composer.tools.sources import (
+136 | |     _MIME_TO_SOURCE,
+137 | |     _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+138 | |     _delimiter_extra_for_csv_blob,
+139 | |     _drop_echoed_source_authoring,
+140 | |     _header_only_inline_csv_conflict,
+141 | |     _options_with_derived_guarantees,
+142 | |     _options_with_source_blob_review,
+143 | |     _planner_guarantee_stamp_error,
+144 | |     _reject_manual_source_authoring,
+145 | |     _reject_manual_source_blob_ref,
+146 | |     _reject_manual_source_blobs,
+147 | |     _resolve_source_blob,
+148 | |     _ResolvedSourceBlob,
+149 | |     _source_authoring_options,
+150 | |     _source_component_id,
+151 | | )
+152 | | from elspeth.web.composer.tools.state_responses import PIPELINE_STATE_RESPONSE_CONTRACT
+153 | | from elspeth.web.credential_guard import (
+154 | |     CREDENTIAL_REFUSAL_DETAIL,
+155 | |     CredentialMaterialRefused,
+156 | |     require_no_credential_material_in_state,
+157 | | )
+158 | | from elspeth.web.interpretation_state import (
+159 | |     BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX,
+160 | |     INTERPRETATION_REQUIREMENTS_KEY,
+161 | |     SOURCE_AUTHORING_KEY,
+162 | |     VAGUE_TERM_UNWIRED_PREFIX,
+163 | |     InterpretationReviewCapacityError,
+164 | |     UnknownInterpretationRequirementError,
+165 | |     composition_review_contract_error,
+166 | |     current_source_data_contract_demand,
+167 | |     interpretation_sites,
+168 | |     parse_interpretation_requirements,
+169 | |     prompt_review_draft_from_options,
+170 | |     reconcile_authoritative_reviews,
+171 | |     source_name_from_component_id,
+172 | |     transform_vague_term_site_tuples,
+173 | |     vague_term_wiring_count,
+174 | |     validate_pipeline_decision_node_semantics,
+175 | | )
+176 | | from elspeth.web.provider_config_policy import (
+177 | |     web_aws_s3_endpoint_url_policy_error,
+178 | | )
+179 | | from elspeth.web.sessions.protocol import InterpretationResolveError
+180 | | from elspeth.web.validation import (
+181 | |     _validate_accepted_value_content,
+182 | |     reject_credential_shaped_content,
+183 | | )
+    | |_^
+184 |
+185 |   ADVISOR_TRIGGER_PROACTIVE_SECURITY: Final[str] = "proactive_security_safety"
+    |
+help: Organize imports
+
+I001 [*] Import block is un-sorted or un-formatted
+   --> src/elspeth/web/composer/tools/sources.py:3:1
+    |
+  1 |   """Composer sources plane — source-spec tool handlers and source-from-blob bridge."""
+  2 |
+  3 | / from __future__ import annotations
+  4 | |
+  5 | | import codecs
+  6 | | import csv
+  7 | | import hashlib
+  8 | | import io
+  9 | | import json
+ 10 | | from collections.abc import Iterator, Mapping, Sequence
+ 11 | | from dataclasses import dataclass, replace
+ 12 | | from pathlib import Path
+ 13 | | from typing import Any, Final, Literal, TypedDict
+ 14 | | from uuid import UUID
+ 15 | |
+ 16 | | from pydantic import BaseModel, ConfigDict, Field
+ 17 | | from pydantic import ValidationError as PydanticValidationError
+ 18 | | from sqlalchemy import Engine, select
+ 19 | |
+ 20 | | from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+ 21 | | from elspeth.contracts.composer_interpretation import InterpretationKind
+ 22 | | from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
+ 23 | | from elspeth.contracts.errors import AuditIntegrityError
+ 24 | | from elspeth.contracts.freeze import deep_thaw, freeze_fields
+ 25 | | from elspeth.contracts.hashing import stable_hash
+ 26 | | from elspeth.contracts.trust_boundary import observation_boundary
+ 27 | | from elspeth.plugins.sources.blob_rows import _ROW_FIELDS as _BLOB_ROWS_ROW_FIELDS
+ 28 | | from elspeth.plugins.sources.field_normalization import declarable_field_name
+ 29 | | from elspeth.web.composer.authority_hashing import project_composer_authority_payload
+ 30 | | from elspeth.web.composer.inventory_response_contracts import PLUGIN_INVENTORY_RESPONSE_CONTRACT
+ 31 | | from elspeth.web.composer.protocol import ToolArgumentError
+ 32 | | from elspeth.web.composer.redaction import (
+ 33 | |     PatchSourceOptionsArgumentsModel,
+ 34 | |     SetSourceArgumentsModel,
+ 35 | |     SetSourceFromBlobArgumentsModel,
+ 36 | |     SetSourceFromBlobsArgumentsModel,
+ 37 | | )
+ 38 | | from elspeth.web.composer.source_inspection import (
+ 39 | |     SOURCE_INSPECTION_RESPONSE_CONTRACT,
+ 40 | |     delimiter_for_filename,
+ 41 | |     facts_to_dict,
+ 42 | |     inspect_blob_content,
+ 43 | |     inspect_csv_source_content,
+ 44 | | )
+ 45 | | from elspeth.web.composer.state import (
+ 46 | |     CompositionState,
+ 47 | |     SourceSpec,
+ 48 | |     validate_composer_source_name,
+ 49 | | )
+ 50 | | from elspeth.web.composer.tools._common import (
+ 51 | |     _path_policy_refusal_message,
+ 52 | |     _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
+ 53 | |     _SERVER_OWNED_SOURCE_OPTION_KEYS,
+ 54 | |     _SOURCE_BLOB_REF_OPTION_KEY,
+ 55 | |     _SOURCE_BLOBS_OPTION_KEY,
+ 56 | |     _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
+ 57 | |     _STEP_DESCRIPTION_DESCRIPTION,
+ 58 | |     EmptyToolArgumentsModel,
+ 59 | |     FailureRouteChoiceError,
+ 60 | |     ToolContext,
+ 61 | |     ToolResult,
+ 62 | |     _apply_merge_patch,
+ 63 | |     _attach_post_call_hints,
+ 64 | |     _canonical_interpretation_requirement_error,
+ 65 | |     _canonicalize_authored_interpretation_requirements,
+ 66 | |     _discovery_result,
+ 67 | |     _echoed_metadata_note,
+ 68 | |     _failure_result,
+ 69 | |     _mutation_result,
+ 70 | |     _normalize_echoed_interpretation_requirements,
+ 71 | |     _options_with_pending_requirement,
+ 72 | |     _pending_interpretation_requirement,
+ 73 | |     _plugin_selection_violation,
+ 74 | |     _prevalidate_source_for_context,
+ 75 | |     _prohibited_section,
+ 76 | |     _RejectionOperation,
+ 77 | |     _resolver_owned_interpretation_requirement_error,
+ 78 | |     _saved_graph_credential_wiring_contract_failure,
+ 79 | |     _saved_graph_plugin_policy_failure,
+ 80 | |     _saved_graph_rejection_result,
+ 81 | |     _source_review_requirement_id,
+ 82 | |     _validate_mutation_arguments,
+ 83 | |     _validate_source_path,
+ 84 | |     resolve_failure_route_choice,
+ 85 | |     review_reconciliation_failure_message,
+ 86 | | )
+ 87 | | from elspeth.web.composer.tools.blobs import (
+ 88 | |     BlobToolRecord,
+ 89 | |     _blob_id_uuid_validation_error,
+ 90 | |     _blob_row_to_tool_dict,
+ 91 | |     _locked_read_ready_blob,
+ 92 | |     _PreparedBlobCreate,
+ 93 | |     _sync_get_blob,
+ 94 | |     _verify_blob_content_hash,
+ 95 | | )
+ 96 | | from elspeth.web.composer.tools.declarations import (
+ 97 | |     ToolDeclaration,
+ 98 | |     ToolKind,
+ 99 | | )
+100 | | from elspeth.web.credential_guard import CREDENTIAL_REFUSAL_DETAIL, CredentialMaterialRefused, require_no_credential_material
+101 | | from elspeth.web.interpretation_state import (
+102 | |     SOURCE_AUTHORING_KEY,
+103 | |     SourceAuthoringMetadata,
+104 | |     reconcile_authoritative_reviews,
+105 | |     source_component_id,
+106 | | )
+107 | | from elspeth.web.provider_config_policy import (
+108 | |     web_aws_s3_endpoint_url_policy_error,
+109 | | )
+110 | | from elspeth.web.sessions.models import blobs_table
+    | |___________________________________________________^
+111 |
+112 |   _INSPECT_SOURCE_MAX_BYTES = 8 * 1024
+    |
+help: Organize imports
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> src/elspeth/web/composer/tools/transforms.py:3:1
+   |
+ 1 |   """Composer transforms plane — node, edge, and metadata graph-mutation handlers."""
+ 2 |
+ 3 | / from __future__ import annotations
+ 4 | |
+ 5 | | from collections.abc import Mapping, Sequence
+ 6 | | from dataclasses import replace
+ 7 | | from typing import Annotated, Any, Final, Literal, cast
+ 8 | |
+ 9 | | from pydantic import BaseModel, ConfigDict, Field, StrictFloat, TypeAdapter
+10 | | from pydantic import ValidationError as PydanticValidationError
+11 | |
+12 | | from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+13 | | from elspeth.contracts.enums import OutputMode
+14 | | from elspeth.core.config import RuntimeNodeName
+15 | | from elspeth.web.composer.inventory_response_contracts import PLUGIN_INVENTORY_RESPONSE_CONTRACT
+16 | | from elspeth.web.composer.protocol import ToolArgumentError
+17 | | from elspeth.web.composer.redaction import (
+18 | |     PatchNodeOptionsArgumentsModel,
+19 | |     SpliceTransformArgumentsModel,
+20 | |     _JsonInteger,
+21 | |     _NodeTriggerModel,
+22 | |     _OmittableString,
+23 | |     _StrictTimeoutSeconds,
+24 | | )
+25 | | from elspeth.web.composer.state import (
+26 | |     CoalesceBranches,
+27 | |     CompositionState,
+28 | |     EdgeSpec,
+29 | |     EdgeType,
+30 | |     NodeSpec,
+31 | |     NodeType,
+32 | |     SourceSpec,
+33 | |     ValidationEntry,
+34 | |     _batch_aware_placement_error,
+35 | |     _batch_aware_required_input_fields_error,
+36 | |     _validate_gate_expression,
+37 | |     _validate_gate_route_parity,
+38 | |     composer_component_kind,
+39 | |     edge_lowering_error,
+40 | |     queue_node_contract_error,
+41 | | )
+42 | | from elspeth.web.composer.tools._common import (
+43 | |     _path_policy_refusal_message,
+44 | |     _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+45 | |     _STEP_DESCRIPTION_DESCRIPTION,
+46 | |     EmptyToolArgumentsModel,
+47 | |     FailureRouteChoiceError,
+48 | |     ToolContext,
+49 | |     ToolResult,
+50 | |     _apply_merge_patch,
+51 | |     _attach_post_call_hints,
+52 | |     _canonical_interpretation_requirement_error,
+53 | |     _canonicalize_authored_interpretation_requirements,
+54 | |     _composition_canonical_interpretation_requirement_error,
+55 | |     _discovery_result,
+56 | |     _echoed_metadata_note,
+57 | |     _mutation_result,
+58 | |     _normalize_echoed_interpretation_requirements,
+59 | |     _options_with_default_llm_reviews,
+60 | |     _plugin_selection_violation,
+61 | |     _post_mutation_invariant_error,
+62 | |     _prevalidate_transform_for_context,
+63 | |     _prohibited_section,
+64 | |     _reserved_connection_names,
+65 | |     _row_union_node_contract_error,
+66 | |     _runtime_owned_llm_option_error,
+67 | |     _saved_graph_credential_wiring_contract_failure,
+68 | |     _saved_graph_plugin_policy_failure,
+69 | |     _saved_graph_rejection_result,
+70 | |     _validate_aggregation_trigger,
+71 | |     _validate_mutation_arguments,
+72 | |     _validate_transform_provider_config_path,
+73 | |     _validate_transform_provider_config_policy,
+74 | |     resolve_failure_route_choice,
+75 | |     review_reconciliation_failure_message,
+76 | | )
+77 | | from elspeth.web.composer.tools._naming_disclosure import _disclose_node_name_constraints
+78 | | from elspeth.web.composer.tools.blobs import _llm_authored_inline_prompt_surface_error
+79 | | from elspeth.web.composer.tools.declarations import (
+80 | |     ToolDeclaration,
+81 | |     ToolKind,
+82 | | )
+83 | | from elspeth.web.interpretation_state import (
+84 | |     INTERPRETATION_REQUIREMENTS_KEY,
+85 | |     PROMPT_TEMPLATE_PARTS_KEY,
+86 | |     approved_prompt_artifact_hash_from_options,
+87 | |     composition_review_contract_error,
+88 | |     reconcile_authoritative_reviews,
+89 | |     serialize_authoring_review_options,
+90 | | )
+   | |_^
+91 |
+92 |   _NODE_ROUTING_OPTION_PATCH_KEYS: Final[frozenset[str]] = frozenset({"input", "on_success", "on_error", "routes", "fork_to"})
+   |
+help: Organize imports
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> src/elspeth/web/execution/_validation_authoring.py:7:1
+   |
+ 5 |   """
+ 6 |
+ 7 | / from __future__ import annotations
+ 8 | |
+ 9 | | from collections.abc import Mapping, Sequence
+10 | | from dataclasses import dataclass
+11 | | from pathlib import Path
+12 | |
+13 | | from pydantic import TypeAdapter
+14 | | from pydantic import ValidationError as PydanticValidationError
+15 | |
+16 | | from elspeth.contracts.plugin_semantics import SemanticEdgeContract, SemanticOutcome, UnknownSemanticPolicy
+17 | | from elspeth.contracts.secrets import SecretRefPlacementViolation, SecretScope, WebSecretResolver
+18 | | from elspeth.contracts.trust_boundary import observation_boundary
+19 | | from elspeth.core.secrets import (
+20 | |     collect_credential_field_violations,
+21 | |     collect_disallowed_secret_ref_markers,
+22 | |     collect_secret_ref_marker_sites,
+23 | |     parse_secret_ref_marker,
+24 | |     secret_env_ref_name,
+25 | | )
+26 | | from elspeth.plugins.infrastructure.manager import http_fetch_transform_names
+27 | | from elspeth.web.catalog.protocol import CatalogService
+28 | | from elspeth.web.composer._semantic_validator import validate_semantic_contracts
+29 | | from elspeth.web.composer.state import (
+30 | |     CompositionState,
+31 | |     ValidationEntry,
+32 | |     _batch_aware_placement_error,
+33 | |     _batch_aware_required_input_fields_error,
+34 | |     _batch_distribution_profile_value_field_entries,
+35 | | )
+36 | | from elspeth.web.execution._semantic_helpers import (
+37 | |     assistance_suggestion_for,
+38 | |     semantic_affected_component_id,
+39 | |     semantic_component_attribution,
+40 | |     serialize_semantic_contracts,
+41 | | )
+42 | | from elspeth.web.execution._validation_materialization import _source_policy_component_id
+43 | | from elspeth.web.execution._validation_model import (
+44 | |     AuthoredValidatedState,
+45 | |     InterpretationValidatedState,
+46 | |     PhaseFailure,
+47 | |     PhaseReport,
+48 | |     PolicyLoweredState,
+49 | |     SecretValidatedState,
+50 | |     _blocked_readiness,
+51 | | )
+52 | | from elspeth.web.execution.schemas import (
+53 | |     CHECK_BATCH_TRANSFORM_OPTIONS,
+54 | |     CHECK_INTERPRETATION_REVIEW,
+55 | |     CHECK_OPERATOR_PROFILE_OPTIONS,
+56 | |     CHECK_OUTCOME_SECRET_REFS_NO_REFS,
+57 | |     CHECK_OUTCOME_SECRET_REFS_RESOLVED,
+58 | |     CHECK_OUTCOME_SECRET_REFS_SKIPPED_NO_SERVICE,
+59 | |     CHECK_OUTCOME_SECRET_REFS_UNRESOLVED,
+60 | |     CHECK_PATH_ALLOWLIST,
+61 | |     CHECK_PLUGIN_ENABLEMENT,
+62 | |     CHECK_REQUIRED_CONTROL_AVAILABILITY,
+63 | |     CHECK_REQUIRED_CONTROL_COVERAGE,
+64 | |     CHECK_SECRET_REFS,
+65 | |     CHECK_SEMANTIC_CONTRACTS,
+66 | |     CHECK_WEB_FETCH_RESOURCE_POLICY,
+67 | |     CHECK_WEB_SCRAPE_NETWORK_POLICY,
+68 | |     ValidationCheck,
+69 | |     ValidationCheckName,
+70 | |     ValidationError,
+71 | | )
+72 | | from elspeth.web.interpretation_state import (
+73 | |     INTERPRETATION_REVIEW_PENDING_CODE,
+74 | |     InterpretationReviewPending,
+75 | |     InterpretationReviewSite,
+76 | |     materialize_state_for_authoring,
+77 | |     materialize_state_for_execution,
+78 | | )
+79 | | from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+80 | | from elspeth.web.paths import McpConfiguredRootAuthority, is_local_path_value, require_mcp_root_context
+81 | | from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+82 | | from elspeth.web.plugin_policy.validation import PolicyValidationStage, validate_plugin_policy
+83 | | from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields, allowed_secret_ref_fields_text
+84 | | from elspeth.web.secrets.service import ScopedSecretResolver
+85 | | from elspeth.web.secrets.wiring_policy import SecretWiringPolicy, secret_wiring_authorization_error
+   | |___________________________________________________________________________________________________^
+86 |
+87 |   _PLUGIN_POLICY_CHECKS: tuple[tuple[PolicyValidationStage, ValidationCheckName], ...] = (
+   |
+help: Organize imports
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> src/elspeth/web/execution/_validation_materialization.py:7:1
+   |
+ 5 |   """
+ 6 |
+ 7 | / from __future__ import annotations
+ 8 | |
+ 9 | | from collections.abc import Callable, Collection, Mapping
+10 | | from dataclasses import dataclass
+11 | | from pathlib import Path
+12 | | from typing import Any, Final, Literal, cast
+13 | | from uuid import UUID
+14 | |
+15 | | import yaml
+16 | |
+17 | | from elspeth.contracts.blobs import AllowedMimeType, BlobNotFoundError, BlobRecord, BlobStateError
+18 | | from elspeth.contracts.blobs_inline import BlobContentResolutionError, BlobInlineRef, BlobInlineValidationViolation
+19 | | from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
+20 | | from elspeth.contracts.errors import PipelineLoweringError
+21 | | from elspeth.contracts.freeze import freeze_fields
+22 | | from elspeth.contracts.plugin_capabilities import PluginCapability
+23 | | from elspeth.core.blobs_inline import (
+24 | |     BLOB_INLINE_AGGREGATE_BYTE_CAP,
+25 | |     BLOB_INLINE_PER_REF_BYTE_CAP,
+26 | |     _discover_blob_content_refs,
+27 | |     _substitute_blob_content_refs_for_validation,
+28 | |     _validate_blob_content_refs_sync,
+29 | | )
+30 | | from elspeth.web.composer.state import CompositionState
+31 | | from elspeth.web.execution._validation_model import (
+32 | |     InterpretationValidatedState,
+33 | |     MaterializedYaml,
+34 | |     PhaseFailure,
+35 | |     PhaseReport,
+36 | |     _blocked_readiness,
+37 | |     _snapshot_materialized_evidence,
+38 | | )
+39 | | from elspeth.web.execution.preflight import resolve_runtime_yaml_paths
+40 | | from elspeth.web.execution.protocol import YamlGenerator
+41 | | from elspeth.web.paths import McpConfiguredRootAuthority
+42 | | from elspeth.web.execution.schemas import (
+43 | |     CHECK_AWS_S3_ENDPOINT_URL_POLICY,
+44 | |     CHECK_AWS_S3_SOURCE_POLICY,
+45 | |     CHECK_BLOB_INLINE_REFS,
+46 | |     CHECK_LLM_BASE_URL_POLICY,
+47 | |     CHECK_LLM_RETRY_BUDGET_POLICY,
+48 | |     CHECK_LLM_TRACING_POLICY,
+49 | |     ValidationCheck,
+50 | |     ValidationError,
+51 | | )
+52 | | from elspeth.web.plugin_policy.coverage import node_has_capability, source_has_capability
+53 | | from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
+54 | | from elspeth.web.provider_config_policy import (
+55 | |     web_aws_s3_endpoint_url_policy_error,
+56 | |     web_aws_s3_source_policy_error,
+57 | |     web_llm_base_url_policy_error,
+58 | |     web_llm_retry_budget_policy_error,
+59 | |     web_llm_tracing_policy_error,
+60 | | )
+   | |_^
+   |
+help: Organize imports
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> src/elspeth/web/execution/_validation_pipeline.py:3:1
+   |
+ 1 |   """Dependency carrier and runner for execution validation."""
+ 2 |
+ 3 | / from __future__ import annotations
+ 4 | |
+ 5 | | from collections.abc import Callable
+ 6 | | from dataclasses import dataclass
+ 7 | | from typing import Protocol
+ 8 | | from uuid import UUID
+ 9 | |
+10 | | from elspeth.contracts.blobs import BlobRecord
+11 | | from elspeth.contracts.secrets import WebSecretResolver
+12 | | from elspeth.web.catalog.protocol import CatalogService
+13 | | from elspeth.web.composer.state import CompositionState
+14 | | from elspeth.web.execution._validation_model import PhaseTermination
+15 | | from elspeth.web.execution._validation_runtime import (
+16 | |     _DictSettingsLoader,
+17 | |     _GraphBuilder,
+18 | |     _PluginInstantiator,
+19 | |     _RouteValidator,
+20 | |     _YamlLoader,
+21 | |     _YamlSettingsLoader,
+22 | | )
+23 | | from elspeth.web.execution.protocol import ValidationSettings, YamlGenerator
+24 | | from elspeth.web.execution.schemas import ValidationResult
+25 | | from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+26 | | from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+27 | | from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
+28 | | from elspeth.web.paths import McpConfiguredRootAuthority
+   | |________________________________________________________^
+   |
+help: Organize imports
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> src/elspeth/web/execution/preflight.py:3:1
+   |
+ 1 |   """Shared runtime preflight helpers for web validation and execution."""
+ 2 |
+ 3 | / from __future__ import annotations
+ 4 | |
+ 5 | | import hashlib
+ 6 | | import json
+ 7 | | from collections.abc import Callable, Iterator, Mapping, MutableMapping
+ 8 | | from contextlib import contextmanager
+ 9 | | from dataclasses import dataclass
+10 | | from pathlib import Path
+11 | | from typing import Any, cast
+12 | |
+13 | | import yaml
+14 | | from sqlalchemy.engine import make_url
+15 | | from sqlalchemy.exc import ArgumentError
+16 | |
+17 | | from elspeth.contracts import SinkProtocol
+18 | | from elspeth.contracts.aws_s3 import S3_PROFILED_AUDIT_SAFE_OPTION_NAMES, S3ProfiledAuditIdentities
+19 | | from elspeth.contracts.aws_textract import TEXTRACT_PROFILED_AUDIT_SAFE_OPTION_NAMES, TextractProfiledAuditIdentities
+20 | | from elspeth.contracts.freeze import deep_thaw
+21 | | from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
+22 | | from elspeth.contracts.trust_boundary import trust_boundary
+23 | | from elspeth.core.config import (
+24 | |     AggregationSettings,
+25 | |     CollectorSettings,
+26 | |     ElspethSettings,
+27 | |     TransformSettings,
+28 | |     load_bounded_pipeline_yaml,
+29 | |     resolve_config,
+30 | | )
+31 | | from elspeth.core.dag.graph import ExecutionGraph
+32 | | from elspeth.plugins.infrastructure.config_base import PluginConfigError
+33 | | from elspeth.plugins.infrastructure.runtime_factory import (
+34 | |     PluginBundle,
+35 | |     instantiate_plugins_from_config,
+36 | |     make_sink_factory,
+37 | | )
+38 | | from elspeth.web.execution import schemas as execution_schemas
+39 | | from elspeth.web.execution.protocol import ValidationSettings
+40 | | from elspeth.web.paths import (
+41 | |     McpConfiguredRootAuthority,
+42 | |     require_mcp_root_context,
+43 | |     NESTED_LOCAL_PATH_OPTION_KEYS,
+44 | |     SINK_LOCAL_PATH_OPTION_KEYS,
+45 | |     SOURCE_LOCAL_PATH_OPTION_KEYS,
+46 | |     resolve_data_path,
+47 | |     resolve_sink_data_path,
+48 | | )
+49 | | from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginKind
+   | |_____________________________________________________________________________________________^
+50 |
+51 |   RUNTIME_CHECK_PLUGIN_INSTANTIATION = execution_schemas.RUNTIME_CHECK_PLUGIN_INSTANTIATION
+   |
+help: Organize imports
+
+I001 [*] Import block is un-sorted or un-formatted
+   --> src/elspeth/web/execution/validation.py:24:1
+    |
+ 22 |   """
+ 23 |
+ 24 | / from __future__ import annotations
+ 25 | |
+ 26 | | from collections.abc import Callable, Mapping, Sequence
+ 27 | | from dataclasses import dataclass
+ 28 | | from pathlib import Path
+ 29 | | from typing import TYPE_CHECKING, Any, cast
+ 30 | | from uuid import UUID
+ 31 | |
+ 32 | | from elspeth.config_loading import load_settings_from_config_dict, load_settings_from_yaml_string
+ 33 | | from elspeth.contracts.blobs import BlobRecord
+ 34 | | from elspeth.contracts.freeze import deep_thaw, freeze_fields
+ 35 | | from elspeth.contracts.secrets import WebSecretResolver
+ 36 | | from elspeth.contracts.trust_boundary import observation_boundary
+ 37 | | from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml
+ 38 | | from elspeth.core.dag.graph import ExecutionGraph
+ 39 | | from elspeth.core.dag.models import EdgeContractError
+ 40 | | from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
+ 41 | | from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
+ 42 | | from elspeth.web.composer.state import (
+ 43 | |     CompositionState,
+ 44 | | )
+ 45 | | from elspeth.web.composer.yaml_generator import LoweredPipelineDocument
+ 46 | | from elspeth.web.config import WebSettings
+ 47 | | from elspeth.web.execution._validation_authoring import (
+ 48 | |     _DEFAULT_PLUGIN_POLICY_SUGGESTION as _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION,
+ 49 | | )
+ 50 | | from elspeth.web.execution._validation_authoring import (
+ 51 | |     _collect_secret_refs as _collect_secret_refs,
+ 52 | | )
+ 53 | | from elspeth.web.execution._validation_authoring import (
+ 54 | |     lower_plugin_policy,
+ 55 | |     review_interpretations,
+ 56 | |     validate_batch_options,
+ 57 | |     validate_path_policy,
+ 58 | |     validate_secret_evidence,
+ 59 | |     validate_semantic_evidence,
+ 60 | |     validate_web_network_policy,
+ 61 | |     validate_web_resource_policy,
+ 62 | | )
+ 63 | | from elspeth.web.execution._validation_diagnostics import (
+ 64 | |     _build_edge_contract_suggestion_with_resolver,
+ 65 | |     _edge_patch_target_for_node_id,
+ 66 | |     _find_gate_fan_out_advisories,
+ 67 | |     _find_identity_node_advisories,
+ 68 | |     _find_static_llm_prompt_advisories,
+ 69 | |     _format_edge_contract_message,
+ 70 | |     _graph_warning_to_validation_warning,
+ 71 | |     _reframe_settings_missing_parts,
+ 72 | | )
+ 73 | | from elspeth.web.execution._validation_diagnostics import (
+ 74 | |     _infer_component_type_from_plugin_error as _infer_component_type_from_plugin_error,
+ 75 | | )
+ 76 | | from elspeth.web.execution._validation_ledger import ValidationLedger
+ 77 | | from elspeth.web.execution._validation_materialization import (
+ 78 | |     materialize_validation_yaml,
+ 79 | |     validate_aws_s3_endpoint_url_policy,
+ 80 | |     validate_aws_s3_source_policy,
+ 81 | |     validate_llm_base_url_policy,
+ 82 | |     validate_llm_retry_budget_policy,
+ 83 | |     validate_llm_tracing_policy,
+ 84 | | )
+ 85 | | from elspeth.web.execution._validation_model import (
+ 86 | |     AuthoredValidatedState,
+ 87 | |     InterpretationValidatedState,
+ 88 | |     PhaseFailure,
+ 89 | |     PhaseReport,
+ 90 | |     _blocked_readiness,
+ 91 | | )
+ 92 | | from elspeth.web.execution._validation_pipeline import ValidationDependencies, ValidationPipeline
+ 93 | | from elspeth.web.execution._validation_runtime import (
+ 94 | |     _GraphBuilder,
+ 95 | |     build_gate_fan_out_advisory_checks,
+ 96 | |     build_identity_advisory_checks,
+ 97 | |     build_static_llm_prompt_advisory_checks,
+ 98 | |     load_runtime_settings,
+ 99 | |     validate_graph_structure,
+100 | |     validate_route_targets,
+101 | |     validate_runtime_plugins,
+102 | |     validate_schema_compatibility,
+103 | |     validate_value_source_compliance,
+104 | | )
+105 | | from elspeth.web.execution.preflight import (
+106 | |     RUNTIME_CHECK_GRAPH_STRUCTURE,
+107 | |     RUNTIME_CHECK_PLUGIN_INSTANTIATION,
+108 | |     RUNTIME_CHECK_SCHEMA_COMPATIBILITY,
+109 | |     RUNTIME_GRAPH_VALIDATION_CHECKS,
+110 | |     _audit_safe_plugin_configs,
+111 | |     _profiled_plugin_ids,
+112 | |     build_runtime_graph,
+113 | |     instantiate_runtime_plugins,
+114 | |     resolve_runtime_yaml_paths,
+115 | | )
+116 | | from elspeth.web.execution.protocol import ValidationSettings, YamlGenerator
+117 | | from elspeth.web.paths import McpConfiguredRootAuthority, require_mcp_root_context
+118 | | from elspeth.web.execution.schemas import (
+119 | |     CHECK_INTERPRETATION_REVIEW,
+120 | |     CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
+121 | |     CHECK_SETTINGS,
+122 | |     CHECK_VALUE_SOURCE_COMPLIANCE,
+123 | |     VALIDATION_BLOCKING_CHECK_NAMES,
+124 | |     SemanticEdgeContractResponse,
+125 | |     ValidationCheck,
+126 | |     ValidationError,
+127 | |     ValidationReadiness,
+128 | |     ValidationResult,
+129 | | )
+130 | | from elspeth.web.interpretation_state import (
+131 | |     INTERPRETATION_REVIEW_DRIFT_CODE,
+132 | |     SOURCE_DATA_CONTRACT_ANALYSIS_LIMIT_CODE,
+133 | |     InterpretationReviewCapacityError,
+134 | |     InterpretationReviewIntegrityError,
+135 | |     InterpretationReviewPending,
+136 | |     materialize_state_for_authoring,
+137 | |     materialize_state_for_execution,
+138 | | )
+139 | | from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginSnapshotAuthority
+140 | | from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+141 | | from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
+    | |________________________________________________________________^
+142 |
+143 |   _CHECK_SETTINGS = CHECK_SETTINGS
+    |
+help: Organize imports
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> tests/unit/composer_mcp/test_configured_root_admission.py:8:1
+   |
+ 6 |   """
+ 7 |
+ 8 | / from __future__ import annotations
+ 9 | |
+10 | | import json
+11 | | import asyncio
+12 | | from copy import deepcopy
+13 | | from dataclasses import dataclass
+14 | | from pathlib import Path
+15 | | from typing import Any
+16 | |
+17 | | import pytest
+18 | | from mcp.server import Server
+19 | | from mcp.types import CallToolRequest, CallToolRequestParams, CallToolResult, TextContent
+20 | |
+21 | | from elspeth.composer_mcp.server import _build_stdio_server, create_server
+22 | | from elspeth.composer_mcp.session import SessionManager
+23 | | from elspeth.web.composer.pipeline_proposal import composition_content_hash
+24 | | from elspeth.web.composer.state import CompositionState
+25 | | from elspeth.web.dependencies import create_catalog_service
+26 | | from elspeth.web.composer.tools._common import ToolContext
+27 | | from elspeth.web.catalog.policy_view import PolicyCatalogView
+28 | | from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+29 | | from elspeth.web.paths import McpConfiguredRootAuthority
+30 | | from elspeth.web.execution.runtime_preflight import RuntimePreflightCoordinator
+31 | | from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
+32 | | from elspeth.web.composer import yaml_generator
+33 | | from elspeth.web.execution._validation_materialization import materialize_validation_yaml
+34 | | from elspeth.web.execution._validation_model import PhaseReport
+35 | | from elspeth.web.execution.validation import _compiled_identity_settings
+36 | | from tests.unit.web.execution.test_validation_materialization import _interpretation
+37 | | import yaml
+38 | | from tests.unit.web.composer.test_splice_transform_tool import _state as _linear_state
+   | |______________________________________________________________________________________^
+   |
+help: Organize imports
+
+Found 13 errors.
+[*] 13 fixable with the `--fix` option.

@@ -1,0 +1,223 @@
+import { type JSX, useMemo, useState } from "react";
+import { ValidationResultBanner } from "@/components/execution/ValidationResult";
+import { Button } from "@/components/ui";
+import { stepLabelForNodeId } from "@/components/chat/interpretationStepLabel";
+import { useComposer } from "@/hooks/useComposer";
+import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
+import { applySuggestionPrompt } from "@/lib/suggestionPrompts";
+import { humaniseValidationSuggestion, makePhraseFor } from "@/lib/validationHumaniser";
+import { useExecutionStore } from "@/stores/executionStore";
+import { useSessionStore } from "@/stores/sessionStore";
+import {
+  COMPOSE_LOADING_SESSION_MESSAGE,
+} from "@/config/composer";
+import type { CompositionState, ValidationEntryDTO } from "@/types/index";
+import {
+  sortedSourceEntries,
+  sourceComponentId,
+} from "@/utils/compositionState";
+
+interface SuggestionListProps {
+  suggestions: ValidationEntryDTO[];
+  phraseFor: (componentId: string | null) => string;
+  stepLabelFor: (componentId: string) => string | null;
+}
+
+function SuggestionList({
+  suggestions,
+  phraseFor,
+  stepLabelFor,
+}: SuggestionListProps): JSX.Element {
+  const { sendMessage, isComposing } = useComposer();
+  const composeTimeoutReady = useSessionStore((s) => s.compositionStateLoaded);
+  const applyDisabled = isComposing || !composeTimeoutReady;
+  const composeGateReason = COMPOSE_LOADING_SESSION_MESSAGE;
+  const [expanded, setExpanded] = useState(suggestions.length <= 2);
+
+  function handleApply(suggestion: ValidationEntryDTO): void {
+    if (applyDisabled) return;
+    // Shared with the chat's DecisionPanel (elspeth-cb0d4b8dba) so both
+    // surfaces send the byte-identical prompt.
+    void sendMessage(applySuggestionPrompt(suggestion));
+  }
+
+  function handleKeyDown(event: React.KeyboardEvent): void {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      setExpanded((prev) => !prev);
+    }
+  }
+
+  // Humanise once per suggestion (elspeth-27efd1e801): the raw dump moves
+  // behind a Technical-details disclosure rendered OUTSIDE the <ul> — a
+  // <details> nested inside a list item still contributes its (closed)
+  // content to the list's textContent, so a reader that only wants the
+  // list's own words would still see the raw dump. Keeping the disclosure a
+  // sibling of the list, not a descendant, is what keeps it out.
+  //
+  // Splitting the row from its disclosure loses the DOM containment that
+  // would otherwise tie them together, so each pair gets an explicit
+  // association (review round 1): a stable per-row id feeds the Apply
+  // button's aria-describedby, and the <summary> carries a per-row
+  // humanised label (never the raw component id) — with 2+ suggestions
+  // carrying raw text, an assistive-tech user needs both the announced
+  // link AND a visually distinguishing label to tell whose dump is whose.
+  const humanisedSuggestions = suggestions.map((s, i) => {
+    const finding = humaniseValidationSuggestion(s, phraseFor, stepLabelFor);
+    return {
+      suggestion: s,
+      finding,
+      technicalId: finding.raw !== null ? `side-rail-suggestion-technical-${i}` : undefined,
+    };
+  });
+  const hasTechnicalDetails = humanisedSuggestions.some(
+    ({ finding }) => finding.raw !== null,
+  );
+
+  return (
+    <div className="side-rail-suggestion-banner">
+      <div
+        className="side-rail-suggestion-header"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        onClick={() => setExpanded((prev) => !prev)}
+        onKeyDown={handleKeyDown}
+      >
+        <span>Suggestions ({suggestions.length})</span>
+        <span className="side-rail-suggestion-chevron">
+          {expanded ? "▴" : "▾"}
+        </span>
+      </div>
+      {expanded && !isComposing && !composeTimeoutReady && (
+        <div role="status" className="side-rail-suggestion-connecting">{composeGateReason}</div>
+      )}
+      {expanded && (
+        <ul className="side-rail-suggestion-list" aria-label="Suggestions">
+          {humanisedSuggestions.map(({ suggestion: s, finding, technicalId }, i) => (
+            <li key={i} className="side-rail-suggestion-item">
+              <span className="side-rail-suggestion-item-text">
+                <strong>{phraseFor(s.component)}:</strong> {finding.headline}
+              </span>
+              <Button
+                variant="bare"
+                className="side-rail-suggestion-apply-btn"
+                disabled={applyDisabled}
+                title={
+                  !isComposing && !composeTimeoutReady
+                    ? composeGateReason
+                    : undefined
+                }
+                aria-describedby={technicalId}
+                onClick={() => handleApply(s)}
+              >
+                {isComposing ? "Applying..." : "Apply"}
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {expanded && hasTechnicalDetails && (
+        <div className="side-rail-suggestion-technical">
+          {humanisedSuggestions.map(({ suggestion: s, finding, technicalId }, i) =>
+            finding.raw !== null ? (
+              <details key={i} id={technicalId} className="validation-banner-technical">
+                <summary>Technical details — {phraseFor(s.component)}</summary>
+                <pre>{finding.raw}</pre>
+              </details>
+            ) : null,
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function buildValidationComponentNames(
+  compositionState: CompositionState | null,
+): Record<string, string> {
+  if (!compositionState) {
+    return {};
+  }
+
+  const componentNames: Record<string, string> = {};
+  for (const [sourceName] of sortedSourceEntries(compositionState)) {
+    componentNames[sourceComponentId(sourceName)] = `source:${sourceName}`;
+  }
+  for (const node of compositionState.nodes) {
+    componentNames[node.id] = `${node.node_type}:${node.id}`;
+  }
+  for (const output of compositionState.outputs) {
+    componentNames[output.name] = `sink:${output.name}`;
+  }
+  return componentNames;
+}
+
+interface ComponentNavigationProps {
+  onSelectComponent?: (componentId: string) => void;
+}
+
+export function SideRailValidationBanner({
+  onSelectComponent,
+}: ComponentNavigationProps = {}): JSX.Element | null {
+  const compositionState = useSessionStore((s) => s.compositionState);
+  const validationResult = useExecutionStore((s) => s.validationResult);
+  const error = useExecutionStore((s) => s.error);
+  const suggestions = compositionState?.validation_suggestions ?? [];
+  const validationComponentNames =
+    buildValidationComponentNames(compositionState);
+  // Shared with SuggestionList (elspeth-27efd1e801) so its suggestion rows
+  // name components and phrase messages identically to the ValidationResult
+  // banner above it — hooks must run before the early-return below.
+  const phraseFor = useMemo(() => makePhraseFor(compositionState), [compositionState]);
+  const stepLabelFor = (componentId: string): string | null =>
+    stepLabelForNodeId(compositionState, componentId);
+
+  if (!error && !validationResult && suggestions.length === 0) {
+    return null;
+  }
+
+  function handleValidationComponentClick(componentId: string): void {
+    if (
+      Object.prototype.hasOwnProperty.call(
+        validationComponentNames,
+        componentId,
+      )
+    ) {
+      if (onSelectComponent !== undefined) {
+        onSelectComponent(componentId);
+        return;
+      }
+      useSessionStore.getState().selectNode(componentId);
+      window.dispatchEvent(new CustomEvent(OPEN_GRAPH_MODAL_EVENT));
+    }
+  }
+
+  return (
+    <div className="side-rail-validation-banner">
+      {error && (
+        <div
+          role="alert"
+          className="validation-banner validation-banner-fail side-rail-error-banner"
+        >
+          {error}
+        </div>
+      )}
+      {validationResult && (
+        <ValidationResultBanner
+          result={validationResult}
+          nodes={compositionState?.nodes}
+          componentNames={validationComponentNames}
+          onComponentClick={handleValidationComponentClick}
+        />
+      )}
+      {suggestions.length > 0 && (
+        <SuggestionList
+          suggestions={suggestions}
+          phraseFor={phraseFor}
+          stepLabelFor={stepLabelFor}
+        />
+      )}
+    </div>
+  );
+}

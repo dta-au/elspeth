@@ -1,0 +1,57 @@
+mode=container; repository=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src/elspeth/web/coordination/repository.py; no checkout edits
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 1 item
+
+tests/unit/web/blobs/test_mutation_admission_quota.py F                  [100%]
+
+=================================== FAILURES ===================================
+_ test_independent_admission_bounds_keep_truthful_durable_quota_evidence[container] _
+
+db_engine = Engine(sqlite:///:memory:)
+session_id = UUID('0b3b95a1-5d75-447f-b483-e7150965ae2d')
+compose_context = SessionOperationContext(fence=SessionOperationFence(session_id='0b3b95a1-5d75-447f-b483-e7150965ae2d', operation_id='b...token='0ca10b6f369d47a48ba1ece571c337c7', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>)
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-81/test_independent_admission_bou0')
+binding = 'container'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("binding", ["session", "identity", "container", "both", "container-only", "none"])
+    async def test_independent_admission_bounds_keep_truthful_durable_quota_evidence(db_engine, session_id, compose_context, tmp_path, binding):
+        recorder, url = _durable_recorder(tmp_path)
+        authority = SQLiteLocalSessionOperationAuthority(db_engine, quota_exceeded_recorder=recorder.record_quota_exceeded)
+        service = BlobServiceImpl(db_engine, tmp_path, session_operation_authority=authority)
+        record = await service.create_blob(session_id, "quota.csv", b"old", "text/csv", session_operation_context=compose_context)
+        _policies(
+            db_engine,
+            cap=5 if binding in {"identity", "both"} else None if binding == "container-only" else 1000,
+            ceiling=5 if binding in {"container", "container-only", "both"} else 1000,
+        )
+        context = replace(
+            admission._context(service, db_engine, compose_context, tmp_path),
+            user_message_content="larger",
+            max_blob_storage_per_session_bytes=5 if binding == "session" else 1000,
+        )
+        before = admission._resources(db_engine, tmp_path / "blobs")
+        result = admit_blob_mutation("update_blob", {"blob_id": str(record.id), "content": "larger"}, admission._empty_state(), context)
+>       assert result.success is (binding == "none")
+E       AssertionError: assert True is ('container' == 'none'
+E        +  where True = ToolResult(success=True, updated_state=CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(name...one, runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).success
+E         
+E         - none
+E         + container)
+
+tests/unit/web/blobs/test_mutation_admission_quota.py:66: AssertionError
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/_pytest/config/__init__.py:1309
+  /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/lib/python3.12/site-packages/_pytest/config/__init__.py:1309: PytestAssertRewriteWarning: Module already imported so cannot be rewritten; anyio
+    self._mark_plugins_for_rewrite(hook, disable_autoload)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/unit/web/blobs/test_mutation_admission_quota.py::test_independent_admission_bounds_keep_truthful_durable_quota_evidence[container]
+========================= 1 failed, 1 warning in 0.46s =========================

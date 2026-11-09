@@ -1,0 +1,13 @@
+src/elspeth/web/composer/pipeline_commit.py: OK
+src/elspeth/web/composer/planning_application.py: OK
+src/elspeth/web/composer/tool_batch.py: OK
+src/elspeth/web/sessions/proposal_authority.py: OK
+src/elspeth/web/sessions/protocol.py: OK
+src/elspeth/web/sessions/routes/composer/pipeline_settlement.py: OK
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py: OK
+tests/integration/web/composer/test_pipeline_proposal_lifecycle.py: OK
+tests/unit/web/composer/test_audit_cohort_settlement.py: OK
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py: OK
+tests/unit/web/composer/test_pipeline_planner.py: OK
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py: OK
+tests/unit/web/sessions/test_pipeline_rejection_callers.py: OK

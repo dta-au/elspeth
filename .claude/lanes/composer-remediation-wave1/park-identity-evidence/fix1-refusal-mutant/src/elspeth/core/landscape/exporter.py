@@ -1,0 +1,1314 @@
+"""Landscape audit trail exporter.
+
+Exports complete audit data for a run in a format suitable for
+compliance review and legal inquiry.
+
+Export records are SELF-CONTAINED: they include the full resolved
+configuration, not just hashes. This allows third-party auditors to
+understand exactly what configuration drove each decision without
+requiring access to the original database.
+"""
+
+import hashlib
+import hmac
+import json
+from collections import defaultdict
+from collections.abc import Iterator
+from contextlib import contextmanager
+from copy import copy
+from datetime import UTC, datetime
+from typing import Any, BinaryIO, Literal, Protocol, cast
+
+from elspeth.contracts import (
+    BatchMember,
+    Call,
+    NodeState,
+    RoutingEvent,
+    Row,
+    Token,
+    TokenOutcome,
+    TokenParent,
+)
+from elspeth.contracts.audit import CallVerification
+from elspeth.contracts.audit_export import (
+    AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION,
+    AUDIT_EXPORT_MAX_CHUNKS,
+    AUDIT_EXPORT_MAX_TOTAL_BYTES,
+    AUDIT_EXPORT_MAX_TOTAL_RECORDS,
+    AUDIT_EXPORT_SERIALIZATION_VERSION,
+    AuditExportDerivationConfig,
+    AuditExportDerivedBundle,
+    AuditExportTerminalWitness,
+    derive_audit_export_bundle,
+    stream_audit_export_bundle_to_spool,
+    validate_compartment_id,
+)
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.export_records import (
+    AuditExportConfigRecord,
+    AuthEventCoverageExportRecord,
+    AuthEventExportRecord,
+    BatchExportRecord,
+    BatchMemberExportRecord,
+    CallExportRecord,
+    CallVerificationExportRecord,
+    CollectorGroupFailureExportRecord,
+    EdgeExportRecord,
+    ExportRecord,
+    GroupLossExportRecord,
+    GroupRecordExportRecord,
+    NodeExportRecord,
+    OperationExportRecord,
+    RoutingEventExportRecord,
+    RowExportRecord,
+    RunExportRecord,
+    SchedulerEventExportRecord,
+    SecretResolutionExportRecord,
+    TokenExportRecord,
+    TokenOutcomeExportRecord,
+    TokenParentExportRecord,
+    TransformErrorExportRecord,
+    ValidationErrorExportRecord,
+    WebPluginPolicyExportRecord,
+)
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import canonical_json_loads
+from elspeth.contracts.identity import LineageFrame
+from elspeth.core.canonical import canonical_json
+from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.export_mappers import (
+    artifact_to_export_record,
+    node_state_to_export_record,
+    sink_effect_attempt_to_export_record,
+    sink_effect_member_to_export_record,
+    sink_effect_stream_to_export_record,
+    sink_effect_to_export_record,
+)
+from elspeth.core.landscape.export_read_model import open_export_read_transaction
+from elspeth.core.landscape.factory import RecorderFactory
+
+
+class ExportReadModel(Protocol):
+    """Read-only repository surface needed by ``LandscapeExporter``."""
+
+    def get_run(self, run_id: str) -> Any | None: ...
+
+    def iter_auth_events(self, cutoff: datetime, *, batch_size: int) -> Iterator[AuthEventExportRecord]: ...
+
+    def get_run_attribution(self, run_id: str) -> tuple[str, str] | None: ...
+
+    def get_web_plugin_policy_evidence(self, run_id: str) -> Any | None: ...
+
+    def get_secret_resolutions_for_run(self, run_id: str) -> list[Any]: ...
+
+    def get_nodes(self, run_id: str) -> list[Any]: ...
+
+    def get_edges(self, run_id: str) -> list[Any]: ...
+
+    def get_operations_for_run(self, run_id: str) -> list[Any]: ...
+
+    def get_all_operation_calls_for_run(self, run_id: str) -> list[Any]: ...
+
+    def iter_verification_decisions_for_run(self, run_id: str, *, batch_size: int) -> Iterator[CallVerification]: ...
+
+    def get_validation_errors_for_run(self, run_id: str) -> list[Any]: ...
+
+    def get_transform_errors_for_run(self, run_id: str) -> list[Any]: ...
+
+    def iter_rows_for_run(self, run_id: str, *, batch_size: int) -> Iterator[list[Any]]: ...
+
+    def get_tokens_for_rows(self, run_id: str, row_ids: list[str]) -> list[Any]: ...
+
+    def get_lineage_paths_for_tokens(self, run_id: str, token_ids: list[str]) -> dict[str, tuple[LineageFrame, ...]]: ...
+
+    def get_group_records_for_run(self, run_id: str) -> list[Any]: ...
+
+    def get_group_losses_for_run(self, run_id: str) -> list[Any]: ...
+
+    def get_collector_group_failures_for_run(self, run_id: str) -> list[Any]: ...
+
+    def get_token_parents_for_tokens(self, token_ids: list[str]) -> list[Any]: ...
+
+    def get_token_outcomes_for_tokens(self, run_id: str, token_ids: list[str]) -> list[Any]: ...
+
+    def get_scheduler_events_for_tokens(self, run_id: str, token_ids: list[str]) -> list[Any]: ...
+
+    def get_node_states_for_tokens(self, run_id: str, token_ids: list[str]) -> list[Any]: ...
+
+    def get_routing_events_for_states(self, state_ids: list[str]) -> list[Any]: ...
+
+    def get_calls_for_states(self, state_ids: list[str]) -> list[Any]: ...
+
+    def get_batches(self, run_id: str) -> list[Any]: ...
+
+    def get_all_batch_members_for_run(self, run_id: str) -> list[Any]: ...
+
+    def get_artifacts(self, run_id: str) -> list[Any]: ...
+
+    def get_sink_effect_streams_for_run(self, run_id: str) -> list[Any] | tuple[Any, ...]: ...
+
+    def get_sink_effects_for_run(self, run_id: str) -> list[Any] | tuple[Any, ...]: ...
+
+    def get_sink_effect_members_for_run(self, run_id: str) -> list[Any] | tuple[Any, ...]: ...
+
+    def get_sink_effect_attempts_for_run(self, run_id: str) -> list[Any] | tuple[Any, ...]: ...
+
+
+class RecorderFactoryExportReadModel:
+    """Adapter from the repository factory bundle to the exporter read model."""
+
+    def __init__(self, factory: RecorderFactory) -> None:
+        self._factory = factory
+
+    def get_run(self, run_id: str) -> Any | None:
+        return self._factory.run_lifecycle.get_run(run_id)
+
+    def iter_auth_events(self, cutoff: datetime, *, batch_size: int) -> Iterator[AuthEventExportRecord]:
+        raise AuditIntegrityError("Deployment auth export requires a snapshot-bound export read model")
+
+    def get_run_attribution(self, run_id: str) -> tuple[str, str] | None:
+        return self._factory.run_lifecycle.get_run_attribution(run_id)
+
+    def get_web_plugin_policy_evidence(self, run_id: str) -> Any | None:
+        return self._factory.run_lifecycle.get_web_plugin_policy_evidence(run_id)
+
+    def get_secret_resolutions_for_run(self, run_id: str) -> list[Any]:
+        return self._factory.run_lifecycle.get_secret_resolutions_for_run(run_id)
+
+    def get_nodes(self, run_id: str) -> list[Any]:
+        return self._factory.data_flow.get_nodes(run_id)
+
+    def get_edges(self, run_id: str) -> list[Any]:
+        return self._factory.data_flow.get_edges(run_id)
+
+    def get_operations_for_run(self, run_id: str) -> list[Any]:
+        return self._factory.execution.get_operations_for_run(run_id)
+
+    def get_all_operation_calls_for_run(self, run_id: str) -> list[Any]:
+        return self._factory.execution.get_all_operation_calls_for_run(run_id)
+
+    def iter_verification_decisions_for_run(self, run_id: str, *, batch_size: int) -> Iterator[CallVerification]:
+        return self._factory.execution.iter_verification_decisions_for_run(run_id, batch_size=batch_size)
+
+    def get_validation_errors_for_run(self, run_id: str) -> list[Any]:
+        return self._factory.data_flow.get_validation_errors_for_run(run_id)
+
+    def get_transform_errors_for_run(self, run_id: str) -> list[Any]:
+        return self._factory.data_flow.get_transform_errors_for_run(run_id)
+
+    def iter_rows_for_run(self, run_id: str, *, batch_size: int) -> Iterator[list[Any]]:
+        return self._factory.query.iter_rows_for_run(run_id, batch_size=batch_size)
+
+    def get_tokens_for_rows(self, run_id: str, row_ids: list[str]) -> list[Any]:
+        return self._factory.query.get_tokens_for_rows(run_id, row_ids)
+
+    def get_lineage_paths_for_tokens(self, run_id: str, token_ids: list[str]) -> dict[str, tuple[LineageFrame, ...]]:
+        return self._factory.data_flow.load_lineage_paths(run_id, token_ids)
+
+    def get_group_records_for_run(self, run_id: str) -> list[Any]:
+        return self._factory.data_flow.get_group_records_for_run(run_id)
+
+    def get_group_losses_for_run(self, run_id: str) -> list[Any]:
+        return self._factory.data_flow.get_group_losses_for_run(run_id)
+
+    def get_collector_group_failures_for_run(self, run_id: str) -> list[Any]:
+        return self._factory.execution.get_collector_group_failures_for_run(run_id)
+
+    def get_token_parents_for_tokens(self, token_ids: list[str]) -> list[Any]:
+        return self._factory.query.get_token_parents_for_tokens(token_ids)
+
+    def get_token_outcomes_for_tokens(self, run_id: str, token_ids: list[str]) -> list[Any]:
+        return self._factory.query.get_token_outcomes_for_tokens(run_id, token_ids)
+
+    def get_scheduler_events_for_tokens(self, run_id: str, token_ids: list[str]) -> list[Any]:
+        return self._factory.query.get_scheduler_events_for_tokens(run_id, token_ids)
+
+    def get_node_states_for_tokens(self, run_id: str, token_ids: list[str]) -> list[Any]:
+        return self._factory.query.get_node_states_for_tokens(run_id, token_ids)
+
+    def get_routing_events_for_states(self, state_ids: list[str]) -> list[Any]:
+        return self._factory.query.get_routing_events_for_states(state_ids)
+
+    def get_calls_for_states(self, state_ids: list[str]) -> list[Any]:
+        return self._factory.query.get_calls_for_states(state_ids)
+
+    def get_batches(self, run_id: str) -> list[Any]:
+        return self._factory.execution.get_batches(run_id)
+
+    def get_all_batch_members_for_run(self, run_id: str) -> list[Any]:
+        return self._factory.execution.get_all_batch_members_for_run(run_id)
+
+    def get_artifacts(self, run_id: str) -> list[Any]:
+        return self._factory.execution.get_artifacts(run_id)
+
+    def get_sink_effect_streams_for_run(self, run_id: str) -> tuple[Any, ...]:
+        return self._factory.execution.sink_effects.get_streams_for_run(run_id)
+
+    def get_sink_effects_for_run(self, run_id: str) -> tuple[Any, ...]:
+        return self._factory.execution.sink_effects.get_effects_for_run(run_id)
+
+    def get_sink_effect_members_for_run(self, run_id: str) -> tuple[Any, ...]:
+        return self._factory.execution.sink_effects.get_members_for_run(run_id)
+
+    def get_sink_effect_attempts_for_run(self, run_id: str) -> tuple[Any, ...]:
+        return self._factory.execution.sink_effects.get_attempts_for_run(run_id)
+
+
+class _DiscardSpool:
+    """Position-tracking byte sink for streaming exports (elspeth-4087266b7d).
+
+    The public ``export_run`` iterator reuses the bounded spooled derivation
+    but never reads the spooled bytes back — only the emitted records and the
+    final manifest matter. This sink satisfies the derivation's write/tell
+    surface while discarding content, keeping the public path free of both
+    full-bundle accumulation and temp-file I/O.
+    """
+
+    __slots__ = ("_position",)
+
+    def __init__(self) -> None:
+        self._position = 0
+
+    def tell(self) -> int:
+        return self._position
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        count = len(data)
+        self._position += count
+        return count
+
+
+class LandscapeExporter:
+    """Export Landscape audit data for a run.
+
+    Produces a flat sequence of records suitable for CSV/JSON export.
+    Each record has a 'record_type' field indicating its category.
+
+    Record types:
+    - run: Run metadata (one per export)
+    - secret_resolution: Key Vault secret provenance (run-level)
+    - node: Registered plugins
+    - edge: Graph edges
+    - operation: Source/sink I/O operations
+    - validation_error: Source validation failures
+    - transform_error: Transform processing failures
+    - row: Source rows
+    - token: Row instances (carries lineage_path — typed frame stack)
+    - token_parent: Token lineage for forks/joins
+    - token_outcome: Terminal state for tokens
+    - group_record: Roster record for one fork/expand opener (spec §4.3)
+    - group_loss: Unified group-loss ledger entry (spec §6.2, WS3 writes it)
+    - scheduler_event: Durable scheduler state transitions and lease attribution
+    - node_state: Processing records
+    - routing_event: Routing decisions
+    - call: External calls (may have state_id OR operation_id)
+    - call_verification: Persisted verify verdicts and source-call comparison evidence
+    - batch: Aggregation batches
+    - batch_member: Batch membership
+    - artifact: Sink outputs
+
+    Memory envelope: the row family (rows, tokens, token_parents,
+    token_outcomes, scheduler_events, node_states, routing_events, and
+    state-parented calls) streams in bounded row batches, so its memory
+    cost is O(row_batch_size), not O(run). The run-structure families
+    (nodes, edges, operations + their calls, validation/transform errors,
+    batches + members, artifacts) are each materialized as one full list;
+    they scale with pipeline structure and error/batch counts rather than
+    row volume. export_run_grouped() is the exception: it deliberately
+    materializes the entire export into one dict.
+
+    Example:
+        db = LandscapeDB.from_url("sqlite:///audit.db")
+        exporter = LandscapeExporter(db, compartment_id="my-compartment")
+
+        # Export to JSON lines
+        for record in exporter.export_run(run_id):
+            json_file.write(json.dumps(record) + "\\n")
+
+        # Export to CSV without keeping every record in memory
+        for record_type, record in exporter.iter_run_records_by_type(run_id):
+            write_csv_record(record_type, record)
+    """
+
+    def __init__(
+        self,
+        db: LandscapeDB,
+        signing_key: bytes | None = None,
+        *,
+        include_raw_error_rows: bool = False,
+        auth_events: Literal["omitted", "deployment_snapshot"] = "omitted",
+        compartment_id: str | None = None,
+        row_batch_size: int = 500,
+        read_model: ExportReadModel | None = None,
+        signer_key_id: str | None = None,
+        export_format: str = "json",
+        exporter_version: str | None = None,
+        serialization_version: str = AUDIT_EXPORT_SERIALIZATION_VERSION,
+        chunking_algorithm_version: str = "record-framing-v1",
+        per_chunk_byte_limit: int = 64 * 1024 * 1024,
+        per_chunk_record_limit: int = 1_000_000,
+        derivation_config: AuditExportDerivationConfig | None = None,
+    ) -> None:
+        """Initialize exporter with database connection.
+
+        Args:
+            db: LandscapeDB instance to export from
+            signing_key: Optional HMAC key for signing exported records.
+                        Required if sign=True is passed to export_run().
+            include_raw_error_rows: Include raw failing-row payloads
+                (``row_data_json``) in validation_error / transform_error
+                records. Default False (elspeth-384184c6ab): the export is
+                an external artifact and every other record type already
+                exports hashes/refs instead of raw payloads; error records
+                default to ``row_hash``-only correlation, with the raw row
+                remaining in the audit database.
+            row_batch_size: Rows per streamed batch for the row-family
+                sections of the export (elspeth-3ae79a4775). Bounds export
+                memory: at most this many rows — plus their tokens, node
+                states, and related child records — are resident at once.
+                The exported record sequence is identical for every value.
+            read_model: Optional narrow read surface for export queries.
+                When supplied, its transaction lifetime remains caller-owned.
+                Otherwise, each public export operation binds a dedicated
+                connection-bound snapshot for its full lifetime.
+
+        Raises:
+            ValueError: If row_batch_size < 1
+        """
+        if row_batch_size < 1:
+            raise ValueError(f"row_batch_size must be >= 1, got {row_batch_size}")
+        self._db = db
+        self._read_model = read_model if read_model is not None else RecorderFactoryExportReadModel(RecorderFactory(db))
+        self._read_model_is_caller_owned = read_model is not None
+        self._signing_key = signing_key
+        self._include_raw_error_rows = include_raw_error_rows
+        if auth_events not in ("omitted", "deployment_snapshot"):
+            raise ValueError("auth_events must be omitted or deployment_snapshot")
+        resolved_exporter_version = AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION if exporter_version is None else exporter_version
+        if resolved_exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+            raise ValueError("exporter_version must be landscape-exporter-auth-v2")
+        self._auth_events = auth_events
+        self._compartment_id = compartment_id
+        self._row_batch_size = row_batch_size
+        self._signer_key_id = signer_key_id
+        self._export_format = export_format
+        self._exporter_version = resolved_exporter_version
+        self._serialization_version = serialization_version
+        self._chunking_algorithm_version = chunking_algorithm_version
+        self._per_chunk_byte_limit = per_chunk_byte_limit
+        self._per_chunk_record_limit = per_chunk_record_limit
+        self._derivation_config = derivation_config
+
+    @contextmanager
+    def _public_export_scope(
+        self,
+        run_id: str,
+    ) -> Iterator[tuple["LandscapeExporter", AuditExportTerminalWitness | None]]:
+        """Bind a default public export to one immutable database snapshot.
+
+        Explicitly injected read models remain caller-owned. The production
+        orchestrator already opens and owns its snapshot before constructing
+        the exporter; opening a nested transaction here would split that
+        authority. The default public constructor instead owns a snapshot for
+        the full generator lifetime and binds a shallow exporter copy to it so
+        concurrent calls cannot replace each other's read model.
+        """
+        if self._read_model_is_caller_owned:
+            yield self, None
+            return
+
+        with open_export_read_transaction(self._db.engine) as read_model:
+            try:
+                witness = read_model.get_export_terminal_witness(run_id)
+            except AuditIntegrityError as exc:
+                # Preserve the public exporter's established validation
+                # contract while deriving the result from the snapshot-bound
+                # terminal witness.
+                raise ValueError("Audit export requires an immutable export-terminal run") from exc
+            scoped = copy(self)
+            scoped._read_model = read_model
+            scoped._read_model_is_caller_owned = True
+            yield scoped, witness
+
+    @staticmethod
+    def _parse_tier1_json(raw_json: str, field_name: str, context: str) -> Any:
+        """Parse stored canonical JSON from Tier 1 audit data, crashing with context on corruption.
+
+        ``settings_json`` and ``config_json`` are written by ``canonical_json``,
+        so they are read with its inverse: a plain ``json.loads`` reads an
+        integral double beyond 2**53 (printed in integer notation) back as an
+        ``int`` -- not the value that was hashed, and one the canonical encoder
+        refuses when the export record is serialized.
+        """
+        try:
+            return canonical_json_loads(raw_json)
+        except json.JSONDecodeError as exc:
+            raise AuditIntegrityError(
+                f"Corrupt {field_name} for {context}: database corruption (Tier 1 violation). Parse error: {exc}"
+            ) from exc
+
+    def _sign_record(self, record: dict[str, Any]) -> str:
+        """Compute HMAC-SHA256 signature for a record.
+
+        Args:
+            record: Record dict to sign (must not contain 'signature' key)
+
+        Returns:
+            Hex-encoded HMAC-SHA256 signature
+
+        Raises:
+            ValueError: If signing key not configured
+        """
+        if self._signing_key is None:
+            raise ValueError("Signing key not configured")
+
+        # Canonical JSON ensures consistent hash
+        canonical = canonical_json(record)
+        return hmac.new(
+            self._signing_key,
+            canonical.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def export_run(
+        self,
+        run_id: str,
+        sign: bool = False,
+    ) -> Iterator[dict[str, Any]]:
+        """Export all audit data for a run.
+
+        Yields flat dict records with 'record_type' field.
+        Order: run -> nodes -> edges -> rows -> tokens -> states -> batches -> artifacts
+
+        Streaming contract (elspeth-4087266b7d): records are yielded on the
+        bounded-memory path — the row family streams in O(row_batch_size)
+        batches and at most one derivation chunk is retained in RAM — while
+        the emitted record sequence, per-record signatures, and the final
+        manifest remain hash-identical to :meth:`derive_run_bundle` output.
+
+        Args:
+            run_id: The run ID to export
+            sign: If True, add HMAC signature to each record and emit
+                  a final manifest with running hash chain.
+
+        Yields:
+            Dict records with 'record_type' and relevant fields.
+            If sign=True, includes 'signature' field and final manifest.
+
+        Raises:
+            ValueError: If run_id is not found, or sign=True without signing_key
+        """
+        if sign and self._signing_key is None:
+            raise ValueError("Signing requested but no signing_key provided")
+        with self._public_export_scope(run_id) as (exporter, terminal_witness):
+            derivation_config = exporter._resolve_derivation_config(
+                run_id,
+                sign=sign,
+                terminal_witness=terminal_witness,
+            )
+            stream = stream_audit_export_bundle_to_spool(
+                exporter._configured_records(run_id, derivation_config),
+                derivation_config,
+                cast(BinaryIO, _DiscardSpool()),
+                max_total_records=AUDIT_EXPORT_MAX_TOTAL_RECORDS,
+                max_total_bytes=AUDIT_EXPORT_MAX_TOTAL_BYTES,
+                max_chunks=AUDIT_EXPORT_MAX_CHUNKS,
+            )
+            while True:
+                try:
+                    record = next(stream)
+                except StopIteration as stop:
+                    bundle = stop.value
+                    break
+                yield deep_thaw(record)
+            yield deep_thaw(bundle.final_manifest)
+
+    def derive_run_bundle(
+        self,
+        run_id: str,
+        *,
+        sign: bool = False,
+        derivation_config: AuditExportDerivationConfig | None = None,
+    ) -> AuditExportDerivedBundle:
+        """Return the current serialization byte graph for one immutable terminal run."""
+        if sign and self._signing_key is None:
+            raise ValueError("Signing requested but no signing_key provided")
+        with self._public_export_scope(run_id) as (exporter, terminal_witness):
+            derivation_config = exporter._resolve_derivation_config(
+                run_id,
+                sign=sign,
+                derivation_config=derivation_config,
+                terminal_witness=terminal_witness,
+            )
+            return derive_audit_export_bundle(exporter._configured_records(run_id, derivation_config), derivation_config)
+
+    def _configured_records(self, run_id: str, config: AuditExportDerivationConfig) -> Iterator[ExportRecord]:
+        scoped = copy(self)
+        scoped._auth_events = config.auth_events
+        scoped._compartment_id = config.compartment_id
+        scoped._exporter_version = config.exporter_version
+        scoped._include_raw_error_rows = config.include_raw_error_rows
+        scoped._signing_key = config.signing_key
+        scoped._signer_key_id = config.signer_key_id
+        scoped._export_format = config.export_format
+        scoped._serialization_version = config.serialization_version
+        scoped._chunking_algorithm_version = config.chunking_algorithm_version
+        scoped._per_chunk_byte_limit = config.per_chunk_byte_limit
+        scoped._per_chunk_record_limit = config.per_chunk_record_limit
+        yield from scoped._iter_records(run_id)
+
+    def _resolve_derivation_config(
+        self,
+        run_id: str,
+        *,
+        sign: bool,
+        derivation_config: AuditExportDerivationConfig | None = None,
+        terminal_witness: AuditExportTerminalWitness | None = None,
+    ) -> AuditExportDerivationConfig:
+        """Resolve and validate the derivation authority for one export request."""
+        if sign and self._signing_key is None:
+            raise ValueError("Signing requested but no signing_key provided")
+        if derivation_config is None:
+            derivation_config = self._derivation_config
+        if derivation_config is None:
+            if terminal_witness is None:
+                run = self._read_model.get_run(run_id)
+                if run is None:
+                    raise ValueError(f"Run not found: {run_id}")
+                completed_at = run.completed_at
+                source_status = run.status.value
+                if completed_at is None or source_status not in {"completed", "completed_with_failures", "empty"}:
+                    raise ValueError("Audit export requires an immutable export-terminal run")
+            else:
+                completed_at = terminal_witness.source_completed_at
+                source_status = terminal_witness.source_status.value
+            # SQLite drops timezone metadata when round-tripping SQLAlchemy
+            # DateTime values. Landscape timestamps are UTC by contract, so
+            # restore that storage-boundary metadata before canonicalization.
+            if completed_at.tzinfo is None or completed_at.utcoffset() is None:
+                completed_at = completed_at.replace(tzinfo=UTC)
+            completed_text = completed_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            if sign:
+                if self._signer_key_id is None:
+                    raise ValueError("Signed export requires an explicit signer_key_id")
+                signing_mode = "hmac_sha256"
+                signer_key_id = self._signer_key_id
+                signing_key = self._signing_key
+            else:
+                signing_mode = "unsigned"
+                signer_key_id = "UNSIGNED"
+                signing_key = None
+            derivation_config = AuditExportDerivationConfig(
+                source_run_id=run_id,
+                source_status=source_status,
+                source_completed_at=completed_text,
+                export_format=self._export_format,  # type: ignore[arg-type]
+                exporter_version=self._exporter_version,
+                serialization_version=self._serialization_version,
+                chunking_algorithm_version=self._chunking_algorithm_version,
+                include_raw_error_rows=self._include_raw_error_rows,
+                auth_events=self._auth_events,
+                compartment_id=self._compartment_id,
+                per_chunk_byte_limit=self._per_chunk_byte_limit,
+                per_chunk_record_limit=self._per_chunk_record_limit,
+                signing_mode=signing_mode,  # type: ignore[arg-type]
+                signer_key_id=signer_key_id,
+                signing_key=signing_key,
+            )
+        else:
+            # An explicitly supplied config (per-call or instance-level) must
+            # agree with the caller's sign request in BOTH directions
+            # (elspeth-f7d63e2d56): an unsigned config must not silently
+            # downgrade sign=True, and an HMAC config must not silently sign
+            # a sign=False export. Publication integrity fails closed.
+            if derivation_config.source_run_id != run_id:
+                raise ValueError("derivation config source_run_id does not match requested run")
+            if terminal_witness is not None:
+                completed_text = terminal_witness.source_completed_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                if (
+                    derivation_config.source_status != terminal_witness.source_status.value
+                    or derivation_config.source_completed_at != completed_text
+                ):
+                    raise AuditIntegrityError("derivation config does not match the snapshot-bound terminal witness")
+            expected_signing_mode = "hmac_sha256" if sign else "unsigned"
+            if derivation_config.signing_mode != expected_signing_mode:
+                raise ValueError(
+                    f"derivation config signing_mode {derivation_config.signing_mode!r} contradicts the "
+                    f"requested export (sign={sign} requires signing_mode {expected_signing_mode!r})"
+                )
+        if derivation_config.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+            raise ValueError("exporter_version must be landscape-exporter-auth-v2")
+        validate_compartment_id(derivation_config.compartment_id)
+        return derivation_config
+
+    def iter_unsigned_run_records(self, run_id: str) -> Iterator[ExportRecord]:
+        """Yield the deterministic unsigned record stream for bounded derivation."""
+        with self._public_export_scope(run_id) as (exporter, _terminal_witness):
+            yield from exporter._iter_records(run_id)
+
+    def iter_run_records_by_type(
+        self,
+        run_id: str,
+        sign: bool = False,
+    ) -> Iterator[tuple[str, dict[str, Any]]]:
+        """Export audit data as a stream of ``(record_type, record)`` pairs.
+
+        This is the bounded-memory grouping surface for callers that need to
+        route records by type, such as multi-file CSV export. It preserves the
+        same deterministic order and signing behavior as :meth:`export_run`
+        without building a full ``record_type -> list[records]`` map.
+        """
+        for record in self.export_run(run_id, sign=sign):
+            yield record["record_type"], record
+
+    def _iter_records(self, run_id: str) -> Iterator[ExportRecord]:
+        """Internal: iterate over raw records (no signing).
+
+        Query strategy: run-structure collections (nodes, edges, operations,
+        errors, batches, artifacts) load with one batch query per family —
+        the Bug 76r N+1 fix. The row family (rows, tokens, and their child
+        records) streams in bounded row batches (elspeth-3ae79a4775): rows
+        page via keyset pagination and each batch loads its children with
+        set-scoped queries, so memory is bounded by row_batch_size instead
+        of run size, at O(row_count / row_batch_size) queries.
+
+        Args:
+            run_id: The run ID to export
+
+        Yields:
+            Dict records with 'record_type' field
+
+        Raises:
+            ValueError: If run_id is not found
+        """
+        if self._exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+            raise ValueError("exporter_version must be landscape-exporter-auth-v2")
+        compartment_id = validate_compartment_id(self._compartment_id)
+
+        # Run metadata
+        run = self._read_model.get_run(run_id)
+        if run is None:
+            raise ValueError(f"Run not found: {run_id}")
+        attribution = self._read_model.get_run_attribution(run_id)
+
+        run_record: RunExportRecord = {
+            "record_type": "run",
+            "run_id": run.run_id,
+            "status": run.status.value,
+            "started_at": run.started_at.isoformat() if run.started_at else None,
+            "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+            "canonical_version": run.canonical_version,
+            "config_hash": run.config_hash,
+            "initiated_by_user_id": attribution[0] if attribution is not None else None,
+            "auth_provider_type": attribution[1] if attribution is not None else None,
+            # Full resolved settings for audit trail portability (not just hash)
+            "settings": self._parse_tier1_json(run.settings_json, "settings_json", f"run {run_id}"),
+            "reproducibility_grade": run.reproducibility_grade.value if run.reproducibility_grade is not None else None,
+        }
+        yield run_record
+
+        if self._signing_key is not None and self._signer_key_id is None:
+            raise ValueError("Signed export requires an explicit signer_key_id")
+        public_config: AuditExportConfigRecord = {
+            "record_type": "audit_export_config",
+            "public_config": {
+                "auth_events": self._auth_events,
+                "compartment_id": compartment_id,
+                "chunking_algorithm_version": self._chunking_algorithm_version,
+                "export_format": self._export_format,
+                "exporter_version": self._exporter_version,
+                "include_raw_error_rows": self._include_raw_error_rows,
+                "per_chunk_byte_limit": self._per_chunk_byte_limit,
+                "per_chunk_record_limit": self._per_chunk_record_limit,
+                "serialization_version": self._serialization_version,
+                "signer_key_id": self._signer_key_id if self._signer_key_id is not None and self._signing_key is not None else "UNSIGNED",
+                "signing_mode": "hmac_sha256" if self._signing_key is not None else "unsigned",
+            },
+        }
+        yield public_config
+        selected_count = 0
+        cutoff = run.completed_at
+        if cutoff is None and self._auth_events == "deployment_snapshot":
+            raise AuditIntegrityError("Auth coverage requires completed run timestamp")
+        if cutoff is not None and cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=UTC)
+        if self._auth_events == "deployment_snapshot":
+            assert cutoff is not None
+            for auth_event in self._read_model.iter_auth_events(cutoff, batch_size=self._row_batch_size):
+                selected_count += 1
+                yield auth_event
+        coverage: AuthEventCoverageExportRecord = {
+            "record_type": "auth_event_coverage",
+            "policy": self._auth_events,
+            "selection_cutoff": cutoff.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            if self._auth_events == "deployment_snapshot" and cutoff is not None
+            else None,
+            "selection_basis": "visible_rows_at_or_before_run_completion" if self._auth_events == "deployment_snapshot" else None,
+            "selected_count": selected_count if self._auth_events == "deployment_snapshot" else None,
+            "reason": "deployment_snapshot" if self._auth_events == "deployment_snapshot" else "not_requested",
+        }
+        yield coverage
+
+        policy_evidence = self._read_model.get_web_plugin_policy_evidence(run_id)
+        if policy_evidence is not None:
+            policy_record: WebPluginPolicyExportRecord = {
+                "record_type": "web_plugin_policy",
+                "run_id": run_id,
+                "schema_version": policy_evidence.schema_version,
+                "policy_hash": policy_evidence.policy_hash,
+                "snapshot_hash": policy_evidence.snapshot_hash,
+                "authorized_plugin_ids": list(policy_evidence.authorized_plugin_ids),
+                "available_plugin_ids": list(policy_evidence.available_plugin_ids),
+                "control_modes": [list(item) for item in policy_evidence.control_modes],
+                "selected_implementations": [list(item) for item in policy_evidence.selected_implementations],
+                "selected_profile_aliases": [list(item) for item in policy_evidence.selected_profile_aliases],
+                "plugin_code_identities": [list(item) for item in policy_evidence.plugin_code_identities],
+                "binding_generation_fingerprint": policy_evidence.binding_generation_fingerprint,
+                "decision_codes": list(policy_evidence.decision_codes),
+                "admission_decision_json": (
+                    policy_evidence.admission_decision.model_dump_json() if policy_evidence.admission_decision is not None else None
+                ),
+                "admission_decision_hash": (
+                    policy_evidence.admission_decision.canonical_hash if policy_evidence.admission_decision is not None else None
+                ),
+            }
+            yield policy_record
+
+        # Secret resolutions (run-level provenance for Key Vault secrets)
+        for resolution in self._read_model.get_secret_resolutions_for_run(run_id):
+            secret_record: SecretResolutionExportRecord = {
+                "record_type": "secret_resolution",
+                "run_id": run_id,
+                "resolution_id": resolution.resolution_id,
+                "timestamp": resolution.timestamp,
+                "env_var_name": resolution.env_var_name,
+                "source": resolution.source,
+                "vault_url": resolution.vault_url,
+                "secret_name": resolution.secret_name,
+                "fingerprint": resolution.fingerprint,
+                "resolution_latency_ms": resolution.resolution_latency_ms,
+            }
+            yield secret_record
+
+        # Nodes
+        for node in self._read_model.get_nodes(run_id):
+            node_record: NodeExportRecord = {
+                "record_type": "node",
+                "run_id": run_id,
+                "node_id": node.node_id,
+                "plugin_name": node.plugin_name,
+                "node_type": node.node_type.value,
+                "plugin_version": node.plugin_version,
+                "source_file_hash": node.source_file_hash,
+                "determinism": node.determinism.value,
+                "config_hash": node.config_hash,
+                # Full resolved config for audit trail portability (not just hash)
+                "config": self._parse_tier1_json(node.config_json, "config_json", f"node {node.node_id} in run {run_id}"),
+                "schema_mode": node.schema_mode,
+                "schema_fields": deep_thaw(node.schema_fields) if node.schema_fields is not None else None,
+                "sequence_in_pipeline": node.sequence_in_pipeline,
+                "registered_at": node.registered_at.isoformat(),
+            }
+            yield node_record
+
+        # Edges
+        for edge in self._read_model.get_edges(run_id):
+            edge_record: EdgeExportRecord = {
+                "record_type": "edge",
+                "run_id": run_id,
+                "edge_id": edge.edge_id,
+                "from_node_id": edge.from_node_id,
+                "to_node_id": edge.to_node_id,
+                "label": edge.label,
+                "default_mode": edge.default_mode.value,
+                "created_at": edge.created_at.isoformat(),
+            }
+            yield edge_record
+
+        # Operations (source loads, sink writes)
+        all_operations = self._read_model.get_operations_for_run(run_id)
+
+        # Batch query: Pre-load all operation-parented calls (N+1 fix)
+        all_op_calls = self._read_model.get_all_operation_calls_for_run(run_id)
+        op_calls_by_operation: defaultdict[str, list[Call]] = defaultdict(list)
+        for call in all_op_calls:
+            if not call.operation_id:
+                raise AuditIntegrityError(
+                    f"Operation-parented call '{call.call_id}' has no operation_id. Run: {run_id}. This violates the Call XOR constraint."
+                )
+            op_calls_by_operation[call.operation_id].append(call)
+
+        for operation in all_operations:
+            operation_record: OperationExportRecord = {
+                "record_type": "operation",
+                "run_id": run_id,
+                "operation_id": operation.operation_id,
+                "node_id": operation.node_id,
+                "operation_type": operation.operation_type,
+                "sink_effect_id": operation.sink_effect_id,
+                "status": operation.status,
+                "started_at": operation.started_at.isoformat() if operation.started_at else None,
+                "completed_at": operation.completed_at.isoformat() if operation.completed_at else None,
+                "duration_ms": operation.duration_ms,
+                "error_message": operation.error_message,
+                "input_data_ref": operation.input_data_ref,
+                "input_data_hash": operation.input_data_hash,
+                "output_data_ref": operation.output_data_ref,
+                "output_data_hash": operation.output_data_hash,
+            }
+            yield operation_record
+
+            # External calls for this operation (from pre-loaded dict). An
+            # explicit `in` guard (not `.get(key, default)`, which trips R1)
+            # avoids defaultdict inflating itself with a throwaway empty list
+            # for every operation that has no calls.
+            for call in op_calls_by_operation[operation.operation_id] if operation.operation_id in op_calls_by_operation else ():
+                op_call_record: CallExportRecord = {
+                    "record_type": "call",
+                    "run_id": run_id,
+                    "call_id": call.call_id,
+                    "state_id": None,  # Operation calls don't have state_id
+                    "operation_id": call.operation_id,
+                    "call_index": call.call_index,
+                    "call_type": call.call_type.value,
+                    "status": call.status.value,
+                    "request_hash": call.request_hash,
+                    "response_hash": call.response_hash,
+                    "approved_prompt_artifact_hash": call.approved_prompt_artifact_hash,
+                    "prompt_tokens": call.prompt_tokens,
+                    "completion_tokens": call.completion_tokens,
+                    "cached_prompt_tokens": call.cached_prompt_tokens,
+                    "reasoning_tokens": call.reasoning_tokens,
+                    "returned_model": call.returned_model,
+                    "latency_ms": call.latency_ms,
+                    "request_ref": call.request_ref,
+                    "response_ref": call.response_ref,
+                    "error_json": call.error_json,
+                    "created_at": call.created_at.isoformat() if call.created_at else None,
+                }
+                yield op_call_record
+
+        yield from self._iter_sink_effect_records(run_id)
+
+        # Source validation and transform error audit evidence.
+        # Repository getters provide deterministic created_at ordering.
+        # Raw-row minimization (elspeth-384184c6ab): row_data_json is
+        # redacted to None unless the operator opted in — row_hash remains
+        # for correlation back to the audit DB, matching the hash/ref
+        # discipline every other exported record type already follows.
+        for validation_error in self._read_model.get_validation_errors_for_run(run_id):
+            validation_error_record: ValidationErrorExportRecord = {
+                "record_type": "validation_error",
+                "run_id": run_id,
+                "error_id": validation_error.error_id,
+                "node_id": validation_error.node_id,
+                "row_id": validation_error.row_id,
+                "row_hash": validation_error.row_hash,
+                "row_data_json": validation_error.row_data_json if self._include_raw_error_rows else None,
+                "error": validation_error.error,
+                "schema_mode": validation_error.schema_mode,
+                "destination": validation_error.destination,
+                "created_at": validation_error.created_at.isoformat(),
+                "violation_type": validation_error.violation_type,
+                "original_field_name": validation_error.original_field_name,
+                "normalized_field_name": validation_error.normalized_field_name,
+                "expected_type": validation_error.expected_type,
+                "actual_type": validation_error.actual_type,
+            }
+            yield validation_error_record
+
+        for transform_error in self._read_model.get_transform_errors_for_run(run_id):
+            transform_error_record: TransformErrorExportRecord = {
+                "record_type": "transform_error",
+                "run_id": run_id,
+                "error_id": transform_error.error_id,
+                "token_id": transform_error.token_id,
+                "transform_id": transform_error.transform_id,
+                "row_hash": transform_error.row_hash,
+                "row_data_json": transform_error.row_data_json if self._include_raw_error_rows else None,
+                "error_details_json": transform_error.error_details_json,
+                "destination": transform_error.destination,
+                "created_at": transform_error.created_at.isoformat(),
+            }
+            yield transform_error_record
+
+        # === Row family: streamed in bounded row batches (elspeth-3ae79a4775) ===
+        # Bug 76r replaced per-entity N+1 queries with full-run preloads; that
+        # fixed the query count but left export memory proportional to the
+        # entire run. The row family now streams: rows page through keyset
+        # pagination and child collections are batch-loaded per row batch, so
+        # memory scales with row_batch_size while the query count stays
+        # O(row_count / row_batch_size).
+        for row_batch in self._read_model.iter_rows_for_run(run_id, batch_size=self._row_batch_size):
+            yield from self._iter_row_batch_records(run_id, row_batch)
+
+        # Unified lineage roster + loss ledger (spec §4.3/§6.2): every
+        # fork/expand opener mints a group_records row (empty expansions
+        # included); group_losses is empty until WS3 writes the ledger, but
+        # the table enters the portable export surface at this flip.
+        for group_record in self._read_model.get_group_records_for_run(run_id):
+            group_record_record: GroupRecordExportRecord = {
+                "record_type": "group_record",
+                "run_id": run_id,
+                "group_id": group_record.group_id,
+                "kind": group_record.kind,
+                "opener_token_id": group_record.opener_token_id,
+                "member_count": group_record.member_count,
+                "created_at": group_record.created_at.isoformat(),
+                "closes_group_id": group_record.closes_group_id,
+            }
+            yield group_record_record
+
+        for group_loss in self._read_model.get_group_losses_for_run(run_id):
+            group_loss_record: GroupLossExportRecord = {
+                "record_type": "group_loss",
+                "loss_id": group_loss.loss_id,
+                "run_id": run_id,
+                "closer_name": group_loss.closer_name,
+                "group_id": group_loss.group_id,
+                "member_key": group_loss.member_key,
+                "token_id": group_loss.token_id,
+                "reason": group_loss.reason,
+                "recorded_by": group_loss.recorded_by,
+                "recorded_at": group_loss.recorded_at.isoformat(),
+                "adopted_epoch": group_loss.adopted_epoch,
+            }
+            yield group_loss_record
+
+        for failure in self._read_model.get_collector_group_failures_for_run(run_id):
+            failure_record: CollectorGroupFailureExportRecord = {
+                "record_type": "collector_group_failure",
+                "run_id": run_id,
+                "group_id": failure.group_id,
+                "collector_node_id": failure.collector_node_id,
+                "failure_reason": failure.failure_reason,
+                "recorded_at": failure.recorded_at.isoformat(),
+            }
+            yield failure_record
+
+        yield from self._iter_batch_and_artifact_records(run_id)
+
+        # Verdicts refer to both state-parented and operation-parented calls.
+        # Read them through the same snapshot as the rest of the export.
+        for decision in self._read_model.iter_verification_decisions_for_run(run_id, batch_size=self._row_batch_size):
+            verification_record: CallVerificationExportRecord = {
+                "record_type": "call_verification",
+                "run_id": decision.current_run_id,
+                "current_call_id": decision.current_call_id,
+                "source_run_id": decision.source_run_id,
+                "source_call_id": decision.source_call_id,
+                "is_match": decision.is_match,
+                "differences_json": decision.differences_json,
+                "recorded_at": decision.recorded_at.isoformat(),
+            }
+            yield verification_record
+
+    def _iter_sink_effect_records(self, run_id: str) -> Iterator[ExportRecord]:
+        """Yield complete safe recovery history in deterministic family order."""
+        for stream in self._read_model.get_sink_effect_streams_for_run(run_id):
+            yield sink_effect_stream_to_export_record(stream)
+        for effect in self._read_model.get_sink_effects_for_run(run_id):
+            yield sink_effect_to_export_record(effect)
+        for member in self._read_model.get_sink_effect_members_for_run(run_id):
+            yield sink_effect_member_to_export_record(member)
+
+        current_effect_id: str | None = None
+        attempt_index = 0
+        for attempt in self._read_model.get_sink_effect_attempts_for_run(run_id):
+            if attempt.effect_id != current_effect_id:
+                current_effect_id = attempt.effect_id
+                attempt_index = 0
+            yield sink_effect_attempt_to_export_record(run_id, attempt, attempt_index=attempt_index)
+            attempt_index += 1
+
+    def _iter_row_batch_records(self, run_id: str, row_batch: list[Row]) -> Iterator[ExportRecord]:
+        """Yield row-family records for one bounded batch of rows.
+
+        Loads the batch's child collections (tokens, token parents, token
+        outcomes, scheduler events, node states, routing events, state calls)
+        with set-scoped batch queries and groups them into per-parent lookup
+        dicts, then emits records nested as row -> token -> (parents,
+        outcomes, scheduler events, states -> (routing events, calls)). Every
+        set-scoped query preserves the per-parent ordering of its full-run
+        counterpart, so the emitted record sequence — and therefore every
+        record signature and the manifest hash chain — is independent of
+        row_batch_size.
+        """
+        row_ids = [row.row_id for row in row_batch]
+        batch_tokens = self._read_model.get_tokens_for_rows(run_id, row_ids)
+        tokens_by_row: defaultdict[str, list[Token]] = defaultdict(list)
+        for token in batch_tokens:
+            tokens_by_row[token.row_id].append(token)
+
+        token_ids = [token.token_id for token in batch_tokens]
+        lineage_paths_by_token = self._read_model.get_lineage_paths_for_tokens(run_id, token_ids)
+        parents_by_token: defaultdict[str, list[TokenParent]] = defaultdict(list)
+        for parent in self._read_model.get_token_parents_for_tokens(token_ids):
+            parents_by_token[parent.token_id].append(parent)
+
+        outcomes_by_token: defaultdict[str, list[TokenOutcome]] = defaultdict(list)
+        for outcome in self._read_model.get_token_outcomes_for_tokens(run_id, token_ids):
+            outcomes_by_token[outcome.token_id].append(outcome)
+
+        scheduler_events_by_token: defaultdict[str, list[Any]] = defaultdict(list)
+        for scheduler_event in self._read_model.get_scheduler_events_for_tokens(run_id, token_ids):
+            scheduler_events_by_token[scheduler_event.token_id].append(scheduler_event)
+
+        batch_states = self._read_model.get_node_states_for_tokens(run_id, token_ids)
+        states_by_token: defaultdict[str, list[NodeState]] = defaultdict(list)
+        for state in batch_states:
+            states_by_token[state.token_id].append(state)
+
+        state_ids = [state.state_id for state in batch_states]
+        events_by_state: defaultdict[str, list[RoutingEvent]] = defaultdict(list)
+        for event in self._read_model.get_routing_events_for_states(state_ids):
+            events_by_state[event.state_id].append(event)
+
+        calls_by_state: defaultdict[str, list[Call]] = defaultdict(list)
+        for call in self._read_model.get_calls_for_states(state_ids):
+            if not call.state_id:
+                raise AuditIntegrityError(
+                    f"State-parented call '{call.call_id}' has no state_id. Run: {run_id}. This violates the Call XOR constraint."
+                )
+            calls_by_state[call.state_id].append(call)
+
+        for row in row_batch:
+            if row.source_row_index is None:
+                raise AuditIntegrityError(
+                    f"Row '{row.row_id}' has no source_row_index. Run: {run_id}. This violates the multi-source row identity contract."
+                )
+            if row.ingest_sequence is None:
+                raise AuditIntegrityError(
+                    f"Row '{row.row_id}' has no ingest_sequence. Run: {run_id}. This violates the multi-source row identity contract."
+                )
+            row_record: RowExportRecord = {
+                "record_type": "row",
+                "run_id": run_id,
+                "row_id": row.row_id,
+                "row_index": row.row_index,
+                "source_row_index": row.source_row_index,
+                "ingest_sequence": row.ingest_sequence,
+                "source_node_id": row.source_node_id,
+                "source_data_hash": row.source_data_hash,
+                "source_data_ref": row.source_data_ref,
+                "source_contract_json": row.source_contract_json,
+                "created_at": row.created_at.isoformat(),
+            }
+            yield row_record
+
+            # Tokens for this row (from pre-loaded dict). An explicit `in`
+            # guard (not `.get(key, default)`, which trips R1) avoids
+            # defaultdict inflating itself with a throwaway empty list for
+            # every row that has no tokens.
+            for token in tokens_by_row[row.row_id] if row.row_id in tokens_by_row else ():
+                token_record: TokenExportRecord = {
+                    "record_type": "token",
+                    "run_id": run_id,
+                    "token_id": token.token_id,
+                    "row_id": token.row_id,
+                    "step_in_pipeline": token.step_in_pipeline,
+                    "lineage_path": [
+                        [frame.kind.value, frame.group_id, frame.member_key] for frame in lineage_paths_by_token[token.token_id]
+                    ],
+                    "join_group_id": token.join_group_id,
+                    "created_at": token.created_at.isoformat(),
+                }
+                yield token_record
+
+                # Token parents (from pre-loaded dict). An explicit `in`
+                # guard (not `.get(key, default)`, which trips R1) avoids
+                # defaultdict inflating itself with a throwaway empty list for
+                # every token that has no parents.
+                for parent in parents_by_token[token.token_id] if token.token_id in parents_by_token else ():
+                    token_parent_record: TokenParentExportRecord = {
+                        "record_type": "token_parent",
+                        "run_id": run_id,
+                        "token_id": parent.token_id,
+                        "parent_token_id": parent.parent_token_id,
+                        "ordinal": parent.ordinal,
+                    }
+                    yield token_parent_record
+
+                # Token outcomes (from pre-loaded dict). An explicit `in`
+                # guard (not `.get(key, default)`, which trips R1) avoids
+                # defaultdict inflating itself with a throwaway empty list for
+                # every token that has no outcomes.
+                for outcome in outcomes_by_token[token.token_id] if token.token_id in outcomes_by_token else ():
+                    token_outcome_record: TokenOutcomeExportRecord = {
+                        "record_type": "token_outcome",
+                        "run_id": run_id,
+                        "outcome_id": outcome.outcome_id,
+                        "token_id": outcome.token_id,
+                        "outcome": outcome.outcome.value if outcome.outcome is not None else None,
+                        "path": outcome.path.value,
+                        "completed": outcome.completed,
+                        "recorded_at": outcome.recorded_at.isoformat(),
+                        "sink_name": outcome.sink_name,
+                        "batch_id": outcome.batch_id,
+                        "error_hash": outcome.error_hash,
+                        "context_json": outcome.context_json,
+                    }
+                    yield token_outcome_record
+
+                # Scheduler transition events (from pre-loaded dict). An
+                # explicit `in` guard (not `.get(key, default)`, which trips
+                # R1) avoids defaultdict inflating itself with a throwaway
+                # empty list for every token that has no scheduler events.
+                for event in scheduler_events_by_token[token.token_id] if token.token_id in scheduler_events_by_token else ():
+                    scheduler_event_record: SchedulerEventExportRecord = {
+                        "record_type": "scheduler_event",
+                        "run_id": run_id,
+                        "seq": event.seq,
+                        "event_id": event.event_id,
+                        "token_id": event.token_id,
+                        "work_item_id": event.work_item_id,
+                        "node_id": event.node_id,
+                        "event_type": event.event_type.value,
+                        "from_status": event.from_status.value if event.from_status is not None else None,
+                        "to_status": event.to_status.value,
+                        "from_lease_owner": event.from_lease_owner,
+                        "to_lease_owner": event.to_lease_owner,
+                        "from_lease_expires_at": (
+                            event.from_lease_expires_at.isoformat() if event.from_lease_expires_at is not None else None
+                        ),
+                        "to_lease_expires_at": (event.to_lease_expires_at.isoformat() if event.to_lease_expires_at is not None else None),
+                        "from_attempt": event.from_attempt,
+                        "to_attempt": event.to_attempt,
+                        "recorded_at": event.recorded_at.isoformat(),
+                        "caller_owner": event.caller_owner,
+                        "context_json": event.context_json,
+                    }
+                    yield scheduler_event_record
+
+                # Node states for this token (from pre-loaded dict). An
+                # explicit `in` guard (not `.get(key, default)`, which trips
+                # R1) avoids defaultdict inflating itself with a throwaway
+                # empty list for every token that has no node states.
+                for state in states_by_token[token.token_id] if token.token_id in states_by_token else ():
+                    yield node_state_to_export_record(run_id, state)
+
+                    # Routing events for this state (from pre-loaded dict).
+                    # An explicit `in` guard (not `.get(key, default)`, which
+                    # trips R1) avoids defaultdict inflating itself with a
+                    # throwaway empty list for every state that has no
+                    # routing events.
+                    for event in events_by_state[state.state_id] if state.state_id in events_by_state else ():
+                        routing_event_record: RoutingEventExportRecord = {
+                            "record_type": "routing_event",
+                            "run_id": run_id,
+                            "event_id": event.event_id,
+                            "state_id": event.state_id,
+                            "edge_id": event.edge_id,
+                            "routing_group_id": event.routing_group_id,
+                            "ordinal": event.ordinal,
+                            "mode": event.mode.value,
+                            "reason_hash": event.reason_hash,
+                            "reason_ref": event.reason_ref,
+                            "created_at": event.created_at.isoformat() if event.created_at else None,
+                        }
+                        yield routing_event_record
+
+                    # External calls for this state (from pre-loaded dict).
+                    # An explicit `in` guard (not `.get(key, default)`, which
+                    # trips R1) avoids defaultdict inflating itself with a
+                    # throwaway empty list for every state that has no calls.
+                    for call in calls_by_state[state.state_id] if state.state_id in calls_by_state else ():
+                        state_call_record: CallExportRecord = {
+                            "record_type": "call",
+                            "run_id": run_id,
+                            "call_id": call.call_id,
+                            "state_id": call.state_id,
+                            "operation_id": None,  # State calls don't have operation_id
+                            "call_index": call.call_index,
+                            "call_type": call.call_type.value,
+                            "status": call.status.value,
+                            "request_hash": call.request_hash,
+                            "response_hash": call.response_hash,
+                            "approved_prompt_artifact_hash": call.approved_prompt_artifact_hash,
+                            "prompt_tokens": call.prompt_tokens,
+                            "completion_tokens": call.completion_tokens,
+                            "cached_prompt_tokens": call.cached_prompt_tokens,
+                            "reasoning_tokens": call.reasoning_tokens,
+                            "returned_model": call.returned_model,
+                            "latency_ms": call.latency_ms,
+                            "request_ref": call.request_ref,
+                            "response_ref": call.response_ref,
+                            "error_json": call.error_json,
+                            "created_at": call.created_at.isoformat() if call.created_at else None,
+                        }
+                        yield state_call_record
+
+    def _iter_batch_and_artifact_records(self, run_id: str) -> Iterator[ExportRecord]:
+        """Yield batch, batch_member, and artifact records for the run."""
+        # Batches
+        all_batches = self._read_model.get_batches(run_id)
+
+        # Batch query: Pre-load all batch members (N+1 fix)
+        all_batch_members = self._read_model.get_all_batch_members_for_run(run_id)
+        members_by_batch: defaultdict[str, list[BatchMember]] = defaultdict(list)
+        for member in all_batch_members:
+            members_by_batch[member.batch_id].append(member)
+
+        for batch in all_batches:
+            batch_record: BatchExportRecord = {
+                "record_type": "batch",
+                "run_id": run_id,
+                "batch_id": batch.batch_id,
+                "aggregation_node_id": batch.aggregation_node_id,
+                "attempt": batch.attempt,
+                "status": batch.status.value,
+                "trigger_type": batch.trigger_type.value if batch.trigger_type is not None else None,
+                "trigger_reason": batch.trigger_reason,
+                "created_at": (batch.created_at.isoformat() if batch.created_at else None),
+                "completed_at": (batch.completed_at.isoformat() if batch.completed_at else None),
+            }
+            yield batch_record
+
+            # Batch members (from pre-loaded dict). An explicit `in` guard
+            # (not `.get(key, default)`, which trips R1) avoids defaultdict
+            # inflating itself with a throwaway empty list for every batch
+            # that has no members.
+            for member in members_by_batch[batch.batch_id] if batch.batch_id in members_by_batch else ():
+                batch_member_record: BatchMemberExportRecord = {
+                    "record_type": "batch_member",
+                    "run_id": member.run_id,
+                    "batch_id": member.batch_id,
+                    "token_id": member.token_id,
+                    "ordinal": member.ordinal,
+                }
+                yield batch_member_record
+
+        # Artifacts
+        for artifact in self._read_model.get_artifacts(run_id):
+            yield artifact_to_export_record(run_id, artifact)
+
+    def export_run_grouped(
+        self,
+        run_id: str,
+        sign: bool = False,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Export all audit data for a run, grouped by record type.
+
+        This method is useful for CSV export where each record type needs
+        its own file (since record types have different schemas).
+
+        Args:
+            run_id: The run ID to export
+            sign: If True, add HMAC signature to each record
+
+        Returns:
+            Dict mapping record_type -> list of records.
+            Keys are in deterministic order for signature stability.
+
+        Raises:
+            ValueError: If run_id is not found, or sign=True without signing_key
+        """
+        groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+        for record_type, record in self.iter_run_records_by_type(run_id, sign=sign):
+            groups[record_type].append(record)
+
+        # Return as regular dict with deterministic key order
+        # (Python 3.7+ dicts maintain insertion order, and export_run
+        # yields records in a consistent type order)
+        return dict(groups)

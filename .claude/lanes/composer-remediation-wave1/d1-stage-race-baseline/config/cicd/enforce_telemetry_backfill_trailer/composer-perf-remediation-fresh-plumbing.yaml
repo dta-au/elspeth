@@ -1,0 +1,36 @@
+entries:
+  - commit_sha: 21952526b6c1e1d078939c4ae1bff557cd035e41
+    cohort: a
+    reason: |
+      Touches cohort (a) shareable_reviews with eight inserted lines in
+      src/elspeth/web/shareable_reviews/service.py: the mark passes the new
+      keyword-only fresh=True to validate_state and to the readiness
+      compute_snapshot, with a two-line comment at each call explaining
+      that a verdict written into a durable review record must never be
+      served from the advisory validation memo (composer performance
+      remediation fix 2C). The edit is call-site plumbing for the memo
+      bypass and emits no telemetry, so no telemetry-backfill cohort
+      attribution exists to record: this is the README's "naturally
+      touches a cohort directory" escape valve. Rewriting history is not
+      appropriate: the commit is published on the open PR branch
+      claude/vibrant-euler-tora25 (dta-au/elspeth#354) with eleven
+      commits on top of it and a CI run already recorded against its sha.
+    owner: claude
+    expires: 2026-12-31
+  - commit_sha: 21952526b6c1e1d078939c4ae1bff557cd035e41
+    cohort: b2
+    reason: |
+      Touches cohort (b2) audit_readiness with eight inserted lines in
+      src/elspeth/web/audit_readiness/service.py: compute_snapshot gains a
+      keyword-only fresh: bool = False parameter, forwards it to
+      validate_state, and documents that the shareable-review mark passes
+      fresh=True while the readiness route keeps the default (composer
+      performance remediation fix 2C). The edit adds a pass-through
+      parameter and emits no telemetry, so no telemetry-backfill cohort
+      attribution exists to record: this is the README's "naturally
+      touches a cohort directory" escape valve. Rewriting history is not
+      appropriate: the commit is published on the open PR branch
+      claude/vibrant-euler-tora25 (dta-au/elspeth#354) with eleven
+      commits on top of it and a CI run already recorded against its sha.
+    owner: claude
+    expires: 2026-12-31

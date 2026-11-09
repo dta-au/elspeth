@@ -1,0 +1,8 @@
+tree        : /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata
+HEAD        : dd3b3524ccd2a1910db98f77eb35f9d7ce69a249  ()
+stages      : ruff,mypy,contracts,lints
+log dir     : /workspace/elspeth/.claude/lanes/composer-remediation-wave1/combined-wave-gates
+provenance  : elspeth -> /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/src/elspeth/__init__.py
+              elspeth_lints -> /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/elspeth-lints/src/elspeth_lints/__init__.py
+siblings    : 0 pytest process(es) already on this box -> workers=4
+tree state  : dd3b3524ccd2a1910db98f77eb35f9d7ce69a249 01ba4719c80b6fe9  (HEAD + sha256 of status+diff; must match after the run)

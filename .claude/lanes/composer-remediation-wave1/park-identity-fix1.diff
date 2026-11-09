@@ -1,0 +1,28 @@
+diff --git a/tests/unit/web/sessions/test_graph_recovery_turn.py b/tests/unit/web/sessions/test_graph_recovery_turn.py
+--- a/tests/unit/web/sessions/test_graph_recovery_turn.py
++++ b/tests/unit/web/sessions/test_graph_recovery_turn.py
+@@ -137,9 +137,21 @@
+         record = await _run(app, job)
+     response = MessageWithStateResponse.model_validate_json(record.result_json)
+     assert record.status == "completed"
+-    assert arguments["message"] not in response.message.content
+-    assert inaccessible not in response.message.content
+-    assert response.recovery_notice is not None and "did not complete" in response.recovery_notice.content
++    expected_assistant = (
++        "\n\n---\n\n[ELSPETH-SYSTEM] The requested graph recovery did not complete. Choose another saved draft or clarify how to continue."
++    )
++    expected_notice = (
++        "Graph recovery did not complete: the requested draft could not be preserved or restored. The current graph is unchanged."
++    )
++    if malformed_head:
++        expected_notice += " The previous stored graph or its completion metadata could not be decoded; its historical row was preserved."
++    assert response.message.content == expected_assistant
++    assert response.recovery_notice is not None
++    assert response.recovery_notice.content == expected_notice
++    for public_text in (response.message.content, response.recovery_notice.content):
++        assert arguments["message"] not in public_text
++        assert inaccessible not in public_text
++        assert arguments["park_id"] not in public_text
+     with app.state.session_engine.connect() as conn:
+         assert conn.execute(
+             select(composition_states_table.c.id).where(composition_states_table.c.session_id == str(session.id))

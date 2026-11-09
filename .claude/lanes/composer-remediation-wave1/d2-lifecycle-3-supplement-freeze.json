@@ -1,0 +1,8 @@
+{
+  "frozen": true,
+  "changed_since_600": [
+    "tests/helpers/composer_stdio_probe.py",
+    "tests/unit/composer_mcp/test_standalone_lifecycle.py"
+  ],
+  "production_unchanged": true
+}

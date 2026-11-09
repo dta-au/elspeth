@@ -1,0 +1,466 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 44 items / 39 deselected / 5 selected
+
+tests/unit/web/sessions/test_composer_proposals.py FFF.F                 [100%]
+
+=================================== FAILURES ===================================
+__ test_create_composition_proposal_rejects_unusable_blob_reference[missing] ___
+
+engine = Engine(sqlite:///:memory:)
+service = <tests.unit.web.sessions.session_test_authority.FencedSessionServiceHarness object at 0x7fb22c5a76e0>
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-125/test_create_composition_propos0')
+failure_kind = 'missing'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure_kind", ["missing", "cross_session", "pending"])
+    async def test_create_composition_proposal_rejects_unusable_blob_reference(engine, service, tmp_path, failure_kind) -> None:
+        session_id = (await service.create_session("alice", "Composer UX", "local")).id
+        other_session_id = (await service.create_session("alice", "Other composer UX", "local")).id
+    
+        blob_id = uuid4()
+        if failure_kind != "missing":
+            owner = other_session_id if failure_kind == "cross_session" else session_id
+            blob_service = BlobServiceImpl(
+                engine,
+                tmp_path,
+            )
+            if failure_kind == "pending":
+                record = await _create_pending_test_blob(
+                    service,
+                    blob_service,
+                    owner,
+                )
+            else:
+                record = await _create_test_blob(
+                    service,
+                    blob_service,
+                    owner,
+                    filename="proposal.csv",
+                    content=b"value\n1\n",
+                )
+            blob_id = record.id
+    
+        with pytest.raises(ValueError, match="blob"):
+            async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+>               await service.create_composition_proposal(
+                    session_id=session_id,
+                    tool_call_id=f"call_{failure_kind}",
+                    tool_name="set_source_from_blob",
+                    summary="Use the blob as source.",
+                    rationale="Requested by the user.",
+                    affects=("source",),
+                    arguments_json={"blob_id": str(blob_id)},
+                    arguments_redacted_json={"blob_id": str(blob_id)},
+                    base_state_id=None,
+                    actor="composer-web:user-alice",
+                    session_operation_context=context,
+                )
+
+tests/unit/web/sessions/test_composer_proposals.py:863: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/sessions/session_test_authority.py:219: in _wrapped
+    return await parent(*args, session_operation_context=session_operation_context, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3153: in create_composition_proposal
+    return cast(CompositionProposalRecord, await self._run_sync(_sync))
+                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:1030: in _run_sync
+    return await run_sync_in_worker(func, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:650: in run_sync_in_worker
+    return await _await_worker_future(concurrent_future, cancel_queued=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:720: in _await_worker_future
+    return future.result()
+           ^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/required_executor.py:119: in invoke
+    return callable_()
+           ^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3137: in _sync
+    return transaction.composer.create_composition_proposal(
+src/elspeth/web/sessions/mutation_capabilities.py:129: in create_composition_proposal
+    validate_proposal_blob_references(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+conn = <sqlalchemy.engine.base.Connection object at 0x7fb22c52a090>
+
+    def validate_proposal_blob_references(
+        conn: Connection,
+        *,
+        session_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> None:
+        """Require every authoritative proposal blob to be owned and ready."""
+        for blob_id in proposal_blob_reference_ids(tool_name, arguments):
+            row = conn.execute(select(blobs_table.c.session_id, blobs_table.c.status).where(blobs_table.c.id == blob_id)).first()
+            if row is None:
+>               raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
+E               elspeth.web.sessions.proposal_blob_refs.ProposalResourceUnavailableError: I couldn't prepare this proposal because a referenced file is no longer available for this session. Please choose the file again and retry.
+
+src/elspeth/web/sessions/proposal_blob_refs.py:185: ProposalResourceUnavailableError
+_ test_create_composition_proposal_rejects_unusable_blob_reference[cross_session] _
+
+engine = Engine(sqlite:///:memory:)
+service = <tests.unit.web.sessions.session_test_authority.FencedSessionServiceHarness object at 0x7fb22c5d7560>
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-125/test_create_composition_propos1')
+failure_kind = 'cross_session'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure_kind", ["missing", "cross_session", "pending"])
+    async def test_create_composition_proposal_rejects_unusable_blob_reference(engine, service, tmp_path, failure_kind) -> None:
+        session_id = (await service.create_session("alice", "Composer UX", "local")).id
+        other_session_id = (await service.create_session("alice", "Other composer UX", "local")).id
+    
+        blob_id = uuid4()
+        if failure_kind != "missing":
+            owner = other_session_id if failure_kind == "cross_session" else session_id
+            blob_service = BlobServiceImpl(
+                engine,
+                tmp_path,
+            )
+            if failure_kind == "pending":
+                record = await _create_pending_test_blob(
+                    service,
+                    blob_service,
+                    owner,
+                )
+            else:
+                record = await _create_test_blob(
+                    service,
+                    blob_service,
+                    owner,
+                    filename="proposal.csv",
+                    content=b"value\n1\n",
+                )
+            blob_id = record.id
+    
+        with pytest.raises(ValueError, match="blob"):
+            async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+>               await service.create_composition_proposal(
+                    session_id=session_id,
+                    tool_call_id=f"call_{failure_kind}",
+                    tool_name="set_source_from_blob",
+                    summary="Use the blob as source.",
+                    rationale="Requested by the user.",
+                    affects=("source",),
+                    arguments_json={"blob_id": str(blob_id)},
+                    arguments_redacted_json={"blob_id": str(blob_id)},
+                    base_state_id=None,
+                    actor="composer-web:user-alice",
+                    session_operation_context=context,
+                )
+
+tests/unit/web/sessions/test_composer_proposals.py:863: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/sessions/session_test_authority.py:219: in _wrapped
+    return await parent(*args, session_operation_context=session_operation_context, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3153: in create_composition_proposal
+    return cast(CompositionProposalRecord, await self._run_sync(_sync))
+                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:1030: in _run_sync
+    return await run_sync_in_worker(func, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:650: in run_sync_in_worker
+    return await _await_worker_future(concurrent_future, cancel_queued=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:720: in _await_worker_future
+    return future.result()
+           ^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/required_executor.py:119: in invoke
+    return callable_()
+           ^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3137: in _sync
+    return transaction.composer.create_composition_proposal(
+src/elspeth/web/sessions/mutation_capabilities.py:129: in create_composition_proposal
+    validate_proposal_blob_references(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+conn = <sqlalchemy.engine.base.Connection object at 0x7fb22c5dc0e0>
+
+    def validate_proposal_blob_references(
+        conn: Connection,
+        *,
+        session_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> None:
+        """Require every authoritative proposal blob to be owned and ready."""
+        for blob_id in proposal_blob_reference_ids(tool_name, arguments):
+            row = conn.execute(select(blobs_table.c.session_id, blobs_table.c.status).where(blobs_table.c.id == blob_id)).first()
+            if row is None:
+                raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
+            if row.session_id != session_id:
+>               raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
+E               elspeth.web.sessions.proposal_blob_refs.ProposalResourceUnavailableError: I couldn't prepare this proposal because a referenced file is no longer available for this session. Please choose the file again and retry.
+
+src/elspeth/web/sessions/proposal_blob_refs.py:187: ProposalResourceUnavailableError
+__ test_create_composition_proposal_rejects_unusable_blob_reference[pending] ___
+
+engine = Engine(sqlite:///:memory:)
+service = <tests.unit.web.sessions.session_test_authority.FencedSessionServiceHarness object at 0x7fb22c33ae70>
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-125/test_create_composition_propos2')
+failure_kind = 'pending'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure_kind", ["missing", "cross_session", "pending"])
+    async def test_create_composition_proposal_rejects_unusable_blob_reference(engine, service, tmp_path, failure_kind) -> None:
+        session_id = (await service.create_session("alice", "Composer UX", "local")).id
+        other_session_id = (await service.create_session("alice", "Other composer UX", "local")).id
+    
+        blob_id = uuid4()
+        if failure_kind != "missing":
+            owner = other_session_id if failure_kind == "cross_session" else session_id
+            blob_service = BlobServiceImpl(
+                engine,
+                tmp_path,
+            )
+            if failure_kind == "pending":
+                record = await _create_pending_test_blob(
+                    service,
+                    blob_service,
+                    owner,
+                )
+            else:
+                record = await _create_test_blob(
+                    service,
+                    blob_service,
+                    owner,
+                    filename="proposal.csv",
+                    content=b"value\n1\n",
+                )
+            blob_id = record.id
+    
+        with pytest.raises(ValueError, match="blob"):
+            async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+>               await service.create_composition_proposal(
+                    session_id=session_id,
+                    tool_call_id=f"call_{failure_kind}",
+                    tool_name="set_source_from_blob",
+                    summary="Use the blob as source.",
+                    rationale="Requested by the user.",
+                    affects=("source",),
+                    arguments_json={"blob_id": str(blob_id)},
+                    arguments_redacted_json={"blob_id": str(blob_id)},
+                    base_state_id=None,
+                    actor="composer-web:user-alice",
+                    session_operation_context=context,
+                )
+
+tests/unit/web/sessions/test_composer_proposals.py:863: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/sessions/session_test_authority.py:219: in _wrapped
+    return await parent(*args, session_operation_context=session_operation_context, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3153: in create_composition_proposal
+    return cast(CompositionProposalRecord, await self._run_sync(_sync))
+                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:1030: in _run_sync
+    return await run_sync_in_worker(func, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:650: in run_sync_in_worker
+    return await _await_worker_future(concurrent_future, cancel_queued=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:720: in _await_worker_future
+    return future.result()
+           ^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/required_executor.py:119: in invoke
+    return callable_()
+           ^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3137: in _sync
+    return transaction.composer.create_composition_proposal(
+src/elspeth/web/sessions/mutation_capabilities.py:129: in create_composition_proposal
+    validate_proposal_blob_references(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+conn = <sqlalchemy.engine.base.Connection object at 0x7fb22c38c0b0>
+
+    def validate_proposal_blob_references(
+        conn: Connection,
+        *,
+        session_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> None:
+        """Require every authoritative proposal blob to be owned and ready."""
+        for blob_id in proposal_blob_reference_ids(tool_name, arguments):
+            row = conn.execute(select(blobs_table.c.session_id, blobs_table.c.status).where(blobs_table.c.id == blob_id)).first()
+            if row is None:
+                raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
+            if row.session_id != session_id:
+                raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
+            if type(row.status) is not str or row.status not in BLOB_STATUSES:
+                raise AuditIntegrityError("Tier 1: owned proposal blob has invalid persisted status")
+            if row.status != "ready":
+>               raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
+E               elspeth.web.sessions.proposal_blob_refs.ProposalResourceUnavailableError: I couldn't prepare this proposal because a referenced file is no longer available for this session. Please choose the file again and retry.
+
+src/elspeth/web/sessions/proposal_blob_refs.py:191: ProposalResourceUnavailableError
+___ test_proposal_blob_validation_and_delete_share_one_serial_order[delete] ____
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-125/test_proposal_blob_validation_1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fb22c2f7fe0>
+winner = 'delete'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("winner", ["proposal", "delete"])
+    async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_path, monkeypatch, winner) -> None:
+        """A deterministic barrier proves the lock closes both race outcomes."""
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'race.db'}")
+        initialize_session_schema(engine)
+        session_service = SessionServiceImpl(
+            engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test"),
+        )
+        blob_service = BlobServiceImpl(engine, tmp_path)
+        session_id = uuid4()
+        with engine.begin() as conn:
+            _insert_session(conn, str(session_id))
+        async with _session_operation_context(session_service, session_id, SessionOperationKind.CREATE) as create_context:
+            blob = await blob_service.create_blob(
+                session_id=session_id,
+                filename="race.csv",
+                content=b"value\n1\n",
+                mime_type="text/csv",
+                created_by="assistant",
+                session_operation_context=create_context,
+            )
+    
+        entered = threading.Event()
+        release = threading.Event()
+    
+        # A session holds one live operation, so both effects run under the same
+        # COMPOSE context — one composer turn proposing a blob-backed source while
+        # deleting the blob. The context does not order the effects; the custody
+        # lock under test does.
+        async with _session_operation_context(session_service, session_id, SessionOperationKind.COMPOSE) as context:
+    
+            async def create_proposal():
+                return await session_service.create_composition_proposal(
+                    session_operation_context=context,
+                    session_id=session_id,
+                    tool_call_id=f"call_{winner}",
+                    tool_name="set_source_from_blob",
+                    summary="Use the blob as source.",
+                    rationale="Requested by the user.",
+                    affects=("source",),
+                    arguments_json={"blob_id": str(blob.id)},
+                    arguments_redacted_json={"blob_id": str(blob.id)},
+                    base_state_id=None,
+                    actor="composer-web:user-alice",
+                )
+    
+            if winner == "proposal":
+                from elspeth.web.sessions import mutation_capabilities
+    
+                original_validate = mutation_capabilities.validate_proposal_blob_references
+    
+                def blocked_validate(*args, **kwargs):
+                    entered.set()
+                    if not release.wait(timeout=5):
+                        raise AssertionError("proposal race barrier timed out")
+                    return original_validate(*args, **kwargs)
+    
+                monkeypatch.setattr(mutation_capabilities, "validate_proposal_blob_references", blocked_validate)
+                proposal_task = asyncio.create_task(create_proposal())
+                assert await run_sync_in_worker(entered.wait, 5)
+                delete_task = asyncio.create_task(blob_service.delete_blob(blob.id, session_operation_context=context))
+                await asyncio.sleep(0)
+                release.set()
+    
+                proposal = await proposal_task
+                with pytest.raises(BlobPendingProposalError):
+                    await delete_task
+                assert proposal.status == "pending"
+                assert await blob_service.get_blob(blob.id, session_operation_context=context) == blob
+                return
+    
+            from elspeth.web.coordination import repository as coordination_repository
+    
+            original_pending = coordination_repository.pending_proposal_reference_id
+    
+            def blocked_pending(*args, **kwargs):
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise AssertionError("delete race barrier timed out")
+                return original_pending(*args, **kwargs)
+    
+            monkeypatch.setattr(coordination_repository, "pending_proposal_reference_id", blocked_pending)
+            delete_task = asyncio.create_task(blob_service.delete_blob(blob.id, session_operation_context=context))
+            assert await run_sync_in_worker(entered.wait, 5)
+            proposal_task = asyncio.create_task(create_proposal())
+            await asyncio.sleep(0)
+            release.set()
+    
+            await delete_task
+            with pytest.raises(ValueError, match="does not exist"):
+>               await proposal_task
+
+tests/unit/web/sessions/test_composer_proposals.py:1006: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/sessions/test_composer_proposals.py:948: in create_proposal
+    return await session_service.create_composition_proposal(
+src/elspeth/web/sessions/service.py:3153: in create_composition_proposal
+    return cast(CompositionProposalRecord, await self._run_sync(_sync))
+                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:1030: in _run_sync
+    return await run_sync_in_worker(func, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:650: in run_sync_in_worker
+    return await _await_worker_future(concurrent_future, cancel_queued=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/async_workers.py:720: in _await_worker_future
+    return future.result()
+           ^^^^^^^^^^^^^^^
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/required_executor.py:119: in invoke
+    return callable_()
+           ^^^^^^^^^^^
+src/elspeth/web/sessions/service.py:3137: in _sync
+    return transaction.composer.create_composition_proposal(
+src/elspeth/web/sessions/mutation_capabilities.py:129: in create_composition_proposal
+    validate_proposal_blob_references(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+conn = <sqlalchemy.engine.base.Connection object at 0x7fb22c198d70>
+
+    def validate_proposal_blob_references(
+        conn: Connection,
+        *,
+        session_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> None:
+        """Require every authoritative proposal blob to be owned and ready."""
+        for blob_id in proposal_blob_reference_ids(tool_name, arguments):
+            row = conn.execute(select(blobs_table.c.session_id, blobs_table.c.status).where(blobs_table.c.id == blob_id)).first()
+            if row is None:
+>               raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
+E               elspeth.web.sessions.proposal_blob_refs.ProposalResourceUnavailableError: I couldn't prepare this proposal because a referenced file is no longer available for this session. Please choose the file again and retry.
+
+src/elspeth/web/sessions/proposal_blob_refs.py:185: ProposalResourceUnavailableError
+=========================== short test summary info ============================
+FAILED tests/unit/web/sessions/test_composer_proposals.py::test_create_composition_proposal_rejects_unusable_blob_reference[missing]
+FAILED tests/unit/web/sessions/test_composer_proposals.py::test_create_composition_proposal_rejects_unusable_blob_reference[cross_session]
+FAILED tests/unit/web/sessions/test_composer_proposals.py::test_create_composition_proposal_rejects_unusable_blob_reference[pending]
+FAILED tests/unit/web/sessions/test_composer_proposals.py::test_proposal_blob_validation_and_delete_share_one_serial_order[delete]
+================== 4 failed, 1 passed, 39 deselected in 2.85s ==================

@@ -1,0 +1,598 @@
+// ============================================================================
+// interpretationEventsStore — per-session view of interpretation review events.
+//
+// Phase 5b Task 3 of 18b-phase-5b-frontend.md.  Holds the local projection
+// of interpretation-event state for the LLM-interpretation review surface.
+// Wraps the API client (api/client.ts Phase 5b.18b.2 methods) and updates
+// store state atomically on success.  Errors from the API surface as
+// rejected promises and DO NOT mutate the store (the wire write didn't
+// happen, so the local projection must not pretend it did).
+//
+// Three slices of state per session:
+//
+//  1. pendingBySession[sid][eventId] — InterpretationEvent
+//     Active "review me" affordances.  Cleared on resolve/opt-out.
+//
+//  2. resolvedCountBySession[sid] — { accepted_as_drafted, amended, opted_out }
+//     Audit-readiness-panel counters.  We don't keep the full resolved
+//     event list in memory for the readiness panel (it only needs counts);
+//     the wire route is the source of truth for individual resolved rows.
+//
+//  2a. resolvedBySession[sid] — InterpretationEvent[]
+//     Resolved events kept in memory for the Phase 6B NarrativeResults
+//     overlay (19b-phase-6b-frontend.md Task 6, load-bearing run-window
+//     filter). The overlay needs to filter resolved events to the active
+//     run's wall-clock window so it does not surface resolutions from
+//     prior runs in the same session. The audit-readiness panel
+//     deliberately reads `resolvedCountBySession`, not this slice — the
+//     two surfaces have different invariants and the count-only view
+//     remains canonical for the readiness gauge.
+//
+//  3. optedOutBySession[sid] — boolean
+//     Mirror of sessions.interpretation_review_disabled.  When true,
+//     pending events for that session are cleared (the UX is
+//     "interpretations silenced from now on for this session"); the
+//     backend may still hold pending DB rows but they're no longer
+//     surfaced.
+//
+// Wire validation belongs at the API boundary; TypeScript annotations
+// alone do not validate responses. This store consumes the declared event
+// contract and owns projection ordering, not wire parsing.
+//
+// Telemetry: NONE.  The backend Landscape is the canonical record for
+// every interpretation-event mutation; emitting client-side telemetry
+// would be redundant duplication of audit truth.
+// ============================================================================
+
+import { create } from "zustand";
+import * as api from "@/api/client";
+import type { CompositionState } from "@/types/api";
+import type {
+  InterpretationEvent,
+  InterpretationResolveRequest,
+} from "@/types/interpretation";
+
+// ── Types ────────────────────────────────────────────────────────────────────
+
+/**
+ * Per-session counters for resolved interpretation events.  Mirrors the
+ * three terminal-from-the-store-perspective `InterpretationChoice` values
+ * the audit-readiness panel cares about.  `pending` is not a count here
+ * (it's derivable from `pendingBySession[sid]` size); `abandoned` is a
+ * Phase-11 orphan-cleanup outcome the readiness panel surfaces separately
+ * if needed and is not yet wired into this store.
+ */
+export interface ResolvedCounts {
+  accepted_as_drafted: number;
+  amended: number;
+  opted_out: number;
+}
+
+const EMPTY_COUNTS: ResolvedCounts = {
+  accepted_as_drafted: 0,
+  amended: 0,
+  opted_out: 0,
+};
+
+/**
+ * The resolved rows that represent an operator approval — the ONLY rows a
+ * rendering surface may present as "the operator accepted this
+ * interpretation" (ChatPanel's "Got it — using your interpretation of
+ * <term>." confirmation, NarrativeResults' per-term overlay).
+ *
+ * Classification is by `choice`, never by field presence. The
+ * surface-specific `auto_interpreted_opt_out` shape is REQUIRED by the
+ * backend CHECK constraint (ck_interpretation_events_opt_out_shape) to
+ * carry a non-null `user_term` and `tool_call_id` — the audit trail must
+ * record exactly what was baked without review — so "has a term" marks a
+ * DECLINED review as readily as an approved one (elspeth-3a8a843c47).
+ * `choice` is exact in both directions: the resolve endpoint admits only
+ * `accepted_as_drafted` and `amended`, and every auto_interpreted_* source
+ * is CHECK-forced to `choice='opted_out'`.
+ */
+export function selectApprovedInterpretations(
+  events: readonly InterpretationEvent[],
+): InterpretationEvent[] {
+  return events.filter(
+    (event) =>
+      event.choice === "accepted_as_drafted" || event.choice === "amended",
+  );
+}
+
+interface InterpretationEventsState {
+  /** Shared request ownership for both snapshot endpoints; reset clears it. */
+  refreshRequestBySession: Record<string, symbol>;
+  /** Every terminal choice suppresses cards, including uncounted retirements. */
+  terminalIdsBySession: Record<string, ReadonlySet<string>>;
+  /**
+   * Outstanding writes belong to this store lifetime, never a later login.
+   * Keyed request → session id so a Run control can tell whether a resolve /
+   * opt-out POST for ITS session is still in flight: the server holds that
+   * session's COMPOSE fence until the POST returns, and a refreshAll serviced
+   * in the post-commit window can drop the card from `pendingBySession`
+   * before then (#352). See `interpretationMutationInFlight`.
+   */
+  mutationRequests: ReadonlyMap<symbol, string>;
+  // ── Primary projections ──────────────────────────────────────────────────
+  pendingBySession: Record<string, Record<string, InterpretationEvent>>;
+  resolvedCountBySession: Record<string, ResolvedCounts>;
+  /**
+   * Resolved interpretation events keyed by session_id, populated by
+   * `refreshAll` (and incrementally by `resolveEvent`). Used by Phase 6B
+   * NarrativeResults to filter events by run wall-clock window for
+   * overlay rendering — see 19b-phase-6b-frontend.md Task 6.
+   *
+   * Events arrive in the API's order (chronological by `created_at` /
+   * `resolved_at`). The component performs the wall-clock filter; the
+   * store does not — keeping ordering responsibilities at the read site
+   * means a future schema change (e.g. adding `run_id` to events) only
+   * touches the consumer.
+   *
+   * WRITE-MONOTONIC (elspeth-292505e1c3): `refreshAll` union-merges its
+   * snapshot with rows already held locally (by event id) instead of
+   * replacing, and `resolveEvent` dedups its append — resolution is
+   * terminal server-side, so under any GET/POST response interleaving a
+   * row may only ever be added once, never removed or doubled. Rows a
+   * snapshot merges in keep API order; local-only rows (resolved after
+   * the snapshot's GET) follow them.
+   */
+  resolvedBySession: Record<string, InterpretationEvent[]>;
+  optedOutBySession: Record<string, boolean>;
+
+  // ── Actions ──────────────────────────────────────────────────────────────
+
+  /**
+   * Refresh the pending-event projection for a session.
+   *
+   * Calls GET /interpretations?status=pending and overwrites
+   * pendingBySession[sessionId] with the result.  Does NOT touch the
+   * resolved counts or opt-out flag — use `refreshAll` if those need
+   * rehydrating too.
+   */
+  refreshPending: (sessionId: string) => Promise<void>;
+
+  /**
+   * Refresh pending events, resolved counts, and opt-out state for a session.
+   *
+   * Calls GET /interpretations?status=all and partitions the result:
+   *   - pending rows → pendingBySession[sessionId]
+   *   - non-pending rows → counted into resolvedCountBySession[sessionId]
+   *   - auto_interpreted_opt_out row → optedOutBySession[sessionId] = true
+   *
+   * Used on session load to bootstrap the per-session view in one round-trip.
+   */
+  refreshAll: (sessionId: string) => Promise<void>;
+
+  /**
+   * Resolve an interpretation event.
+   *
+   * On success: removes the event from pendingBySession[sessionId],
+   * increments the matching counter in resolvedCountBySession[sessionId],
+   * returns the new composition state so the caller can update its
+   * own composition-state view atomically.
+   *
+   * On error: throws (rejection propagated); event projections are untouched
+   * (atomicity — if the wire write didn't happen, the projection must
+   * not pretend it did).
+   */
+  resolveEvent: (
+    sessionId: string,
+    eventId: string,
+    body: InterpretationResolveRequest,
+  ) => Promise<{ new_state: CompositionState }>;
+
+  /**
+   * Record the per-session opt-out decision.
+   *
+   * On success: flips optedOutBySession[sessionId] to true, clears
+   * pendingBySession[sessionId], increments the opted_out counter by 1
+   * (representing the opt-out event itself; subsequent auto-baked
+   * opt-out rows are NOT pre-counted here — the audit-readiness panel
+   * fetches /opt_out_summary on demand).
+   *
+   * On error: throws; event projections are untouched.
+   */
+  optOut: (sessionId: string) => Promise<void>;
+
+  /**
+   * Add a single pending event to the store.
+   *
+   * Used when a fresh interpretation event arrives via the compose-loop
+   * response (the backend creates it inline and we'd rather not round-trip
+   * GET /interpretations to surface it).  Idempotent — re-adding the same
+   * event ID overwrites the previous entry.
+   */
+  addPendingEvent: (sessionId: string, event: InterpretationEvent) => void;
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Increment the per-session resolved counter for the given choice.
+ * Returns a new record (immutable update).  Unknown choice values throw
+ * (offensive: the wire-side InterpretationChoice union is closed; an
+ * unknown value here is a bug in the API client or the backend, not
+ * a user-data issue).
+ */
+function incrementResolvedCount(
+  prev: Record<string, ResolvedCounts>,
+  sessionId: string,
+  choice: InterpretationEvent["choice"],
+): Record<string, ResolvedCounts> {
+  const current = prev[sessionId] ?? EMPTY_COUNTS;
+  let next: ResolvedCounts;
+  switch (choice) {
+    case "accepted_as_drafted":
+      next = { ...current, accepted_as_drafted: current.accepted_as_drafted + 1 };
+      break;
+    case "amended":
+      next = { ...current, amended: current.amended + 1 };
+      break;
+    case "opted_out":
+      next = { ...current, opted_out: current.opted_out + 1 };
+      break;
+    case "pending":
+      // Pending is not a resolved state; the caller should not have
+      // dispatched here.  Throw offensively
+      // (docs/guides/data-trust-and-error-handling.md §The Decision Test:
+      // bug in our code → let it crash with a meaningful message).
+      throw new Error(
+        "incrementResolvedCount: 'pending' is not a resolved state",
+      );
+    case "abandoned":
+      // Abandoned is a Phase-11 orphan-cleanup outcome written by the
+      // session-end job, not by user resolve actions.  It does not flow
+      // through resolveEvent / optOut; if we ever see it here, the
+      // call site is wrong.
+      throw new Error(
+        "incrementResolvedCount: 'abandoned' is not produced by user action",
+      );
+    case "superseded":
+      // Superseded is written by the backend state-commit sweep when a
+      // later commit extinguishes the reviewed site — never by a user
+      // resolve action; if we ever see it here, the call site is wrong.
+      throw new Error(
+        "incrementResolvedCount: 'superseded' is not produced by user action",
+      );
+    default: {
+      // Exhaustiveness check: a future widening of InterpretationChoice
+      // turns this into a compile error.
+      const _exhaustive: never = choice;
+      throw new Error(
+        `incrementResolvedCount: unhandled choice ${String(_exhaustive)}`,
+      );
+    }
+  }
+  return { ...prev, [sessionId]: next };
+}
+
+function withMutationRequest(
+  requests: ReadonlyMap<symbol, string>,
+  request: symbol,
+  sessionId: string,
+): ReadonlyMap<symbol, string> {
+  const next = new Map(requests);
+  next.set(request, sessionId);
+  return next;
+}
+
+function withoutMutationRequest(
+  requests: ReadonlyMap<symbol, string>,
+  request: symbol,
+): ReadonlyMap<symbol, string> {
+  const next = new Map(requests);
+  next.delete(request);
+  return next;
+}
+
+/**
+ * True while a resolve or opt-out POST for `sessionId` is outstanding. Both
+ * hold the session's COMPOSE fence server-side until they return, so a Run
+ * dispatched meanwhile is refused with 409 "Session operation is already
+ * active" (#352). Read through a selector so callers re-render on change.
+ */
+export function interpretationMutationInFlight(
+  state: Pick<InterpretationEventsState, "mutationRequests">,
+  sessionId: string,
+): boolean {
+  for (const owner of state.mutationRequests.values()) {
+    if (owner === sessionId) return true;
+  }
+  return false;
+}
+
+// ── Store ────────────────────────────────────────────────────────────────────
+
+export const useInterpretationEventsStore = create<InterpretationEventsState>(
+  (set, get) => ({
+    pendingBySession: {},
+    resolvedCountBySession: {},
+    resolvedBySession: {},
+    optedOutBySession: {},
+    refreshRequestBySession: {},
+    terminalIdsBySession: {},
+    mutationRequests: new Map(),
+
+    async refreshPending(sessionId: string) {
+      const request = Symbol();
+      const pendingAtStart = get().pendingBySession[sessionId] ?? {};
+      set((state) => ({
+        refreshRequestBySession: {
+          ...state.refreshRequestBySession,
+          [sessionId]: request,
+        },
+      }));
+      // The API client returns InterpretationEvent[] (envelope already
+      // unwrapped).  Project into the {eventId: event} map.
+      const events = await api.listInterpretationEvents(sessionId, "pending");
+      const map: Record<string, InterpretationEvent> = {};
+      for (const event of events) {
+        map[event.id] = event;
+      }
+      set((state) => {
+        if (state.refreshRequestBySession[sessionId] !== request) return state;
+        for (const [id, event] of Object.entries(state.pendingBySession[sessionId] ?? {})) {
+          if (pendingAtStart[id] !== event) map[id] = event;
+        }
+        const terminalIds = state.terminalIdsBySession[sessionId];
+        for (const id of Object.keys(map)) {
+          if (terminalIds?.has(id)) delete map[id];
+        }
+        return {
+          pendingBySession: {
+            ...state.pendingBySession,
+            [sessionId]: state.optedOutBySession[sessionId] ? {} : map,
+          },
+        };
+      });
+    },
+
+    async refreshAll(sessionId: string) {
+      const request = Symbol();
+      const pendingAtStart = get().pendingBySession[sessionId] ?? {};
+      set((state) => ({
+        refreshRequestBySession: {
+          ...state.refreshRequestBySession,
+          [sessionId]: request,
+        },
+      }));
+      const events = await api.listInterpretationEvents(sessionId, "all");
+      const pendingMap: Record<string, InterpretationEvent> = {};
+      // Resolved-event list for the Phase 6B NarrativeResults overlay.
+      // Preserves API order (chronological); the consumer (NarrativeResults)
+      // owns the wall-clock filter. We include every non-pending choice
+      // that the counts surface tracks; 'abandoned' rows are skipped here
+      // for the same reason they're skipped from counts.
+      const resolvedList: InterpretationEvent[] = [];
+      let optedOutFromHistory = false;
+      for (const event of events) {
+        if (event.interpretation_source === "auto_interpreted_opt_out") {
+          optedOutFromHistory = true;
+        }
+        if (event.choice === "pending") {
+          pendingMap[event.id] = event;
+        } else if (
+          event.choice === "accepted_as_drafted" ||
+          event.choice === "amended" ||
+          event.choice === "opted_out"
+        ) {
+          resolvedList.push(event);
+        }
+        // 'abandoned' and 'superseded' rows are not counted in this store;
+        // the audit-readiness panel surfaces them via a separate code path
+        // if needed.
+      }
+      set((state) => {
+        if (state.refreshRequestBySession[sessionId] !== request) return state;
+        const terminalIds = new Set(state.terminalIdsBySession[sessionId]);
+        for (const event of events) {
+          if (event.choice !== "pending") terminalIds.add(event.id);
+        }
+        // The resolved slice is write-MONOTONIC (elspeth-292505e1c3):
+        // resolution is terminal server-side (resolved rows are audit
+        // records, never deleted), so a row present locally but missing
+        // from this snapshot resolved AFTER the GET was serviced — the
+        // unlocked backend read means this refreshAll (fired void from
+        // compose-completion paths) can race a click-handler resolveEvent
+        // in either direction. Union by id: a stale snapshot may only
+        // fail to add rows, never subtract them. Same idiom as the
+        // sticky optedOutBySession merge below.
+        const snapshotIds = new Set(resolvedList.map((event) => event.id));
+        const localOnlyResolved = (
+          state.resolvedBySession[sessionId] ?? []
+        ).filter((event) => !snapshotIds.has(event.id));
+        const mergedResolved = [...resolvedList, ...localOnlyResolved];
+
+        // Pending and counts DERIVE from the merged resolved set, not the
+        // raw snapshot: a card whose row resolved after this GET must not
+        // resurrect (re-clicking it would 409), and its count must not
+        // drop out of the gauge until the next refresh.
+        const counts: ResolvedCounts = { ...EMPTY_COUNTS };
+        for (const event of mergedResolved) {
+          if (
+            event.choice === "accepted_as_drafted" ||
+            event.choice === "amended" ||
+            event.choice === "opted_out"
+          ) {
+            counts[event.choice] += 1;
+          }
+        }
+        const nextPending: Record<string, InterpretationEvent> = {};
+        // Inline compose receipts received after the GET began are absent
+        // from its snapshot. Preserve them, unless a terminal row retires them.
+        for (const [id, event] of Object.entries(state.pendingBySession[sessionId] ?? {})) {
+          if (pendingAtStart[id] !== event) pendingMap[id] = event;
+        }
+        for (const [id, event] of Object.entries(pendingMap)) {
+          if (!terminalIds.has(id)) {
+            nextPending[id] = event;
+          }
+        }
+
+        const optedOut =
+          optedOutFromHistory || state.optedOutBySession[sessionId] === true;
+        return {
+          terminalIdsBySession: {
+            ...state.terminalIdsBySession,
+            [sessionId]: terminalIds,
+          },
+          pendingBySession: {
+            ...state.pendingBySession,
+            [sessionId]: optedOut ? {} : nextPending,
+          },
+          resolvedCountBySession: {
+            ...state.resolvedCountBySession,
+            [sessionId]: counts,
+          },
+          resolvedBySession: {
+            ...state.resolvedBySession,
+            [sessionId]: mergedResolved,
+          },
+          optedOutBySession: optedOut
+            ? { ...state.optedOutBySession, [sessionId]: true }
+            : state.optedOutBySession,
+        };
+      });
+    },
+
+    async resolveEvent(
+      sessionId: string,
+      eventId: string,
+      body: InterpretationResolveRequest,
+    ) {
+      // Register request custody, then call the API. Errors propagate without
+      // changing the event projections (atomicity invariant).
+      const request = Symbol();
+      set((state) => ({
+        mutationRequests: withMutationRequest(state.mutationRequests, request, sessionId),
+      }));
+      let response;
+      try {
+        response = await api.resolveInterpretation(sessionId, eventId, body);
+      } catch (error) {
+        set((state) => ({
+          mutationRequests: withoutMutationRequest(state.mutationRequests, request),
+        }));
+        throw error;
+      }
+      const resolvedChoice = response.event.choice;
+      const resolvedEvent = response.event;
+
+      set((state) => {
+        if (!state.mutationRequests.has(request)) return state;
+        // Remove the event from pending.  Use a fresh inner map rather
+        // than mutating the existing one (Zustand selectors compare by
+        // reference identity).
+        const sessionPending = state.pendingBySession[sessionId];
+        const nextSessionPending: Record<string, InterpretationEvent> = {};
+        if (sessionPending) {
+          for (const [id, evt] of Object.entries(sessionPending)) {
+            if (id !== eventId) {
+              nextSessionPending[id] = evt;
+            }
+          }
+        }
+
+        // Append the newly resolved event into the resolved-list slice
+        // so NarrativeResults (Phase 6B Task 6) can render it without
+        // forcing a refreshAll round-trip after every resolve.
+        //
+        // Dedup by id (elspeth-292505e1c3): a refreshAll whose unlocked
+        // GET was serviced in the post-commit window may have delivered
+        // this row before our POST response landed. If it did, the
+        // snapshot pass already holds the row AND already counted it —
+        // appending or bumping again doubles the "Got it" bubble and
+        // collides React keys (tail confirmations key on event.id).
+        const priorResolved = state.resolvedBySession[sessionId] ?? [];
+        const alreadyDelivered = priorResolved.some(
+          (event) => event.id === resolvedEvent.id,
+        );
+        const nextResolved = alreadyDelivered
+          ? priorResolved
+          : [...priorResolved, resolvedEvent];
+
+        return {
+          mutationRequests: withoutMutationRequest(state.mutationRequests, request),
+          terminalIdsBySession: {
+            ...state.terminalIdsBySession,
+            [sessionId]: new Set([
+              ...(state.terminalIdsBySession[sessionId] ?? []), eventId,
+            ]),
+          },
+          pendingBySession: {
+            ...state.pendingBySession,
+            [sessionId]: nextSessionPending,
+          },
+          resolvedCountBySession: alreadyDelivered
+            ? state.resolvedCountBySession
+            : incrementResolvedCount(
+                state.resolvedCountBySession,
+                sessionId,
+                resolvedChoice,
+              ),
+          resolvedBySession: {
+            ...state.resolvedBySession,
+            [sessionId]: nextResolved,
+          },
+        };
+      });
+
+      return { new_state: response.new_state };
+    },
+
+    async optOut(sessionId: string) {
+      // Register request custody; API errors leave event projections untouched.
+      const request = Symbol();
+      set((state) => ({
+        mutationRequests: withMutationRequest(state.mutationRequests, request, sessionId),
+      }));
+      try {
+        await api.optOutOfInterpretations(sessionId);
+      } catch (error) {
+        set((state) => ({
+          mutationRequests: withoutMutationRequest(state.mutationRequests, request),
+        }));
+        throw error;
+      }
+
+      set((state) => {
+        if (!state.mutationRequests.has(request)) return state;
+        return {
+          mutationRequests: withoutMutationRequest(state.mutationRequests, request),
+          optedOutBySession: { ...state.optedOutBySession, [sessionId]: true },
+          // Clear pending events for the session — the UX is "interpretations
+          // silenced from now on". The backend may still hold pending rows
+          // in the DB; the panel owns the lazy opt-out summary fetch.
+          pendingBySession: { ...state.pendingBySession, [sessionId]: {} },
+          // Count the opt-out event itself.
+          resolvedCountBySession: incrementResolvedCount(
+            state.resolvedCountBySession,
+            sessionId,
+            "opted_out",
+          ),
+        };
+      });
+    },
+
+    addPendingEvent(sessionId: string, event: InterpretationEvent) {
+      // Defensive note: this entry point exists for inline-add from the
+      // compose-loop response path.  The caller is responsible for only
+      // dispatching pending events here; counts/opt-out are not touched.
+      set((state) => {
+        if (
+          state.optedOutBySession[sessionId] ||
+          state.terminalIdsBySession[sessionId]?.has(event.id)
+        ) {
+          return state;
+        }
+        const sessionPending = state.pendingBySession[sessionId] ?? {};
+        return {
+          pendingBySession: {
+            ...state.pendingBySession,
+            [sessionId]: { ...sessionPending, [event.id]: event },
+          },
+        };
+      });
+    },
+  }),
+);

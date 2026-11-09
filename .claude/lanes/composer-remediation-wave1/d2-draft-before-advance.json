@@ -1,0 +1,5 @@
+{
+  "tests/unit/composer_mcp/test_configured_root_admission.py": "4376f6492e52443908bc91c24aab8ff84c362ad39505054c8611e34030142eff",
+  "tests/unit/web/composer/test_set_pipeline_candidate.py": "a1eba8278df7ddd4608ea670ff0afc30331bc0ef1e59bd51d5d713e9c034dc54",
+  "tests/unit/web/test_paths.py": "4d93f15f0c5663065a4d146d71eac395cfaabc75a3863890662a3dd15c2dc420"
+}

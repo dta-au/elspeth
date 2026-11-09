@@ -1,0 +1,101 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 3 items
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py F [ 33%]
+..                                                                       [100%]
+
+=================================== FAILURES ===================================
+_ test_complete_auto_raw_equality_still_applies_required_control_and_review_finalization _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-157/test_complete_auto_raw_equalit0')
+
+    @pytest.mark.asyncio
+    async def test_complete_auto_raw_equality_still_applies_required_control_and_review_finalization(tmp_path: Path) -> None:
+        from elspeth.web.composer.pipeline_proposal import composition_content_hash
+        from elspeth.web.composer.required_controls import wire_required_controls
+        from elspeth.web.composer.tools._common import _serialize_set_pipeline_arguments
+        from tests.integration.web.composer.test_freeform_required_controls import (
+            _assert_required_control_disclosures,
+            _incremental_textract_state,
+            _required_textract_policy,
+        )
+    
+        harness = _harness(tmp_path)
+        view, snapshot = _required_textract_policy(tmp_path)
+        incomplete, output = await _incremental_textract_state(tmp_path, harness=harness, view=view, snapshot=snapshot)
+        completed = real_execute_tool(
+            "set_output",
+            output,
+            incomplete,
+            view,
+            plugin_snapshot=snapshot,
+            data_dir=str(tmp_path),
+            session_engine=harness.engine,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            validate_arguments=True,
+            require_data_dir_for_paths=True,
+            raise_schema_argument_errors=True,
+        )
+        assert completed.success and completed.validation.is_valid
+        current = completed.updated_state
+        assert current.sources and current.outputs
+        assert not any(node.plugin.startswith("aws_bedrock_") for node in current.nodes)
+        arguments, error = _serialize_set_pipeline_arguments(current)
+        assert error is None and arguments is not None
+        authored = deepcopy(arguments)
+        await harness.sessions.update_composer_preferences(
+            UUID(harness.session_id),
+            trust_mode="auto_commit",
+            density_default="high",
+            actor="user:proposal-prevalidation-user",
+        )
+        candidates = []
+    
+        def observe_candidate(*args: Any, **kwargs: Any) -> Any:
+            candidate = real_build_set_pipeline_candidate(*args, **kwargs)
+            candidates.append(candidate)
+            return candidate
+    
+        llm = _ScriptedLLM(_tool_turn("call_complete_equal_controls", "set_pipeline", arguments))
+        with (
+            patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            patch("elspeth.web.composer.tool_batch.build_set_pipeline_candidate", side_effect=observe_candidate),
+            patch("elspeth.web.composer.tool_batch.wire_required_controls", wraps=wire_required_controls) as finalizer,
+            patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as executor,
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Keep this complete pipeline and apply current required controls.",
+                [],
+                current,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                user_message_id=harness.user_message_id,
+            )
+        assert candidates[0].acceptable
+        assert composition_content_hash(candidates[0].result.updated_state) == composition_content_hash(current)
+>       assert composition_content_hash(candidates[-1].result.updated_state) != composition_content_hash(current)
+E       AssertionError: assert '42895f958afada89ba18750797af70f149b3a96951cd6f0dfaf266f22cc04408' != '42895f958afada89ba18750797af70f149b3a96951cd6f0dfaf266f22cc04408'
+E        +  where '42895f958afada89ba18750797af70f149b3a96951cd6f0dfaf266f22cc04408' = <function composition_content_hash at 0x7f7f17f577e0>(CompositionState(nodes=(NodeSpec(id='extract_document', node_type='transform', plugin='aws_textract_document_analysis'... 'e2e27747-1003-43ae-b403-7c5b80f16c89', 'mode': 'bind_source'}), on_validation_failure='discard', description=None)})))
+E        +    where CompositionState(nodes=(NodeSpec(id='extract_document', node_type='transform', plugin='aws_textract_document_analysis'... 'e2e27747-1003-43ae-b403-7c5b80f16c89', 'mode': 'bind_source'}), on_validation_failure='discard', description=None)})) = ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='extract_document', node_type='transform', ...one, runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None).updated_state
+E        +      where ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='extract_document', node_type='transform', ...one, runtime_preflight=None, post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None) = SetPipelineCandidate(result=ToolResult(success=True, updated_state=CompositionState(nodes=(NodeSpec(id='extract_docume... post_call_hints=(), plugin_schemas=None, validation_guidance=None, applied_component=None), prepared_inline_blob=None).result
+E        +  and   '42895f958afada89ba18750797af70f149b3a96951cd6f0dfaf266f22cc04408' = <function composition_content_hash at 0x7f7f17f577e0>(CompositionState(nodes=(NodeSpec(id='extract_document', node_type='transform', plugin='aws_textract_document_analysis'... 'e2e27747-1003-43ae-b403-7c5b80f16c89', 'mode': 'bind_source'}), on_validation_failure='discard', description=None)})))
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:2399: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 14:30:57 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 14:30:59 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 14:30:59 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 14:30:59 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=20.0 configured_turns=5 fundable_turns_estimate=1 planning_seconds_per_turn=15.0
+2026-11-09 14:31:00 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+=========================== short test summary info ============================
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_complete_auto_raw_equality_still_applies_required_control_and_review_finalization
+========================= 1 failed, 2 passed in 7.05s ==========================

@@ -1,0 +1,607 @@
+"""Batch paired preference transform plugin."""
+
+from __future__ import annotations
+
+import math
+import statistics
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Any
+
+from pydantic import Field, field_validator, model_validator
+
+from elspeth.contracts import Determinism
+from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.errors import RowErrorEntry, TransformErrorReason
+from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.plugins.infrastructure.base import BaseTransform
+from elspeth.plugins.infrastructure.config_base import TransformDataConfig
+from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError, require_scalar_group_key
+from elspeth.plugins.transforms._scalar_buckets import (
+    append_unique_bucket_value,
+    same_scalar_bucket_value,
+    scalar_bucket_contains,
+)
+
+type BatchPairedPreferenceRow = dict[str, object]
+
+# Every output field with the type the plugin's code fixes (ADR-050). The
+# field names are configured strings and the counts are ints. The variant
+# labels are the values as they appear in the rows (a configured variant is
+# matched against them), carried from the data, so they are ``any``. Only int
+# and float scores reach the arithmetic (``_score_entry_for`` fails the batch on
+# any other type): each paired delta is ``float(...)``, and the means and the
+# win/loss/tie rates are true divisions, so all are floats. ``preference_rate``
+# is undefined when every pair ties, and the standard error and confidence
+# bounds when fewer than two pairs were compared — each is emitted None then,
+# never a fabricated 0.0 (B4.5). The ``incomplete_pairs`` list is written only
+# when a pair was incomplete (optional) and is a list the schema DSL has no
+# type for.
+_PAIRED_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("baseline_mean", "float"),
+    FieldDefinition("baseline_variant", "any"),
+    FieldDefinition("batch_size", "int"),
+    FieldDefinition("compared_pair_count", "int"),
+    FieldDefinition("confidence_95_high", "float", nullable=True),
+    FieldDefinition("confidence_95_low", "float", nullable=True),
+    FieldDefinition("incomplete_pair_count", "int"),
+    FieldDefinition("loss_rate", "float"),
+    FieldDefinition("losses", "int"),
+    FieldDefinition("mean_paired_delta", "float"),
+    FieldDefinition("missing_score_count", "int"),
+    FieldDefinition("non_finite_score_count", "int"),
+    FieldDefinition("pair_field", "str"),
+    FieldDefinition("preference_rate", "float", nullable=True),
+    FieldDefinition("score_field", "str"),
+    FieldDefinition("standard_error_delta", "float", nullable=True),
+    FieldDefinition("tie_rate", "float"),
+    FieldDefinition("ties", "int"),
+    FieldDefinition("total_pair_count", "int"),
+    FieldDefinition("variant", "any"),
+    FieldDefinition("variant_field", "str"),
+    FieldDefinition("variant_mean", "float"),
+    FieldDefinition("win_rate", "float"),
+    FieldDefinition("wins", "int"),
+    FieldDefinition("incomplete_pairs", "any", required=False),
+)
+_PAIRED_OUTPUT_FIELDS = frozenset(field.name for field in _PAIRED_CREATED_FIELDS if field.required)
+_MAX_BATCH_ROWS = 4096
+
+
+@dataclass(frozen=True, slots=True)
+class _ScoreEntry:
+    variant: Any
+    row_index: int
+    score: int | float | None
+    missing: bool = False
+    non_finite: bool = False
+
+
+class BatchPairedPreferenceConfig(TransformDataConfig):
+    """Configuration for batch paired preference transform."""
+
+    pair_field: str = Field(description="Field that identifies paired evaluation items")
+    variant_field: str = Field(description="Field that identifies the prompt/model/treatment variant")
+    score_field: str = Field(description="Numeric score field to compare within each pair")
+    baseline_variant: str | int | bool | None = Field(
+        default=None,
+        description="Optional baseline variant. When omitted, the first-seen variant is the baseline.",
+    )
+
+    @field_validator("pair_field")
+    @classmethod
+    def _reject_empty_pair_field(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("pair_field must not be empty")
+        return v
+
+    @field_validator("variant_field")
+    @classmethod
+    def _reject_empty_variant_field(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("variant_field must not be empty")
+        return v
+
+    @field_validator("score_field")
+    @classmethod
+    def _reject_empty_score_field(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("score_field must not be empty")
+        return v
+
+    @field_validator("baseline_variant")
+    @classmethod
+    def _reject_empty_baseline_variant(cls, v: str | int | bool | None) -> str | int | bool | None:
+        if type(v) is str and not v.strip():
+            raise ValueError("baseline_variant must not be empty")
+        return v
+
+    @model_validator(mode="after")
+    def _reject_field_collisions(self) -> BatchPairedPreferenceConfig:
+        if len({self.pair_field, self.variant_field, self.score_field}) != 3:
+            raise ValueError("pair_field, variant_field, and score_field must be distinct")
+        return self
+
+
+class BatchPairedPreference(BaseTransform):
+    """Compare paired variant scores over an aggregation batch."""
+
+    name = "batch_paired_preference"
+    determinism = Determinism.DETERMINISTIC
+    plugin_version = "1.0.0"
+    source_file_hash: str | None = "sha256:d74b9452995a54ec"
+    config_model = BatchPairedPreferenceConfig
+    is_batch_aware = True
+    # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
+    flush_emits_one_row_per_buffered_row = False
+    usage_when_to_use: str = (
+        "Use when a pair ID identifies matched baseline and candidate rows in the same flushed window and you "
+        "need win, loss, tie, and score-delta summaries."
+    )
+    usage_when_not_to_use: str = (
+        "Not for unmatched cohorts or stateful reconciliation: split-window pairs never join later, so choose a "
+        "trigger that keeps each complete pair together."
+    )
+    example_use: str = """aggregations:
+  - name: paired_preference
+    plugin: batch_paired_preference
+    input: preference_rows
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 100
+    output_mode: transform
+    options:
+      pair_field: case_id
+      variant_field: variant
+      score_field: preference_score
+      baseline_variant: control
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "paired", "comparison")
+
+    @classmethod
+    def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
+        if issue_code is None:
+            return PluginAssistance(
+                plugin_name=cls.name,
+                issue_code=None,
+                summary="Compares paired variant scores and emits win/loss/tie preference metrics.",
+                composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
+                    "Use batch_paired_preference under aggregations with a trigger; it compares variants within pair_field groups.",
+                    "pair_field, variant_field, and score_field must be three distinct fields.",
+                    "baseline_variant defaults to the first-seen variant; incomplete pairs are counted but not compared.",
+                    "Output is paired preference metrics, not the original rows.",
+                ),
+            )
+        return None
+
+    @classmethod
+    def probe_config(cls) -> dict[str, Any]:
+        """Minimal config for the ADR-009 backward invariant."""
+        return {
+            "schema": {"mode": "observed"},
+            "pair_field": "batch_paired_preference_probe_pair",
+            "variant_field": "batch_paired_preference_probe_variant",
+            "score_field": "batch_paired_preference_probe_score",
+        }
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__(config)
+        cfg = BatchPairedPreferenceConfig.from_dict(config, plugin_name=self.name)
+        self._initialize_declared_input_fields(cfg)
+        self._pair_field = cfg.pair_field
+        self._variant_field = cfg.variant_field
+        self._score_field = cfg.score_field
+        self._baseline_variant = cfg.baseline_variant
+        self.declared_output_fields = _PAIRED_OUTPUT_FIELDS
+
+        base_required = set(cfg.schema_config.required_fields or ())
+        base_required.update({cfg.pair_field, cfg.variant_field, cfg.score_field})
+        if base_required != set(cfg.schema_config.required_fields or ()):
+            schema_config = SchemaConfig(
+                mode=cfg.schema_config.mode,
+                fields=cfg.schema_config.fields,
+                guaranteed_fields=cfg.schema_config.guaranteed_fields,
+                audit_fields=cfg.schema_config.audit_fields,
+                required_fields=tuple(base_required),
+            )
+        else:
+            schema_config = cfg.schema_config
+
+        self._schema_config = schema_config
+        self.input_schema, self.output_schema = self._create_schemas(
+            schema_config,
+            "BatchPairedPreference",
+            adds_fields=True,
+        )
+        self._output_schema_config = self._build_output_schema_config(schema_config)
+
+    def _build_output_schema_config(self, schema_config: SchemaConfig) -> SchemaConfig:
+        """Describe paired comparison rows without propagating input fields."""
+        return SchemaConfig(
+            mode="observed",
+            fields=None,
+            guaranteed_fields=tuple(sorted(self.declared_output_fields)),
+            required_fields=None,
+            audit_fields=None,
+        )
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The typed table above: the same fields on every paired-preference row (ADR-050)."""
+        return _PAIRED_CREATED_FIELDS
+
+    def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Exercise the paired comparison output path for the backward invariant."""
+        baseline = self._augment_invariant_probe_row(probe, field_name=self._pair_field, value="probe")
+        baseline = self._augment_invariant_probe_row(baseline, field_name=self._variant_field, value="baseline")
+        baseline = self._augment_invariant_probe_row(baseline, field_name=self._score_field, value=1.0)
+        candidate = self._augment_invariant_probe_row(probe, field_name=self._pair_field, value="probe")
+        candidate = self._augment_invariant_probe_row(candidate, field_name=self._variant_field, value="candidate")
+        candidate = self._augment_invariant_probe_row(candidate, field_name=self._score_field, value=2.0)
+        return [baseline, candidate]
+
+    def _score_entry_for(self, row: PipelineRow, *, row_index: int) -> _ScoreEntry:
+        raw_score = row[self._score_field]
+        variant = row[self._variant_field]
+        require_scalar_group_key(variant, field=self._variant_field, row_index=row_index)
+
+        if raw_score is None:
+            return _ScoreEntry(variant=variant, row_index=row_index, score=None, missing=True)
+
+        if type(raw_score) not in (int, float):
+            # BATCH-level failure, not a skip. The branches around this one
+            # skip-and-report deliberately (a missing score and a non-finite
+            # float are counted as incomplete pairs); a wrong TYPE is not, and
+            # John's ruling (elspeth-d5034647f0) fails the whole batch rather
+            # than publishing a preference over pairs the operator never
+            # specified. No coercion: a str that is not a number is not a
+            # number. Raised here and converted once in `process` because this
+            # helper returns values, not results.
+            raise BatchRowTypeError(
+                field=self._score_field,
+                row_index=row_index,
+                expected="numeric (int or float)",
+                found=type(raw_score).__name__,
+            )
+
+        if type(raw_score) is float and not math.isfinite(raw_score):
+            return _ScoreEntry(variant=variant, row_index=row_index, score=None, non_finite=True)
+
+        return _ScoreEntry(variant=variant, row_index=row_index, score=raw_score)
+
+    @staticmethod
+    def _is_non_finite_variant(value: object) -> bool:
+        if type(value) is float:
+            return not math.isfinite(value)
+        if type(value) is Decimal:
+            return not value.is_finite()
+        return False
+
+    def _non_finite_variant_error(self, rows: list[PipelineRow]) -> TransformResult | None:
+        """Return an error if any row carries a non-finite variant key (B4.5-d)."""
+        row_errors: list[RowErrorEntry] = []
+        for row_index, row in enumerate(rows):
+            if self._is_non_finite_variant(row[self._variant_field]):
+                row_errors.append({"row_index": row_index, "reason": "non_finite_variant"})
+        if not row_errors:
+            return None
+        reason: TransformErrorReason = {
+            "reason": "validation_failed",
+            "cause": "non_finite_variant",
+            "field": self._variant_field,
+            "row_errors": row_errors,
+        }
+        return TransformResult.error(reason, retryable=False)
+
+    def _collect_pairs(self, rows: list[PipelineRow]) -> tuple[list[tuple[Any, list[_ScoreEntry]]], list[Any]]:
+        pairs: list[tuple[Any, list[_ScoreEntry]]] = []
+        variants: list[Any] = []
+
+        for row_index, row in enumerate(rows):
+            pair_id = row[self._pair_field]
+            require_scalar_group_key(pair_id, field=self._pair_field, row_index=row_index)
+            entry = self._score_entry_for(row, row_index=row_index)
+
+            append_unique_bucket_value(variants, entry.variant)
+
+            for existing_pair, entries in pairs:
+                if same_scalar_bucket_value(pair_id, existing_pair):
+                    entries.append(entry)
+                    break
+            else:
+                pairs.append((pair_id, [entry]))
+
+        return pairs, variants
+
+    @staticmethod
+    def _duplicate_variant_entries(entries: list[_ScoreEntry]) -> list[_ScoreEntry]:
+        """Return every entry whose variant already appeared earlier in the same pair."""
+        seen: list[Any] = []
+        duplicates: list[_ScoreEntry] = []
+        for entry in entries:
+            if scalar_bucket_contains(seen, entry.variant):
+                duplicates.append(entry)
+            else:
+                seen.append(entry.variant)
+        return duplicates
+
+    def _duplicate_variant_in_pair_error(self, pairs: list[tuple[Any, list[_ScoreEntry]]]) -> TransformResult | None:
+        """Return an error if any pair contains two entries with the same variant (B4.5-e).
+
+        The reason names the batch row INDEX of each repeated entry, never the
+        pair id: a pair id is row content, and the audit reason records where
+        the fault is, not what the row said.
+        """
+        row_errors: list[RowErrorEntry] = []
+        for _pair_id, entries in pairs:
+            for entry in self._duplicate_variant_entries(entries):
+                row_errors.append({"row_index": entry.row_index, "reason": "duplicate_variant_in_pair"})
+        if not row_errors:
+            return None
+        row_errors.sort(key=lambda row_error: row_error["row_index"])
+        reason: TransformErrorReason = {
+            "reason": "validation_failed",
+            "cause": "duplicate_variant_in_pair",
+            "field": self._variant_field,
+            "row_errors": row_errors,
+        }
+        return TransformResult.error(reason, retryable=False)
+
+    @staticmethod
+    def _error_for_batch_too_large(*, batch_size: int) -> TransformResult:
+        reason: TransformErrorReason = {
+            "reason": "validation_failed",
+            "cause": "batch_too_large",
+            "batch_size": batch_size,
+            "expected": f"at most {_MAX_BATCH_ROWS} rows",
+        }
+        return TransformResult.error(reason, retryable=False)
+
+    @staticmethod
+    def _find_variant_entry(entries: list[_ScoreEntry], variant: Any) -> _ScoreEntry | None:
+        for entry in entries:
+            if same_scalar_bucket_value(entry.variant, variant):
+                return entry
+        return None
+
+    @staticmethod
+    def _mean(values: list[int | float]) -> float:
+        return sum(values) / len(values)
+
+    @staticmethod
+    def _standard_error(values: list[float]) -> float | None:
+        if len(values) <= 1:
+            # se undefined at n<=1 -- emit None, never 0.0 (B4.5-a)
+            return None
+        return statistics.stdev(values) / math.sqrt(len(values))
+
+    @staticmethod
+    def _require_finite(value: float, *, operation: str) -> float:
+        if not math.isfinite(value):
+            raise OverflowError(operation)
+        return value
+
+    def _comparison_for(
+        self,
+        *,
+        pairs: list[tuple[Any, list[_ScoreEntry]]],
+        baseline_variant: Any,
+        variant: Any,
+        batch_size: int,
+    ) -> tuple[BatchPairedPreferenceRow, TransformResult | None]:
+        baseline_scores: list[int | float] = []
+        variant_scores: list[int | float] = []
+        deltas: list[float] = []
+        incomplete_pairs: list[Any] = []
+        missing_score_count = 0
+        non_finite_score_count = 0
+        wins = 0
+        losses = 0
+        ties = 0
+
+        for pair_id, entries in pairs:
+            baseline = self._find_variant_entry(entries, baseline_variant)
+            candidate = self._find_variant_entry(entries, variant)
+            if baseline is None or candidate is None:
+                incomplete_pairs.append(pair_id)
+                continue
+
+            missing_score_count += int(baseline.missing) + int(candidate.missing)
+            non_finite_score_count += int(baseline.non_finite) + int(candidate.non_finite)
+            if baseline.score is None or candidate.score is None:
+                incomplete_pairs.append(pair_id)
+                continue
+
+            try:
+                delta = self._require_finite(float(candidate.score - baseline.score), operation="paired_delta")
+            except OverflowError as exc:
+                # Row indices, not the variant labels: a variant is row content
+                # and stays out of the audit reason.
+                overflow_reason: TransformErrorReason = {
+                    "reason": "float_overflow",
+                    "operation": str(exc) or "paired_delta",
+                    "field": self._score_field,
+                    "row_errors": [
+                        {"row_index": baseline.row_index, "reason": "float_overflow"},
+                        {"row_index": candidate.row_index, "reason": "float_overflow"},
+                    ],
+                }
+                return {}, TransformResult.error(overflow_reason, retryable=False)
+
+            baseline_scores.append(baseline.score)
+            variant_scores.append(candidate.score)
+            deltas.append(delta)
+            if delta > 0:
+                wins += 1
+            elif delta < 0:
+                losses += 1
+            else:
+                ties += 1
+
+        compared_count = len(deltas)
+        if compared_count == 0:
+            no_complete_pairs_reason: TransformErrorReason = {
+                "reason": "validation_failed",
+                "cause": "no_complete_pairs",
+                "field": self._variant_field,
+                "batch_size": batch_size,
+                "count": len(pairs),
+            }
+            return {}, TransformResult.error(no_complete_pairs_reason, retryable=False)
+
+        try:
+            mean_delta = self._require_finite(sum(deltas) / compared_count, operation="mean_paired_delta")
+            baseline_mean = self._require_finite(self._mean(baseline_scores), operation="baseline_mean")
+            variant_mean = self._require_finite(self._mean(variant_scores), operation="variant_mean")
+            # _standard_error returns None when n<=1 (undefined) -- CI bounds are
+            # also undefined in that case; emit None (honest-absence, B4.5-a)
+            se_raw = self._standard_error(deltas)
+            standard_error_delta: float | None
+            confidence_95_low: float | None
+            confidence_95_high: float | None
+            if se_raw is None:
+                standard_error_delta = None
+                confidence_95_low = None
+                confidence_95_high = None
+            else:
+                standard_error_delta = self._require_finite(se_raw, operation="standard_error_delta")
+                confidence_95_low = self._require_finite(mean_delta - 1.96 * standard_error_delta, operation="confidence_95_low")
+                confidence_95_high = self._require_finite(mean_delta + 1.96 * standard_error_delta, operation="confidence_95_high")
+        except OverflowError as exc:
+            aggregate_overflow_reason: TransformErrorReason = {
+                "reason": "float_overflow",
+                "operation": str(exc) or "paired_preference",
+                "field": self._score_field,
+            }
+            return {}, TransformResult.error(aggregate_overflow_reason, retryable=False)
+
+        preference_denominator = wins + losses
+        # preference_rate = wins/(wins+losses) is 0/0 when all pairs tie --
+        # emit None (honest-absence), never 0.0 (B4.5-b)
+        preference_rate: float | None = None if preference_denominator == 0 else wins / preference_denominator
+
+        result: BatchPairedPreferenceRow = {
+            "pair_field": self._pair_field,
+            "variant_field": self._variant_field,
+            "score_field": self._score_field,
+            "baseline_variant": baseline_variant,
+            "variant": variant,
+            "batch_size": batch_size,
+            "total_pair_count": len(pairs),
+            "compared_pair_count": compared_count,
+            "incomplete_pair_count": len(incomplete_pairs),
+            "missing_score_count": missing_score_count,
+            "non_finite_score_count": non_finite_score_count,
+            "baseline_mean": baseline_mean,
+            "variant_mean": variant_mean,
+            "mean_paired_delta": mean_delta,
+            "wins": wins,
+            "losses": losses,
+            "ties": ties,
+            "win_rate": wins / compared_count,
+            "loss_rate": losses / compared_count,
+            "tie_rate": ties / compared_count,
+            "preference_rate": preference_rate,
+            "standard_error_delta": standard_error_delta,
+            "confidence_95_low": confidence_95_low,
+            "confidence_95_high": confidence_95_high,
+        }
+        if incomplete_pairs:
+            result["incomplete_pairs"] = incomplete_pairs
+        return result, None
+
+    def process(  # type: ignore[override] # Batch signature: list[PipelineRow] instead of PipelineRow
+        self, rows: list[PipelineRow], ctx: TransformContext
+    ) -> TransformResult:
+        """Compute paired preference summaries over a batch."""
+        if not rows:
+            return TransformResult.error({"reason": "empty_batch"}, retryable=False)
+        if len(rows) > _MAX_BATCH_ROWS:
+            return self._error_for_batch_too_large(batch_size=len(rows))
+
+        non_finite_error = self._non_finite_variant_error(rows)
+        if non_finite_error is not None:
+            return non_finite_error
+
+        try:
+            pairs, variants = self._collect_pairs(rows)
+        except BatchRowTypeError as exc:
+            # The batch records that it failed and WHY -- which row, which
+            # field, what was found where a number was required -- and nothing
+            # of the row's value. The structural caller owns disposition: an
+            # aggregation applies its declared on_error
+            # (AggregationExecutor._complete_error_flush records the reason and
+            # the DIVERT; RowProcessor.handle_timeout_flush sends every buffered
+            # row to the on_error sink, or records it discarded), while a
+            # collector turns this into a whole-group failure settled by scope
+            # policy and nesting.
+            return TransformResult.error(exc.as_reason(), retryable=False)
+
+        dup_error = self._duplicate_variant_in_pair_error(pairs)
+        if dup_error is not None:
+            return dup_error
+
+        baseline_variant = self._baseline_variant if self._baseline_variant is not None else variants[0]
+        if not scalar_bucket_contains(variants, baseline_variant):
+            # Only a CONFIGURED baseline can be absent (a first-seen baseline is
+            # in `variants` by construction), so `expected` is config, not row
+            # content. The variants the batch did carry are row content: the
+            # reason counts them and never lists them.
+            return TransformResult.error(
+                {
+                    "reason": "validation_failed",
+                    "cause": "baseline_variant_missing",
+                    "field": self._variant_field,
+                    "expected": str(baseline_variant),
+                    "count": len(variants),
+                },
+                retryable=False,
+            )
+
+        candidates = [variant for variant in variants if not same_scalar_bucket_value(variant, baseline_variant)]
+        if not candidates:
+            return TransformResult.error(
+                {
+                    "reason": "validation_failed",
+                    "cause": "insufficient_variants",
+                    "count": len(variants),
+                },
+                retryable=False,
+            )
+
+        results: list[BatchPairedPreferenceRow] = []
+        for variant in candidates:
+            comparison, error = self._comparison_for(
+                pairs=pairs,
+                baseline_variant=baseline_variant,
+                variant=variant,
+                batch_size=len(rows),
+            )
+            if error is not None:
+                return error
+            results.append(comparison)
+
+        output_contract = self._batch_output_contract(key for result in results for key in result)
+        fields_added = [field.normalized_name for field in output_contract.fields]
+        pipeline_rows = [PipelineRow(result, output_contract) for result in results]
+
+        if len(pipeline_rows) > 1:
+            return TransformResult.success_multi(
+                pipeline_rows,
+                success_reason={"action": "processed", "fields_added": fields_added},
+            )
+
+        return TransformResult.success(
+            pipeline_rows[0],
+            success_reason={"action": "processed", "fields_added": fields_added},
+        )
+
+    def close(self) -> None:
+        """No resources to release."""
+        pass

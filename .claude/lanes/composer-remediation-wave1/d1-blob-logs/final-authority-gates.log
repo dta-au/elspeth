@@ -1,0 +1,542 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 299 items / 290 deselected / 9 selected
+
+tests/unit/architecture/test_session_db_mutation_authority.py .FFFFFFFx  [100%]
+
+=================================== FAILURES ===================================
+__ test_blob_replacement_facet_writer_identities_are_exact_and_bidirectional ___
+
+    def test_blob_replacement_facet_writer_identities_are_exact_and_bidirectional() -> None:
+        root = _repo_root()
+        path = root / "src/elspeth/web/coordination/repository.py"
+        symbols = {
+            "_RepositoryBlobMutations.prepare_blob_replacement",
+            "_RepositoryBlobMutations.mark_blob_replacement_staged",
+            "_RepositoryBlobMutations.commit_blob_replacement",
+            "_RepositoryBlobMutations.retire_blob_replacement",
+            "_RepositoryBlobMutations.abort_blob_replacement",
+        }
+        live = [site for site in scan_production_writers([path], anchor=root) if site.symbol in symbols]
+        reviewed = [site for site in _REVIEWED_WRITERS if site.symbol in symbols]
+        assert len(live) == len(reviewed) == 7
+>       assert inventory_drift(live, reviewed) == ([], [])
+E       AssertionError: assert ([WriterIdent...=False), ...]) == ([], [])
+E         
+E         At index 0 diff: [WriterIdentity(path='src/elspeth/web/coordination/repository.py', symbol='_RepositoryBlobMutations.prepare_blob_replacement', table='blob_replacement_cleanups', operation='insert', fingerprint='bca2ee74a8a93022', ordinal=1, authority='SessionBlobMutationAuthority', line=2484, connection_escape=False), WriterIdentity(path='src/elspeth/web/coordination/repository.py', symbol='_RepositoryBlobMutations.mark_blob_replacement_staged', table='blob_replacement_cleanups', operation='update', fingerprint='6128417bd9a69f02', ordinal=1, authority='SessionBlobMutationAuthority', line=25...
+E         
+E         ...Full output truncated (2 lines hidden), use '-vv' to show
+
+tests/unit/architecture/test_session_db_mutation_authority.py:13035: AssertionError
+___________ test_output_storage_writers_are_exact_fenced_blob_facets ___________
+
+    def test_output_storage_writers_are_exact_fenced_blob_facets() -> None:
+        root = _repo_root()
+        path = "src/elspeth/web/coordination/repository.py"
+        symbols = {
+            "_RepositoryBlobMutations.commit_blob_replacement",
+            "_RepositoryBlobMutations._set_run_output_storage",
+            "_RepositoryBlobMutations._settle_purged_blob_output_storage",
+        }
+        live = [
+            site
+            for site in scan_production_writers([root / path], anchor=root)
+            if site.table == "output_storage_reservations" or site.symbol == "_RepositoryBlobMutations._set_run_output_storage"
+        ]
+        reviewed = [
+            site
+            for site in _REVIEWED_WRITERS
+            if site.table == "output_storage_reservations" or site.symbol == "_RepositoryBlobMutations._set_run_output_storage"
+        ]
+        assert len(live) == len(reviewed) == 6
+>       assert inventory_drift(live, reviewed) == ([], [])
+E       AssertionError: assert ([WriterIdent...scape=False)]) == ([], [])
+E         
+E         At index 0 diff: [WriterIdentity(path='src/elspeth/web/coordination/repository.py', symbol='_RepositoryBlobMutations.commit_blob_replacement', table='output_storage_reservations', operation='update', fingerprint='eeb24b28f3f2ab1c', ordinal=1, authority='SessionBlobMutationAuthority', line=2628, connection_escape=False), WriterIdentity(path='src/elspeth/web/coordination/repository.py', symbol='_RepositoryBlobMutations._settle_purged_blob_output_storage', table='output_storage_reservations', operation='update', fingerprint='3d723c4f6c791eec', ordinal=1, authority='SessionBlobMutationAuthority'...
+E         
+E         ...Full output truncated (2 lines hidden), use '-vv' to show
+
+tests/unit/architecture/test_session_db_mutation_authority.py:13058: AssertionError
+__ test_blob_service_writers_are_exactly_bound_to_the_blob_mutation_authority __
+
+    def test_blob_service_writers_are_exactly_bound_to_the_blob_mutation_authority() -> None:
+        """Family B (elspeth-af0fdc3cc6): the blob service's own transaction boundaries.
+    
+        The remaining direct writers serve fork and inline custody publication.
+        Public creation,
+        deletion, run links, and output finalization use exact-context authority
+        facets. Their advisory-lock acquisitions are separately reviewed reads,
+        which cannot authorize metadata writes or escaping connection handles.
+        Custody-lock forwards into ``_blob_phase_transaction`` remain contained
+        by the scanner's caller-parameter proof (family H slice 3).
+        """
+        root = _repo_root()
+        service_path = "src/elspeth/web/blobs/service.py"
+        composer_path = "src/elspeth/web/composer/tools/blobs.py"
+        service_symbols = {
+            "_insert_pending_blob_row",
+            "_persist_blob_content",
+            "_reserve_pending_blob",
+            "_finalize_reserved_blob",
+            "_discard_nonidempotent_reservation",
+            "reconcile_inline_custody_publications",
+            "persist_inline_custody_blob_on_connection",
+            "BlobServiceImpl._delete_fork_blob_row_locked",
+            "BlobServiceImpl._finalize_registered_fork_blob_deletion",
+            "BlobServiceImpl._cleanup_blobs_for_fork_sync",
+        }
+        contained_symbols = {
+            "_persist_blob_content",
+            "_reserve_pending_blob",
+            "_finalize_reserved_blob",
+            "_discard_nonidempotent_reservation",
+            "reconcile_inline_custody_publications",
+            "BlobServiceImpl._finalize_registered_fork_blob_deletion",
+            "BlobServiceImpl._cleanup_blobs_for_fork_sync",
+        }
+        for path, symbols in ((service_path, service_symbols),):
+            for symbol in symbols:
+                assert _authority_for(path, symbol) == "SessionBlobMutationAuthority"
+                assert _authority_for(path, f"{symbol}_replacement") is None
+                expected_contained = "SessionBlobMutationAuthority" if symbol in contained_symbols else None
+                assert _contained_connection_authority_for(path, symbol) == expected_contained
+        # The routed and deleted writers are not boundaries and must not resurface as raw writers.
+        retired = {
+            "BlobServiceImpl._delete_blob_row_locked",
+            "BlobServiceImpl._finalize_registered_blob_deletion",
+            "BlobServiceImpl._delete_blob_sync",
+            "BlobServiceImpl.create_pending_blob._sync",
+            "BlobServiceImpl.finalize_blob._sync",
+            "BlobServiceImpl._finalize_blob_sync",
+            "BlobServiceImpl.link_blob_to_run._sync",
+            "BlobServiceImpl._best_effort_mark_blob_error",
+            "BlobServiceImpl._mark_run_output_ready",
+            "BlobServiceImpl._mark_run_output_error",
+            "BlobServiceImpl._finalize_one_output_blob",
+        }
+        for symbol in retired:
+            assert _authority_for(service_path, symbol) is None
+            assert _contained_connection_authority_for(service_path, symbol) is None
+    
+        scanned = scan_production_writers([root / service_path, root / composer_path], anchor=root)
+        assert not [site for site in scanned if site.symbol in retired and site.table != "<sessions-write-connection>"]
+        assert not [site for site in scanned if site.table == "<unresolved-session-write>"]
+    
+        blob_tables = {
+            "blobs",
+            "blob_deletion_cleanups",
+            "blob_run_links",
+            "blob_inline_resolutions",
+            "blob_replacement_cleanups",
+        }
+        writes = [site for site in scanned if site.table in blob_tables]
+        reviewed_writes = [site for site in _REVIEWED_WRITERS if site.path in {service_path, composer_path} and site.table in blob_tables]
+        assert len(writes) == len(reviewed_writes) == 7
+        assert {(site.path, site.symbol, site.table, site.operation) for site in writes} == {
+            (service_path, "_insert_pending_blob_row", "blobs", "insert"),
+            (service_path, "_finalize_reserved_blob", "blobs", "update"),
+            (service_path, "_discard_nonidempotent_reservation", "blobs", "delete"),
+            (service_path, "persist_inline_custody_blob_on_connection", "blobs", "update"),
+            (
+                service_path,
+                "BlobServiceImpl._delete_fork_blob_row_locked",
+                "blob_deletion_cleanups",
+                "insert",
+            ),
+            (
+                service_path,
+                "BlobServiceImpl._delete_fork_blob_row_locked",
+                "blobs",
+                "delete",
+            ),
+            (
+                service_path,
+                "BlobServiceImpl._finalize_registered_fork_blob_deletion",
+                "blob_deletion_cleanups",
+                "delete",
+            ),
+        }
+        assert {site.authority for site in writes} == {"SessionBlobMutationAuthority"}
+>       assert inventory_drift(writes, reviewed_writes) == ([], [])
+E       AssertionError: assert ([WriterIdent...=False), ...]) == ([], [])
+E         
+E         At index 0 diff: [WriterIdentity(path='src/elspeth/web/blobs/service.py', symbol='_insert_pending_blob_row', table='blobs', operation='insert', fingerprint='bb9d60d5e991d99d', ordinal=1, authority='SessionBlobMutationAuthority', line=1326, connection_escape=False), WriterIdentity(path='src/elspeth/web/blobs/service.py', symbol='_finalize_reserved_blob', table='blobs', operation='update', fingerprint='69ac6eeb2d6a3bb4', ordinal=1, authority='SessionBlobMutationAuthority', line=1450, connection_escape=False), WriterIdentity(path='src/elspeth/web/blobs/service.py', symbol='_discard_nonidempoten...
+E         
+E         ...Full output truncated (2 lines hidden), use '-vv' to show
+
+tests/unit/architecture/test_session_db_mutation_authority.py:13167: AssertionError
+_ test_atomic_blob_deletion_retirement_facet_identity_is_exact_and_bidirectional _
+
+    def test_atomic_blob_deletion_retirement_facet_identity_is_exact_and_bidirectional() -> None:
+        root = _repo_root()
+        path = "src/elspeth/web/coordination/repository.py"
+        symbol = "_RepositoryBlobMutations.retire_atomic_blob_deletion"
+    
+        assert _authority_for(path, symbol) == "SessionBlobMutationAuthority"
+        assert _authority_for(path, f"{symbol}_replacement") is None
+        assert _authority_for("src/elspeth/web/blobs/service.py", symbol) is None
+        live = [site for site in scan_production_writers([root / path], anchor=root) if site.symbol == symbol]
+        reviewed = [site for site in _REVIEWED_WRITERS if site.symbol == symbol]
+        assert len(live) == len(reviewed) == 1
+        assert [(site.table, site.operation) for site in live] == [("blob_deletion_cleanups", "delete")]
+>       assert inventory_drift(live, reviewed) == ([], [])
+E       AssertionError: assert ([WriterIdent...scape=False)]) == ([], [])
+E         
+E         At index 0 diff: [WriterIdentity(path='src/elspeth/web/coordination/repository.py', symbol='_RepositoryBlobMutations.retire_atomic_blob_deletion', table='blob_deletion_cleanups', operation='delete', fingerprint='2f1a2d64948bf4b7', ordinal=1, authority='SessionBlobMutationAuthority', line=3540, connection_escape=False)] != []
+E         Use -v to get more diff
+
+tests/unit/architecture/test_session_db_mutation_authority.py:13207: AssertionError
+_ test_blob_custody_read_connection_admissions_are_exact_and_not_mutation_authorities _
+
+    def test_blob_custody_read_connection_admissions_are_exact_and_not_mutation_authorities() -> None:
+        root = _repo_root()
+        path = "src/elspeth/web/blobs/service.py"
+        symbols = {
+            "BlobServiceImpl._locked_blob_row_for_read",
+            "BlobServiceImpl._persist_fenced_blob_record._sync",
+            "BlobServiceImpl.delete_blob._sync",
+            "BlobServiceImpl.finalize_run_output_blobs._sync",
+            "BlobServiceImpl._stage_output_blob_error_and_remove_bytes",
+        }
+        live = [site for site in scan_production_writers([root / path], anchor=root) if site.symbol in symbols]
+        reviewed = [site for site in _REVIEWED_READ_CONNECTIONS if site.path == path and site.symbol in symbols]
+        # Four custody-only caller sites moved with their wrapper to locking.py;
+        # the error-staging SELECT remains the sole local read acquisition.
+        assert len(live) == len(reviewed) == 1
+        assert {site.symbol for site in live} == {"BlobServiceImpl._stage_output_blob_error_and_remove_bytes"}
+>       assert subtract_reviewed_read_identities(live, reviewed) == ([], [])
+E       AssertionError: assert ([WriterIdent...scape=False)]) == ([], [])
+E         
+E         At index 0 diff: [WriterIdentity(path='src/elspeth/web/blobs/service.py', symbol='BlobServiceImpl._stage_output_blob_error_and_remove_bytes', table='<sessions-write-connection>', operation='write_connection', fingerprint='990aa332b8773eb8', ordinal=1, authority=None, line=4025, connection_escape=False)] != []
+E         Use -v to get more diff
+
+tests/unit/architecture/test_session_db_mutation_authority.py:13276: AssertionError
+_ test_blob_custody_read_admissions_reject_injected_production_mutations_and_escapes _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-92/test_blob_custody_read_admissi0')
+
+    def test_blob_custody_read_admissions_reject_injected_production_mutations_and_escapes(
+        tmp_path: Path,
+    ) -> None:
+        relative = "src/elspeth/web/blobs/service.py"
+        original = (_repo_root() / relative).read_text()
+        source = tmp_path / relative
+        source.parent.mkdir(parents=True)
+        cases = (
+            (
+                "BlobServiceImpl._persist_fenced_blob_record._sync",
+                "                self._reconcile_abandoned_creations_locked(session_operation_context)\n",
+            ),
+            (
+                "BlobServiceImpl.delete_blob._sync",
+                "                self._delete_blob_with_ledger(\n",
+            ),
+            (
+                "BlobServiceImpl.finalize_run_output_blobs._sync",
+                "                records = self._session_operation_authority.mutate(\n",
+            ),
+            (
+                "BlobServiceImpl._locked_blob_row_for_read",
+                "            row = self._fenced_blob_record(UUID(blob_id_str), context)\n",
+            ),
+            (
+                "BlobServiceImpl._stage_output_blob_error_and_remove_bytes",
+                "                    observed = conn.execute(\n",
+            ),
+        )
+        for symbol, marker in cases:
+            assert original.count(marker) == 1
+            reviewed = [site for site in _REVIEWED_READ_CONNECTIONS if site.path == relative and site.symbol == symbol]
+            baseline = [site for site in scan_production_writers([_repo_root() / relative], anchor=_repo_root()) if site.symbol == symbol]
+            assert len(reviewed) == (1 if symbol == "BlobServiceImpl._stage_output_blob_error_and_remove_bytes" else 0)
+>           assert subtract_reviewed_read_identities(baseline, reviewed) == ([], [])
+E           AssertionError: assert ([WriterIdent...scape=False)]) == ([], [])
+E             
+E             At index 0 diff: [WriterIdentity(path='src/elspeth/web/blobs/service.py', symbol='BlobServiceImpl._stage_output_blob_error_and_remove_bytes', table='<sessions-write-connection>', operation='write_connection', fingerprint='990aa332b8773eb8', ordinal=1, authority=None, line=4025, connection_escape=False)] != []
+E             Use -v to get more diff
+
+tests/unit/architecture/test_session_db_mutation_authority.py:13331: AssertionError
+_ test_blob_proposal_effect_receipt_writers_are_exact_authorized_and_bidirectional _
+
+    def test_blob_proposal_effect_receipt_writers_are_exact_authorized_and_bidirectional() -> None:
+        root = _repo_root()
+        paths = [
+            root / "src/elspeth/web/coordination/repository.py",
+            root / "src/elspeth/web/sessions/proposal_blob_effects.py",
+            root / "src/elspeth/web/sessions/mutation_capabilities.py",
+        ]
+        authorities = {
+            "_RepositoryBlobMutations._record_applied_blob_proposal_effect": "SessionBlobMutationAuthority",
+            "_SessionComposerMutations.accept_pending_ordinary_proposal": "SessionComposerMutationAuthority",
+            # The substrate twin the composer blob tools call inside a
+            # ``locked_session_transaction`` block (P4-D6 family S, ruling (ii)).
+            "record_applied_blob_proposal_effect": "SessionBlobMutationAuthority",
+        }
+        live = [
+            site
+            for site in scan_production_writers(paths, anchor=root)
+            if site.table == "proposal_blob_effect_receipts" and site.symbol in authorities
+        ]
+        reviewed = [site for site in _REVIEWED_WRITERS if site.table == "proposal_blob_effect_receipts"]
+    
+        assert len(live) == len(reviewed) == 3
+        assert {(site.symbol, site.operation, site.authority) for site in live} == {
+            (
+                "_RepositoryBlobMutations._record_applied_blob_proposal_effect",
+                "insert",
+                "SessionBlobMutationAuthority",
+            ),
+            (
+                "_SessionComposerMutations.accept_pending_ordinary_proposal",
+                "update",
+                "SessionComposerMutationAuthority",
+            ),
+            (
+                "record_applied_blob_proposal_effect",
+                "insert",
+                "SessionBlobMutationAuthority",
+            ),
+        }
+>       assert inventory_drift(live, reviewed) == ([], [])
+E       AssertionError: assert ([WriterIdent...scape=False)]) == ([], [])
+E         
+E         At index 0 diff: [WriterIdentity(path='src/elspeth/web/coordination/repository.py', symbol='_RepositoryBlobMutations._record_applied_blob_proposal_effect', table='proposal_blob_effect_receipts', operation='insert', fingerprint='8c66fbb679cf7fa3', ordinal=1, authority='SessionBlobMutationAuthority', line=3312, connection_escape=False)] != []
+E         Use -v to get more diff
+
+tests/unit/architecture/test_session_db_mutation_authority.py:13741: AssertionError
+=========================== short test summary info ============================
+XFAIL tests/unit/architecture/test_session_db_mutation_authority.py::test_all_production_sessions_writers_are_reviewed_typed_authorities - Sessions mutation authority inventory drift.
+Every production writer must appear exactly once in _REVIEWED_WRITERS after routing through the named typed authority in _TABLE_POLICIES.
+Unexpected/unreviewed (207):
+  src/elspeth/cli.py:5049 health write_connection <sessions-write-connection> fp=b50078a98f79748e#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/_database_ops.py:83 DatabaseOps.execute_insert_on unknown_execute <unresolved-session-write> fp=4ceabbfbabb72347#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/graph.py:474 GraphAuditRepository.update_node_output_contract unknown_execute <unresolved-session-write> fp=175e19ad03a3afc4#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/outcomes.py:642 TokenOutcomeRepository.record_token_outcome_on unknown_execute <unresolved-session-write> fp=86affbe751cc9714#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/outcomes.py:730 TokenOutcomeRepository.record_token_outcomes_on unknown_execute <unresolved-session-write> fp=551d5f14a9f30aa9#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/outcomes.py:112 TokenOutcomeRepository._execute_fetchone unknown_execute <unresolved-session-write> fp=bce56c50f0124e8e#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/outcomes.py:128 TokenOutcomeRepository._execute_lock_query unknown_execute <unresolved-session-write> fp=136f32824ae6eeb7#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:247 RowTokenRepository._insert_child_tokens_on unknown_execute <unresolved-session-write> fp=d8a792b277c3457d#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:263 RowTokenRepository._insert_child_tokens_on unknown_execute <unresolved-session-write> fp=ee554f2f56338049#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:238 RowTokenRepository._insert_lineage_frames_many unknown_execute <unresolved-session-write> fp=a535ea981552c361#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:671 RowTokenRepository.fork_token unknown_execute <unresolved-session-write> fp=c6a665fb71dad382#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:686 RowTokenRepository.fork_token unknown_execute <unresolved-session-write> fp=c6a665fb71dad382#2 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:1667 RowTokenRepository.expand_token unknown_execute <unresolved-session-write> fp=aa2c9b963ff4807e#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:2056 RowTokenRepository.record_empty_expansion unknown_execute <unresolved-session-write> fp=488ede01449fcd32#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:1623 RowTokenRepository.expand_token unknown_execute <unresolved-session-write> fp=aa2c9b963ff4807e#2 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:1684 RowTokenRepository.expand_token unknown_execute <unresolved-session-write> fp=aa2c9b963ff4807e#3 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/database.py:1448 LandscapeDB._set_sqlite_schema_epoch write_connection <sessions-write-connection> fp=145b5590f940eae3#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/execution/calls.py:452 CallAuditRepository._update_call_refs_on unknown_execute <unresolved-session-write> fp=c79c6e6e5f2148c2#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/execution/calls.py:273 CallAuditRepository._insert_allocated_call unknown_execute <unresolved-session-write> fp=a5a6843d43ea59ca#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/execution/node_states.py:630 NodeStateRepository.complete_node_state_on unknown_execute <unresolved-session-write> fp=592d0d3623826a46#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/execution/node_states.py:1304 NodeStateRepository._insert_routing_events_on unknown_execute <unresolved-session-write> fp=c5722ed85cb6d89d#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/execution/node_states.py:1316 NodeStateRepository._insert_routing_events_on unknown_execute <unresolved-session-write> fp=be2693474ed75075#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/item_fencing.py:43 fenced_item_transaction unknown_execute <unresolved-session-write> fp=b76c8203dc2f35a0#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/run_coordination_repository.py:210 record_coordination_event unknown_execute <unresolved-session-write> fp=925885ed9f12efad#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/run_coordination_repository.py:1331 RunCoordinationRepository.worker_heartbeat unknown_execute <unresolved-session-write> fp=9480e9933bb01523#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/run_coordination_repository.py:1520 RunCoordinationRepository.depart_worker unknown_execute <unresolved-session-write> fp=f8113c0f8312f18c#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/run_coordination_repository.py:1347 RunCoordinationRepository.worker_heartbeat unknown_execute <unresolved-session-write> fp=9480e9933bb01523#2 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/run_lifecycle_repository.py:1967 RunLifecycleRepository.record_readiness_check unknown_execute <unresolved-session-write> fp=2083962e4f1b3ab8#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/run_start_admission.py:62 RunStartAdmissionRepository.observe write_connection <non-session-write-connection> fp=daf6c82e4ce03a9f#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/dispositions.py:896 SchedulerDispositionRepository._transition_on unknown_execute <unresolved-session-write> fp=f5fb498ca8303719#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/dispositions.py:912 SchedulerDispositionRepository._transition_on unknown_execute <unresolved-session-write> fp=f5fb498ca8303719#2 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/dispositions.py:925 SchedulerDispositionRepository._transition_on unknown_execute <unresolved-session-write> fp=f5fb498ca8303719#3 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/dispositions.py:941 SchedulerDispositionRepository._transition_on unknown_execute <unresolved-session-write> fp=f5fb498ca8303719#4 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/events.py:174 SchedulerEventStore.record unknown_execute <unresolved-session-write> fp=6d84d2f23120893d#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/events.py:195 SchedulerEventStore.record_many unknown_execute <unresolved-session-write> fp=6d09356bd9643350#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/group_losses.py:123 record_group_losses unknown_execute <unresolved-session-write> fp=35de3fe3d71ff170#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/group_losses.py:134 record_group_losses unknown_execute <unresolved-session-write> fp=35de3fe3d71ff170#2 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/leases.py:249 SchedulerLeaseRepository.claim_ready_row unknown_execute <unresolved-session-write> fp=215bbc3c250dcbca#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/leases.py:1167 SchedulerLeaseRepository.heartbeat_lease unknown_execute <unresolved-session-write> fp=1d3537bc27bd785b#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/work_items.py:288 insert_work_items_idempotent unknown_execute <unresolved-session-write> fp=caee7875a079eb16#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/work_items.py:299 insert_work_items_idempotent unknown_execute <unresolved-session-write> fp=caee7875a079eb16#2 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/rate_limit/limiter.py:226 RateLimiter.__init__ unknown_execute <unresolved-session-write> fp=2dbd557f91b59fa9#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/schema_identity.py:51 insert_schema_identity unknown_execute <unresolved-session-write> fp=d72416d2cd214e5a#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/schema_shape.py:906 _text_builtin_identity_rows_on_connection unknown_execute <unresolved-session-write> fp=f3e69e00bb3e7df4#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/schema_shape.py:772 _collect_sqlite_table_option_issues write_connection <sessions-write-connection> fp=0564af7982a64ad9#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/schema_shape.py:793 _proven_pg_catalog_text_builtin_calls write_connection <sessions-write-connection> fp=9d26eba31115d8ff#1 authority=UNCLASSIFIED connection_escape=True
+  src/elspeth/engine/orchestrator/abandon.py:145 _read_run_work write_connection <non-session-write-connection> fp=8f0726b70a181707#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/engine/orchestrator/resume.py:194 pending_source_snapshot_rows write_connection <non-session-write-connection> fp=ab2f1648449dd07d#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/mcp/analyzers/queries.py:1321 query unknown_execute <unresolved-session-write> fp=32f0737cf5dbe9a2#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/mcp/server.py:798 create_server.call_tool unknown_execute <unresolved-session-write> fp=116978fc04d4f048#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/plugins/infrastructure/clients/deadline.py:198 DeadlineNetworkBackend.connect_tcp write_connection <sessions-write-connection> fp=e90063fba330ff27#1 authority=UNCLASSIFIED connection_escape=True
+  src/elspeth/plugins/sinks/database_sink.py:780 DatabaseSink._insert_effect_rows unknown_execute <unresolved-session-write> fp=5703931479aa73fa#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/plugins/sinks/database_sink.py:794 DatabaseSink._insert_effect_rows unknown_execute <unresolved-session-write> fp=f35dce5a853ba78f#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/plugins/sinks/database_sink.py:969 DatabaseSink.commit_effect unknown_opaque <unresolved-session-write> fp=a1ed0f32c96a6da4#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/plugins/sinks/database_sink.py:947 DatabaseSink.commit_effect unknown_exec_driver_sql <unresolved-session-write> fp=b4bfb8c0f54d34d7#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:572 LocalAuthProvider._delete_user_rows unknown_execute <unresolved-session-write> fp=09ab65e44a38c679#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:573 LocalAuthProvider._delete_user_rows unknown_execute <unresolved-session-write> fp=551af1400cbc5a25#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:574 LocalAuthProvider._delete_user_rows unknown_execute <unresolved-session-write> fp=801cea148e3c1a1d#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:575 LocalAuthProvider._delete_user_rows unknown_execute <unresolved-session-write> fp=74b8557e297ffb4e#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:587 LocalAuthProvider._clear_token_audit_intent unknown_execute <unresolved-session-write> fp=4449c8fc77d2db23#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:771 LocalAuthProvider._insert_verification_delivery unknown_execute <unresolved-session-write> fp=5c89171d6e69b6c1#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:779 LocalAuthProvider._insert_verification_delivery unknown_execute <unresolved-session-write> fp=520d90f00a1358bb#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:869 LocalAuthProvider._restore_retryable_verification unknown_execute <unresolved-session-write> fp=989a97601b9f5cdc#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:873 LocalAuthProvider._restore_retryable_verification unknown_execute <unresolved-session-write> fp=caed3e4665ea38d8#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:881 LocalAuthProvider._restore_retryable_verification unknown_execute <unresolved-session-write> fp=70930f1593b316d1#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:489 LocalAuthProvider.register_open_user_with_audit unknown_execute <unresolved-session-write> fp=b2a439b931ad542a#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:712 LocalAuthProvider.set_password unknown_execute <unresolved-session-write> fp=7791766020142135#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:738 LocalAuthProvider.create_email_verification_token unknown_execute <unresolved-session-write> fp=6bb91536025e57a4#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:742 LocalAuthProvider.create_email_verification_token unknown_execute <unresolved-session-write> fp=6bb91536025e57a4#2 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:811 LocalAuthProvider._reap_stale_pending_registrations unknown_execute <unresolved-session-write> fp=def51b5f0f095f01#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:812 LocalAuthProvider._reap_stale_pending_registrations unknown_execute <unresolved-session-write> fp=def51b5f0f095f01#2 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:813 LocalAuthProvider._reap_stale_pending_registrations unknown_execute <unresolved-session-write> fp=def51b5f0f095f01#3 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:1051 LocalAuthProvider.verify_email_and_issue_token unknown_execute <unresolved-session-write> fp=4ee0eaa4cf6e6c3d#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:1059 LocalAuthProvider.verify_email_and_issue_token unknown_execute <unresolved-session-write> fp=4ee0eaa4cf6e6c3d#2 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:1066 LocalAuthProvider.verify_email_and_issue_token unknown_execute <unresolved-session-write> fp=4ee0eaa4cf6e6c3d#3 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:399 LocalAuthProvider._connect unknown_execute <unresolved-session-write> fp=324fd5bf1fc6d051#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:435 LocalAuthProvider.create_user unknown_execute <unresolved-session-write> fp=f15b94e4d5bb7625#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:483 LocalAuthProvider.register_open_user_with_audit unknown_execute <unresolved-session-write> fp=b2a439b931ad542a#2 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:940 LocalAuthProvider.register_email_verified_user unknown_execute <unresolved-session-write> fp=5e548fc37cdaa276#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/auth/local.py:966 LocalAuthProvider.register_email_verified_user unknown_execute <unresolved-session-write> fp=5e548fc37cdaa276#2 authority=UNCLASSIFIED connection_escape=False
+Stale reviewed (94):
+  src/elspeth/web/coordination/repository.py:2559 _RepositoryBlobMutations.commit_blob_replacement update output_storage_reservations fp=eeb24b28f3f2ab1c#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:3559 _RepositoryBlobMutations._settle_purged_blob_output_storage update output_storage_reservations fp=3d723c4f6c791eec#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:3561 _RepositoryBlobMutations._settle_purged_blob_output_storage delete output_storage_reservations fp=3d723c4f6c791eec#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:3887 _RepositoryBlobMutations._set_run_output_storage insert output_storage_reservations fp=8c40ff41aedf8438#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:3890 _RepositoryBlobMutations._set_run_output_storage update output_storage_reservations fp=8c40ff41aedf8438#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:3895 _RepositoryBlobMutations._set_run_output_storage update blobs fp=4cfeafb2df7dcb9d#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/blobs/service.py:4291 BlobServiceImpl._cleanup_blobs_for_fork_sync write_connection <sessions-write-connection> fp=ceea1c242cbfdb83#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/blobs/service.py:4334 BlobServiceImpl._cleanup_blobs_for_fork_sync write_connection <sessions-write-connection> fp=ceea1c242cbfdb83#2 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/blobs/service.py:4447 BlobServiceImpl._cleanup_blobs_for_fork_sync write_connection <sessions-write-connection> fp=ceea1c242cbfdb83#3 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/blobs/service.py:4371 BlobServiceImpl._cleanup_blobs_for_fork_sync write_connection <sessions-write-connection> fp=ceea1c242cbfdb83#4 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/blobs/service.py:4234 BlobServiceImpl._delete_fork_blob_row_locked insert blob_deletion_cleanups fp=16da07b191192600#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/blobs/service.py:4244 BlobServiceImpl._delete_fork_blob_row_locked delete blobs fp=16da07b191192600#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/blobs/service.py:4263 BlobServiceImpl._finalize_registered_fork_blob_deletion write_connection <sessions-write-connection> fp=1039c549bf5d962c#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/blobs/service.py:4266 BlobServiceImpl._finalize_registered_fork_blob_deletion delete blob_deletion_cleanups fp=9adc75e8d72e71ad#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/blobs/service.py:1458 _discard_nonidempotent_reservation write_connection <sessions-write-connection> fp=726caad0e48b0bcc#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/blobs/service.py:1460 _discard_nonidempotent_reservation delete blobs fp=dfb9e7995e5fc483#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/blobs/service.py:1431 _finalize_reserved_blob write_connection <sessions-write-connection> fp=9f94f34df90428d1#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/blobs/service.py:1441 _finalize_reserved_blob update blobs fp=69ac6eeb2d6a3bb4#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/blobs/service.py:1317 _insert_pending_blob_row insert blobs fp=bb9d60d5e991d99d#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/blobs/service.py:1353 _reserve_pending_blob write_connection <sessions-write-connection> fp=58557289c6621c6c#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/blobs/service.py:2057 persist_inline_custody_blob_on_connection update blobs fp=8269e201d89d7e63#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/blobs/service.py:1893 reconcile_inline_custody_publications write_connection <sessions-write-connection> fp=c29cebfe705db1ba#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:4275 _ForkChildSessionMutations.append_child_messages insert chat_messages fp=b3fcd50e04854888#1 authority=SessionForkChildMutations connection_escape=False
+  src/elspeth/web/coordination/repository.py:4222 _ForkChildSessionMutations.insert_child_state insert composition_states fp=a20e7856361bd56b#1 authority=SessionForkChildMutations connection_escape=False
+  src/elspeth/web/coordination/repository.py:4404 _ForkParentReceiptMutations.bind_fork_receipt update session_operation_receipts fp=93116a46895f86ed#1 authority=SessionForkParentReceiptMutations connection_escape=False
+  src/elspeth/web/coordination/repository.py:3699 _RepositoryBlobMutations._adopt_pending_run_outputs update blobs fp=d8e2ea36cf4bd35c#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:3243 _RepositoryBlobMutations._record_applied_blob_proposal_effect insert proposal_blob_effect_receipts fp=8c66fbb679cf7fa3#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:3598 _RepositoryBlobMutations.abort_blob_deletion delete blob_deletion_cleanups fp=4f9e61b1cf7247b0#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:2618 _RepositoryBlobMutations.abort_blob_replacement delete blob_replacement_cleanups fp=75415f0d12b7a661#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:3511 _RepositoryBlobMutations.commit_blob_deletion update blob_deletion_cleanups fp=32bd4fca1428b085#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:3518 _RepositoryBlobMutations.commit_blob_deletion delete blobs fp=87f41b9adb5c8772#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:2524 _RepositoryBlobMutations.commit_blob_replacement update blob_replacement_cleanups fp=2ecd759927d60392#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:2532 _RepositoryBlobMutations.commit_blob_replacement update blobs fp=d2ea73ee0e8472e4#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:2945 _RepositoryBlobMutations.discard_pending_blob delete blobs fp=0e357be387ddc260#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:2721 _RepositoryBlobMutations.finalize_pending_output_blob update blobs fp=d2eb84d546dbcdd2#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:4067 _RepositoryBlobMutations.insert_blob_inline_resolutions insert blob_inline_resolutions fp=4c42110eaa7c5994#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:3623 _RepositoryBlobMutations.insert_blob_run_link insert blob_run_links fp=05fd90838bf9a030#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:3470 _RepositoryBlobMutations.mark_blob_deletion_staged update blob_deletion_cleanups fp=afe03ed89b5a16c7#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:2916 _RepositoryBlobMutations.mark_blob_ready update blobs fp=3fd8ace829dbb08b#1 authority=SessionBlobMutationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:2465 _RepositoryBlobMutations.mark_blob_replacement_staged update blob_replacement_cleanups fp=6128417bd9a69f02#1 authority=SessionBlobMutationAuthority connection_escape=False
+Connections outside exact contained authority (37):
+  src/elspeth/cli.py:5049 health write_connection <sessions-write-connection> fp=b50078a98f79748e#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/database.py:1448 LandscapeDB._set_sqlite_schema_epoch write_connection <sessions-write-connection> fp=145b5590f940eae3#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/run_start_admission.py:62 RunStartAdmissionRepository.observe write_connection <non-session-write-connection> fp=daf6c82e4ce03a9f#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/schema_shape.py:772 _collect_sqlite_table_option_issues write_connection <sessions-write-connection> fp=0564af7982a64ad9#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/schema_shape.py:793 _proven_pg_catalog_text_builtin_calls write_connection <sessions-write-connection> fp=9d26eba31115d8ff#1 authority=UNCLASSIFIED connection_escape=True
+  src/elspeth/engine/orchestrator/abandon.py:145 _read_run_work write_connection <non-session-write-connection> fp=8f0726b70a181707#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/engine/orchestrator/resume.py:194 pending_source_snapshot_rows write_connection <non-session-write-connection> fp=ab2f1648449dd07d#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/plugins/infrastructure/clients/deadline.py:198 DeadlineNetworkBackend.connect_tcp write_connection <sessions-write-connection> fp=e90063fba330ff27#1 authority=UNCLASSIFIED connection_escape=True
+  src/elspeth/web/blobs/service.py:1805 publish_inline_custody_publication_locked write_connection <sessions-write-connection> fp=ef84064b21eb8128#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/blobs/service.py:2874 BlobServiceImpl.list_blobs._sync write_connection <sessions-write-connection> fp=4fa518a6c8ccdf63#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/blobs/service.py:3611 BlobServiceImpl.get_blob_run_links._sync write_connection <sessions-write-connection> fp=793b2531e21a4ec2#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/blobs/service.py:4109 BlobServiceImpl.copy_blobs_for_fork._verify_plan_and_quota write_connection <sessions-write-connection> fp=3a607d21bd66351e#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/blobs/service.py:4234 BlobServiceImpl.copy_blobs_for_fork._verify_exact_target write_connection <sessions-write-connection> fp=4536b6d6104a3575#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/blobs/service.py:4025 BlobServiceImpl._stage_output_blob_error_and_remove_bytes write_connection <sessions-write-connection> fp=990aa332b8773eb8#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/coordination/composer_operation_authority.py:476 ComposerAsyncOperationAuthority.list_failure_outcomes write_connection <sessions-write-connection> fp=aef66a8ba094ed6d#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/coordination/repository.py:5028 _SessionOperationAuthorityRepository._session_exists write_connection <sessions-write-connection> fp=f98bc6d74193a045#1 authority=SessionOperationAuthority connection_escape=False
+  src/elspeth/web/coordination/repository.py:4851 _SessionOperationAuthorityRepository.__build_locked_fork_pair_controls.locked_pair_transaction write_connection <sessions-write-connection> fp=749bb668e4cee8c8#1 authority=SessionOperationAuthority connection_escape=True
+  src/elspeth/web/doctor.py:385 _inspect_via_engine write_connection <sessions-write-connection> fp=0d13e49af38d8ee4#1 authority=UNCLASSIFIED connection_escape=True
+  src/elspeth/web/doctor.py:480 _initialize_via_engine write_connection <sessions-write-connection> fp=b87b8f33fcdb54e2#1 authority=UNCLASSIFIED connection_escape=True
+  src/elspeth/web/external_state_startup.py:117 _probe_with_connection_budget write_connection <sessions-write-connection> fp=e9abbfc4fb7d4b08#1 authority=UNCLASSIFIED connection_escape=True
+  src/elspeth/web/operator_telemetry_custody.py:130 RawMetricExporterCustodian.shutdown write_connection <sessions-write-connection> fp=fae66a52b2813fed#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/operator_telemetry_custody.py:224 OwnedPrometheusMetricReader.shutdown write_connection <sessions-write-connection> fp=0a386b39549ac4b3#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/operator_telemetry_custody.py:286 OwnedPeriodicExportingMetricReader.shutdown write_connection <sessions-write-connection> fp=24b6b48f526fd45e#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/operator_telemetry_custody.py:397 OwnedMeterProvider.shutdown write_connection <sessions-write-connection> fp=387e0c54b2061e49#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/readiness.py:147 _probe_database_engine write_connection <sessions-write-connection> fp=65d5d82276d99f4d#1 authority=UNCLASSIFIED connection_escape=True
+  src/elspeth/web/schema_probe.py:248 _run_locked write_connection <sessions-write-connection> fp=6577c8508024422b#1 authority=UNCLASSIFIED connection_escape=True
+  src/elspeth/web/sessions/locking.py:301 locked_session_transaction write_connection <sessions-write-connection> fp=e938e86c91ec013e#1 authority=SessionOperationAuthority connection_escape=True
+  src/elspeth/web/sessions/locking.py:436 _blob_custody_session_lock write_connection <sessions-write-connection> fp=aa7551b102d956a4#1 authority=UNCLASSIFIED connection_escape=True
+  src/elspeth/web/sessions/service.py:1085 SessionServiceImpl._session_process_locked_begin write_connection <sessions-write-connection> fp=8453659988590c7c#1 authority=UNCLASSIFIED connection_escape=True
+  src/elspeth/web/sessions/service.py:903 SessionServiceImpl._prepare_inline_blob_snapshot._metadata_hint write_connection <sessions-write-connection> fp=11cd7c6122f30a3b#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/sessions/service.py:944 SessionServiceImpl._preflight_state_pair._read write_connection <sessions-write-connection> fp=c0d6edafbecfdc55#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/sessions/service.py:1097 SessionServiceImpl._session_pair_locked_begin write_connection <sessions-write-connection> fp=d511c9930d66a05a#1 authority=UNCLASSIFIED connection_escape=True
+  src/elspeth/web/sessions/service.py:3417 SessionServiceImpl.get_authoritative_composition_proposal._sync write_connection <sessions-write-connection> fp=b200723c49979cce#1 authority=UNCLASSIFIED connection_escape=True
+  src/elspeth/web/sessions/service.py:4384 SessionServiceImpl.replay_pipeline_composition_proposal._sync write_connection <sessions-write-connection> fp=e192ea3c567bc429#1 authority=UNCLASSIFIED connection_escape=True
+  src/elspeth/web/sessions/service.py:4794 SessionServiceImpl.list_composition_proposals._sync write_connection <sessions-write-connection> fp=6902bb6a312b495e#1 authority=UNCLASSIFIED connection_escape=True
+  src/elspeth/web/sessions/service.py:5218 SessionServiceImpl.resolve_interpretation_event._read_pending_event write_connection <sessions-write-connection> fp=cc276aa18425c66e#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/shareable_reviews/service.py:663 ShareableReviewService._latest_mark_ready_event write_connection <sessions-write-connection> fp=cdb73b156f37ffa7#1 authority=UNCLASSIFIED connection_escape=False
+Unresolved write executions (74):
+  src/elspeth/core/landscape/_database_ops.py:83 DatabaseOps.execute_insert_on unknown_execute <unresolved-session-write> fp=4ceabbfbabb72347#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/graph.py:474 GraphAuditRepository.update_node_output_contract unknown_execute <unresolved-session-write> fp=175e19ad03a3afc4#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/outcomes.py:642 TokenOutcomeRepository.record_token_outcome_on unknown_execute <unresolved-session-write> fp=86affbe751cc9714#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/outcomes.py:730 TokenOutcomeRepository.record_token_outcomes_on unknown_execute <unresolved-session-write> fp=551d5f14a9f30aa9#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/outcomes.py:112 TokenOutcomeRepository._execute_fetchone unknown_execute <unresolved-session-write> fp=bce56c50f0124e8e#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/outcomes.py:128 TokenOutcomeRepository._execute_lock_query unknown_execute <unresolved-session-write> fp=136f32824ae6eeb7#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:247 RowTokenRepository._insert_child_tokens_on unknown_execute <unresolved-session-write> fp=d8a792b277c3457d#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:263 RowTokenRepository._insert_child_tokens_on unknown_execute <unresolved-session-write> fp=ee554f2f56338049#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:238 RowTokenRepository._insert_lineage_frames_many unknown_execute <unresolved-session-write> fp=a535ea981552c361#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:671 RowTokenRepository.fork_token unknown_execute <unresolved-session-write> fp=c6a665fb71dad382#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:686 RowTokenRepository.fork_token unknown_execute <unresolved-session-write> fp=c6a665fb71dad382#2 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:1667 RowTokenRepository.expand_token unknown_execute <unresolved-session-write> fp=aa2c9b963ff4807e#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:2056 RowTokenRepository.record_empty_expansion unknown_execute <unresolved-session-write> fp=488ede01449fcd32#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:1623 RowTokenRepository.expand_token unknown_execute <unresolved-session-write> fp=aa2c9b963ff4807e#2 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/data_flow/tokens.py:1684 RowTokenRepository.expand_token unknown_execute <unresolved-session-write> fp=aa2c9b963ff4807e#3 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/execution/calls.py:452 CallAuditRepository._update_call_refs_on unknown_execute <unresolved-session-write> fp=c79c6e6e5f2148c2#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/execution/calls.py:273 CallAuditRepository._insert_allocated_call unknown_execute <unresolved-session-write> fp=a5a6843d43ea59ca#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/execution/node_states.py:630 NodeStateRepository.complete_node_state_on unknown_execute <unresolved-session-write> fp=592d0d3623826a46#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/execution/node_states.py:1304 NodeStateRepository._insert_routing_events_on unknown_execute <unresolved-session-write> fp=c5722ed85cb6d89d#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/execution/node_states.py:1316 NodeStateRepository._insert_routing_events_on unknown_execute <unresolved-session-write> fp=be2693474ed75075#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/item_fencing.py:43 fenced_item_transaction unknown_execute <unresolved-session-write> fp=b76c8203dc2f35a0#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/run_coordination_repository.py:210 record_coordination_event unknown_execute <unresolved-session-write> fp=925885ed9f12efad#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/run_coordination_repository.py:1331 RunCoordinationRepository.worker_heartbeat unknown_execute <unresolved-session-write> fp=9480e9933bb01523#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/run_coordination_repository.py:1520 RunCoordinationRepository.depart_worker unknown_execute <unresolved-session-write> fp=f8113c0f8312f18c#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/run_coordination_repository.py:1347 RunCoordinationRepository.worker_heartbeat unknown_execute <unresolved-session-write> fp=9480e9933bb01523#2 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/run_lifecycle_repository.py:1967 RunLifecycleRepository.record_readiness_check unknown_execute <unresolved-session-write> fp=2083962e4f1b3ab8#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/dispositions.py:896 SchedulerDispositionRepository._transition_on unknown_execute <unresolved-session-write> fp=f5fb498ca8303719#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/dispositions.py:912 SchedulerDispositionRepository._transition_on unknown_execute <unresolved-session-write> fp=f5fb498ca8303719#2 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/dispositions.py:925 SchedulerDispositionRepository._transition_on unknown_execute <unresolved-session-write> fp=f5fb498ca8303719#3 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/dispositions.py:941 SchedulerDispositionRepository._transition_on unknown_execute <unresolved-session-write> fp=f5fb498ca8303719#4 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/events.py:174 SchedulerEventStore.record unknown_execute <unresolved-session-write> fp=6d84d2f23120893d#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/events.py:195 SchedulerEventStore.record_many unknown_execute <unresolved-session-write> fp=6d09356bd9643350#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/group_losses.py:123 record_group_losses unknown_execute <unresolved-session-write> fp=35de3fe3d71ff170#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/group_losses.py:134 record_group_losses unknown_execute <unresolved-session-write> fp=35de3fe3d71ff170#2 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/leases.py:249 SchedulerLeaseRepository.claim_ready_row unknown_execute <unresolved-session-write> fp=215bbc3c250dcbca#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/leases.py:1167 SchedulerLeaseRepository.heartbeat_lease unknown_execute <unresolved-session-write> fp=1d3537bc27bd785b#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/work_items.py:288 insert_work_items_idempotent unknown_execute <unresolved-session-write> fp=caee7875a079eb16#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/landscape/scheduler/work_items.py:299 insert_work_items_idempotent unknown_execute <unresolved-session-write> fp=caee7875a079eb16#2 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/rate_limit/limiter.py:226 RateLimiter.__init__ unknown_execute <unresolved-session-write> fp=2dbd557f91b59fa9#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/core/schema_identity.py:51 insert_schema_identity unknown_execute <unresolved-session-write> fp=d72416d2cd214e5a#1 authority=UNCLASSIFIED connection_escape=False
+Writers without a named authority (2):
+  src/elspeth/web/sessions/service.py:4693 SessionServiceImpl._reject_pipeline_composition_proposal._sync insert proposal_events fp=687735f153f25054#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/sessions/service.py:4704 SessionServiceImpl._reject_pipeline_composition_proposal._sync update composition_proposals fp=687735f153f25054#1 authority=UNCLASSIFIED connection_escape=False
+Writers under the wrong table authority (0):
+
+Stale reviewed read connections (9):
+  src/elspeth/cli.py:5043 health write_connection <sessions-write-connection> fp=b50078a98f79748e#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/blobs/service.py:3944 BlobServiceImpl._stage_output_blob_error_and_remove_bytes write_connection <sessions-write-connection> fp=990aa332b8773eb8#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/blobs/service.py:4153 BlobServiceImpl.copy_blobs_for_fork._verify_exact_target write_connection <sessions-write-connection> fp=4536b6d6104a3575#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/blobs/service.py:4028 BlobServiceImpl.copy_blobs_for_fork._verify_plan_and_quota write_connection <sessions-write-connection> fp=3a607d21bd66351e#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/blobs/service.py:3530 BlobServiceImpl.get_blob_run_links._sync write_connection <sessions-write-connection> fp=793b2531e21a4ec2#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/blobs/service.py:2865 BlobServiceImpl.list_blobs._sync write_connection <sessions-write-connection> fp=4fa518a6c8ccdf63#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/blobs/service.py:1796 publish_inline_custody_publication_locked write_connection <sessions-write-connection> fp=ef84064b21eb8128#1 authority=UNCLASSIFIED connection_escape=False
+  src/elspeth/web/coordination/repository.py:4909 _SessionOperationAuthorityRepository._session_exists write_connection <sessions-write-connection> fp=f98bc6d74193a045#1 authority=SessionOperationAuthority connection_escape=False
+  src/elspeth/web/shareable_reviews/service.py:655 ShareableReviewService._latest_mark_ready_event write_connection <sessions-write-connection> fp=cdb73b156f37ffa7#1 authority=UNCLASSIFIED connection_escape=False
+Stale non-Sessions connection classifications (0):
+
+Invalid reviewed read connections (0):
+
+FAILED tests/unit/architecture/test_session_db_mutation_authority.py::test_blob_replacement_facet_writer_identities_are_exact_and_bidirectional
+FAILED tests/unit/architecture/test_session_db_mutation_authority.py::test_output_storage_writers_are_exact_fenced_blob_facets
+FAILED tests/unit/architecture/test_session_db_mutation_authority.py::test_blob_service_writers_are_exactly_bound_to_the_blob_mutation_authority
+FAILED tests/unit/architecture/test_session_db_mutation_authority.py::test_atomic_blob_deletion_retirement_facet_identity_is_exact_and_bidirectional
+FAILED tests/unit/architecture/test_session_db_mutation_authority.py::test_blob_custody_read_connection_admissions_are_exact_and_not_mutation_authorities
+FAILED tests/unit/architecture/test_session_db_mutation_authority.py::test_blob_custody_read_admissions_reject_injected_production_mutations_and_escapes
+FAILED tests/unit/architecture/test_session_db_mutation_authority.py::test_blob_proposal_effect_receipt_writers_are_exact_authorized_and_bidirectional
+====== 7 failed, 1 passed, 290 deselected, 1 xfailed in 223.07s (0:03:43) ======

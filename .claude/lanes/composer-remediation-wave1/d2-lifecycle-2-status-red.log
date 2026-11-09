@@ -1,0 +1,34 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 45 items / 44 deselected / 1 selected
+
+tests/unit/composer_mcp/test_portable_supervisor.py F                    [100%]
+
+=================================== FAILURES ===================================
+______ test_dedicated_supervisor_has_stdlib_only_startup_and_clean_stdout ______
+
+    def test_dedicated_supervisor_has_stdlib_only_startup_and_clean_stdout():
+        script = str(ROOT / "src/elspeth/composer_mcp/portable_supervisor.py")
+        absent = subprocess.run([sys.executable, "-S", script], capture_output=True, timeout=5)
+        assert absent.returncode == 2 and absent.stdout == b""
+        assert absent.stderr == b"Private Composer supervisor requires an owned runner command\n"
+        exited = subprocess.run([sys.executable, "-S", script, sys.executable, "-c", "raise SystemExit(7)"], capture_output=True, timeout=5)
+        assert exited.returncode == 7 and exited.stdout == exited.stderr == b""
+        signaled = subprocess.run(
+            [sys.executable, "-S", script, sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"],
+            capture_output=True, timeout=5,
+        )
+>       assert signaled.returncode == -signal.SIGTERM and signaled.stdout == signaled.stderr == b""
+E       AssertionError: assert (143 == -<Signals.SIGTERM: 15>)
+E        +  where 143 = CompletedProcess(args=['/workspace/elspeth/.claude/worktrees/composer-remediation-portable-supervisor/.venv/bin/python.../bin/python', '-c', 'import os, signal; os.kill(os.getpid(), signal.SIGTERM)'], returncode=143, stdout=b'', stderr=b'').returncode
+E        +  and   <Signals.SIGTERM: 15> = signal.SIGTERM
+
+tests/unit/composer_mcp/test_portable_supervisor.py:222: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/composer_mcp/test_portable_supervisor.py::test_dedicated_supervisor_has_stdlib_only_startup_and_clean_stdout
+======================= 1 failed, 44 deselected in 3.20s =======================

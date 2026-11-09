@@ -1,0 +1,2 @@
+elspeth=/workspace/elspeth/.claude/worktrees/composer-remediation-park-identity/src/elspeth/__init__.py
+elspeth_lints=/workspace/elspeth/.claude/worktrees/composer-remediation-park-identity/elspeth-lints/src/elspeth_lints/__init__.py

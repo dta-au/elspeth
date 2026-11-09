@@ -1,0 +1,252 @@
+"""Landscape run-setup registration/recording functions for the orchestrator.
+
+This module contains pure functions that write run-setup records to the
+Landscape audit trail:
+- register_nodes with the data-flow repository for every node in the execution
+  graph (resolving plugin metadata, schema config, output contract per node)
+- record_schema_contract: persist the source schema contract at source-node
+  level and expose it to transforms via the plugin context
+
+All functions operate on external state passed via parameters - they don't
+maintain internal state. This follows the same pattern as aggregation.py and
+outcomes.py: pure delegation targets for the Orchestrator. (Moving them does not
+change audit ordering - the bodies are unchanged.)
+
+These functions were extracted from ``Orchestrator`` (where they lived as
+``_register_nodes_with_landscape`` and ``_record_schema_contract``) to shrink
+``core.py``.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol
+
+from elspeth import __version__ as ENGINE_VERSION
+from elspeth.contracts import Determinism, NodeType
+from elspeth.contracts.errors import FrameworkBugError, OrchestrationInvariantError
+from elspeth.contracts.types import CollectorName, NodeID, SinkName
+
+if TYPE_CHECKING:
+    from elspeth.contracts import SourceProtocol
+    from elspeth.contracts.coordination import CoordinationToken
+    from elspeth.contracts.plugin_context import PluginContext
+    from elspeth.contracts.schema_contract import SchemaContract
+    from elspeth.core.dag import ExecutionGraph
+    from elspeth.core.landscape.factory import RecorderFactory
+    from elspeth.engine.orchestrator.types import PipelineConfig
+
+
+@dataclass(frozen=True, slots=True)
+class NodeAuditMetadata:
+    """Audit metadata Landscape stores for an execution-graph node."""
+
+    plugin_version: str
+    determinism: Determinism
+    source_file_hash: str | None
+
+
+class _AuditMetadataPlugin(Protocol):
+    """Plugin attributes required for node audit registration."""
+
+    @property
+    def plugin_version(self) -> str: ...
+
+    @property
+    def determinism(self) -> Determinism: ...
+
+    @property
+    def source_file_hash(self) -> str | None: ...
+
+
+_ENGINE_NODE_AUDIT_METADATA = NodeAuditMetadata(
+    plugin_version=f"engine:{ENGINE_VERSION}",
+    determinism=Determinism.DETERMINISTIC,
+    source_file_hash=None,
+)
+
+
+def resolve_node_audit_metadata(
+    config: PipelineConfig,
+    graph: ExecutionGraph,
+    *,
+    source_id_map: Mapping[str, NodeID],
+    transform_id_map: Mapping[int, NodeID],
+    sink_id_map: Mapping[SinkName, NodeID],
+    config_gate_node_ids: set[NodeID],
+    aggregation_node_ids: set[NodeID],
+    coalesce_node_ids: set[NodeID],
+    collector_id_map: Mapping[CollectorName, NodeID],
+    collector_transforms: Mapping[CollectorName, _AuditMetadataPlugin],
+) -> dict[NodeID, NodeAuditMetadata]:
+    """Resolve audit metadata for every graph node before Landscape writes.
+
+    Collector nodes are plugin-backed (a batch transform closes the EXPAND
+    group) but ride neither ``config.transforms`` nor an aggregation entry;
+    their instances come from the graph's own accessor
+    (``ExecutionGraph.get_collector_transform_map``, META-29), keyed by the
+    same collector name as ``collector_id_map``.
+    """
+
+    plugin_by_node: dict[NodeID, _AuditMetadataPlugin] = {}
+    for source_name, source_node_id in source_id_map.items():
+        plugin_by_node[source_node_id] = config.sources[source_name]
+
+    for collector_name, collector_node_id in collector_id_map.items():
+        if collector_name not in collector_transforms:
+            raise OrchestrationInvariantError(
+                f"Collector {collector_name!r} (node {collector_node_id!r}) is in the graph's collector id map "
+                "but has no transform instance in its collector transform map; the builder populates both together."
+            )
+        plugin_by_node[collector_node_id] = collector_transforms[collector_name]
+
+    for seq, transform in enumerate(config.transforms):
+        if seq in transform_id_map:
+            plugin_by_node[transform_id_map[seq]] = transform
+        elif transform.node_id is not None and NodeID(transform.node_id) in aggregation_node_ids:
+            plugin_by_node[NodeID(transform.node_id)] = transform
+
+    for sink_name, sink in config.sinks.items():
+        if SinkName(sink_name) in sink_id_map:
+            plugin_by_node[sink_id_map[SinkName(sink_name)]] = sink
+
+    metadata_by_node: dict[NodeID, NodeAuditMetadata] = {}
+    for raw_node_id in graph.topological_order():
+        node_id = NodeID(raw_node_id)
+        node_info = graph.get_node_info(raw_node_id)
+        if node_id in config_gate_node_ids or node_id in coalesce_node_ids or node_info.node_type in (NodeType.QUEUE, NodeType.ROW_UNION):
+            metadata_by_node[node_id] = _ENGINE_NODE_AUDIT_METADATA
+            continue
+
+        plugin = plugin_by_node.get(node_id)
+        if plugin is None:
+            raise OrchestrationInvariantError(
+                f"Node {raw_node_id!r} ({node_info.node_type.value}/{node_info.plugin_name}) requires plugin-backed audit metadata, "
+                "but no plugin instance was resolved from the graph ID maps."
+            )
+        metadata_by_node[node_id] = NodeAuditMetadata(
+            plugin_version=plugin.plugin_version,
+            determinism=plugin.determinism,
+            source_file_hash=plugin.source_file_hash,
+        )
+
+    return metadata_by_node
+
+
+def resolve_source_contracts_by_node_id(
+    config: PipelineConfig,
+    source_id_map: Mapping[str, NodeID],
+) -> dict[NodeID, SchemaContract | None]:
+    """Resolve source output contracts by graph node ID."""
+
+    source_contracts_by_node_id: dict[NodeID, SchemaContract | None] = {}
+    for source_name, source_node_id in source_id_map.items():
+        try:
+            source = config.sources[source_name]
+        except KeyError as exc:
+            raise OrchestrationInvariantError(
+                f"Source ID map references source {source_name!r}, but PipelineConfig.sources has no matching source."
+            ) from exc
+        source_contracts_by_node_id[source_node_id] = source.get_schema_contract()
+    return source_contracts_by_node_id
+
+
+def register_nodes_with_landscape(
+    factory: RecorderFactory,
+    graph: ExecutionGraph,
+    execution_order: list[str],
+    audit_metadata_by_node: Mapping[NodeID, NodeAuditMetadata],
+    source_contracts_by_node_id: Mapping[NodeID, SchemaContract | None],
+    *,
+    coordination_token: CoordinationToken,
+) -> None:
+    """Register each node in the execution graph with Landscape.
+
+    Iterates the topological execution order, resolves plugin metadata
+    (version, determinism), schema config, and output contract for each node,
+    then calls factory.data_flow.register_node().
+
+    Args:
+        factory: RecorderFactory for audit trail.
+        coordination_token: Acquired run leadership authority.
+        graph: Execution graph (for node info lookup).
+        execution_order: Topological ordering of node IDs.
+        audit_metadata_by_node: Pre-resolved plugin/engine metadata by node ID.
+        source_contracts_by_node_id: Pre-resolved output contracts for source nodes.
+    """
+
+    for sequence, node_id in enumerate(execution_order):
+        node_info = graph.get_node_info(node_id)
+        try:
+            audit_metadata = audit_metadata_by_node[NodeID(node_id)]
+        except KeyError as exc:
+            raise FrameworkBugError(f"Node '{node_id}' has no resolved audit metadata.") from exc
+
+        # Schema config is always available via output_schema_config —
+        # populated at construction time for all node types.
+        schema_config = node_info.output_schema_config
+        if schema_config is None:
+            raise FrameworkBugError(
+                f"Node '{node_id}' has no output_schema_config. "
+                "All nodes in execution order must have schema config "
+                "populated by the builder."
+            )
+
+        output_contract = None
+        if node_info.node_type == NodeType.SOURCE:
+            try:
+                output_contract = source_contracts_by_node_id[NodeID(node_id)]
+            except KeyError as exc:
+                raise FrameworkBugError(f"Source node '{node_id}' has no resolved output contract entry.") from exc
+
+        factory.data_flow.register_node(
+            coordination_token=coordination_token,
+            node_id=node_id,
+            plugin_name=node_info.plugin_name,
+            node_type=NodeType(node_info.node_type),  # Already lowercase
+            plugin_version=audit_metadata.plugin_version,
+            config=node_info.config,
+            determinism=audit_metadata.determinism,
+            schema_config=schema_config,
+            output_contract=output_contract,
+            source_file_hash=audit_metadata.source_file_hash,
+            sequence=sequence,
+        )
+
+
+def record_schema_contract(
+    factory: RecorderFactory,
+    source_id: NodeID,
+    ctx: PluginContext,
+    *,
+    active_source: SourceProtocol,
+    coordination_token: CoordinationToken,
+) -> bool:
+    """Record source schema contract if available.
+
+    Called once per run — on the first VALID row (quarantined rows don't
+    trigger contract population) or post-loop for runs with no valid rows
+    (empty input or all-quarantined).
+
+    Returns:
+        True if schema contract was recorded, False otherwise.
+    """
+    schema_contract = active_source.get_schema_contract()
+    if schema_contract is None:
+        return False
+
+    # Update source-scoped resume metadata before row processing can fail.
+    # Per ADR-025 §3 Decision 5 (G6), ``run_sources.schema_contract_json`` is
+    # the single authoritative writer/reader for resume contracts. Do not also
+    # write the legacy run-level singleton surface.
+    factory.run_lifecycle.update_run_source_contract(
+        source_node_id=source_id,
+        schema_contract=schema_contract,
+        coordination_token=coordination_token,
+    )
+    # Update source node's output_contract (was NULL at registration)
+    factory.data_flow.update_node_output_contract(source_id, schema_contract, member_token=coordination_token.membership)
+    # Make contract available to transforms via context
+    ctx.contract = schema_contract
+    return True

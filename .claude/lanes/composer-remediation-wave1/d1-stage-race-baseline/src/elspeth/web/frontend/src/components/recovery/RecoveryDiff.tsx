@@ -1,0 +1,348 @@
+import { useMemo, useState } from "react";
+import { Button } from "@/components/ui";
+import type {
+  CompositionState,
+  EdgeSpec,
+  NodeSpec,
+} from "@/types/api";
+import type { OutputSpec, SourceSpec } from "@/types/index";
+import { sortedSourceEntries } from "@/utils/compositionState";
+import { plural } from "@/utils/plural";
+
+// DiffKind / DiffSection / DiffEntry are exported for reuse by the chat
+// panel's proposal cards (elspeth-10f76f9250): mutating tool-call proposals
+// render fragment-level before/after rows through the same DiffEntryRow this
+// recovery view uses, so "what is about to change" reads identically on both
+// surfaces. The "metadata" and "option" sections are only emitted by the
+// proposal projection (set_metadata / patch_*_options tools) — buildDiff here
+// never produces them.
+export type DiffKind = "added" | "removed" | "changed";
+export type DiffSection =
+  | "source"
+  | "node"
+  | "edge"
+  | "output"
+  | "metadata"
+  | "option";
+
+export interface DiffEntry {
+  kind: DiffKind;
+  section: DiffSection;
+  identity: string;
+  before: unknown;
+  after: unknown;
+  beforeSummary: string;
+  afterSummary: string;
+}
+
+interface DiffGroup {
+  kind: DiffKind;
+  label: string;
+  entries: DiffEntry[];
+}
+
+interface RecoveryDiffProps {
+  currentState: CompositionState | null;
+  recoveredState: CompositionState;
+}
+
+const LARGE_DIFF_ROW_THRESHOLD = 50;
+
+export function stableStringify(value: unknown): string {
+  return JSON.stringify(sortJson(value));
+}
+
+function sortJson(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortJson);
+  }
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, nested]) => [key, sortJson(nested)]),
+  );
+}
+
+export function sourceEntrySummary(entry: [string, SourceSpec]): string {
+  const [sourceName, source] = entry;
+  return sourceName === "source" ? source.plugin : `${sourceName} (${source.plugin})`;
+}
+
+export function nodeSummary(node: NodeSpec): string {
+  return [node.node_type, node.plugin ?? "no plugin"].join(" ");
+}
+
+export function edgeIdentity(edge: EdgeSpec): string {
+  return edge.id || `${edge.from_node}->${edge.to_node}:${edge.edge_type}`;
+}
+
+export function edgeSummary(edge: EdgeSpec): string {
+  return `${edge.from_node} -> ${edge.to_node} (${edge.edge_type})`;
+}
+
+function outputIdentity(output: OutputSpec): string {
+  return output.name;
+}
+
+export function outputSummary(output: OutputSpec): string {
+  return `${output.name} (${output.plugin})`;
+}
+
+function labelForEntry(entry: DiffEntry): string {
+  const action =
+    entry.kind === "added"
+      ? "Added"
+      : entry.kind === "removed"
+        ? "Removed"
+        : "Changed";
+  return `${action} ${entry.section}`;
+}
+
+function addCollectionDiff<T>(
+  entries: DiffEntry[],
+  section: DiffSection,
+  currentItems: T[],
+  recoveredItems: T[],
+  identityFor: (item: T) => string,
+  summarize: (item: T) => string,
+): void {
+  const currentById = new Map(currentItems.map((item) => [identityFor(item), item]));
+  const recoveredById = new Map(
+    recoveredItems.map((item) => [identityFor(item), item]),
+  );
+  const identities = Array.from(
+    new Set([...currentById.keys(), ...recoveredById.keys()]),
+  ).sort((left, right) => left.localeCompare(right));
+
+  for (const identity of identities) {
+    const before = currentById.get(identity);
+    const after = recoveredById.get(identity);
+    if (before === undefined && after !== undefined) {
+      entries.push({
+        kind: "added",
+        section,
+        identity,
+        before,
+        after,
+        beforeSummary: "",
+        afterSummary: summarize(after),
+      });
+      continue;
+    }
+    if (before !== undefined && after === undefined) {
+      entries.push({
+        kind: "removed",
+        section,
+        identity,
+        before,
+        after,
+        beforeSummary: summarize(before),
+        afterSummary: "",
+      });
+      continue;
+    }
+    if (
+      before !== undefined &&
+      after !== undefined &&
+      stableStringify(before) !== stableStringify(after)
+    ) {
+      entries.push({
+        kind: "changed",
+        section,
+        identity,
+        before,
+        after,
+        beforeSummary: summarize(before),
+        afterSummary: summarize(after),
+      });
+    }
+  }
+}
+
+function buildDiff(
+  currentState: CompositionState | null,
+  recoveredState: CompositionState,
+): DiffGroup[] {
+  const entries: DiffEntry[] = [];
+  addCollectionDiff(
+    entries,
+    "source",
+    sortedSourceEntries(currentState),
+    sortedSourceEntries(recoveredState),
+    ([sourceName]) => sourceName,
+    sourceEntrySummary,
+  );
+  addCollectionDiff(
+    entries,
+    "node",
+    currentState?.nodes ?? [],
+    recoveredState.nodes,
+    (node) => node.id,
+    nodeSummary,
+  );
+  addCollectionDiff(
+    entries,
+    "edge",
+    currentState?.edges ?? [],
+    recoveredState.edges,
+    edgeIdentity,
+    edgeSummary,
+  );
+  addCollectionDiff(
+    entries,
+    "output",
+    currentState?.outputs ?? [],
+    recoveredState.outputs,
+    outputIdentity,
+    outputSummary,
+  );
+
+  const groups: DiffGroup[] = [
+    {
+      kind: "added",
+      label: plural(
+        entries.filter((entry) => entry.kind === "added").length,
+        "addition",
+      ),
+      entries: entries.filter((entry) => entry.kind === "added"),
+    },
+    {
+      kind: "changed",
+      label: plural(
+        entries.filter((entry) => entry.kind === "changed").length,
+        "change",
+      ),
+      entries: entries.filter((entry) => entry.kind === "changed"),
+    },
+    {
+      kind: "removed",
+      label: plural(
+        entries.filter((entry) => entry.kind === "removed").length,
+        "removal",
+      ),
+      entries: entries.filter((entry) => entry.kind === "removed"),
+    },
+  ];
+  return groups.filter((group) => group.entries.length > 0);
+}
+
+/**
+ * `label` overrides the "Added/Removed/Changed <section>" text derived from
+ * `kind`. It exists because a caller can know something `DiffKind` cannot
+ * express: the proposal projection's option and metadata rows are built from
+ * REDACTED arguments, so they know the proposal WRITES a field but not that
+ * the written value differs from the current one. Labelling those "Changed"
+ * asserts a delta nobody measured. Omitting the prop keeps the derived label,
+ * so the recovery view — which diffs two unredacted states and can prove a
+ * difference — is unaffected.
+ */
+export function DiffEntryRow({ entry, label }: { entry: DiffEntry; label?: string }) {
+  return (
+    <li className={`recovery-diff-row recovery-diff-row--${entry.kind}`}>
+      <div className="recovery-diff-row-title">
+        <span>{label ?? labelForEntry(entry)}</span>
+        <code>{entry.identity}</code>
+      </div>
+      {entry.kind === "changed" ? (
+        <div className="recovery-diff-row-change">
+          <span>{entry.beforeSummary}</span>
+          <span aria-hidden="true">{" -> "}</span>
+          <span>{entry.afterSummary}</span>
+        </div>
+      ) : (
+        <div className="recovery-diff-row-change">
+          {entry.kind === "added" ? entry.afterSummary : entry.beforeSummary}
+        </div>
+      )}
+    </li>
+  );
+}
+
+export function RecoveryDiff({
+  currentState,
+  recoveredState,
+}: RecoveryDiffProps) {
+  const [expandedGroups, setExpandedGroups] = useState<Set<DiffKind>>(
+    () => new Set(),
+  );
+  const groups = useMemo(
+    () => buildDiff(currentState, recoveredState),
+    [currentState, recoveredState],
+  );
+
+  if (groups.length === 0) {
+    return (
+      <section className="recovery-diff" aria-labelledby="recovery-diff-title">
+        <h3 id="recovery-diff-title">Pipeline changes</h3>
+        <p>No pipeline changes to apply.</p>
+      </section>
+    );
+  }
+
+  return (
+    <section className="recovery-diff" aria-labelledby="recovery-diff-title">
+      <h3 id="recovery-diff-title">Pipeline changes</h3>
+      {/* role="group" so the aria-label is exposed — aria-label on a
+          role-less div is ignored by AT (WCAG 1.3.1, elspeth-37293a3b7c). */}
+      <div
+        className="recovery-diff-summary"
+        role="group"
+        aria-label="Recovery diff summary"
+      >
+        {groups.map((group) => (
+          <span key={group.kind}>{group.label}</span>
+        ))}
+      </div>
+      {groups.map((group) => {
+        const isLarge = group.entries.length > LARGE_DIFF_ROW_THRESHOLD;
+        const isExpanded = expandedGroups.has(group.kind);
+        const showRows = !isLarge || isExpanded;
+        return (
+          <div
+            className={`recovery-diff-group recovery-diff-group--${group.kind}`}
+            key={group.kind}
+          >
+            <div className="recovery-diff-group-header">
+              <h4>{group.label}</h4>
+              {isLarge ? (
+                <Button
+                  type="button"
+                  onClick={() =>
+                    setExpandedGroups((previous) => {
+                      const next = new Set(previous);
+                      if (next.has(group.kind)) {
+                        next.delete(group.kind);
+                      } else {
+                        next.add(group.kind);
+                      }
+                      return next;
+                    })
+                  }
+                >
+                  {isExpanded ? `Hide ${group.label}` : `Show ${group.label}`}
+                </Button>
+              ) : null}
+            </div>
+            {showRows ? (
+              <ul className="recovery-diff-list">
+                {group.entries.map((entry) => (
+                  <DiffEntryRow
+                    entry={entry}
+                    key={`${entry.kind}:${entry.section}:${entry.identity}`}
+                  />
+                ))}
+              </ul>
+            ) : (
+              <p className="recovery-diff-compact">
+                Details are collapsed to keep this recovery review responsive.
+              </p>
+            )}
+          </div>
+        );
+      })}
+    </section>
+  );
+}

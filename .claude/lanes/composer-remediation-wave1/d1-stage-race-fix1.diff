@@ -1,0 +1,72 @@
+--- a/tests/integration/web/composer/test_freeform_proposal_prevalidation.py
++++ b/tests/integration/web/composer/test_freeform_proposal_prevalidation.py
+@@ -2351,7 +2351,8 @@
+ 
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize("publisher", ["canonical", "ordinary", "promoted"])
+-async def test_publication_resource_race_refuses_once_then_allows_valid_repair(tmp_path: Path, publisher: str) -> None:
++@pytest.mark.parametrize("repair_batch", ["later", "same"])
++async def test_publication_resource_race_refuses_once_then_allows_valid_repair(tmp_path: Path, publisher: str, repair_batch: str) -> None:
+     from sqlalchemy import update
+ 
+     from tests.helpers.session_fences import fenced_operation_context
+@@ -2399,11 +2400,18 @@
+             conn.execute(update(blobs_table).values(status="pending" if len(calls) == 1 else "ready"))
+         return await api(**kwargs)
+ 
+-    llm = _ScriptedLLM(
+-        _tool_turn("call_raced", tool_name, arguments),
+-        _tool_turn("call_repaired", "set_metadata", {"patch": {"name": "repair"}}),
+-        _fake_llm_response(content="The repair awaits approval."),
++    repair_count = 10 if repair_batch == "same" else 1
++    repair_calls = tuple(
++        {"id": f"call_repaired_{index}", "name": "set_metadata", "arguments": {"patch": {"name": f"repair-{index}"}}}
++        for index in range(repair_count)
+     )
++    repair_ids = tuple(call["id"] for call in repair_calls)
++    if repair_batch == "same":
++        # The refusal and all ten admitted proposals must share one counter.
++        responses = (_fake_llm_response(tool_calls=({"id": "call_raced", "name": tool_name, "arguments": arguments}, *repair_calls)),)
++    else:
++        responses = (_tool_turn("call_raced", tool_name, arguments), _fake_llm_response(tool_calls=repair_calls))
++    llm = _ScriptedLLM(*responses, _fake_llm_response(content="The repair awaits approval."))
+     dispatches = []
+     dispatch = harness.service._dispatch_tool_batch
+ 
+@@ -2441,10 +2449,9 @@
+                 user_id="proposal-prevalidation-user",
+                 user_message_id=harness.user_message_id,
+             )
+-    assert len(calls) == (1 if publisher == "canonical" else 2)
+-    assert [call.args[0] for call in handlers.call_args_list] == (
+-        ["set_metadata", "set_metadata"] if publisher == "promoted" else ["set_metadata"]
+-    )
++    assert len(calls) == (1 if publisher == "canonical" else 1 + repair_count)
++    assert [call.args[0] for call in handlers.call_args_list] == ["set_metadata"] * (repair_count + int(publisher == "promoted"))
++    assert [len(dispatched.tool_outcomes) for dispatched in dispatches] == ([11] if repair_batch == "same" else [1, 1])
+     assert dispatches[0].mutation_success_observed is False
+     feedback = [message for message in llm.message_snapshots[1] if message.get("tool_call_id") == "call_raced"]
+     assert len(feedback) == 1
+@@ -2456,11 +2463,19 @@
+     assert payload["version"] == state.version
+     assert payload["affected_nodes"] == []
+     assert "validation_delta" not in payload
+-    assert [inv.tool_call_id for inv in result.tool_invocations] == ["call_raced", "call_repaired"]
++    assert [inv.tool_call_id for inv in result.tool_invocations] == ["call_raced", *repair_ids]
++    assert len(result.tool_invocations) == 1 + repair_count
++    with harness.engine.connect() as conn:
++        persisted_invocation_ids = (
++            conn.execute(select(chat_messages_table.c.tool_call_id).where(chat_messages_table.c.role == "tool")).scalars().all()
++        )
++    assert len(persisted_invocation_ids) == 1 + repair_count
++    assert set(persisted_invocation_ids) == {"call_raced", *repair_ids}
+     assert result.tool_invocations[0].status is ComposerToolStatus.SUCCESS
+     assert len([outcome for dispatched in dispatches for outcome in dispatched.tool_outcomes if outcome.call.id == "call_raced"]) == 1
+     proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+-    assert [proposal.tool_call_id for proposal in proposals] == ["call_repaired"]
+-    assert _count_rows(harness.engine, proposal_events_table) == 1
++    assert len(proposals) == repair_count
++    assert {proposal.tool_call_id for proposal in proposals} == set(repair_ids)
++    assert _count_rows(harness.engine, proposal_events_table) == repair_count
+     assert _count_rows(harness.engine, composition_states_table) == 0
+     assert result.state is state

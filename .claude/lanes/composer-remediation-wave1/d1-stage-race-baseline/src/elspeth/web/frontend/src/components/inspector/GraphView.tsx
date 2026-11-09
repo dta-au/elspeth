@@ -1,0 +1,2338 @@
+// ============================================================================
+// GraphView
+//
+// React Flow (@xyflow/react) DAG visualisation of the current CompositionState.
+// Converts nodes and edges to React Flow format with colour-coded node types.
+// Read-only (no drag-to-connect, no node deletion). Pan and zoom enabled.
+// Auto-layout using dagre (@dagrejs/dagre) for hierarchical top-to-bottom.
+//
+// ARIA: container has aria-label describing the pipeline structure.
+// "Pipeline graph with N components."
+//
+// Empty state when no nodes.
+// ============================================================================
+
+import { useMemo, useCallback, useEffect, useRef, useState, type JSX, type ReactNode } from "react";
+import {
+  ReactFlow,
+  ReactFlowProvider,
+  BaseEdge,
+  Handle,
+  MarkerType,
+  Position,
+  type Node,
+  type Edge,
+  type EdgeProps,
+  type EdgeTypes,
+  type NodeProps,
+  type NodeTypes,
+  type NodeMouseHandler,
+  type OnInit,
+  type ReactFlowInstance,
+  type FitViewOptions,
+  Background,
+  ControlButton,
+  Controls,
+  MiniMap,
+} from "@xyflow/react";
+import dagre from "@dagrejs/dagre";
+import "@xyflow/react/dist/style.css";
+import { useSessionStore } from "@/stores/sessionStore";
+import { useExecutionStore } from "@/stores/executionStore";
+import { useTheme } from "@/hooks/useTheme";
+import {
+  hasCompositionContent,
+  sortedSourceEntries,
+  sourceComponentId,
+} from "@/utils/compositionState";
+import {
+  branchEntries,
+  DISCARD_CONNECTION,
+  publishedSuccessConnection,
+  FAN_IN_NODE_TYPES,
+} from "@/lib/graphTopology";
+import { plural } from "@/utils/plural";
+import { BADGE_COLORS, BADGE_BACKGROUNDS, EDGE_COLORS, EDGE_LABEL_COLOR, VALIDATION_COLORS } from "@/styles/tokens";
+import { Button, Icon, TypeBadge } from "@/components/ui";
+import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
+import { llmBindingLabel } from "@/lib/llmBindingLabel";
+import type { CompositionState } from "@/types/index";
+
+import { ConfigRows } from "./ConfigRows";
+import { OptionRows } from "./OptionRows";
+import { GraphOutputs } from "./GraphOutputs";
+import { visibleGraphRoutes } from "@/lib/graphRouteVisibility";
+import { ErrorBoundary } from "@/components/common/ErrorBoundary";
+
+const NODE_WIDTH = 260;
+const NODE_HEIGHT = 80;
+const FALLBACK_MINIMAP_NODE_COLOR_VAR = "--color-text-muted";
+const MINIMAP_NODE_STROKE_COLOR_VAR = "--color-border-strong";
+// Interim UX threshold: avoid MiniMap noise on small graphs until we can
+// promote this to a viewport-overflow heuristic or an explicit user toggle.
+const MINIMAP_NODE_COUNT_THRESHOLD = 8;
+const GRAPH_MIN_ZOOM = 0.15;
+// One options object for ALL THREE fit-view surfaces, each of which reads its
+// options from a DIFFERENT place and none of which falls back to another:
+//   1. handleInit's imperative instance.fitView(...) — takes them as an argument;
+//   2. the <ReactFlow fitViewOptions> prop — seeds the store's initial fit;
+//   3. the <Controls fitViewOptions> prop — ControlsComponent calls
+//      fitView(fitViewOptions) with its OWN prop, never the ReactFlow one
+//      (@xyflow/react dist/esm/index.js:4558,4571).
+// Passing this constant to (3) is not optional decoration: fitView(undefined)
+// writes fitViewOptions: undefined into the store, and fitViewport then falls
+// through to `options?.maxZoom ?? maxZoom` = the library default 2 with padding
+// 0.1 (@xyflow/system dist/esm/index.js:439-446). The fit-view button therefore
+// zoomed the canvas IN to 2.0x — doubling every token drawn on it — and left
+// the zoom-in button disabled at maxZoomReached (elspeth-a8074a3a7b).
+const GRAPH_FIT_VIEW_OPTIONS: FitViewOptions = {
+  padding: 0.15,
+  maxZoom: 1.5,
+  minZoom: GRAPH_MIN_ZOOM,
+};
+const PIPELINE_NODE_TYPE = "pipeline-component";
+const PARALLEL_EDGE_TYPE = "parallel-lane";
+const PARALLEL_EDGE_LANE_GAP = 22;
+const PARALLEL_HANDLE_INSET = 16;
+
+const EDGE_LABEL_MAP: Record<string, string> = {
+  on_success: "success",
+  on_error: "error",
+  route_true: "true",
+  route_false: "false",
+  fork: "fork",
+};
+
+function humanNodeType(typeLabel: string): string {
+  return typeLabel === "row_union" ? "row union" : typeLabel;
+}
+
+/**
+ * Keep simple inferred ids readable while length-prefixing any hyphenated
+ * component. Plain delimiter joining is ambiguous for valid ids such as
+ * ("a-b", "c") and ("a", "b-c").
+ */
+function inferredEdgeId(kind: string, ...parts: string[]): string {
+  const payload = parts.some((part) => part.includes("-"))
+    ? parts.map((part) => `${part.length}:${part}`).join("|")
+    : parts.join("-");
+  return `inferred-${kind}-${payload}`;
+}
+
+type EdgeFlowType = "success" | "error";
+
+function edgeSemanticIdentity(
+  source: string,
+  target: string,
+  label: string,
+  flowType: EdgeFlowType,
+): string {
+  return [source, target, label, flowType]
+    .map((part) => `${part.length}:${part}`)
+    .join("|");
+}
+
+function inferredSemanticEdgeId(
+  kind: string,
+  source: string,
+  target: string,
+  label: string,
+  flowType: EdgeFlowType,
+): string {
+  return inferredEdgeId(kind, source, target, label, flowType);
+}
+
+// Producer registry: connection_point_name → producers.
+// ELSPETH allows MANY producers to publish one connection name ONLY when a
+// declared queue node consumes it (structural fan-in, ADR-028). So this is a
+// MULTIMAP, not one-producer-per-connection: overwriting would silently drop
+// every producer but the last and misrender the intentional fan-in.
+type ProducerInfo = {
+  nodeId: string;
+  edgeType: EdgeFlowType;
+  label: string;
+  origin: "success" | "error" | "route" | "fork";
+};
+
+export function buildProducerRegistry(
+  compositionState: CompositionState,
+): Map<string, ProducerInfo[]> {
+  const connectionProducers = new Map<string, ProducerInfo[]>();
+  function registerProducer(connection: string, producer: ProducerInfo): void {
+    const producers = connectionProducers.get(connection) ?? [];
+    producers.push(producer);
+    connectionProducers.set(connection, producers);
+  }
+
+  // Each source produces on its on_success connection
+  for (const [sourceName, source] of sortedSourceEntries(compositionState)) {
+    if (source.on_success) {
+      registerProducer(source.on_success, {
+        nodeId: sourceComponentId(sourceName),
+        edgeType: "success",
+        label: "success",
+        origin: "success",
+      });
+    }
+  }
+
+  // Each node can produce on on_success, on_error, or routes. Queue nodes have
+  // none of these (their output is implicit under their own id), so they
+  // register nothing here.
+  for (const node of compositionState.nodes) {
+    const published = publishedSuccessConnection(node);
+    if (published) {
+      registerProducer(published, {
+        nodeId: node.id,
+        edgeType: "success",
+        label: "success",
+        origin: "success",
+      });
+    }
+    // Collector failure is a structural whole-group verdict. The universal
+    // CompositionState shape can carry malformed legacy on_error data, but
+    // drawing it would promise a runtime route that does not exist.
+    if (node.node_type !== "collector" && node.on_error) {
+      registerProducer(node.on_error, {
+        nodeId: node.id,
+        edgeType: "error",
+        label: "error",
+        origin: "error",
+      });
+    }
+    if (node.routes) {
+      for (const [routeLabel, targetConn] of Object.entries(node.routes)) {
+        registerProducer(targetConn, {
+          nodeId: node.id,
+          edgeType: "success",
+          label: routeLabel,
+          origin: "route",
+        });
+      }
+    }
+    if (
+      node.node_type === "gate"
+      && node.routes
+      && Object.values(node.routes).includes("fork")
+      && node.fork_to
+    ) {
+      for (const branchConnection of node.fork_to) {
+        registerProducer(branchConnection, {
+          nodeId: node.id,
+          edgeType: "success",
+          label: branchConnection,
+          origin: "fork",
+        });
+      }
+    }
+  }
+
+  return connectionProducers;
+}
+
+interface PipelineEdgeData extends Record<string, unknown> {
+  flowType: EdgeFlowType;
+}
+
+interface ParallelLaneEdgeData extends PipelineEdgeData {
+  laneOffset: number;
+  arrivalOffset?: number;
+}
+
+interface ParallelHandle {
+  id: string;
+  offsetPercent: number;
+}
+
+interface PipelineGraphNodeData extends Record<string, unknown> {
+  label: ReactNode;
+  parallelSourceHandles?: ParallelHandle[];
+  parallelTargetHandles?: ParallelHandle[];
+}
+
+type PipelineGraphNodeModel = Node<
+  PipelineGraphNodeData,
+  typeof PIPELINE_NODE_TYPE
+>;
+
+type PipelineGraphEdgeModel = Edge<PipelineEdgeData> & {
+  data: PipelineEdgeData;
+  label: string;
+};
+
+function edgeModelSemanticIdentity(edge: PipelineGraphEdgeModel): string {
+  return edgeSemanticIdentity(
+    edge.source,
+    edge.target,
+    edge.label,
+    edge.data.flowType,
+  );
+}
+
+function deduplicateSemanticEdges(
+  edges: PipelineGraphEdgeModel[],
+): PipelineGraphEdgeModel[] {
+  const seen = new Set<string>();
+  return edges.filter((edge) => {
+    const identity = edgeModelSemanticIdentity(edge);
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+}
+
+type ParallelLaneEdgeModel = Edge<
+  ParallelLaneEdgeData,
+  typeof PARALLEL_EDGE_TYPE
+> & {
+  data: ParallelLaneEdgeData;
+};
+
+function parallelLanePath(
+  sourceX: number,
+  sourceY: number,
+  targetX: number,
+  targetY: number,
+  laneOffset: number,
+  forceVertical = false,
+): { path: string; labelX: number; labelY: number } {
+  const horizontal = !forceVertical && Math.abs(targetX - sourceX) > Math.abs(targetY - sourceY);
+  if (horizontal) {
+    const bend = Math.max(40, Math.abs(targetX - sourceX) * 0.4);
+    const direction = targetX >= sourceX ? 1 : -1;
+    return {
+      path:
+        `M ${sourceX} ${sourceY} `
+        + `C ${sourceX + direction * bend} ${sourceY + laneOffset}, `
+        + `${targetX - direction * bend} ${targetY + laneOffset}, `
+        + `${targetX} ${targetY}`,
+      labelX: (sourceX + targetX) / 2,
+      labelY: (sourceY + targetY) / 2 + laneOffset,
+    };
+  }
+
+  const bend = Math.max(40, Math.abs(targetY - sourceY) * 0.4);
+  const direction = targetY >= sourceY ? 1 : -1;
+  return {
+    path:
+      `M ${sourceX} ${sourceY} `
+      + `C ${sourceX + laneOffset} ${sourceY + direction * bend}, `
+      + `${targetX + laneOffset} ${targetY - direction * bend}, `
+      + `${targetX} ${targetY}`,
+    labelX: (sourceX + targetX) / 2 + laneOffset,
+    labelY: (sourceY + targetY) / 2,
+  };
+}
+
+function PipelineGraphNode({
+  data,
+}: NodeProps<PipelineGraphNodeModel>): JSX.Element {
+  return (
+    <>
+      <Handle
+        type="target"
+        position={Position.Top}
+        isConnectable={false}
+        style={{ opacity: 0, pointerEvents: "none" }}
+      />
+      {data.parallelTargetHandles?.map((handle) => (
+        <Handle
+          key={handle.id}
+          id={handle.id}
+          type="target"
+          position={Position.Top}
+          isConnectable={false}
+          style={{
+            left: `${handle.offsetPercent}%`,
+            opacity: 0,
+            pointerEvents: "none",
+          }}
+        />
+      ))}
+      {data.label}
+      <Handle
+        type="source"
+        position={Position.Bottom}
+        isConnectable={false}
+        style={{ opacity: 0, pointerEvents: "none" }}
+      />
+      {data.parallelSourceHandles?.map((handle) => (
+        <Handle
+          key={handle.id}
+          id={handle.id}
+          type="source"
+          position={Position.Bottom}
+          isConnectable={false}
+          style={{
+            left: `${handle.offsetPercent}%`,
+            opacity: 0,
+            pointerEvents: "none",
+          }}
+        />
+      ))}
+    </>
+  );
+}
+
+function ParallelLaneEdge({
+  id,
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  data,
+  label,
+  labelStyle,
+  markerEnd,
+  style,
+}: EdgeProps<ParallelLaneEdgeModel>): JSX.Element {
+  const { path, labelX, labelY } = parallelLanePath(
+    sourceX,
+    sourceY,
+    targetX + (data?.arrivalOffset ?? 0),
+    targetY,
+    data?.laneOffset ?? 0,
+    data?.arrivalOffset !== undefined,
+  );
+  return (
+    <BaseEdge
+      id={id}
+      path={path}
+      label={label}
+      labelX={labelX}
+      labelY={labelY}
+      labelStyle={labelStyle}
+      markerEnd={markerEnd}
+      style={style}
+    />
+  );
+}
+
+const EDGE_TYPES: EdgeTypes = {
+  [PARALLEL_EDGE_TYPE]: ParallelLaneEdge,
+};
+
+/** Spread drawn arrivals without changing any logical node, edge or handle. */
+export function withFanInArrivals(nodes: Node[], edges: PipelineGraphEdgeModel[]): PipelineGraphEdgeModel[] {
+  const byTarget = new Map<string, PipelineGraphEdgeModel[]>();
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  for (const edge of edges) {
+    const arrivals = byTarget.get(edge.target) ?? [];
+    arrivals.push(edge);
+    byTarget.set(edge.target, arrivals);
+  }
+  const offsets = new Map<string, number>();
+  for (const [target, arrivals] of byTarget) {
+    if (arrivals.length < 2) continue;
+    const ordered = [...arrivals].sort((left, right) =>
+      (nodeById.get(left.source)?.position.x ?? 0) - (nodeById.get(right.source)?.position.x ?? 0)
+      || left.id.localeCompare(right.id),
+    );
+    const targetNode = nodeById.get(target) as PipelineGraphNodeModel | undefined;
+    const handles = targetNode?.data.parallelTargetHandles ?? [];
+    ordered.forEach((edge, index) => {
+      const desired = PARALLEL_HANDLE_INSET + index * (NODE_WIDTH - 2 * PARALLEL_HANDLE_INSET) / (ordered.length - 1);
+      const handle = handles.find((candidate) => candidate.id === edge.targetHandle);
+      const current = handle ? handle.offsetPercent * NODE_WIDTH / 100 : NODE_WIDTH / 2;
+      offsets.set(edge.id, desired - current);
+    });
+  }
+  return edges.map((edge) => offsets.has(edge.id) ? {
+    ...edge,
+    type: PARALLEL_EDGE_TYPE,
+    data: { ...edge.data, laneOffset: edge.data.laneOffset ?? 0, arrivalOffset: offsets.get(edge.id) },
+  } : edge);
+}
+
+const NODE_TYPES: NodeTypes = {
+  [PIPELINE_NODE_TYPE]: PipelineGraphNode,
+};
+
+const EDGE_DIRECTION_MARKER_SIZE = 12;
+
+/**
+ * Give EVERY edge its arrowhead.
+ *
+ * Direction is the single most important thing this diagram states, so it is a
+ * property of every connector — not a side effect of lane assignment. markerEnd
+ * used to be written only inside assignParallelEdgeLanes, whose lane pass
+ * short-circuits for any endpoint group holding fewer than 2 edges, so one
+ * branching pipeline rendered directed and undirected connectors side by side
+ * (elspeth-ddae27dff1).
+ *
+ * Applied as ONE pass over the finished edge list rather than at each of the
+ * nine construction sites: two later phases (claimExplicitBranchAlias and the
+ * row_union outbound rewrite) restyle an already-built edge from authority, and
+ * a per-site marker would keep the old colour while style.stroke moved. Keying
+ * the marker on the same data.flowType that every site uses to pick
+ * style.stroke makes arrowhead colour and line colour unable to disagree.
+ */
+function withDirectionMarkers(
+  edges: PipelineGraphEdgeModel[],
+): PipelineGraphEdgeModel[] {
+  return edges.map((edge) => ({
+    ...edge,
+    markerEnd: {
+      type: MarkerType.ArrowClosed,
+      color:
+        edge.data.flowType === "error" ? EDGE_COLORS.error : EDGE_COLORS.normal,
+      width: EDGE_DIRECTION_MARKER_SIZE,
+      height: EDGE_DIRECTION_MARKER_SIZE,
+    },
+  }));
+}
+
+function assignParallelEdgeLanes(
+  nodes: PipelineGraphNodeModel[],
+  edges: PipelineGraphEdgeModel[],
+): { nodes: PipelineGraphNodeModel[]; edges: PipelineGraphEdgeModel[] } {
+  const indexesByEndpoints = new Map<string, number[]>();
+  for (const [index, edge] of edges.entries()) {
+    const key =
+      `${edge.source.length}:${edge.source}|${edge.target.length}:${edge.target}`;
+    const indexes = indexesByEndpoints.get(key) ?? [];
+    indexes.push(index);
+    indexesByEndpoints.set(key, indexes);
+  }
+
+  const laneOffsetByIndex = new Map<number, number>();
+  const sourceHandlesByNode = new Map<string, ParallelHandle[]>();
+  const targetHandlesByNode = new Map<string, ParallelHandle[]>();
+  for (const indexes of indexesByEndpoints.values()) {
+    if (indexes.length < 2) continue;
+    const sortedIndexes = [...indexes].sort((left, right) =>
+      edges[left]!.id.localeCompare(edges[right]!.id),
+    );
+    const laneGap = Math.min(
+      PARALLEL_EDGE_LANE_GAP,
+      (NODE_WIDTH - PARALLEL_HANDLE_INSET * 2) / (sortedIndexes.length - 1),
+    );
+    sortedIndexes.forEach((edgeIndex, laneIndex) => {
+      const edge = edges[edgeIndex]!;
+      const laneOffset =
+        (laneIndex - (sortedIndexes.length - 1) / 2) * laneGap;
+      laneOffsetByIndex.set(edgeIndex, laneOffset);
+      const offsetPercent = 50 + (laneOffset / NODE_WIDTH) * 100;
+      const sourceHandle = {
+        id: `parallel-source-${edge.id}`,
+        offsetPercent,
+      };
+      const targetHandle = {
+        id: `parallel-target-${edge.id}`,
+        offsetPercent,
+      };
+      sourceHandlesByNode.set(edge.source, [
+        ...(sourceHandlesByNode.get(edge.source) ?? []),
+        sourceHandle,
+      ]);
+      targetHandlesByNode.set(edge.target, [
+        ...(targetHandlesByNode.get(edge.target) ?? []),
+        targetHandle,
+      ]);
+    });
+  }
+
+  const parallelEdges = edges.map((edge, index) => {
+    const laneOffset = laneOffsetByIndex.get(index);
+    if (laneOffset === undefined) return edge;
+    return {
+      ...edge,
+      type: PARALLEL_EDGE_TYPE,
+      sourceHandle: `parallel-source-${edge.id}`,
+      targetHandle: `parallel-target-${edge.id}`,
+      data: {
+        ...edge.data,
+        laneOffset,
+      },
+    };
+  });
+  const nodesWithHandles = nodes.map((node) => ({
+    ...node,
+    data: {
+      ...node.data,
+      parallelSourceHandles: sourceHandlesByNode.get(node.id),
+      parallelTargetHandles: targetHandlesByNode.get(node.id),
+    },
+  }));
+  return { nodes: nodesWithHandles, edges: parallelEdges };
+}
+
+type MiniMapNodeKind = keyof typeof BADGE_COLORS;
+type ValidationStatus = "valid" | "warning" | "error";
+
+// The validation dot is a 14px circle. A TEXT glyph inside it cannot be given
+// breathing room, because the product's smallest type token is the 12px floor
+// (--font-size-xs) — which left the old letter `x` / `!` marks 1px of clearance
+// and reading as clipped, in two different registers (a Latin letter beside a
+// typographic exclamation mark) so two members of one icon set looked like two
+// different mistakes. Stroked paths on a shared 12x12 viewBox are not type, so
+// they answer to the 8px mark size below instead: one stroke weight, one
+// optical size, 3px of clearance on every side (elspeth-ac3fff7ef2).
+const VALIDATION_MARK_SIZE = 8;
+
+function ValidationMark({ children }: { children: ReactNode }): JSX.Element {
+  return (
+    <svg
+      width={VALIDATION_MARK_SIZE}
+      height={VALIDATION_MARK_SIZE}
+      viewBox="0 0 12 12"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      focusable="false"
+    >
+      {children}
+    </svg>
+  );
+}
+
+const VALIDATION_STATUS_MARKERS: Record<
+  ValidationStatus,
+  { ariaLabel: string; glyph: ReactNode; fallbackTitle: string }
+> = {
+  error: {
+    ariaLabel: "Validation: error",
+    glyph: (
+      <ValidationMark>
+        <path d="M3 3 L9 9" />
+        <path d="M9 3 L3 9" />
+      </ValidationMark>
+    ),
+    fallbackTitle: "Has validation errors",
+  },
+  warning: {
+    ariaLabel: "Validation: warning",
+    glyph: (
+      <ValidationMark>
+        <path d="M6 2 L6 7" />
+        {/* An explicit filled circle, not a zero-length round-capped path:
+            renderers disagree about whether that degenerate case paints. r=1
+            makes a 2-unit dot, the same weight as the stem's stroke. */}
+        <circle cx="6" cy="9.75" r="1" fill="currentColor" stroke="none" />
+      </ValidationMark>
+    ),
+    fallbackTitle: "Has warnings",
+  },
+  // Deliberately unreachable on the canvas: makeRfNode reads the bare
+  // nodeValidationMap, which attributes nothing to a passing node, so a valid
+  // run draws no marker at all. Activating this arm is a separate, deliberate
+  // change (elspeth-b5b7c5a6ad), so it is carried forward in the same stroked
+  // register as its two live siblings rather than left behind as a `✓` that
+  // would reintroduce the mixed-register defect the day someone wires it up.
+  valid: {
+    ariaLabel: "Validation: passing",
+    glyph: (
+      <ValidationMark>
+        <path d="M2.5 6.5 L5 9 L9.5 3.5" />
+      </ValidationMark>
+    ),
+    fallbackTitle: "Valid",
+  },
+};
+
+interface SelectedComponentConfig {
+  id: string;
+  typeLabel: MiniMapNodeKind;
+  plugin: string | null;
+  pluginKind: "source" | "transform" | "sink";
+  connections: Record<string, unknown>;
+  options: Record<string, unknown>;
+}
+
+function readThemeColor(cssVariableName: string, fallbackVariableName: string): string {
+  if (typeof document === "undefined" || typeof getComputedStyle !== "function") {
+    return `var(${fallbackVariableName})`;
+  }
+
+  const rootStyles = getComputedStyle(document.documentElement);
+  return (
+    rootStyles.getPropertyValue(cssVariableName).trim() ||
+    rootStyles.getPropertyValue(fallbackVariableName).trim() ||
+    `var(${fallbackVariableName})`
+  );
+}
+
+function buildMiniMapNodeKindById(
+  compositionState: CompositionState | null,
+): Map<string, MiniMapNodeKind> {
+  const kindById = new Map<string, MiniMapNodeKind>();
+  if (!compositionState) {
+    return kindById;
+  }
+
+  for (const [sourceName] of sortedSourceEntries(compositionState)) {
+    kindById.set(sourceComponentId(sourceName), "source");
+  }
+  for (const node of compositionState.nodes) {
+    kindById.set(node.id, node.node_type);
+  }
+  for (const output of compositionState.outputs) {
+    kindById.set(output.name, "sink");
+  }
+
+  return kindById;
+}
+
+function withoutNullishFields(
+  fields: Record<string, unknown>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(fields).filter(([, value]) => value !== null && value !== undefined),
+  );
+}
+
+function selectedComponentConfig(
+  compositionState: CompositionState | null,
+  selectedNodeId: string | null,
+): SelectedComponentConfig | null {
+  if (!compositionState || !selectedNodeId) {
+    return null;
+  }
+
+  const selectedSource = sortedSourceEntries(compositionState).find(
+    ([sourceName]) => sourceComponentId(sourceName) === selectedNodeId,
+  );
+  if (selectedSource) {
+    const [sourceName, source] = selectedSource;
+    const componentId = sourceComponentId(sourceName);
+    return {
+      id: componentId,
+      typeLabel: "source",
+      plugin: source.plugin,
+      pluginKind: "source",
+      connections: withoutNullishFields({
+        on_success: source.on_success,
+        on_validation_failure: source.on_validation_failure,
+      }),
+      options: source.options,
+    };
+  }
+
+  const node = compositionState.nodes.find((candidate) => candidate.id === selectedNodeId);
+  if (node) {
+    return {
+      id: node.id,
+      typeLabel: node.node_type,
+      plugin: node.plugin,
+      pluginKind: "transform",
+      connections: withoutNullishFields({
+        input: node.input,
+        on_success: node.on_success,
+        on_error: node.on_error,
+        condition: node.condition,
+        routes: node.routes,
+        fork_to: node.fork_to,
+        branches: node.branches,
+        policy: node.policy,
+        merge: node.merge,
+        timeout_seconds: node.timeout_seconds,
+        scope_name: node.scope_name,
+        scope_opener: node.scope_opener,
+        scope_policy: node.scope_policy,
+      }),
+      options: node.options,
+    };
+  }
+
+  const output = compositionState.outputs.find(
+    (candidate) => candidate.name === selectedNodeId,
+  );
+  if (output) {
+    return {
+      id: output.name,
+      typeLabel: "sink",
+      plugin: output.plugin,
+      pluginKind: "sink",
+      connections: withoutNullishFields({
+        on_write_failure: output.on_write_failure,
+      }),
+      options: output.options,
+    };
+  }
+
+  return null;
+}
+
+function NodeConfigPanel({
+  config,
+  onClose,
+  panelRef,
+}: {
+  config: SelectedComponentConfig;
+  onClose: () => void;
+  panelRef?: React.Ref<HTMLElement>;
+}): JSX.Element {
+  return (
+    <aside
+      ref={panelRef}
+      // Programmatic focus target: keyboard selection via the a11y list
+      // moves focus here so the opened panel is announced and reachable
+      // without tabbing back through the whole canvas (elspeth-37f6f13132).
+      tabIndex={-1}
+      className="graph-config-panel"
+      role="complementary"
+      aria-label={`${config.id} configuration`}
+    >
+      <header className="graph-config-panel-header">
+        <div>
+          {/* ui/TypeBadge composes the same --color-badge-* tokens the inline
+              style used; the primitive replaces the hand-rolled span
+              (elspeth-e1c5ad0b53). Canvas-drawn badges keep the raw token
+              values because React Flow / MiniMap need resolved colours. */}
+          <TypeBadge type={config.typeLabel} />
+          <h3>{config.id} config</h3>
+          {config.plugin && (
+            /* Human register on the line, the raw catalog id in `title`
+               (elspeth-ca456d9d8d) — the config panel names the plugin's
+               identity, so it uses the catalog register. */
+            <p className="graph-config-plugin" title={config.plugin}>
+              {pluginDisplayName(config.plugin)}
+            </p>
+          )}
+        </div>
+        <Button
+          variant="bare"
+          className="graph-config-close"
+          onClick={onClose}
+          aria-label="Close node configuration"
+        >
+          {/* U+00D7 MULTIPLICATION SIGN, the close glyph the other nine close
+              affordances use and that GraphModal.test.tsx names as the standard
+              ("uses the standard × close glyph (not a lowercase 'x')"). A Latin
+              letter x sits at a different optical weight and cap height
+              (elspeth-51cbcf1664). */}
+          ×
+        </Button>
+      </header>
+
+      <section className="graph-config-section">
+        <h4>Settings</h4>
+        <OptionRows
+          options={config.options}
+          ariaLabel={`${config.id} settings`}
+          plugin={config.plugin === null ? null : { kind: config.pluginKind, name: config.plugin }}
+        />
+      </section>
+
+      <details className="graph-config-section graph-config-connections">
+        <summary>Connections &amp; schema</summary>
+        <ConfigRows
+          values={config.connections}
+          emptyText="No explicit connections configured."
+        />
+      </details>
+    </aside>
+  );
+}
+
+// ── Dagre layout ─────────────────────────────────────────────────────────────
+
+/**
+ * Apply dagre layout to nodes and edges, returning positioned React Flow
+ * nodes. Layout is top-to-bottom (TB) with reasonable spacing.
+ */
+function layoutGraph(
+  rfNodes: Node[],
+  rfEdges: PipelineGraphEdgeModel[],
+): { nodes: Node[]; edges: PipelineGraphEdgeModel[] } {
+  const g = new dagre.graphlib.Graph();
+  g.setDefaultEdgeLabel(() => ({}));
+  g.setGraph({ rankdir: "TB", nodesep: 60, ranksep: 100 });
+
+  for (const node of rfNodes) {
+    g.setNode(node.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
+  }
+  for (const edge of rfEdges) {
+    g.setEdge(edge.source, edge.target);
+  }
+
+  dagre.layout(g);
+
+  const positionedNodes = rfNodes.map((node) => {
+    const pos = g.node(node.id);
+    return {
+      ...node,
+      position: {
+        x: pos.x - NODE_WIDTH / 2,
+        y: pos.y - NODE_HEIGHT / 2,
+      },
+    };
+  });
+
+  return { nodes: positionedNodes, edges: rfEdges };
+}
+
+// ── GraphView component ──────────────────────────────────────────────────────
+
+export interface GraphViewProps {
+  /** Opens the full-screen graph. Passed by the Workflow tab only; GraphModal
+   *  renders this same component and must not offer to open itself. */
+  onFullscreen?: () => void;
+}
+
+export function GraphView({ onFullscreen }: GraphViewProps = {}) {
+  const compositionState = useSessionStore((s) => s.compositionState);
+  const pendingProposalCount = useSessionStore(
+    (s) =>
+      s.compositionProposals.filter(
+        (proposal) =>
+          proposal.status === "pending" && proposal.affects.includes("graph"),
+      ).length,
+  );
+  const selectedNodeId = useSessionStore((s) => s.selectedNodeId);
+  const [activeEdgeId, setActiveEdgeId] = useState<string | null>(null);
+  const [showFailureRoutes, setShowFailureRoutes] = useState(true);
+  const selectNode = useSessionStore((s) => s.selectNode);
+  const { resolvedTheme } = useTheme();
+
+  const validationResult = useExecutionStore((s) => s.validationResult);
+  const selectedConfig = useMemo(
+    () => selectedComponentConfig(compositionState, selectedNodeId),
+    [compositionState, selectedNodeId],
+  );
+
+  // Keyboard-selection focus hand-off (elspeth-37f6f13132): activating an
+  // a11y-list item flips aria-pressed, but the resulting NodeConfigPanel
+  // opened silently elsewhere in the DOM. When the selection came from the
+  // keyboard list, move focus to the panel once it renders. Mouse clicks on
+  // canvas nodes do not set the flag, so pointer users keep their focus.
+  const configPanelRef = useRef<HTMLElement | null>(null);
+  const focusPanelOnOpenRef = useRef(false);
+  useEffect(() => {
+    if (selectedConfig && focusPanelOnOpenRef.current) {
+      focusPanelOnOpenRef.current = false;
+      configPanelRef.current?.focus();
+    }
+    if (!selectedConfig) {
+      focusPanelOnOpenRef.current = false;
+    }
+  }, [selectedConfig]);
+
+  const miniMapNodeKindById = useMemo(
+    () => buildMiniMapNodeKindById(compositionState),
+    [compositionState],
+  );
+
+  const getMiniMapNodeColor = useCallback(
+    (node: Node) => {
+      const nodeKind = miniMapNodeKindById.get(node.id);
+      return readThemeColor(
+        nodeKind
+          ? `--color-badge-${nodeKind.replace("_", "-")}`
+          : FALLBACK_MINIMAP_NODE_COLOR_VAR,
+        FALLBACK_MINIMAP_NODE_COLOR_VAR,
+      );
+    },
+    [miniMapNodeKindById],
+  );
+
+  const getMiniMapNodeStrokeColor = useCallback(
+    () => readThemeColor(MINIMAP_NODE_STROKE_COLOR_VAR, FALLBACK_MINIMAP_NODE_COLOR_VAR),
+    [],
+  );
+
+  // Node click handler — toggle selection
+  const onNodeClick: NodeMouseHandler = useCallback(
+    (_event, node) => {
+      setActiveEdgeId(null);
+      selectNode(selectedNodeId === node.id ? null : node.id);
+    },
+    [selectedNodeId, selectNode],
+  );
+
+  // Pane click handler — deselect when clicking background
+  const onPaneClick = useCallback(() => {
+    setActiveEdgeId(null);
+    selectNode(null);
+  }, [selectNode]);
+
+  // Fit-to-view ONCE, at the first moment the canvas can actually be measured.
+  //
+  // "Once" is deliberate: `fitView` as a static prop re-triggers a viewport
+  // reset whenever `nodesInitialized` flips (i.e. every chat-driven topology
+  // change), which destroys the operator's pan/zoom. The imperative call does
+  // not inherit the `fitViewOptions` prop, so pass the same options
+  // explicitly or the initial fit uses the library default maxZoom of 1 and
+  // small pipelines render tiny in a large canvas.
+  //
+  // "When measurable" is the other half, and it is not optional. Below the
+  // workspace's wide-layout breakpoint the authoring and pipeline panes
+  // become TABS, and the losing tab keeps this component MOUNTED at zero
+  // width. onInit fires there, and fitViewport divides by that zero extent:
+  // the zoom clamps to minZoom and the translate lands at
+  // -(contentCentre x minZoom), i.e. the whole pipeline drawn at 0.3x in the
+  // top-left corner. Fitting once meant that poisoned viewport was also the
+  // FINAL one — switching to the Pipeline tab never repaired it.
+  //
+  // Measuring the diagram element rather than trusting onInit's timing is
+  // what makes this derive from the real precondition (a non-empty canvas)
+  // instead of restating an assumption about when React mounts things.
+  const diagramRef = useRef<HTMLDivElement | null>(null);
+  const flowInstanceRef = useRef<ReactFlowInstance | null>(null);
+  const hasFittedRef = useRef(false);
+
+  const fitOnceWhenMeasurable = useCallback(() => {
+    if (hasFittedRef.current) return false;
+    const instance = flowInstanceRef.current;
+    const element = diagramRef.current;
+    if (!instance || !element) return false;
+    const { width, height } = element.getBoundingClientRect();
+    if (width <= 0 || height <= 0) return false;
+    hasFittedRef.current = true;
+    void instance.fitView(GRAPH_FIT_VIEW_OPTIONS);
+    return true;
+  }, []);
+
+  const handleInit: OnInit = useCallback(
+    (instance) => {
+      flowInstanceRef.current = instance;
+      fitOnceWhenMeasurable();
+    },
+    [fitOnceWhenMeasurable],
+  );
+
+  // Re-attempt the one fit when the canvas first gains a size — the tab
+  // becoming visible is a resize, and it is the only signal that the
+  // precondition onInit could not satisfy has now been met.
+  useEffect(() => {
+    if (hasFittedRef.current) return;
+    const element = diagramRef.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (fitOnceWhenMeasurable()) observer.disconnect();
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [fitOnceWhenMeasurable]);
+
+  // Build a map of component_id → validation severity for border coloring
+  const nodeValidationMap = useMemo(() => {
+    const map: Record<string, ValidationStatus> = {};
+    if (!validationResult) return map;
+
+    // All nodes with errors
+    for (const err of validationResult.errors) {
+      if (err.component_id) {
+        map[err.component_id] = "error";
+      }
+    }
+
+    // All nodes with warnings (only if not already error)
+    if (validationResult.warnings) {
+      for (const warn of validationResult.warnings) {
+        if (warn.component_id && !map[warn.component_id]) {
+          map[warn.component_id] = "warning";
+        }
+      }
+    }
+
+    return map;
+  }, [validationResult]);
+
+  // Build a map of component_id → tooltip string with error/warning messages
+  const nodeMessageMap = useMemo(() => {
+    const map: Record<string, string> = {};
+    if (!validationResult) return map;
+
+    // Collect messages per component_id
+    const errors: Record<string, string[]> = {};
+    const warnings: Record<string, string[]> = {};
+
+    for (const err of validationResult.errors) {
+      if (err.component_id) {
+        (errors[err.component_id] ??= []).push(err.message);
+      }
+    }
+
+    if (validationResult.warnings) {
+      for (const warn of validationResult.warnings) {
+        if (warn.component_id) {
+          (warnings[warn.component_id] ??= []).push(warn.message);
+        }
+      }
+    }
+
+    // Merge into tooltip strings
+    const allIds = new Set([...Object.keys(errors), ...Object.keys(warnings)]);
+    for (const id of allIds) {
+      const parts: string[] = [];
+      if (errors[id]) {
+        parts.push(`Errors:\n${errors[id].map((m) => `- ${m}`).join("\n")}`);
+      }
+      if (warnings[id]) {
+        parts.push(`Warnings:\n${warnings[id].map((m) => `- ${m}`).join("\n")}`);
+      }
+      map[id] = parts.join("\n\n");
+    }
+
+    return map;
+  }, [validationResult]);
+
+  const { nodes, edges } = useMemo(() => {
+    if (!hasCompositionContent(compositionState)) {
+      return {
+        nodes: [] as PipelineGraphNodeModel[],
+        edges: [] as PipelineGraphEdgeModel[],
+      };
+    }
+
+    function makeRfNode(
+      id: string,
+      typeLabel: string,
+      subtitle: string | null,
+      badgeBg: string,
+      badgeColor: string,
+      validationStatus?: ValidationStatus,
+      validationTooltip?: string,
+      isSelected?: boolean,
+      modelLabel?: string,
+    ): PipelineGraphNodeModel {
+      const validationMarker = validationStatus
+        ? VALIDATION_STATUS_MARKERS[validationStatus]
+        : null;
+      // State is carried OUTSIDE the box, never in border width. The card is a
+      // fixed NODE_WIDTH x NODE_HEIGHT box, so widening its border 1px -> 2px
+      // shrinks the content box and shifts everything inside it 1px down and
+      // 1px right — badge chips that lined up in a column before validation are
+      // misregistered the instant it completes, and the whole canvas appears to
+      // shiver (elspeth-003794d55c). The border therefore stays 1px in every
+      // state and only changes COLOUR; the extra weight comes from a box-shadow
+      // ring, which paints outside the border box and costs no layout. That is
+      // the idiom the selection state already used for its outer halo, so
+      // selection now uses it for its whole emphasis rather than half of it.
+      // Selection ring takes priority over the validation ring.
+      const ringColor = isSelected
+        ? "var(--color-selected-ring)"
+        : validationStatus === "error"
+          ? VALIDATION_COLORS.invalid
+          : validationStatus === "warning"
+            ? VALIDATION_COLORS.warning
+            : validationStatus === "valid"
+              ? VALIDATION_COLORS.valid
+              : null;
+      const borderStyle = `1px solid ${ringColor ?? "var(--color-border-strong)"}`;
+      // Selection keeps its heavier 3px halo; validation matches the 2px total
+      // weight the old 2px border drew, as 1px border + 1px ring.
+      const ringShadow = isSelected
+        ? "0 0 0 3px var(--color-selected-ring)"
+        : ringColor
+          ? `0 0 0 1px ${ringColor}`
+          : undefined;
+
+      return {
+        id,
+        type: PIPELINE_NODE_TYPE,
+        data: {
+          label: (
+            <div
+              className="graph-node-content"
+              title={validationTooltip ?? (validationStatus === "valid" ? "Valid" : undefined)}
+            >
+              <div className="graph-node-header">
+                <span
+                  className="graph-node-badge"
+                  style={{ backgroundColor: badgeBg, color: badgeColor }}
+                >
+                  {humanNodeType(typeLabel)}
+                </span>
+                <span className="graph-node-label">
+                  {id}
+                </span>
+                {validationStatus && (
+                  <span
+                    className="graph-validation-dot"
+                    role="img"
+                    aria-label={validationMarker?.ariaLabel}
+                    style={{
+                      backgroundColor:
+                        validationStatus === "error"
+                          ? VALIDATION_COLORS.invalid
+                          : validationStatus === "warning"
+                            ? VALIDATION_COLORS.warning
+                            : VALIDATION_COLORS.valid,
+                    }}
+                    title={
+                      validationTooltip
+                        ? validationTooltip
+                        : validationMarker?.fallbackTitle
+                    }
+                  >
+                    {validationMarker?.glyph}
+                  </span>
+                )}
+              </div>
+              {subtitle && (
+                <div
+                  className="graph-node-subtitle"
+                  title={modelLabel ? `${subtitle} · ${modelLabel}` : undefined}
+                  style={modelLabel ? { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } : undefined}
+                >
+                  {subtitle}{modelLabel && <> · {modelLabel}</>}
+                </div>
+              )}
+            </div>
+          ),
+        },
+        position: { x: 0, y: 0 },
+        style: {
+          backgroundColor: "var(--color-surface-elevated)",
+          border: borderStyle,
+          // The card corner reads the token, not a raw 8 (elspeth-37cc8b5310):
+          // the literal was invisible to the radius system, so a retune of the
+          // card rank could never reach the graph. --radius-lg is that rank,
+          // and .graph-config-panel (inspector.css) rounds at the same token
+          // so the panel floating over these cards can never round SHARPER
+          // than they do. Pinned by inspectorPanelContracts.test.ts.
+          borderRadius: "var(--radius-lg)",
+          width: NODE_WIDTH,
+          height: NODE_HEIGHT,
+          padding: 0,
+          // The whole selection / validation emphasis (see ringShadow above).
+          boxShadow: ringShadow,
+          cursor: "pointer",
+        },
+      };
+    }
+
+    const rfNodes: PipelineGraphNodeModel[] = [];
+
+    // Source nodes (synthetic — source names are producer roots in edges)
+    for (const [sourceName, source] of sortedSourceEntries(compositionState)) {
+      const componentId = sourceComponentId(sourceName);
+      rfNodes.push(
+        makeRfNode(
+          componentId,
+          "source",
+          source.plugin,
+          BADGE_BACKGROUNDS.source,
+          BADGE_COLORS.source,
+          nodeValidationMap[componentId],
+          nodeMessageMap[componentId],
+          selectedNodeId === componentId,
+        ),
+      );
+    }
+
+    // Pipeline nodes (transforms, gates, aggregations, coalesces)
+    for (const node of compositionState.nodes) {
+      rfNodes.push(
+        makeRfNode(
+          node.id,
+          node.node_type,
+          node.plugin,
+          BADGE_BACKGROUNDS[node.node_type],
+          BADGE_COLORS[node.node_type],
+          nodeValidationMap[node.id],
+          nodeMessageMap[node.id],
+          selectedNodeId === node.id,
+          node.node_type === "transform" && node.plugin === "llm"
+            ? llmBindingLabel(node.options)
+            : undefined,
+        ),
+      );
+    }
+
+    // Output/sink nodes (synthetic — output names are used as to_node in edges)
+    for (const output of compositionState.outputs) {
+      rfNodes.push(
+        makeRfNode(
+          output.name,
+          "sink",
+          output.plugin,
+          BADGE_BACKGROUNDS.sink,
+          BADGE_COLORS.sink,
+          nodeValidationMap[output.name],
+          nodeMessageMap[output.name],
+          selectedNodeId === output.name,
+        ),
+      );
+    }
+
+    // Build edges: start with explicit edges from compositionState
+    const sourceIds = new Set(Object.keys(compositionState.sources));
+    const toGraphNodeId = (id: string): string =>
+      sourceIds.has(id) ? sourceComponentId(id) : id;
+    const collectorIds = new Set(
+      compositionState.nodes
+        .filter((node) => node.node_type === "collector")
+        .map((node) => node.id),
+    );
+
+    // Collector on_error is inexpressible. A universal/legacy composition
+    // shape can still carry a stale explicit edge, but projecting it would
+    // promise group-failure routing the runtime never performs.
+    const explicitEdges = compositionState.edges.filter(
+      (edge) => edge.edge_type !== "on_error" || !collectorIds.has(edge.from_node),
+    );
+    const rfEdges: PipelineGraphEdgeModel[] = explicitEdges.map((edge, i) => ({
+      id: `e-${edge.from_node}-${edge.to_node}-${i}`,
+      source: toGraphNodeId(edge.from_node),
+      target: toGraphNodeId(edge.to_node),
+      label: edge.label ?? EDGE_LABEL_MAP[edge.edge_type] ?? edge.edge_type,
+      data: {
+        flowType: edge.edge_type === "on_error" ? "error" : "success",
+      },
+      animated: edge.edge_type === "on_error",
+      style: {
+        stroke: edge.edge_type === "on_error" ? EDGE_COLORS.error : EDGE_COLORS.normal,
+        strokeWidth: 1.5,
+      },
+      labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
+    }));
+    const explicitRfEdgeIds = new Set(rfEdges.map((edge) => edge.id));
+
+    // The runtime is a MultiDiGraph: equal endpoints do not make two routing
+    // facts equal. Preserve every distinct label/flow pair while still
+    // suppressing an exact render-hint duplicate.
+    const existingConnections = new Set(
+      rfEdges.map(edgeModelSemanticIdentity),
+    );
+    const explicitSuccessEdgeIds = new Set(
+      rfEdges.filter((_, index) => explicitEdges[index]?.edge_type === "on_success")
+        .map((edge) => edge.id),
+    );
+    function rebuildExistingConnections(): void {
+      existingConnections.clear();
+      for (const edge of rfEdges) {
+        existingConnections.add(edgeModelSemanticIdentity(edge));
+        // An explicit on_success edge may use a descriptive display label.
+        // It still represents the success route inferred from connection names.
+        if (explicitSuccessEdgeIds.has(edge.id)) {
+          existingConnections.add(edgeSemanticIdentity(
+            edge.source,
+            edge.target,
+            "success",
+            "success",
+          ));
+        }
+      }
+    }
+    const explicitEdgeIndexesByConnection = new Map<string, number[]>();
+    for (const [index, edge] of rfEdges.entries()) {
+      const connectionKey = `${edge.source}->${edge.target}`;
+      const indexes = explicitEdgeIndexesByConnection.get(connectionKey) ?? [];
+      indexes.push(index);
+      explicitEdgeIndexesByConnection.set(connectionKey, indexes);
+    }
+    const claimedExplicitBranchEdges = new Set<number>();
+    // The same claims keyed by edge ID. Phase 1 claims by INDEX (it rewrites
+    // `rfEdges[i]` in place), but the outbound drop loop below runs after
+    // splices have moved every index, and judges by ID. Without this the two
+    // ledgers disagree: an edge phase 1 claimed as an authoritative inbound
+    // branch arm reads as an unclaimed outbound hint and is deleted.
+    const claimedExplicitBranchEdgeIds = new Set<string>();
+    function claimExplicitBranchAlias(
+      connectionKey: string,
+      alias: string,
+      edgeType: EdgeFlowType,
+    ): boolean {
+      const candidateIndexes =
+        explicitEdgeIndexesByConnection.get(connectionKey) ?? [];
+      const matchingIndex = candidateIndexes.find(
+        (index) =>
+          !claimedExplicitBranchEdges.has(index)
+          && explicitEdges[index]?.label === alias,
+      );
+      const unlabelledIndex = candidateIndexes.find(
+        (index) =>
+          !claimedExplicitBranchEdges.has(index)
+          && explicitEdges[index]?.label === null,
+      );
+      const claimedIndex = matchingIndex ?? unlabelledIndex;
+      if (claimedIndex === undefined) return false;
+
+      claimedExplicitBranchEdges.add(claimedIndex);
+      const claimedId = rfEdges[claimedIndex]?.id;
+      if (claimedId !== undefined) claimedExplicitBranchEdgeIds.add(claimedId);
+      const isError = edgeType === "error";
+      rfEdges[claimedIndex] = {
+        ...rfEdges[claimedIndex],
+        label: alias,
+        data: {
+          ...rfEdges[claimedIndex]!.data,
+          flowType: edgeType,
+        },
+        animated: isError,
+        style: {
+          ...rfEdges[claimedIndex]!.style,
+          stroke: isError ? EDGE_COLORS.error : EDGE_COLORS.normal,
+        },
+      };
+      return true;
+    }
+    const nodeIds = new Set(rfNodes.map(n => n.id));
+    const outputIds = new Set(compositionState.outputs.map((output) => output.name));
+    function hasErrorRoute(sourceId: string, targetId: string): boolean {
+      // An explicit on_error hint may carry a useful route name. Its label
+      // differs from the inferred "error" label, but both draw the same route.
+      return rfEdges.some((edge) =>
+        edge.source === sourceId
+        && edge.target === targetId
+        && edge.data.flowType === "error",
+      );
+    }
+    function addDirectOutputErrorEdge(
+      kind: string,
+      sourceId: string,
+      targetId: string | undefined,
+    ): void {
+      if (
+        !targetId
+        || targetId === DISCARD_CONNECTION
+        || !outputIds.has(targetId)
+      ) {
+        return;
+      }
+      const semanticKey = edgeSemanticIdentity(
+        sourceId,
+        targetId,
+        "error",
+        "error",
+      );
+      if (hasErrorRoute(sourceId, targetId)) return;
+
+      rfEdges.push({
+        id: inferredSemanticEdgeId(
+          kind,
+          sourceId,
+          targetId,
+          "error",
+          "error",
+        ),
+        source: sourceId,
+        target: targetId,
+        label: "error",
+        data: { flowType: "error" },
+        animated: true,
+        style: { stroke: EDGE_COLORS.error, strokeWidth: 1.5 },
+        labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
+      });
+      existingConnections.add(semanticKey);
+    }
+
+    // Always infer missing edges from connection properties.
+    // ELSPETH uses a NAMED CONNECTION POINT model:
+    // - source.on_success is a connection point name (e.g., "transform_in")
+    // - node.input is the connection point name it reads from
+    // - node.on_success/on_error/routes are connection points or sink names
+    //
+    // Edge inference strategy:
+    // 1. Build a producer registry: connection_point → { nodeId, edgeType, label }
+    // 2. For each node, look up node.input in the registry to find upstream producer
+    // 3. For direct sink references (on_success/on_error/routes pointing to sink names),
+    //    create edges directly since sinks are in nodeIds
+
+    const connectionProducers = buildProducerRegistry(compositionState);
+
+    // Declared queue ids: a queue is the SOLE canonical producer of its own
+    // connection for ordinary downstream lookup, and every producer publishing
+    // that name draws an edge to the queue node.
+    const queueIds = new Set(
+      compositionState.nodes
+        .filter((node) => node.node_type === "queue")
+        .map((node) => node.id),
+    );
+    const rowUnionIds = new Set(
+      compositionState.nodes
+        .filter((node) => node.node_type === "row_union")
+        .map((node) => node.id),
+    );
+    const authoritativeRowUnionOutboundSemantics = new Map<
+      string,
+      ProducerInfo[]
+    >();
+    function registerAuthoritativeRowUnionOutbound(
+      connectionKey: string,
+      producer: ProducerInfo,
+    ): void {
+      const semantics =
+        authoritativeRowUnionOutboundSemantics.get(connectionKey) ?? [];
+      if (
+        semantics.some(
+          (semantic) =>
+            semantic.edgeType === producer.edgeType
+            && semantic.label === producer.label,
+        )
+      ) {
+        return;
+      }
+      semantics.push(producer);
+      authoritativeRowUnionOutboundSemantics.set(connectionKey, semantics);
+    }
+
+    // Phase 1: draw every producer → fan-in edge from the authoritative
+    // alias→connection mapping. NodeSpec.input is only the backend-compatible
+    // first-branch placeholder for a fan-in node; it is deliberately ignored
+    // so the graph cannot invent a duplicate unlabelled input edge.
+    const inferredBranchSemantics = new Set<string>();
+    // Fan-in nodes whose aliases phase 1 actually enumerated. Recorded here,
+    // at the one place the predicate is evaluated, so the phase-1b and phase-3
+    // guards can never drift from "phase 1 spoke for this node's inbound
+    // wiring" — a branchless fan-in node is NOT in this set and keeps its
+    // ordinary `input` inference.
+    const aliasMappedFanInIds = new Set<string>();
+    for (const fanIn of compositionState.nodes.filter(
+      (node) => FAN_IN_NODE_TYPES.has(node.node_type),
+    )) {
+      const branches = branchEntries(fanIn.branches);
+      if (branches.length === 0) continue;
+      aliasMappedFanInIds.add(fanIn.id);
+      for (const [alias, connection] of branches) {
+        const producers: ProducerInfo[] = queueIds.has(connection)
+          ? [{
+              nodeId: connection,
+              edgeType: "success",
+              label: "success",
+              origin: "success",
+            }]
+          : [...(connectionProducers.get(connection) ?? [])]
+              .sort((a, b) => a.nodeId.localeCompare(b.nodeId));
+        const producerCountByNodeAndFlow = new Map<string, number>();
+        for (const producer of producers) {
+          const key = `${producer.nodeId.length}:${producer.nodeId}|${producer.edgeType}`;
+          producerCountByNodeAndFlow.set(
+            key,
+            (producerCountByNodeAndFlow.get(key) ?? 0) + 1,
+          );
+        }
+        for (const producer of producers) {
+          if (producer.nodeId === fanIn.id) continue;
+          const connectionKey = `${producer.nodeId}->${fanIn.id}`;
+          const producerGroupKey =
+            `${producer.nodeId.length}:${producer.nodeId}|${producer.edgeType}`;
+          // A single producer for a branch keeps the consumer's useful alias.
+          // When one gate contributes several semantics to the same branch,
+          // retain each route label; the fork arm itself still reads as the
+          // branch alias. This mirrors the runtime's branch+route collision
+          // handling without sacrificing the established fan-in vocabulary.
+          const edgeLabel =
+            (producerCountByNodeAndFlow.get(producerGroupKey) ?? 0) > 1
+              ? producer.origin === "fork" ? alias : producer.label
+              : alias;
+          const semanticKey = edgeSemanticIdentity(
+            producer.nodeId,
+            fanIn.id,
+            edgeLabel,
+            producer.edgeType,
+          );
+          if (inferredBranchSemantics.has(semanticKey)) continue;
+          if (
+            claimExplicitBranchAlias(
+              connectionKey,
+              edgeLabel,
+              producer.edgeType,
+            )
+          ) {
+            inferredBranchSemantics.add(semanticKey);
+            continue;
+          }
+          const isError = producer.edgeType === "error";
+          rfEdges.push({
+            id: inferredSemanticEdgeId(
+              "fan-in",
+              producer.nodeId,
+              fanIn.id,
+              edgeLabel,
+              producer.edgeType,
+            ),
+            source: producer.nodeId,
+            target: fanIn.id,
+            label: edgeLabel,
+            data: { flowType: producer.edgeType },
+            animated: isError,
+            style: {
+              stroke: isError ? EDGE_COLORS.error : EDGE_COLORS.normal,
+              strokeWidth: 1.5,
+            },
+            labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
+          });
+          inferredBranchSemantics.add(semanticKey);
+          existingConnections.add(semanticKey);
+        }
+      }
+    }
+
+    // Phase 1 can rewrite explicit labels and flow types in place. Re-derive
+    // the semantic ledger once from the resulting edge models so subsequent
+    // inference never consults the pre-rewrite identity.
+    rebuildExistingConnections();
+
+    // Phase 1b: once phase 1 has spoken, `branches` is the ONLY route into an
+    // alias-mapped fan-in node — every inbound lane, of every edge_type, comes
+    // from that mapping (phase 1 carries error styling via producer.edgeType).
+    // An explicit edge into such a node that no alias claimed is stale
+    // wiring: `with_node` replaces a node in place and never reconciles
+    // `edges` (unlike `without_node`, which prunes edges touching the removed
+    // node), and validation only checks that edge endpoints resolve — never
+    // that a label names a live alias. So a renamed alias or a repointed
+    // branch leaves a validation-VALID composition whose edge list still
+    // describes the old wiring. Rendering it would show operators — in the
+    // diagram AND in its accessible text alternative — a route into the node
+    // that the authoritative state does not have.
+    //
+    // Every one of the 20 saved states that materialises inbound coalesce
+    // edges writes them with label: null, which claimExplicitBranchAlias
+    // claims through its unlabelled fallback — so extending phase 1 to
+    // coalesce prunes nothing that the corpus actually contains.
+    //
+    // Removal is by descending index so the remaining explicit indexes stay
+    // aligned. `existingConnections` is then REBUILT from the surviving
+    // edges rather than left as it was: it is a dedup set, and a pruned
+    // edge's key is no longer a duplicate of anything. Leaving it stale
+    // suppressed a later, legitimate draw — the direct-sink blocks below
+    // push into ANY node id, alias-mapped or not, so a node whose
+    // `on_success` names a fan-in node BY ID had its edge pruned here and
+    // then silently declined there. Deriving the set from the edges that
+    // actually exist cannot drift the way a hand-maintained one did.
+    const staleFanInEdgeIndexes: number[] = [];
+    for (let index = 0; index < explicitEdges.length; index += 1) {
+      if (claimedExplicitBranchEdges.has(index)) continue;
+      const target = rfEdges[index]?.target;
+      if (target === undefined || !aliasMappedFanInIds.has(target)) continue;
+      staleFanInEdgeIndexes.push(index);
+    }
+    for (const index of staleFanInEdgeIndexes.reverse()) {
+      rfEdges.splice(index, 1);
+    }
+    if (staleFanInEdgeIndexes.length > 0) {
+      rebuildExistingConnections();
+    }
+
+    // Phase 2: draw every producer → queue edge. Deterministic (sorted by
+    // producer id) so source insertion order cannot change the output; a
+    // self-producer is skipped. This runs BEFORE the direct-edge blocks below so
+    // these ids own the producer→queue pairs and the dedup set suppresses the
+    // direct-block duplicates (a queue IS a node, so nodeIds.has(queueId) is true).
+    for (const queueId of queueIds) {
+      const producers = [...(connectionProducers.get(queueId) ?? [])].sort((a, b) =>
+        a.nodeId.localeCompare(b.nodeId),
+      );
+      for (const producer of producers) {
+        if (producer.nodeId === queueId) continue; // no queue self-loop
+        const connectionKey = `${producer.nodeId}->${queueId}`;
+        if (rowUnionIds.has(producer.nodeId)) {
+          registerAuthoritativeRowUnionOutbound(connectionKey, producer);
+        }
+        const semanticKey = edgeSemanticIdentity(
+          producer.nodeId,
+          queueId,
+          producer.label,
+          producer.edgeType,
+        );
+        if (
+          existingConnections.has(semanticKey)
+          || (producer.origin === "error" && hasErrorRoute(producer.nodeId, queueId))
+        ) continue;
+        const isError = producer.edgeType === "error";
+        rfEdges.push({
+          id: inferredSemanticEdgeId(
+            "queue-in",
+            producer.nodeId,
+            queueId,
+            producer.label,
+            producer.edgeType,
+          ),
+          source: producer.nodeId,
+          target: queueId,
+          label: producer.label,
+          data: { flowType: producer.edgeType },
+          animated: isError,
+          style: {
+            stroke: isError ? EDGE_COLORS.error : EDGE_COLORS.normal,
+            strokeWidth: 1.5,
+          },
+          labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
+        });
+        existingConnections.add(semanticKey);
+      }
+    }
+
+    // Phase 3: infer edges by matching node.input to its upstream producer.
+    for (const node of compositionState.nodes) {
+      if (!node.input) continue;
+      // Skip only nodes phase 1 actually spoke for. Keying this on the
+      // alias-mapped set rather than on the node KIND is what keeps a
+      // branchless fan-in node from rendering with no inbound edge at all:
+      // phase 1 skips it (`branches.length === 0`), so `input` is still the
+      // only description of its wiring that exists.
+      if (aliasMappedFanInIds.has(node.id)) continue;
+
+      // A queue is the SOLE canonical producer of its own connection: synthesise
+      // the queue node as the producer (queue → consumer), never the upstream
+      // sources (which would be a dishonest producer → consumer bypass).
+      if (queueIds.has(node.input)) {
+        if (node.input === node.id) continue; // the queue's own implicit output
+        const semanticKey = edgeSemanticIdentity(
+          node.input,
+          node.id,
+          "success",
+          "success",
+        );
+        if (!existingConnections.has(semanticKey)) {
+          rfEdges.push({
+            id: inferredSemanticEdgeId(
+              "queue-out",
+              node.input,
+              node.id,
+              "success",
+              "success",
+            ),
+            source: node.input,
+            target: node.id,
+            label: "success",
+            data: { flowType: "success" },
+            style: { stroke: EDGE_COLORS.normal, strokeWidth: 1.5 },
+            labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
+          });
+          existingConnections.add(semanticKey);
+        }
+        continue;
+      }
+
+      const producers = [...(connectionProducers.get(node.input) ?? [])].sort((a, b) =>
+        a.nodeId.localeCompare(b.nodeId),
+      );
+      for (const producer of producers) {
+        if (producer.nodeId === node.id) continue;
+        const connectionKey = `${producer.nodeId}->${node.id}`;
+        if (rowUnionIds.has(producer.nodeId)) {
+          registerAuthoritativeRowUnionOutbound(connectionKey, producer);
+        }
+        const semanticKey = edgeSemanticIdentity(
+          producer.nodeId,
+          node.id,
+          producer.label,
+          producer.edgeType,
+        );
+        if (
+          existingConnections.has(semanticKey)
+          || (producer.origin === "error" && hasErrorRoute(producer.nodeId, node.id))
+        ) continue;
+        const isError = producer.edgeType === "error";
+        rfEdges.push({
+          id: rowUnionIds.has(producer.nodeId)
+            ? inferredSemanticEdgeId(
+                "row-union-out",
+                producer.nodeId,
+                node.id,
+                producer.label,
+                producer.edgeType,
+              )
+            : inferredSemanticEdgeId(
+                "conn",
+                producer.nodeId,
+                node.id,
+                producer.label,
+                producer.edgeType,
+              ),
+          source: producer.nodeId,
+          target: node.id,
+          label: producer.label,
+          data: { flowType: producer.edgeType },
+          animated: isError,
+          style: {
+            stroke: isError ? EDGE_COLORS.error : EDGE_COLORS.normal,
+            strokeWidth: 1.5,
+          },
+          labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
+        });
+        existingConnections.add(semanticKey);
+      }
+    }
+
+    // Handle source → sink direct edges (no transforms in between)
+    for (const [sourceName, source] of sortedSourceEntries(compositionState)) {
+      const sourceId = sourceComponentId(sourceName);
+      const semanticKey = source.on_success
+        ? edgeSemanticIdentity(
+            sourceId,
+            source.on_success,
+            "success",
+            "success",
+          )
+        : null;
+      if (
+        source.on_success &&
+        nodeIds.has(source.on_success) &&
+        semanticKey !== null &&
+        !existingConnections.has(semanticKey)
+      ) {
+        rfEdges.push({
+          id: inferredSemanticEdgeId(
+            "sink",
+            sourceId,
+            source.on_success,
+            "success",
+            "success",
+          ),
+          source: sourceId,
+          target: source.on_success,
+          label: "success",
+          data: { flowType: "success" },
+          style: { stroke: EDGE_COLORS.normal, strokeWidth: 1.5 },
+          labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
+        });
+        existingConnections.add(semanticKey);
+      }
+
+      addDirectOutputErrorEdge(
+        "source-validation-failure",
+        sourceId,
+        source.on_validation_failure,
+      );
+    }
+
+    // Handle direct sink references (on_success/on_error/routes pointing to sink names)
+    // Sinks are in nodeIds, so we can create edges directly to them
+    for (const node of compositionState.nodes) {
+      // on_success → sink (only if target is a sink, not a connection point)
+      const successConnectionKey = `${node.id}->${node.on_success}`;
+      if (
+        rowUnionIds.has(node.id)
+        && node.on_success
+        && nodeIds.has(node.on_success)
+      ) {
+        registerAuthoritativeRowUnionOutbound(successConnectionKey, {
+          nodeId: node.id,
+          edgeType: "success",
+          label: "success",
+          origin: "success",
+        });
+      }
+      if (
+        node.on_success &&
+        nodeIds.has(node.on_success) &&
+        !existingConnections.has(edgeSemanticIdentity(
+          node.id,
+          node.on_success,
+          "success",
+          "success",
+        ))
+      ) {
+        rfEdges.push({
+          id: inferredSemanticEdgeId(
+            "sink",
+            node.id,
+            node.on_success,
+            "success",
+            "success",
+          ),
+          source: node.id,
+          target: node.on_success,
+          label: "success",
+          data: { flowType: "success" },
+          style: { stroke: EDGE_COLORS.normal, strokeWidth: 1.5 },
+          labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
+        });
+        existingConnections.add(edgeSemanticIdentity(
+          node.id,
+          node.on_success,
+          "success",
+          "success",
+        ));
+      }
+
+      // on_error → sink
+      const errorConnectionKey = `${node.id}->${node.on_error}`;
+      if (
+        rowUnionIds.has(node.id)
+        && node.on_error
+        && nodeIds.has(node.on_error)
+      ) {
+        registerAuthoritativeRowUnionOutbound(errorConnectionKey, {
+          nodeId: node.id,
+          edgeType: "error",
+          label: "error",
+          origin: "error",
+        });
+      }
+      if (
+        node.node_type !== "collector" &&
+        node.on_error &&
+        nodeIds.has(node.on_error) &&
+        !hasErrorRoute(node.id, node.on_error)
+      ) {
+        rfEdges.push({
+          id: inferredSemanticEdgeId(
+            "sink",
+            node.id,
+            node.on_error,
+            "error",
+            "error",
+          ),
+          source: node.id,
+          target: node.on_error,
+          label: "error",
+          data: { flowType: "error" },
+          animated: true,
+          style: { stroke: EDGE_COLORS.error, strokeWidth: 1.5 },
+          labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
+        });
+        existingConnections.add(edgeSemanticIdentity(
+          node.id,
+          node.on_error,
+          "error",
+          "error",
+        ));
+      }
+
+      // Gate routes → sink
+      if (node.routes) {
+        for (const [routeLabel, targetId] of Object.entries(node.routes)) {
+          const routeConnectionKey = `${node.id}->${targetId}`;
+          if (rowUnionIds.has(node.id) && nodeIds.has(targetId)) {
+            registerAuthoritativeRowUnionOutbound(routeConnectionKey, {
+              nodeId: node.id,
+              edgeType: "success",
+              label: routeLabel,
+              origin: "route",
+            });
+          }
+          const semanticKey = edgeSemanticIdentity(
+            node.id,
+            targetId,
+            routeLabel,
+            "success",
+          );
+          if (nodeIds.has(targetId) && !existingConnections.has(semanticKey)) {
+            rfEdges.push({
+              id: inferredSemanticEdgeId(
+                "sink",
+                node.id,
+                targetId,
+                routeLabel,
+                "success",
+              ),
+              source: node.id,
+              target: targetId,
+              label: routeLabel,
+              data: { flowType: "success" },
+              style: { stroke: EDGE_COLORS.normal, strokeWidth: 1.5 },
+              labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
+            });
+            existingConnections.add(semanticKey);
+          }
+        }
+      }
+    }
+
+    // Source validation and sink write failure are engine-level routes to
+    // configured outputs. They are not named-connection producers, so they
+    // stay out of buildProducerRegistry and are projected directly here.
+    for (const output of compositionState.outputs) {
+      addDirectOutputErrorEdge(
+        "output-write-failure",
+        output.name,
+        output.on_write_failure,
+      );
+    }
+
+    // DELIBERATE EXCLUSION: this outbound rewrite stays row_union-scoped and
+    // is NOT widened to the other FAN_IN_NODE_TYPES. It treats "no
+    // authoritative semantic was registered for this connection" as "the
+    // explicit hint is stale" and drops the edge — sound only for a kind that
+    // always declares its outbound wiring. The saved corpus holds a coalesce
+    // with an explicit `merge_branches -> tidy_columns` edge whose on_success,
+    // on_error and routes are ALL null, so widening this loop would erase a
+    // working connection from the diagram. (The same hole exists for a
+    // row_union declaring no outbound wiring; it has never fired, since the
+    // corpus contains none.) Guarded by a test in GraphView.test.tsx.
+    //
+    // A row union's connection properties are authoritative for its outbound
+    // semantics just as `branches` is authoritative for its inbound topology.
+    // Explicit edges are materialized render hints and can retain a stale
+    // label/route even when their endpoints still match. Claim at most one hint
+    // per live semantic, rewrite it from authority, and drop every unclaimed
+    // row_union hint. When no explicit hint exists, the inference phase above
+    // has already emitted the authoritative edge.
+    const claimedExplicitRowUnionOutboundEdgeIds = new Set<string>();
+    for (
+      const [connectionKey, semantics]
+      of authoritativeRowUnionOutboundSemantics
+    ) {
+      const candidates = rfEdges.filter(
+        (edge) =>
+          explicitRfEdgeIds.has(edge.id)
+          && rowUnionIds.has(edge.source)
+          && `${edge.source}->${edge.target}` === connectionKey,
+      );
+      for (const semantic of semantics) {
+        const unclaimed = candidates.filter(
+          (edge) => !claimedExplicitRowUnionOutboundEdgeIds.has(edge.id),
+        );
+        const claimed =
+          unclaimed.find(
+            (edge) =>
+              edge.data.flowType === semantic.edgeType
+              && edge.label === semantic.label,
+          )
+          ?? unclaimed.find(
+            (edge) => edge.data.flowType === semantic.edgeType,
+          )
+          ?? unclaimed[0];
+        if (!claimed) continue;
+
+        claimedExplicitRowUnionOutboundEdgeIds.add(claimed.id);
+        const claimedIndex = rfEdges.findIndex(
+          (edge) => edge.id === claimed.id,
+        );
+        const isError = semantic.edgeType === "error";
+        rfEdges[claimedIndex] = {
+          ...claimed,
+          label: semantic.label,
+          data: {
+            ...claimed.data,
+            flowType: semantic.edgeType,
+          },
+          animated: isError,
+          style: {
+            ...claimed.style,
+            stroke: isError ? EDGE_COLORS.error : EDGE_COLORS.normal,
+          },
+        };
+      }
+    }
+    for (let index = rfEdges.length - 1; index >= 0; index -= 1) {
+      const edge = rfEdges[index]!;
+      if (!explicitRfEdgeIds.has(edge.id) || !rowUnionIds.has(edge.source)) {
+        continue;
+      }
+      if (claimedExplicitRowUnionOutboundEdgeIds.has(edge.id)) {
+        continue;
+      }
+      // Already spoken for as a CONSUMER's branch arm. Phase 1 rewrote it
+      // from the consumer's `branches`, which is as authoritative for this
+      // edge as the producer's connection properties would be — so it is not
+      // an unclaimed hint, and dropping it would erase a declared arm.
+      if (claimedExplicitBranchEdgeIds.has(edge.id)) {
+        continue;
+      }
+      rfEdges.splice(index, 1);
+    }
+
+    // Direction markers last: every construction and rewrite phase above has
+    // settled data.flowType by now, so the arrowhead colour cannot disagree
+    // with the stroke it points along (elspeth-ddae27dff1).
+    // Keep the first edge for an exact semantic duplicate. Explicit render
+    // hints are seeded before inferred edges, so a late authority rewrite
+    // retains the explicit hint's rendered id and removes only the
+    // now-redundant inferred copy; distinct labels or flow types remain
+    // independent lanes.
+    const semanticallyDistinctEdges = deduplicateSemanticEdges(rfEdges);
+    return { nodes: rfNodes, edges: withDirectionMarkers(semanticallyDistinctEdges) };
+  }, [compositionState, nodeValidationMap, nodeMessageMap, selectedNodeId]);
+
+  const visibleGraph = useMemo(() => {
+    const visible = visibleGraphRoutes(
+      nodes, edges, new Set(compositionState?.outputs.map((output) => output.name)), showFailureRoutes,
+    );
+    const parallelGeometry = assignParallelEdgeLanes(
+      visible.nodes,
+      visible.edges,
+    );
+    const laidOut = layoutGraph(parallelGeometry.nodes, parallelGeometry.edges);
+    return { nodes: laidOut.nodes, edges: withFanInArrivals(laidOut.nodes, laidOut.edges) };
+  }, [nodes, edges, compositionState, showFailureRoutes]);
+  const hiddenOutputNames = useMemo(() => {
+    const visibleIds = new Set(visibleGraph.nodes.map((node) => node.id));
+    return new Set(compositionState?.outputs.filter((output) => !visibleIds.has(output.name)).map((output) => output.name));
+  }, [visibleGraph.nodes, compositionState]);
+  useEffect(() => {
+    if (activeEdgeId && !visibleGraph.edges.some((edge) => edge.id === activeEdgeId)) setActiveEdgeId(null);
+    if (selectedNodeId && hiddenOutputNames.has(selectedNodeId)) selectNode(null);
+  }, [activeEdgeId, visibleGraph.edges, selectedNodeId, hiddenOutputNames, selectNode]);
+  const activeEdge = visibleGraph.edges.find((edge) => edge.id === activeEdgeId);
+  const renderedEdges = visibleGraph.edges.map((edge) => ({
+    ...edge,
+    selected: edge.id === activeEdge?.id,
+    zIndex: edge.id === activeEdge?.id ? 10 : 0,
+    style: edge.id === activeEdge?.id ? { ...edge.style, strokeWidth: 4 } : edge.style,
+  }));
+  const renderedNodes = visibleGraph.nodes.map((node) => activeEdge && (node.id === activeEdge.source || node.id === activeEdge.target)
+    ? { ...node, style: { ...node.style, boxShadow: "0 0 0 3px var(--color-selected-ring)" } }
+    : node);
+
+  // Accessible, keyboard-operable equivalent of the visual DAG. The React Flow
+  // diagram is a visual image (role="img", scoped to the diagram element
+  // only); this list is its text alternative
+  // (WCAG 1.1.1 — elspeth-ef897110dd) AND the keyboard path to node inspection,
+  // since onNodeClick is mouse-only (WCAG 2.1.1 — elspeth-d37b7217c9). Activating
+  // an item drives the same selectedNodeId store that opens NodeConfigPanel.
+  const accessibleNodes = useMemo(() => {
+    if (!compositionState) {
+      return [] as Array<{ id: string; status?: ValidationStatus; label: string }>;
+    }
+    const describe = (
+      id: string,
+      typeLabel: string,
+      plugin: string | null,
+    ): { id: string; status?: ValidationStatus; label: string } => {
+      // A passing validation attributes no per-node findings, so the map is
+      // empty; announce 'valid' only when is_valid is strictly true. A
+      // failing result with unattributed (component_id: null) errors must
+      // keep unblamed nodes at 'not yet validated', never claim validity.
+      // Deliberately announced-only (elspeth-b5b7c5a6ad): the visual canvas
+      // does not render the 'valid' marker/border (makeRfNode reads the bare
+      // map, so its 'valid' arms are unreachable) — activating them changes
+      // pinned screenshot baselines and is a separate, deliberate change.
+      const status =
+        nodeValidationMap[id] ??
+        (validationResult?.is_valid === true ? "valid" : undefined);
+      const validity =
+        status === "error"
+          ? "has validation errors"
+          : status === "warning"
+            ? "has warnings"
+            : status === "valid"
+              ? // "passed validation", not "valid": a verb phrase parallel to
+                // its three siblings, and the same word the status chip uses
+                // ("Validation: Passed", workspaceStatus.ts) so an operator
+                // cross-checking chip against node hears one vocabulary.
+                "passed validation"
+              : "not yet validated";
+      const message = nodeMessageMap[id];
+      return {
+        id,
+        status,
+        label: `${humanNodeType(typeLabel)}: ${id}${plugin ? ` (${plugin})` : ""} — ${validity}${message ? `. ${message}` : ""}`,
+      };
+    };
+    const out: Array<{ id: string; status?: ValidationStatus; label: string }> = [];
+    for (const [sourceName, source] of sortedSourceEntries(compositionState)) {
+      out.push(describe(sourceComponentId(sourceName), "source", source.plugin));
+    }
+    for (const node of compositionState.nodes) {
+      const description = describe(node.id, node.node_type, node.plugin);
+      if (node.node_type === "transform" && node.plugin === "llm") {
+        description.label += `. ${llmBindingLabel(node.options)}`;
+      }
+      out.push(description);
+    }
+    for (const output of compositionState.outputs) {
+      if (!hiddenOutputNames.has(output.name)) out.push(describe(output.name, "sink", output.plugin));
+    }
+    return out;
+  }, [compositionState, nodeValidationMap, nodeMessageMap, validationResult, hiddenOutputNames]);
+
+  const accessibleEdges = useMemo(
+    () =>
+      visibleGraph.edges.map((edge) => ({
+        id: edge.id,
+        label:
+          `${edge.source} to ${edge.target}: ${
+            typeof edge.label === "string" ? edge.label : "connection"
+          } (${edge.data.flowType})`,
+      })),
+    [visibleGraph.edges],
+  );
+
+  // Empty state — must match the hasContent check above so that a
+  // source-to-sink pipeline (zero transform nodes) still renders.
+  //
+  // Centred in the canvas void, not top-pinned (elspeth-1f4b60a492): the
+  // shared .empty-state register centres within its OWN box, but with no
+  // height the box hugged its one line of text at the top edge of a ~950px
+  // panel, reading as an unfinished layout. .graph-view-empty stretches the
+  // box to the panel and stacks the empty-landing treatment (an
+  // --font-size-xl lead + muted guidance — header.css .empty-landing is the
+  // precedent register). Two <p>s, not a heading: this sits inside a
+  // tabpanel, and the message is a state, not a document section. The
+  // explicit {" "} keeps the two sentences one whitespace-normalised string
+  // for text-content assertions.
+  //
+  if (nodes.length === 0) {
+    return (
+      <div className="empty-state graph-view-empty">
+        <p className="graph-view-empty-title">No pipeline to visualise.</p>{" "}
+        <p className="graph-view-empty-hint">
+          Start a conversation to build one.
+        </p>
+      </div>
+    );
+  }
+
+  const nodeCount = visibleGraph.nodes.length;
+  // Deliberately row_union-only, not FAN_IN_NODE_TYPES. This clause exists to
+  // gloss a kind whose name does not read as English (cf. humanNodeType); the
+  // <ol> text alternative below already names each coalesce by its own
+  // self-describing type, so counting them here would add length without
+  // adding information.
+  const rowUnionCount =
+    compositionState?.nodes.filter((node) => node.node_type === "row_union")
+      .length ?? 0;
+  const rowUnionSummary =
+    rowUnionCount > 0
+      ? `, including ${plural(rowUnionCount, "row union")}`
+      : "";
+  const ariaLabel =
+    `Pipeline graph with ${plural(nodeCount, "component")}`
+    + `${rowUnionSummary} (sources, processing steps, sinks).`;
+
+  return (
+    // ReactFlowProvider lets Controls/MiniMap render OUTSIDE the <ReactFlow>
+    // element while sharing its store — required so they can live outside the
+    // role="img" diagram scope below (elspeth-37f6f13132).
+    <ReactFlowProvider>
+      <div
+        className="graph-view-shell"
+      >
+        <div className="graph-view-toolbar">
+          <Button compact aria-pressed={showFailureRoutes} onClick={() => setShowFailureRoutes((shown) => !shown)}>
+            {showFailureRoutes ? "Hide" : "Show"} quarantine and discard routes
+          </Button>
+        </div>
+        {/* Accessible + keyboard-operable equivalent of the visual DAG.
+            The diagram below stays role="img" (a visual diagram); THIS list is
+            its text alternative (WCAG 1.1.1) and the keyboard path to node
+            inspection (WCAG 2.1.1), since onNodeClick is mouse-only. Visually
+            hidden until a child is focused (.graph-a11y-list, inspector.css) —
+            a real keyboard target with a visible focus state, not an invisible
+            tab trap. */}
+        <ol
+          className="graph-a11y-list"
+          aria-label={`Pipeline components in source-to-sink order (${accessibleNodes.length})`}
+        >
+          {accessibleNodes.map((node) => (
+            <li key={node.id}>
+              {/* variant="bare" with no className: emits no class attribute,
+                  exactly like the raw <button> it replaces — the control is
+                  styled by the .graph-a11y-list descendant rules. */}
+              <Button
+                variant="bare"
+                aria-pressed={selectedNodeId === node.id}
+                onClick={() => {
+                  const nextNodeId =
+                    selectedNodeId === node.id ? null : node.id;
+                  // Keyboard path: hand focus to the config panel once it
+                  // opens (see the focusPanelOnOpen effect above).
+                  focusPanelOnOpenRef.current = nextNodeId !== null;
+                  selectNode(nextNodeId);
+                }}
+              >
+                {node.label}. Activate to inspect.
+              </Button>
+            </li>
+          ))}
+        </ol>
+        <ul
+          className="visually-hidden"
+          aria-label="Pipeline branch connections"
+        >
+          {accessibleEdges.map((edge) => (
+            <li key={edge.id}>{edge.label}</li>
+          ))}
+        </ul>
+        {/* role="img" is children-presentational: everything inside it is
+            pruned from the accessibility tree. It therefore scopes the
+            DIAGRAM ONLY — the live "pending #N" pill and the interactive
+            zoom/fit Controls are siblings so AT can still reach them
+            (WCAG 4.1.3 / 1.3.1, elspeth-37f6f13132). */}
+        <div className="graph-view-canvas">
+          {pendingProposalCount > 0 && (
+            <div
+              role="status"
+              className="pending-overlay-pill"
+              aria-label={`${pendingProposalCount} pending graph proposal${pendingProposalCount === 1 ? "" : "s"}`}
+            >
+              pending #{pendingProposalCount}
+            </div>
+          )}
+          <div
+            ref={diagramRef}
+            className="graph-view-diagram"
+            aria-label={ariaLabel}
+            aria-roledescription="Pipeline DAG diagram"
+            role="img"
+          >
+            <ReactFlow
+              nodes={renderedNodes}
+              edges={renderedEdges}
+              edgeTypes={EDGE_TYPES}
+              nodeTypes={NODE_TYPES}
+              nodesDraggable={false}
+              nodesConnectable={false}
+              // Visual nodes and edges are display-only; keyboard node
+              // selection is provided by the .graph-a11y-list above and edge
+              // topology by the "Pipeline branch connections" list, so canvas
+              // nodes/edges are not extra (invisible, role="img"-hidden) tab
+              // stops.
+              nodesFocusable={false}
+              edgesFocusable={false}
+              elementsSelectable={true}
+              onNodeClick={onNodeClick}
+              onEdgeClick={(_event, edge) => setActiveEdgeId(edge.id)}
+              onPaneClick={onPaneClick}
+              colorMode={resolvedTheme}
+              onInit={handleInit}
+              minZoom={GRAPH_MIN_ZOOM}
+              fitViewOptions={GRAPH_FIT_VIEW_OPTIONS}
+              proOptions={{ hideAttribution: true }}
+            >
+              <Background gap={16} size={1} color="var(--color-canvas-grid)" />
+            </ReactFlow>
+          </div>
+          {/* fitViewOptions is read from THIS prop, not from <ReactFlow>'s —
+              see GRAPH_FIT_VIEW_OPTIONS (elspeth-a8074a3a7b). */}
+          <Controls
+            showInteractive={false}
+            fitViewOptions={GRAPH_FIT_VIEW_OPTIONS}
+          >
+            {/* Fourth control, under fit view: the keyboard-operable trigger
+                for GraphModal (palette "Show graph" and Ctrl+Shift+G only
+                switch to this tab; the canvas's click gestures are bound). */}
+            {onFullscreen && (
+              <ControlButton onClick={onFullscreen} title="Fullscreen" aria-label="Fullscreen">
+                <Icon name="maximise" />
+              </ControlButton>
+            )}
+          </Controls>
+          {visibleGraph.nodes.length > MINIMAP_NODE_COUNT_THRESHOLD && (
+            <MiniMap
+              bgColor="var(--color-surface)"
+              nodeColor={getMiniMapNodeColor}
+              nodeStrokeColor={getMiniMapNodeStrokeColor}
+              nodeStrokeWidth={3}
+              zoomable
+              pannable
+              // width/height only. An inline `bottom`/`right` here does not
+              // REPLACE .react-flow__panel's own 15px margin, it stacks on top
+              // of it — which rested the MiniMap 23px off the canvas floor
+              // while the Controls, the other floating panel on the same
+              // canvas, rested at 15px (elspeth-a7ce6e6a4c). MiniMapComponent
+              // still reads style.width/style.height to scale its viewport
+              // rectangle, so those two stay.
+              style={{ width: 120, height: 80 }}
+            />
+          )}
+        </div>
+        {compositionState && (
+          <ErrorBoundary label="Wiring table">
+            <GraphOutputs state={compositionState} showFailureRoutes={showFailureRoutes} hiddenOutputNames={hiddenOutputNames}>
+              <ul className="graph-route-controls" aria-label="Inspect pipeline routes">
+                {visibleGraph.edges.map((edge) => (
+                  <li key={edge.id}>
+                    <Button variant="bare" type="button" aria-pressed={edge.id === activeEdge?.id}
+                      onFocus={() => setActiveEdgeId(edge.id)} onClick={() => setActiveEdgeId(edge.id)}>
+                      {edge.source} → {edge.target}: {String(edge.label ?? edge.data.flowType)} ({edge.data.flowType})
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            </GraphOutputs>
+            {activeEdge && <p className="graph-route-detail" role="status">Selected route: {activeEdge.source} → {activeEdge.target}: {String(activeEdge.label ?? activeEdge.data.flowType)} ({activeEdge.data.flowType})</p>}
+          </ErrorBoundary>
+        )}
+        {selectedConfig && !hiddenOutputNames.has(selectedNodeId ?? "") && (
+          <NodeConfigPanel
+            config={selectedConfig}
+            onClose={() => selectNode(null)}
+            panelRef={configPanelRef}
+          />
+        )}
+      </div>
+    </ReactFlowProvider>
+  );
+}

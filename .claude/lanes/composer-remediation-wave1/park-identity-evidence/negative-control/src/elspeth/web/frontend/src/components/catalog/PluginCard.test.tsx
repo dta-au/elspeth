@@ -1,0 +1,993 @@
+// ============================================================================
+// PluginCard — rendering regression coverage for bug elspeth-dcf12c061b.
+//
+// Pins the two JSON-Schema shapes the card renders:
+//   1. Flat ``{properties, required}`` from single-model plugins.
+//   2. Pydantic discriminated union (``oneOf`` + ``$defs`` + ``discriminator``)
+//      from plugins like the LLM transform — rendered as one section per
+//      variant, labelled via the discriminator mapping.
+// ============================================================================
+
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen, within, act } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { PluginCard } from "./PluginCard";
+import type { PluginSummary, PluginSchemaInfo } from "@/types/index";
+import type { AuditCharacteristicFlag } from "./auditCharacteristics";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { resetStore } from "@/test/store-helpers";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
+
+beforeEach(() => resetStore(usePreferencesStore));
+
+// The wire is structurally JSON string[] (types/index.ts:412-420); the TS
+// union tightens in-repo construction so a typo'd flag cannot compile. A
+// fixture simulating an out-of-vocabulary flag arriving over the wire —
+// exactly the drift lookupAuditCharacteristic tolerates at runtime — has to
+// go around that same narrowing, the same way this file already does for
+// PluginSchemaInfo (`as unknown as` below, e.g. :943).
+function withWireDriftFlag(flags: string[]): AuditCharacteristicFlag[] {
+  return flags as unknown as AuditCharacteristicFlag[];
+}
+
+function makePlugin(overrides: Partial<PluginSummary> = {}): PluginSummary {
+  return {
+    name: "example",
+    plugin_type: "transform",
+    description: "An example plugin",
+    config_fields: [],
+    usage_when_to_use: null,
+    usage_when_not_to_use: null,
+    example_use: null,
+    capability_tags: [],
+    audit_characteristics: [],
+    ...overrides,
+  };
+}
+
+const FLAT_SCHEMA: PluginSchemaInfo = {
+  name: "csv",
+  plugin_type: "source",
+  description: "CSV source",
+  json_schema: {
+    properties: {
+      path: { type: "string", description: "File path" },
+      encoding: { type: "string" },
+    },
+    required: ["path"],
+  },
+  knob_schema: { fields: [] },
+};
+
+// Minimal Pydantic-shaped discriminated union (real LLM transform shape,
+// trimmed). ``$defs`` entry names match the ``discriminator.mapping`` values
+// so the label-resolution path exercises the real production contract.
+const DISCRIMINATED_SCHEMA: PluginSchemaInfo = {
+  name: "llm",
+  plugin_type: "transform",
+  description: "LLM transform",
+  json_schema: {
+    oneOf: [
+      { $ref: "#/$defs/AzureOpenAIConfig" },
+      { $ref: "#/$defs/OpenRouterConfig" },
+    ],
+    discriminator: {
+      propertyName: "provider",
+      mapping: {
+        azure: "#/$defs/AzureOpenAIConfig",
+        openrouter: "#/$defs/OpenRouterConfig",
+      },
+    },
+    $defs: {
+      AzureOpenAIConfig: {
+        properties: {
+          deployment_name: { type: "string", description: "Azure deployment" },
+          endpoint: { type: "string" },
+          api_key: { type: "string", description: "Azure API key" },
+        },
+        required: ["deployment_name", "endpoint", "api_key"],
+      },
+      OpenRouterConfig: {
+        properties: {
+          model: { type: "string", description: "OpenRouter model id" },
+          api_key: { type: "string", description: "OpenRouter API key" },
+        },
+        required: ["model", "api_key"],
+      },
+    },
+  },
+  knob_schema: { fields: [] },
+};
+
+// Fixtures for the detail-level describe block below (elspeth-8555a6a9e0).
+// Written as distinct literals rather than reusing makePlugin()/FLAT_SCHEMA:
+// those existing fixtures' audit_characteristics and json_schema.required
+// don't match what the gating tests need to assert against.
+const CARD_PLUGIN: PluginSummary = makePlugin({
+  audit_characteristics: ["deterministic", "quarantine", "credentials", "coerce"],
+});
+
+const CARD_SCHEMA: PluginSchemaInfo = {
+  name: "example",
+  plugin_type: "transform",
+  description: "An example plugin",
+  json_schema: {
+    properties: { profile: { type: "string" } },
+    required: ["profile"],
+  },
+  knob_schema: { fields: [] },
+};
+
+describe("PluginCard — collapsed header", () => {
+  it("renders display name (primary), raw id (metadata), and description without expanding", () => {
+    render(
+      <PluginCard
+        plugin={makePlugin({ name: "csv", description: "CSV source" })}
+        schema={null}
+        onExpand={vi.fn()}
+      />,
+    );
+    // Display name is the primary label; the raw plugin id is demoted to
+    // secondary mono metadata (elspeth-5ee1f76e39).
+    expect(screen.getByText("CSV")).toHaveClass("plugin-card-name");
+    expect(screen.getByText("csv")).toHaveClass("plugin-card-id");
+    expect(screen.getByText("CSV source")).toHaveAttribute("title", "CSV source");
+    // Expanded content does NOT render while collapsed.
+    expect(screen.queryByText(/Loading/)).not.toBeInTheDocument();
+  });
+
+  it("humanises underscore ids while preserving the raw id as metadata", () => {
+    render(
+      <PluginCard
+        plugin={makePlugin({ name: "azure_document_intelligence" })}
+        schema={null}
+        onExpand={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Azure Document Intelligence")).toHaveClass(
+      "plugin-card-name",
+    );
+    expect(screen.getByText("azure_document_intelligence")).toHaveClass(
+      "plugin-card-id",
+    );
+  });
+
+  // The internal badge is gone with elspeth-06566208b3: CatalogDrawer now
+  // omits internal-machinery plugins entirely, so no card can carry one and
+  // a badge branch here would be unreachable render code. The filter is
+  // covered by CatalogDrawer.test.tsx ("CatalogDrawer — internal plugins").
+});
+
+describe("PluginCard — flat single-model schema", () => {
+  // These tests exercise the Schema disclosure mechanics themselves (not the
+  // detail-level gate), so they need the Schema button visible — see the
+  // "detail level (elspeth-8555a6a9e0)" describe block below for the gate.
+  beforeEach(() => usePreferencesStore.setState({ showAdvanced: true }));
+
+  it("links the schema disclosure to the expanded schema panel", async () => {
+    const user = userEvent.setup();
+    render(
+      <PluginCard
+        plugin={makePlugin({ name: "csv loader", plugin_type: "source" })}
+        schema={FLAT_SCHEMA}
+        onExpand={vi.fn()}
+      />,
+    );
+
+    const disclosure = screen.getByRole("button", { name: /schema for csv loader/i });
+    expect(disclosure).toHaveAttribute(
+      "aria-controls",
+      "plugin-card-schema-panel-source-csv-loader",
+    );
+
+    await user.click(disclosure);
+    const panel = screen.getByText("path").closest(".plugin-card-expanded");
+    expect(panel).toHaveAttribute("id", "plugin-card-schema-panel-source-csv-loader");
+  });
+
+  it("renders each property and marks the required ones", async () => {
+    const user = userEvent.setup();
+    render(
+      <PluginCard
+        plugin={makePlugin({ name: "csv" })}
+        schema={FLAT_SCHEMA}
+        onExpand={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /schema for csv/i }));
+    expect(screen.getByText("path")).toBeInTheDocument();
+    expect(screen.getByText("encoding")).toBeInTheDocument();
+    // Required badge appears for ``path`` but not ``encoding``.
+    const badges = screen.getAllByText("required");
+    expect(badges).toHaveLength(1);
+    expect(screen.getByText("File path")).toBeInTheDocument();
+  });
+});
+
+describe("PluginCard — discriminated union", () => {
+  // Schema-disclosure mechanics — needs the Schema button visible; see the
+  // "detail level (elspeth-8555a6a9e0)" describe block for the gate itself.
+  beforeEach(() => usePreferencesStore.setState({ showAdvanced: true }));
+
+  it("renders one section per variant labelled by discriminator value", async () => {
+    const user = userEvent.setup();
+    render(
+      <PluginCard
+        plugin={makePlugin({ name: "llm" })}
+        schema={DISCRIMINATED_SCHEMA}
+        onExpand={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /schema for llm/i }));
+    expect(
+      screen.getByText("This plugin supports multiple providers. Configure exactly one:"),
+    ).toBeInTheDocument();
+    // Labels come from the discriminator mapping (provider: azure / openrouter),
+    // NOT the raw $defs class names (AzureOpenAIConfig / OpenRouterConfig).
+    expect(screen.getByText("provider: azure")).toBeInTheDocument();
+    expect(screen.getByText("provider: openrouter")).toBeInTheDocument();
+    expect(screen.queryByText("provider: AzureOpenAIConfig")).not.toBeInTheDocument();
+  });
+
+  it("marks a field required only within variants whose required list names it", async () => {
+    const user = userEvent.setup();
+    render(
+      <PluginCard
+        plugin={makePlugin({ name: "llm" })}
+        schema={DISCRIMINATED_SCHEMA}
+        onExpand={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /schema for llm/i }));
+    // Azure variant: deployment_name, endpoint, api_key required (3 badges).
+    // OpenRouter variant: model, api_key required (2 badges).
+    // Total: 5 required badges across the rendered card.
+    const badges = screen.getAllByText("required");
+    expect(badges).toHaveLength(5);
+    // Both Azure-only and OpenRouter-only fields are rendered.
+    expect(screen.getByText("deployment_name")).toBeInTheDocument();
+    expect(screen.getByText("endpoint")).toBeInTheDocument();
+    expect(screen.getByText("model")).toBeInTheDocument();
+    // ``api_key`` appears in both variants — there should be two nodes.
+    expect(screen.getAllByText("api_key")).toHaveLength(2);
+  });
+
+  it("falls back to def name when discriminator mapping is absent", async () => {
+    const user = userEvent.setup();
+    const schemaWithoutMapping: PluginSchemaInfo = {
+      ...DISCRIMINATED_SCHEMA,
+      json_schema: {
+        ...(DISCRIMINATED_SCHEMA.json_schema as Record<string, unknown>),
+        discriminator: { propertyName: "provider" },
+      },
+    };
+    render(
+      <PluginCard
+        plugin={makePlugin()}
+        schema={schemaWithoutMapping}
+        onExpand={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /schema for example/i }));
+    // Without mapping, the $defs class name is the fallback label.
+    expect(screen.getByText("provider: AzureOpenAIConfig")).toBeInTheDocument();
+    expect(screen.getByText("provider: OpenRouterConfig")).toBeInTheDocument();
+  });
+
+  it("defaults discriminator label prefix to 'variant' when propertyName missing", async () => {
+    const user = userEvent.setup();
+    const schemaWithoutDiscProp: PluginSchemaInfo = {
+      ...DISCRIMINATED_SCHEMA,
+      json_schema: {
+        oneOf: [{ $ref: "#/$defs/A" }],
+        $defs: { A: { properties: {}, required: [] } },
+      },
+    };
+    render(
+      <PluginCard
+        plugin={makePlugin()}
+        schema={schemaWithoutDiscProp}
+        onExpand={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /schema for example/i }));
+    expect(screen.getByText("variant: A")).toBeInTheDocument();
+  });
+
+  it("skips oneOf entries whose $ref does not target local $defs", async () => {
+    const user = userEvent.setup();
+    const mixedRefSchema: PluginSchemaInfo = {
+      ...DISCRIMINATED_SCHEMA,
+      json_schema: {
+        oneOf: [
+          { $ref: "#/components/schemas/External" },
+          { $ref: "#/$defs/Local" },
+        ],
+        discriminator: {
+          propertyName: "provider",
+          mapping: { local: "#/$defs/Local" },
+        },
+        $defs: {
+          Local: {
+            properties: { field: { type: "string" } },
+            required: ["field"],
+          },
+        },
+      },
+    };
+    render(
+      <PluginCard
+        plugin={makePlugin()}
+        schema={mixedRefSchema}
+        onExpand={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /schema for example/i }));
+    expect(screen.getByText("provider: local")).toBeInTheDocument();
+    expect(screen.queryByText(/External/)).not.toBeInTheDocument();
+  });
+
+  it("silently drops oneOf refs whose $defs entry is missing", async () => {
+    // Mirror of the backend policy at the boundary: a dangling $ref in the
+    // frontend should not crash the render — the variant is simply absent.
+    const user = userEvent.setup();
+    const danglingSchema: PluginSchemaInfo = {
+      ...DISCRIMINATED_SCHEMA,
+      json_schema: {
+        oneOf: [
+          { $ref: "#/$defs/Missing" },
+          { $ref: "#/$defs/Present" },
+        ],
+        discriminator: {
+          propertyName: "provider",
+          mapping: {
+            missing: "#/$defs/Missing",
+            present: "#/$defs/Present",
+          },
+        },
+        $defs: {
+          Present: {
+            properties: { field: { type: "string" } },
+            required: [],
+          },
+        },
+      },
+    };
+    render(
+      <PluginCard
+        plugin={makePlugin()}
+        schema={danglingSchema}
+        onExpand={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /schema for example/i }));
+    expect(screen.getByText("provider: present")).toBeInTheDocument();
+    expect(screen.queryByText("provider: missing")).not.toBeInTheDocument();
+  });
+
+  it("renders 'No configuration fields' when a variant has no properties", async () => {
+    const user = userEvent.setup();
+    const emptyVariantSchema: PluginSchemaInfo = {
+      ...DISCRIMINATED_SCHEMA,
+      json_schema: {
+        oneOf: [{ $ref: "#/$defs/Empty" }],
+        discriminator: {
+          propertyName: "provider",
+          mapping: { empty: "#/$defs/Empty" },
+        },
+        $defs: { Empty: {} },
+      },
+    };
+    render(
+      <PluginCard
+        plugin={makePlugin()}
+        schema={emptyVariantSchema}
+        onExpand={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /schema for example/i }));
+    expect(screen.getByText("No configuration fields.")).toBeInTheDocument();
+  });
+});
+
+describe("PluginCard — error and loading states", () => {
+  // Schema-disclosure mechanics — needs the Schema button visible; see the
+  // "detail level (elspeth-8555a6a9e0)" describe block for the gate itself.
+  beforeEach(() => usePreferencesStore.setState({ showAdvanced: true }));
+
+  it("shows schema error message and suppresses content", async () => {
+    const user = userEvent.setup();
+    const onRetrySchema = vi.fn();
+    render(
+      <PluginCard
+        plugin={makePlugin()}
+        schema={null}
+        schemaError
+        onExpand={vi.fn()}
+        onRetrySchema={onRetrySchema}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /schema for example/i }));
+    expect(
+      screen.getByText(/Failed to load schema/),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Retry loading schema" }));
+    expect(onRetrySchema).toHaveBeenCalledTimes(1);
+  });
+
+  it("announces schema loading with a spinner when schema is null and no error", async () => {
+    const user = userEvent.setup();
+    render(
+      <PluginCard plugin={makePlugin()} schema={null} onExpand={vi.fn()} />,
+    );
+    await user.click(screen.getByRole("button", { name: /schema for example/i }));
+    const status = screen.getByRole("status");
+
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(status).toHaveTextContent("Loading schema");
+    expect(status.querySelector(".spinner")).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("calls onExpand exactly once per expand toggle", async () => {
+    const user = userEvent.setup();
+    const onExpand = vi.fn();
+    render(
+      <PluginCard plugin={makePlugin()} schema={null} onExpand={onExpand} />,
+    );
+    await user.click(screen.getByRole("button", { name: /schema for example/i })); // expand
+    await user.click(screen.getByRole("button", { name: /schema for example/i })); // collapse
+    await user.click(screen.getByRole("button", { name: /schema for example/i })); // expand again
+    // onExpand fires on transitions from collapsed → expanded only (2 times).
+    expect(onExpand).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("PluginCard — Phase 7B reshape", () => {
+  it("renders the plugin name and one-line description", () => {
+    render(<PluginCard plugin={makePlugin({ name: "csv", description: "Read rows from a CSV file." })} schema={null} onExpand={() => {}} />);
+    expect(screen.getByText("csv")).toBeInTheDocument();
+    expect(screen.getByText(/Read rows from a CSV file/i)).toBeInTheDocument();
+  });
+
+  it("exposes the card as an article named by the display name (WCAG 1.3.1)", () => {
+    // The visually-heading name span must convey programmatic structure:
+    // role="article" + aria-labelledby points the accessible name at the
+    // name element rather than leaving it an undifferentiated bold span.
+    render(
+      <PluginCard
+        plugin={makePlugin({ name: "csv", plugin_type: "source" })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    const article = screen.getByRole("article", { name: "CSV" });
+    const name = screen.getByText("CSV");
+    expect(name.id).toBe("plugin-card-name-source-csv");
+    expect(article).toHaveAttribute("aria-labelledby", name.id);
+  });
+
+  it("renders one audit-characteristic icon per flag", () => {
+    // io_read is not one of the DEFAULT_VISIBLE_AUDIT_FLAGS; this test pins
+    // the general per-flag rendering mechanism, not the detail-level gate.
+    usePreferencesStore.setState({ showAdvanced: true });
+    render(
+      <PluginCard
+        plugin={makePlugin({ audit_characteristics: ["io_read", "quarantine"] })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    expect(screen.getByText(/reads i\/?o/i)).toBeInTheDocument();
+    expect(screen.getByText(/quarantines/i)).toBeInTheDocument();
+  });
+
+  it("exposes the audit strip as a group named 'Audit characteristics' (WCAG 1.3.1)", () => {
+    // aria-label on a role-less div is not exposed to AT; the strip must
+    // carry role="group" for the label to associate (elspeth-37293a3b7c).
+    // io_read is not a DEFAULT_VISIBLE_AUDIT_FLAGS entry, so the flag must
+    // be on for the strip to render at all.
+    usePreferencesStore.setState({ showAdvanced: true });
+    render(
+      <PluginCard
+        plugin={makePlugin({ audit_characteristics: ["io_read"] })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    expect(
+      screen.getByRole("group", { name: "Audit characteristics" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the known chip and no raw flag at the DEFAULT detail level (elspeth-0bfd019f68)", () => {
+    // external_call is in DEFAULT_VISIBLE_AUDIT_FLAGS, so its chip renders
+    // here; future_characteristic is filtered out by that same list before it
+    // ever reaches the icon. This test pins the default surface — it does NOT
+    // exercise the deleted branch, which is what the next test is for.
+    const { container } = render(
+      <PluginCard
+        plugin={makePlugin({ audit_characteristics: withWireDriftFlag(["external_call", "future_characteristic"]) })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    expect(screen.getByText("network call")).toBeInTheDocument(); // positive anchor
+    expect(screen.queryByText("future_characteristic")).not.toBeInTheDocument();
+    expectNoIdentifiersInDefaultDom(container);
+  });
+
+  it("renders no chip at all for an out-of-vocabulary flag at the DETAILED level (elspeth-0bfd019f68)", () => {
+    // THIS is the test that exercises the deleted branch: with the flag on,
+    // the unknown characteristic reaches AuditCharacteristicIcon, which now
+    // returns null. Before the change it rendered `future_characteristic`
+    // verbatim, so this assertion goes from red to green on the deletion.
+    usePreferencesStore.setState({ showAdvanced: true });
+    render(
+      <PluginCard
+        plugin={makePlugin({ audit_characteristics: withWireDriftFlag(["external_call", "future_characteristic"]) })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    expect(screen.getByText("network call")).toBeInTheDocument();
+    expect(screen.queryByText("future_characteristic")).not.toBeInTheDocument();
+  });
+
+  it("renders no labelled group at all when every characteristic is out of vocabulary (elspeth-0bfd019f68)", () => {
+    // PluginCard.tsx:189's `length > 0` guard counts flags, not rendered
+    // chips. Without the lookup filter this is a <div role="group"
+    // aria-label="Audit characteristics"> with no children — announced as a
+    // labelled group containing nothing.
+    usePreferencesStore.setState({ showAdvanced: true });
+    render(
+      <PluginCard
+        plugin={makePlugin({ audit_characteristics: withWireDriftFlag(["future_characteristic"]) })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    expect(screen.queryByRole("group", { name: "Audit characteristics" })).not.toBeInTheDocument();
+  });
+
+  it("renders the 'Use when' prose in the details disclosure", async () => {
+    render(<PluginCard plugin={makePlugin({ usage_when_to_use: "When you have a CSV file already." })} schema={null} onExpand={() => {}} />);
+    expect(screen.queryByText(/use when/i)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /reference details for example/i }));
+    expect(screen.getByText(/use when/i)).toBeInTheDocument();
+    expect(screen.getByText(/when you have a csv file/i)).toBeInTheDocument();
+  });
+
+  it("links the details disclosure to the details panel", async () => {
+    render(
+      <PluginCard
+        plugin={makePlugin({ name: "csv loader", usage_when_to_use: "When you have a CSV file already." })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    const detailsButton = screen.getByRole("button", { name: /reference details for csv loader/i });
+    expect(detailsButton).toHaveAttribute(
+      "aria-controls",
+      "plugin-card-details-panel-transform-csv-loader",
+    );
+
+    await userEvent.click(detailsButton);
+    const panel = screen.getByText(/when you have a csv file/i).closest(".plugin-card-details");
+    expect(panel).toHaveAttribute("id", "plugin-card-details-panel-transform-csv-loader");
+  });
+
+  it("renders the 'Avoid when' prose in the details disclosure", async () => {
+    render(<PluginCard plugin={makePlugin({ usage_when_not_to_use: "When the data is inline." })} schema={null} onExpand={() => {}} />);
+    await userEvent.click(screen.getByRole("button", { name: /reference details for example/i }));
+    expect(screen.getByText(/avoid when/i)).toBeInTheDocument();
+  });
+
+  it("renders the example use as a code block preserving whitespace in details", async () => {
+    const exampleUse = "source:\n  plugin: csv\n  options:\n    path: data/input.csv";
+    const { container } = render(
+      <PluginCard
+        plugin={makePlugin({ example_use: exampleUse })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: /reference details for example/i }));
+    const codeBlock = container.querySelector(".plugin-card-example-code");
+    expect(codeBlock).not.toBeNull();
+    expect(codeBlock?.tagName.toLowerCase()).toBe("pre");
+    expect(codeBlock?.textContent).toBe(exampleUse);
+  });
+
+  it("preserves inline and fenced code formatting in details prose", async () => {
+    const { container } = render(
+      <PluginCard
+        plugin={makePlugin({
+          usage_when_to_use:
+            "Use `options.path` when the file is local.\n\n```yaml\nsource:\n  plugin: csv\n```",
+        })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+
+    await userEvent.click(
+      screen.getByRole("button", { name: /reference details for example/i }),
+    );
+
+    expect(screen.getByText("options.path").tagName.toLowerCase()).toBe("code");
+    // Fenced blocks render through MarkdownRenderer's Prism highlighter,
+    // which splits the code into per-token spans across multiple lines —
+    // the same reason MarkdownRenderer.test.tsx queries via the container
+    // rather than screen.getByText for fenced content.
+    const pre = container.querySelector("pre.code-block");
+    expect(pre).not.toBeNull();
+    const code = pre?.querySelector("code");
+    expect(code).not.toBeNull();
+    expect(code?.textContent).toContain("source:");
+    expect(code?.textContent).toContain("plugin:");
+  });
+
+  it("renders bullet-style prose as a list for scannability", async () => {
+    render(
+      <PluginCard
+        plugin={makePlugin({
+          usage_when_not_to_use:
+            "- when rows are already structured\n- when credentials would be embedded",
+        })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+
+    await userEvent.click(
+      screen.getByRole("button", { name: /reference details for example/i }),
+    );
+
+    const list = screen.getByRole("list");
+    expect(within(list).getByText("when rows are already structured")).toBeInTheDocument();
+    expect(within(list).getByText("when credentials would be embedded")).toBeInTheDocument();
+  });
+
+  it.each(
+    (["usage_when_to_use", "usage_when_not_to_use", "example_use"] as const)
+      .flatMap((field) =>
+        ([null, "", "   ", "\n\t"] as const).map((value) => [field, value] as const),
+      ),
+  )("hides details when %s is %j and the other catalogue fields are empty", (field, value) => {
+    const { container } = render(
+      <PluginCard
+        plugin={makePlugin({ [field]: value })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: /reference details for example/i }),
+    ).not.toBeInTheDocument();
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+    expect(screen.queryByText(/see the technical description above/i)).not.toBeInTheDocument();
+  });
+
+  it("renders only meaningful catalogue sections when sibling fields are whitespace", async () => {
+    const { container } = render(
+      <PluginCard
+        plugin={makePlugin({
+          usage_when_to_use: "   ",
+          usage_when_not_to_use: "Use a database sink for relational queries.",
+          example_use: "\n\t",
+        })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+
+    const detailsButton = screen.getByRole("button", {
+      name: /reference details for example/i,
+    });
+    await userEvent.click(detailsButton);
+
+    expect(screen.queryByText("Use when:")).not.toBeInTheDocument();
+    expect(screen.getByText("Avoid when:")).toBeInTheDocument();
+    expect(
+      screen.getByText("Use a database sink for relational queries."),
+    ).toBeInTheDocument();
+    expect(container.querySelector(".plugin-card-example")).not.toBeInTheDocument();
+    expect(screen.queryByText(/see the technical description above/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps populated CSV details collapsed by default and supports close and reopen", async () => {
+    const user = userEvent.setup();
+    const csvPlugin = makePlugin({
+      name: "csv",
+      plugin_type: "source",
+      usage_when_to_use: "When the input is a bounded CSV file.",
+      usage_when_not_to_use: "When the rows are already structured.",
+      example_use: "source:\n  plugin: csv",
+    });
+    const { container } = render(
+      <PluginCard plugin={csvPlugin} schema={null} onExpand={() => {}} />,
+    );
+    const detailsButton = screen.getByRole("button", {
+      name: /reference details for csv/i,
+    });
+
+    expect(detailsButton).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+
+    await user.click(detailsButton);
+    expect(detailsButton).toHaveAttribute("aria-expanded", "true");
+    expect(container.querySelector(".plugin-card-details")).toBeInTheDocument();
+
+    await user.click(detailsButton);
+    expect(detailsButton).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+
+    await user.click(detailsButton);
+    expect(detailsButton).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("When the input is a bounded CSV file.")).toBeInTheDocument();
+  });
+
+  it("operates the populated details disclosure from the keyboard", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <PluginCard
+        plugin={makePlugin({ usage_when_to_use: "When the input is tabular." })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    const detailsButton = screen.getByRole("button", {
+      name: /reference details for example/i,
+    });
+
+    detailsButton.focus();
+    await user.keyboard("{Enter}");
+    expect(detailsButton).toHaveAttribute("aria-expanded", "true");
+    expect(container.querySelector(".plugin-card-details")).toBeInTheDocument();
+
+    await user.keyboard(" ");
+    expect(detailsButton).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+  });
+
+  it("starts details collapsed when the card switches to another plugin", async () => {
+    const user = userEvent.setup();
+    const { container, rerender } = render(
+      <PluginCard
+        plugin={makePlugin({
+          name: "csv",
+          usage_when_to_use: "When the input is a bounded CSV file.",
+        })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /reference details for csv/i }));
+    expect(container.querySelector(".plugin-card-details")).toBeInTheDocument();
+
+    rerender(
+      <PluginCard
+        plugin={makePlugin({
+          name: "json",
+          usage_when_to_use: "When the input is structured JSON.",
+        })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+
+    const jsonDetails = screen.getByRole("button", {
+      name: /reference details for json/i,
+    });
+    expect(jsonDetails).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+  });
+
+  it("does not restore stale details state after switching away and back", async () => {
+    const user = userEvent.setup();
+    const csvPlugin = makePlugin({
+      name: "csv",
+      usage_when_to_use: "When the input is a bounded CSV file.",
+    });
+    const jsonPlugin = makePlugin({
+      name: "json",
+      usage_when_to_use: "When the input is structured JSON.",
+    });
+    const { container, rerender } = render(
+      <PluginCard plugin={csvPlugin} schema={null} onExpand={() => {}} />,
+    );
+    await user.click(screen.getByRole("button", { name: /reference details for csv/i }));
+    expect(container.querySelector(".plugin-card-details")).toBeInTheDocument();
+
+    rerender(
+      <PluginCard plugin={jsonPlugin} schema={null} onExpand={() => {}} />,
+    );
+    const jsonDetails = screen.getByRole("button", {
+      name: /reference details for json/i,
+    });
+    expect(jsonDetails).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+
+    rerender(
+      <PluginCard plugin={csvPlugin} schema={null} onExpand={() => {}} />,
+    );
+    const returningCsvDetails = screen.getByRole("button", {
+      name: /reference details for csv/i,
+    });
+    expect(returningCsvDetails).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+  });
+
+  it("resets details after the same plugin loses and regains reference content", async () => {
+    const user = userEvent.setup();
+    const populatedPlugin = makePlugin({
+      name: "csv",
+      usage_when_to_use: "When the input is a bounded CSV file.",
+      usage_when_not_to_use: "When rows are already structured.",
+      example_use: "source:\n  plugin: csv",
+    });
+    const blankPlugin = makePlugin({
+      name: "csv",
+      usage_when_to_use: "   ",
+      usage_when_not_to_use: "\n\t",
+      example_use: "",
+    });
+    const { container, rerender } = render(
+      <PluginCard plugin={populatedPlugin} schema={null} onExpand={() => {}} />,
+    );
+    await user.click(screen.getByRole("button", { name: /reference details for csv/i }));
+    expect(container.querySelector(".plugin-card-details")).toBeInTheDocument();
+
+    rerender(
+      <PluginCard plugin={blankPlugin} schema={null} onExpand={() => {}} />,
+    );
+    expect(
+      screen.queryByRole("button", { name: /reference details for csv/i }),
+    ).not.toBeInTheDocument();
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+
+    rerender(
+      <PluginCard plugin={populatedPlugin} schema={null} onExpand={() => {}} />,
+    );
+    const returningDetails = screen.getByRole("button", {
+      name: /reference details for csv/i,
+    });
+    expect(returningDetails).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+  });
+
+  it("does NOT render a 'Use in pipeline' button (toolkit affordance removed)", () => {
+    render(<PluginCard plugin={makePlugin()} schema={null} onExpand={() => {}} />);
+    expect(screen.queryByRole("button", { name: /use in pipeline/i })).not.toBeInTheDocument();
+  });
+
+  it("renders a numbered list as real list items, not a flattened paragraph", async () => {
+    // Regression coverage for elspeth-b7b1b62940: parseProseBlocks only
+    // recognised -/* bullets; numbered lines fell through to the paragraph
+    // branch and were flattened onto one line via lines.join(' ').
+    render(
+      <PluginCard
+        plugin={makePlugin({
+          usage_when_to_use: "1. First step\n2. Second step\n3. Third step",
+        })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: /reference details for example/i }),
+    );
+    const items = screen.getAllByRole("listitem");
+    expect(items.map((item) => item.textContent)).toEqual([
+      "First step",
+      "Second step",
+      "Third step",
+    ]);
+    // The flattened single-paragraph rendering must not appear.
+    expect(
+      screen.queryByText(/1\. First step 2\. Second step 3\. Third step/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders bold prose as real emphasis, not literal asterisks", async () => {
+    render(
+      <PluginCard
+        plugin={makePlugin({
+          usage_when_to_use: "This plugin is **not** recommended for production.",
+        })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: /reference details for example/i }),
+    );
+    const strong = screen.getByText("not");
+    expect(strong.tagName.toLowerCase()).toBe("strong");
+    // The literal markdown asterisks must not leak into the rendered text.
+    expect(screen.queryByText(/\*\*not\*\*/)).not.toBeInTheDocument();
+  });
+
+  it("renders a markdown link as a real anchor, not literal bracket syntax", async () => {
+    render(
+      <PluginCard
+        plugin={makePlugin({
+          usage_when_to_use:
+            "See the [reference guide](https://example.com/docs) for details.",
+        })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: /reference details for example/i }),
+    );
+    const link = screen.getByRole("link", { name: "reference guide" });
+    expect(link).toHaveAttribute("href", "https://example.com/docs");
+    // The literal markdown bracket/paren syntax must not leak into the text.
+    expect(
+      screen.queryByText(/\[reference guide\]\(https:\/\/example\.com\/docs\)/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("calls onExpand when the 'Schema →' disclosure is activated", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    const onExpand = vi.fn();
+    render(<PluginCard plugin={makePlugin({ name: "csv" })} schema={null} onExpand={onExpand} />);
+    const disclosure = screen.getByRole("button", { name: /schema for csv/i });
+    await userEvent.click(disclosure);
+    expect(onExpand).toHaveBeenCalled();
+  });
+
+  it("renders the expanded schema after onExpand resolves and schema arrives", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    const schema: PluginSchemaInfo = {
+      name: "csv",
+      plugin_type: "source",
+      description: "Read CSV files.",
+      json_schema: {
+        properties: { path: { type: "string", description: "Path to file" } },
+        required: ["path"],
+      },
+    } as unknown as PluginSchemaInfo;
+    render(<PluginCard plugin={makePlugin({ name: "csv" })} schema={schema} onExpand={() => {}} initialExpanded />);
+    expect(screen.getByText("path")).toBeInTheDocument();
+  });
+});
+
+describe("detail level (elspeth-8555a6a9e0)", () => {
+  it("shows only the behavioural flags and no Schema button by default", () => {
+    const { container } = render(<PluginCard plugin={CARD_PLUGIN} schema={null} onExpand={vi.fn()} />);
+    expectNoIdentifiersInDefaultDom(container);
+    const strip = screen.getByRole("group", { name: "Audit characteristics" });
+    expect(within(strip).getByText("quarantines bad rows")).toBeInTheDocument();
+    expect(within(strip).getByText("needs credentials")).toBeInTheDocument();
+    expect(within(strip).queryByText("deterministic")).not.toBeInTheDocument();
+    expect(within(strip).queryByText("can coerce types")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Schema for / })).not.toBeInTheDocument();
+  });
+
+  it("shows all flags, the Schema button, and separated schema columns with show_advanced on", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    render(<PluginCard plugin={CARD_PLUGIN} schema={CARD_SCHEMA} onExpand={vi.fn()} initialExpanded />);
+    const strip = screen.getByRole("group", { name: "Audit characteristics" });
+    for (const label of ["deterministic", "quarantines bad rows", "needs credentials", "can coerce types"]) {
+      expect(within(strip).getByText(label)).toBeInTheDocument();
+    }
+    expect(screen.getByRole("button", { name: /^Schema for / })).toBeInTheDocument();
+    const row = screen.getByText("profile").closest(".plugin-card-field-row") as HTMLElement;
+    expect(within(row).getByText("string")).toBeInTheDocument();
+    expect(within(row).getByText("required")).toBeInTheDocument();
+  });
+
+  it("closes an open Schema panel when the flag goes off on a mounted card", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    render(<PluginCard plugin={CARD_PLUGIN} schema={CARD_SCHEMA} onExpand={vi.fn()} initialExpanded />);
+    expect(screen.getByText("profile")).toBeInTheDocument();
+    act(() => usePreferencesStore.setState({ showAdvanced: false }));
+    expect(screen.queryByText("profile")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Schema for / })).not.toBeInTheDocument();
+  });
+});

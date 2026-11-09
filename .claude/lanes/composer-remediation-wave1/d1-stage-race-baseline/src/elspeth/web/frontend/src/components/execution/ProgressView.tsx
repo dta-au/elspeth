@@ -1,0 +1,375 @@
+// ============================================================================
+// ProgressView
+//
+// Live progress display for an active execution run. Shows:
+// - Indeterminate progress bar (using .progress-bar CSS classes from styles/animations.css)
+// - Explicit source/token counters
+// - Recent errors list (scrolling, newest first, capped at 50)
+// - Cancel button (disabled once run reaches terminal state)
+// - "Pipeline execution was cancelled" message on cancelled event
+// - WebSocket disconnect banner with reconnect status
+// ============================================================================
+
+import { useMemo, useState } from "react";
+import { useExecutionStore } from "@/stores/executionStore";
+import { useSessionStore } from "@/stores/sessionStore";
+import { useShowAdvanced } from "@/stores/preferencesStore";
+import { useWebSocket } from "@/hooks/useWebSocket";
+import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { Button, StatusBadge } from "@/components/ui";
+import { makePhraseFor } from "@/lib/validationHumaniser";
+import {
+  RUN_ACCOUNTING_CLOSURE_PHRASES,
+  RUN_ACCOUNTING_GLOSSES,
+  RUN_ACCOUNTING_LABELS,
+  RUN_COUNTER_LABELS,
+  terminalRunAnnouncement,
+} from "./runTerminalPhrases";
+import { isTerminalRunStatus, type RunAccounting, type RunProgress } from "@/types/index";
+
+function formattedCount(value: number): string {
+  return value.toLocaleString();
+}
+
+// M07 (WCAG 4.1.3): phase-driven announcement for the polite live region.
+// Derived from ``progress.status`` (the phase) rather than the counters, so the
+// string is stable across counter ticks while running and only changes on a
+// terminal transition — the live region then announces the run once per phase
+// instead of on every update.
+//
+// The terminal phrasing is NOT owned here: it comes from runTerminalPhrases,
+// shared with the App-level RunOutcomeNotice so the two announcement surfaces
+// for one event cannot drift into separate vocabularies. Only the in-flight
+// phases (cancelling / pending / running), which that surface never speaks,
+// are local literals.
+function buildStatusAnnouncement(progress: RunProgress, cancelRequested: boolean): string {
+  if (cancelRequested) return "Cancelling pipeline.";
+  const totals =
+    `${formattedCount(progress.source_rows_processed)} rows, ` +
+    `${formattedCount(progress.tokens_succeeded)} succeeded, ` +
+    `${formattedCount(progress.tokens_failed)} failed`;
+  if (isTerminalRunStatus(progress.status)) {
+    return terminalRunAnnouncement(progress.status, totals);
+  }
+  switch (progress.status) {
+    case "pending":
+      // Distinct from "running" so the polite live region announces the
+      // pending→running transition (a queued run has not started yet).
+      return "Pipeline queued.";
+    case "running":
+      return "Pipeline running.";
+  }
+}
+
+function ProgressAccountingDetails({
+  accounting,
+  showAdvanced,
+}: {
+  accounting: RunAccounting;
+  showAdvanced: boolean;
+}) {
+  // Labels come from the shared run-panel vocabulary (runTerminalPhrases),
+  // not inline literals — one owner holds the sentence-case register
+  // (elspeth-406b503a82).
+  const accountingCounters = [
+    [RUN_ACCOUNTING_LABELS.tokensEmitted, accounting.tokens.emitted],
+    [RUN_ACCOUNTING_LABELS.tokensTerminal, accounting.tokens.terminal],
+    [RUN_ACCOUNTING_LABELS.tokensStructural, accounting.tokens.structural],
+    [RUN_ACCOUNTING_LABELS.tokensPending, accounting.tokens.pending],
+    [RUN_ACCOUNTING_LABELS.tokensAbandoned, accounting.tokens.abandoned],
+    [RUN_ACCOUNTING_LABELS.rowsDiscarded, accounting.routing.discarded],
+    [RUN_ACCOUNTING_LABELS.collectorGroupsFailed, accounting.collector_groups_failed],
+  ] as const;
+  const integrityWarnings = [
+    [
+      RUN_ACCOUNTING_LABELS.missingTerminal,
+      accounting.integrity.missing_terminal_outcomes,
+    ],
+    [
+      RUN_ACCOUNTING_LABELS.duplicateTerminal,
+      accounting.integrity.duplicate_terminal_outcomes,
+    ],
+  ] as const;
+
+  return (
+    <div role="group" aria-label="Run accounting" className="progress-accounting">
+      <p className="progress-accounting-closure">
+        {RUN_ACCOUNTING_LABELS.auditClosure}: {RUN_ACCOUNTING_CLOSURE_PHRASES[accounting.integrity.closure]}
+      </p>
+      <div className="progress-accounting-integrity">
+        {integrityWarnings.map(([label, value]) =>
+          value > 0 ? (
+            <span key={label} className="progress-accounting-integrity-item progress-accounting-integrity-item--warning">
+              <span className="progress-accounting-integrity-label">{label}</span>
+              <strong>{formattedCount(value)}</strong>
+            </span>
+          ) : null,
+        )}
+      </div>
+      <details className="progress-accounting-detail" open={showAdvanced}>
+        <summary title={RUN_ACCOUNTING_GLOSSES.token}>Accounting detail</summary>
+        <dl className="progress-accounting-grid">
+          {accountingCounters.map(([label, value]) => (
+            <div key={label} className="progress-accounting-item">
+              <dt>{label}</dt>
+              <dd>{formattedCount(value)}</dd>
+            </div>
+          ))}
+        </dl>
+      </details>
+    </div>
+  );
+}
+
+export function ProgressView() {
+  const { progress, wsDisconnected, activeRunId } = useWebSocket();
+  const wsStreamEnded = useExecutionStore((s) => s.wsStreamEnded);
+  const cancel = useExecutionStore((s) => s.cancel);
+  const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const showAdvanced = useShowAdvanced();
+  const compositionState = useSessionStore((s) => s.compositionState);
+  const phraseFor = useMemo(() => makePhraseFor(compositionState), [compositionState]);
+
+  if (!progress || !activeRunId) return null;
+
+  // Phase 2.2 (elspeth-0de989c56d): the operator-completion subset
+  // (completed / completed_with_failures / empty) is also terminal — the
+  // older 3-value tuple ("completed", "cancelled", "failed") would leave the
+  // progress view appearing active for the two new terminal statuses.
+  const isTerminal =
+    progress.status === "completed" ||
+    progress.status === "completed_with_failures" ||
+    progress.status === "empty" ||
+    progress.status === "cancelled" ||
+    progress.status === "failed";
+  const cancelRequested = progress.cancel_requested === true && !isTerminal;
+  const isPending = progress.status === "pending";
+  const statusAnnouncement = buildStatusAnnouncement(progress, cancelRequested);
+  const displayStatus = cancelRequested ? ("cancelling" as const) : progress.status;
+  const progressBarLabel = isPending ? "Pipeline execution queued" : "Pipeline execution in progress";
+
+  return (
+    <div className="progress-container">
+      {/* Single phase-driven live region (M07 / WCAG 4.1.3): announces the run
+          phase (running → each terminal status) once per transition. The
+          visible cancelled/failed messages below are visual-only (no live
+          role) so a screen reader hears each terminal status exactly once,
+          politely, via this region rather than from a competing live region. */}
+      <div role="status" aria-live="polite" className="sr-only">
+        {statusAnnouncement}
+      </div>
+
+      {/* WebSocket disconnect banner. Two causes, two truthful messages: a
+          transient drop the socket is retrying, versus a stream the server
+          ended for good (1000/1011) after which the store's own status poll —
+          not a reconnect — is what retires the run. */}
+      {wsDisconnected && !isTerminal && (
+        <div
+          role="status"
+          className="progress-ws-banner"
+        >
+          {wsStreamEnded
+            ? "Live progress connection ended. Checking run status..."
+            : "Live progress connection lost. Reconnecting..."}
+        </div>
+      )}
+
+      {/* Status header with cancel button. StatusBadge carries the a11y glyph
+          map (⚠ completed_with_failures / ∅ empty) so the distinction is not
+          colour-only (elspeth-e1c5ad0b53); the underscored identifier is
+          rendered space-separated for human reading and the badge CSS handles
+          uppercasing. */}
+      <div className="progress-status-header">
+        <StatusBadge status={displayStatus}>
+          {displayStatus.replace(/_/g, " ")}
+        </StatusBadge>
+        {!isTerminal && !cancelRequested && (
+          <Button
+            variant="danger"
+            onClick={() => setShowCancelConfirm(true)}
+            aria-label="Cancel pipeline execution"
+            className="progress-cancel-btn"
+          >
+            Cancel
+          </Button>
+        )}
+      </div>
+
+      {showCancelConfirm && (
+        <ConfirmDialog
+          title="Cancel pipeline"
+          message={
+            isPending
+              ? "Cancel the queued pipeline? This cannot be undone."
+              : "Cancel the running pipeline? This cannot be undone."
+          }
+          confirmLabel="Cancel pipeline"
+          variant="danger"
+          onConfirm={() => {
+            cancel(activeRunId);
+            setShowCancelConfirm(false);
+          }}
+          onCancel={() => setShowCancelConfirm(false)}
+        />
+      )}
+
+      {/* Progress bar -- indeterminate mode (no percentage, animated stripe).
+          R2-F5 (elspeth-139a345050): role="progressbar" and the "in
+          progress" label previously stayed on this element in EVERY state,
+          including terminal ones, so a finished run still claimed (visually
+          and to assistive tech) to be in progress. The colored strip below
+          stays for terminal states (intentional per the colour mapping
+          comment) but the progressbar semantics only apply while the run is
+          actually running. */}
+      <div
+        className="progress-bar progress-bar-outer"
+        role={isTerminal ? undefined : "progressbar"}
+        aria-label={isTerminal ? undefined : progressBarLabel}
+      >
+        <div
+          className={isTerminal ? "progress-bar-complete" : "progress-bar-stripe"}
+          style={
+            isTerminal
+              ? {
+                  // Phase 2.2 colour mapping:
+                  //   completed                  → success (green)
+                  //   completed_with_failures    → warning (the run produced
+                  //                                output but had failures)
+                  //   empty                      → muted text (clean run that
+                  //                                consumed no rows)
+                  //   failed                     → error (red)
+                  //   cancelled                  → warning (orange)
+                  backgroundColor:
+                    progress.status === "completed"
+                      ? "var(--color-success)"
+                      : progress.status === "failed"
+                        ? "var(--color-error)"
+                        : progress.status === "empty"
+                          ? "var(--color-text-muted)"
+                          : "var(--color-warning)",
+                }
+              : {}
+          }
+        />
+      </div>
+
+      {/* R2-F5: mid-run counters read as a settled final tally without an
+          in-progress affordance — this caption makes clear the numbers
+          below are a running total, not a finished result. */}
+      {!isTerminal && (
+        <div className="progress-counters-caption">
+          {isPending ? "Queued — waiting to start" : "Running — counts so far"}
+        </div>
+      )}
+
+      {/* Source/token counters -- large and prominent. Labels from the shared
+          run-panel vocabulary (elspeth-406b503a82). */}
+      <div className="progress-counters">
+        <div>
+          <div className="progress-counter-label">
+            {RUN_COUNTER_LABELS.sourceRows}
+          </div>
+          <div className="progress-counter-value">
+            {progress.source_rows_processed.toLocaleString()}
+          </div>
+        </div>
+        <div>
+          <div className="progress-counter-label">
+            {RUN_COUNTER_LABELS.tokensSucceeded}
+          </div>
+          <div className="progress-counter-value">
+            {progress.tokens_succeeded.toLocaleString()}
+          </div>
+        </div>
+        <div>
+          <div className="progress-counter-label">
+            {RUN_COUNTER_LABELS.tokensFailed}
+          </div>
+          <div
+            className="progress-counter-value"
+            style={{
+              color:
+                progress.tokens_failed > 0
+                  ? "var(--color-error)"
+                  : "var(--color-text)",
+            }}
+          >
+            {progress.tokens_failed.toLocaleString()}
+          </div>
+        </div>
+      </div>
+
+      {(progress.tokens_quarantined > 0 ||
+        progress.tokens_routed_success > 0 ||
+        progress.tokens_routed_failure > 0) && (
+        <div className="progress-routing-summary">
+          {progress.tokens_routed_success > 0 && (
+            <span>{progress.tokens_routed_success.toLocaleString()} routed success</span>
+          )}
+          {progress.tokens_routed_failure > 0 && (
+            <span>{progress.tokens_routed_failure.toLocaleString()} routed failure</span>
+          )}
+          {progress.tokens_quarantined > 0 && (
+            <span title={RUN_ACCOUNTING_GLOSSES.quarantined}>
+              {progress.tokens_quarantined.toLocaleString()} quarantined
+            </span>
+          )}
+        </div>
+      )}
+
+      {progress.accounting && (
+        <ProgressAccountingDetails accounting={progress.accounting} showAdvanced={showAdvanced} />
+      )}
+
+      {/* Cancellation message — visual-only; the announcement is carried by
+          the polite live region at the top of the container. */}
+      {progress.status === "cancelled" && (
+        <div className="progress-cancelled-msg">
+          Pipeline execution was cancelled.
+        </div>
+      )}
+
+      {/* Failure message — visual-only; announced via the live region above. */}
+      {progress.status === "failed" && progress.recent_errors.length === 0 && (
+        <div className="progress-failed-msg">
+          Pipeline execution failed.
+        </div>
+      )}
+
+      {/* Recent errors */}
+      {progress.recent_errors.length > 0 && (
+        <details className="progress-errors" open={showAdvanced}>
+          <summary className="progress-errors-title">
+            {progress.recent_errors.length === 1
+              ? "1 row failed — view details"
+              : `${progress.recent_errors.length} rows failed — view details`}
+          </summary>
+          <div className="progress-errors-container">
+            {progress.recent_errors.map((err, i) => (
+              <div
+                key={`${err.node_id}-${i}`}
+                className="progress-error-item"
+                style={{
+                  borderBottom:
+                    i < progress.recent_errors.length - 1
+                      ? "1px solid var(--color-error-border)"
+                      : "none",
+                }}
+              >
+                {err.node_id && <strong>{phraseFor(err.node_id)}</strong>}
+                {err.node_id && ": "}
+                {err.message}
+                {err.row_id && (
+                  <span className="progress-error-row-id">
+                    {" "}
+                    (row: {err.row_id})
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+    </div>
+  );
+}

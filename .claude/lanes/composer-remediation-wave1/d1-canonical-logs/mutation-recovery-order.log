@@ -1,0 +1,215 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 4 items
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py ..FF [100%]
+
+=================================== FAILURES ===================================
+_____ test_equal_candidate_only_rejects_after_recovery_integrity[mismatch] _____
+
+proposal = _Proposal(service=<elspeth.web.sessions.service.SessionServiceImpl object at 0x7f3d42c82c00>, engine=Engine(sqlite:///...1ad29834575f5d94b228c0a4eb88468b4'), root=PosixPath('/tmp/pytest-of-agent/pytest-147/test_equal_candidate_only_reje2'))
+recovery = 'mismatch'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("recovery", ["fresh", "matching", "mismatch", "missing_pair"])
+    async def test_equal_candidate_only_rejects_after_recovery_integrity(proposal: _Proposal, recovery: str) -> None:
+        operations = proposal.service.session_operation_authority
+        context = operations.acquire(
+            session_id=proposal.authority.row.session_id,
+            operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=proposal.service.session_operation_owner_instance_id,
+            lease_seconds=300,
+        )
+        try:
+            prepared = await _prepare(proposal, context)
+            current = replace(prepared.result.updated_state, version=19)
+            recorder = BufferingRecorder()
+            binding = prepared.dispatch if recovery != "fresh" else None
+            executor_hash = prepared.executor_content_hash if recovery == "matching" else "0" * 64 if recovery == "mismatch" else None
+            expected_error = AuditIntegrityError if recovery == "missing_pair" else PipelineCommitError
+            with pytest.raises(expected_error) as caught:
+                await _prepare(
+                    proposal,
+                    context,
+                    recorder=recorder,
+                    current_state=current,
+                    recovery_dispatch=binding,
+                    recovery_executor_content_hash=executor_hash,
+                )
+            if isinstance(caught.value, PipelineCommitError):
+>               assert caught.value.code == ("CANDIDATE_EXECUTOR_MISMATCH" if recovery == "mismatch" else "NO_CHANGE")
+E               AssertionError: assert 'NO_CHANGE' == 'CANDIDATE_EXECUTOR_MISMATCH'
+E                 
+E                 - CANDIDATE_EXECUTOR_MISMATCH
+E                 + NO_CHANGE
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:240: AssertionError
+___ test_equal_candidate_only_rejects_after_recovery_integrity[missing_pair] ___
+
+proposal = _Proposal(service=<elspeth.web.sessions.service.SessionServiceImpl object at 0x7f3d42cd7590>, engine=Engine(sqlite:///...1ad29834575f5d94b228c0a4eb88468b4'), root=PosixPath('/tmp/pytest-of-agent/pytest-147/test_equal_candidate_only_reje3'))
+recovery = 'missing_pair'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("recovery", ["fresh", "matching", "mismatch", "missing_pair"])
+    async def test_equal_candidate_only_rejects_after_recovery_integrity(proposal: _Proposal, recovery: str) -> None:
+        operations = proposal.service.session_operation_authority
+        context = operations.acquire(
+            session_id=proposal.authority.row.session_id,
+            operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=proposal.service.session_operation_owner_instance_id,
+            lease_seconds=300,
+        )
+        try:
+            prepared = await _prepare(proposal, context)
+            current = replace(prepared.result.updated_state, version=19)
+            recorder = BufferingRecorder()
+            binding = prepared.dispatch if recovery != "fresh" else None
+            executor_hash = prepared.executor_content_hash if recovery == "matching" else "0" * 64 if recovery == "mismatch" else None
+            expected_error = AuditIntegrityError if recovery == "missing_pair" else PipelineCommitError
+            with pytest.raises(expected_error) as caught:
+>               await _prepare(
+                    proposal,
+                    context,
+                    recorder=recorder,
+                    current_state=current,
+                    recovery_dispatch=binding,
+                    recovery_executor_content_hash=executor_hash,
+                )
+
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:231: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_pipeline_commit_operation_authority.py:184: in _prepare
+    result = await prepare_pipeline_proposal_commit(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def prepare_pipeline_proposal_commit(
+        *,
+        authority: AuthoritativePipelineProposal,
+        current_state: CompositionState,
+        current_state_id: UUID | None,
+        policy_catalog: PolicyCatalogView,
+        plugin_snapshot: PluginAvailabilitySnapshot,
+        config: PipelineCommitConfig,
+        recorder: BufferingRecorder,
+        actor: str,
+        recovery_dispatch: PipelineDispatchAuditBinding | None = None,
+        recovery_executor_content_hash: str | None = None,
+    ) -> PreparedPipelineCommit | RecoveredPipelineCommit:
+        """Revalidate and audited-dispatch exact arguments; never settle state."""
+        if type(authority) is not AuthoritativePipelineProposal:
+            raise TypeError("authority must be an exact AuthoritativePipelineProposal")
+        if config.session_operation_context.fence.session_id != str(authority.row.session_id):
+            raise AuditIntegrityError("pipeline commit context does not match the proposal session")
+        if authority.row.status != "pending":
+            raise PipelineCommitError("pipeline proposal is not pending", code="NOT_PENDING")
+        if policy_catalog.snapshot is not plugin_snapshot:
+            raise ValueError("plugin_snapshot_catalog_mismatch")
+        if type(authority.proposal.base) is AbsentBase:
+            if current_state_id is not None:
+                raise PipelineCommitError("pipeline proposal base changed", code="BASE_CONFLICT")
+        elif type(authority.proposal.base) is PresentBase:
+            if current_state_id != authority.proposal.base.state_id:
+                raise PipelineCommitError("pipeline proposal base changed", code="BASE_CONFLICT")
+            if composition_content_hash(current_state) != authority.proposal.base.composition_content_hash:
+                raise PipelineCommitError("pipeline proposal base content changed", code="BASE_CONFLICT")
+        else:
+            raise AuditIntegrityError("pipeline proposal base is malformed")
+    
+        pipeline_arguments = deep_thaw(authority.proposal.pipeline)
+        if type(pipeline_arguments) is not dict:
+            raise AuditIntegrityError("authoritative pipeline arguments must thaw to an exact mapping")
+        if composer_authority_hash(pipeline_arguments) != authority.row.tool_arguments_hash:
+            raise AuditIntegrityError("authoritative pipeline arguments do not match the proposal row")
+        owned_state_authority = is_owned_composition_state_authority(pipeline_arguments)
+        proposed_state: CompositionState | None = None
+        execution_arguments: Mapping[str, Any]
+        if owned_state_authority:
+            proposed_state = restore_owned_composition_state_authority(
+                pipeline_arguments,
+                version=current_state.version + 1,
+            )
+            execution_arguments = owned_composition_state_execution_arguments_from_restored(proposed_state)
+            proposed_content_hash = composition_content_hash(proposed_state)
+        else:
+            execution_arguments = pipeline_arguments
+            proposed_content_hash = None
+    
+        deadline = asyncio.get_running_loop().time() + float(config.timeout_seconds)
+    
+        async def bounded(func: Any, *args: Any, **kwargs: Any) -> Any:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise PipelineCommitError("pipeline commit preparation timed out", code="TIMEOUT")
+            try:
+                return await asyncio.wait_for(run_sync_in_worker(func, *args, **kwargs), timeout=remaining)
+            except TimeoutError as exc:
+                raise PipelineCommitError("pipeline commit preparation timed out", code="TIMEOUT") from exc
+    
+        prior_validation = (await bounded(policy_catalog.validate_composition_state, current_state)).validation
+        if owned_state_authority:
+            assert proposed_state is not None
+            reviewed_source_authority = await bounded(
+                resolve_owned_composition_source_authority,
+                engine=config.session_engine,
+                session_id=str(authority.row.session_id),
+                user_id=config.user_id,
+                state=proposed_state,
+            )
+        else:
+            reviewed_source_authority = None
+        context = ToolContext(
+            catalog=policy_catalog,
+            plugin_snapshot=plugin_snapshot,
+            data_dir=config.data_dir,
+            require_data_dir_for_paths=True,
+            session_engine=config.session_engine,
+            session_operation_context=config.session_operation_context,
+            session_operation_authority=config.session_operation_authority,
+            session_id=str(authority.row.session_id),
+            secret_service=config.secret_service,
+            secret_wiring_policy=config.secret_wiring_policy,
+            user_id=config.user_id,
+            baseline=current_state,
+            current_validation=prior_validation,
+            runtime_preflight=config.runtime_preflight,
+            max_blob_storage_per_session_bytes=config.max_blob_storage_per_session_bytes,
+            user_message_id=str(authority.row.user_message_id) if authority.row.user_message_id is not None else None,
+            user_message_content=config.user_message_content,
+            composer_model_identifier=authority.row.composer_model_identifier,
+            composer_model_version=authority.row.composer_model_version,
+            composer_provider=authority.row.composer_provider,
+            composer_skill_hash=authority.row.composer_skill_hash,
+            tool_arguments_hash=authority.row.tool_arguments_hash,
+            reviewed_source_authority=reviewed_source_authority,
+            _interpretation_requirements_are_internal=True,
+        )
+    
+        try:
+            candidate = await bounded(
+                build_set_pipeline_candidate,
+                execution_arguments,
+                current_state,
+                context,
+            )
+        except ToolArgumentError as exc:
+            raise PipelineCommitError(exc.safe_message, code="ARGUMENT_ERROR", dispatch=recovery_dispatch) from exc
+        if not candidate.acceptable or candidate.prepared_inline_blob is not None:
+            raise PipelineCommitError("pipeline proposal failed current candidate validation", code="VALIDATION_FAILED")
+        candidate_hash = composition_content_hash(candidate.result.updated_state)
+        if proposed_content_hash is not None and candidate_hash != proposed_content_hash:
+            raise AuditIntegrityError("owned composition-state candidate differs from the exact proposed content")
+    
+        if candidate_hash == composition_content_hash(current_state):
+>           raise PipelineCommitError("pipeline proposal does not change the current composition", code="NO_CHANGE", dispatch=recovery_dispatch)
+E           elspeth.web.composer.pipeline_commit.PipelineCommitError: pipeline proposal does not change the current composition
+
+src/elspeth/web/composer/pipeline_commit.py:548: PipelineCommitError
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_pipeline_commit_operation_authority.py::test_equal_candidate_only_rejects_after_recovery_integrity[mismatch]
+FAILED tests/unit/web/composer/test_pipeline_commit_operation_authority.py::test_equal_candidate_only_rejects_after_recovery_integrity[missing_pair]
+========================= 2 failed, 2 passed in 3.37s ==========================

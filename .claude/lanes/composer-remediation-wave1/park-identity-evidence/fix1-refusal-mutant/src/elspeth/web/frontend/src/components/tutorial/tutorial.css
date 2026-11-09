@@ -1,0 +1,862 @@
+/* tutorial.css — First-run tutorial chrome and progress UI.
+   Owners: .tutorial-shell, .tutorial-step-header*, .tutorial-step-instruction,
+   .tutorial-build-intro, .tutorial-brief, .tutorial-turn, .tutorial-kicker, .tutorial-layer,
+   .tutorial-prompt, .tutorial-error, .tutorial-graph*, .tutorial-graph-node,
+   .tutorial-running, .tutorial-draft-progress, .tutorial-progress-bar,
+   .tutorial-result-table, .tutorial-cancelled-note, .tutorial-mode-fieldset,
+   .tutorial-progress-dot, @keyframes tutorial-progress-slide + responsive media. */
+
+/* ---------------------------------------------------------------------------
+   First-run tutorial
+   --------------------------------------------------------------------------- */
+.tutorial-shell {
+  height: 100%;
+  overflow-y: auto;
+  padding: var(--space-xl);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-lg);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent 220px),
+    var(--color-bg);
+}
+
+.tutorial-turn {
+  width: min(920px, 100%);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-2xl);
+  /* Tokenised elevation (elspeth-651ef08d53). The raw
+     `0 12px 30px rgba(0, 0, 0, 0.18)` this replaces never consulted the theme,
+     so the first-run card kept full dark-theme shadow strength against the
+     light ground and was invisible to the shadow token system. --shadow-dropdown
+     is the matching tier: byte-identical colour and alpha in the dark theme,
+     and it carries the light-theme softening the raw value never had. */
+  box-shadow: var(--shadow-dropdown);
+}
+
+.tutorial-turn h2 {
+  margin: 0 0 var(--space-md);
+  font-size: var(--font-size-xl);
+  line-height: var(--line-height-tight);
+  letter-spacing: 0;
+}
+
+.tutorial-turn h3 {
+  margin: 0 0 var(--space-sm);
+  font-size: var(--font-size-lg);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.tutorial-turn p {
+  max-width: 760px;
+}
+
+.tutorial-kicker {
+  /* Centre the 64rem block; text stays left-aligned inside it. Kickers live
+     only inside .tutorial-turn cards (Build's step header has none — the
+     progress row already names the step), so the cap rarely binds. */
+  margin: 0 auto var(--space-sm);
+  max-width: 64rem;
+  width: 100%;
+  color: var(--color-info);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+  /* Sentence case (was uppercase): the welcome copy read as a second shouty
+     eyebrow competing with the uppercase "CURRENT DECISION" micro-label. One
+     uppercase eyebrow per column; the kicker is the quieter, friendlier one. */
+  letter-spacing: 0.01em;
+}
+
+/* Tutorial workspace wrapper: the common Composer
+   workspace lives here and owns the authoring/artifact split. */
+.tutorial-workspace-shell {
+  width: 100%;
+}
+
+.tutorial-shell.tutorial-shell--workspace {
+  /* Not a scroller, and not a clip. On a tall viewport the frame is exactly
+     the main area and nothing scrolls but the panes. On a short one the
+     workspace keeps its OWN usable-canvas floor (420px desktop, 480px narrow,
+     workspace.css) and the overflow becomes the App-owned .app-main scroll
+     path (header.css, WCAG 1.4.10) — the same path the ordinary composer
+     takes. This replaces `overflow: hidden` plus a hand-summed
+     calc(420px + …) floor, which ignored the narrow floor and anything above
+     the workspace, and a `min-height: 0` that erased the workspace floor:
+     measured at 1280x560 the conversation was left 49px, at 390x700 32px. */
+  overflow: visible;
+  flex: 1 1 auto;
+  height: 100%;
+  /* Full-bleed workspace: children span the frame; the bands that need an
+     inset (progress row, step header) carry their own inline padding. */
+  align-items: stretch;
+  padding: var(--space-sm) 0 0;
+  gap: var(--space-sm);
+}
+
+.tutorial-shell--workspace .tutorial-progress {
+  flex-shrink: 0;
+  padding-inline: var(--space-lg);
+}
+
+.tutorial-shell--workspace .tutorial-workspace-shell {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* No min-height override: the workspace's own floor must hold here too. */
+.tutorial-shell--workspace .tutorial-workspace-shell > .composer-workspace {
+  flex: 1 1 auto;
+}
+
+/* Step header (TutorialWorkspaceFrame): the step's title, the one instruction
+   that says what to do next, and the step's forward action, on a band that
+   spans both panes. Tutorial chrome stays OUT of the authoring pane: there it
+   shrank the conversation's min(160px, 30%) floor with the chat panel and
+   pushed the conversation 97px below the top of the artifact pane beside
+   it. Its inset is the progress row's, so the
+   two bands share one left edge; the rule underneath closes the tutorial's
+   chrome off from the workspace's own bands. */
+.tutorial-step-header {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm) var(--space-lg);
+  padding: 0 var(--space-lg) var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.tutorial-step-header-text {
+  display: grid;
+  flex: 1 1 24rem;
+  gap: var(--space-xs);
+  min-width: 0;
+}
+
+/* The tutorial's step title rung (--font-size-xl), stated rather than left to
+   the user agent's 1.5em + 0.83em margins, which put it at an off-scale 24px. */
+.tutorial-step-header h2 {
+  /* Hug the text: Run focuses its title on mount and on Run, and a heading
+     stretched across the grid column drew a focus ring the header's width. */
+  justify-self: start;
+  margin: 0;
+  font-size: var(--font-size-xl);
+  line-height: var(--line-height-tight);
+  letter-spacing: 0;
+}
+
+.tutorial-step-instruction {
+  margin: 0;
+  max-width: 760px;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.tutorial-step-header .tutorial-error {
+  margin: 0;
+  padding: var(--space-sm) var(--space-md);
+}
+
+.tutorial-step-header-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.tutorial-shell--workspace .tutorial-workspace-authoring {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+/* Build's non-chat content (the brief before it is sent, the sample-load
+   status and its retry), on the pane's 16px gutter like the transcript. A
+   flex column so the brief is the one box that yields: it shrinks and scrolls
+   while the Send button below it never leaves the pane — the same ordering
+   .chat-panel-dock gives the docked composer (chat.css). */
+.tutorial-build-intro {
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-md);
+  min-height: 0;
+  padding: var(--space-md) var(--space-lg);
+}
+
+/* (0,2,0): outranks .tutorial-error's own margin-top, which sits later in
+   this file; the column's gap is the only spacing here. */
+.tutorial-workspace-authoring > .tutorial-build-intro > * {
+  margin: 0;
+}
+
+.tutorial-brief {
+  --scroll-owner: authoring;
+
+  flex: 0 1 auto;
+  align-self: stretch;
+  min-height: 0;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-md);
+  background: var(--color-surface-elevated);
+  font: inherit;
+}
+
+/* Re-bound the panel (chat.css's base .chat-panel is height:100% against a
+   full-height parent; here the parent is a flex column, so height:auto +
+   flex:1 is the correct fill). overflow:hidden clips to the frame — the
+   conversation column inside owns the scroll. */
+.tutorial-shell--workspace .tutorial-workspace-authoring > .chat-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
+  overflow: hidden;
+}
+
+/* Run step (I-1): the same workspace frame as the freeform Build, so the
+   pipeline pane keeps showing the graph the learner just confirmed while the
+   step header carries Run. The authoring pane holds the run's body — the
+   network disclosure, the prompt-shield note, then the results — with no
+   internal scroll region of its own (the result table can outgrow the frame),
+   so this wrapper owns the scroll and every block keeps its intrinsic height
+   instead of being squashed to fit. Named `authoring` under the scroll-owner
+   contract (workspace.css): no ChatPanel is mounted on Run, so the name is
+   uncontested. */
+.tutorial-shell--workspace .tutorial-run-authoring {
+  --scroll-owner: authoring;
+
+  gap: var(--space-md);
+  overflow-y: auto;
+  padding: var(--space-md) var(--space-lg) var(--space-xl);
+}
+
+/* (0,2,0): the column's gap is the only spacing, over the blocks' own
+   card-era margins (.tutorial-callout, .tutorial-run-discarded,
+   .tutorial-result-table-wrap). */
+.tutorial-shell--workspace .tutorial-run-authoring > * {
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+/* The run's progress line sits in the step header's instruction slot. */
+.tutorial-step-header .tutorial-running {
+  margin-top: 0;
+}
+
+
+.tutorial-sample-loading {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.tutorial-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-md);
+  margin-top: var(--space-xl);
+  align-items: center;
+}
+
+/* Link-styled secondary action. The six tutorial call sites route through
+   ui/Button as `variant="bare" className="tutorial-link-button"` (D3
+   primitive migration, elspeth-e7dd7ae371): bare carries this bespoke recipe
+   verbatim because `.link-button` (shared.css:269-287) has no touch-target
+   floor and variant="ghost" is chrome-button styling, not a link — either
+   swap would visually regress six first-run controls. The recipe must stay
+   in step with `.link-button` — the radius and hover cue below are the
+   primitive's, verbatim, and tutorialShell.test.ts pins them to it.
+
+   Before elspeth-4603f4a432 this class had NO hover rule anywhere, so every
+   secondary action in the tutorial was dead on hover while the identical-looking
+   link elsewhere thickened its underline, and it had no border-radius, so its
+   focus ring was square where every other link-button's is rounded.
+
+   The min-height is the one deliberate divergence from `.link-button`
+   (padding: 0, no floor): dropping it would shrink six touch targets. The dense
+   progress-row instance takes the chrome rung instead — see
+   `.tutorial-exit-button` below. */
+.tutorial-link-button {
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-link);
+  cursor: pointer;
+  font: inherit;
+  min-height: var(--size-control);
+  padding: var(--space-sm) 0;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.tutorial-link-button:hover {
+  text-decoration-thickness: 2px;
+}
+
+.tutorial-layer-grid,
+.tutorial-summary-grid {
+  /* Rendered as <ol> so assistive tech reports the layer/stage sequence
+     with explicit ordering. Reset list defaults to keep the existing
+     grid layout. */
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-md);
+  margin-top: var(--space-lg);
+  padding: 0;
+  list-style: none;
+}
+
+.tutorial-layer,
+.tutorial-summary-grid > li {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-lg);
+  background: var(--color-surface-elevated);
+}
+
+.tutorial-layer strong {
+  /* Neutral emphasis (uppercase + body text colour). The prior
+     --color-success green read as "completed" semantics on a welcome
+     screen where nothing has happened yet.
+
+     Sized on the micro-label rung (elspeth-e2d19ae400). With no font-size of
+     its own this inherited 16px, so SENSE/DECIDE/ACT out-shouted the 22px h2 on
+     the very first screen a new user sees, and the 0.04em tracking had been
+     calibrated for a 12-13px label. --font-size-xs is the 12px floor every
+     other uppercase micro-label in the tree sits on. */
+  display: block;
+  color: var(--color-text);
+  margin-bottom: var(--space-xs);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-bold);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* The layer's explanatory line. With no colour of its own it inherited the same
+   --color-text as the label above it, so label and body read as one undivided
+   block; the secondary tone restores the step — the same strong/span pairing
+   `.tutorial-graduation-list` uses below. */
+.tutorial-layer span {
+  color: var(--color-text-secondary);
+}
+
+.tutorial-muted {
+  color: var(--color-text-muted);
+}
+
+.tutorial-callout {
+  margin-top: var(--space-lg);
+  padding: var(--space-md);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  /* Teaching moments LIFT off the card, like every other boxed note in this
+     file (.tutorial-layer, .tutorial-audit-list div, .tutorial-mode-fieldset
+     label). --color-surface-input, which this replaces (elspeth-4da8113ac3), is
+     byte-identical to --color-bg in the dark theme — darker than the card it
+     sits in — so the pedagogical note recessed and read as a disabled text
+     field, and on Turn 4 it moved AWAY from the card surface directly beneath a
+     toned AlertBanner that moved towards it. */
+  background: var(--color-surface-elevated);
+  color: var(--color-text);
+}
+
+.tutorial-preamble {
+  /* Top margin for the disclosure note under the welcome cards / above the
+     Turn 4 run indicator. (Font size now comes from the AlertBanner.) */
+  margin-top: var(--space-md);
+}
+
+.tutorial-disclosure.alert-banner {
+  /* The network/LLM egress disclosure ("…calls the configured LLM and fetches
+     pages over the network") is a real data-handling statement, so it renders
+     as the design system's AlertBanner rather than the muted line it used to
+     be — buried low-contrast text understated a notice that should be seen.
+     The base .alert-banner is a top-of-panel strip (bottom border only); these
+     overrides make it a self-contained, left-aligned framed note, matching the
+     weight of what it says.
+
+     The frame is TONE-SCOPED (elspeth-8dfa1fd709). It used to be an
+     unconditional `border: 1px solid var(--color-info-border)` at (0,2,0),
+     which outranked the primitive's own tone rules at (0,1,0) — so the welcome
+     screen's error-tone banner (AlertBanner's DEFAULT tone, which is what
+     `startDisabledReason` renders through: "the composer model is unavailable")
+     shipped red text on --color-error-bg inside a cyan frame. The base below
+     mirrors the primitive's default tone and each modifier re-points it, so the
+     map is total: every tone AlertBanner can emit has a frame that agrees with
+     it. tutorialShell.test.ts pins the map to the primitive's.
+
+     There is deliberately NO ::before glyph (elspeth-58d45762d8): the ⓘ that
+     used to live here was the only non-empty CSS `content:` string in the
+     stylesheet corpus, was justified by a status vocabulary (∅, ⚠) it was not a
+     member of, and — being unconditional — could not vary with tone either. */
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: var(--space-sm);
+  border: 1px solid var(--color-error-border);
+  border-radius: var(--radius-md);
+}
+
+.tutorial-disclosure.alert-banner--info {
+  border-color: var(--color-info-border);
+}
+
+.tutorial-disclosure.alert-banner--warning {
+  border-color: var(--color-warning-border);
+}
+
+.tutorial-disclosure.alert-banner--success {
+  border-color: var(--color-success-border);
+}
+
+.tutorial-textarea-label {
+  display: block;
+  margin: var(--space-lg) 0 var(--space-sm);
+  font-weight: 600;
+}
+
+.tutorial-prompt-input {
+  width: 100%;
+  min-height: 120px;
+  resize: vertical;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-input);
+  color: var(--color-text);
+  padding: var(--space-md);
+  font: inherit;
+}
+
+.tutorial-error {
+  margin-top: var(--space-lg);
+  padding: var(--space-md);
+  border: 1px solid var(--color-error-border);
+  border-radius: var(--radius-md);
+  background: var(--color-error-bg);
+  color: var(--color-error);
+}
+
+.tutorial-interpretation {
+  margin-top: var(--space-lg);
+}
+
+.tutorial-graph {
+  /* Rendered as <ol> with <li> stages and aria-hidden chevrons between
+     them. Flexbox so the chevron items can be narrow auto-width siblings
+     of the flex:1 stage items. Under 760px the layout switches to
+     column-direction (see media query below) and chevrons rotate. */
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: var(--space-md);
+  margin: var(--space-xl) 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tutorial-graph > li {
+  flex: 1 1 130px;
+  min-width: 130px;
+  display: flex;
+  flex-direction: column;
+}
+
+.tutorial-graph-chevron {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xl);
+  line-height: 1;
+}
+
+.tutorial-graph-stage {
+  min-width: 0;
+  position: relative;
+}
+
+.tutorial-graph-node {
+  min-height: 72px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: var(--space-md);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-badge-source-border);
+  background: var(--color-badge-source-bg);
+  color: var(--color-text);
+  overflow-wrap: anywhere;
+}
+
+.tutorial-graph-stage span {
+  display: block;
+  margin-top: var(--space-sm);
+  color: var(--color-text-muted);
+  text-align: center;
+  font-size: var(--font-size-sm);
+}
+
+.tutorial-running {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  margin-top: var(--space-lg);
+}
+
+.tutorial-draft-progress {
+  align-items: flex-start;
+  max-width: 720px;
+}
+
+.tutorial-draft-progress-copy {
+  display: grid;
+  gap: var(--space-xs);
+  min-width: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+  line-height: 1.45;
+}
+
+.tutorial-draft-progress-headline {
+  color: var(--color-text);
+  font-weight: 600;
+}
+
+.tutorial-draft-progress-evidence {
+  margin: 0;
+  padding-left: var(--space-lg);
+}
+
+.tutorial-draft-progress-next {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.tutorial-progress-bar {
+  /* Indeterminate progress affordance. The prior implementation was a
+     static 60% gradient that reads as "stuck at 60%". A sliding shimmer
+     gives the user a continuous "still working" signal without claiming
+     a specific completion percentage. Under prefers-reduced-motion the
+     animation is suppressed and the bar falls back to a flat,
+     non-misleading "Working…" chip rendered alongside (handled by the
+     consumer; see Turn 4's status text region). */
+  width: 160px;
+  height: 10px;
+  border-radius: var(--radius-pill);
+  background: var(--color-surface-elevated);
+  border: 1px solid var(--color-border);
+  overflow: hidden;
+  position: relative;
+}
+
+.tutorial-progress-bar::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -40%;
+  width: 40%;
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--color-state-positive) 50%,
+    transparent
+  );
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .tutorial-progress-bar::after {
+    animation: tutorial-progress-slide 1.4s ease-in-out infinite;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tutorial-progress-bar::after {
+    /* Static centred chunk so the affordance still says "something is
+       happening" without motion. */
+    left: 30%;
+    background: var(--color-state-positive);
+  }
+}
+
+@keyframes tutorial-progress-slide {
+  from {
+    left: -40%;
+  }
+  to {
+    left: 100%;
+  }
+}
+
+.tutorial-run-summary {
+  color: var(--color-state-positive);
+  font-weight: 600;
+}
+
+/* Discarded-rows note on the run turn — a subdued warning (rows were dropped at
+   the source but recorded in the audit trail). */
+.tutorial-run-discarded {
+  margin-top: var(--space-xs);
+  color: var(--color-warning);
+  font-size: var(--font-size-sm);
+  max-width: 760px;
+}
+
+.tutorial-result-table-wrap {
+  overflow-x: auto;
+  margin-top: var(--space-lg);
+}
+
+/* Fits the authoring pane (360–640px) rather than a 640px floor, which cut the
+   summary column off at the pane edge behind a horizontal scroller. Long URLs
+   and summaries wrap inside their cells; the wrapper's overflow-x stays as the
+   escape for a column set wider than the pane. */
+.tutorial-result-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.tutorial-result-table th,
+.tutorial-result-table td {
+  border-bottom: 1px solid var(--color-border);
+  padding: var(--space-sm);
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.tutorial-cell-note {
+  display: block;
+  margin-top: var(--space-xs);
+  color: var(--color-warning);
+  font-size: var(--font-size-xs);
+}
+
+.tutorial-audit-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-md);
+  margin: var(--space-lg) 0;
+}
+
+.tutorial-audit-list div {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-md);
+  background: var(--color-surface-elevated);
+}
+
+.tutorial-audit-list dt {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.tutorial-audit-list dd {
+  margin: var(--space-xs) 0 0;
+  overflow-wrap: anywhere;
+}
+
+.tutorial-hash {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+}
+
+.tutorial-hash-value {
+  flex: 1 1 0;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2xs) var(--space-1-5);
+  overflow-wrap: anywhere;
+}
+
+/* Compact copy control in the dense audit panel. It does not need .btn's 44px
+   (WCAG 2.5.5 AAA) hit area — tokens.css:242-249 sanctions the smaller
+   --size-control-compact rung (2.5.8, AA) for exactly this kind of chrome row.
+
+   COMPOSES .btn-compact (elspeth-e7dd7ae371, closing the caveat previously
+   recorded here): the TutorialTurn5AuditStory call site renders
+   `<Button compact className="tutorial-hash-copy">`, so geometry, radius,
+   font, transition and hover treatment come from .btn-compact
+   (shared.css:196-233) directly instead of being mirrored declaration by
+   declaration. This rule keeps only the deliberate divergences:
+   `background-color: transparent`, because the control sits ON
+   --color-surface-elevated and would otherwise vanish into its own panel
+   (tutorial.css loads after shared.css, so it wins the equal-specificity tie;
+   .btn-compact's :hover fill still applies at (0,2,0)); and `flex: 0 0 auto`,
+   which is row layout, not chrome. Composition is pinned by
+   teachingMoments.test.tsx. */
+.tutorial-hash-copy {
+  flex: 0 0 auto;
+  background-color: transparent;
+}
+
+.tutorial-cancelled-note {
+  /* Rendered on Turn 6 when the user arrived via cancelRun. role="status"
+     so AT users hear the acknowledgement when the turn mounts. Visually
+     subdued (uses the warning-bg tint, not warning-fg) so it reads as an
+     informational note, not an error. */
+  margin: 0 0 var(--space-md);
+  padding: var(--space-md);
+  border: 1px solid var(--color-warning-border);
+  border-radius: var(--radius-md);
+  background: var(--color-warning-bg);
+  color: var(--color-text);
+}
+
+.tutorial-mode-fieldset {
+  display: grid;
+  gap: var(--space-md);
+  border: 0;
+  padding: 0;
+  margin: var(--space-lg) 0 0;
+}
+
+.tutorial-mode-fieldset legend {
+  font-weight: 700;
+  margin-bottom: var(--space-sm);
+}
+
+.tutorial-mode-fieldset label {
+  display: flex;
+  gap: var(--space-md);
+  align-items: flex-start;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-md);
+  background: var(--color-surface-elevated);
+}
+
+.tutorial-mode-fieldset input {
+  margin-top: var(--space-xs);
+}
+
+.tutorial-mode-fieldset strong {
+  display: block;
+  margin-bottom: var(--space-xs);
+}
+
+.tutorial-graduation-list {
+  display: grid;
+  gap: var(--space-md);
+  margin: var(--space-lg) 0 0;
+  padding-left: 1.25rem;
+}
+
+.tutorial-graduation-list li {
+  max-width: 760px;
+  padding-left: var(--space-xs);
+}
+
+.tutorial-graduation-list strong {
+  display: block;
+  margin-bottom: var(--space-xs);
+  color: var(--color-text);
+}
+
+.tutorial-graduation-list span {
+  color: var(--color-text-secondary);
+}
+
+.tutorial-progress {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.tutorial-shell:not(.tutorial-shell--workspace) .tutorial-progress {
+  width: min(920px, 100%);
+}
+
+/* Visible name for the tutorial-level tracker (elspeth-d75756fa2c): "Tutorial ·
+   Build — step 2 of 5" distinguishes this row from the build stepper's five
+   chips directly beneath it. */
+.tutorial-progress-label {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+.tutorial-progress-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: var(--radius-pill);
+  background: var(--color-border-strong);
+}
+
+/* Persistent in-context exit (elspeth-61591e64bb): right-anchored in the
+   progress row so it reads as shell chrome, present on every step between
+   the Welcome and graduation bookends. */
+.tutorial-exit-button {
+  margin-left: auto;
+  /* Chrome rung, not `.tutorial-link-button`'s 44px canvas floor: this is a
+     13px text link inside a dense progress band, and the AAA floor inflated the
+     whole band around it (elspeth-4603f4a432). tokens.css:242-249 sanctions the
+     2.5.8 (AA) rung for chrome-row controls, which is what this is. */
+  min-height: var(--size-control-compact);
+  font-size: var(--font-size-sm);
+  white-space: nowrap;
+}
+
+/* Completed steps: filled (reached), no ring. */
+.tutorial-progress-dot--complete {
+  background: var(--color-state-positive);
+}
+
+/* Current step: filled AND ringed. The halo is a SHAPE cue (not colour alone),
+   so "you are here" is distinguishable from the identically-filled completed
+   dots even without colour perception. Previously complete and current shared a
+   single `--active` class and were visually indistinguishable. */
+.tutorial-progress-dot--active {
+  background: var(--color-state-positive);
+  box-shadow:
+    0 0 0 2px var(--color-bg),
+    0 0 0 4px var(--color-state-positive);
+}
+
+@media (max-width: 760px) {
+  .tutorial-shell {
+    padding: var(--space-md);
+  }
+
+  .tutorial-turn {
+    padding: var(--space-lg);
+  }
+
+  .tutorial-layer-grid,
+  .tutorial-summary-grid,
+  .tutorial-audit-list {
+    grid-template-columns: 1fr;
+  }
+
+  .tutorial-graph {
+    /* Stack stages vertically; chevrons rotate 90deg so the down-arrow
+       direction still reads as flow. */
+    flex-direction: column;
+  }
+
+  .tutorial-graph-chevron {
+    transform: rotate(90deg);
+  }
+}

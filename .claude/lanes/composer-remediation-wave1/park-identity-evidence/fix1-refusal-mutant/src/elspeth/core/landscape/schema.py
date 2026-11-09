@@ -1,0 +1,2877 @@
+"""SQLAlchemy table definitions for Landscape.
+
+Uses SQLAlchemy Core (not ORM) for explicit control over queries
+and compatibility with multiple database backends.
+"""
+
+from enum import StrEnum
+
+from sqlalchemy import (
+    DDL,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Column,
+    ColumnElement,
+    DateTime,
+    Float,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    MetaData,
+    PrimaryKeyConstraint,
+    String,
+    Table,
+    Text,
+    UniqueConstraint,
+    and_,
+    event,
+    false,
+    or_,
+    select,
+    text,
+)
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.sql.compiler import SQLCompiler
+
+from elspeth.contracts.enums import CollectorGroupFailureReason, FrameKind, TerminalOutcome, TerminalPath
+from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
+from elspeth.contracts.types import NODE_ID_MAX_LENGTH
+from elspeth.core.schema_identity import create_schema_identity_table
+
+# Shared metadata for all tables
+metadata = MetaData()
+
+
+class _LowerHex64Check(ColumnElement[bool]):
+    """Dialect-exact lowercase SHA-256 CHECK expression."""
+
+    inherit_cache = True
+
+    def __init__(self, column_name: str) -> None:
+        super().__init__()
+        self.column_name = column_name
+
+
+@compiles(_LowerHex64Check, "sqlite")
+def _compile_sqlite_lower_hex(element: _LowerHex64Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"length({name})=64 AND {name} NOT GLOB '*[^0-9a-f]*'"
+
+
+@compiles(_LowerHex64Check, "postgresql")
+def _compile_postgres_lower_hex(element: _LowerHex64Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    return f"{element.column_name} ~ '^[0-9a-f]{{64}}$'"
+
+
+class _SigningTupleCheck(ColumnElement[bool]):
+    """Dialect-exact closed HMAC/UNSIGNED snapshot signing tuple."""
+
+    inherit_cache = True
+
+
+@compiles(_SigningTupleCheck, "sqlite")
+def _compile_sqlite_signing_tuple(_element: _SigningTupleCheck, _compiler: SQLCompiler, **_kw: object) -> str:
+    return (
+        "(signing_mode = 'hmac_sha256' AND signer_key_id <> 'UNSIGNED' "
+        "AND length(trim(signer_key_id)) > 0 AND signature_hex IS NOT NULL "
+        "AND length(signature_hex)=64 AND signature_hex NOT GLOB '*[^0-9a-f]*' "
+        "AND record_chain_algorithm = 'sha256_concat_hmac_sha256_signatures_v1') OR "
+        "(signing_mode = 'unsigned' AND signer_key_id = 'UNSIGNED' AND signature_hex IS NULL "
+        "AND record_chain_algorithm = 'sha256_concat_record_sha256_v1')"
+    )
+
+
+@compiles(_SigningTupleCheck, "postgresql")
+def _compile_postgres_signing_tuple(_element: _SigningTupleCheck, _compiler: SQLCompiler, **_kw: object) -> str:
+    return (
+        "signing_mode::text = 'hmac_sha256'::text AND signer_key_id::text <> 'UNSIGNED'::text "
+        "AND length(TRIM(BOTH FROM signer_key_id)) > 0 AND signature_hex IS NOT NULL "
+        "AND signature_hex::text ~ '^[0-9a-f]{64}$'::text "
+        "AND record_chain_algorithm::text = 'sha256_concat_hmac_sha256_signatures_v1'::text OR "
+        "signing_mode::text = 'unsigned'::text AND signer_key_id::text = 'UNSIGNED'::text AND signature_hex IS NULL "
+        "AND record_chain_algorithm::text = 'sha256_concat_record_sha256_v1'::text"
+    )
+
+
+class _Sha256ContentRefCheck(ColumnElement[bool]):
+    """Dialect-exact ``sha256:<hash>`` reference binding."""
+
+    inherit_cache = True
+
+    def __init__(self, reference_column: str, hash_column: str) -> None:
+        super().__init__()
+        self.reference_column = reference_column
+        self.hash_column = hash_column
+
+
+@compiles(_Sha256ContentRefCheck, "sqlite")
+def _compile_sqlite_sha256_content_ref(element: _Sha256ContentRefCheck, _compiler: SQLCompiler, **_kw: object) -> str:
+    return f"{element.reference_column} = 'sha256:' || {element.hash_column}"
+
+
+@compiles(_Sha256ContentRefCheck, "postgresql")
+def _compile_postgres_sha256_content_ref(element: _Sha256ContentRefCheck, _compiler: SQLCompiler, **_kw: object) -> str:
+    return f"{element.reference_column}::text = ('sha256:'::text || {element.hash_column}::text)"
+
+
+class _SignedManifestSizeCheck(ColumnElement[bool]):
+    """Dialect-exact signed-manifest byte bounds."""
+
+    inherit_cache = True
+
+
+@compiles(_SignedManifestSizeCheck, "sqlite")
+def _compile_sqlite_signed_manifest_size(_element: _SignedManifestSizeCheck, _compiler: SQLCompiler, **_kw: object) -> str:
+    return "signed_manifest_size_bytes BETWEEN 1 AND 65536"
+
+
+@compiles(_SignedManifestSizeCheck, "postgresql")
+def _compile_postgres_signed_manifest_size(_element: _SignedManifestSizeCheck, _compiler: SQLCompiler, **_kw: object) -> str:
+    return "signed_manifest_size_bytes >= 1 AND signed_manifest_size_bytes <= 65536"
+
+
+class _OptionalLowerHex64Check(ColumnElement[bool]):
+    inherit_cache = True
+
+    def __init__(self, column_name: str) -> None:
+        super().__init__()
+        self.column_name = column_name
+
+
+@compiles(_OptionalLowerHex64Check, "sqlite")
+def _compile_sqlite_optional_lower_hex(element: _OptionalLowerHex64Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR (length({name})=64 AND {name} NOT GLOB '*[^0-9a-f]*')"
+
+
+@compiles(_OptionalLowerHex64Check, "postgresql")
+def _compile_postgres_optional_lower_hex(element: _OptionalLowerHex64Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR {name} ~ '^[0-9a-f]{{64}}$'"
+
+
+class _OptionalLowerHex16Check(ColumnElement[bool]):
+    """Dialect-exact optional 16-character audit error fingerprint."""
+
+    inherit_cache = True
+
+    def __init__(self, column_name: str) -> None:
+        super().__init__()
+        self.column_name = column_name
+
+
+@compiles(_OptionalLowerHex16Check, "sqlite")
+def _compile_sqlite_optional_lower_hex16(element: _OptionalLowerHex16Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR (length({name})=16 AND {name} NOT GLOB '*[^0-9a-f]*')"
+
+
+@compiles(_OptionalLowerHex16Check, "postgresql")
+def _compile_postgres_optional_lower_hex16(element: _OptionalLowerHex16Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR {name} ~ '^[0-9a-f]{{16}}$'"
+
+
+class _OptionalLowerHex32Check(ColumnElement[bool]):
+    """Dialect-exact optional 32-character ``SchemaContract.version_hash`` value."""
+
+    inherit_cache = True
+
+    def __init__(self, column_name: str) -> None:
+        super().__init__()
+        self.column_name = column_name
+
+
+@compiles(_OptionalLowerHex32Check, "sqlite")
+def _compile_sqlite_optional_lower_hex32(element: _OptionalLowerHex32Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR (length({name})=32 AND {name} NOT GLOB '*[^0-9a-f]*')"
+
+
+@compiles(_OptionalLowerHex32Check, "postgresql")
+def _compile_postgres_optional_lower_hex32(element: _OptionalLowerHex32Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR {name} ~ '^[0-9a-f]{{32}}$'"
+
+
+class _OptionalSha256Ref16Check(ColumnElement[bool]):
+    """Dialect-exact optional ``sha256:<16 hex>`` plugin source fingerprint."""
+
+    inherit_cache = True
+
+    def __init__(self, column_name: str) -> None:
+        super().__init__()
+        self.column_name = column_name
+
+
+@compiles(_OptionalSha256Ref16Check, "sqlite")
+def _compile_sqlite_optional_sha256_ref16(element: _OptionalSha256Ref16Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR (length({name})=23 AND substr({name}, 1, 7) = 'sha256:' AND substr({name}, 8) NOT GLOB '*[^0-9a-f]*')"
+
+
+@compiles(_OptionalSha256Ref16Check, "postgresql")
+def _compile_postgres_optional_sha256_ref16(element: _OptionalSha256Ref16Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR {name} ~ '^sha256:[0-9a-f]{{16}}$'"
+
+
+def _sql_string_literal(value: str) -> str:
+    """Render one deterministic SQL string literal for generated CHECK clauses."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _enum_value_list(enum_type: type[StrEnum]) -> str:
+    return ", ".join(_sql_string_literal(member.value) for member in enum_type)
+
+
+def _enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
+    """Render a SQL IN fragment from a StrEnum's persisted values."""
+    return f"{column_name} IN ({_enum_value_list(enum_type)})"
+
+
+def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
+    return f"{column_name} IS NULL OR {_enum_in_check(column_name, enum_type)}"
+
+
+# Explicit Landscape schema epoch for pre-1.0 compatibility policy.
+# Stored in the cross-dialect identity row and, on SQLite, PRAGMA user_version
+# so future releases can distinguish "intentionally old schema, needs
+# migration" from "runtime-required field". The constant retains its
+# historical name for compatibility.
+#
+# Epoch history (pre-1.0 policy — bumps require DB recreation unless an epoch
+# entry explicitly names an in-place migration):
+#   1 → initial
+#   2 → Phase 5 schema contracts + operation I/O hashes (pre-ADR-010)
+#   3 → ADR-010 §Decision 3 M3: runtime_val_manifest_json
+#        column on runs_table records the declaration + Tier-1 registries
+#        in effect at run start, enabling auditor queries like "which VAL
+#        contracts were in force during run X?"
+#   4 → validation_errors.row_id links quarantine errors to persisted rows,
+#        allowing explain() to resolve the exact validation failures for
+#        quarantined tokens even when the stored row payload is normalized
+#        before persistence.
+#   5 → batch/artifact audit links are mechanically run-scoped: batch_members
+#        carries run_id, token_outcomes.batch_id is scoped by run_id,
+#        batches.aggregation_state_id is scoped by run_id, and
+#        artifacts.produced_by_state_id is scoped by run_id.
+#   6 → batches.retry_of_batch_id records retry lineage so retry_batch()
+#        can deduplicate per failed batch rather than per aggregation node.
+#   7 → ADR-019 Stage 2/3: token_outcomes stores the two-axis terminal model
+#        (`outcome`, `path`, `completed`) instead of the old single-axis outcome + is_terminal.
+#   8 → Phase 5b interpretation-review audit anchor:
+#        calls.approved_prompt_artifact_hash records the runtime-side hash used
+#        to join Landscape LLM calls back to session interpretation_events.
+#   9 → Phase 4 hello-world tutorial audit-story fields:
+#        runs.llm_call_count, runs.seeded_from_cache, and runs.cache_key.
+#  10 → OpenRouter catalog snapshot anchor (audit-completeness):
+#        runs.openrouter_catalog_sha256 and runs.openrouter_catalog_source
+#        record which model catalog blessed each run's decisions.
+#  11 → resume fork/expand/coalesce re-emit fix: tokens.token_data_ref persists per-token
+#        payloads (expand children + coalesce merged tokens) and node_states.resume_checkpoint_id
+#        marks resume re-drives, so incomplete tokens are reconstructable + attributable.
+#  12 → Multi-source foundation: per-source run records, source-scoped row
+#        indexes, global ingest sequence ordering, and durable token work items.
+#  13 → Durable scheduler continuation routing: token_work_items.on_success_sink
+#        preserves sink-bound continuations across resume/recovery.
+#  14 → Durable scheduler resume identity: token_work_items stores token lineage
+#        and coalesce cursor fields so resumed workers do not depend on in-memory
+#        pending_items state.
+#  15 → Durable scheduler sink handoff: token_work_items can persist a
+#        pending sink outcome without replaying the transform that produced it;
+#        run_sources.lifecycle_state is mechanically constrained.
+#  15 → Multi-worker scheduler durability: token_work_items grows a
+#        CHECK constraint that LEASED rows have a non-empty lease_owner
+#        (closes the wedge that elspeth-28aaa36a62's recovery sweep tolerates)
+#        and a covering index on (run_id, status, lease_owner,
+#        lease_expires_at) so the RC6 multi-worker drain sweep is index-only
+#        rather than O(workers²) per drain wave (elspeth-9990c81e14).
+#  16 → Scheduler state-transition audit: scheduler_events records immutable
+#        enqueue, claim, recovery, lease-loss, and terminalization transitions
+#        for durable lease attribution (elspeth-2b608abbd3,
+#        elspeth-9030f34c32).
+#  17 → Scheduler event lease-expiry evidence: scheduler_events stores
+#        from/to lease_expires_at timestamps and enforces event/status/attempt
+#        domains so lease recovery and heartbeat loss are exportable facts.
+#   17 → Token-scoped pending-sink lookup: token_work_items gains
+#        ix_token_work_items_pending_sink_token for post-sink terminalization.
+#   18 → Source exhaustion lifecycle evidence: run_sources.lifecycle_state
+#        distinguishes exhausted-before-EOF-engine-work from interrupted source
+#        iteration so resume can safely drain recoverable engine state.
+#   19 → Dead-lane and vestigial-anchor subtraction (F4+F2): scheduler WAITING
+#        status and mark_waiting/release_waiting event types removed from the
+#        scheduler_events CHECK constraints; checkpoints lose the token_id/
+#        node_id anchor columns and checkpoint_node_config_hash (full-topology
+#        hash subsumes per-node compatibility validation).
+#   20 → F1 durability unification: token_work_items.barrier_blocked_at added;
+#        checkpoints aggregation_state_json/coalesce_state_json replaced by
+#        barrier_scalars_json; restore_blocked event type removed from
+#        scheduler_events CHECK.
+#   21 → Option-C multi-worker coordination substrate (ADR-030, slice 2):
+#        run_coordination / run_workers / run_coordination_events /
+#        coalesce_branch_losses tables; token_work_items gains
+#        barrier_adopted_epoch (adoption CAS marker, written only by the
+#        slice-3 fenced adoption verb; NULL = intake-pending).
+#   22 → Routing events are run-scoped: routing_events carries run_id and
+#        composite FKs to node_states(state_id, run_id) and edges(edge_id, run_id)
+#        so state/edge route decisions cannot cross audit-run boundaries.
+#   23 → Web plugin-policy audit evidence: run_web_plugin_policy stores one
+#        optional, sanitized policy/snapshot decision row per web run. This is
+#        a deliberate pre-1.0 drop/recreate boundary, not an in-place migration.
+#   24 → elspeth_schema_identity gives SQLite and PostgreSQL the same explicit
+#        application/store/epoch proof, including semantic-only schema bumps;
+#        token ownership is also mechanically row-authoritative: tokens(row_id,
+#        run_id) references rows(row_id, run_id). This is a pre-1.0
+#        delete-and-recreate boundary; predecessor stores are not transformed.
+#   25 → Artifact logical-effect idempotency: non-null artifact keys are unique
+#        within a run, so retries converge on one immutable audit identity.
+#        This is also a pre-1.0 delete-and-recreate boundary.
+#   26 → Recoverable sink-effect ledger and immutable audit-export snapshot
+#        registry; artifacts/operations gain exclusive effect linkage.
+#   27 → Durable coalesce-effect receipts with normalized parent/state evidence;
+#        sink-effect preparation claims become a legal RESERVED lifecycle state.
+#   28 → Failsink provenance moves to each sink-effect member so one recovered
+#        failsink batch can link every token to its exact primary effect.
+#   29 → Node output-contract evolution stores its canonical contract hash;
+#        validation-error row links and token ancestry become run-scoped;
+#        batch expansion has one durable effect claim per batch; committed
+#        sidecar-journal batches use a transaction-owned outbox bound to their
+#        canonical sidecar destination.
+#   30 → row_union barrier durability: token_work_items.row_union_name records
+#        which declared row_union barrier a blocked work item belongs to, so a
+#        recovered scheduler can reconcile fork-branch groups without in-memory
+#        state. This is a pre-1.0 delete-and-recreate boundary; a Landscape
+#        store written at epoch 29 lacks the column and is not migrated.
+#   31 → token_work_items.status is mechanically closed over TokenWorkStatus.
+#        Removed states such as WAITING can no longer be reintroduced through
+#        direct SQL. This is a pre-1.0 delete-and-recreate boundary.
+#   32 → Every successful aggregation completion records an ordered,
+#        self-contained result receipt. A replacement process can materialize
+#        transform outputs, continue passthrough rows with their original
+#        token identities, or finish empty members without replaying the
+#        plugin after node/batch completion.
+#   33 → token_outcomes carries a composite (run_id, token_id) access path.
+#        Run-scoped per-token reads previously had to choose between two
+#        single-column indexes with no statistics to separate them, and the
+#        accounting census picked the wrong one. This is a pre-1.0
+#        delete-and-recreate boundary: the index is physical schema, so a store
+#        written at epoch 32 lacks it and is not migrated.
+#   34 → Unified lineage groundwork (WS1a, barrier-scopes spec rev 3.2):
+#        token_lineage_frames (typed lineage-frame stack per token, written in
+#        the token-INSERT transaction), group_records (roster record for every
+#        opening operation, empty expansions included), group_losses (the
+#        unified loss ledger — written from WS3), and
+#        token_work_items.lineage_path_json (journal-riding lineage path).
+#        Pre-1.0 delete-and-recreate boundary; no migration.
+#   35 → Unified lineage flip (WS1b Phase B): tri-column lineage retirement —
+#        tokens.{fork_group_id,expand_group_id,branch_name},
+#        token_outcomes.{fork_group_id,join_group_id,expand_group_id}, and
+#        token_work_items.{branch_name,fork_group_id,expand_group_id} are
+#        deleted; token_outcomes.expected_branches_json is deleted (D2);
+#        lineage_path_json (token_work_items) and token_lineage_frames are the
+#        sole lineage truth. join_group_id stays on tokens/token_work_items
+#        (merge-event identity, D1). Pre-1.0 delete-and-recreate boundary; no
+#        migration.
+#   36 → coalesce_effects.group_id (elspeth-8655045f98, WS4 Task 12 part 2,
+#        arch-M1 site #4): two sibling fork groups sharing one row_id can
+#        each complete their own merge at the same coalesce node, and the
+#        restore-recovery reader (get_committed_coalesce_residual) had no
+#        column to tell them apart, raising a false AuditIntegrityError on
+#        the legitimate second residual. Unlike epoch 35's collector_name
+#        addition (nullable, no table-shape change, landed within-epoch),
+#        this column is nullable=False with no defaulting branch — a
+#        genuine table-shape change, not a same-shape widening — so it gets
+#        its own epoch rather than folding into 35. uq_coalesce_effects_scope
+#        is unchanged (row_id kept, argument on that decision at the
+#        constraint's own definition). Pre-1.0 delete-and-recreate boundary;
+#        no migration.
+#   37 → pluggable SSO (elspeth-07cd19ba73, spec
+#        docs/specs/2026-09-02-pluggable-sso-design.md): auth_events gains a
+#        nullable indexed identity_id and its event_type CHECK widens from
+#        three values to twenty-three, covering admission, authority, the org
+#        tree and workflow governance. That CHECK is CLOSED, so a value
+#        missing from it is a self-inflicted outage — R4 refuses the mutation
+#        whose audit write failed — which is why the whole vocabulary lands
+#        now rather than arriving with the features that use it. The auth
+#        provider discriminator also widens from three values to five —
+#        ck_run_attributions_auth_provider_type and ck_auth_events_provider
+#        both admit 'vanguard' and 'google'. Landscape compares declared
+#        CHECK text against the reflected constraint structurally, so a
+#        widened constraint trips the schema validator against an existing
+#        database exactly as the 2026-08-14 index change did; it is a schema
+#        change even though every value the old constraint admitted is still
+#        admitted. Cut over in the SAME service-stop window as sessions
+#        epoch 52 (one window, two stores). Pre-1.0 delete-and-recreate
+#        boundary; no migration, rollback_permitted: false.
+#   38 → scheduler_events replay order (elspeth-2d436dd6e8,
+#        elspeth-5d66fc5ed1): scheduler_events gains an AUTOINCREMENT ``seq``
+#        primary key in the run_coordination_events shape and every reader
+#        orders by it; event_id is demoted to a non-unique content digest of
+#        the transition that no longer covers recorded_at. Under ADR-047
+#        database time (whole-second on SQLite, one shared transaction
+#        timestamp on PostgreSQL) events tie on recorded_at and replayed in
+#        hash order — a caller-stamped mark_terminal at S.4 sorted AFTER the
+#        database-stamped claim at S.0 that followed it — and two identical
+#        transitions of one work item inside one second collided on the
+#        event_id primary key. The two supporting indexes follow the key
+#        (ix_scheduler_events_run_token_time is replaced by
+#        ix_scheduler_events_run_token_seq). Pre-1.0 delete-and-recreate
+#        boundary; no migration, rollback_permitted: false.
+#   39 → immutable web run-start permit binding and recoverable pre-effect
+#        admission state. Pre-1.0 delete-and-recreate boundary; no migration.
+#   40 → VANguard residual schema batch (elspeth-255ae1a544,
+#        elspeth-ff89d2bea0): nullable prompt_tokens, completion_tokens,
+#        cached_prompt_tokens and reasoning_tokens on calls preserve reported
+#        usage, including measured zero, without inventing usage when unknown.
+#        Run policy evidence gains the assessed quota-policy identities and
+#        canonical secret-wiring hash bound to the durable admission decision.
+#        These items missed the epoch-38 window; their named trigger is this
+#        prepared residual batch after ACA epoch 39, not a future incidental
+#        bump. Deploy together with Sessions epoch 55 in ONE service-stop
+#        window. Definitions and admission checks prepare that window; they
+#        do not perform a deployed cutover or assert complete token accounting.
+#        Pre-1.0 delete-and-recreate boundary; no migration,
+#        rollback_permitted: false. Preserve/export evidence before cutover.
+#  41 → Approved prompt artifact anchor replaces the fallback-template digest.
+#        Covers system prompt and ordered effective queries; delete/recreate.
+#  42 → Admission evidence v2 persists per-principal token quota usage and limits.
+#        Its decoder rejects stored v1 run_web_plugin_policy evidence, so even
+#        an unchanged table layout requires a pre-1.0 delete/recreate boundary.
+#        Deploy with Sessions epoch 59; never relabel old evidence as v2.
+#  43 → Every digest column carries a shape CHECK. SQLite ignores the declared
+#        VARCHAR width, so String(64) alone admitted any text: 64-hex, the
+#        16-hex error fingerprints, the 32-hex SchemaContract.version_hash
+#        values and the ``sha256:<16 hex>`` plugin source fingerprint now each
+#        have their own rule. Deploy with Sessions epoch 63; delete/recreate.
+#  44 → Calls gain source-call lineage and durable verification decisions;
+#        operations gain a fenced per-node/type occurrence index for repeatable
+#        source/preflight call matching.
+#        Populated epoch-43 stores require delete/recreate under pre-1.0 policy.
+#  45 → One immutable collector-group failure verdict per group, including
+#        groups with no arrived members. The run result counts these separately
+#        from failed rows. Its failure_reason is the closed
+#        CollectorGroupFailureReason vocabulary under a CHECK, and each failed
+#        member's CollectorGroupFailure hold names its group_id (folded into
+#        45 by operator ruling 2026-09-25, no bump; a store created before the
+#        fold lacks ck_collector_group_failures_failure_reason and startup
+#        validation refuses it). Populated epoch-44 stores require
+#        delete/recreate.
+#  46 → Valid source rows retain their exact source contract for sparse-stream
+#        replay and verify. The scheduler_events event_type CHECK admits
+#        ``resume_requeue_failed``: resume returns a FAILED item whose token
+#        has no completed outcome to READY (folded into 46 by lane ruling
+#        2026-09-26, no bump; a store created before the fold carries the
+#        narrower CHECK and startup shape validation refuses it). Populated
+#        epoch-45 stores require delete/recreate.
+#  47 → Verification verdicts page through a run/time/call index, while
+#        corrupt run bindings are found from indexed call parents. Populated
+#        epoch-46 stores require delete/recreate.
+#  48 → A source-quarantined row is handed to its sink through a durable
+#        PENDING_SINK work item written in its ingest transaction (the fifth
+#        pending_sink_bundle_clause arm), resume re-drives only scheduler work
+#        and never re-derives a row, and the run_coordination_events
+#        event_type CHECK admits ``resume_refused`` (resume refuses a run whose
+#        tokens are neither decided nor covered by scheduler work). A store
+#        written before this epoch can hold a quarantined token with no work
+#        item that the new resume refuses as corruption, so only a bump — not
+#        a fold — keeps such a store from opening. Populated epoch-47 stores
+#        require delete/recreate.
+SQLITE_SCHEMA_EPOCH = 50
+
+schema_identity_table = create_schema_identity_table(metadata)
+
+sidecar_journal_outbox_table = Table(
+    "sidecar_journal_outbox",
+    metadata,
+    Column("sequence", Integer, primary_key=True, autoincrement=True),
+    Column("batch_id", String(32), nullable=False, unique=True),
+    Column("journal_owner", String(64), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("records_json", Text, nullable=False),
+    sqlite_autoincrement=True,
+)
+Index(
+    "ix_sidecar_journal_outbox_owner_sequence",
+    sidecar_journal_outbox_table.c.journal_owner,
+    sidecar_journal_outbox_table.c.sequence,
+)
+
+# Column width for node_id across all tables. The cross-layer identifier limit
+# lives in contracts.types; changing this value requires an Alembic migration.
+NODE_ID_COLUMN_LENGTH = NODE_ID_MAX_LENGTH
+
+
+class RunSourceLifecycleState(StrEnum):
+    """Finite lifecycle states for per-source run metadata."""
+
+    READY = "ready"
+    LOADING = "loading"
+    EXHAUSTED = "exhausted"
+    LOADED = "loaded"
+    INTERRUPTED = "interrupted"
+
+
+# ADR-038: the source lifecycle states from which a resume can rebuild source
+# evidence. Shared by the resume gate (``IncompleteSourceResumeError``,
+# engine/orchestrator/resume.py) and the run-finalization abandonment sweep
+# (run_lifecycle_repository) — the sweep abandons exactly when the gate would
+# refuse, and drift between the two predicates is the bug class this shared
+# constant prevents.
+SOURCE_COMPLETE_LIFECYCLE_STATES: frozenset[str] = frozenset(
+    {
+        RunSourceLifecycleState.EXHAUSTED.value,
+        RunSourceLifecycleState.LOADED.value,
+    }
+)
+
+
+# === Runs and Configuration ===
+
+runs_table = Table(
+    "runs",
+    metadata,
+    Column("run_id", String(64), primary_key=True),
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("completed_at", DateTime(timezone=True)),
+    Column("config_hash", String(64), nullable=False),
+    Column("settings_json", Text, nullable=False),
+    Column("run_mode", String(16), nullable=False, server_default="live"),
+    Column("replay_from_run_id", String(64), ForeignKey("runs.run_id"), nullable=True),
+    Column("reproducibility_grade", String(32)),
+    Column("canonical_version", String(64), nullable=False),
+    # Source schema for resume type restoration
+    # Stores serialized PluginSchema class info to enable proper type coercion
+    # when resuming from payloads (datetime/Decimal string -> typed values)
+    Column("source_schema_json", Text),  # Nullable — populated on new runs, NULL for runs created before this column
+    # Field resolution mapping from source.load() - captures original→final header mapping
+    # Field normalization is mandatory; mapping records original→final header names. Stored at run level since one source per run.
+    Column("source_field_resolution_json", Text),  # Nullable — populated on new runs, NULL for runs created before this column
+    Column("status", String(32), nullable=False),
+    # Export tracking - separate from run status so export failures
+    # don't mask successful pipeline completion
+    Column("export_status", String(32)),  # pending, completed, failed, None if not configured
+    Column("export_error", Text),  # Error message if export failed
+    Column("exported_at", DateTime(timezone=True)),  # When export completed
+    Column("export_format", String(16)),  # csv, json
+    Column("export_sink", String(128)),  # Sink name used for export
+    # Runtime-VAL manifest for audit trail (ADR-010 §Decision 3 M3).
+    # Captures the set of DeclarationContract and Tier-1 error classes
+    # registered at bootstrap, serialized as canonical JSON. Enables auditor
+    # queries like "which VAL contracts were in force during run X?" and
+    # regression detection across runs ("are TIER_1_ERRORS the same between
+    # runs X and Y?"). The column is nullable for resume paths and for
+    # tests that skip the full bootstrap path.
+    Column("runtime_val_manifest_json", Text),
+    # Phase 4 audit-story projection fields. `started_at` already exists
+    # above; source_data_hash and plugin_versions remain on rows/nodes and
+    # are aggregated by the read side instead of denormalized here.
+    Column("llm_call_count", Integer, nullable=True),
+    Column("seeded_from_cache", Boolean, nullable=False, default=False, server_default=false()),
+    Column("cache_key", String(64), nullable=True),
+    # OpenRouter model catalog snapshot anchor (audit-completeness):
+    # records which catalog blessed the run's model decisions.  The sha
+    # is canonical (sorted utf-8 ids joined on '\n') so it is invariant
+    # under prime-order; source ∈ {"live", "bundled"} distinguishes
+    # online-probed snapshots from the bundled litellm fallback.  Both
+    # NOT NULL — see ``read_openrouter_catalog_snapshot_id`` for the
+    # reader the orchestrator uses to populate them.  Under Tier-1 rules
+    # (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+    # Model) no ``server_default`` is set: a synthetic placeholder in the
+    # audit trail would be indistinguishable from a real hash to any
+    # downstream reader, and a fabricated value is not evidence.
+    # Production goes through :meth:`RunLifecycleRepository.begin_run`
+    # which validates both fields; direct ``runs_table.insert()`` from
+    # test fixtures must supply them explicitly.
+    Column("openrouter_catalog_sha256", String(64), nullable=False),
+    Column("openrouter_catalog_source", String(8), nullable=False),
+    CheckConstraint(
+        "openrouter_catalog_source IN ('live', 'bundled')",
+        name="ck_runs_openrouter_catalog_source",
+    ),
+    CheckConstraint(_LowerHex64Check("config_hash"), name="ck_runs_config_hash_hex"),
+    CheckConstraint("run_mode IN ('live', 'replay', 'verify')", name="ck_runs_mode"),
+    CheckConstraint(
+        "(run_mode = 'live' AND replay_from_run_id IS NULL) OR (run_mode <> 'live' AND replay_from_run_id IS NOT NULL AND replay_from_run_id <> run_id)",
+        name="ck_runs_mode_source",
+    ),
+    CheckConstraint(_LowerHex64Check("openrouter_catalog_sha256"), name="ck_runs_openrouter_catalog_sha256_hex"),
+)
+Index("uq_runs_export_witness", runs_table.c.run_id, runs_table.c.status, runs_table.c.completed_at, unique=True)
+
+run_start_admissions_table = Table(
+    "run_start_admissions",
+    metadata,
+    Column("run_id", String(64), ForeignKey("runs.run_id"), primary_key=True),
+    Column("permit_id", String, nullable=False, unique=True),
+    Column("permit_epoch", Integer, nullable=False),
+    Column("subject_hash", String(64), nullable=False),
+    Column("state", String(16), nullable=False),
+    CheckConstraint("permit_epoch > 0", name="ck_run_start_admissions_epoch"),
+    CheckConstraint("length(trim(permit_id)) > 0", name="ck_run_start_admissions_permit").ddl_if(dialect="sqlite"),
+    CheckConstraint("length(btrim(permit_id)) > 0", name="ck_run_start_admissions_permit").ddl_if(dialect="postgresql"),
+    CheckConstraint(_LowerHex64Check("subject_hash"), name="ck_run_start_admissions_hash"),
+    CheckConstraint("state IN ('prepared', 'executing')", name="ck_run_start_admissions_state"),
+)
+
+run_attributions_table = Table(
+    "run_attributions",
+    metadata,
+    Column("run_id", String(64), ForeignKey("runs.run_id"), primary_key=True),
+    Column("recorded_at", DateTime(timezone=True), nullable=False),
+    Column("initiated_by_user_id", String(255), nullable=False),
+    Column("auth_provider_type", String(32), nullable=False),
+    CheckConstraint(
+        "auth_provider_type IN ('local', 'oidc', 'entra', 'vanguard', 'google')",
+        name="ck_run_attributions_auth_provider_type",
+    ),
+)
+Index("ix_run_attributions_user", run_attributions_table.c.initiated_by_user_id, run_attributions_table.c.auth_provider_type)
+
+run_web_plugin_policy_table = Table(
+    "run_web_plugin_policy",
+    metadata,
+    Column("run_id", String(64), ForeignKey("runs.run_id"), primary_key=True),
+    Column("schema_version", Integer, nullable=False),
+    Column("policy_hash", String(64), nullable=False),
+    Column("snapshot_hash", String(64), nullable=False),
+    Column("authorized_plugin_ids_json", Text, nullable=False),
+    Column("available_plugin_ids_json", Text, nullable=False),
+    Column("control_modes_json", Text, nullable=False),
+    Column("selected_implementations_json", Text, nullable=False),
+    Column("selected_profile_aliases_json", Text, nullable=False),
+    Column("plugin_code_identities_json", Text, nullable=False),
+    Column("binding_generation_fingerprint", String(64), nullable=False),
+    Column("decision_codes_json", Text, nullable=False),
+    Column("admission_decision_json", Text, nullable=True),
+    Column("admission_decision_hash", String(64), nullable=True),
+    CheckConstraint(
+        "(admission_decision_json IS NULL AND admission_decision_hash IS NULL) OR "
+        "(admission_decision_json IS NOT NULL AND admission_decision_hash IS NOT NULL)",
+        name="ck_run_web_plugin_policy_admission_pair",
+    ),
+    CheckConstraint("schema_version >= 1", name="ck_run_web_plugin_policy_schema_version"),
+    CheckConstraint(_LowerHex64Check("policy_hash"), name="ck_run_web_plugin_policy_policy_hash_hex"),
+    CheckConstraint(_LowerHex64Check("snapshot_hash"), name="ck_run_web_plugin_policy_snapshot_hash_hex"),
+    CheckConstraint(
+        _LowerHex64Check("binding_generation_fingerprint"),
+        name="ck_run_web_plugin_policy_binding_generation_fingerprint_hex",
+    ),
+    CheckConstraint(
+        _OptionalLowerHex64Check("admission_decision_hash"),
+        name="ck_run_web_plugin_policy_admission_decision_hash_hex",
+    ),
+)
+
+run_sources_table = Table(
+    "run_sources",
+    metadata,
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("source_node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    Column("source_name", String(64), nullable=False),
+    Column("plugin_name", String(128), nullable=False),
+    Column("lifecycle_state", String(32), nullable=False),
+    Column("config_hash", String(64), nullable=False),
+    Column("schema_json", Text),
+    Column("schema_contract_json", Text),
+    # SchemaContract.version_hash() is a 32-character (128-bit) hex digest.
+    # PostgreSQL enforces VARCHAR widths (SQLite does not), so this column must
+    # match the runtime contract rather than the historical 16-char width.
+    Column("schema_contract_hash", String(32)),
+    Column("field_resolution_json", Text),
+    Column("recorded_at", DateTime(timezone=True), nullable=False),
+    PrimaryKeyConstraint("run_id", "source_node_id"),
+    UniqueConstraint("run_id", "source_name"),
+    CheckConstraint(
+        _enum_in_check("lifecycle_state", RunSourceLifecycleState),
+        name="ck_run_sources_lifecycle_state",
+    ),
+    CheckConstraint(_LowerHex64Check("config_hash"), name="ck_run_sources_config_hash_hex"),
+    CheckConstraint(_OptionalLowerHex32Check("schema_contract_hash"), name="ck_run_sources_schema_contract_hash_hex"),
+    ForeignKeyConstraint(["source_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+)
+Index("ix_run_sources_run", run_sources_table.c.run_id)
+Index("ix_run_sources_source_name", run_sources_table.c.run_id, run_sources_table.c.source_name)
+
+# === Nodes (Plugin Instances) ===
+
+nodes_table = Table(
+    "nodes",
+    metadata,
+    Column("node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("plugin_name", String(128), nullable=False),
+    Column("node_type", String(32), nullable=False),
+    Column("plugin_version", String(32), nullable=False),
+    Column("source_file_hash", String(32), nullable=True),
+    Column("determinism", String(32), nullable=False),  # deterministic, seeded, nondeterministic (from Determinism enum)
+    Column("config_hash", String(64), nullable=False),
+    Column("config_json", Text, nullable=False),
+    Column("sequence_in_pipeline", Integer),
+    Column("registered_at", DateTime(timezone=True), nullable=False),
+    # Schema configuration for audit trail (WP-11.99)
+    Column("schema_mode", String(16)),  # "observed", "fixed", "flexible", "parse", or NULL
+    Column("schema_fields_json", Text),  # JSON array of field definitions, or NULL
+    # Schema contracts for audit trail (Phase 5: Unified Schema Contracts)
+    # Input contract: what the node requires (field names and types)
+    Column("input_contract_json", Text),
+    # Output contract. A source records its inferred-and-locked contract on its
+    # first valid row; a transform records its DECLARED output contract (declared
+    # types, fixed before row 1) whose field set evolves as observed pass-through
+    # fields fold in (ADR-050).
+    Column("output_contract_json", Text),
+    Column("output_contract_hash", String(32)),
+    # Composite PK: same node config can exist in multiple runs
+    # This allows running the same pipeline multiple times against the same database
+    PrimaryKeyConstraint("node_id", "run_id"),
+    CheckConstraint(_LowerHex64Check("config_hash"), name="ck_nodes_config_hash_hex"),
+    CheckConstraint(_OptionalLowerHex32Check("output_contract_hash"), name="ck_nodes_output_contract_hash_hex"),
+    CheckConstraint(_OptionalSha256Ref16Check("source_file_hash"), name="ck_nodes_source_file_hash_ref"),
+)
+
+# === Edges ===
+
+edges_table = Table(
+    "edges",
+    metadata,
+    Column("edge_id", String(64), primary_key=True),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("from_node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    Column("to_node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    Column("label", String(64), nullable=False),
+    Column("default_mode", String(16), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    # Composite unique target for run-scoped FKs to edges.
+    UniqueConstraint("edge_id", "run_id"),
+    UniqueConstraint("run_id", "from_node_id", "label"),
+    # Composite FKs to nodes (node_id, run_id)
+    ForeignKeyConstraint(["from_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    ForeignKeyConstraint(["to_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+)
+
+# === Source Rows ===
+#
+# Audit-DB invariants for the rows table (archived issue elspeth-56c3cda89b,
+# ADR-bundle systems-thinker Finding 5, "Tragedy of the Commons"). The shared
+# resource is the audit database's invariant surface; the actors are 25+
+# downstream consumers (audit-readiness panel, ``elspeth explain``, MCP
+# failure-context, redaction policy, composer state, resume orchestrator,
+# replay verifier...). Each consumer carries its own assumption about
+# per-source provenance; without a central guarantor, the failure mode is
+# *simultaneous* across consumers rather than progressive.
+#
+# Invariants by mechanical enforcement status:
+#
+# 1. ``source_node_id NOT NULL`` (this table, line 225). STRUCTURALLY
+#    ENFORCED at schema level. Every row in the audit trail attributes to a
+#    specific source node, never NULL.
+#
+# 2. ``ingest_sequence`` is monotone per run and globally unique within a
+#    run. STRUCTURALLY ENFORCED via ``UniqueConstraint("run_id",
+#    "ingest_sequence")`` (line 234) plus the ``NOT NULL`` on the column.
+#
+# 3. Compound row identity ``(run_id, source_node_id, source_row_index)``
+#    is unique. STRUCTURALLY ENFORCED via ``UniqueConstraint`` at line 233.
+#    Two sources emitting the same ``source_row_index`` value produce
+#    distinct rows because ``source_node_id`` discriminates.
+#
+# Invariants NOT YET structurally enforced (gaps below the schema):
+#
+# A. ``source_row_index`` and ``ingest_sequence`` fabrication ban (G22).
+#    ``data_flow_repository.create_row`` raises ``AuditIntegrityError`` when
+#    these values are not explicitly provided ("Do not fabricate
+#    source_row_index or ingest_sequence from row_index"), but the
+#    prohibition lives in an exception string at one write boundary.
+#    Tracked under archived issue elspeth-92afea0d23
+#    (elspeth-lints rule with the same enforcement status as
+#    ``trust_tier.tier_model``).
+#
+# B. Scheduler lease-ownership transitions (G29). ``token_work_items``
+#    carries the current lease state but not its transition history; a
+#    lease-expiry event during multi-worker execution leaves no per-worker
+#    audit attribution. Tracked under archived issue elspeth-9030f34c32
+#    (``scheduler_events`` table).
+
+rows_table = Table(
+    "rows",
+    metadata,
+    Column("row_id", String(64), primary_key=True),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("source_node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    Column("row_index", Integer),
+    Column("source_row_index", Integer, nullable=False),
+    Column("ingest_sequence", Integer, nullable=False),
+    Column("source_data_hash", String(64), nullable=False),
+    Column("source_data_ref", String(256)),
+    Column("source_contract_json", Text),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint("row_id", "run_id"),
+    UniqueConstraint("run_id", "source_node_id", "source_row_index"),
+    UniqueConstraint("run_id", "ingest_sequence"),
+    CheckConstraint(_LowerHex64Check("source_data_hash"), name="ck_rows_source_data_hash_hex"),
+    # Composite FK to nodes (node_id, run_id)
+    ForeignKeyConstraint(["source_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+)
+
+# === Tokens ===
+
+tokens_table = Table(
+    "tokens",
+    metadata,
+    Column("token_id", String(64), primary_key=True),
+    Column("row_id", String(64), ForeignKey("rows.row_id"), nullable=False),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),  # Run ownership for cross-run contamination prevention
+    Column("join_group_id", String(64)),  # merge event — anchors the coalesce_effects composite FK
+    Column("step_in_pipeline", Integer),  # Step where this token was created (fork/coalesce/expand)
+    # Payload-store ref for a token whose row_data differs from its source row:
+    # expand/deaggregation children (independently-transformed data) AND post-coalesce
+    # merged tokens (the merged row, computed in memory at barrier time). NULL for fork
+    # children, which share the parent/source payload retrievable by row_id. Enables
+    # faithful reconstruction of incomplete expand/coalesce tokens on resume (epoch 11).
+    Column("token_data_ref", String(64), nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    # Composite unique target for downstream composite FKs (token_id, run_id)
+    UniqueConstraint("token_id", "run_id"),
+    # Epoch 24: row ownership is authoritative. The independent run FK proves
+    # the run exists; this composite FK proves it is the row's run.
+    ForeignKeyConstraint(["row_id", "run_id"], ["rows.row_id", "rows.run_id"]),
+)
+Index("uq_tokens_identity_row_run", tokens_table.c.token_id, tokens_table.c.row_id, tokens_table.c.run_id, unique=True)
+Index(
+    "uq_tokens_coalesce_result_identity",
+    tokens_table.c.token_id,
+    tokens_table.c.run_id,
+    tokens_table.c.join_group_id,
+    unique=True,
+)
+
+# === Token Outcomes (AUD-001: Explicit terminal state recording) ===
+
+token_outcomes_table = Table(
+    "token_outcomes",
+    metadata,
+    # Identity
+    Column("outcome_id", String(64), primary_key=True),
+    Column("run_id", String(64), nullable=False, index=True),
+    Column("token_id", String(64), nullable=False, index=True),
+    # Composite FK: enforces token_id and run_id belong together (prevents cross-run contamination)
+    ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+    # ADR-019 two-axis terminal model. ``completed`` mirrors the prior
+    # ``is_terminal`` column (sub-decision 3). ``outcome`` value space changed
+    # from the old single-axis outcome (12 values, non-NULL) to TerminalOutcome (3 values:
+    # success / failure / transient) with NULL when completed=False
+    # (only ``BUFFERED`` today). ``path`` is producer-declared per ADR-019
+    # § "Classification is producer-declared, not topology-derivable" and
+    # always populated, including ``path="buffered"`` for non-terminal rows.
+    Column("outcome", String(32), nullable=True),
+    Column("path", String(64), nullable=False),
+    Column("completed", Integer, nullable=False),
+    Column("recorded_at", DateTime(timezone=True), nullable=False),
+    # Outcome-specific fields (nullable based on (outcome, path) pair)
+    Column("sink_name", String(128)),
+    Column("batch_id", String(64)),
+    Column("error_hash", String(64)),
+    # Optional extended context
+    Column("context_json", Text),
+    CheckConstraint(_OptionalLowerHex16Check("error_hash"), name="ck_token_outcomes_error_hash_hex"),
+    # Composite FK: batch outcomes must point at a batch from the same run.
+    ForeignKeyConstraint(["batch_id", "run_id"], ["batches.batch_id", "batches.run_id"]),
+)
+
+# Partial unique index: exactly one terminal outcome per token
+# Note: SQLite partial index syntax differs; SQLAlchemy handles this
+Index(
+    "ix_token_outcomes_terminal_unique",
+    token_outcomes_table.c.token_id,
+    unique=True,
+    sqlite_where=(token_outcomes_table.c.completed == 1),
+    postgresql_where=(token_outcomes_table.c.completed == 1),
+)
+
+# Run-scoped per-token access path (epoch 33, elspeth-c675c8c2d9). run_id and
+# token_id are each indexed above, and that was precisely the trap: a
+# (run_id, token_id) equality pair offered two single-column candidates, and an
+# audit database carries no ANALYZE statistics, so SQLite's fixed selectivity
+# guess could not tell that run_id matches an entire run's outcomes while
+# token_id matches at most a handful. It chose run_id, and the accounting
+# census degraded to a nested scan — 618s to project one 60k-token run.
+#
+# The census no longer joins per token, so this index is not what rescues that
+# endpoint; the read model's own shape is. What it buys is ordering: the census
+# groups by (run_id, token_id), and with this index those rows arrive in group
+# order, so the grouping streams instead of sorting every outcome row through a
+# temp B-tree. It also removes the two-candidate ambiguity for any future
+# run-scoped per-token read, which is the defect class that produced the hang.
+Index(
+    "ix_token_outcomes_run_token",
+    token_outcomes_table.c.run_id,
+    token_outcomes_table.c.token_id,
+)
+
+token_work_items_table = Table(
+    "token_work_items",
+    metadata,
+    Column("work_item_id", String(64), primary_key=True),
+    Column("run_id", String(64), nullable=False, index=True),
+    Column("token_id", String(64), nullable=False),
+    Column("row_id", String(64), nullable=False),
+    Column("node_id", String(NODE_ID_COLUMN_LENGTH)),
+    Column("step_index", Integer, nullable=False),
+    Column("ingest_sequence", Integer, nullable=False),
+    Column("row_payload_json", Text, nullable=False),
+    Column("status", String(32), nullable=False),
+    Column("queue_key", String(128)),
+    Column("barrier_key", String(128)),
+    Column("on_success_sink", String(128)),
+    Column("pending_sink_name", String(128)),
+    Column("pending_outcome", String(32)),
+    Column("pending_path", String(64)),
+    Column("pending_error_hash", String(64)),
+    Column("pending_error_message", Text),
+    Column("join_group_id", String(128)),
+    # Epoch 35: the token's typed lineage path (outermost first), serialized by
+    # contracts.identity.lineage_path_to_json. The journal is authoritative for
+    # resume — this is the sole lineage write path.
+    Column("lineage_path_json", Text, nullable=False),
+    Column("coalesce_node_id", String(NODE_ID_COLUMN_LENGTH)),
+    Column("coalesce_name", String(128)),
+    Column("row_union_name", String(128)),
+    # WS4 Task 6: the collector's barrier BINDING address (spec §4.3), mirroring
+    # row_union_name's epoch-30 shape one column over. Lands within the current
+    # epoch 35 (pre-1.0, no migration) rather than its own bump — no table-shape
+    # change is entangled with it, unlike epoch 30's original addition.
+    Column("collector_name", String(128)),
+    Column("attempt", Integer, nullable=False),
+    Column("lease_owner", String(128)),
+    Column("lease_expires_at", DateTime(timezone=True)),
+    Column("available_at", DateTime(timezone=True), nullable=False),
+    Column("barrier_blocked_at", DateTime(timezone=True), nullable=True),
+    # Epoch 21: adoption CAS marker (§C.4 row 6a) — set only by the fenced
+    # barrier-adoption verb (slice 3). NULL means intake-pending. Column lands
+    # at epoch 21 so the schema is stable across slices 2→3.
+    Column("barrier_adopted_epoch", Integer, nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint("run_id", "token_id", "node_id", "attempt"),
+    # ``status=leased`` must imply a non-empty ``lease_owner``. The
+    # ``recover_expired_leases`` sweep's OR-NULL predicate (elspeth-28aaa36a62)
+    # treats ``lease_owner=NULL`` as a recoverable wedge, so the CHECK closes
+    # the structural gap by preventing the wedge from being written in the
+    # first place (archived issue elspeth-9990c81e14, embedded-database-reviewer).
+    # The literal MUST match ``TokenWorkStatus.LEASED.value`` exactly — the
+    # enum is a ``StrEnum`` whose ``.value`` is lowercase ``"leased"`` and
+    # every write site persists ``.value`` (e.g. ``scheduler_repository.py``
+    # ``status=TokenWorkStatus.LEASED.value``). A mismatched literal here
+    # would make both arms of the CHECK trivially satisfied for every row
+    # and silently nullify the Tier-1 invariant (elspeth-36d5635402).
+    # The constraint runs independently of ``PRAGMA foreign_keys`` in SQLite.
+    CheckConstraint(
+        f"(status = {_sql_string_literal(TokenWorkStatus.LEASED.value)} "
+        f"AND lease_owner IS NOT NULL AND length(lease_owner) > 0) OR status != {_sql_string_literal(TokenWorkStatus.LEASED.value)}",
+        name="ck_token_work_items_lease_owner_required_when_leased",
+    ),
+    CheckConstraint(_enum_in_check("status", TokenWorkStatus), name="ck_token_work_items_status"),
+    ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+    ForeignKeyConstraint(["row_id", "run_id"], ["rows.row_id", "rows.run_id"]),
+    ForeignKeyConstraint(["node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    ForeignKeyConstraint(["coalesce_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    CheckConstraint(_OptionalLowerHex16Check("pending_error_hash"), name="ck_token_work_items_pending_error_hash_hex"),
+)
+Index("ix_token_work_items_ready", token_work_items_table.c.run_id, token_work_items_table.c.status, token_work_items_table.c.available_at)
+Index(
+    "ix_token_work_items_lease", token_work_items_table.c.run_id, token_work_items_table.c.status, token_work_items_table.c.lease_expires_at
+)
+# Covering index for the multi-worker drain ``recover_expired_leases`` sweep.
+# ``ix_token_work_items_lease`` covers ``(run_id, status, lease_expires_at)``
+# which served the pre-multi-worker predicate; the worker-skipping predicate
+# ``lease_owner != caller_owner`` (elspeth-28aaa36a62, elspeth-941f1508f5)
+# leaves SQLite to apply the inequality as a row filter against the existing
+# index. Bounded by run-LEASED rows today, but the RC6 multi-worker target
+# runs the sweep per-worker-per-iteration: O(workers²) per drain wave. The
+# wider index puts ``lease_owner`` into the seek key so the sweep is index-
+# only (archived issue elspeth-9990c81e14, embedded-database-reviewer MED).
+Index(
+    "ix_token_work_items_recovery",
+    token_work_items_table.c.run_id,
+    token_work_items_table.c.status,
+    token_work_items_table.c.lease_owner,
+    token_work_items_table.c.lease_expires_at,
+)
+# Token-scoped lookup for the sink durability callback. Without this, SQLite
+# plans ``mark_pending_sink_terminal`` as a run/status scan for every token,
+# turning large sink batches into an O(n^2) post-write grind.
+Index(
+    "ix_token_work_items_pending_sink_token",
+    token_work_items_table.c.run_id,
+    token_work_items_table.c.token_id,
+    token_work_items_table.c.status,
+    token_work_items_table.c.pending_sink_name,
+)
+Index(
+    "uq_token_work_items_terminal_identity",
+    token_work_items_table.c.run_id,
+    token_work_items_table.c.token_id,
+    token_work_items_table.c.attempt,
+    unique=True,
+    sqlite_where=token_work_items_table.c.node_id.is_(None),
+    postgresql_where=token_work_items_table.c.node_id.is_(None),
+)
+
+
+def pending_sink_bundle_clause() -> ColumnElement[bool]:
+    """Return the complete durable sink-redrive subtype predicate.
+
+    ``PENDING_SINK`` is not merely a status: the dedicated redrive path must
+    be able to rebuild a legal sink-bound ``RowResult`` without replaying its
+    producer.  The opaque row payload and sink identity must therefore be
+    present, the persisted outcome/path pair must be one of the five
+    sink-bound terminal pairs, and pair-specific evidence must be complete.
+    Source quarantine is the fifth: a row the source rejected is handed to its
+    quarantine sink through the same durable bundle as every other sink-bound
+    token, carrying the audited quarantine error hash and bounded message.
+    ``(FAILURE, QUARANTINED_AT_SOURCE)`` is also the sinkless discard pair;
+    a discarded token records its outcome directly and never parks, so a
+    parked item on this pair is always a source-quarantine handoff.
+
+    Keep this predicate at the schema boundary so claim selection and its CAS
+    UPDATE use the exact same SQL on SQLite and PostgreSQL.  Payload *shape*
+    validation remains the separately owned scheduler-payload contract; this
+    subtype guard only rejects the representable empty payload sentinel.
+    """
+    no_error_evidence = and_(
+        token_work_items_table.c.pending_error_hash.is_(None),
+        token_work_items_table.c.pending_error_message.is_(None),
+    )
+    return and_(
+        token_work_items_table.c.row_payload_json != "",
+        token_work_items_table.c.pending_sink_name.is_not(None),
+        token_work_items_table.c.pending_sink_name != "",
+        or_(
+            and_(
+                token_work_items_table.c.pending_outcome == TerminalOutcome.SUCCESS.value,
+                token_work_items_table.c.pending_path == TerminalPath.DEFAULT_FLOW.value,
+                no_error_evidence,
+            ),
+            and_(
+                token_work_items_table.c.pending_outcome == TerminalOutcome.SUCCESS.value,
+                token_work_items_table.c.pending_path == TerminalPath.GATE_ROUTED.value,
+                no_error_evidence,
+            ),
+            and_(
+                token_work_items_table.c.pending_outcome == TerminalOutcome.FAILURE.value,
+                token_work_items_table.c.pending_path == TerminalPath.ON_ERROR_ROUTED.value,
+                token_work_items_table.c.pending_error_hash.is_not(None),
+                token_work_items_table.c.pending_error_hash != "",
+                token_work_items_table.c.pending_error_message.is_not(None),
+            ),
+            and_(
+                token_work_items_table.c.pending_outcome == TerminalOutcome.SUCCESS.value,
+                token_work_items_table.c.pending_path == TerminalPath.COALESCED.value,
+                token_work_items_table.c.join_group_id.is_not(None),
+                token_work_items_table.c.join_group_id != "",
+                no_error_evidence,
+            ),
+            and_(
+                token_work_items_table.c.pending_outcome == TerminalOutcome.FAILURE.value,
+                token_work_items_table.c.pending_path == TerminalPath.QUARANTINED_AT_SOURCE.value,
+                token_work_items_table.c.pending_error_hash.is_not(None),
+                token_work_items_table.c.pending_error_hash != "",
+                token_work_items_table.c.pending_error_message.is_not(None),
+                token_work_items_table.c.join_group_id.is_(None),
+            ),
+        ),
+    )
+
+
+def work_item_token_decided_clause() -> ColumnElement[bool]:
+    """EXISTS: the work item's token carries a completed terminal outcome in its run.
+
+    Correlated to ``token_work_items`` (a SELECT over it or an UPDATE of it).
+    """
+    return (
+        select(token_outcomes_table.c.outcome_id)
+        .where(token_outcomes_table.c.run_id == token_work_items_table.c.run_id)
+        .where(token_outcomes_table.c.token_id == token_work_items_table.c.token_id)
+        .where(token_outcomes_table.c.completed == 1)
+        .exists()
+    )
+
+
+def token_decided_clause() -> ColumnElement[bool]:
+    """EXISTS: the token carries a completed terminal outcome in its run.
+
+    Correlated to ``tokens``. The partial unique index
+    ``ix_token_outcomes_terminal_unique`` caps completed outcomes at one per
+    token, so NOT EXISTS of this clause is exactly "the token has no recorded
+    terminal outcome" — the fact a success stamp must never coexist with.
+    """
+    return (
+        select(token_outcomes_table.c.outcome_id)
+        .where(token_outcomes_table.c.run_id == tokens_table.c.run_id)
+        .where(token_outcomes_table.c.token_id == tokens_table.c.token_id)
+        .where(token_outcomes_table.c.completed == 1)
+        .exists()
+    )
+
+
+def undecided_failed_work_clause() -> ColumnElement[bool]:
+    """Predicate selecting FAILED work items whose token has no completed outcome.
+
+    FAILED is a disposition, not a fate. A routed failure records the token's
+    outcome before ``mark_failed``; a FAILED item whose token has none is a
+    claim that died on an exception mid-row (the drain's exception arm marks
+    it FAILED and the worker exits), so the row is undecided. Resume returns
+    exactly these items to READY for re-drive
+    (``requeue_undecided_failed_work``); ``complete_run``'s undecided-token
+    arm (``token_decided_clause``) refuses a success stamp over their tokens.
+    """
+    return and_(
+        token_work_items_table.c.status == TokenWorkStatus.FAILED.value,
+        ~work_item_token_decided_clause(),
+    )
+
+
+def blocked_barrier_hold_clause() -> ColumnElement[bool]:
+    """Predicate selecting journal BLOCKED rows that are BARRIER holds.
+
+    BLOCKED rows are dual-use (F1 design D1): barrier holds carry a non-NULL
+    ``barrier_key`` (coalesce_name for coalesce, str(node_id) for
+    aggregation), while ADR-028 queue-holds carry only a ``queue_key``. The
+    ``barrier_key IS NOT NULL`` filter is what keeps queue-holds out of
+    barrier sweeps (restore, quiescence counting).
+
+    Single source of truth for the dual-use predicate — shared by
+    ``TokenSchedulerRepository.list_blocked_barrier_items`` and
+    ``count_blocked_barrier_items``. The literal ``'blocked'`` MUST match
+    ``TokenWorkStatus.BLOCKED.value`` (a lowercase ``StrEnum``), consistent
+    with the status literals in this module's CHECK constraints.
+    """
+    return and_(
+        token_work_items_table.c.status == "blocked",
+        token_work_items_table.c.barrier_key.is_not(None),
+    )
+
+
+scheduler_events_table = Table(
+    "scheduler_events",
+    metadata,
+    # Authoritative replay order and row identity (epoch 38). AUTOINCREMENT
+    # (not bare rowid) so seq values are never reused after deletion and are
+    # strictly monotonic for the life of the ledger. recorded_at is database
+    # time (ADR-047): whole-second on SQLite and one shared transaction
+    # timestamp on PostgreSQL, so it ties inside a second and inside a
+    # transaction and cannot order; seq can. Same shape as
+    # run_coordination_events.seq.
+    Column("seq", Integer, primary_key=True, autoincrement=True),
+    # sha256(canonical_json(transition content)) — the identity of WHAT
+    # happened (run, token, work item, from/to status, owners, attempts,
+    # deadlines, caller, context), deliberately NOT of when: recorded_at is
+    # excluded, and two content-identical transitions inside one database
+    # second are two rows that share an event_id and differ by seq. Not
+    # unique by design (elspeth-5d66fc5ed1) — the tickets forbid a nonce or
+    # process-clock microseconds in the hash, and seq is the occurrence.
+    Column("event_id", String(64), nullable=False),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("token_id", String(64), nullable=False),
+    # ``work_item_id`` is a forensic scheduler identity, not a foreign key:
+    # recover_expired_leases intentionally rotates token_work_items.work_item_id
+    # on attempt bump. A FK or ON UPDATE CASCADE would rewrite immutable
+    # history or reject the lease-loss event this table exists to preserve.
+    Column("work_item_id", String(64), nullable=False),
+    Column("node_id", String(NODE_ID_COLUMN_LENGTH)),
+    Column("event_type", String(64), nullable=False),
+    Column("from_status", String(32)),
+    Column("to_status", String(32), nullable=False),
+    Column("from_lease_owner", String(128)),
+    Column("to_lease_owner", String(128)),
+    Column("from_lease_expires_at", DateTime(timezone=True)),
+    Column("to_lease_expires_at", DateTime(timezone=True)),
+    Column("from_attempt", Integer),
+    Column("to_attempt", Integer, nullable=False),
+    Column("recorded_at", DateTime(timezone=True), nullable=False),
+    Column("caller_owner", String(128)),
+    Column("context_json", Text, nullable=False, server_default=text("'{}'")),
+    CheckConstraint(
+        _enum_in_check("event_type", SchedulerEventType),
+        name="ck_scheduler_events_event_type",
+    ),
+    CheckConstraint(
+        _optional_enum_in_check("from_status", TokenWorkStatus),
+        name="ck_scheduler_events_from_status",
+    ),
+    CheckConstraint(
+        _enum_in_check("to_status", TokenWorkStatus),
+        name="ck_scheduler_events_to_status",
+    ),
+    CheckConstraint("from_attempt IS NULL OR from_attempt >= 0", name="ck_scheduler_events_from_attempt_non_negative"),
+    CheckConstraint("to_attempt >= 0", name="ck_scheduler_events_to_attempt_non_negative"),
+    ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+    ForeignKeyConstraint(["node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    # Mandatory for the AUTOINCREMENT DDL on SQLite (see run_coordination_events);
+    # inert on PostgreSQL, where the Integer PK becomes IDENTITY.
+    sqlite_autoincrement=True,
+)
+Index(
+    "ix_scheduler_events_run_token_seq",
+    scheduler_events_table.c.run_id,
+    scheduler_events_table.c.token_id,
+    scheduler_events_table.c.seq,
+)
+Index(
+    "ix_scheduler_events_work_item",
+    scheduler_events_table.c.run_id,
+    scheduler_events_table.c.work_item_id,
+    scheduler_events_table.c.seq,
+)
+
+# === Multi-worker run coordination (epoch 21, ADR-030) ===
+
+run_coordination_table = Table(
+    "run_coordination",
+    metadata,
+    # Exactly one row per run, created by begin_run (uniformity rule: an N=1
+    # worker is leader of its own run at epoch 1).
+    Column("run_id", String(64), ForeignKey("runs.run_id"), primary_key=True),
+    Column("leader_worker_id", String(128)),  # NULL = vacant seat
+    # THE fencing token; monotonic, bumps on every acquisition CAS (§B.4).
+    Column("leader_epoch", Integer, nullable=False, server_default=text("0")),
+    Column("leader_heartbeat_expires_at", DateTime(timezone=True)),  # run-level leader liveness clock
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    # Vacant seat ⇔ no liveness clock; occupied seat ⇔ clock present.
+    CheckConstraint(
+        "(leader_worker_id IS NULL) = (leader_heartbeat_expires_at IS NULL)",
+        name="ck_run_coordination_seat_liveness_paired",
+    ),
+)
+
+run_workers_table = Table(
+    "run_workers",
+    metadata,
+    Column("worker_id", String(128), primary_key=True),  # 'worker:{run_id}:{uuid4().hex}'
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("role", String(16), nullable=False),
+    Column("status", String(16), nullable=False),
+    Column("registered_at", DateTime(timezone=True), nullable=False),
+    Column("heartbeat_expires_at", DateTime(timezone=True), nullable=False),  # run-level worker liveness clock
+    Column("departed_at", DateTime(timezone=True)),
+    Column("evicted_at", DateTime(timezone=True)),  # forensics (graft, Design 1)
+    Column("evicted_by_worker_id", String(128)),  # forensics: who ran the eviction CAS
+    # Forensic only — EXCEPT pid, surfaced by the BUSY-takeover diagnostic
+    # (§B.4 WriteLockHeldError carries registered pids).
+    Column("pid", Integer),
+    Column("hostname", String(255)),
+    Column("entry_point", String(255)),
+    CheckConstraint("role IN ('leader','follower')", name="ck_run_workers_role"),
+    CheckConstraint("status IN ('active','departed','evicted')", name="ck_run_workers_status"),
+    CheckConstraint("(status = 'evicted') = (evicted_at IS NOT NULL)", name="ck_run_workers_evicted_at_paired"),
+)
+# Serves both hot paths: the slice-4 EXISTS membership fence probes
+# (run_id, status='active', worker_id) — (run_id, status) prefix seek then
+# worker_id filter on a tiny table — and the liveness reap scans
+# (run_id, status, heartbeat_expires_at) index-only. Worker_id point lookups
+# (heartbeat CAS) use the PK.
+Index(
+    "ix_run_workers_liveness",
+    run_workers_table.c.run_id,
+    run_workers_table.c.status,
+    run_workers_table.c.heartbeat_expires_at,
+)
+
+run_coordination_events_table = Table(
+    "run_coordination_events",
+    metadata,
+    # Authoritative replay order. AUTOINCREMENT (not bare rowid) so seq values
+    # are never reused after deletion and are strictly monotonic for the life
+    # of the ledger — process-stamped recorded_at can invert commit order
+    # under busy_timeout stalls; seq cannot.
+    Column("seq", Integer, primary_key=True, autoincrement=True),
+    # sha256(canonical_json(identity)) — same dedup recipe as scheduler
+    # events (scheduler_repository.py:434-455).
+    Column("event_id", String(64), nullable=False),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("event_type", String(32), nullable=False),
+    Column("worker_id", String(128), nullable=False),
+    Column("leader_epoch", Integer),
+    Column("recorded_at", DateTime(timezone=True), nullable=False),  # forensic wall-clock; NOT the replay order
+    Column("context_json", Text, nullable=False, server_default=text("'{}'")),
+    # All 10 event types from the design DDL (§A.2), including the slice-4
+    # producers worker_stalled and heartbeat_degraded — pinned into the
+    # epoch-21 CHECK now so slice 4 needs no schema change — plus epoch 48's
+    # resume_refused: the resuming leader's value-free record of a run whose
+    # tokens resume cannot account for (SchedulerLeaseRepository.verify_resume_coverage).
+    CheckConstraint(
+        "event_type IN ('worker_register', 'worker_depart', 'worker_evict', 'worker_stalled', "
+        "'leader_acquire', 'leader_release', 'leadership_lost', "
+        "'fence_refusal', 'heartbeat_degraded', 'finalize', 'resume_refused')",
+        name="ck_run_coordination_events_event_type",
+    ),
+    # Mandatory: without the table kwarg, SQLAlchemy emits a bare INTEGER
+    # PRIMARY KEY (rowid alias, values reusable after delete); with it the DDL
+    # is `seq INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT`. Inert on Postgres
+    # (Integer PK becomes IDENTITY — also monotonic).
+    sqlite_autoincrement=True,
+)
+# event_id uniqueness is a named unique Index, not UniqueConstraint/unique=True,
+# deliberately: SQLAlchemy's SQLite inspector get_indexes() does not report
+# sqlite_autoindex_* indexes created by inline UNIQUE constraints, so a
+# UniqueConstraint cannot be verified by the _REQUIRED_INDEXES loop. Same
+# pattern as uq_token_work_items_terminal_identity above.
+Index(
+    "uq_run_coordination_events_event_id",
+    run_coordination_events_table.c.event_id,
+    unique=True,
+)
+Index(
+    "ix_run_coordination_events_run",
+    run_coordination_events_table.c.run_id,
+    run_coordination_events_table.c.seq,
+)
+
+# === Unified lineage (epoch 34, barrier-scopes spec rev 3.2 §4.3) ===
+
+token_lineage_frames_table = Table(
+    "token_lineage_frames",
+    metadata,
+    Column("token_id", String(64), primary_key=True),
+    Column("run_id", String(64), primary_key=True),
+    Column("depth", Integer, primary_key=True),  # 0 = outermost
+    Column("kind", String(16), nullable=False),
+    Column("group_id", String(64), nullable=False),
+    Column("member_key", String(128), nullable=False),  # FORK: branch name; EXPAND: member token_id
+    CheckConstraint(_enum_in_check("kind", FrameKind), name="ck_token_lineage_frames_kind"),
+    ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+)
+Index(
+    "ix_token_lineage_frames_group",
+    token_lineage_frames_table.c.run_id,
+    token_lineage_frames_table.c.group_id,
+    token_lineage_frames_table.c.member_key,
+)
+
+group_records_table = Table(
+    "group_records",
+    metadata,
+    Column("run_id", String(64), ForeignKey("runs.run_id"), primary_key=True),
+    Column("group_id", String(64), primary_key=True),
+    Column("kind", String(16), nullable=False),
+    Column("opener_token_id", String(64), nullable=False),
+    # member_count=0 is legal and REQUIRED for empty expansions (§4.3): it is
+    # the durable referent the require_all empty-group failure needs.
+    Column("member_count", Integer, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    # META-38: the WRITTEN release fact. A collector RELEASE group (minted by
+    # collect_tokens when a bound EXPAND group closes) records the id of the
+    # group it closed; a real fork/expand opener leaves it NULL. This is the
+    # ONE discriminator `is_release_group` reads — no derivation from
+    # lineage shape, terminal-path vocabulary, or binding config, none of
+    # which survive nesting or a durable-twin reader with no config in hand.
+    Column("closes_group_id", String(64), nullable=True),
+    CheckConstraint("member_count >= 0", name="ck_group_records_member_count_nonneg"),
+    CheckConstraint(_enum_in_check("kind", FrameKind), name="ck_group_records_kind"),
+    ForeignKeyConstraint(["opener_token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+)
+# One token opens at most one group. For fork/expand openers: a non-empty
+# opener records its terminal parent disposition (FORK_PARENT /
+# EXPAND_PARENT / BATCH_CONSUMED) in the same claim as its group_records
+# row; an EMPTY expansion is the measured exception (META-38 amendment 2):
+# record_empty_expansion writes only the member_count=0 row, and the
+# opener's FILTER_DROPPED terminal lands later from the traversal
+# (token_traversal.py) — that transactional gap is ticketed separately. A
+# second open is unreachable either way — this uniqueness is what makes the empty-expansion mint
+# idempotent under re-driven claims.
+#
+# For a COLLECT release's opener (a group MEMBER token, not an "opener" in
+# the fork/expand sense): collect_tokens writes no terminal disposition for
+# the representative member in the same claim (WS4 fix-round ruling + B-2
+# amendment — collector member terminals ride the WS3 settlement seam by
+# design, the same "closers stop writing token terminals" split fork/expand
+# openers already follow). The uniqueness invariant for this case is
+# EVENTUALLY-sustained via that settlement seam once the WS4 integration item
+# wires CloserKind.COLLECTOR dispatch into it; before that lands there is a
+# crash window in which a representative could theoretically be claimed a
+# second time without its terminal write having landed, and any takeover
+# replay across that window must tolerate it via collect_tokens' idempotent
+# replay skip (the existing group_records row short-circuits the re-drive
+# rather than re-minting).
+Index(
+    "uq_group_records_opener",
+    group_records_table.c.run_id,
+    group_records_table.c.opener_token_id,
+    unique=True,
+)
+
+collector_group_failures_table = Table(
+    "collector_group_failures",
+    metadata,
+    Column("run_id", String(64), primary_key=True),
+    Column("group_id", String(64), primary_key=True),
+    Column("collector_node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    # Closed vocabulary (CollectorGroupFailureReason): an engine-authored code
+    # the counting readers render as a failure category, never row data.
+    Column("failure_reason", String(64), nullable=False),
+    Column("recorded_at", DateTime(timezone=True), nullable=False),
+    ForeignKeyConstraint(["run_id", "group_id"], ["group_records.run_id", "group_records.group_id"]),
+    ForeignKeyConstraint(["collector_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    CheckConstraint(
+        _enum_in_check("failure_reason", CollectorGroupFailureReason),
+        name="ck_collector_group_failures_failure_reason",
+    ),
+)
+
+group_losses_table = Table(
+    "group_losses",
+    metadata,
+    Column("loss_id", String(64), primary_key=True),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("closer_name", String(128), nullable=False),
+    Column("group_id", String(64), nullable=False),
+    Column("member_key", String(128), nullable=False),
+    Column("token_id", String(64), nullable=False),
+    # Categorical vocabulary only (2026-08-08 convention; String(64) per the
+    # battery-round-7 Postgres lesson pinned in
+    # test_coalesce_branch_loss_reason_postgres.py — WS3 owes the same
+    # three-proof treatment on this column).
+    Column("reason", String(64), nullable=False),
+    Column("recorded_by", String(128), nullable=False),
+    Column("recorded_at", DateTime(timezone=True), nullable=False),
+    Column("adopted_epoch", Integer),  # NULL = not yet replayed into leader memory (§E.5 cursor)
+    ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+)
+# Natural-key idempotency (record_group_loss is idempotent on the natural
+# key). Named unique Index rather than a UniqueConstraint for
+# _REQUIRED_INDEXES verifiability — matches the retired
+# coalesce_branch_losses precedent; doubles as the hot lookup index (replay
+# scans by run_id + closer_name prefix).
+Index(
+    "uq_group_losses_natural",
+    group_losses_table.c.run_id,
+    group_losses_table.c.closer_name,
+    group_losses_table.c.group_id,
+    group_losses_table.c.member_key,
+    unique=True,
+)
+
+
+def active_worker_fence_clause(*, worker_id: ColumnElement[str] | str, run_id: ColumnElement[str] | str) -> ColumnElement[bool]:
+    """Membership fence: the acting worker holds an *active* run_workers row.
+
+    Single source of truth for the EXISTS predicate that slice 4 compiles
+    into enqueue_ready's INSERT guard (design §G verb table). Strict variant:
+    ABSENT worker → False (the caller explicitly supplied worker_id so absence
+    is a definite membership failure). Single-use identity doctrine:
+    'departed'/'evicted' rows never return to 'active', so a False result is
+    a permanent fence. The literal 'active' MUST match the worker-status
+    CHECK on run_workers.
+
+    For claim_ready / claim_pending_sink CAS UPDATEs use
+    ``claim_verb_fence_clause`` which adds the backward-compat OR-branch that
+    passes when the run has no registered workers at all (N=0 unit-test mode).
+    """
+    return (
+        select(run_workers_table.c.worker_id)
+        .where(
+            run_workers_table.c.worker_id == worker_id,
+            run_workers_table.c.run_id == run_id,
+            run_workers_table.c.status == "active",
+        )
+        .exists()
+    )
+
+
+def claim_verb_fence_clause(*, worker_id: ColumnElement[str] | str, run_id: ColumnElement[str] | str) -> ColumnElement[bool]:
+    """Lenient membership fence for claim_ready / claim_pending_sink CAS UPDATEs.
+
+    Passes when either:
+
+    * the acting worker holds an ACTIVE run_workers row for this run, or
+    * the run has no registered workers at all (N=0 unit-test compatibility).
+
+    Semantics by case:
+    (a) ABSENT worker and N=0 run registry: no registered workers exist for the
+        run → pass. Backward-compat for unit tests that call claim_ready with
+        fictional lease_owner IDs without populating run_workers.
+    (b) ABSENT worker and N>0 run registry: registered workers exist for the run
+        but this caller is not one of them → fail closed with zero mutation.
+    (c) ACTIVE run_workers row for this worker and run → pass.
+    (d) EVICTED or DEPARTED row for this worker and run → fail; the claim verb
+        re-probe raises RunWorkerEvictedError.
+
+    This is strictly weaker than ``active_worker_fence_clause`` (strict):
+    ABSENT passes here only when the run has no registry at all, and is refused
+    once any worker has registered for the run. Use the strict variant for
+    ``enqueue_ready``'s explicit-worker_id guard where ABSENT is always wrong
+    (caller supplied worker_id, registration is mandatory).
+    """
+    run_has_no_registered_workers = ~select(run_workers_table.c.worker_id).where(run_workers_table.c.run_id == run_id).exists()
+    return or_(
+        active_worker_fence_clause(worker_id=worker_id, run_id=run_id),
+        run_has_no_registered_workers,
+    )
+
+
+# === Token Parents (for multi-parent joins) ===
+
+token_parents_table = Table(
+    "token_parents",
+    metadata,
+    Column("token_id", String(64), primary_key=True),
+    Column("parent_token_id", String(64), primary_key=True),
+    Column("run_id", String(64), nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    UniqueConstraint("token_id", "ordinal"),
+    ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+    ForeignKeyConstraint(["parent_token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+)
+
+# === Node States ===
+
+node_states_table = Table(
+    "node_states",
+    metadata,
+    Column("state_id", String(64), primary_key=True),
+    Column("token_id", String(64), nullable=False),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    Column("step_index", Integer, nullable=False),
+    Column("attempt", Integer, nullable=False, default=0),
+    Column("status", String(32), nullable=False),
+    Column("input_hash", String(64), nullable=False),
+    Column("output_hash", String(64)),
+    Column("context_before_json", Text),
+    Column("context_after_json", Text),
+    Column("duration_ms", Float),
+    Column("error_json", Text),
+    Column("success_reason_json", Text),  # TransformSuccessReason for successful transforms
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("completed_at", DateTime(timezone=True)),
+    # Resume provenance marker (epoch 11): NULL for every node_state written during the
+    # original run; set to the resumed-from checkpoint id for every node_state written
+    # while re-driving a reconstructed incomplete token on resume. Makes a resume re-drive
+    # (which records at attempt = max+1 under the SAME run_id) provably distinguishable
+    # from a run-1 tenacity retry — explain() filters on resume_checkpoint_id IS NULL.
+    #
+    # MARKER-ONLY (no FK): the id is a durable provenance fact, like a content hash — it
+    # endures even after its checkpoint row is purged. Checkpoints are deletable progress
+    # state (delete_checkpoints clears them unconditionally on successful completion); the
+    # marker on node_states does NOT keep them alive and carries NO referential constraint
+    # to the checkpoints table. explain() distinguishes resume re-drives from run-1 retries
+    # purely by this column's NULL-ness (resume_checkpoint_id IS NOT NULL), which survives
+    # checkpoint purge. (Operator decision 2026-05-30, faithful to "hashes survive payload
+    # deletion".)
+    Column("resume_checkpoint_id", String(64), nullable=True),
+    # Composite unique target for run-scoped FKs to node_states.
+    UniqueConstraint("state_id", "run_id"),
+    UniqueConstraint("token_id", "node_id", "attempt"),
+    UniqueConstraint("token_id", "step_index", "attempt"),
+    # Composite FK: enforces token_id and run_id belong together (prevents cross-run contamination)
+    ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+    # Composite FK to nodes (node_id, run_id)
+    ForeignKeyConstraint(["node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    CheckConstraint(_LowerHex64Check("input_hash"), name="ck_node_states_input_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("output_hash"), name="ck_node_states_output_hash_hex"),
+)
+Index(
+    "uq_node_states_coalesce_member_identity",
+    node_states_table.c.state_id,
+    node_states_table.c.run_id,
+    node_states_table.c.token_id,
+    unique=True,
+)
+
+# === Durable coalesce effects (epoch 27) ===
+
+coalesce_effects_table = Table(
+    "coalesce_effects",
+    metadata,
+    Column("effect_id", String(64), primary_key=True),
+    Column("run_id", String(64), nullable=False),
+    Column("coalesce_node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    Column("row_id", String(64), nullable=False),
+    # Epoch 36 (elspeth-8655045f98, arch-M1 site #4): the closing FORK
+    # group's id, captured pre-pop at the writer (coalesce_tokens'
+    # shared_group_id, NOT re-derived from the merged token's own path,
+    # which no longer carries the frame once the closer pops it). Sibling
+    # fork groups share row_id but never share group_id, so this is the
+    # collision-free key the restore reader needs — row_id alone let two
+    # independently-completed sibling merges look like corruption
+    # (get_committed_coalesce_residual raised on >1 row). nullable=False,
+    # no defaulting branch: the writer's own guard already requires the
+    # anchor to carry an innermost FORK frame before it gets this far.
+    Column("group_id", String(64), nullable=False),
+    Column("parent_set_hash", String(64), nullable=False),
+    Column("effect_hash", String(64), nullable=False),
+    Column("expected_token_data_ref", String(64), nullable=False),
+    Column("step_in_pipeline", Integer),
+    Column("status", String(16), nullable=False),
+    Column("result_token_id", String(64), nullable=False),
+    Column("result_join_group_id", String(64), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("completed_at", DateTime(timezone=True)),
+    UniqueConstraint("effect_id", "run_id", name="uq_coalesce_effects_run_identity"),
+    # uq_coalesce_effects_scope deliberately KEEPS row_id, not group_id
+    # (elspeth-8655045f98 review disposition): group_id structurally
+    # determines row_id (a fork group belongs to exactly one row) and
+    # parent_set_hash already discriminates sibling groups today — they
+    # never share a parent token set — so (row_id, parent_set_hash) and
+    # (group_id, parent_set_hash) give equivalent idempotency protection
+    # here. Swapping in group_id would buy nothing against arch-M1 while
+    # opening a real gap: the idempotency SELECT immediately below (which
+    # this constraint backstops) cannot cheaply gain group_id — the
+    # closing FORK group isn't known until the parent lineage paths load
+    # inside write_connection(), after this scope is built — so a
+    # constraint keyed on group_id while the SELECT stays row_id-keyed
+    # would let a legitimate idempotent retry miss the SELECT and hit the
+    # constraint as a hard IntegrityError instead of an idempotent return
+    # (the surrounding code's own contract: a natural-key IntegrityError
+    # here means a violated lock invariant, not idempotency, and must
+    # surface unchanged). The existing tuple remains correct as-is.
+    UniqueConstraint(
+        "run_id",
+        "coalesce_node_id",
+        "row_id",
+        "parent_set_hash",
+        name="uq_coalesce_effects_scope",
+    ),
+    UniqueConstraint("result_token_id", name="uq_coalesce_effects_result_token"),
+    UniqueConstraint("result_join_group_id", name="uq_coalesce_effects_result_group"),
+    CheckConstraint(
+        "(status = 'materialized' AND completed_at IS NULL) OR (status = 'completed' AND completed_at IS NOT NULL)",
+        name="ck_coalesce_effects_lifecycle",
+    ),
+    CheckConstraint(_LowerHex64Check("parent_set_hash"), name="ck_coalesce_effects_parent_set_hash_hex"),
+    CheckConstraint(_LowerHex64Check("effect_hash"), name="ck_coalesce_effects_effect_hash_hex"),
+    CheckConstraint(_LowerHex64Check("expected_token_data_ref"), name="ck_coalesce_effects_payload_ref_hex"),
+    ForeignKeyConstraint(["run_id"], ["runs.run_id"], name="fk_coalesce_effects_run"),
+    ForeignKeyConstraint(["row_id", "run_id"], ["rows.row_id", "rows.run_id"], name="fk_coalesce_effects_row"),
+    ForeignKeyConstraint(
+        ["result_token_id", "run_id", "result_join_group_id"],
+        ["tokens.token_id", "tokens.run_id", "tokens.join_group_id"],
+        name="fk_coalesce_effects_result_identity",
+    ),
+)
+
+coalesce_effect_members_table = Table(
+    "coalesce_effect_members",
+    metadata,
+    Column("effect_id", String(64), nullable=False),
+    Column("run_id", String(64), nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    Column("parent_token_id", String(64), nullable=False),
+    Column("parent_state_id", String(64)),
+    PrimaryKeyConstraint("effect_id", "ordinal"),
+    UniqueConstraint("effect_id", "parent_token_id", name="uq_coalesce_effect_members_token"),
+    UniqueConstraint("effect_id", "parent_state_id", name="uq_coalesce_effect_members_state"),
+    CheckConstraint("ordinal >= 0", name="ck_coalesce_effect_members_ordinal"),
+    ForeignKeyConstraint(
+        ["effect_id", "run_id"],
+        ["coalesce_effects.effect_id", "coalesce_effects.run_id"],
+        name="fk_coalesce_effect_members_effect",
+    ),
+    ForeignKeyConstraint(
+        ["parent_token_id", "run_id"],
+        ["tokens.token_id", "tokens.run_id"],
+        name="fk_coalesce_effect_members_token",
+    ),
+    ForeignKeyConstraint(
+        ["parent_state_id", "run_id", "parent_token_id"],
+        ["node_states.state_id", "node_states.run_id", "node_states.token_id"],
+        name="fk_coalesce_effect_members_state_token",
+    ),
+)
+
+# === Recoverable sink effects (epoch 26) ===
+
+sink_effect_streams_table = Table(
+    "sink_effect_streams",
+    metadata,
+    Column("stream_id", String(64), primary_key=True),
+    Column("run_id", String(64), nullable=False),
+    Column("sink_node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    Column("role", String(16), nullable=False),
+    Column("requested_target_hash", String(64), nullable=False),
+    Column("resolved_target", String(512)),
+    Column("next_sequence", Integer, nullable=False),
+    Column("tail_effect_id", String(64)),
+    Column("head_effect_id", String(64)),
+    Column("head_descriptor_hash", String(64)),
+    UniqueConstraint("stream_id", "run_id"),
+    CheckConstraint("role IN ('primary','failsink')", name="ck_sink_effect_streams_role"),
+    CheckConstraint("next_sequence >= 0", name="ck_sink_effect_streams_next_sequence"),
+    CheckConstraint(_LowerHex64Check("requested_target_hash"), name="ck_sink_effect_streams_requested_target_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("head_descriptor_hash"), name="ck_sink_effect_streams_head_descriptor_hash_hex"),
+    ForeignKeyConstraint(["run_id"], ["runs.run_id"]),
+    ForeignKeyConstraint(["sink_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+)
+Index(
+    "uq_sink_effect_stream_identity",
+    sink_effect_streams_table.c.run_id,
+    sink_effect_streams_table.c.sink_node_id,
+    sink_effect_streams_table.c.role,
+    sink_effect_streams_table.c.requested_target_hash,
+    unique=True,
+)
+
+audit_export_snapshots_table = Table(
+    "audit_export_snapshots",
+    metadata,
+    Column("snapshot_id", String(64), primary_key=True),
+    Column("source_run_id", String(64), nullable=False),
+    Column("source_status", String(32), nullable=False),
+    Column("source_completed_at", DateTime(timezone=True), nullable=False),
+    Column("exported_at", DateTime(timezone=True), nullable=False),
+    Column("registry_key_hash", String(64), nullable=False),
+    Column("exporter_version", String(64), nullable=False),
+    Column("serialization_version", String(64), nullable=False),
+    Column("export_format", String(16), nullable=False),
+    Column("signing_mode", String(16), nullable=False),
+    Column("signer_key_id", String(128), nullable=False),
+    Column("derivation_version", String(64), nullable=False),
+    Column("public_export_config_hash", String(64), nullable=False),
+    Column("chunking_algorithm_version", String(64), nullable=False),
+    Column("per_chunk_record_limit", Integer, nullable=False),
+    Column("per_chunk_byte_limit", Integer, nullable=False),
+    Column("record_count", Integer, nullable=False),
+    Column("total_bytes", Integer, nullable=False),
+    Column("chunk_count", Integer, nullable=False),
+    Column("terminal_chunk_ordinal", Integer, nullable=False),
+    Column("content_store_id", String(128), nullable=False),
+    Column("manifest_hash", String(64), nullable=False),
+    Column("last_chunk_seal_hash", String(64), nullable=False),
+    Column("snapshot_hash", String(64), nullable=False),
+    Column("snapshot_seal_hash", String(64), nullable=False),
+    Column("signature_hex", String(64)),
+    Column("record_chain_algorithm", String(64), nullable=False),
+    Column("final_hash", String(64), nullable=False),
+    Column("signed_manifest_schema", String(64), nullable=False),
+    Column("signed_manifest_hash", String(64), nullable=False),
+    Column("signed_manifest_ref", String(71), nullable=False),
+    Column("signed_manifest_size_bytes", Integer, nullable=False),
+    UniqueConstraint("snapshot_id", "source_run_id"),
+    CheckConstraint(
+        "source_status IN ('completed','completed_with_failures','empty') AND source_completed_at IS NOT NULL",
+        name="ck_audit_export_snapshots_terminal_witness",
+    ),
+    CheckConstraint("record_count > 0 AND total_bytes > 0 AND chunk_count > 0", name="ck_audit_export_snapshots_positive_totals"),
+    CheckConstraint("terminal_chunk_ordinal = chunk_count - 1", name="ck_audit_export_snapshots_terminal_ordinal"),
+    CheckConstraint(_LowerHex64Check("manifest_hash"), name="ck_audit_export_snapshots_manifest_hash_hex"),
+    CheckConstraint(_LowerHex64Check("snapshot_hash"), name="ck_audit_export_snapshots_snapshot_hash_hex"),
+    CheckConstraint(_LowerHex64Check("snapshot_seal_hash"), name="ck_audit_export_snapshots_snapshot_seal_hash_hex"),
+    CheckConstraint(_LowerHex64Check("last_chunk_seal_hash"), name="ck_audit_export_snapshots_last_chunk_seal_hash_hex"),
+    CheckConstraint(_LowerHex64Check("final_hash"), name="ck_audit_export_snapshots_final_hash_hex"),
+    CheckConstraint(_LowerHex64Check("signed_manifest_hash"), name="ck_audit_export_snapshots_signed_manifest_hash_hex"),
+    CheckConstraint(_LowerHex64Check("registry_key_hash"), name="ck_audit_export_snapshots_registry_key_hash_hex"),
+    CheckConstraint(_LowerHex64Check("public_export_config_hash"), name="ck_audit_export_snapshots_public_export_config_hash_hex"),
+    CheckConstraint(
+        _Sha256ContentRefCheck("signed_manifest_ref", "signed_manifest_hash"),
+        name="ck_audit_export_snapshots_signed_manifest_ref",
+    ),
+    CheckConstraint(
+        _SignedManifestSizeCheck(),
+        name="ck_audit_export_snapshots_signed_manifest_size",
+    ),
+    CheckConstraint(
+        "signed_manifest_schema = 'elspeth.audit-export-manifest.v2'",
+        name="ck_audit_export_snapshots_manifest_schema",
+    ),
+    CheckConstraint(
+        "derivation_version = 'audit-export-derivation-v1'",
+        name="ck_audit_export_snapshots_derivation_version",
+    ),
+    CheckConstraint(_SigningTupleCheck(), name="ck_audit_export_snapshots_signing_tuple"),
+    ForeignKeyConstraint(
+        ["source_run_id", "source_status", "source_completed_at"],
+        ["runs.run_id", "runs.status", "runs.completed_at"],
+    ),
+    ForeignKeyConstraint(
+        ["snapshot_id", "terminal_chunk_ordinal", "last_chunk_seal_hash", "record_count", "total_bytes"],
+        [
+            "audit_export_snapshot_chunks.snapshot_id",
+            "audit_export_snapshot_chunks.ordinal",
+            "audit_export_snapshot_chunks.chunk_seal_hash",
+            "audit_export_snapshot_chunks.cumulative_records",
+            "audit_export_snapshot_chunks.cumulative_bytes",
+        ],
+        deferrable=True,
+        initially="DEFERRED",
+    ),
+)
+Index(
+    "uq_audit_export_snapshots_registry_key",
+    audit_export_snapshots_table.c.source_run_id,
+    audit_export_snapshots_table.c.exporter_version,
+    audit_export_snapshots_table.c.serialization_version,
+    audit_export_snapshots_table.c.export_format,
+    audit_export_snapshots_table.c.signing_mode,
+    audit_export_snapshots_table.c.signer_key_id,
+    audit_export_snapshots_table.c.public_export_config_hash,
+    unique=True,
+)
+Index("ix_audit_export_snapshots_registry_key_hash", audit_export_snapshots_table.c.registry_key_hash, unique=True)
+
+audit_export_snapshot_chunks_table = Table(
+    "audit_export_snapshot_chunks",
+    metadata,
+    Column("snapshot_id", String(64), nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    Column("content_ref", String(71), nullable=False),
+    Column("content_hash", String(64), nullable=False),
+    Column("size_bytes", Integer, nullable=False),
+    Column("record_count", Integer, nullable=False),
+    Column("predecessor_seal_hash", String(64)),
+    Column("cumulative_records", Integer, nullable=False),
+    Column("cumulative_bytes", Integer, nullable=False),
+    Column("chunk_seal_hash", String(64), nullable=False),
+    PrimaryKeyConstraint("snapshot_id", "ordinal"),
+    CheckConstraint("ordinal >= 0", name="ck_audit_export_snapshot_chunks_ordinal"),
+    CheckConstraint("size_bytes > 0 AND size_bytes <= 67108864", name="ck_audit_export_snapshot_chunks_size"),
+    CheckConstraint("record_count > 0 AND record_count <= 1000000", name="ck_audit_export_snapshot_chunks_records"),
+    CheckConstraint("cumulative_records > 0 AND cumulative_bytes > 0", name="ck_audit_export_snapshot_chunks_cumulative"),
+    CheckConstraint(_LowerHex64Check("content_hash"), name="ck_audit_export_snapshot_chunks_content_hash_hex"),
+    CheckConstraint(_LowerHex64Check("chunk_seal_hash"), name="ck_audit_export_snapshot_chunks_seal_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("predecessor_seal_hash"), name="ck_audit_export_snapshot_chunks_predecessor_hash"),
+    CheckConstraint(
+        _Sha256ContentRefCheck("content_ref", "content_hash"),
+        name="ck_audit_export_snapshot_chunks_content_ref",
+    ),
+    ForeignKeyConstraint(["snapshot_id"], ["audit_export_snapshots.snapshot_id"], deferrable=True, initially="DEFERRED"),
+)
+Index(
+    "uq_audit_export_snapshot_chunks_terminal",
+    audit_export_snapshot_chunks_table.c.snapshot_id,
+    audit_export_snapshot_chunks_table.c.ordinal,
+    audit_export_snapshot_chunks_table.c.chunk_seal_hash,
+    audit_export_snapshot_chunks_table.c.cumulative_records,
+    audit_export_snapshot_chunks_table.c.cumulative_bytes,
+    unique=True,
+)
+
+sink_effects_table = Table(
+    "sink_effects",
+    metadata,
+    Column("effect_id", String(64), primary_key=True),
+    Column("run_id", String(64), nullable=False),
+    Column("sink_node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    Column("role", String(16), nullable=False),
+    Column("state", String(16), nullable=False),
+    Column("protocol_version", String(64), nullable=False),
+    Column("input_kind", String(32), nullable=False),
+    Column("required_member_ordinal", Integer),
+    Column("required_snapshot_slot", Integer),
+    Column("config_hash", String(64), nullable=False),
+    Column("membership_or_manifest_hash", String(64), nullable=False),
+    Column("group_payload_hash", String(64), nullable=False),
+    Column("artifact_id", String(64), nullable=False),
+    Column("artifact_idempotency_key", String(256), nullable=False),
+    Column("target_json", Text, nullable=False),
+    Column("inspection_mode", String(32)),
+    Column("inspection_attempt_id", String(64)),
+    Column("plan_json", Text),
+    Column("plan_hash", String(64)),
+    Column("descriptor_mode", String(32)),
+    Column("expected_descriptor_hash", String(64)),
+    Column("precondition_hash", String(64)),
+    Column("prepared_at", DateTime(timezone=True)),
+    Column("lease_owner", String(128)),
+    Column("generation", Integer, nullable=False),
+    Column("lease_expires_at", DateTime(timezone=True)),
+    Column("lease_heartbeat_at", DateTime(timezone=True)),
+    Column("reconcile_kind", String(48)),
+    Column("reconcile_evidence_hash", String(64)),
+    Column("result_descriptor_hash", String(64)),
+    Column("publication_performed", Boolean),
+    Column("publication_evidence_kind", String(32)),
+    Column("primary_effect_id", String(64)),
+    Column("stream_id", String(64)),
+    Column("stream_sequence", Integer),
+    Column("predecessor_effect_id", String(64)),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("finalized_at", DateTime(timezone=True)),
+    UniqueConstraint("effect_id", "input_kind"),
+    UniqueConstraint("effect_id", "run_id"),
+    UniqueConstraint("effect_id", "run_id", "sink_node_id"),
+    UniqueConstraint("effect_id", "stream_id"),
+    CheckConstraint("role IN ('primary','failsink')", name="ck_sink_effects_role"),
+    CheckConstraint("state IN ('reserved','prepared','in_flight','finalized')", name="ck_sink_effects_state"),
+    CheckConstraint(
+        "(input_kind = 'pipeline_members' AND required_member_ordinal = 0 AND required_snapshot_slot IS NULL) OR "
+        "(input_kind = 'audit_export_snapshot' AND required_member_ordinal IS NULL AND required_snapshot_slot = 0)",
+        name="ck_sink_effects_input_kind_xor",
+    ),
+    CheckConstraint(
+        "(state = 'reserved' AND inspection_mode IS NULL AND inspection_attempt_id IS NULL "
+        "AND plan_json IS NULL AND plan_hash IS NULL AND descriptor_mode IS NULL AND expected_descriptor_hash IS NULL "
+        "AND precondition_hash IS NULL AND prepared_at IS NULL "
+        "AND ((generation = 0 AND lease_owner IS NULL AND lease_expires_at IS NULL AND lease_heartbeat_at IS NULL) OR "
+        "(generation > 0 AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL AND lease_heartbeat_at IS NOT NULL)) "
+        "AND reconcile_kind IS NULL AND reconcile_evidence_hash IS NULL "
+        "AND result_descriptor_hash IS NULL AND publication_performed IS NULL AND publication_evidence_kind IS NULL "
+        "AND finalized_at IS NULL) OR "
+        "(state = 'prepared' AND plan_hash IS NOT NULL AND plan_json IS NOT NULL "
+        "AND inspection_mode IS NOT NULL AND inspection_attempt_id IS NOT NULL AND descriptor_mode IS NOT NULL "
+        "AND precondition_hash IS NOT NULL AND prepared_at IS NOT NULL AND lease_owner IS NULL "
+        "AND lease_expires_at IS NULL AND lease_heartbeat_at IS NULL AND reconcile_kind IS NULL "
+        "AND reconcile_evidence_hash IS NULL AND result_descriptor_hash IS NULL AND publication_performed IS NULL "
+        "AND publication_evidence_kind IS NULL AND finalized_at IS NULL) OR "
+        "(state = 'in_flight' AND plan_hash IS NOT NULL AND plan_json IS NOT NULL AND inspection_mode IS NOT NULL "
+        "AND inspection_attempt_id IS NOT NULL AND descriptor_mode IS NOT NULL AND precondition_hash IS NOT NULL "
+        "AND prepared_at IS NOT NULL AND lease_owner IS NOT NULL AND generation > 0 AND lease_expires_at IS NOT NULL "
+        "AND lease_heartbeat_at IS NOT NULL AND reconcile_kind IS NULL AND reconcile_evidence_hash IS NULL "
+        "AND result_descriptor_hash IS NULL AND publication_performed IS NULL AND publication_evidence_kind IS NULL "
+        "AND finalized_at IS NULL) OR "
+        "(state = 'finalized' AND plan_hash IS NOT NULL AND plan_json IS NOT NULL AND inspection_mode IS NOT NULL "
+        "AND inspection_attempt_id IS NOT NULL AND descriptor_mode IS NOT NULL AND precondition_hash IS NOT NULL "
+        "AND prepared_at IS NOT NULL AND result_descriptor_hash IS NOT NULL AND publication_performed IS NOT NULL "
+        "AND publication_evidence_kind IS NOT NULL AND lease_owner IS NULL AND lease_expires_at IS NULL "
+        "AND lease_heartbeat_at IS NULL AND finalized_at IS NOT NULL AND "
+        "((publication_performed IS TRUE AND publication_evidence_kind = 'returned' AND reconcile_kind IS NULL "
+        "AND reconcile_evidence_hash IS NULL) OR "
+        "(publication_performed IS TRUE AND publication_evidence_kind = 'reconciled' "
+        "AND reconcile_kind = 'applied_with_exact_descriptor' AND reconcile_evidence_hash IS NOT NULL) OR "
+        "(publication_performed IS FALSE AND publication_evidence_kind IN ('inherited','virtual') "
+        "AND reconcile_kind IS NULL AND reconcile_evidence_hash IS NULL)))",
+        name="ck_sink_effects_lifecycle",
+    ),
+    CheckConstraint("generation >= 0", name="ck_sink_effects_generation"),
+    CheckConstraint(
+        "lease_expires_at IS NULL OR lease_heartbeat_at IS NULL OR lease_expires_at >= lease_heartbeat_at",
+        name="ck_sink_effects_lease_window",
+    ),
+    CheckConstraint(
+        "(stream_id IS NULL AND stream_sequence IS NULL AND predecessor_effect_id IS NULL) OR "
+        "(stream_id IS NOT NULL AND stream_sequence = 0 AND predecessor_effect_id IS NULL) OR "
+        "(stream_id IS NOT NULL AND stream_sequence > 0 AND predecessor_effect_id IS NOT NULL)",
+        name="ck_sink_effects_stream_shape",
+    ),
+    CheckConstraint(
+        "descriptor_mode IS NULL OR "
+        "(descriptor_mode = 'precomputed' AND expected_descriptor_hash IS NOT NULL) OR "
+        "(descriptor_mode = 'result_derived' AND expected_descriptor_hash IS NULL) OR "
+        "(descriptor_mode = 'no_publication' AND expected_descriptor_hash IS NOT NULL)",
+        name="ck_sink_effects_descriptor_mode",
+    ),
+    CheckConstraint(
+        "inspection_mode IS NULL OR inspection_mode IN ('inspected','no_inspection_required')",
+        name="ck_sink_effects_inspection_mode",
+    ),
+    CheckConstraint(
+        "reconcile_kind IS NULL OR reconcile_kind IN ('not_applied','applied_with_exact_descriptor','unknown')",
+        name="ck_sink_effects_reconcile_kind",
+    ),
+    ForeignKeyConstraint(["run_id"], ["runs.run_id"]),
+    CheckConstraint(_LowerHex64Check("config_hash"), name="ck_sink_effects_config_hash_hex"),
+    CheckConstraint(_LowerHex64Check("membership_or_manifest_hash"), name="ck_sink_effects_membership_or_manifest_hash_hex"),
+    CheckConstraint(_LowerHex64Check("group_payload_hash"), name="ck_sink_effects_group_payload_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("plan_hash"), name="ck_sink_effects_plan_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("expected_descriptor_hash"), name="ck_sink_effects_expected_descriptor_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("precondition_hash"), name="ck_sink_effects_precondition_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("result_descriptor_hash"), name="ck_sink_effects_result_descriptor_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("reconcile_evidence_hash"), name="ck_sink_effects_reconcile_evidence_hash_hex"),
+    ForeignKeyConstraint(["sink_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    ForeignKeyConstraint(["primary_effect_id"], ["sink_effects.effect_id"]),
+    ForeignKeyConstraint(["stream_id", "run_id"], ["sink_effect_streams.stream_id", "sink_effect_streams.run_id"]),
+    ForeignKeyConstraint(["predecessor_effect_id", "stream_id"], ["sink_effects.effect_id", "sink_effects.stream_id"]),
+    ForeignKeyConstraint(
+        ["effect_id", "input_kind", "required_member_ordinal"],
+        ["sink_effect_members.effect_id", "sink_effect_members.input_kind", "sink_effect_members.ordinal"],
+        deferrable=True,
+        initially="DEFERRED",
+    ),
+    ForeignKeyConstraint(
+        ["effect_id", "input_kind", "required_snapshot_slot"],
+        [
+            "sink_effect_export_snapshots.effect_id",
+            "sink_effect_export_snapshots.input_kind",
+            "sink_effect_export_snapshots.slot",
+        ],
+        deferrable=True,
+        initially="DEFERRED",
+    ),
+)
+Index("ix_sink_effects_stream_sequence", sink_effects_table.c.stream_id, sink_effects_table.c.stream_sequence, unique=True)
+Index("ix_sink_effects_run_state", sink_effects_table.c.run_id, sink_effects_table.c.state)
+
+sink_effect_members_table = Table(
+    "sink_effect_members",
+    metadata,
+    Column("effect_id", String(64), nullable=False),
+    Column("input_kind", String(32), nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    Column("run_id", String(64), nullable=False),
+    Column("sink_node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    Column("role", String(16), nullable=False),
+    Column("token_id", String(64), nullable=False),
+    Column("row_id", String(64), nullable=False),
+    Column("ingest_sequence", Integer, nullable=False),
+    Column("lineage_json", Text, nullable=False),
+    Column("lineage_hash", String(64), nullable=False),
+    Column("payload_hash", String(64), nullable=False),
+    Column("primary_effect_id", String(64)),
+    Column("prepared_disposition", String(16)),
+    Column("reason_hash", String(64)),
+    Column("member_effect_id", String(64)),
+    Column("member_state", String(16)),
+    Column("descriptor_hash", String(64)),
+    Column("evidence_hash", String(64)),
+    PrimaryKeyConstraint("effect_id", "ordinal"),
+    UniqueConstraint("effect_id", "input_kind", "ordinal"),
+    CheckConstraint("input_kind = 'pipeline_members'", name="ck_sink_effect_members_input_kind"),
+    CheckConstraint("ordinal >= 0 AND ingest_sequence >= 0", name="ck_sink_effect_members_order"),
+    CheckConstraint(
+        "(role = 'primary' AND primary_effect_id IS NULL) OR (role = 'failsink' AND primary_effect_id IS NOT NULL)",
+        name="ck_sink_effect_members_primary_linkage",
+    ),
+    CheckConstraint(
+        "prepared_disposition IS NULL OR prepared_disposition IN ('accepted','diverted')",
+        name="ck_sink_effect_members_disposition",
+    ),
+    CheckConstraint(
+        "member_state IS NULL OR member_state IN ('reserved','prepared','in_flight','finalized')",
+        name="ck_sink_effect_members_state",
+    ),
+    ForeignKeyConstraint(["effect_id", "input_kind"], ["sink_effects.effect_id", "sink_effects.input_kind"]),
+    ForeignKeyConstraint(["token_id", "row_id", "run_id"], ["tokens.token_id", "tokens.row_id", "tokens.run_id"]),
+    ForeignKeyConstraint(["row_id", "run_id"], ["rows.row_id", "rows.run_id"]),
+    ForeignKeyConstraint(["sink_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    ForeignKeyConstraint(["primary_effect_id", "run_id"], ["sink_effects.effect_id", "sink_effects.run_id"]),
+    CheckConstraint(_LowerHex64Check("lineage_hash"), name="ck_sink_effect_members_lineage_hash_hex"),
+    CheckConstraint(_LowerHex64Check("payload_hash"), name="ck_sink_effect_members_payload_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("descriptor_hash"), name="ck_sink_effect_members_descriptor_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("evidence_hash"), name="ck_sink_effect_members_evidence_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("reason_hash"), name="ck_sink_effect_members_reason_hash_hex"),
+)
+Index(
+    "uq_sink_effect_member_binding",
+    sink_effect_members_table.c.run_id,
+    sink_effect_members_table.c.sink_node_id,
+    sink_effect_members_table.c.role,
+    sink_effect_members_table.c.token_id,
+    unique=True,
+)
+
+sink_effect_export_snapshots_table = Table(
+    "sink_effect_export_snapshots",
+    metadata,
+    Column("effect_id", String(64), nullable=False),
+    Column("input_kind", String(32), nullable=False),
+    Column("slot", Integer, nullable=False),
+    Column("snapshot_id", String(64), nullable=False),
+    PrimaryKeyConstraint("effect_id", "slot"),
+    UniqueConstraint("effect_id", "input_kind", "slot"),
+    UniqueConstraint("effect_id", "snapshot_id"),
+    CheckConstraint("input_kind = 'audit_export_snapshot'", name="ck_sink_effect_export_snapshots_input_kind"),
+    CheckConstraint("slot = 0", name="ck_sink_effect_export_snapshots_slot"),
+    ForeignKeyConstraint(["effect_id", "input_kind"], ["sink_effects.effect_id", "sink_effects.input_kind"]),
+    ForeignKeyConstraint(["snapshot_id"], ["audit_export_snapshots.snapshot_id"]),
+)
+
+sink_effect_attempts_table = Table(
+    "sink_effect_attempts",
+    metadata,
+    Column("attempt_id", String(64), primary_key=True),
+    Column("effect_id", String(64), nullable=False),
+    Column("member_ordinal", Integer),
+    Column("generation", Integer, nullable=False),
+    Column("action", String(16), nullable=False),
+    Column("call_kind", String(64), nullable=False),
+    Column("request_hash", String(64), nullable=False),
+    Column("state", String(32), nullable=False),
+    Column("evidence_json", Text),
+    Column("evidence_hash", String(64)),
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("completed_at", DateTime(timezone=True)),
+    Column("latency_ms", Float),
+    CheckConstraint("generation >= 0", name="ck_sink_effect_attempts_generation"),
+    CheckConstraint("action IN ('inspect','commit','reconcile')", name="ck_sink_effect_attempts_action"),
+    CheckConstraint("state IN ('intent','returned','response_lost','error')", name="ck_sink_effect_attempts_state"),
+    CheckConstraint(_LowerHex64Check("request_hash"), name="ck_sink_effect_attempts_request_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("evidence_hash"), name="ck_sink_effect_attempts_evidence_hash_hex"),
+    ForeignKeyConstraint(["effect_id"], ["sink_effects.effect_id"]),
+    ForeignKeyConstraint(["effect_id", "member_ordinal"], ["sink_effect_members.effect_id", "sink_effect_members.ordinal"]),
+)
+Index("ix_sink_effect_attempts_effect", sink_effect_attempts_table.c.effect_id, sink_effect_attempts_table.c.started_at)
+
+sink_effect_streams_table.append_constraint(
+    ForeignKeyConstraint(["tail_effect_id", "stream_id"], ["sink_effects.effect_id", "sink_effects.stream_id"])
+)
+sink_effect_streams_table.append_constraint(
+    ForeignKeyConstraint(["head_effect_id", "stream_id"], ["sink_effects.effect_id", "sink_effects.stream_id"])
+)
+
+_SQLITE_AUDIT_EXPORT_TRIGGERS: tuple[str, ...] = (
+    """
+    CREATE TRIGGER trg_audit_export_chunk_insert_validate
+    BEFORE INSERT ON audit_export_snapshot_chunks
+    BEGIN
+      SELECT CASE WHEN NEW.content_ref <> 'sha256:' || NEW.content_hash
+        THEN RAISE(ABORT, 'audit export chunk content ref/hash mismatch') END;
+      SELECT CASE WHEN EXISTS (
+        SELECT 1 FROM audit_export_snapshots WHERE snapshot_id = NEW.snapshot_id
+      ) THEN RAISE(ABORT, 'sealed audit export snapshot cannot accept chunks') END;
+      SELECT CASE WHEN NEW.ordinal = 0 AND (
+        NEW.predecessor_seal_hash IS NOT NULL OR
+        NEW.cumulative_records <> NEW.record_count OR
+        NEW.cumulative_bytes <> NEW.size_bytes
+      ) THEN RAISE(ABORT, 'invalid audit export genesis chunk') END;
+      SELECT CASE WHEN NEW.ordinal > 0 AND NOT EXISTS (
+        SELECT 1 FROM audit_export_snapshot_chunks AS prior
+        WHERE prior.snapshot_id = NEW.snapshot_id
+          AND prior.ordinal = NEW.ordinal - 1
+          AND NEW.predecessor_seal_hash = prior.chunk_seal_hash
+          AND NEW.cumulative_records = prior.cumulative_records + NEW.record_count
+          AND NEW.cumulative_bytes = prior.cumulative_bytes + NEW.size_bytes
+      ) THEN RAISE(ABORT, 'invalid audit export chunk predecessor/totals') END;
+    END
+    """,
+    """
+    CREATE TRIGGER trg_audit_export_snapshot_insert_seal
+    BEFORE INSERT ON audit_export_snapshots
+    BEGIN
+      SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM audit_export_snapshot_chunks
+        WHERE snapshot_id = NEW.snapshot_id
+        GROUP BY snapshot_id
+        HAVING COUNT(*) = NEW.chunk_count
+           AND MIN(ordinal) = 0
+           AND MAX(ordinal) = NEW.chunk_count - 1
+           AND SUM(record_count) = NEW.record_count
+           AND SUM(size_bytes) = NEW.total_bytes
+      ) THEN RAISE(ABORT, 'audit export snapshot chunk graph is incomplete') END;
+      SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM audit_export_snapshot_chunks
+        WHERE snapshot_id = NEW.snapshot_id
+          AND ordinal = NEW.terminal_chunk_ordinal
+          AND chunk_seal_hash = NEW.last_chunk_seal_hash
+          AND cumulative_records = NEW.record_count
+          AND cumulative_bytes = NEW.total_bytes
+      ) THEN RAISE(ABORT, 'audit export terminal descriptor mismatch') END;
+    END
+    """,
+    """
+    CREATE TRIGGER trg_audit_export_snapshot_immutable
+    BEFORE UPDATE ON audit_export_snapshots
+    BEGIN SELECT RAISE(ABORT, 'sealed audit export snapshot is immutable'); END
+    """,
+    """
+    CREATE TRIGGER trg_audit_export_snapshot_immutable_delete
+    BEFORE DELETE ON audit_export_snapshots
+    BEGIN SELECT RAISE(ABORT, 'sealed audit export snapshot is immutable'); END
+    """,
+    """
+    CREATE TRIGGER trg_audit_export_chunk_immutable
+    BEFORE UPDATE ON audit_export_snapshot_chunks
+    WHEN EXISTS (SELECT 1 FROM audit_export_snapshots WHERE snapshot_id = OLD.snapshot_id)
+    BEGIN SELECT RAISE(ABORT, 'sealed audit export chunk is immutable'); END
+    """,
+    """
+    CREATE TRIGGER trg_audit_export_chunk_immutable_delete
+    BEFORE DELETE ON audit_export_snapshot_chunks
+    WHEN EXISTS (SELECT 1 FROM audit_export_snapshots WHERE snapshot_id = OLD.snapshot_id)
+    BEGIN SELECT RAISE(ABORT, 'sealed audit export chunk is immutable'); END
+    """,
+)
+for _trigger_ddl in _SQLITE_AUDIT_EXPORT_TRIGGERS:
+    event.listen(
+        audit_export_snapshot_chunks_table,
+        "after_create",
+        DDL(_trigger_ddl).execute_if(dialect="sqlite"),  # type: ignore[no-untyped-call]
+    )
+
+_POSTGRES_AUDIT_EXPORT_TRIGGER_DDL: tuple[str, ...] = (
+    """
+    CREATE FUNCTION fn_audit_export_chunk_insert_validate() RETURNS trigger AS $$
+    BEGIN
+      IF NEW.content_ref <> 'sha256:' || NEW.content_hash THEN
+        RAISE EXCEPTION 'audit export chunk content ref/hash mismatch';
+      END IF;
+      IF EXISTS (SELECT 1 FROM audit_export_snapshots WHERE snapshot_id=NEW.snapshot_id) THEN
+        RAISE EXCEPTION 'sealed audit export snapshot cannot accept chunks';
+      END IF;
+      IF NEW.ordinal=0 THEN
+        IF NEW.predecessor_seal_hash IS NOT NULL OR NEW.cumulative_records<>NEW.record_count
+           OR NEW.cumulative_bytes<>NEW.size_bytes THEN
+          RAISE EXCEPTION 'invalid audit export genesis chunk';
+        END IF;
+      ELSIF NOT EXISTS (
+        SELECT 1 FROM audit_export_snapshot_chunks prior
+        WHERE prior.snapshot_id=NEW.snapshot_id AND prior.ordinal=NEW.ordinal-1
+          AND NEW.predecessor_seal_hash=prior.chunk_seal_hash
+          AND NEW.cumulative_records=prior.cumulative_records+NEW.record_count
+          AND NEW.cumulative_bytes=prior.cumulative_bytes+NEW.size_bytes
+      ) THEN RAISE EXCEPTION 'invalid audit export chunk predecessor/totals';
+      END IF;
+      RETURN NEW;
+    END; $$ LANGUAGE plpgsql
+    """,
+    """
+    CREATE TRIGGER trg_audit_export_chunk_insert_validate
+    BEFORE INSERT ON audit_export_snapshot_chunks
+    FOR EACH ROW EXECUTE FUNCTION fn_audit_export_chunk_insert_validate()
+    """,
+    """
+    CREATE FUNCTION fn_audit_export_snapshot_insert_seal() RETURNS trigger AS $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM audit_export_snapshot_chunks WHERE snapshot_id=NEW.snapshot_id
+        GROUP BY snapshot_id HAVING COUNT(*)=NEW.chunk_count AND MIN(ordinal)=0
+          AND MAX(ordinal)=NEW.chunk_count-1 AND SUM(record_count)=NEW.record_count
+          AND SUM(size_bytes)=NEW.total_bytes
+      ) THEN RAISE EXCEPTION 'audit export snapshot chunk graph is incomplete'; END IF;
+      IF NOT EXISTS (
+        SELECT 1 FROM audit_export_snapshot_chunks WHERE snapshot_id=NEW.snapshot_id
+          AND ordinal=NEW.terminal_chunk_ordinal AND chunk_seal_hash=NEW.last_chunk_seal_hash
+          AND cumulative_records=NEW.record_count AND cumulative_bytes=NEW.total_bytes
+      ) THEN RAISE EXCEPTION 'audit export terminal descriptor mismatch'; END IF;
+      RETURN NEW;
+    END; $$ LANGUAGE plpgsql
+    """,
+    """
+    CREATE TRIGGER trg_audit_export_snapshot_insert_seal
+    BEFORE INSERT ON audit_export_snapshots
+    FOR EACH ROW EXECUTE FUNCTION fn_audit_export_snapshot_insert_seal()
+    """,
+    """
+    CREATE FUNCTION fn_audit_export_snapshot_immutable() RETURNS trigger AS $$
+    BEGIN RAISE EXCEPTION 'sealed audit export snapshot is immutable'; END; $$ LANGUAGE plpgsql
+    """,
+    """
+    CREATE TRIGGER trg_audit_export_snapshot_immutable
+    BEFORE UPDATE ON audit_export_snapshots
+    FOR EACH ROW EXECUTE FUNCTION fn_audit_export_snapshot_immutable()
+    """,
+    """
+    CREATE TRIGGER trg_audit_export_snapshot_immutable_delete
+    BEFORE DELETE ON audit_export_snapshots
+    FOR EACH ROW EXECUTE FUNCTION fn_audit_export_snapshot_immutable()
+    """,
+    """
+    CREATE FUNCTION fn_audit_export_chunk_immutable() RETURNS trigger AS $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM audit_export_snapshots WHERE snapshot_id=OLD.snapshot_id) THEN
+        RAISE EXCEPTION 'sealed audit export chunk is immutable';
+      END IF;
+      IF TG_OP = 'UPDATE' THEN
+        RETURN NEW;
+      END IF;
+      RETURN OLD;
+    END; $$ LANGUAGE plpgsql
+    """,
+    """
+    CREATE TRIGGER trg_audit_export_chunk_immutable
+    BEFORE UPDATE ON audit_export_snapshot_chunks
+    FOR EACH ROW EXECUTE FUNCTION fn_audit_export_chunk_immutable()
+    """,
+    """
+    CREATE TRIGGER trg_audit_export_chunk_immutable_delete
+    BEFORE DELETE ON audit_export_snapshot_chunks
+    FOR EACH ROW EXECUTE FUNCTION fn_audit_export_chunk_immutable()
+    """,
+)
+for _trigger_ddl in _POSTGRES_AUDIT_EXPORT_TRIGGER_DDL:
+    event.listen(
+        audit_export_snapshot_chunks_table,
+        "after_create",
+        DDL(_trigger_ddl).execute_if(dialect="postgresql"),  # type: ignore[no-untyped-call]
+    )
+
+# === Operations (Source/Sink I/O) ===
+# Operations are the source/sink equivalent of node_states - they provide
+# a parent context for external calls made during source.load() or sink.write().
+# Unlike node_states (which require a token_id), operations exist at the
+# run/node level because sources CREATE tokens rather than processing them.
+
+operations_table = Table(
+    "operations",
+    metadata,
+    Column("operation_id", String(64), primary_key=True),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False, index=True),
+    Column("node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    Column("operation_type", String(32), nullable=False),  # 'source_load' | 'sink_write' | 'runtime_preflight'
+    Column("occurrence_index", Integer, nullable=True),  # Transactional per-run/node/type order; NULL for legacy/raw rows
+    Column("sink_effect_id", String(64), ForeignKey("sink_effects.effect_id"), nullable=True),
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("completed_at", DateTime(timezone=True)),
+    Column("status", String(16), nullable=False),  # 'open' | 'completed' | 'failed' | 'pending'
+    Column("input_data_ref", String(256)),  # Payload store reference for operation input
+    Column("input_data_hash", String(64)),  # SHA-256 of canonical JSON (survives purge)
+    Column("output_data_ref", String(256)),  # Payload store reference for operation output
+    Column("output_data_hash", String(64)),  # SHA-256 of canonical JSON (survives purge)
+    Column("error_message", Text),  # Error details if failed
+    Column("duration_ms", Float),
+    # Composite FK to nodes (node_id, run_id)
+    ForeignKeyConstraint(["node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    CheckConstraint(
+        "sink_effect_id IS NULL OR operation_type = 'sink_write'",
+        name="ck_operations_sink_effect_type",
+    ),
+    CheckConstraint(_OptionalLowerHex64Check("input_data_hash"), name="ck_operations_input_data_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("output_data_hash"), name="ck_operations_output_data_hash_hex"),
+)
+Index("uq_operations_sink_effect_id", operations_table.c.sink_effect_id, unique=True)
+Index(
+    "uq_operations_occurrence",
+    operations_table.c.run_id,
+    operations_table.c.node_id,
+    operations_table.c.operation_type,
+    operations_table.c.occurrence_index,
+    unique=True,
+    sqlite_where=operations_table.c.occurrence_index.isnot(None),
+    postgresql_where=operations_table.c.occurrence_index.isnot(None),
+)
+
+# === External Calls ===
+# Calls can be parented by either a node_state (transform processing) or an
+# operation (source/sink I/O). Exactly one parent must be set (XOR constraint).
+
+calls_table = Table(
+    "calls",
+    metadata,
+    Column("call_id", String(64), primary_key=True),
+    Column("state_id", String(64), ForeignKey("node_states.state_id"), nullable=True),  # NULL for operation calls
+    Column("operation_id", String(64), ForeignKey("operations.operation_id"), nullable=True),  # NULL for state calls
+    Column("call_index", Integer, nullable=False),
+    Column("call_type", String(32), nullable=False),
+    Column("status", String(32), nullable=False),
+    Column("request_hash", String(64), nullable=False),
+    Column("request_ref", String(256)),
+    Column("response_hash", String(64)),
+    Column("response_ref", String(256)),
+    # Retain provider attribution independently of optional response retention.
+    Column("returned_model", Text, nullable=True),
+    Column("source_call_id", String(64), ForeignKey("calls.call_id"), nullable=True),
+    # Cross-DB hash anchor for interpretation events (Option A — Phase 5b).
+    # Populated by the LLM-transform plugin at execution time when the runtime
+    # node config contains an ``approved_prompt_artifact_hash`` sibling field
+    # (written by ``resolve_interpretation_event`` at compose time and committed
+    # into ``composition_states.nodes``). If the sibling field is absent (the
+    # LLM transform is NOT downstream of an interpretation event), this column
+    # is NULL.
+    #
+    # When non-NULL, this hash MUST equal the corresponding
+    # ``interpretation_events.approved_prompt_artifact_hash`` in the session
+    # audit DB for the same approved prompt artifact. An inequality indicates
+    # tampering or a composition-to-execution coherence failure. Checked by the
+    # audit-tooling layer; a mismatch is a Tier-1 crash-on-anomaly.
+    #
+    # Hash domain: elspeth.approved-prompt-artifact.v1 in core/prompt_artifact.py.
+    # Includes the system prompt and ordered effective query names/templates.
+    # Actual per-query template_hash and rendered request evidence are separate.
+    Column("approved_prompt_artifact_hash", String(64), nullable=True),
+    # Missing provider usage is unknown, never zero. Provider-specific totals
+    # and Anthropic cache measures remain in the retained response payload.
+    Column("prompt_tokens", BigInteger, nullable=True),
+    Column("completion_tokens", BigInteger, nullable=True),
+    Column("cached_prompt_tokens", BigInteger, nullable=True),
+    Column("reasoning_tokens", BigInteger, nullable=True),
+    CheckConstraint("prompt_tokens >= 0", name="calls_prompt_tokens_nonnegative"),
+    CheckConstraint("completion_tokens >= 0", name="calls_completion_tokens_nonnegative"),
+    CheckConstraint("cached_prompt_tokens >= 0", name="calls_cached_prompt_tokens_nonnegative"),
+    CheckConstraint("reasoning_tokens >= 0", name="calls_reasoning_tokens_nonnegative"),
+    Column("error_json", Text),
+    Column("latency_ms", Float),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    # XOR constraint: exactly one parent (state OR operation)
+    CheckConstraint(
+        "(state_id IS NOT NULL AND operation_id IS NULL) OR (state_id IS NULL AND operation_id IS NOT NULL)",
+        name="calls_has_parent",
+    ),
+    CheckConstraint(_LowerHex64Check("request_hash"), name="ck_calls_request_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("response_hash"), name="ck_calls_response_hash_hex"),
+    # The cross-store link to the session ``interpretation_events`` row of the
+    # same name; both sides carry the identical shape rule.
+    CheckConstraint(_OptionalLowerHex64Check("approved_prompt_artifact_hash"), name="ck_calls_approved_prompt_artifact_hash_hex"),
+)
+
+call_verifications_table = Table(
+    "call_verifications",
+    metadata,
+    Column("current_call_id", String(64), ForeignKey("calls.call_id"), primary_key=True),
+    Column("current_run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("source_run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("source_call_id", String(64), ForeignKey("calls.call_id"), nullable=True),
+    Column("is_match", Boolean, nullable=True),
+    Column("differences_json", Text, nullable=False),
+    Column("recorded_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("current_run_id <> source_run_id", name="ck_call_verifications_distinct_runs"),
+    CheckConstraint("is_match IS NOT TRUE OR source_call_id IS NOT NULL", name="ck_call_verifications_match_has_source"),
+)
+Index(
+    "ix_call_verifications_run",
+    call_verifications_table.c.current_run_id,
+    call_verifications_table.c.recorded_at,
+    call_verifications_table.c.current_call_id,
+)
+
+# Partial unique indexes for call_index uniqueness within each parent type.
+# Since calls can be parented by EITHER state_id OR operation_id (XOR),
+# we need separate uniqueness constraints for each parent type.
+# This preserves the original UNIQUE(state_id, call_index) semantics while
+# also enforcing UNIQUE(operation_id, call_index) for operation calls.
+Index(
+    "ix_calls_state_call_index_unique",
+    calls_table.c.state_id,
+    calls_table.c.call_index,
+    unique=True,
+    sqlite_where=(calls_table.c.state_id.isnot(None)),
+    postgresql_where=(calls_table.c.state_id.isnot(None)),
+)
+
+Index(
+    "ix_calls_operation_call_index_unique",
+    calls_table.c.operation_id,
+    calls_table.c.call_index,
+    unique=True,
+    sqlite_where=(calls_table.c.operation_id.isnot(None)),
+    postgresql_where=(calls_table.c.operation_id.isnot(None)),
+)
+
+# === Artifacts ===
+
+artifacts_table = Table(
+    "artifacts",
+    metadata,
+    Column("artifact_id", String(64), primary_key=True),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column(
+        "produced_by_state_id",
+        String(64),
+        nullable=True,
+    ),
+    Column("sink_effect_id", String(64), nullable=True),
+    Column("sink_node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    Column("artifact_type", String(64), nullable=False),
+    Column("path_or_uri", String(512), nullable=False),
+    Column("content_hash", String(64), nullable=False),
+    Column("size_bytes", Integer, nullable=False),
+    Column("idempotency_key", String(256)),  # For retry deduplication
+    Column("publication_performed", Boolean, nullable=False),
+    Column("publication_evidence_kind", String(32), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    # Composite FK: producer node state must belong to the artifact run.
+    ForeignKeyConstraint(["produced_by_state_id", "run_id"], ["node_states.state_id", "node_states.run_id"]),
+    ForeignKeyConstraint(
+        ["sink_effect_id", "run_id", "sink_node_id"],
+        ["sink_effects.effect_id", "sink_effects.run_id", "sink_effects.sink_node_id"],
+    ),
+    # Composite FK to nodes (node_id, run_id)
+    ForeignKeyConstraint(["sink_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    CheckConstraint(
+        "(produced_by_state_id IS NOT NULL AND sink_effect_id IS NULL) OR (produced_by_state_id IS NULL AND sink_effect_id IS NOT NULL)",
+        name="ck_artifacts_producer_xor",
+    ),
+    CheckConstraint(
+        "publication_evidence_kind IN ('returned','reconciled','inherited','virtual','legacy_returned')",
+        name="ck_artifacts_publication_evidence_kind",
+    ),
+    CheckConstraint(_LowerHex64Check("content_hash"), name="ck_artifacts_content_hash_hex"),
+)
+Index(
+    "uq_artifacts_run_idempotency_key",
+    artifacts_table.c.run_id,
+    artifacts_table.c.idempotency_key,
+    unique=True,
+    sqlite_where=artifacts_table.c.idempotency_key.isnot(None),
+    postgresql_where=artifacts_table.c.idempotency_key.isnot(None),
+)
+
+# === Routing Events ===
+
+routing_events_table = Table(
+    "routing_events",
+    metadata,
+    Column("event_id", String(64), primary_key=True),
+    Column("state_id", String(64), nullable=False),
+    Column("edge_id", String(64), nullable=False),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("routing_group_id", String(64), nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    Column("mode", String(16), nullable=False),  # move, copy
+    Column("reason_hash", String(64)),
+    Column("reason_ref", String(256)),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint("routing_group_id", "ordinal"),
+    # Composite FKs: routed state and edge must belong to the same run.
+    ForeignKeyConstraint(["state_id", "run_id"], ["node_states.state_id", "node_states.run_id"]),
+    ForeignKeyConstraint(["edge_id", "run_id"], ["edges.edge_id", "edges.run_id"]),
+    CheckConstraint(_OptionalLowerHex64Check("reason_hash"), name="ck_routing_events_reason_hash_hex"),
+)
+
+# === Batches (Aggregation) ===
+
+batches_table = Table(
+    "batches",
+    metadata,
+    Column("batch_id", String(64), primary_key=True),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("aggregation_node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    Column("aggregation_state_id", String(64)),
+    # Epoch 29: one batch may materialize exactly one deaggregation child set.
+    # The expansion writer claims this slot by CAS in the same transaction as
+    # the child tokens and selected-parent terminal outcome.
+    Column("expansion_group_id", String(32)),
+    Column("retry_of_batch_id", String(64)),
+    Column("trigger_reason", String(128)),
+    Column("trigger_type", String(32)),  # TriggerType enum value
+    Column("attempt", Integer, nullable=False, default=0),
+    Column("status", String(32), nullable=False),  # draft, executing, completed, failed
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("completed_at", DateTime(timezone=True)),
+    # Composite unique target for run-scoped batch FKs.
+    UniqueConstraint("batch_id", "run_id"),
+    UniqueConstraint("retry_of_batch_id"),
+    # Composite FK to nodes (node_id, run_id)
+    ForeignKeyConstraint(["aggregation_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    # Composite FK: aggregation state must belong to the batch run.
+    ForeignKeyConstraint(["aggregation_state_id", "run_id"], ["node_states.state_id", "node_states.run_id"]),
+    # Retry lineage is same-run and one-to-one at the direct-retry level.
+    ForeignKeyConstraint(["retry_of_batch_id", "run_id"], ["batches.batch_id", "batches.run_id"]),
+)
+
+batch_members_table = Table(
+    "batch_members",
+    metadata,
+    Column("batch_id", String(64), nullable=False),
+    Column("run_id", String(64), nullable=False),
+    Column("token_id", String(64), nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    PrimaryKeyConstraint("batch_id", "token_id"),  # Natural key: token belongs to batch once
+    UniqueConstraint("batch_id", "ordinal"),  # Ordering uniqueness within a batch
+    # Composite FKs: member token and batch must belong to the same run.
+    ForeignKeyConstraint(["batch_id", "run_id"], ["batches.batch_id", "batches.run_id"]),
+    ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+)
+
+aggregation_results_table = Table(
+    "aggregation_results",
+    metadata,
+    Column("batch_id", String(64), primary_key=True),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("aggregation_state_id", String(64), nullable=False),
+    Column("output_mode", String(16), nullable=False),
+    Column("output_shape", String(16), nullable=False),
+    Column("output_hash", String(64), nullable=False),
+    Column("expansion_parent_token_id", String(64)),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint("batch_id", "run_id"),
+    UniqueConstraint("aggregation_state_id", "run_id"),
+    CheckConstraint("output_mode IN ('transform', 'passthrough')", name="ck_aggregation_results_output_mode"),
+    CheckConstraint("output_shape IN ('empty', 'single', 'multi')", name="ck_aggregation_results_output_shape"),
+    CheckConstraint(
+        "(output_mode = 'transform' AND output_shape IN ('single', 'multi') AND expansion_parent_token_id IS NOT NULL) OR "
+        "(output_mode = 'transform' AND output_shape = 'empty' AND expansion_parent_token_id IS NULL) OR "
+        "(output_mode = 'passthrough' AND output_shape IN ('empty', 'multi') AND expansion_parent_token_id IS NULL)",
+        name="ck_aggregation_results_mode_shape_parent",
+    ),
+    CheckConstraint(_LowerHex64Check("output_hash"), name="ck_aggregation_results_output_hash_hex"),
+    ForeignKeyConstraint(["batch_id", "run_id"], ["batches.batch_id", "batches.run_id"]),
+    ForeignKeyConstraint(
+        ["aggregation_state_id", "run_id"],
+        ["node_states.state_id", "node_states.run_id"],
+    ),
+    ForeignKeyConstraint(
+        ["expansion_parent_token_id", "run_id"],
+        ["tokens.token_id", "tokens.run_id"],
+    ),
+)
+
+aggregation_result_outputs_table = Table(
+    "aggregation_result_outputs",
+    metadata,
+    Column("batch_id", String(64), nullable=False),
+    Column("run_id", String(64), nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    Column("token_data_ref", String(64), nullable=False),
+    PrimaryKeyConstraint("batch_id", "ordinal"),
+    CheckConstraint("ordinal >= 0", name="ck_aggregation_result_outputs_ordinal"),
+    CheckConstraint(_LowerHex64Check("token_data_ref"), name="ck_aggregation_result_outputs_ref_hex"),
+    ForeignKeyConstraint(["batch_id", "run_id"], ["aggregation_results.batch_id", "aggregation_results.run_id"]),
+)
+
+aggregation_result_members_table = Table(
+    "aggregation_result_members",
+    metadata,
+    Column("batch_id", String(64), nullable=False),
+    Column("run_id", String(64), nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    Column("token_id", String(64), nullable=False),
+    Column("action", String(32), nullable=False),
+    Column("error_hash", String(64)),
+    PrimaryKeyConstraint("batch_id", "ordinal"),
+    UniqueConstraint("batch_id", "token_id"),
+    CheckConstraint("ordinal >= 0", name="ck_aggregation_result_members_ordinal"),
+    CheckConstraint(
+        "(action IN ('consume_batch', 'drop_filtered', 'continue_passthrough') AND error_hash IS NULL) OR "
+        "(action = 'quarantine' AND error_hash IS NOT NULL)",
+        name="ck_aggregation_result_members_action",
+    ),
+    CheckConstraint(_OptionalLowerHex16Check("error_hash"), name="ck_aggregation_result_members_error_hash_hex"),
+    ForeignKeyConstraint(["batch_id", "run_id"], ["aggregation_results.batch_id", "aggregation_results.run_id"]),
+    ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+)
+
+batch_outputs_table = Table(
+    "batch_outputs",
+    metadata,
+    Column("batch_output_id", String(64), primary_key=True),  # Surrogate PK
+    Column("batch_id", String(64), ForeignKey("batches.batch_id"), nullable=False),
+    Column("output_type", String(32), nullable=False),  # token, artifact
+    Column("output_id", String(64), nullable=False),
+    UniqueConstraint("batch_id", "output_type", "output_id"),  # Prevent duplicates
+)
+
+# === Indexes for Query Performance ===
+
+Index("ix_routing_events_state", routing_events_table.c.state_id)
+Index("ix_routing_events_run_state", routing_events_table.c.run_id, routing_events_table.c.state_id)
+Index("ix_routing_events_group", routing_events_table.c.routing_group_id)
+Index("ix_batches_run_status", batches_table.c.run_id, batches_table.c.status)
+Index("ix_batch_members_batch", batch_members_table.c.batch_id)
+Index("ix_aggregation_results_run", aggregation_results_table.c.run_id)
+Index("ix_aggregation_result_outputs_ref", aggregation_result_outputs_table.c.token_data_ref)
+Index("ix_batch_outputs_batch", batch_outputs_table.c.batch_id)
+
+# Indexes for existing Phase 1 tables
+Index("ix_nodes_run_id", nodes_table.c.run_id)
+Index("ix_edges_run_id", edges_table.c.run_id)
+Index("ix_rows_run_id", rows_table.c.run_id)
+Index("ix_rows_run_ingest_sequence", rows_table.c.run_id, rows_table.c.ingest_sequence)
+Index("ix_rows_run_source_row", rows_table.c.run_id, rows_table.c.source_node_id, rows_table.c.source_row_index)
+Index("ix_tokens_row_id", tokens_table.c.row_id)
+# Performance index for run-accounting API projections and session-list batch
+# reads. This is additive and intentionally does not advance the SQLite schema
+# epoch or participate in the required-schema compatibility gate.
+Index("ix_tokens_run_id", tokens_table.c.run_id)
+Index("ix_token_parents_parent", token_parents_table.c.parent_token_id)
+Index("ix_node_states_token", node_states_table.c.token_id)
+Index("ix_node_states_node", node_states_table.c.node_id)
+Index("ix_node_states_run", node_states_table.c.run_id)
+Index("ix_calls_state", calls_table.c.state_id)
+Index("ix_calls_operation", calls_table.c.operation_id)  # For operation call lookups
+# Phase 5b — supports the cross-DB anchor lookup: "given a session-side
+# interpretation_events.approved_prompt_artifact_hash, find the matching
+# Landscape calls row". The index is sparse on NULL (SQLite excludes NULL
+# keys from B-tree indexes by default), so the storage cost is proportional
+# to the number of LLM-transform calls downstream of an interpretation event.
+Index(
+    "ix_calls_approved_prompt_artifact_hash",
+    calls_table.c.approved_prompt_artifact_hash,
+)
+Index("ix_operations_node_run", operations_table.c.node_id, operations_table.c.run_id)
+Index("ix_artifacts_run", artifacts_table.c.run_id)
+
+# === Validation Errors (WP-11.99: Config-Driven Plugin Schemas) ===
+
+validation_errors_table = Table(
+    "validation_errors",
+    metadata,
+    Column("error_id", String(32), primary_key=True),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("node_id", String(NODE_ID_COLUMN_LENGTH)),  # Source node where validation failed (nullable)
+    Column("row_id", String(64)),  # Persisted quarantine row when one exists
+    Column("row_hash", String(64), nullable=False),
+    Column("row_data_json", Text),  # Store the row for debugging
+    Column("error", Text, nullable=False),
+    Column("schema_mode", String(16), nullable=False),  # "fixed", "flexible", "observed", "parse"
+    Column("destination", String(255), nullable=False),  # Sink name or "discard"
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    # Schema contract violation details (Phase 5: Unified Schema Contracts)
+    # These columns provide structured violation data for auditing
+    Column("violation_type", String(32)),  # "type_mismatch", "missing_field", "extra_field"
+    Column("original_field_name", String(256)),  # "'Amount USD'" for display
+    Column("normalized_field_name", String(256)),  # "amount_usd" for code reference
+    Column("expected_type", String(32)),  # "int", "str", etc.
+    Column("actual_type", String(32)),  # Type of actual value
+    # Composite FK to nodes (node_id, run_id) - nullable node_id supported
+    ForeignKeyConstraint(
+        ["node_id", "run_id"],
+        ["nodes.node_id", "nodes.run_id"],
+        ondelete="RESTRICT",
+    ),
+    ForeignKeyConstraint(
+        ["row_id", "run_id"],
+        ["rows.row_id", "rows.run_id"],
+        ondelete="RESTRICT",
+    ),
+    CheckConstraint(_LowerHex64Check("row_hash"), name="ck_validation_errors_row_hash_hex"),
+)
+
+Index("ix_validation_errors_run", validation_errors_table.c.run_id)
+Index("ix_validation_errors_node", validation_errors_table.c.node_id)
+Index("ix_validation_errors_run_row", validation_errors_table.c.run_id, validation_errors_table.c.row_id)
+
+# === Transform Errors (WP-11.99b: Transform Error Routing) ===
+
+transform_errors_table = Table(
+    "transform_errors",
+    metadata,
+    Column("error_id", String(32), primary_key=True),
+    Column("run_id", String(64), nullable=False),
+    Column("token_id", String(64), nullable=False),
+    Column("transform_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),  # Part of composite FK to nodes
+    Column("row_hash", String(64), nullable=False),
+    Column("row_data_json", Text),
+    Column("error_details_json", Text),  # From TransformResult.error()
+    Column("destination", String(255), nullable=False),  # Sink name or "discard"
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    # Composite FK to tokens (token_id, run_id) — enforces token/run ownership
+    ForeignKeyConstraint(
+        ["token_id", "run_id"],
+        ["tokens.token_id", "tokens.run_id"],
+        ondelete="RESTRICT",
+    ),
+    # Composite FK to nodes (transform_id, run_id)
+    ForeignKeyConstraint(
+        ["transform_id", "run_id"],
+        ["nodes.node_id", "nodes.run_id"],
+        ondelete="RESTRICT",
+    ),
+    CheckConstraint(_LowerHex64Check("row_hash"), name="ck_transform_errors_row_hash_hex"),
+)
+
+Index("ix_transform_errors_run", transform_errors_table.c.run_id)
+Index("ix_transform_errors_token", transform_errors_table.c.token_id)
+Index("ix_transform_errors_transform", transform_errors_table.c.transform_id)
+
+# === Checkpoints (Phase 5: Production Hardening) ===
+
+checkpoints_table = Table(
+    "checkpoints",
+    metadata,
+    Column("checkpoint_id", String(64), primary_key=True),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("sequence_number", Integer, nullable=False),  # Monotonic progress marker
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    # Topology validation (topological checkpoint compatibility). The full
+    # topology hash embeds every node's config hash, so no per-node anchor
+    # columns are needed for compatibility checking (epoch 19).
+    Column("upstream_topology_hash", String(64), nullable=False),  # Hash of ALL nodes + edges in the DAG
+    # Format version for compatibility checking (replaces hardcoded date check)
+    # Version 1: Pre-deterministic node IDs (legacy, rejected)
+    # Version 2: Deterministic node IDs (2026-01-24+)
+    # Version 3: Phase 2 traversal refactor checkpoint break
+    # Version 4: Pending coalesce state persisted in checkpoints
+    # Version 5: F1 durability unification — buffered tokens live in journal
+    #            BLOCKED rows; the checkpoint carries only scalar barrier
+    #            metadata (barrier_scalars_json)
+    Column("format_version", Integer, nullable=True),  # Nullable — populated on new runs, NULL for checkpoints created before this column
+    # Epoch 20: F1 durability unification — scalar barrier metadata replaces
+    # the dropped per-barrier buffer blob columns; buffered tokens live in
+    # token_work_items journal BLOCKED rows.
+    Column("barrier_scalars_json", Text, nullable=True),
+    CheckConstraint(_LowerHex64Check("upstream_topology_hash"), name="ck_checkpoints_upstream_topology_hash_hex"),
+)
+
+Index("ix_checkpoints_run", checkpoints_table.c.run_id)
+Index(
+    "ix_checkpoints_run_seq",
+    checkpoints_table.c.run_id,
+    checkpoints_table.c.sequence_number,
+)
+Index(
+    "ix_checkpoints_run_sequence_unique",
+    checkpoints_table.c.run_id,
+    checkpoints_table.c.sequence_number,
+    unique=True,
+)
+
+# === Secret Resolutions (P2-10: Key Vault Secret Audit Trail) ===
+# Records which secrets were loaded from where during pipeline startup.
+# NOTE: Records are inserted AFTER run is created, though secrets load before.
+# Allows auditors to answer: "Which Key Vault did this secret come from?"
+# without exposing actual secret values (stores fingerprint only).
+
+secret_resolutions_table = Table(
+    "secret_resolutions",
+    metadata,
+    Column("resolution_id", String(64), primary_key=True),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False, index=True),
+    Column("timestamp", Float, nullable=False),  # When secret was loaded (before run)
+    Column("env_var_name", String(256), nullable=False),  # Target environment variable
+    Column("source", String(32), nullable=False),  # 'keyvault' (env source doesn't record)
+    Column("vault_url", Text, nullable=True),  # Key Vault URL (NULL if source != keyvault)
+    Column("secret_name", String(256), nullable=True),  # Secret name in vault
+    Column("fingerprint", String(64), nullable=False),  # HMAC fingerprint of secret value
+    Column("resolution_latency_ms", Float, nullable=True),  # Time to fetch from vault
+    CheckConstraint(_LowerHex64Check("fingerprint"), name="ck_secret_resolutions_fingerprint_hex"),
+)
+
+Index("ix_secret_resolutions_run", secret_resolutions_table.c.run_id)
+
+
+# === Web Auth Events ===
+# Additive, non-run-scoped Landscape table for web authentication audit.
+# Records must never contain passwords, bearer tokens, raw JWTs, or unredacted
+# provider exception text.
+
+auth_events_table = Table(
+    "auth_events",
+    metadata,
+    Column("event_id", String(64), primary_key=True),
+    Column("occurred_at", DateTime(timezone=True), nullable=False),
+    Column("event_type", String(32), nullable=False),
+    Column("outcome", String(16), nullable=False),
+    Column("provider", String(16), nullable=False),
+    Column("user_id", String(256)),
+    Column("username", String(256)),
+    Column("failure_category", String(64)),
+    Column("request_id", String(64)),
+    Column("client_host", String(128)),
+    Column("user_agent", Text),
+    Column("metadata_json", Text, nullable=False),
+    # Nullable and indexed: rows written before the identity substrate
+    # existed have none, and a login that fails before an identity is
+    # resolved never will. ``user_id`` stays for the audit reader.
+    Column("identity_id", String(64)),
+    # Hand-written and pinned against ``AuthAuditEventType`` by
+    # ``tests/unit/web/auth/test_provider_type_contract.py``. Deriving the SQL
+    # from the Literal would let a contract edit change what the database
+    # admits with no epoch bump; pinning it means the drift is caught instead.
+    CheckConstraint(
+        "event_type IN ("
+        "'login', 'token_issued', 'auth_failure', 'logout', "
+        "'identity_activated', 'identity_disabled', 'identity_enabled', "
+        "'role_granted', 'role_revoked', "
+        "'relationship_asserted', 'relationship_revoked', "
+        "'approval_requested', 'approval_decided', "
+        "'review_requested', 'review_request_cancelled', 'review_attested', "
+        "'library_published', 'library_accepted', 'library_rejected', "
+        "'library_deprecated', 'library_recalled', "
+        "'quota_set', 'quota_exceeded', 'pending_identities_purged'"
+        ")",
+        name="ck_auth_events_event_type",
+    ),
+    CheckConstraint(
+        "outcome IN ('success', 'failure')",
+        name="ck_auth_events_outcome",
+    ),
+    CheckConstraint(
+        "provider IN ('local', 'oidc', 'entra', 'vanguard', 'google')",
+        name="ck_auth_events_provider",
+    ),
+)
+
+Index("ix_auth_events_occurred_at", auth_events_table.c.occurred_at)
+Index("ix_auth_events_type_outcome", auth_events_table.c.event_type, auth_events_table.c.outcome)
+Index("ix_auth_events_user", auth_events_table.c.user_id)
+Index("ix_auth_events_identity", auth_events_table.c.identity_id)
+
+# === Pre-flight Results (Pipeline Dependencies & Commencement Gates) ===
+
+preflight_results_table = Table(
+    "preflight_results",
+    metadata,
+    Column("result_id", String(64), primary_key=True),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("result_type", String(32), nullable=False),
+    Column("name", String(256), nullable=False),  # Dependency name or gate name
+    Column("result_json", Text, nullable=False),  # Full result as canonical JSON
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "result_type IN ('dependency_run', 'commencement_gate', 'readiness_check')",
+        name="ck_preflight_result_type",
+    ),
+)
+
+Index("ix_preflight_results_run", preflight_results_table.c.run_id)

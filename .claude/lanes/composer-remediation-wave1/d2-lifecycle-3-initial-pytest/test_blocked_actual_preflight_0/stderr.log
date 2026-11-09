@@ -1,0 +1,21 @@
+Traceback (most recent call last):
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/tests/helpers/composer_lifecycle_probe.py", line 108, in <module>
+    child(Path(sys.argv[1]), sys.argv[2])
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/tests/helpers/composer_lifecycle_probe.py", line 104, in child
+    asyncio.run(run())
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/runners.py", line 195, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/asyncio/base_events.py", line 691, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/tests/helpers/composer_lifecycle_probe.py", line 94, in run
+    await standalone.run_standalone(watchdog, draining, directory / "scratch", directory / "data")
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src/elspeth/composer_mcp/standalone.py", line 76, in run_standalone
+    raise originals[0]
+  File "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src/elspeth/composer_mcp/standalone.py", line 53, in settle
+    await asyncio.shield(task)
+asyncio.exceptions.CancelledError: Composer process shutdown

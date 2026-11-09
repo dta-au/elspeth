@@ -1,0 +1,5 @@
+HEAD 5e192342c3fb025fd9a91244bebe437158e9de8e
+706504f449c84f66f1491d81fb739c2bea79d0f4765385cfbbf7c7e8875c06b0  src/elspeth/web/sessions/routes/composer/proposals.py
+c138ef9072aaae9fb16eb1920e5ef8b4c8305dff33956c4bc327af3742b73d2d  src/elspeth/web/frontend/src/stores/sessionStore.ts
+5fe58216462b034fec1c56b26238a5fe4ddce2c97ae5268c5500db704c60f4f2  src/elspeth/web/frontend/src/stores/sessionStore.test.ts
+1a709f765f7202eba9b69e116437f978f0ae09237953baa999f75a2bd19b3eb8  tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py

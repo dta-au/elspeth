@@ -1,0 +1,465 @@
+"""Validation and transform error audit persistence (split from ``DataFlowRepository``).
+
+Owns the ``validation_errors`` and ``transform_errors`` audit aggregates:
+recording quarantine/validation failures and legitimate transform errors
+(Tier-3 coerce-and-record on the external row data), row linkage for
+persisted quarantine rows, and the error read models.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any, get_args
+
+from sqlalchemy import select
+from sqlalchemy.engine import Connection
+from sqlalchemy.exc import SQLAlchemyError
+
+from elspeth.contracts import (
+    TransformErrorReason,
+    TransformErrorRecord,
+    ValidationErrorRecord,
+    ValidationErrorWithContract,
+)
+from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.errors import AuditIntegrityError, TransformErrorCategory
+from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.core.ids import generate_id
+from elspeth.core.landscape._database_ops import DatabaseOps
+from elspeth.core.landscape._helpers import now
+from elspeth.core.landscape.data_flow.ownership import RowTokenOwnership
+from elspeth.core.landscape.data_flow.serialization import (
+    canonical_or_recorded_error_details_json,
+    canonical_or_recorded_hash,
+    canonical_or_recorded_json,
+)
+from elspeth.core.landscape.errors import LandscapeRecordError
+from elspeth.core.landscape.item_fencing import fenced_item_transaction
+from elspeth.core.landscape.model_loaders import TransformErrorLoader, ValidationErrorLoader
+from elspeth.core.landscape.ports import LandscapeConnectionProvider
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+from elspeth.core.landscape.schema import rows_table, transform_errors_table, validation_errors_table
+
+if TYPE_CHECKING:
+    from elspeth.contracts.errors import ContractViolation
+    from elspeth.contracts.schema_contract import PipelineRow
+
+__all__ = ["ErrorAuditRepository", "insert_batch_transform_errors_on"]
+
+
+def _require_transform_error_category(error_details: TransformErrorReason) -> None:
+    """Refuse a transform error whose reason is not a known TransformErrorCategory.
+
+    Tier 1 write guard shared by the per-row and batch writers. TypedDict has
+    zero runtime enforcement — the Literal annotation only helps at compile
+    time. Invalid reasons must crash before persisting.
+    """
+    reason = error_details["reason"]
+    valid_reasons = get_args(TransformErrorCategory)
+    if reason not in valid_reasons:
+        raise AuditIntegrityError(
+            f"Invalid TransformErrorCategory '{reason}' at Tier 1 write boundary. "
+            f"This is a plugin bug — transforms must use a valid error category. "
+            f"Valid categories: {sorted(valid_reasons)}"
+        )
+
+
+def insert_batch_transform_errors_on(
+    conn: Connection,
+    *,
+    run_id: str,
+    members: Sequence[tuple[TokenRef, PipelineRow]],
+    transform_id: str,
+    error_details: TransformErrorReason,
+    destination: str,
+) -> tuple[str, ...]:
+    """Insert one transform error per member of a FAILED aggregation batch, on ``conn``.
+
+    The batch-level twin of :meth:`ErrorAuditRepository.record_transform_error`
+    (operator ruling B5). A batch transform that returns
+    ``TransformResult.error`` fails the WHOLE batch, so every buffered member
+    gets its own ``transform_errors`` row carrying its own row and the one
+    (already scrubbed) batch reason, with the ``destination`` the per-row seam
+    records (the ``on_error`` sink name, or ``"discard"``). ONE executemany
+    INSERT, so no crash leaves a partially attributed batch.
+
+    Deliberately a connection-level helper with no transaction of its own:
+    the rows are part of the batch's recorded FAILED verdict, which
+    ``ExecutionRepository.complete_aggregation_failure`` writes in ONE
+    leader-fenced transaction with the flush node_state, the batch row and
+    the DIVERT routing_event. Whether that verdict exists is then never a
+    matter of crash timing.
+
+    Returns:
+        The error_ids, in member order.
+
+    Raises:
+        AuditIntegrityError: The member set is empty, a member belongs to
+            another run, or the reason category is not a known
+            TransformErrorCategory.
+        LandscapeRecordError: The database rejected the write or wrote fewer
+            rows than members.
+    """
+    if not members:
+        raise AuditIntegrityError("insert_batch_transform_errors_on: a failed batch has at least one member")
+    if any(ref.run_id != run_id for ref, _row_data in members):
+        raise AuditIntegrityError("insert_batch_transform_errors_on: token reference does not belong to the authority's run")
+    _require_transform_error_category(error_details)
+
+    # Coerce-and-record exactly as record_transform_error does: the reason
+    # and each member's row are canonicalised before the INSERT runs.
+    error_details_json = canonical_or_recorded_error_details_json(error_details)
+    created_at = now()
+    values = [
+        {
+            "error_id": f"terr_{generate_id()[:12]}",
+            "run_id": run_id,
+            "token_id": ref.token_id,
+            "transform_id": transform_id,
+            "row_hash": canonical_or_recorded_hash(row_data),
+            "row_data_json": canonical_or_recorded_json(row_data),
+            "error_details_json": error_details_json,
+            "destination": destination,
+            "created_at": created_at,
+        }
+        for ref, row_data in members
+    ]
+    try:
+        result = conn.execute(transform_errors_table.insert().returning(transform_errors_table.c.error_id), values)
+    except SQLAlchemyError as exc:
+        raise LandscapeRecordError(
+            f"insert_batch_transform_errors_on failed — database rejected audit write: {type(exc).__name__}"
+        ) from exc
+    if len(result.fetchall()) != len(values):
+        raise LandscapeRecordError("insert_batch_transform_errors_on: incomplete batch — audit write failed")
+    return tuple(str(value["error_id"]) for value in values)
+
+
+class ErrorAuditRepository:
+    """Validation and transform error recording and read models."""
+
+    def __init__(
+        self,
+        db: LandscapeConnectionProvider,
+        ops: DatabaseOps,
+        *,
+        validation_error_loader: ValidationErrorLoader,
+        transform_error_loader: TransformErrorLoader,
+        ownership: RowTokenOwnership,
+    ) -> None:
+        self._db = db
+        self._ops = ops
+        self._validation_error_loader = validation_error_loader
+        self._transform_error_loader = transform_error_loader
+        self._ownership = ownership
+
+    def record_validation_error(
+        self,
+        node_id: str | None,
+        row_data: Any,
+        error: str,
+        schema_mode: str,
+        destination: str,
+        *,
+        coordination_token: CoordinationToken,
+        row_id: str | None = None,
+        contract_violation: ContractViolation | None = None,
+    ) -> str:
+        """Record a validation error in the audit trail.
+
+        Called when a source row fails schema validation. The row is
+        quarantined (not processed further) but we record what we saw
+        for complete audit coverage.
+
+        Args:
+            run_id: Current run ID
+            node_id: Node where validation failed
+            row_data: The row that failed validation (may be non-dict or contain non-finite values)
+            error: Error description
+            schema_mode: Schema mode that caught the error ("fixed", "flexible", "observed")
+            destination: Where row was routed ("discard" or sink name)
+            contract_violation: Optional contract violation details for structured auditing
+
+        Returns:
+            error_id for tracking
+        """
+        run_id = coordination_token.run_id
+        error_id = f"verr_{generate_id()[:12]}"
+
+        if row_id is not None:
+            actual_run_id = self._ownership.resolve_run_id_for_row(row_id)
+            if actual_run_id != run_id:
+                raise AuditIntegrityError(
+                    f"Validation error recording prevented cross-run contamination: row {row_id!r} belongs to "
+                    f"run {actual_run_id!r}, but caller supplied run_id={run_id!r}."
+                )
+
+        # Tier-3 (external data) trust boundary: row_data may be non-canonical.
+        # The coerce-and-record helpers return the canonical representation or an
+        # explicit non-canonical fallback recorded in the audit trail.
+        row_hash = canonical_or_recorded_hash(row_data)
+        row_data_json = canonical_or_recorded_json(row_data)
+
+        # Extract contract violation details if provided
+        violation_type: str | None = None
+        normalized_field_name: str | None = None
+        original_field_name: str | None = None
+        expected_type: str | None = None
+        actual_type: str | None = None
+
+        if contract_violation is not None:
+            violation_record = ValidationErrorWithContract.from_violation(contract_violation)
+            violation_type = violation_record.violation_type
+            normalized_field_name = violation_record.normalized_field_name
+            original_field_name = violation_record.original_field_name
+            expected_type = violation_record.expected_type
+            actual_type = violation_record.actual_type
+
+        with fenced_leader_transaction(
+            self._db.engine, token=coordination_token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, verb="record_validation_error"
+        ) as conn:
+            self._ops.execute_insert_on(
+                conn,
+                validation_errors_table.insert().values(
+                    error_id=error_id,
+                    run_id=coordination_token.run_id,
+                    node_id=node_id,
+                    row_id=row_id,
+                    row_hash=row_hash,
+                    row_data_json=row_data_json,
+                    error=error,
+                    schema_mode=schema_mode,
+                    destination=destination,
+                    created_at=now(),
+                    violation_type=violation_type,
+                    normalized_field_name=normalized_field_name,
+                    original_field_name=original_field_name,
+                    expected_type=expected_type,
+                    actual_type=actual_type,
+                ),
+            )
+
+        return error_id
+
+    def link_validation_error_to_row_on(
+        self,
+        conn: Connection,
+        *,
+        run_id: str,
+        error_id: str,
+        row_id: str,
+    ) -> None:
+        """Attach a quarantine row inside the caller's write transaction."""
+        row = conn.execute(select(rows_table.c.run_id).where(rows_table.c.row_id == row_id)).one_or_none()
+        if row is None:
+            raise AuditIntegrityError(
+                f"Validation error linkage references row {row_id!r}, which does not exist in rows. This is Tier 1 data corruption."
+            )
+        if row.run_id != run_id:
+            raise AuditIntegrityError(
+                f"Validation error linkage prevented cross-run contamination: row {row_id!r} belongs to "
+                f"run {row.run_id!r}, but caller supplied run_id={run_id!r}."
+            )
+
+        error_row = conn.execute(
+            select(
+                validation_errors_table.c.run_id,
+                validation_errors_table.c.row_id,
+            )
+            .where(validation_errors_table.c.error_id == error_id)
+            .with_for_update()
+        ).one_or_none()
+        if error_row is None:
+            raise AuditIntegrityError(f"Validation error {error_id!r} does not exist in validation_errors. This is Tier 1 data corruption.")
+        if error_row.run_id != run_id:
+            raise AuditIntegrityError(
+                f"Validation error linkage prevented cross-run contamination: error {error_id!r} belongs to "
+                f"run {error_row.run_id!r}, but caller supplied run_id={run_id!r}."
+            )
+        if error_row.row_id is not None:
+            if error_row.row_id != row_id:
+                raise AuditIntegrityError(
+                    f"Validation error {error_id!r} is already linked to row {error_row.row_id!r}; refusing to relink it to {row_id!r}."
+                )
+            return
+
+        result = conn.execute(
+            validation_errors_table.update()
+            .where(
+                validation_errors_table.c.error_id == error_id,
+                validation_errors_table.c.run_id == run_id,
+                validation_errors_table.c.row_id.is_(None),
+            )
+            .values(row_id=row_id)
+        )
+        if result.rowcount != 1:
+            # Defensive CAS validation for dialects/drivers whose lock
+            # behavior differs from PostgreSQL SELECT FOR UPDATE or
+            # SQLite BEGIN IMMEDIATE.
+            current_row_id = conn.execute(
+                select(validation_errors_table.c.row_id).where(validation_errors_table.c.error_id == error_id)
+            ).scalar_one_or_none()
+            if current_row_id == row_id:
+                return
+            if current_row_id is not None:
+                raise AuditIntegrityError(
+                    f"Validation error {error_id!r} is already linked to row {current_row_id!r}; refusing to relink it to {row_id!r}."
+                )
+            raise AuditIntegrityError(f"Validation error {error_id!r} linkage compare-and-set affected zero rows")
+
+    def record_transform_error(
+        self,
+        ref: TokenRef,
+        transform_id: str,
+        row_data: Mapping[str, object] | PipelineRow,
+        error_details: TransformErrorReason,
+        destination: str,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
+    ) -> str:
+        """Record a transform processing error in the audit trail.
+
+        Called when a transform returns TransformResult.error().
+        This is for legitimate errors, NOT transform bugs.
+
+        Validates that the token belongs to the specified run_id before recording.
+        Cross-run contamination crashes immediately per Tier 1 trust model.
+
+        Args:
+            ref: TokenRef bundling token_id and run_id
+            transform_id: Transform that returned the error
+            row_data: The row that could not be processed
+            error_details: Error details from TransformResult (TransformErrorReason TypedDict)
+            destination: Where row was routed ("discard" or sink name)
+
+        Returns:
+            error_id for tracking
+
+        Raises:
+            AuditIntegrityError: If token does not belong to the specified run
+        """
+        # Validate token belongs to the specified run (Tier 1 invariant)
+        self._ownership.validate_token_run_ownership(ref)
+
+        _require_transform_error_category(error_details)
+
+        error_id = f"terr_{generate_id()[:12]}"
+
+        # error_details may contain NaN/Infinity or non-serializable values
+        # (e.g. from exception context in row operations). Tier-3 boundary:
+        # error_details originates from transform results which may carry
+        # arbitrary row-derived data. The helper returns canonical JSON or an
+        # explicit __non_canonical__ envelope recorded in the audit trail.
+        error_details_json = canonical_or_recorded_error_details_json(error_details)
+
+        # row_data may contain NaN/Infinity (valid floats that passed source
+        # validation). The coerce-and-record helpers return the canonical
+        # representation or an explicit non-canonical fallback — losing the
+        # error record is worse than recording a repr-based hash.
+        row_hash = canonical_or_recorded_hash(row_data)
+        row_data_json = canonical_or_recorded_json(row_data)
+
+        if ref.run_id != member_token.run_id or ref.token_id != work_item.token_id:
+            raise AuditIntegrityError("record_transform_error: token reference does not belong to the claimed work item")
+        with fenced_item_transaction(
+            self._db.engine, member_token=member_token, work_item=work_item, verb="record_transform_error"
+        ) as conn:
+            self._ops.execute_insert_on(
+                conn,
+                transform_errors_table.insert().values(
+                    error_id=error_id,
+                    run_id=member_token.run_id,
+                    token_id=ref.token_id,
+                    transform_id=transform_id,
+                    row_hash=row_hash,
+                    row_data_json=row_data_json,
+                    error_details_json=error_details_json,
+                    destination=destination,
+                    created_at=now(),
+                ),
+            )
+
+        return error_id
+
+    def get_validation_errors_for_row(
+        self,
+        run_id: str,
+        row_hash: str | None = None,
+        *,
+        row_id: str | None = None,
+    ) -> list[ValidationErrorRecord]:
+        """Get validation errors for a row by stable row linkage or legacy hash.
+
+        Args:
+            run_id: Run ID to query
+            row_hash: Legacy hash of the row data (used for historical/fallback lookup)
+            row_id: Persisted row identifier for quarantined rows when available
+
+        Returns:
+            List of ValidationErrorRecord models
+        """
+        if row_id is not None:
+            row_query = select(validation_errors_table).where(
+                validation_errors_table.c.run_id == run_id,
+                validation_errors_table.c.row_id == row_id,
+            )
+            row_rows = self._ops.execute_fetchall(row_query)
+            if row_rows or row_hash is None:
+                return [self._validation_error_loader.load(r) for r in row_rows]
+
+        if row_hash is None:
+            raise ValueError("get_validation_errors_for_row requires row_id or row_hash")
+
+        hash_query = select(validation_errors_table).where(
+            validation_errors_table.c.run_id == run_id,
+            validation_errors_table.c.row_hash == row_hash,
+        )
+        hash_rows = self._ops.execute_fetchall(hash_query)
+        return [self._validation_error_loader.load(r) for r in hash_rows]
+
+    def get_validation_errors_for_run(self, run_id: str) -> list[ValidationErrorRecord]:
+        """Get all validation errors for a run.
+
+        Args:
+            run_id: Run ID to query
+
+        Returns:
+            List of ValidationErrorRecord models, ordered by created_at
+        """
+        query = (
+            select(validation_errors_table).where(validation_errors_table.c.run_id == run_id).order_by(validation_errors_table.c.created_at)
+        )
+        rows = self._ops.execute_fetchall(query)
+        return [self._validation_error_loader.load(r) for r in rows]
+
+    def get_transform_errors_for_token(self, token_id: str) -> list[TransformErrorRecord]:
+        """Get transform errors for a specific token.
+
+        Args:
+            token_id: Token ID to query
+
+        Returns:
+            List of TransformErrorRecord models
+        """
+        query = select(transform_errors_table).where(
+            transform_errors_table.c.token_id == token_id,
+        )
+        rows = self._ops.execute_fetchall(query)
+        return [self._transform_error_loader.load(r) for r in rows]
+
+    def get_transform_errors_for_run(self, run_id: str) -> list[TransformErrorRecord]:
+        """Get all transform errors for a run.
+
+        Args:
+            run_id: Run ID to query
+
+        Returns:
+            List of TransformErrorRecord models, ordered by created_at
+        """
+        query = (
+            select(transform_errors_table).where(transform_errors_table.c.run_id == run_id).order_by(transform_errors_table.c.created_at)
+        )
+        rows = self._ops.execute_fetchall(query)
+        return [self._transform_error_loader.load(r) for r in rows]

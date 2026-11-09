@@ -1,0 +1,97 @@
+{
+  "head": "8c35a2e2a9092260f15e88525cbe343df5410d4e",
+  "fix_paths": [
+    "src/elspeth/composer_mcp/portable_supervisor.py",
+    "tests/helpers/composer_stdio_ownership_probe.py",
+    "tests/unit/composer_mcp/test_standalone_lifecycle.py"
+  ],
+  "tracked": [
+    "src/elspeth/composer_mcp/__init__.py",
+    "src/elspeth/composer_mcp/portable_supervisor.py",
+    "src/elspeth/composer_mcp/server.py",
+    "src/elspeth/web/async_workers.py",
+    "src/elspeth/web/required_executor.py",
+    "tests/conftest.py",
+    "tests/fixtures/required_executor.py",
+    "tests/unit/composer_mcp/test_server.py"
+  ],
+  "new": [
+    "docs/guides/composer-mcp-lifecycle.md",
+    "src/elspeth/composer_mcp/runner.py",
+    "src/elspeth/composer_mcp/standalone.py",
+    "tests/helpers/composer_lifecycle_probe.py",
+    "tests/helpers/composer_parent_death_probe.py",
+    "tests/helpers/composer_stdio_ownership_probe.py",
+    "tests/helpers/composer_stdio_probe.py",
+    "tests/unit/composer_mcp/test_standalone_lifecycle.py",
+    "tests/unit/web/test_async_worker_settlement.py"
+  ],
+  "artifacts": [
+    {
+      "path": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-fix1.diff",
+      "bytes": 7918,
+      "sha256": "0cbb975bcd23d7b74d84e624bdfd23e7e4f7def3d6ba601f4334fab4111aa1bb",
+      "checks": [
+        {
+          "command": [
+            "git",
+            "apply",
+            "--reverse",
+            "--check",
+            "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-fix1.diff"
+          ],
+          "exit": 0,
+          "stdout": "",
+          "stderr": ""
+        },
+        {
+          "command": [
+            "git",
+            "apply",
+            "--check",
+            "--whitespace=error-all",
+            "--reverse",
+            "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-fix1.diff"
+          ],
+          "exit": 0,
+          "stdout": "",
+          "stderr": ""
+        }
+      ],
+      "numstat": "5\t0\tsrc/elspeth/composer_mcp/portable_supervisor.py\n128\t0\ttests/helpers/composer_stdio_ownership_probe.py\n14\t0\ttests/unit/composer_mcp/test_standalone_lifecycle.py\n"
+    },
+    {
+      "path": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-fix1-full.diff",
+      "bytes": 87824,
+      "sha256": "530cd979f8bb0d647623d0390205cb3f12da42aa2df068443c96fb1b426053d9",
+      "checks": [
+        {
+          "command": [
+            "git",
+            "apply",
+            "--reverse",
+            "--check",
+            "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-fix1-full.diff"
+          ],
+          "exit": 0,
+          "stdout": "",
+          "stderr": ""
+        },
+        {
+          "command": [
+            "git",
+            "apply",
+            "--check",
+            "--whitespace=error-all",
+            "--reverse",
+            "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-fix1-full.diff"
+          ],
+          "exit": 0,
+          "stdout": "",
+          "stderr": ""
+        }
+      ],
+      "numstat": "16\t5\tsrc/elspeth/composer_mcp/__init__.py\n39\t6\tsrc/elspeth/composer_mcp/portable_supervisor.py\n29\t96\tsrc/elspeth/composer_mcp/server.py\n62\t0\tsrc/elspeth/web/async_workers.py\n15\t0\tsrc/elspeth/web/required_executor.py\n5\t0\ttests/conftest.py\n4\t0\ttests/fixtures/required_executor.py\n4\t2\ttests/unit/composer_mcp/test_server.py\n40\t0\tdocs/guides/composer-mcp-lifecycle.md\n62\t0\tsrc/elspeth/composer_mcp/runner.py\n78\t0\tsrc/elspeth/composer_mcp/standalone.py\n239\t0\ttests/helpers/composer_lifecycle_probe.py\n143\t0\ttests/helpers/composer_parent_death_probe.py\n128\t0\ttests/helpers/composer_stdio_ownership_probe.py\n187\t0\ttests/helpers/composer_stdio_probe.py\n373\t0\ttests/unit/composer_mcp/test_standalone_lifecycle.py\n71\t0\ttests/unit/web/test_async_worker_settlement.py\n"
+    }
+  ]
+}

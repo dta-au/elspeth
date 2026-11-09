@@ -1,0 +1,190 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-lifecycle-foundations
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 21 items / 19 deselected / 2 selected
+
+tests/unit/web/execution/test_runtime_preflight_coordinator.py FF        [100%]
+
+=================================== FAILURES ===================================
+_________ test_exhausted_budget_still_joins_a_completed_worker[False] __________
+
+fail = False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fail", [False, True])
+    async def test_exhausted_budget_still_joins_a_completed_worker(fail: bool) -> None:
+        """Zero budget must still return an already-settled in-flight result."""
+        coordinator = RuntimePreflightCoordinator()
+        key = RuntimePreflightKey("session:abc123", 5, "state-hash", "settings-hash")
+        expected = _passing_preflight()
+        original = ValueError("completed ordinary failure")
+        release = asyncio.Event()
+    
+        async def worker() -> ValidationResult:
+            await release.wait()
+            if fail:
+                raise original
+            return expected
+    
+        holder = asyncio.create_task(coordinator.run(key, worker, timeout=5.0))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.sleep(0)
+        # The task has settled but its eviction callback may not have run yet.
+        first = await coordinator.run(key, worker, timeout=0.0)
+        # No yield: the done callback has not yet evicted this exposed task.
+>       second = await coordinator.run(key, worker, timeout=0.0)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/web/execution/test_runtime_preflight_coordinator.py:263: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <elspeth.web.execution.runtime_preflight.RuntimePreflightCoordinator object at 0x7fca9e43cfb0>
+key = RuntimePreflightKey(session_scope='session:abc123', state_version=5, state_content_hash='state-hash', settings_hash='settings-hash', interpretation_tolerant=False, session_operation_context=None)
+worker = <function test_exhausted_budget_still_joins_a_completed_worker.<locals>.worker at 0x7fca9e2577e0>
+
+    async def run(
+        self,
+        key: RuntimePreflightKey,
+        worker: RuntimePreflightWorker,
+        *,
+        timeout: float | None = None,
+    ) -> RuntimePreflightEntry:
+        """Join or start the in-flight preflight for ``key``.
+    
+        ``worker`` must be the UNTIMED preflight coroutine; the per-caller
+        budget is ``timeout`` (seconds, event-loop clock). Wrapping the
+        timeout inside ``worker`` would make its expiry the shared task's
+        outcome — evicting the entry while the sync work still runs — which
+        is exactly the early release this coordinator exists to prevent.
+        """
+        async with self._lock:
+            if self._sealed:
+                return RuntimePreflightFailure(RuntimePreflightUnavailable("runtime preflight admission is sealed"))
+            if key not in self._inflight:
+                if timeout is not None and timeout <= 0:
+                    # No budget left and nothing to join: do not admit work
+                    # this caller will never await.
+                    return RuntimePreflightFailure(TimeoutError("runtime preflight budget exhausted before admission"))
+                task = asyncio.create_task(self._capture(worker))
+                self._inflight[key] = task
+                retained = _RetainedPreflight(task, asyncio.Event())
+                self._retained[task] = retained
+    
+                # Drop the in-flight entry as soon as the task finishes, even
+                # if all awaiters have been cancelled. Without this callback,
+                # a mid-flight cancellation followed by no future caller (the
+                # common case, because state_version rotates on every state
+                # mutation) would leak the entry for the life of the process.
+                # The membership check, identity comparison, and `del` below
+                # run with no intervening await, so they are atomic under the
+                # GIL; the identity guard prevents deleting a replacement task
+                # scheduled by a later run() after this one was evicted.
+                def _evict(finished: asyncio.Task[RuntimePreflightEntry]) -> None:
+                    self._observe(retained)
+                    if key in self._inflight and self._inflight[key] is finished:
+                        del self._inflight[key]
+    
+                task.add_done_callback(_evict)
+    
+            task = self._inflight[key]
+>           retained = self._retained[task]
+                       ^^^^^^^^^^^^^^^^^^^^
+E           KeyError: <Task finished name='Task-3' coro=<RuntimePreflightCoordinator._capture() done, defined at /workspace/elspeth/.claude/worktrees/composer-remediation-lifecycle-foundations/src/elspeth/web/execution/runtime_preflight.py:225> result=ValidationRes..._contracts=[])>
+
+src/elspeth/web/execution/runtime_preflight.py:121: KeyError
+__________ test_exhausted_budget_still_joins_a_completed_worker[True] __________
+
+fail = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fail", [False, True])
+    async def test_exhausted_budget_still_joins_a_completed_worker(fail: bool) -> None:
+        """Zero budget must still return an already-settled in-flight result."""
+        coordinator = RuntimePreflightCoordinator()
+        key = RuntimePreflightKey("session:abc123", 5, "state-hash", "settings-hash")
+        expected = _passing_preflight()
+        original = ValueError("completed ordinary failure")
+        release = asyncio.Event()
+    
+        async def worker() -> ValidationResult:
+            await release.wait()
+            if fail:
+                raise original
+            return expected
+    
+        holder = asyncio.create_task(coordinator.run(key, worker, timeout=5.0))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.sleep(0)
+        # The task has settled but its eviction callback may not have run yet.
+        first = await coordinator.run(key, worker, timeout=0.0)
+        # No yield: the done callback has not yet evicted this exposed task.
+>       second = await coordinator.run(key, worker, timeout=0.0)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/web/execution/test_runtime_preflight_coordinator.py:263: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <elspeth.web.execution.runtime_preflight.RuntimePreflightCoordinator object at 0x7fca9e2c5550>
+key = RuntimePreflightKey(session_scope='session:abc123', state_version=5, state_content_hash='state-hash', settings_hash='settings-hash', interpretation_tolerant=False, session_operation_context=None)
+worker = <function test_exhausted_budget_still_joins_a_completed_worker.<locals>.worker at 0x7fca9dff9d00>
+
+    async def run(
+        self,
+        key: RuntimePreflightKey,
+        worker: RuntimePreflightWorker,
+        *,
+        timeout: float | None = None,
+    ) -> RuntimePreflightEntry:
+        """Join or start the in-flight preflight for ``key``.
+    
+        ``worker`` must be the UNTIMED preflight coroutine; the per-caller
+        budget is ``timeout`` (seconds, event-loop clock). Wrapping the
+        timeout inside ``worker`` would make its expiry the shared task's
+        outcome — evicting the entry while the sync work still runs — which
+        is exactly the early release this coordinator exists to prevent.
+        """
+        async with self._lock:
+            if self._sealed:
+                return RuntimePreflightFailure(RuntimePreflightUnavailable("runtime preflight admission is sealed"))
+            if key not in self._inflight:
+                if timeout is not None and timeout <= 0:
+                    # No budget left and nothing to join: do not admit work
+                    # this caller will never await.
+                    return RuntimePreflightFailure(TimeoutError("runtime preflight budget exhausted before admission"))
+                task = asyncio.create_task(self._capture(worker))
+                self._inflight[key] = task
+                retained = _RetainedPreflight(task, asyncio.Event())
+                self._retained[task] = retained
+    
+                # Drop the in-flight entry as soon as the task finishes, even
+                # if all awaiters have been cancelled. Without this callback,
+                # a mid-flight cancellation followed by no future caller (the
+                # common case, because state_version rotates on every state
+                # mutation) would leak the entry for the life of the process.
+                # The membership check, identity comparison, and `del` below
+                # run with no intervening await, so they are atomic under the
+                # GIL; the identity guard prevents deleting a replacement task
+                # scheduled by a later run() after this one was evicted.
+                def _evict(finished: asyncio.Task[RuntimePreflightEntry]) -> None:
+                    self._observe(retained)
+                    if key in self._inflight and self._inflight[key] is finished:
+                        del self._inflight[key]
+    
+                task.add_done_callback(_evict)
+    
+            task = self._inflight[key]
+>           retained = self._retained[task]
+                       ^^^^^^^^^^^^^^^^^^^^
+E           KeyError: <Task finished name='Task-8' coro=<RuntimePreflightCoordinator._capture() done, defined at /workspace/elspeth/.claude/worktrees/composer-remediation-lifecycle-foundations/src/elspeth/web/execution/runtime_preflight.py:225> result=RuntimePrefli...ary failure'))>
+
+src/elspeth/web/execution/runtime_preflight.py:121: KeyError
+=========================== short test summary info ============================
+FAILED tests/unit/web/execution/test_runtime_preflight_coordinator.py::test_exhausted_budget_still_joins_a_completed_worker[False]
+FAILED tests/unit/web/execution/test_runtime_preflight_coordinator.py::test_exhausted_budget_still_joins_a_completed_worker[True]
+======================= 2 failed, 19 deselected in 0.24s =======================

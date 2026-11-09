@@ -1,0 +1,64 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-lifecycle-foundations
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 60 items / 3 deselected / 57 selected
+
+tests/unit/web/test_process_watchdog.py ..........................       [ 45%]
+tests/unit/web/test_process_recovery.py ...                              [ 50%]
+tests/unit/web/execution/test_runtime_preflight_coordinator.py ......... [ 66%]
+...............F...                                                      [100%]
+
+=================================== FAILURES ===================================
+_ test_many_abandoned_completed_failures_are_observed_once_without_task_archive[True] _
+
+timeout = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timeout", [False, True])
+    async def test_many_abandoned_completed_failures_are_observed_once_without_task_archive(timeout: bool) -> None:
+        coordinator = RuntimePreflightCoordinator()
+        task_refs = []
+        with capture_logs() as logs:
+            for index in range(25):
+                started = asyncio.Event()
+                release = asyncio.Event()
+    
+                async def worker(started: asyncio.Event = started, release: asyncio.Event = release, index: int = index) -> ValidationResult:
+                    started.set()
+                    await release.wait()
+                    raise ValueError(f"private preflight detail {index}")
+    
+                key = RuntimePreflightKey("abandoned", index, "s", "k")
+                caller = asyncio.create_task(coordinator.run(key, worker, timeout=0.01 if timeout else None))
+                await started.wait()
+                task_refs.append(weakref.ref(coordinator._inflight[key]))
+                if timeout:
+                    result = await caller
+                    assert isinstance(result, RuntimePreflightFailure)
+                    assert isinstance(result.original_exc, TimeoutError)
+                else:
+                    caller.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await caller
+                del caller
+                release.set()
+                for _ in range(4):
+                    await asyncio.sleep(0)
+                assert coordinator._retained == {}
+                assert coordinator._inflight == {}
+            await coordinator.seal_and_join()
+            await coordinator.seal_and_join()
+        gc.collect()
+>       assert all(reference() is None for reference in task_refs)
+E       assert False
+E        +  where False = all(<generator object test_many_abandoned_completed_failures_are_observed_once_without_task_archive.<locals>.<genexpr> at 0x7fc78075a670>)
+
+tests/unit/web/execution/test_runtime_preflight_coordinator.py:566: AssertionError
+- generated xml file: /workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-1-fix1-focused.xml -
+=========================== short test summary info ============================
+FAILED tests/unit/web/execution/test_runtime_preflight_coordinator.py::test_many_abandoned_completed_failures_are_observed_once_without_task_archive[True]
+================== 1 failed, 56 passed, 3 deselected in 7.67s ==================

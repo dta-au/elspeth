@@ -1,0 +1,4 @@
+exact staged path set: 13
+complete new files: ['tests/testcontainer/web/test_blob_mutation_admission_postgres.py', 'tests/unit/web/blobs/test_mutation_admission.py', 'tests/unit/web/blobs/test_mutation_admission_quota.py']
+artifact SHA256: 6177a62c3ddf70ea749d145d10ba574907fc9340c0a8c1e143b218ca78ec2651
+all staged bytes match frozen worktree; diff bytes equal Git producer; frozen manifests match

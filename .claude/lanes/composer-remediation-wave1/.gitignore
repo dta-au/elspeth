@@ -1,0 +1,16 @@
+# Credential-shaped content excluded from the requested lane backup.
+# Includes conservative matches in fixtures and historical diagnostic logs.
+# Required runtime libraries are part of the portable checkpoint.
+!/runtime-deps/sqlite3/root/usr/lib/
+!/runtime-deps/sqlite3/root/usr/lib/**
+!/playwright-browsers/**/*.so
+/d1-combined-gates/20261109T143656Z-composer-remediation-wave1-50437/pytest.log
+/d1-combined-gates/20261109T150428Z-composer-remediation-wave1-68412/pytest-junit.xml
+/d1-combined-gates/20261109T150428Z-composer-remediation-wave1-68412/pytest.log
+/d1-stage-race-baseline/config/mcp/claude-config-examples.json
+/d1-stage-race-baseline/src/elspeth/contracts/credential_material.py
+/d1-stage-race-baseline/src/elspeth/core/config.py
+/park-identity-evidence/fix1-refusal-mutant/src/elspeth/contracts/credential_material.py
+/park-identity-evidence/fix1-refusal-mutant/src/elspeth/core/config.py
+/park-identity-evidence/negative-control/src/elspeth/contracts/credential_material.py
+/park-identity-evidence/negative-control/src/elspeth/core/config.py

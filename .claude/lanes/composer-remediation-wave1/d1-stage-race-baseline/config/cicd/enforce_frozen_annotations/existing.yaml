@@ -1,0 +1,54 @@
+# Existing frozen dataclasses with intentional mutable container annotations.
+#
+# Migrated to the shared core allowlist loader. Stale entries are now enforced
+# by elspeth-lints as allowlist governance findings; this file is intentionally
+# empty until a live finding needs a reviewed exemption.
+
+allow_hits:
+  # MCP tool definition: Callable signature contains dict parameter
+  - key: "src/elspeth/mcp/server.py:immutability.frozen_annotations:_module_:fp=src/elspeth/mcp/server.py:_ToolDef:handler"
+    owner: "@elspeth-maintainers"
+    reason: "MCP tool definition: Callable signature contains dict parameter."
+    safety: "pre-existing exemption — content audit pending in Plan B"
+
+  # Composer redaction TraversalNode callables receive and/or mutate consumer-owned dicts.
+  - key: "src/elspeth/web/composer/redaction.py:immutability.frozen_annotations:_module_:fp=src/elspeth/web/composer/redaction.py:TraversalNode:value_provider"
+    owner: "@elspeth-maintainers"
+    reason: "Composer redaction TraversalNode: value_provider Callable receives the model's serialised root dict. The frozen TraversalNode holds the callable reference, not the dict."
+    safety: "pre-existing exemption — content audit pending in Plan B"
+  - key: "src/elspeth/web/composer/redaction.py:immutability.frozen_annotations:_module_:fp=src/elspeth/web/composer/redaction.py:TraversalNode:substitute_provider"
+    owner: "@elspeth-maintainers"
+    reason: "Composer redaction TraversalNode: substitute_provider mutates the consumer-supplied dict through a held callable. The frozen TraversalNode holds the callable reference, not the dict."
+    safety: "pre-existing exemption — content audit pending in Plan B"
+
+  # Composer dispatch ToolBatchContext: discovery_cache is an intentionally mutable per-compose-call cache.
+  - key: "src/elspeth/web/composer/tool_batch.py:immutability.frozen_annotations:_module_:fp=src/elspeth/web/composer/tool_batch.py:ToolBatchContext:discovery_cache"
+    owner: "@elspeth-maintainers"
+    reason: "Composer dispatch ToolBatchContext: discovery_cache is an intentionally mutable shared cache the dispatch loop writes into across batches of one compose call."
+    safety: "Verified: run_tool_batch writes discovery_cache[cache_key]; the frozen dataclass holds only the reference."
+
+  # Dataverse API response — Tier 3 external data, genuinely mutable
+  - key: "src/elspeth/plugins/infrastructure/clients/dataverse.py:immutability.frozen_annotations:_module_:fp=src/elspeth/plugins/infrastructure/clients/dataverse.py:DataversePageResponse:rows"
+    owner: "@elspeth-maintainers"
+    reason: "Dataverse API response rows are external Tier 3 data and the runtime type is a list of dict rows."
+    safety: "pre-existing exemption — content audit pending in Plan B"
+  - key: "src/elspeth/plugins/infrastructure/clients/dataverse.py:immutability.frozen_annotations:_module_:fp=src/elspeth/plugins/infrastructure/clients/dataverse.py:DataversePageResponse:headers"
+    owner: "@elspeth-maintainers"
+    reason: "Dataverse API response headers are external Tier 3 data and the runtime type is dict[str, str]."
+    safety: "pre-existing exemption — content audit pending in Plan B"
+  - key: "src/elspeth/plugins/infrastructure/clients/dataverse.py:immutability.frozen_annotations:_module_:fp=src/elspeth/plugins/infrastructure/clients/dataverse.py:DataversePageResponse:request_headers"
+    owner: "@elspeth-maintainers"
+    reason: "Dataverse request headers are retained with the response metadata and the runtime type is dict[str, str]."
+    safety: "pre-existing exemption — content audit pending in Plan B"
+
+  # Retrieval chunk metadata — external search API response (Tier 3)
+  - key: "src/elspeth/plugins/infrastructure/clients/retrieval/types.py:immutability.frozen_annotations:_module_:fp=src/elspeth/plugins/infrastructure/clients/retrieval/types.py:RetrievalChunk:metadata"
+    owner: "@elspeth-maintainers"
+    reason: "Retrieval chunk metadata is external search API response data and the runtime type is dict[str, Any]."
+    safety: "pre-existing exemption — content audit pending in Plan B"
+
+  # GroupBindingRegistry: _expand_groups is the runtime EXPAND-group mint-path index.
+  - key: "src/elspeth/core/dag/group_bindings.py:immutability.frozen_annotations:_module_:fp=src/elspeth/core/dag/group_bindings.py:GroupBindingRegistry:_expand_groups"
+    owner: "@elspeth-maintainers"
+    reason: "GroupBindingRegistry._expand_groups indexes runtime-minted EXPAND group ids (generate_id(), unknowable at build time) to their scope binding; register_expand_group writes it after construction, symmetric with ToolBatchContext.discovery_cache above."
+    safety: "Verified: only register_expand_group mutates it (self._expand_groups[group_id] = binding); _fork_binding_by_member/_expand_binding_by_opener, the two indices that ARE build-time-derivable, are frozen via deep_freeze in __post_init__ instead."

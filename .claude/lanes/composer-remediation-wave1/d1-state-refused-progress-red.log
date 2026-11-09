@@ -1,0 +1,98 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 1 item
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py F [100%]
+
+=================================== FAILURES ===================================
+_______ test_final_profile_rejection_is_unapplied_audited_and_repairable _______
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-55/test_final_profile_rejection_i0')
+
+    @pytest.mark.asyncio
+    async def test_final_profile_rejection_is_unapplied_audited_and_repairable(tmp_path: Path) -> None:
+        harness = _harness(tmp_path)
+        state = _incremental_base_state(tmp_path)
+        invalid = _valid_pipeline_args(tmp_path, metadata_name="final-profile-reject")
+        repaired = _valid_pipeline_args(tmp_path, metadata_name="profile-repaired")
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.catalog)
+        catalog = _FinalRejectingCatalog.for_trained_operator(harness.catalog, snapshot)
+        failures: list[tuple[str, str]] = []
+        message_snapshots: list[list[dict[str, Any]]] = []
+        responses = [
+            _tool_turn("call_final_invalid", "set_pipeline", invalid),
+            _tool_turn("call_final_repaired", "set_pipeline", repaired),
+            _fake_llm_response(content="The repaired proposal is pending approval."),
+        ]
+        files_before = tuple(sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*") if path.is_file()))
+        original_record_failure = AntiAnchorTracker.record_failure
+        progress_events = []
+    
+        async def record_progress(event: Any) -> None:
+            progress_events.append(event)
+    
+        def _record_failure(tracker: AntiAnchorTracker, tool_name: str, arguments_hash: str) -> None:
+            failures.append((tool_name, arguments_hash))
+            original_record_failure(tracker, tool_name, arguments_hash)
+    
+        async def _llm(
+            messages: list[dict[str, Any]],
+            _tools: Any,
+            *,
+            provider_custody: object | None = None,
+            credential_state: object | None = None,
+            prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+            prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+            prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        ) -> Any:
+            message_snapshots.append(deepcopy(messages))
+            if len(message_snapshots) == 2:
+                assert _count_rows(harness.engine, composition_proposals_table) == 0
+                assert _count_rows(harness.engine, composition_states_table) == 0
+                assert _count_rows(harness.engine, blobs_table) == 0
+                assert builder.call_count == 1
+            return responses.pop(0)
+    
+        with (
+            patch.object(harness.service._policy_context, "build", return_value=(snapshot, catalog)),
+            patch.object(harness.service._provider_gateway, "_call_llm", new=_llm),
+            patch.object(AntiAnchorTracker, "record_failure", new=_record_failure),
+            patch(
+                "elspeth.web.composer.tool_batch.build_set_pipeline_candidate",
+                wraps=real_build_set_pipeline_candidate,
+            ) as builder,
+        ):
+            result = await harness.service.compose(
+                "Build a reviewed pipeline.",
+                [],
+                state,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                user_message_id=harness.user_message_id,
+                progress=record_progress,
+            )
+    
+        proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+        assert len(proposals) == 1
+        assert proposals[0].tool_call_id == "call_final_repaired"
+        assert result.state is state
+        assert builder.call_count == 2
+        assert [tool_name for tool_name, _hash in failures] == ["set_pipeline"]
+>       assert any("visible blocker" in event.headline for event in progress_events)
+E       assert False
+E        +  where False = any(<generator object test_final_profile_rejection_is_unapplied_audited_and_repairable.<locals>.<genexpr> at 0x7f7aac56f510>)
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:527: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:35:55 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:35:57 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:35:57 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:35:57 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+=========================== short test summary info ============================
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_final_profile_rejection_is_unapplied_audited_and_repairable
+============================== 1 failed in 4.69s ===============================

@@ -1,0 +1,17 @@
+{
+  "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata",
+  "argv": [
+    "/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv/bin/python",
+    "-m",
+    "elspeth_lints.core.cli",
+    "check",
+    "--rules",
+    "trust_boundary.tests,trust_boundary.scope,trust_boundary.tier",
+    "--root",
+    "src/elspeth",
+    "--format",
+    "json"
+  ],
+  "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/src:/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/elspeth-lints/src",
+  "MYPYPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/src:/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/elspeth-lints/src:/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/typings"
+}

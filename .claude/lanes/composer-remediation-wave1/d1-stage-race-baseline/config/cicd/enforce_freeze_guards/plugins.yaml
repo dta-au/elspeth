@@ -1,0 +1,37 @@
+per_file_rules:
+- pattern: plugins/sources/field_normalization.py
+  rules:
+  - FG1
+  reason: FieldResolutionMapping.resolution_mapping uses MappingProxyType(dict()) — values are str (scalars)
+  expires: null
+  max_hits: 1
+- pattern: plugins/transforms/llm/multi_query.py
+  rules:
+  - FG1
+  reason: QuerySpec.input_fields uses MappingProxyType(dict()) — values are str (scalars)
+  expires: null
+  max_hits: 1
+- pattern: plugins/transforms/llm/transform.py
+  rules:
+  - FG2
+  reason: MultiQueryStrategy isinstance guard on query_specs tuple conversion
+  expires: null
+  max_hits: 1
+- pattern: plugins/transforms/llm/validation.py
+  rules:
+  - FG2
+  reason: ValidationSuccess isinstance guard on data MappingProxyType check
+  expires: null
+  max_hits: 1
+- pattern: plugins/infrastructure/clients/llm.py
+  rules:
+  - FG2
+  reason: LLMResponse isinstance guard on raw_response — checks if already frozen before deep_freeze
+  expires: null
+  max_hits: 1
+- pattern: plugins/infrastructure/clients/replayer.py
+  rules:
+  - FG2
+  reason: ReplayedCall isinstance guards on response_data and error_data — checks if already frozen
+  expires: null
+  max_hits: 2

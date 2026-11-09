@@ -1,0 +1,24 @@
+tree        : /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+HEAD        : cf23f38d889eac66231797782ed129fa299f250f  ()
+stages      : ruff,mypy,contracts,lints,pytest,testcontainer
+log dir     : /workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-combined-gates
+provenance  : elspeth -> /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src/elspeth/__init__.py
+              elspeth_lints -> /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src/elspeth_lints/__init__.py
+siblings    : 1 pytest process(es) already on this box -> workers=8
+  pid 40891 cwd ? :: .venv/bin/python -m pytest -n 0 -o pythonpath=/workspace/elspeth/.claude/worktrees/compose
+
+docker      : reachable
+WARNING     : a testcontainer run beside another suite records contention as failures; serialise on the box first
+sha256sum: src/elspeth/web/frontend/node_modules: Is a directory
+REFUSED     : initial tree-state sample failed; source freeze cannot be proved
+note        : 9 uncommitted path(s); the measurement is of the WORKING TREE, not of HEAD
+
+commands (PYTHONPATH=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src:/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src exported for every stage):
+  [ruff] /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/ruff check src/ tests/ scripts/ examples/ elspeth-lints/src/ && /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/ruff format --check src/ tests/ scripts/ examples/ elspeth-lints/src/
+  [mypy] /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/mypy src/ elspeth-lints/src/
+  [contracts] /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/python scripts/check_contracts.py && /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/python scripts/cicd/generate_skill_inventory.py --check
+  [lints] ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/python -m elspeth_lints.core.cli check --rules all --root src/elspeth
+  [pytest] /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/python -m pytest tests/ -n 8 -o 'pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src' -v --junitxml=<run-dir>/pytest-junit.xml 
+  [testcontainer] /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/python -m pytest tests/ -m testcontainer -n 0 -o 'pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src' -v --junitxml=<run-dir>/testcontainer-junit.xml
+
+preflight REFUSED; nothing run

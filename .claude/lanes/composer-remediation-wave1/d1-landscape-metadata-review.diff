@@ -1,0 +1,482 @@
+diff --git a/src/elspeth/core/landscape/database.py b/src/elspeth/core/landscape/database.py
+index a0fc3cf82..f7b26fce2 100644
+--- a/src/elspeth/core/landscape/database.py
++++ b/src/elspeth/core/landscape/database.py
+@@ -77,6 +77,26 @@ WRITE_INTENT_OPTION = "elspeth_write_intent"
+ # that text reaches exception chains, logs and any wrap that interpolates it.
+ LANDSCAPE_HIDE_BOUND_PARAMETERS = True
+ 
++_LANDSCAPE_METADATA_CREATE_LOCK = threading.Lock()
++
++
++def _create_landscape_tables(bind: Engine | Connection, *, checkfirst: bool = True) -> None:
++    """Create tables without leaking SQLAlchemy's transient constraint rules.
++
++    PostgreSQL defers cyclic foreign keys to ALTER statements, which leave
++    ``_create_rule`` annotations on the shared metadata. Those annotations
++    suppress inline foreign keys in a later SQLite initialization. Serialize
++    creation and restore the exact original rules, including on DDL failure.
++    """
++    with _LANDSCAPE_METADATA_CREATE_LOCK:
++        original_rules = [(constraint, constraint._create_rule) for table in metadata.tables.values() for constraint in table.constraints]
++        try:
++            metadata.create_all(bind=bind, checkfirst=checkfirst)
++        finally:
++            for constraint, rule in original_rules:
++                constraint._create_rule = rule
++
++
+ _JOURNAL_WORKER_SUFFIX_RE = re.compile(r"[0-9a-f]+")
+ 
+ # Canonical SQLite PRAGMA invariants for the Landscape audit DB.
+@@ -1385,7 +1405,7 @@ class LandscapeDB:
+ 
+     def _create_tables(self) -> None:
+         """Create all tables if they don't exist."""
+-        metadata.create_all(self.engine)
++        _create_landscape_tables(self.engine)
+ 
+     def _create_additive_indexes(self) -> None:
+         """Create non-gating performance indexes for existing schemas."""
+@@ -1890,7 +1910,7 @@ class LandscapeDB:
+         cls._verify_sqlite_pragmas(engine, "sqlite:///:memory:")
+         instance = cls._from_parts("sqlite:///:memory:", engine)
+         instance._sync_sqlite_schema_epoch()
+-        metadata.create_all(engine)
++        _create_landscape_tables(engine)
+         instance._sync_schema_identity()
+         instance._sync_sqlite_schema_epoch()
+         return instance
+@@ -2085,7 +2105,7 @@ class LandscapeDB:
+ 
+             if create_tables:
+                 instance._sync_sqlite_schema_epoch()
+-                metadata.create_all(engine)
++                _create_landscape_tables(engine)
+                 instance._create_additive_indexes()
+                 instance._sync_schema_identity()
+                 instance._sync_sqlite_schema_epoch()
+diff --git a/src/elspeth/web/schema_probe.py b/src/elspeth/web/schema_probe.py
+index d6dff18c3..0520feef4 100644
+--- a/src/elspeth/web/schema_probe.py
++++ b/src/elspeth/web/schema_probe.py
+@@ -19,10 +19,10 @@ from elspeth.contracts.trust_boundary import trust_boundary
+ from elspeth.core.landscape.database import (
+     LandscapeSchemaShape,
+     SchemaCompatibilityError,
++    _create_landscape_tables,
+     probe_schema_shape,
+ )
+ from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
+-from elspeth.core.landscape.schema import metadata as landscape_metadata
+ from elspeth.core.landscape.schema import schema_identity_table as landscape_schema_identity_table
+ from elspeth.core.schema_identity import insert_schema_identity
+ from elspeth.web.sessions.models import metadata as session_metadata
+@@ -348,7 +348,7 @@ def init_landscape_schema(engine: Engine) -> None:
+         if state is SchemaState.CURRENT:
+             return
+         if state is SchemaState.MISSING:
+-            landscape_metadata.create_all(bind=conn, checkfirst=True)
++            _create_landscape_tables(bind=conn, checkfirst=True)
+             insert_schema_identity(
+                 conn,
+                 landscape_schema_identity_table,
+diff --git a/tests/testcontainer/web/test_schema_probe_postgres.py b/tests/testcontainer/web/test_schema_probe_postgres.py
+index 0516e7483..a4f1e3a05 100644
+--- a/tests/testcontainer/web/test_schema_probe_postgres.py
++++ b/tests/testcontainer/web/test_schema_probe_postgres.py
+@@ -36,6 +36,7 @@ from elspeth.core.landscape.database import _REQUIRED_TRIGGERS, LandscapeDB, Sch
+ from elspeth.core.landscape.factory import RecorderFactory
+ from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction, fenced_member_transaction
+ from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH, audit_export_snapshot_chunks_table
++from elspeth.core.landscape.schema import metadata as landscape_metadata
+ from elspeth.core.landscape.schema import schema_identity_table as landscape_schema_identity_table
+ from elspeth.core.schema_identity import SCHEMA_IDENTITY_APPLICATION_ID
+ from elspeth.core.schema_shape import _text_builtin_identity_rows_on_connection, database_target_is_empty
+@@ -498,6 +499,42 @@ def test_postgres_session_init_does_not_poison_later_sqlite_schema(postgres_engi
+     assert inspect(sqlite_engine).get_foreign_keys("chat_messages")
+ 
+ 
++@pytest.mark.parametrize("postgres_creation", ["constructor", "from_url", "web_init"])
++@pytest.mark.parametrize("sqlite_creation", ["constructor", "from_url", "in_memory"])
++def test_postgres_landscape_creation_preserves_later_sqlite_schema(
++    postgres_engine: Engine, tmp_path: Path, postgres_creation: str, sqlite_creation: str
++) -> None:
++    """PostgreSQL's deferred FK DDL must not suppress SQLite's inline FKs."""
++    from elspeth.core.landscape.database import LandscapeSchemaShape, probe_schema_shape
++    from elspeth.core.landscape.schema import metadata
++
++    original_rules = [(constraint, constraint._create_rule) for table in metadata.tables.values() for constraint in table.constraints]
++    try:
++        postgres_url = postgres_engine.url.render_as_string(hide_password=False)
++        if postgres_creation == "web_init":
++            init_landscape_schema(postgres_engine)
++        else:
++            postgres_db = LandscapeDB(postgres_url) if postgres_creation == "constructor" else LandscapeDB.from_url(postgres_url)
++            postgres_db.close()
++
++        sqlite_url = f"sqlite:///{tmp_path / 'after-postgres.db'}"
++        if sqlite_creation == "in_memory":
++            sqlite_db = LandscapeDB.in_memory()
++        else:
++            sqlite_db = LandscapeDB(sqlite_url) if sqlite_creation == "constructor" else LandscapeDB.from_url(sqlite_url)
++        with sqlite_db:
++            sqlite_db._validate_schema()
++            assert probe_schema_shape(sqlite_db.engine) is LandscapeSchemaShape.MATCHES
++        if sqlite_creation != "in_memory":
++            with LandscapeDB.from_url(sqlite_url, create_tables=False) as reopened:
++                assert probe_schema_shape(reopened.engine) is LandscapeSchemaShape.MATCHES
++        assert all(constraint._create_rule is rule for constraint, rule in original_rules)
++    finally:
++        # A failing regression must not contaminate later cases in this process.
++        for constraint, rule in original_rules:
++            constraint._create_rule = rule
++
++
+ def _seed_postgres_trigger_rows(postgres_engine: Engine, *, session_id: str, include_completion: bool) -> None:
+     with postgres_engine.begin() as conn:
+         ensure_test_identity(conn, identity_id="trigger-user")
+@@ -1606,7 +1643,7 @@ def test_concurrent_initializers_serialize_to_one_create_all(
+     kind: str,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+-    metadata = session_metadata if kind == "session" else schema_probe_module.landscape_metadata
++    metadata = session_metadata if kind == "session" else landscape_metadata
+     initializer = init_session_schema if kind == "session" else init_landscape_schema
+     original_create_all = metadata.create_all
+     holder_entered = threading.Event()
+diff --git a/tests/unit/architecture/test_session_db_mutation_authority.py b/tests/unit/architecture/test_session_db_mutation_authority.py
+index 218f27b45..f6eec312c 100644
+--- a/tests/unit/architecture/test_session_db_mutation_authority.py
++++ b/tests/unit/architecture/test_session_db_mutation_authority.py
+@@ -4922,7 +4922,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         fingerprint="701a4d03f32ac0d4",
+         ordinal=1,
+         authority=None,
+-        line=935,
++        line=955,
+         connection_escape=False,
+     ),
+     WriterIdentity(
+@@ -5933,12 +5933,14 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
+ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
+     # This initializer holds the Landscape target lock and stamps only its
+     # proven empty Landscape store, never the separate Sessions database.
++    # Table creation now uses the shared constraint-rule restoration helper;
++    # its same-Connection forwarding grants no additional mutation authority.
+     WriterIdentity(
+         path="src/elspeth/web/schema_probe.py",
+         symbol="init_landscape_schema.body",
+         table="elspeth_schema_identity",
+         operation="stamp_sqlite_sentinel",
+-        fingerprint="73db976a22a18557",
++        fingerprint="b887ed3ea6657001",
+         ordinal=1,
+         authority=None,
+         line=359,
+@@ -5984,6 +5986,8 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
+     # check-constraint table above the same later sites (a05cfb2a9): a
+     # source-only shift of two, fingerprints, domains, escape flags and
+     # acquisition counts unchanged.
++    # The Landscape metadata helper adds twenty lines above these sites;
++    # their acquisition bodies, domains and escape flags remain identical.
+     WriterIdentity(
+         "src/elspeth/core/landscape/database.py",
+         "verify_sqlite_tier1_pragmas",
+@@ -5992,7 +5996,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         "4e9098161956fab6",
+         1,
+         None,
+-        line=131,
++        line=151,
+     ),
+     WriterIdentity(
+         "src/elspeth/core/landscape/database.py",
+@@ -6002,7 +6006,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         "1084a431b73718a3",
+         1,
+         None,
+-        line=879,
++        line=899,
+     ),
+     # Re-pinned by P4-D6 step 5 (cross-module rule): the connection is handed
+     # to ``read_schema_identities`` behind a plain import, whose body executes
+@@ -6015,7 +6019,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         "54f25c9b2650a66b",
+         1,
+         None,
+-        line=904,
++        line=924,
+     ),
+     WriterIdentity(
+         "src/elspeth/core/landscape/database.py",
+@@ -6025,7 +6029,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         "f95bb339c5816e92",
+         1,
+         None,
+-        line=1010,
++        line=1030,
+     ),
+     WriterIdentity(
+         "src/elspeth/core/landscape/database.py",
+@@ -6035,7 +6039,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         "7b14f45607d6611f",
+         1,
+         None,
+-        line=1230,
++        line=1250,
+     ),
+     WriterIdentity(
+         "src/elspeth/core/landscape/database.py",
+@@ -6045,7 +6049,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         "bc4b6272008ed6ec",
+         1,
+         None,
+-        line=1375,
++        line=1395,
+         connection_escape=True,
+     ),
+     # Re-pinned by P4-D6 step 5 (cross-module rule): same shape as
+@@ -6058,7 +6062,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         "bca7301699f0abd0",
+         1,
+         None,
+-        line=1396,
++        line=1416,
+     ),
+     # ``with begin_write(self._engine) as conn`` inside LandscapeDB: the
+     # in-file wrapper hop is transparent and ``self`` carries the declared
+@@ -6071,7 +6075,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         "dc8b3ee57e650e2d",
+         1,
+         None,
+-        line=1409,
++        line=1429,
+         connection_escape=True,
+     ),
+     WriterIdentity(
+@@ -6082,7 +6086,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         "4644a6cc893b4d09",
+         1,
+         None,
+-        line=1436,
++        line=1456,
+     ),
+     WriterIdentity(
+         "src/elspeth/core/landscape/database.py",
+@@ -6092,7 +6096,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         "2cfb5322571d6d44",
+         1,
+         None,
+-        line=1693,
++        line=1713,
+     ),
+     WriterIdentity(
+         "src/elspeth/core/landscape/database.py",
+@@ -6102,7 +6106,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         "44c4543542ceeb85",
+         1,
+         None,
+-        line=2243,
++        line=2263,
+         connection_escape=True,
+     ),
+     WriterIdentity(
+@@ -6113,7 +6117,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         "222b5f4b0d258dbe",
+         1,
+         None,
+-        line=2225,
++        line=2245,
+         connection_escape=True,
+     ),
+     WriterIdentity(
+@@ -6231,7 +6235,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
+         "40f92c2195132323",
+         1,
+         None,
+-        line=1959,
++        line=1979,
+     ),
+     # The reference schema exists only in a private sqlite3 :memory: store.
+     WriterIdentity(
+@@ -20713,7 +20717,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
+             "145b5590f940eae3",
+             1,
+             None,
+-            line=1448,
++            line=1468,
+         ),
+         WriterIdentity(
+             "src/elspeth/core/schema_shape.py",
+diff --git a/tests/unit/architecture/test_web_landscape_mutation_fencing.py b/tests/unit/architecture/test_web_landscape_mutation_fencing.py
+index 18ba5a08e..3fa1669bc 100644
+--- a/tests/unit/architecture/test_web_landscape_mutation_fencing.py
++++ b/tests/unit/architecture/test_web_landscape_mutation_fencing.py
+@@ -14361,9 +14361,11 @@ def _raw_attribute_collector(unit: SourceUnit, units: tuple[SourceUnit, ...]) ->
+ # Exact non-run initialization effect: the supplied sources bind the locked
+ # callback, EMPTY-only admission, and its shared occupancy implementation.
+ # These are source bindings, not permissions granted by a filename alone.
++# Landscape creation now serializes and restores SQLAlchemy's transient DDL
++# rules. The EMPTY-only admission, locked callback and stamp are unchanged.
+ _NEW_LANDSCAPE_STAMP_SOURCES = {
+-    "src/elspeth/web/schema_probe.py": "c0f27e271e6128ea96a4cb345f32ef4c61bbcdd338aba0a9eaaf1db34447851d",
+-    "src/elspeth/core/landscape/database.py": "b8da4ed519bbe887140a0a72f040ce264fc4910724c56ca0f55065c2a89653cf",
++    "src/elspeth/web/schema_probe.py": "0e4ba641686cba00c9b459e3cc241ce686847211197c2563a4991f5a5d31c4cd",
++    "src/elspeth/core/landscape/database.py": "099a5bff4fa162b87119cadbd5fc10109938cff4d6c4d2a1e8ac2e5d3f31f1ed",
+     "src/elspeth/core/schema_shape.py": "5b32f7faf09a03a7c482b48a092eb0f7cf5811eb927302ad72820fde81ceccb0",
+ }
+ 
+@@ -21465,6 +21467,8 @@ def _new_landscape_stamp_control_call(unit: SourceUnit) -> ast.Call:
+             "return LandscapeSchemaShape.EMPTY if database_target_is_empty(bind) else LandscapeSchemaShape.DIVERGENT",
+             "return LandscapeSchemaShape.EMPTY",
+         ),
++        ("src/elspeth/core/landscape/database.py", "with _LANDSCAPE_METADATA_CREATE_LOCK:", "if True:"),
++        ("src/elspeth/core/landscape/database.py", "constraint._create_rule = rule", "constraint._create_rule = None"),
+         ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA application_id").scalar_one() == 0', "and True"),
+         ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA user_version").scalar_one() == 0', "and True"),
+     ],
+diff --git a/tests/unit/core/landscape/test_database_metadata_creation.py b/tests/unit/core/landscape/test_database_metadata_creation.py
+new file mode 100644
+index 000000000..6e772cd3e
+--- /dev/null
++++ b/tests/unit/core/landscape/test_database_metadata_creation.py
+@@ -0,0 +1,138 @@
++"""Landscape initialization owns and restores SQLAlchemy's transient DDL rules."""
++
++from concurrent.futures import ThreadPoolExecutor
++from threading import Event, Lock
++
++import pytest
++from sqlalchemy import create_mock_engine
++
++from elspeth.core.landscape import database as database_module
++from elspeth.core.landscape.database import LandscapeDB, LandscapeSchemaShape, probe_schema_shape
++from elspeth.core.landscape.schema import metadata, sink_effect_members_table
++
++
++@pytest.fixture
++def original_rules():
++    """Include a meaningful pre-existing rule, then isolate intentional DDL leaks."""
++    untouched = [(constraint, constraint._create_rule) for table in metadata.tables.values() for constraint in table.constraints]
++    constraint = next(iter(sink_effect_members_table.foreign_key_constraints))
++
++    def allow_constraint(_compiler):
++        return True
++
++    constraint._create_rule = allow_constraint
++    original = [(constraint, constraint._create_rule) for table in metadata.tables.values() for constraint in table.constraints]
++    try:
++        yield original
++    finally:
++        for constraint, rule in untouched:
++            constraint._create_rule = rule
++
++
++@pytest.mark.parametrize("ddl_fails", [False, True])
++def test_landscape_creation_restores_exact_rules_after_ddl(monkeypatch, original_rules, ddl_fails):
++    """Both successful and failed DDL must preserve non-None prior rules."""
++    real_create_all = metadata.create_all
++    engines = []
++    primary_error = RuntimeError("DDL failed after PostgreSQL deferred constraints")
++
++    def create_all(bind, *, checkfirst=True):
++        engines.append(bind)
++        # Keep actual SQLite creation intact; use real SQLAlchemy PostgreSQL
++        # generation to induce the same deferred-FK mutation without a server.
++        real_create_all(bind=bind, checkfirst=checkfirst)
++        real_create_all(create_mock_engine("postgresql://", lambda *_args, **_kwargs: None))
++        assert any(constraint._create_rule is not rule for constraint, rule in original_rules)
++        if ddl_fails:
++            raise primary_error
++
++    monkeypatch.setattr(metadata, "create_all", create_all)
++    try:
++        if ddl_fails:
++            with pytest.raises(RuntimeError) as caught:
++                LandscapeDB.in_memory()
++            assert caught.value is primary_error
++        else:
++            with LandscapeDB.in_memory() as db:
++                db._validate_schema()
++                assert probe_schema_shape(db.engine) is LandscapeSchemaShape.MATCHES
++        assert all(constraint._create_rule is rule for constraint, rule in original_rules)
++    finally:
++        for engine in engines:
++            engine.dispose()
++
++
++@pytest.mark.parametrize("first_fails", [False, True])
++def test_landscape_initializers_cannot_capture_each_others_transient_rules(monkeypatch, original_rules, first_fails):
++    """A second initializer must wait until its predecessor restores metadata."""
++    real_create_all = metadata.create_all
++    first_mutated, release_first, contender_observed, contender_blocked, second_ddl = (Event() for _ in range(5))
++    engines = []
++    primary_error = RuntimeError("first initializer failed")
++
++    class ObservedLock:
++        """A real lock with a deterministic notification when acquisition blocks."""
++
++        def __init__(self):
++            self.lock = Lock()
++
++        def __enter__(self):
++            if not self.lock.acquire(blocking=False):
++                contender_blocked.set()
++                contender_observed.set()
++                assert self.lock.acquire(timeout=10)
++            return self
++
++        def __exit__(self, *_args):
++            self.lock.release()
++
++    def create_all(bind, *, checkfirst=True):
++        engines.append(bind)
++        if first_mutated.is_set():
++            second_ddl.set()
++            contender_observed.set()
++            real_create_all(bind=bind, checkfirst=checkfirst)
++            return
++        real_create_all(bind=bind, checkfirst=checkfirst)
++        real_create_all(create_mock_engine("postgresql://", lambda *_args, **_kwargs: None))
++        assert any(constraint._create_rule is not rule for constraint, rule in original_rules)
++        first_mutated.set()
++        assert release_first.wait(10)
++        if first_fails:
++            raise primary_error
++
++    def initialize():
++        with LandscapeDB.in_memory() as db:
++            db._validate_schema()
++            assert probe_schema_shape(db.engine) is LandscapeSchemaShape.MATCHES
++
++    # On the unfixed implementation this lock is ignored: the second DDL
++    # interval enters while the first is paused, which is the failing oracle.
++    monkeypatch.setattr(database_module, "_LANDSCAPE_METADATA_CREATE_LOCK", ObservedLock(), raising=False)
++    monkeypatch.setattr(metadata, "create_all", create_all)
++    try:
++        with ThreadPoolExecutor(max_workers=2) as workers:
++            first = workers.submit(initialize)
++            try:
++                assert first_mutated.wait(10)
++                second = workers.submit(initialize)
++                try:
++                    assert contender_observed.wait(10)
++                    assert contender_blocked.is_set()
++                    assert not second_ddl.is_set()
++                finally:
++                    release_first.set()
++                if first_fails:
++                    with pytest.raises(RuntimeError) as caught:
++                        first.result(timeout=10)
++                    assert caught.value is primary_error
++                else:
++                    first.result(timeout=10)
++                second.result(timeout=10)
++                assert second_ddl.is_set()
++            finally:
++                release_first.set()
++        assert all(constraint._create_rule is rule for constraint, rule in original_rules)
++    finally:
++        for engine in engines:
++            engine.dispose()

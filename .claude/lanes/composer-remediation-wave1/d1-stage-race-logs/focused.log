@@ -1,0 +1,361 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 201 items
+
+tests/unit/web/sessions/test_proposal_blob_refs.py ..................... [ 10%]
+........                                                                 [ 14%]
+tests/unit/web/sessions/test_pipeline_rejection_callers.py ............. [ 20%]
+..........................                                               [ 33%]
+tests/unit/web/sessions/test_pipeline_rejection_required.py ............ [ 39%]
+.....                                                                    [ 42%]
+tests/unit/web/composer/test_audit_cohort_settlement.py ................ [ 50%]
+....                                                                     [ 52%]
+tests/unit/web/composer/test_planner_stage_runtime_preflight.py ........ [ 56%]
+...                                                                      [ 57%]
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py . [ 58%]
+........................................................................ [ 94%]
+.........FFF                                                             [100%]
+
+=================================== FAILURES ===================================
+_ test_publication_resource_race_refuses_once_then_allows_valid_repair[canonical] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-120/test_publication_resource_race0')
+publisher = 'canonical'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("publisher", ["canonical", "ordinary", "promoted"])
+    async def test_publication_resource_race_refuses_once_then_allows_valid_repair(tmp_path: Path, publisher: str) -> None:
+        from sqlalchemy import update
+    
+        from tests.helpers.session_fences import fenced_operation_context
+    
+        harness = _harness(tmp_path)
+        state = _incremental_base_state(tmp_path)
+        if publisher == "canonical":
+            tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
+        elif publisher == "ordinary":
+            with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as operation:
+                blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+                    UUID(harness.session_id), "retained.txt", b"original", "text/plain", session_operation_context=operation
+                )
+            tool_name, arguments = "delete_blob", {"blob_id": str(blob.id)}
+        else:
+            from tests.integration.web.composer.test_freeform_required_controls import _incremental_textract_state, _required_textract_policy
+    
+            view, snapshot = _required_textract_policy(tmp_path)
+            state, output = await _incremental_textract_state(tmp_path, harness=harness, view=view, snapshot=snapshot)
+            completed = real_execute_tool(
+                "set_output",
+                output,
+                state,
+                view,
+                plugin_snapshot=snapshot,
+                data_dir=str(tmp_path),
+                session_engine=harness.engine,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                validate_arguments=True,
+                require_data_dir_for_paths=True,
+                raise_schema_argument_errors=True,
+            )
+            assert completed.success and completed.validation.is_valid
+            state = completed.updated_state
+            tool_name, arguments = "set_metadata", {"patch": {}}
+    
+        api = harness.sessions.create_composition_proposal if publisher == "ordinary" else harness.sessions.create_pipeline_composition_proposal
+        calls = []
+    
+        async def change_resource_then_create(**kwargs: Any) -> Any:
+            calls.append(kwargs)
+            with harness.engine.begin() as conn:
+                assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() > 0
+                conn.execute(update(blobs_table).values(status="pending" if len(calls) == 1 else "ready"))
+            return await api(**kwargs)
+    
+        llm = _ScriptedLLM(
+            _tool_turn("call_raced", tool_name, arguments),
+            _tool_turn("call_repaired", "set_metadata", {"patch": {"name": "repair"}}),
+            _fake_llm_response(content="The repair awaits approval."),
+        )
+        dispatches = []
+        dispatch = harness.service._dispatch_tool_batch
+    
+        async def record_dispatch(**kwargs: Any) -> Any:
+            dispatched = await dispatch(**kwargs)
+            dispatches.append(dispatched[0])
+            return dispatched
+    
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            patch.object(
+                harness.sessions,
+                "create_composition_proposal" if publisher == "ordinary" else "create_pipeline_composition_proposal",
+                new=change_resource_then_create,
+            ),
+            patch.object(harness.service, "_dispatch_tool_batch", new=record_dispatch),
+            patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as handlers,
+        ):
+            if publisher == "promoted":
+                with patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)):
+                    result = await harness.service.compose(
+                        "Prepare this change.",
+                        [],
+                        state,
+                        session_id=harness.session_id,
+                        user_id="proposal-prevalidation-user",
+                        user_message_id=harness.user_message_id,
+                    )
+            else:
+                result = await harness.service.compose(
+                    "Prepare this change.",
+                    [],
+                    state,
+                    session_id=harness.session_id,
+                    user_id="proposal-prevalidation-user",
+                    user_message_id=harness.user_message_id,
+                )
+        assert len(calls) == (2 if publisher == "promoted" else 1)
+        assert [call.args[0] for call in handlers.call_args_list] == (
+            ["set_metadata", "set_metadata"] if publisher == "promoted" else ["set_metadata"]
+        )
+        assert dispatches[0].mutation_success_observed is False
+>       assert dispatches[0].turn_has_mutation is False
+E       assert True is False
+E        +  where True = _DispatchOutcome(state=CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(name='Untitled Pipel...lure": "discard"}], "metadata": {"name": "inline-proposal"}}}')),), mutation_success_observed=False, pre_state_id=None).turn_has_mutation
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:2449: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:22:10 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:22:10 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:22:10 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 13:22:10 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_publication_resource_race_refuses_once_then_allows_valid_repair[ordinary] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-120/test_publication_resource_race1')
+publisher = 'ordinary'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("publisher", ["canonical", "ordinary", "promoted"])
+    async def test_publication_resource_race_refuses_once_then_allows_valid_repair(tmp_path: Path, publisher: str) -> None:
+        from sqlalchemy import update
+    
+        from tests.helpers.session_fences import fenced_operation_context
+    
+        harness = _harness(tmp_path)
+        state = _incremental_base_state(tmp_path)
+        if publisher == "canonical":
+            tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
+        elif publisher == "ordinary":
+            with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as operation:
+                blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+                    UUID(harness.session_id), "retained.txt", b"original", "text/plain", session_operation_context=operation
+                )
+            tool_name, arguments = "delete_blob", {"blob_id": str(blob.id)}
+        else:
+            from tests.integration.web.composer.test_freeform_required_controls import _incremental_textract_state, _required_textract_policy
+    
+            view, snapshot = _required_textract_policy(tmp_path)
+            state, output = await _incremental_textract_state(tmp_path, harness=harness, view=view, snapshot=snapshot)
+            completed = real_execute_tool(
+                "set_output",
+                output,
+                state,
+                view,
+                plugin_snapshot=snapshot,
+                data_dir=str(tmp_path),
+                session_engine=harness.engine,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                validate_arguments=True,
+                require_data_dir_for_paths=True,
+                raise_schema_argument_errors=True,
+            )
+            assert completed.success and completed.validation.is_valid
+            state = completed.updated_state
+            tool_name, arguments = "set_metadata", {"patch": {}}
+    
+        api = harness.sessions.create_composition_proposal if publisher == "ordinary" else harness.sessions.create_pipeline_composition_proposal
+        calls = []
+    
+        async def change_resource_then_create(**kwargs: Any) -> Any:
+            calls.append(kwargs)
+            with harness.engine.begin() as conn:
+                assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() > 0
+                conn.execute(update(blobs_table).values(status="pending" if len(calls) == 1 else "ready"))
+            return await api(**kwargs)
+    
+        llm = _ScriptedLLM(
+            _tool_turn("call_raced", tool_name, arguments),
+            _tool_turn("call_repaired", "set_metadata", {"patch": {"name": "repair"}}),
+            _fake_llm_response(content="The repair awaits approval."),
+        )
+        dispatches = []
+        dispatch = harness.service._dispatch_tool_batch
+    
+        async def record_dispatch(**kwargs: Any) -> Any:
+            dispatched = await dispatch(**kwargs)
+            dispatches.append(dispatched[0])
+            return dispatched
+    
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            patch.object(
+                harness.sessions,
+                "create_composition_proposal" if publisher == "ordinary" else "create_pipeline_composition_proposal",
+                new=change_resource_then_create,
+            ),
+            patch.object(harness.service, "_dispatch_tool_batch", new=record_dispatch),
+            patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as handlers,
+        ):
+            if publisher == "promoted":
+                with patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)):
+                    result = await harness.service.compose(
+                        "Prepare this change.",
+                        [],
+                        state,
+                        session_id=harness.session_id,
+                        user_id="proposal-prevalidation-user",
+                        user_message_id=harness.user_message_id,
+                    )
+            else:
+                result = await harness.service.compose(
+                    "Prepare this change.",
+                    [],
+                    state,
+                    session_id=harness.session_id,
+                    user_id="proposal-prevalidation-user",
+                    user_message_id=harness.user_message_id,
+                )
+>       assert len(calls) == (2 if publisher == "promoted" else 1)
+E       AssertionError: assert 2 == 1
+E        +  where 2 = len([{'actor': 'composer-web:user:proposal-prevalidation-user', 'affects': ('blob_store',), 'arguments_json': {'blob_id': ...son': {'patch': {'name': 'repair'}}, 'arguments_redacted_json': mappingproxy({'patch': '<metadata-patch:name>'}), ...}])
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:2444: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:22:11 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:22:11 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:22:11 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 13:22:11 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_publication_resource_race_refuses_once_then_allows_valid_repair[promoted] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-120/test_publication_resource_race2')
+publisher = 'promoted'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("publisher", ["canonical", "ordinary", "promoted"])
+    async def test_publication_resource_race_refuses_once_then_allows_valid_repair(tmp_path: Path, publisher: str) -> None:
+        from sqlalchemy import update
+    
+        from tests.helpers.session_fences import fenced_operation_context
+    
+        harness = _harness(tmp_path)
+        state = _incremental_base_state(tmp_path)
+        if publisher == "canonical":
+            tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
+        elif publisher == "ordinary":
+            with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as operation:
+                blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+                    UUID(harness.session_id), "retained.txt", b"original", "text/plain", session_operation_context=operation
+                )
+            tool_name, arguments = "delete_blob", {"blob_id": str(blob.id)}
+        else:
+            from tests.integration.web.composer.test_freeform_required_controls import _incremental_textract_state, _required_textract_policy
+    
+            view, snapshot = _required_textract_policy(tmp_path)
+            state, output = await _incremental_textract_state(tmp_path, harness=harness, view=view, snapshot=snapshot)
+            completed = real_execute_tool(
+                "set_output",
+                output,
+                state,
+                view,
+                plugin_snapshot=snapshot,
+                data_dir=str(tmp_path),
+                session_engine=harness.engine,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                validate_arguments=True,
+                require_data_dir_for_paths=True,
+                raise_schema_argument_errors=True,
+            )
+            assert completed.success and completed.validation.is_valid
+            state = completed.updated_state
+            tool_name, arguments = "set_metadata", {"patch": {}}
+    
+        api = harness.sessions.create_composition_proposal if publisher == "ordinary" else harness.sessions.create_pipeline_composition_proposal
+        calls = []
+    
+        async def change_resource_then_create(**kwargs: Any) -> Any:
+            calls.append(kwargs)
+            with harness.engine.begin() as conn:
+                assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() > 0
+                conn.execute(update(blobs_table).values(status="pending" if len(calls) == 1 else "ready"))
+            return await api(**kwargs)
+    
+        llm = _ScriptedLLM(
+            _tool_turn("call_raced", tool_name, arguments),
+            _tool_turn("call_repaired", "set_metadata", {"patch": {"name": "repair"}}),
+            _fake_llm_response(content="The repair awaits approval."),
+        )
+        dispatches = []
+        dispatch = harness.service._dispatch_tool_batch
+    
+        async def record_dispatch(**kwargs: Any) -> Any:
+            dispatched = await dispatch(**kwargs)
+            dispatches.append(dispatched[0])
+            return dispatched
+    
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            patch.object(
+                harness.sessions,
+                "create_composition_proposal" if publisher == "ordinary" else "create_pipeline_composition_proposal",
+                new=change_resource_then_create,
+            ),
+            patch.object(harness.service, "_dispatch_tool_batch", new=record_dispatch),
+            patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as handlers,
+        ):
+            if publisher == "promoted":
+                with patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)):
+                    result = await harness.service.compose(
+                        "Prepare this change.",
+                        [],
+                        state,
+                        session_id=harness.session_id,
+                        user_id="proposal-prevalidation-user",
+                        user_message_id=harness.user_message_id,
+                    )
+            else:
+                result = await harness.service.compose(
+                    "Prepare this change.",
+                    [],
+                    state,
+                    session_id=harness.session_id,
+                    user_id="proposal-prevalidation-user",
+                    user_message_id=harness.user_message_id,
+                )
+        assert len(calls) == (2 if publisher == "promoted" else 1)
+        assert [call.args[0] for call in handlers.call_args_list] == (
+            ["set_metadata", "set_metadata"] if publisher == "promoted" else ["set_metadata"]
+        )
+        assert dispatches[0].mutation_success_observed is False
+>       assert dispatches[0].turn_has_mutation is False
+E       assert True is False
+E        +  where True = _DispatchOutcome(state=CompositionState(nodes=(NodeSpec(id='extract_document', node_type='transform', plugin='aws_text...tedToolFunction(name='set_metadata', arguments='{"patch": {}}')),), mutation_success_observed=False, pre_state_id=None).turn_has_mutation
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:2449: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:22:12 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:22:12 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:22:12 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 13:22:12 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=20.0 configured_turns=5 fundable_turns_estimate=1 planning_seconds_per_turn=15.0
+2026-11-09 13:22:12 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+=========================== short test summary info ============================
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_publication_resource_race_refuses_once_then_allows_valid_repair[canonical]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_publication_resource_race_refuses_once_then_allows_valid_repair[ordinary]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_publication_resource_race_refuses_once_then_allows_valid_repair[promoted]
+================== 3 failed, 198 passed in 116.33s (0:01:56) ===================

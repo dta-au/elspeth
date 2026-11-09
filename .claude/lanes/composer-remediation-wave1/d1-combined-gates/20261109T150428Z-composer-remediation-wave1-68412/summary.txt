@@ -1,0 +1,9 @@
+run_dir=/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-combined-gates/20261109T150428Z-composer-remediation-wave1-68412
+tree=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1 head=14fef5e5342ccbd79b4fdd69b276c20f77d66dc1 before=14fef5e5342ccbd79b4fdd69b276c20f77d66dc1 01ba4719c80b6fe9
+stage=pytest exit=1 seconds=4742 fatal=1 161 failed, 71776 passed, 227 skipped, 1 xfailed, 41 warnings, 139 errors in 4724.68s (1:18:44)
+freeze_monitor stage=pytest status=healthy watcher_exit=0
+stage=testcontainer exit=1 seconds=3121 fatal=1 1 failed, 1068 passed, 1 skipped, 72445 deselected, 13 warnings in 3089.89s (0:51:29)
+freeze_monitor stage=testcontainer status=healthy watcher_exit=0
+after=14fef5e5342ccbd79b4fdd69b276c20f77d66dc1 01ba4719c80b6fe9 frozen=yes
+RESULT=FAIL
+driver_exit=1 reason=completed phase=complete stage=none stage_exit=UNKNOWN freeze_monitor=healthy

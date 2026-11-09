@@ -1,0 +1,791 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-cache-audit
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 7 items
+
+tests/unit/web/composer/test_service.py FFF                              [ 42%]
+tests/unit/web/composer/test_compose_loop_audit_wiring.py FFFF           [100%]
+
+=================================== FAILURES ===================================
+_ TestDiscoveryCache.test_cache_hit_rebuilds_result_envelope_from_current_state[list_sources] _
+
+self = <tests.unit.web.composer.test_service.TestDiscoveryCache object at 0x7f2600487aa0>
+tool_name = 'list_sources'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_name", ["list_sources", "get_expression_grammar", "get_audit_info"])
+    async def test_cache_hit_rebuilds_result_envelope_from_current_state(self, tool_name: str) -> None:
+        """Cacheable discovery data is reused, but validation/version stay current."""
+        from elspeth.web.composer import tool_batch as tool_batch_module
+    
+        catalog = _mock_catalog()
+        settings = _make_settings()
+        service, session_id = _composer_service_with_session(catalog, settings)
+        state = _empty_state()
+    
+        disc1 = _make_llm_response(
+            tool_calls=[{"id": "c1", "name": tool_name, "arguments": {}}],
+        )
+        mutate = _make_llm_response(
+            tool_calls=[
+                {
+                    "id": "c2",
+                    "name": "set_source",
+                    "arguments": {
+                        "plugin": "csv",
+                        "on_success": "out",
+                        "options": {
+                            "path": f"/data/blobs/{session_id}/input.csv",
+                            "schema": {"mode": "observed"},
+                        },
+                        "on_validation_failure": "quarantine",
+                    },
+                }
+            ],
+        )
+        disc2 = _make_llm_response(
+            tool_calls=[{"id": "c3", "name": tool_name, "arguments": {}}],
+        )
+        text = _make_llm_response(content="Done.")
+    
+        passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        with (
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
+            patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
+        ):
+            mock_llm.side_effect = [disc1, mutate, disc2, text]
+            result = await service.compose("Build", [], state, session_id=session_id)
+    
+        assert result.state.version == 2
+        assert dispatch.call_count == 2  # one discovery miss and one mutation
+        cached_tool_message = mock_llm.call_args_list[3][0][0][-1]
+        cached_payload = json.loads(cached_tool_message["content"])
+        first_message = next(message for message in mock_llm.call_args_list[3][0][0] if message.get("tool_call_id") == "c1")
+        first_payload = json.loads(first_message["content"])
+        assert first_payload["version"] == 1
+        assert cached_payload["data"] == first_payload["data"]
+        assert cached_payload["version"] == 2
+        expected_validation = ToolResult(
+            success=True,
+            updated_state=result.state,
+            validation=result.state.validate(),
+            affected_nodes=(),
+        ).to_dict()["validation"]
+        assert cached_payload["validation"] == expected_validation
+        assert cached_payload["affected_nodes"] == first_payload["affected_nodes"] == []
+        discovery_invocations = [entry for entry in result.tool_invocations if entry.tool_name == tool_name]
+        assert len(discovery_invocations) == 2
+        assert [entry.cache_hit for entry in discovery_invocations] == [False, True]
+        miss, hit = discovery_invocations
+        assert miss.result_canonical is not None
+        assert hit.result_canonical is not None
+        assert json.loads(miss.result_canonical) == first_payload
+>       assert json.loads(hit.result_canonical) == cached_payload
+E       AssertionError: assert {'cache_hit':...uccess': True} == {'affected_no...[], ...}, ...}
+E         
+E         Omitting 2 identical items, use -vv to show
+E         Left contains 1 more item:
+E         {'cache_hit': True}
+E         Right contains 3 more items:
+E         {'affected_nodes': [],
+E          'validation': {'errors': [{'component': 'pipeline',...
+E         
+E         ...Full output truncated (27 lines hidden), use '-vv' to show
+
+tests/unit/web/composer/test_service.py:4785: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 18:05:46 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 18:05:46 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 18:05:46 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 18:05:46 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=782c6231-a94c-43a3-9a35-ba8b594afc08 state_is_structurally_empty=True
+_ TestDiscoveryCache.test_cache_hit_rebuilds_result_envelope_from_current_state[get_expression_grammar] _
+
+self = <tests.unit.web.composer.test_service.TestDiscoveryCache object at 0x7f25f59e0da0>
+tool_name = 'get_expression_grammar'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_name", ["list_sources", "get_expression_grammar", "get_audit_info"])
+    async def test_cache_hit_rebuilds_result_envelope_from_current_state(self, tool_name: str) -> None:
+        """Cacheable discovery data is reused, but validation/version stay current."""
+        from elspeth.web.composer import tool_batch as tool_batch_module
+    
+        catalog = _mock_catalog()
+        settings = _make_settings()
+        service, session_id = _composer_service_with_session(catalog, settings)
+        state = _empty_state()
+    
+        disc1 = _make_llm_response(
+            tool_calls=[{"id": "c1", "name": tool_name, "arguments": {}}],
+        )
+        mutate = _make_llm_response(
+            tool_calls=[
+                {
+                    "id": "c2",
+                    "name": "set_source",
+                    "arguments": {
+                        "plugin": "csv",
+                        "on_success": "out",
+                        "options": {
+                            "path": f"/data/blobs/{session_id}/input.csv",
+                            "schema": {"mode": "observed"},
+                        },
+                        "on_validation_failure": "quarantine",
+                    },
+                }
+            ],
+        )
+        disc2 = _make_llm_response(
+            tool_calls=[{"id": "c3", "name": tool_name, "arguments": {}}],
+        )
+        text = _make_llm_response(content="Done.")
+    
+        passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        with (
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
+            patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
+        ):
+            mock_llm.side_effect = [disc1, mutate, disc2, text]
+            result = await service.compose("Build", [], state, session_id=session_id)
+    
+        assert result.state.version == 2
+        assert dispatch.call_count == 2  # one discovery miss and one mutation
+        cached_tool_message = mock_llm.call_args_list[3][0][0][-1]
+        cached_payload = json.loads(cached_tool_message["content"])
+        first_message = next(message for message in mock_llm.call_args_list[3][0][0] if message.get("tool_call_id") == "c1")
+        first_payload = json.loads(first_message["content"])
+        assert first_payload["version"] == 1
+        assert cached_payload["data"] == first_payload["data"]
+        assert cached_payload["version"] == 2
+        expected_validation = ToolResult(
+            success=True,
+            updated_state=result.state,
+            validation=result.state.validate(),
+            affected_nodes=(),
+        ).to_dict()["validation"]
+        assert cached_payload["validation"] == expected_validation
+        assert cached_payload["affected_nodes"] == first_payload["affected_nodes"] == []
+        discovery_invocations = [entry for entry in result.tool_invocations if entry.tool_name == tool_name]
+        assert len(discovery_invocations) == 2
+        assert [entry.cache_hit for entry in discovery_invocations] == [False, True]
+        miss, hit = discovery_invocations
+        assert miss.result_canonical is not None
+        assert hit.result_canonical is not None
+        assert json.loads(miss.result_canonical) == first_payload
+>       assert json.loads(hit.result_canonical) == cached_payload
+E       AssertionError: assert {'cache_hit':...uccess': True} == {'affected_no...[], ...}, ...}
+E         
+E         Omitting 2 identical items, use -vv to show
+E         Left contains 1 more item:
+E         {'cache_hit': True}
+E         Right contains 3 more items:
+E         {'affected_nodes': [],
+E          'validation': {'errors': [{'component': 'pipeline',...
+E         
+E         ...Full output truncated (27 lines hidden), use '-vv' to show
+
+tests/unit/web/composer/test_service.py:4785: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 18:05:48 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 18:05:49 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 18:05:49 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 18:05:49 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=7ce47c41-7dfb-4029-bbbc-4e2329906475 state_is_structurally_empty=True
+_ TestDiscoveryCache.test_cache_hit_rebuilds_result_envelope_from_current_state[get_audit_info] _
+
+self = <tests.unit.web.composer.test_service.TestDiscoveryCache object at 0x7f25f59e0d70>
+tool_name = 'get_audit_info'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_name", ["list_sources", "get_expression_grammar", "get_audit_info"])
+    async def test_cache_hit_rebuilds_result_envelope_from_current_state(self, tool_name: str) -> None:
+        """Cacheable discovery data is reused, but validation/version stay current."""
+        from elspeth.web.composer import tool_batch as tool_batch_module
+    
+        catalog = _mock_catalog()
+        settings = _make_settings()
+        service, session_id = _composer_service_with_session(catalog, settings)
+        state = _empty_state()
+    
+        disc1 = _make_llm_response(
+            tool_calls=[{"id": "c1", "name": tool_name, "arguments": {}}],
+        )
+        mutate = _make_llm_response(
+            tool_calls=[
+                {
+                    "id": "c2",
+                    "name": "set_source",
+                    "arguments": {
+                        "plugin": "csv",
+                        "on_success": "out",
+                        "options": {
+                            "path": f"/data/blobs/{session_id}/input.csv",
+                            "schema": {"mode": "observed"},
+                        },
+                        "on_validation_failure": "quarantine",
+                    },
+                }
+            ],
+        )
+        disc2 = _make_llm_response(
+            tool_calls=[{"id": "c3", "name": tool_name, "arguments": {}}],
+        )
+        text = _make_llm_response(content="Done.")
+    
+        passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        with (
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
+            patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
+        ):
+            mock_llm.side_effect = [disc1, mutate, disc2, text]
+            result = await service.compose("Build", [], state, session_id=session_id)
+    
+        assert result.state.version == 2
+        assert dispatch.call_count == 2  # one discovery miss and one mutation
+        cached_tool_message = mock_llm.call_args_list[3][0][0][-1]
+        cached_payload = json.loads(cached_tool_message["content"])
+        first_message = next(message for message in mock_llm.call_args_list[3][0][0] if message.get("tool_call_id") == "c1")
+        first_payload = json.loads(first_message["content"])
+        assert first_payload["version"] == 1
+        assert cached_payload["data"] == first_payload["data"]
+        assert cached_payload["version"] == 2
+        expected_validation = ToolResult(
+            success=True,
+            updated_state=result.state,
+            validation=result.state.validate(),
+            affected_nodes=(),
+        ).to_dict()["validation"]
+        assert cached_payload["validation"] == expected_validation
+        assert cached_payload["affected_nodes"] == first_payload["affected_nodes"] == []
+        discovery_invocations = [entry for entry in result.tool_invocations if entry.tool_name == tool_name]
+        assert len(discovery_invocations) == 2
+        assert [entry.cache_hit for entry in discovery_invocations] == [False, True]
+        miss, hit = discovery_invocations
+        assert miss.result_canonical is not None
+        assert hit.result_canonical is not None
+        assert json.loads(miss.result_canonical) == first_payload
+>       assert json.loads(hit.result_canonical) == cached_payload
+E       AssertionError: assert {'cache_hit':...uccess': True} == {'affected_no...[], ...}, ...}
+E         
+E         Omitting 2 identical items, use -vv to show
+E         Left contains 1 more item:
+E         {'cache_hit': True}
+E         Right contains 3 more items:
+E         {'affected_nodes': [],
+E          'validation': {'errors': [{'component': 'pipeline',...
+E         
+E         ...Full output truncated (27 lines hidden), use '-vv' to show
+
+tests/unit/web/composer/test_service.py:4785: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 18:05:49 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 18:05:49 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 18:05:49 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 18:05:49 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=5f8129b1-f918-4565-872b-d43d44c25d66 state_is_structurally_empty=True
+_ TestComposerDiscoveryAuditPreservesResult.test_cache_hit_audit_preserves_pydantic_payload[list_sources-tool_args0] _
+
+self = <tests.unit.web.composer.test_compose_loop_audit_wiring.TestComposerDiscoveryAuditPreservesResult object at 0x7f25f5b705c0>
+tool_name = 'list_sources', tool_args = {}
+
+    @pytest.mark.parametrize(
+        ("tool_name", "tool_args"),
+        [
+            ("list_sources", {}),
+            ("list_transforms", {}),
+            ("list_sinks", {}),
+            ("get_plugin_schema", {"plugin_type": "source", "name": "csv"}),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_cache_hit_audit_preserves_pydantic_payload(self, tool_name: str, tool_args: dict[str, Any]) -> None:
+        """Cache-hit replay records the cached catalog data, not the sentinel.
+    
+        Cache hits readmit the owned response and record the full delivered
+        envelope while avoiding a second handler dispatch.
+    
+        Sequence: two compose loop turns each issuing the same
+        cacheable tool call, then a final text turn. The first call
+        populates ``discovery_cache``; the second hits it.
+        """
+        catalog = _mock_catalog()
+        settings = _make_settings()
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
+        state = _empty_state()
+    
+        # Same arguments dict on both turns → identical cache key.
+        turn1 = _make_llm_response(
+            tool_calls=[
+                {
+                    "id": f"call_{tool_name}_first",
+                    "name": tool_name,
+                    "arguments": tool_args,
+                }
+            ],
+        )
+        turn2 = _make_llm_response(
+            tool_calls=[
+                {
+                    "id": f"call_{tool_name}_replay",
+                    "name": tool_name,
+                    "arguments": tool_args,
+                }
+            ],
+        )
+        turn3 = _make_llm_response(content="Cached discovery complete.")
+    
+        passing_preflight = _passing_preflight()
+    
+        with (
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
+            patch(
+                "elspeth.web.composer.tool_batch.execute_tool",
+                wraps=_strict_execute_tool,
+            ) as mock_execute_tool,
+        ):
+            mock_llm.side_effect = [turn1, turn2, turn3]
+            result = await service.compose(f"Cache {tool_name}", [], state, session_id=session_id)
+    
+        # Cache hit means execute_tool was called only once across both
+        # turns — the second turn served the result from
+        # discovery_cache without re-dispatching to the handler.
+        assert mock_execute_tool.call_count == 1, (
+            f"{tool_name}: expected exactly one execute_tool call across "
+            f"both turns (second served from cache); got {mock_execute_tool.call_count}"
+        )
+    
+        invocations = result.tool_invocations
+        assert len(invocations) == 2, f"{tool_name}: expected two audit rows (cache miss + hit)"
+    
+        miss_inv, hit_inv = invocations
+        assert miss_inv.status == ComposerToolStatus.SUCCESS
+        assert miss_inv.cache_hit is False
+        assert hit_inv.status == ComposerToolStatus.SUCCESS
+        assert hit_inv.cache_hit is True
+    
+        # Both audit rows must carry the real data — pre-fix the
+        # cache-hit row would have landed the sentinel because the
+        # hand-built payload bypassed any normalization.
+        assert miss_inv.result_canonical is not None
+        assert hit_inv.result_canonical is not None
+        miss_payload = json.loads(miss_inv.result_canonical)
+        hit_payload = json.loads(hit_inv.result_canonical)
+    
+        _assert_payload_preserved(miss_payload, tool_name)
+>       _assert_payload_preserved(hit_payload, tool_name)
+
+tests/unit/web/composer/test_compose_loop_audit_wiring.py:1258: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+payload = {'cache_hit': True, 'data': {'available': [{'aggregation_output_modes': [], 'audit_characteristics': [], 'capability_tags': [], 'composer_hints': [], ...}], 'prohibited': []}, 'success': True}
+tool_name = 'list_sources'
+
+    def _assert_payload_preserved(payload: dict[str, Any], tool_name: str) -> None:
+        """Common assertions for a discovery-tool audit payload.
+    
+        Pinned invariants:
+    
+        - The sentinel diagnostic key is absent (the actual data made it
+          through canonicalization).
+        - The payload carries the expected envelope keys for a successful
+          discovery (``success``, ``validation``, ``version``, ``data``).
+        - The catalog data inside ``payload["data"]`` matches what the
+          ``_mock_catalog()`` fixture configured.
+        """
+        assert "_canonicalization_error" not in payload, (
+            f"{tool_name}: sentinel landed where real data was expected — audit primacy violated. Payload: {payload}"
+        )
+        assert payload["success"] is True
+>       assert "validation" in payload
+E       AssertionError: assert 'validation' in {'cache_hit': True, 'data': {'available': [{'aggregation_output_modes': [], 'audit_characteristics': [], 'capability_tags': [], 'composer_hints': [], ...}], 'prohibited': []}, 'success': True}
+
+tests/unit/web/composer/test_compose_loop_audit_wiring.py:1078: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 18:05:50 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 18:05:50 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 18:05:50 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 18:05:50 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=43326e18-7497-413e-9ce9-22156d02fa2a state_is_structurally_empty=True
+_ TestComposerDiscoveryAuditPreservesResult.test_cache_hit_audit_preserves_pydantic_payload[list_transforms-tool_args1] _
+
+self = <tests.unit.web.composer.test_compose_loop_audit_wiring.TestComposerDiscoveryAuditPreservesResult object at 0x7f25f59e0e60>
+tool_name = 'list_transforms', tool_args = {}
+
+    @pytest.mark.parametrize(
+        ("tool_name", "tool_args"),
+        [
+            ("list_sources", {}),
+            ("list_transforms", {}),
+            ("list_sinks", {}),
+            ("get_plugin_schema", {"plugin_type": "source", "name": "csv"}),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_cache_hit_audit_preserves_pydantic_payload(self, tool_name: str, tool_args: dict[str, Any]) -> None:
+        """Cache-hit replay records the cached catalog data, not the sentinel.
+    
+        Cache hits readmit the owned response and record the full delivered
+        envelope while avoiding a second handler dispatch.
+    
+        Sequence: two compose loop turns each issuing the same
+        cacheable tool call, then a final text turn. The first call
+        populates ``discovery_cache``; the second hits it.
+        """
+        catalog = _mock_catalog()
+        settings = _make_settings()
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
+        state = _empty_state()
+    
+        # Same arguments dict on both turns → identical cache key.
+        turn1 = _make_llm_response(
+            tool_calls=[
+                {
+                    "id": f"call_{tool_name}_first",
+                    "name": tool_name,
+                    "arguments": tool_args,
+                }
+            ],
+        )
+        turn2 = _make_llm_response(
+            tool_calls=[
+                {
+                    "id": f"call_{tool_name}_replay",
+                    "name": tool_name,
+                    "arguments": tool_args,
+                }
+            ],
+        )
+        turn3 = _make_llm_response(content="Cached discovery complete.")
+    
+        passing_preflight = _passing_preflight()
+    
+        with (
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
+            patch(
+                "elspeth.web.composer.tool_batch.execute_tool",
+                wraps=_strict_execute_tool,
+            ) as mock_execute_tool,
+        ):
+            mock_llm.side_effect = [turn1, turn2, turn3]
+            result = await service.compose(f"Cache {tool_name}", [], state, session_id=session_id)
+    
+        # Cache hit means execute_tool was called only once across both
+        # turns — the second turn served the result from
+        # discovery_cache without re-dispatching to the handler.
+        assert mock_execute_tool.call_count == 1, (
+            f"{tool_name}: expected exactly one execute_tool call across "
+            f"both turns (second served from cache); got {mock_execute_tool.call_count}"
+        )
+    
+        invocations = result.tool_invocations
+        assert len(invocations) == 2, f"{tool_name}: expected two audit rows (cache miss + hit)"
+    
+        miss_inv, hit_inv = invocations
+        assert miss_inv.status == ComposerToolStatus.SUCCESS
+        assert miss_inv.cache_hit is False
+        assert hit_inv.status == ComposerToolStatus.SUCCESS
+        assert hit_inv.cache_hit is True
+    
+        # Both audit rows must carry the real data — pre-fix the
+        # cache-hit row would have landed the sentinel because the
+        # hand-built payload bypassed any normalization.
+        assert miss_inv.result_canonical is not None
+        assert hit_inv.result_canonical is not None
+        miss_payload = json.loads(miss_inv.result_canonical)
+        hit_payload = json.loads(hit_inv.result_canonical)
+    
+        _assert_payload_preserved(miss_payload, tool_name)
+>       _assert_payload_preserved(hit_payload, tool_name)
+
+tests/unit/web/composer/test_compose_loop_audit_wiring.py:1258: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+payload = {'cache_hit': True, 'data': {'available': [], 'prohibited': []}, 'success': True}
+tool_name = 'list_transforms'
+
+    def _assert_payload_preserved(payload: dict[str, Any], tool_name: str) -> None:
+        """Common assertions for a discovery-tool audit payload.
+    
+        Pinned invariants:
+    
+        - The sentinel diagnostic key is absent (the actual data made it
+          through canonicalization).
+        - The payload carries the expected envelope keys for a successful
+          discovery (``success``, ``validation``, ``version``, ``data``).
+        - The catalog data inside ``payload["data"]`` matches what the
+          ``_mock_catalog()`` fixture configured.
+        """
+        assert "_canonicalization_error" not in payload, (
+            f"{tool_name}: sentinel landed where real data was expected — audit primacy violated. Payload: {payload}"
+        )
+        assert payload["success"] is True
+>       assert "validation" in payload
+E       AssertionError: assert 'validation' in {'cache_hit': True, 'data': {'available': [], 'prohibited': []}, 'success': True}
+
+tests/unit/web/composer/test_compose_loop_audit_wiring.py:1078: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 18:05:50 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 18:05:50 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 18:05:50 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 18:05:50 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=062aaeed-eb56-46de-9633-71597256f87e state_is_structurally_empty=True
+_ TestComposerDiscoveryAuditPreservesResult.test_cache_hit_audit_preserves_pydantic_payload[list_sinks-tool_args2] _
+
+self = <tests.unit.web.composer.test_compose_loop_audit_wiring.TestComposerDiscoveryAuditPreservesResult object at 0x7f25f59e1370>
+tool_name = 'list_sinks', tool_args = {}
+
+    @pytest.mark.parametrize(
+        ("tool_name", "tool_args"),
+        [
+            ("list_sources", {}),
+            ("list_transforms", {}),
+            ("list_sinks", {}),
+            ("get_plugin_schema", {"plugin_type": "source", "name": "csv"}),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_cache_hit_audit_preserves_pydantic_payload(self, tool_name: str, tool_args: dict[str, Any]) -> None:
+        """Cache-hit replay records the cached catalog data, not the sentinel.
+    
+        Cache hits readmit the owned response and record the full delivered
+        envelope while avoiding a second handler dispatch.
+    
+        Sequence: two compose loop turns each issuing the same
+        cacheable tool call, then a final text turn. The first call
+        populates ``discovery_cache``; the second hits it.
+        """
+        catalog = _mock_catalog()
+        settings = _make_settings()
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
+        state = _empty_state()
+    
+        # Same arguments dict on both turns → identical cache key.
+        turn1 = _make_llm_response(
+            tool_calls=[
+                {
+                    "id": f"call_{tool_name}_first",
+                    "name": tool_name,
+                    "arguments": tool_args,
+                }
+            ],
+        )
+        turn2 = _make_llm_response(
+            tool_calls=[
+                {
+                    "id": f"call_{tool_name}_replay",
+                    "name": tool_name,
+                    "arguments": tool_args,
+                }
+            ],
+        )
+        turn3 = _make_llm_response(content="Cached discovery complete.")
+    
+        passing_preflight = _passing_preflight()
+    
+        with (
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
+            patch(
+                "elspeth.web.composer.tool_batch.execute_tool",
+                wraps=_strict_execute_tool,
+            ) as mock_execute_tool,
+        ):
+            mock_llm.side_effect = [turn1, turn2, turn3]
+            result = await service.compose(f"Cache {tool_name}", [], state, session_id=session_id)
+    
+        # Cache hit means execute_tool was called only once across both
+        # turns — the second turn served the result from
+        # discovery_cache without re-dispatching to the handler.
+        assert mock_execute_tool.call_count == 1, (
+            f"{tool_name}: expected exactly one execute_tool call across "
+            f"both turns (second served from cache); got {mock_execute_tool.call_count}"
+        )
+    
+        invocations = result.tool_invocations
+        assert len(invocations) == 2, f"{tool_name}: expected two audit rows (cache miss + hit)"
+    
+        miss_inv, hit_inv = invocations
+        assert miss_inv.status == ComposerToolStatus.SUCCESS
+        assert miss_inv.cache_hit is False
+        assert hit_inv.status == ComposerToolStatus.SUCCESS
+        assert hit_inv.cache_hit is True
+    
+        # Both audit rows must carry the real data — pre-fix the
+        # cache-hit row would have landed the sentinel because the
+        # hand-built payload bypassed any normalization.
+        assert miss_inv.result_canonical is not None
+        assert hit_inv.result_canonical is not None
+        miss_payload = json.loads(miss_inv.result_canonical)
+        hit_payload = json.loads(hit_inv.result_canonical)
+    
+        _assert_payload_preserved(miss_payload, tool_name)
+>       _assert_payload_preserved(hit_payload, tool_name)
+
+tests/unit/web/composer/test_compose_loop_audit_wiring.py:1258: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+payload = {'cache_hit': True, 'data': {'available': [], 'prohibited': []}, 'success': True}
+tool_name = 'list_sinks'
+
+    def _assert_payload_preserved(payload: dict[str, Any], tool_name: str) -> None:
+        """Common assertions for a discovery-tool audit payload.
+    
+        Pinned invariants:
+    
+        - The sentinel diagnostic key is absent (the actual data made it
+          through canonicalization).
+        - The payload carries the expected envelope keys for a successful
+          discovery (``success``, ``validation``, ``version``, ``data``).
+        - The catalog data inside ``payload["data"]`` matches what the
+          ``_mock_catalog()`` fixture configured.
+        """
+        assert "_canonicalization_error" not in payload, (
+            f"{tool_name}: sentinel landed where real data was expected — audit primacy violated. Payload: {payload}"
+        )
+        assert payload["success"] is True
+>       assert "validation" in payload
+E       AssertionError: assert 'validation' in {'cache_hit': True, 'data': {'available': [], 'prohibited': []}, 'success': True}
+
+tests/unit/web/composer/test_compose_loop_audit_wiring.py:1078: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 18:05:51 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 18:05:51 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 18:05:51 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 18:05:51 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=5b146455-0671-493c-9208-829743d51c6a state_is_structurally_empty=True
+_ TestComposerDiscoveryAuditPreservesResult.test_cache_hit_audit_preserves_pydantic_payload[get_plugin_schema-tool_args3] _
+
+self = <tests.unit.web.composer.test_compose_loop_audit_wiring.TestComposerDiscoveryAuditPreservesResult object at 0x7f25f59e1970>
+tool_name = 'get_plugin_schema'
+tool_args = {'name': 'csv', 'plugin_type': 'source'}
+
+    @pytest.mark.parametrize(
+        ("tool_name", "tool_args"),
+        [
+            ("list_sources", {}),
+            ("list_transforms", {}),
+            ("list_sinks", {}),
+            ("get_plugin_schema", {"plugin_type": "source", "name": "csv"}),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_cache_hit_audit_preserves_pydantic_payload(self, tool_name: str, tool_args: dict[str, Any]) -> None:
+        """Cache-hit replay records the cached catalog data, not the sentinel.
+    
+        Cache hits readmit the owned response and record the full delivered
+        envelope while avoiding a second handler dispatch.
+    
+        Sequence: two compose loop turns each issuing the same
+        cacheable tool call, then a final text turn. The first call
+        populates ``discovery_cache``; the second hits it.
+        """
+        catalog = _mock_catalog()
+        settings = _make_settings()
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
+        state = _empty_state()
+    
+        # Same arguments dict on both turns → identical cache key.
+        turn1 = _make_llm_response(
+            tool_calls=[
+                {
+                    "id": f"call_{tool_name}_first",
+                    "name": tool_name,
+                    "arguments": tool_args,
+                }
+            ],
+        )
+        turn2 = _make_llm_response(
+            tool_calls=[
+                {
+                    "id": f"call_{tool_name}_replay",
+                    "name": tool_name,
+                    "arguments": tool_args,
+                }
+            ],
+        )
+        turn3 = _make_llm_response(content="Cached discovery complete.")
+    
+        passing_preflight = _passing_preflight()
+    
+        with (
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
+            patch(
+                "elspeth.web.composer.tool_batch.execute_tool",
+                wraps=_strict_execute_tool,
+            ) as mock_execute_tool,
+        ):
+            mock_llm.side_effect = [turn1, turn2, turn3]
+            result = await service.compose(f"Cache {tool_name}", [], state, session_id=session_id)
+    
+        # Cache hit means execute_tool was called only once across both
+        # turns — the second turn served the result from
+        # discovery_cache without re-dispatching to the handler.
+        assert mock_execute_tool.call_count == 1, (
+            f"{tool_name}: expected exactly one execute_tool call across "
+            f"both turns (second served from cache); got {mock_execute_tool.call_count}"
+        )
+    
+        invocations = result.tool_invocations
+        assert len(invocations) == 2, f"{tool_name}: expected two audit rows (cache miss + hit)"
+    
+        miss_inv, hit_inv = invocations
+        assert miss_inv.status == ComposerToolStatus.SUCCESS
+        assert miss_inv.cache_hit is False
+        assert hit_inv.status == ComposerToolStatus.SUCCESS
+        assert hit_inv.cache_hit is True
+    
+        # Both audit rows must carry the real data — pre-fix the
+        # cache-hit row would have landed the sentinel because the
+        # hand-built payload bypassed any normalization.
+        assert miss_inv.result_canonical is not None
+        assert hit_inv.result_canonical is not None
+        miss_payload = json.loads(miss_inv.result_canonical)
+        hit_payload = json.loads(hit_inv.result_canonical)
+    
+        _assert_payload_preserved(miss_payload, tool_name)
+>       _assert_payload_preserved(hit_payload, tool_name)
+
+tests/unit/web/composer/test_compose_loop_audit_wiring.py:1258: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+payload = {'cache_hit': True, 'data': {'aggregation_output_modes': [], 'composer_hints': [], 'description': 'CSV source', 'json_schema': {'properties': {}, 'title': 'Config'}, ...}, 'success': True}
+tool_name = 'get_plugin_schema'
+
+    def _assert_payload_preserved(payload: dict[str, Any], tool_name: str) -> None:
+        """Common assertions for a discovery-tool audit payload.
+    
+        Pinned invariants:
+    
+        - The sentinel diagnostic key is absent (the actual data made it
+          through canonicalization).
+        - The payload carries the expected envelope keys for a successful
+          discovery (``success``, ``validation``, ``version``, ``data``).
+        - The catalog data inside ``payload["data"]`` matches what the
+          ``_mock_catalog()`` fixture configured.
+        """
+        assert "_canonicalization_error" not in payload, (
+            f"{tool_name}: sentinel landed where real data was expected — audit primacy violated. Payload: {payload}"
+        )
+        assert payload["success"] is True
+>       assert "validation" in payload
+E       AssertionError: assert 'validation' in {'cache_hit': True, 'data': {'aggregation_output_modes': [], 'composer_hints': [], 'description': 'CSV source', 'json_schema': {'properties': {}, 'title': 'Config'}, ...}, 'success': True}
+
+tests/unit/web/composer/test_compose_loop_audit_wiring.py:1078: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 18:05:51 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 18:05:51 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 18:05:51 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 18:05:51 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=5125e179-a102-43c7-8481-98ba56f8ca71 state_is_structurally_empty=True
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_service.py::TestDiscoveryCache::test_cache_hit_rebuilds_result_envelope_from_current_state[list_sources]
+FAILED tests/unit/web/composer/test_service.py::TestDiscoveryCache::test_cache_hit_rebuilds_result_envelope_from_current_state[get_expression_grammar]
+FAILED tests/unit/web/composer/test_service.py::TestDiscoveryCache::test_cache_hit_rebuilds_result_envelope_from_current_state[get_audit_info]
+FAILED tests/unit/web/composer/test_compose_loop_audit_wiring.py::TestComposerDiscoveryAuditPreservesResult::test_cache_hit_audit_preserves_pydantic_payload[list_sources-tool_args0]
+FAILED tests/unit/web/composer/test_compose_loop_audit_wiring.py::TestComposerDiscoveryAuditPreservesResult::test_cache_hit_audit_preserves_pydantic_payload[list_transforms-tool_args1]
+FAILED tests/unit/web/composer/test_compose_loop_audit_wiring.py::TestComposerDiscoveryAuditPreservesResult::test_cache_hit_audit_preserves_pydantic_payload[list_sinks-tool_args2]
+FAILED tests/unit/web/composer/test_compose_loop_audit_wiring.py::TestComposerDiscoveryAuditPreservesResult::test_cache_hit_audit_preserves_pydantic_payload[get_plugin_schema-tool_args3]
+============================== 7 failed in 9.03s ===============================

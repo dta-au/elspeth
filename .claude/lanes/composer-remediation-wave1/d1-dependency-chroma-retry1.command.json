@@ -1,0 +1,21 @@
+{
+  "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-wave1",
+  "argv": [
+    "/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/python",
+    "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/run-chroma-with-local-assets.py",
+    "-n",
+    "0",
+    "-o",
+    "pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src",
+    "tests/unit/plugins/infrastructure/clients/retrieval/test_chroma.py",
+    "tests/integration/pipeline/test_rag_indexed_smoke.py",
+    "tests/integration/pipeline/test_row_type_violation_routing.py",
+    "tests/integration/plugins/transforms/test_rag_pipeline.py",
+    "tests/integration/plugins/transforms/test_template_worker_loss.py"
+  ],
+  "runtime": {
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src:/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src",
+    "PATH": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/runtime-deps/caddy:/workspace/elspeth/.claude/lanes/composer-remediation-wave1/runtime-deps/sqlite3/bin:/home/agent/.local/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/override:/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/node/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin:/opt/codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/agent/.local/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/fallback",
+    "PLAYWRIGHT_BROWSERS_PATH": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/playwright-browsers"
+  }
+}

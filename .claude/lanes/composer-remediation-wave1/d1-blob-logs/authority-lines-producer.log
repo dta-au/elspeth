@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-blob-refresh-authority-lines.py", line 12, in <module>
+    from tests.unit.architecture import test_session_db_mutation_authority as gate
+ModuleNotFoundError: No module named 'tests'

@@ -1,0 +1,519 @@
+"""LLM transform plugins for ELSPETH.
+
+Provides transforms for Azure OpenAI, OpenRouter, and other LLM providers.
+Includes support for pooled execution, batch processing, and multi-query evaluation.
+
+Plugins are accessed via PluginManager, not direct imports:
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    transform = manager.get_transform_by_name("llm")
+
+For testing or advanced usage, import directly from module paths:
+    from elspeth.plugins.transforms.llm.transform import LLMTransform
+    from elspeth.plugins.transforms.llm.templates import PromptTemplate
+    from elspeth.contracts.schema_contract import PipelineRow
+
+Metadata Field Categories
+=========================
+
+guaranteed_fields: Contract-stable fields downstream can depend on
+    - <response_field>: The LLM response content
+    - <response_field>_usage: Token usage (for cost/quota management)
+    - <response_field>_model: Model identifier (for routing/reporting)
+
+audit_fields: Provenance metadata for audit trail (may change between versions)
+    - <response_field>_template_hash: SHA256 of prompt template
+    - <response_field>_variables_hash: SHA256 of what the template could see (its declared fields, ADR-051)
+    - <response_field>_template_source: Config file path
+    - <response_field>_lookup_hash: SHA256 of lookup data
+    - <response_field>_lookup_source: Config file path
+    - <response_field>_system_prompt_source: Config file path
+
+WARNING: Do not build production logic that depends on audit_fields.
+These fields exist for audit trail reconstruction (explain() queries)
+and may change between versions without notice.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Literal
+
+from elspeth.contracts.identifiers import validate_field_name
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_missing_guaranteed_fields
+from elspeth.contracts.token_usage import TokenUsage
+
+if TYPE_CHECKING:
+    from elspeth.contracts import PluginSchema
+    from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig
+
+# Metadata field suffixes for contract-stable fields (downstream can depend on these)
+LLM_GUARANTEED_SUFFIXES: tuple[str, ...] = (
+    "",  # The response content field itself
+    "_usage",  # Token usage dict {prompt_tokens, completion_tokens, total_tokens}
+    "_model",  # Model identifier that actually responded
+)
+
+# Type alias matching FieldDefinition.field_type
+_FieldType = Literal["str", "int", "float", "bool", "any"]
+
+# Schema types for each guaranteed suffix — used by output schema builders
+# to advertise real types instead of erasing to "any".
+_SUFFIX_SCHEMA_TYPES: dict[str, _FieldType] = {
+    "": "str",  # Response content is always str
+    "_usage": "any",  # Token usage dict — shape varies by provider
+    "_model": "str",  # Model identifier is always str
+}
+
+# Maps OutputFieldType enum values to schema field_type strings
+_OUTPUT_FIELD_TYPE_TO_SCHEMA: dict[str, _FieldType] = {
+    "string": "str",
+    "integer": "int",
+    "number": "float",
+    "boolean": "bool",
+    "enum": "str",  # Enum values are string labels in output rows
+}
+
+# Multi-query transforms emit suffixed fields only (no base field)
+# e.g., category_score, category_rationale, category_usage, category_model
+# NOT category (the base field with empty suffix)
+MULTI_QUERY_GUARANTEED_SUFFIXES: tuple[str, ...] = (
+    "_usage",  # Token usage dict {prompt_tokens, completion_tokens, total_tokens}
+    "_model",  # Model identifier that actually responded
+)
+
+# Metadata field suffixes for audit-only fields (exist but may change between versions)
+LLM_AUDIT_SUFFIXES: tuple[str, ...] = (
+    "_template_hash",  # SHA256 of prompt template
+    "_variables_hash",  # SHA256 of what the template could see: its declared fields (ADR-051)
+    "_template_source",  # File path of template (None if inline)
+    "_lookup_hash",  # SHA256 of lookup data
+    "_lookup_source",  # File path of lookup data (None if no lookup)
+    "_system_prompt_source",  # File path of system prompt (None if inline)
+)
+
+
+def _llm_created_output_fields(
+    response_field: str,
+    prefix: str,
+    output_fields: Iterable[OutputFieldConfig],
+) -> tuple[FieldDefinition, ...]:
+    """The typed created fields of one query: its operational fields plus its structured fields under ``prefix``.
+
+    The one table of what an LLM transform writes and as which type: the
+    transform stamps it (``LLMTransform.created_output_fields``) and
+    ``LLMConfig`` checks the operator's authored types against it.
+
+    Operational values overwrite extracted values of the same name when
+    the row is assembled, so their declarations have the same precedence.
+    """
+    operational_fields = tuple(
+        FieldDefinition(f"{response_field}{suffix}", _SUFFIX_SCHEMA_TYPES[suffix]) for suffix in LLM_GUARANTEED_SUFFIXES
+    )
+    operational_names = {field.name for field in operational_fields}
+    return (
+        *operational_fields,
+        *(
+            FieldDefinition(f"{prefix}{field.suffix}", _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value], nullable=field.nullable)
+            for field in output_fields
+            if f"{prefix}{field.suffix}" not in operational_names
+        ),
+    )
+
+
+def _validate_response_field(response_field: str) -> None:
+    if not response_field or not response_field.strip():
+        raise ValueError("response_field cannot be empty or whitespace-only")
+    if not response_field.isidentifier():
+        raise ValueError(
+            f"response_field '{response_field}' is not a valid Python identifier. "
+            f"Use only letters, digits, and underscores, starting with a letter or underscore."
+        )
+
+
+def _metadata_fields(response_field: str, suffixes: Iterable[str]) -> tuple[str, ...]:
+    _validate_response_field(response_field)
+    return tuple(f"{response_field}{suffix}" for suffix in suffixes)
+
+
+def get_llm_guaranteed_fields(response_field: str) -> tuple[str, ...]:
+    """Return contract-stable metadata field names for LLM transforms.
+
+    These fields are part of the stable API. Downstream transforms can
+    safely declare dependencies on them via required_fields.
+
+    Args:
+        response_field: Base field name (e.g., "llm_response"). Must not be empty
+            or whitespace-only.
+
+    Returns:
+        Tuple of field names that are guaranteed to exist.
+
+    Raises:
+        ValueError: If response_field is empty or whitespace-only.
+    """
+    return _metadata_fields(response_field, LLM_GUARANTEED_SUFFIXES)
+
+
+def get_llm_audit_fields(response_field: str) -> tuple[str, ...]:
+    """Return audit-only metadata field names for LLM transforms.
+
+    These fields exist for audit trail reconstruction but are NOT part
+    of the stability contract. They may change between versions.
+
+    Args:
+        response_field: Base field name (e.g., "llm_response"). Must not be empty
+            or whitespace-only.
+
+    Returns:
+        Tuple of field names for audit purposes.
+
+    Raises:
+        ValueError: If response_field is empty or whitespace-only.
+    """
+    return _metadata_fields(response_field, LLM_AUDIT_SUFFIXES)
+
+
+def _build_llm_output_schema_config(
+    schema_config: SchemaConfig,
+    guaranteed_fields: Iterable[str],
+    *,
+    generated_fields: tuple[FieldDefinition, ...],
+) -> SchemaConfig:
+    """Propagate upstream fields and the types emitted on successful LLM calls."""
+    base_guaranteed = set(schema_config.guaranteed_fields or ())
+    output_fields = base_guaranteed | set(guaranteed_fields)
+    upstream_declared = schema_config.guaranteed_fields is not None
+    if upstream_declared or output_fields:
+        guaranteed_fields_result = tuple(sorted(output_fields))
+    else:
+        guaranteed_fields_result = None
+    return SchemaConfig(
+        mode=schema_config.mode,
+        fields=declare_missing_guaranteed_fields(
+            None if schema_config.fields is None else _merge_generated_output_fields(schema_config.fields, generated_fields),
+            guaranteed_fields_result,
+        ),
+        guaranteed_fields=guaranteed_fields_result,
+        required_fields=schema_config.required_fields,
+    )
+
+
+def _llm_generated_output_fields(
+    response_field: str,
+    extracted_fields: tuple[tuple[str, _FieldType], ...] = (),
+    *,
+    nullable_fields: frozenset[str] = frozenset(),
+) -> tuple[FieldDefinition, ...]:
+    """Declare successful query fields with operational-field precedence.
+
+    nullable_fields contains complete extracted names, including query prefixes.
+    A nullable field remains required: only its admitted value domain expands.
+    """
+    operational_fields = tuple(
+        FieldDefinition(name=f"{response_field}{suffix}", field_type=_SUFFIX_SCHEMA_TYPES[suffix], required=True, nullable=False)
+        for suffix in LLM_GUARANTEED_SUFFIXES
+    )
+    operational_names = {field.name for field in operational_fields}
+    return (
+        *operational_fields,
+        *(
+            FieldDefinition(name=name, field_type=field_type, required=True, nullable=name in nullable_fields)
+            for name, field_type in extracted_fields
+            if name not in operational_names
+        ),
+    )
+
+
+def _merge_generated_output_fields(
+    base_fields: tuple[FieldDefinition, ...],
+    generated_fields: tuple[FieldDefinition, ...],
+) -> tuple[FieldDefinition, ...]:
+    """Replace authored generated fields while retaining upstream declarations."""
+    generated_by_name = {field.name: field for field in generated_fields}
+    base_names = {field.name for field in base_fields}
+    return (
+        *(generated_by_name[field.name] if field.name in generated_by_name else field for field in base_fields),
+        *(field for field in generated_by_name.values() if field.name not in base_names),
+    )
+
+
+def build_llm_source_output_schema_config(
+    schema_config: SchemaConfig,
+    response_field: str,
+    structured_output_fields: tuple[OutputFieldConfig, ...] = (),
+) -> SchemaConfig:
+    """Add the fields guaranteed by a single-request LLM source.
+
+    Explicit authored fields may repeat an LLM output field only with its
+    runtime type; fields, guarantees, and audit_fields outside the
+    emitted values are rejected because a source has no upstream row from
+    which to preserve them, and required_fields are rejected outright
+    because a source has no input row to require fields of
+    (elspeth-fb202d3793). The returned schema preserves the authored mode
+    and contract metadata while making all emitted fields required
+    and guaranteed. ``structured_output_fields`` (the source's top-level
+    structured-output declaration) join the emitted set with their declared
+    runtime types — extraction fails the row before emission when one is
+    missing, so on success they are always present. Their nullable flags govern
+    both explicit authored declarations and added output-field declarations.
+    """
+    validate_field_name(response_field, "response_field")
+    structured_names = tuple(field.suffix for field in structured_output_fields)
+    guaranteed_fields = (*get_llm_guaranteed_fields(response_field), *structured_names)
+    expected_types = {f"{response_field}{suffix}": _SUFFIX_SCHEMA_TYPES[suffix] for suffix in LLM_GUARANTEED_SUFFIXES}
+    expected_types.update({field.suffix: _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value] for field in structured_output_fields})
+    nullable_fields = frozenset(field.suffix for field in structured_output_fields if field.nullable)
+
+    authored_fields = schema_config.fields or ()
+    authored_by_name = {field.name: field for field in authored_fields}
+    unsupported_fields = sorted(set(authored_by_name) - set(expected_types))
+    if unsupported_fields:
+        unsupported = ", ".join(repr(field_name) for field_name in unsupported_fields)
+        raise ValueError(
+            f"LLM source schema field(s) {unsupported} are outside the emitted fields; "
+            "an LLM source does not emit arbitrary authored fields"
+        )
+    unsupported_guarantees = sorted(set(schema_config.guaranteed_fields or ()) - set(expected_types))
+    if unsupported_guarantees:
+        unsupported = ", ".join(repr(field_name) for field_name in unsupported_guarantees)
+        raise ValueError(
+            f"LLM source guaranteed field(s) {unsupported} are outside the emitted fields; "
+            "an LLM source does not emit arbitrary authored fields"
+        )
+    if schema_config.required_fields is not None:
+        required = ", ".join(repr(field_name) for field_name in sorted(schema_config.required_fields))
+        raise ValueError(f"LLM source schema declares required_fields {required}; a source has no input row, so it cannot require fields")
+    unsupported_audit = sorted(set(schema_config.audit_fields or ()) - set(expected_types))
+    if unsupported_audit:
+        unsupported = ", ".join(repr(field_name) for field_name in unsupported_audit)
+        raise ValueError(
+            f"LLM source audit field(s) {unsupported} are outside the emitted fields; an LLM source does not emit arbitrary authored fields"
+        )
+    for field_name, expected_type in expected_types.items():
+        if field_name not in authored_by_name:
+            continue
+        authored_field = authored_by_name[field_name]
+        if authored_field.field_type != expected_type:
+            actual_type = authored_field.field_type
+            raise ValueError(f"LLM source schema field {field_name!r} must have type {expected_type!r}, got {actual_type!r}")
+        if not authored_field.required:
+            raise ValueError(f"LLM source schema field {field_name!r} must be required")
+        if field_name in nullable_fields and not authored_field.nullable:
+            raise ValueError(f"LLM source schema field {field_name!r} must be nullable")
+        if field_name not in nullable_fields and authored_field.nullable:
+            raise ValueError(f"LLM source schema field {field_name!r} must be non-nullable")
+
+    if schema_config.fields is None:
+        output_fields = None
+    else:
+        output_fields = authored_fields + tuple(
+            FieldDefinition(name=field_name, field_type=field_type, nullable=field_name in nullable_fields)
+            for field_name, field_type in expected_types.items()
+            if field_name not in authored_by_name
+        )
+
+    output_guarantees = tuple(sorted(set(schema_config.guaranteed_fields or ()) | set(guaranteed_fields)))
+    return SchemaConfig(
+        mode=schema_config.mode,
+        fields=output_fields,
+        guaranteed_fields=output_guarantees,
+        required_fields=schema_config.required_fields,
+        audit_fields=schema_config.audit_fields,
+    )
+
+
+def populate_llm_operational_fields(
+    output: dict[str, object],
+    field_prefix: str,
+    *,
+    usage: TokenUsage | None,
+    model: str | None,
+) -> None:
+    """Populate operational metadata into the output row (stays in pipeline data).
+
+    These fields have legitimate downstream use (budgeting, routing).
+    Audit provenance fields go to success_reason["metadata"] via
+    build_llm_audit_metadata() instead.
+
+    Args:
+        output: Mutable row dict to populate.
+        field_prefix: Response field name (e.g., "llm_response").
+        usage: Token usage (TokenUsage or None).
+        model: Model identifier that actually responded.
+    """
+    output[f"{field_prefix}_usage"] = usage.to_dict() if usage is not None else None
+    output[f"{field_prefix}_model"] = model
+
+
+def build_llm_audit_metadata(
+    field_prefix: str,
+    *,
+    template_hash: str,
+    variables_hash: str | None,
+    template_source: str | None,
+    lookup_hash: str | None,
+    lookup_source: str | None,
+    system_prompt_source: str | None,
+    parts_hash: str | None = None,
+) -> dict[str, str | None]:
+    """Build audit provenance dict for inclusion in success_reason["metadata"].
+
+    Does NOT write to the output row — audit provenance lives in the Landscape only.
+
+    Args:
+        field_prefix: Response field name (e.g., "llm_response").
+        template_hash: SHA-256 of prompt template.
+        variables_hash: SHA-256 of what the template could see, its declared fields
+            (ADR-051); None for batch-level metadata where per-row hashes are
+            recorded in the calls table.
+        template_source: Config file path of template (None if inline).
+        lookup_hash: SHA-256 of lookup data (None if no lookup).
+        lookup_source: Config file path of lookup data (None if no lookup).
+        system_prompt_source: Config file path of system prompt (None if inline).
+        parts_hash: SHA-256 over the user message's content parts (from
+            ``chat_parts.parts_hash``) when image inputs were bound into the
+            call. ``None`` for a text-only call — the key is omitted entirely
+            rather than emitted as null, so text-only audit metadata stays
+            byte-identical to the pre-image tree.
+
+    Returns:
+        Dict of audit field names to values, ready to merge into
+        success_reason["metadata"].
+    """
+    metadata: dict[str, str | None] = {
+        f"{field_prefix}_template_hash": template_hash,
+        f"{field_prefix}_variables_hash": variables_hash,
+        f"{field_prefix}_template_source": template_source,
+        f"{field_prefix}_lookup_hash": lookup_hash,
+        f"{field_prefix}_lookup_source": lookup_source,
+        f"{field_prefix}_system_prompt_source": system_prompt_source,
+    }
+    if parts_hash is not None:
+        metadata[f"{field_prefix}_parts_hash"] = parts_hash
+    return metadata
+
+
+def _build_augmented_output_schema(
+    base_schema_config: SchemaConfig,
+    response_field: str,
+    schema_name: str,
+    extracted_fields: tuple[tuple[str, _FieldType], ...] | None = None,
+    *,
+    nullable_fields: frozenset[str] = frozenset(),
+) -> type[PluginSchema]:
+    """Build an output schema that includes LLM-added fields.
+
+    LLM transforms add response, usage, and model fields to output rows.
+    The output schema must include these fields for DAG type validation to pass
+    when downstream consumers have explicit schemas requiring LLM output fields.
+
+    For observed schemas this returns the same dynamic schema (no fields to add).
+    For explicit schemas, this declares required generated fields with their
+    successful runtime types.
+
+    Args:
+        base_schema_config: The base schema config from plugin options.
+        response_field: Base field name (e.g., "llm_response").
+        schema_name: Name for the generated Pydantic model class.
+        extracted_fields: (field_name, schema_type) tuples from single-mode
+            structured output_fields config — unprefixed fields extracted
+            from the LLM JSON response (e.g. (("score", "int"),)).
+        nullable_fields: Complete extracted field names that admit None.
+
+    Returns:
+        A PluginSchema subclass with input fields plus LLM output fields.
+    """
+    from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+
+    if base_schema_config.is_observed:
+        # Observed schemas accept anything — no augmentation needed
+        return create_schema_from_config(base_schema_config, schema_name, allow_coercion=False)
+
+    generated_fields = _llm_generated_output_fields(response_field, extracted_fields or (), nullable_fields=nullable_fields)
+    augmented_config = SchemaConfig(
+        # Use flexible mode so extra fields from upstream are accepted
+        mode="flexible",
+        fields=_merge_generated_output_fields(base_schema_config.fields or (), generated_fields),
+        guaranteed_fields=base_schema_config.guaranteed_fields,
+        required_fields=base_schema_config.required_fields,
+        audit_fields=base_schema_config.audit_fields,
+    )
+    return create_schema_from_config(augmented_config, schema_name, allow_coercion=False)
+
+
+def _build_multi_query_output_schema(
+    base_schema_config: SchemaConfig,
+    response_field: str,
+    query_names: tuple[str, ...],
+    schema_name: str,
+    extracted_fields: dict[str, tuple[tuple[str, _FieldType], ...]] | None = None,
+    *,
+    nullable_fields: frozenset[str] = frozenset(),
+) -> type[PluginSchema]:
+    """Build an output schema for multi-query mode with prefixed fields.
+
+    Multi-query transforms emit query-prefixed fields (e.g., quality_llm_response,
+    sentiment_llm_response) instead of the unprefixed single-query fields. The output
+    schema must include these fields for DAG type validation.
+
+    For observed schemas this returns the same dynamic schema (no fields to add).
+    For explicit schemas this augments the base fields with required prefixed
+    LLM output fields with their successful runtime types.
+
+    Args:
+        base_schema_config: The base schema config from plugin options.
+        response_field: Base field name (e.g., "llm_response").
+        query_names: Tuple of query names (e.g., ("quality", "sentiment")).
+        schema_name: Name for the generated Pydantic model class.
+        extracted_fields: Mapping of query name to (field_name, schema_type) tuples
+            from structured output_fields config. These are fields extracted from
+            LLM JSON responses (e.g., {"quality": (("quality_score", "int"), ("quality_label", "str"))}).
+        nullable_fields: Complete query-prefixed extracted names that admit None.
+
+    Returns:
+        A PluginSchema subclass with input fields plus prefixed LLM output fields.
+    """
+    from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+
+    if base_schema_config.is_observed:
+        return create_schema_from_config(base_schema_config, schema_name, allow_coercion=False)
+
+    if extracted_fields is not None:
+        unknown_queries = set(extracted_fields) - set(query_names)
+        if unknown_queries:
+            raise ValueError(f"extracted_fields references unknown query names: {unknown_queries}")
+
+    generated_fields = tuple(
+        field
+        for query_name in query_names
+        for field in _llm_generated_output_fields(
+            f"{query_name}_{response_field}",
+            extracted_fields[query_name] if extracted_fields is not None and query_name in extracted_fields else (),
+            nullable_fields=nullable_fields,
+        )
+    )
+    augmented_config = SchemaConfig(
+        mode="flexible",
+        fields=_merge_generated_output_fields(base_schema_config.fields or (), generated_fields),
+        guaranteed_fields=base_schema_config.guaranteed_fields,
+        required_fields=base_schema_config.required_fields,
+        audit_fields=base_schema_config.audit_fields,
+    )
+    return create_schema_from_config(augmented_config, schema_name, allow_coercion=False)
+
+
+__all__ = [
+    "LLM_AUDIT_SUFFIXES",
+    "LLM_GUARANTEED_SUFFIXES",
+    "MULTI_QUERY_GUARANTEED_SUFFIXES",
+    "_OUTPUT_FIELD_TYPE_TO_SCHEMA",
+    "_SUFFIX_SCHEMA_TYPES",
+    "_build_augmented_output_schema",
+    "_build_multi_query_output_schema",
+    "_llm_created_output_fields",
+    "build_llm_audit_metadata",
+    "get_llm_audit_fields",
+    "get_llm_guaranteed_fields",
+    "populate_llm_operational_fields",
+]

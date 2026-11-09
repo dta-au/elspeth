@@ -1,0 +1,1163 @@
+"""Dataverse source plugin for ELSPETH.
+
+Loads rows from Microsoft Dataverse entities via OData v4 REST API.
+Supports structured OData queries and FetchXML queries with pagination.
+
+IMPORTANT: Sources use allow_coercion=True to normalize external data.
+This is the ONLY place in the pipeline where coercion is allowed.
+"""
+
+from __future__ import annotations
+
+import re
+import urllib.parse
+import xml.etree.ElementTree as ET
+from collections.abc import Iterator, Mapping
+from datetime import UTC, datetime
+from typing import Any, ClassVar, Literal, Self, TypedDict
+
+from pydantic import Field, JsonValue, ValidationError, field_validator, model_validator
+
+import elspeth.contracts.errors as contract_errors
+from elspeth.contracts import Call, CallStatus, CallType, Determinism, PluginSchema, SourceRow
+from elspeth.contracts.contexts import LifecycleContext, LimiterProtocol, SourceContext
+from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLimitExceeded
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
+from elspeth.contracts.events import DataverseLoadStatistics
+from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
+from elspeth.contracts.schema_contract_factory import create_contract_from_config
+from elspeth.contracts.wire_visible_identity import (
+    is_operator_required_placeholder_value,
+    reject_operator_required_placeholder_value,
+)
+from elspeth.core.url_validation import validate_credential_safe_https_url
+from elspeth.plugins.infrastructure.base import BaseSource
+from elspeth.plugins.infrastructure.clients.dataverse import (
+    DataverseAuthConfig,
+    DataverseClient,
+    DataverseClientError,
+    DataversePageResponse,
+    validate_additional_domain,
+)
+from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_url
+from elspeth.plugins.infrastructure.config_base import (
+    DataPluginConfig,
+    NormalizedFieldMappingOption,
+    declared_source_schema_field_names,
+)
+from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+from elspeth.plugins.sources.field_normalization import (
+    ExternalHeaderError,
+    FieldResolution,
+    check_declared_fields_reachable,
+    extend_field_resolution,
+    normalize_field_name,
+    resolve_field_names,
+)
+
+
+class _DataverseSourceRequest(TypedDict):
+    method: str
+    url: str | None
+    headers: dict[str, str] | None
+
+
+# OData annotation prefixes to strip from row data
+_ODATA_ANNOTATION_PATTERN = re.compile(r"^@odata\.|@Microsoft\.Dynamics\.CRM\.")
+_FORMATTED_VALUE_SUFFIX = "@OData.Community.Display.V1.FormattedValue"
+_DATAVERSE_LOGICAL_NAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*$")
+_DATAVERSE_ENTITY_SET_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_dataverse_logical_name(value: object, *, field_name: str) -> str:
+    """Require a lowercase Dataverse LogicalName with no URL delimiters."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string containing a valid lowercase ASCII identifier")
+    reject_operator_required_placeholder_value(value, field_name=field_name)
+    if _DATAVERSE_LOGICAL_NAME_PATTERN.fullmatch(value) is None:
+        raise ValueError(
+            f"{field_name} must be a lowercase ASCII identifier beginning with a lowercase letter or underscore "
+            "and containing only lowercase letters, digits, and underscores"
+        )
+    return value
+
+
+def _validate_dataverse_entity_set_name(value: object, *, field_name: str) -> str:
+    """Require a case-preserving Dataverse EntitySetName with no URL delimiters."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string containing a valid ASCII identifier")
+    reject_operator_required_placeholder_value(value, field_name=field_name)
+    if _DATAVERSE_ENTITY_SET_NAME_PATTERN.fullmatch(value) is None:
+        raise ValueError(
+            f"{field_name} must be an ASCII identifier beginning with a letter or underscore "
+            "and containing only letters, digits, and underscores"
+        )
+    return value
+
+
+class DataverseSourceConfig(DataPluginConfig):
+    """Configuration for Dataverse source plugin.
+
+    Extends DataPluginConfig which requires schema configuration.
+    Unlike file-based sources, does not extend PathConfig (no local file path).
+    """
+
+    _plugin_component_type: ClassVar[str | None] = "source"
+
+    environment_url: str = Field(
+        ...,
+        description="Dataverse environment URL (e.g., https://myorg.crm.dynamics.com)",
+    )
+    auth: DataverseAuthConfig = Field(
+        ...,
+        description="Authentication configuration",
+    )
+    api_version: str = Field(
+        default="v9.2",
+        description="Dataverse Web API version",
+    )
+    on_validation_failure: str = Field(
+        ...,
+        description="Sink name for non-conformant rows, or 'discard' for explicit drop",
+    )
+
+    # Structured query mode
+    entity: str | None = Field(
+        default=None,
+        description="Entity logical name (e.g., 'contact')",
+    )
+    entity_set_name: str | None = Field(
+        default=None,
+        description="Explicit EntitySetName fallback when Dataverse metadata access is forbidden",
+    )
+    select: list[str] | None = Field(
+        default=None,
+        description="$select fields (None = all)",
+    )
+    filter: str | None = Field(
+        default=None,
+        description="$filter expression (static OData only)",
+    )
+    orderby: str | None = Field(
+        default=None,
+        description="$orderby expression",
+    )
+    top: int | None = Field(
+        default=None,
+        description="$top limit (None = all records)",
+    )
+
+    # FetchXML query mode
+    fetch_xml: str | None = Field(
+        default=None,
+        description="Raw FetchXML string",
+    )
+
+    # Field handling
+    field_mapping: NormalizedFieldMappingOption = Field(
+        default=None,
+        description="Manual field name overrides",
+    )
+    include_formatted_values: bool = Field(
+        default=False,
+        description="Preserve Dataverse formatted value annotations",
+    )
+
+    # Additional SSRF domain patterns (deployment-level)
+    additional_domains: list[str] | None = Field(
+        default=None,
+        description="Additional Dataverse domain patterns for SSRF allowlist",
+    )
+
+    @field_validator("environment_url")
+    @classmethod
+    def validate_environment_url_https(cls, v: str) -> str:
+        """HTTPS required. Bearer tokens sent over plain HTTP would be unencrypted."""
+        return validate_credential_safe_https_url(v, field_name="environment_url")
+
+    @field_validator("additional_domains")
+    @classmethod
+    def validate_additional_domains(cls, v: list[str] | None) -> list[str] | None:
+        if v is not None:
+            for pattern in v:
+                validate_additional_domain(pattern)
+        return v
+
+    @field_validator("entity")
+    @classmethod
+    def validate_entity_not_placeholder(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return _validate_dataverse_logical_name(v, field_name="entity")
+
+    @field_validator("entity_set_name")
+    @classmethod
+    def validate_entity_set_name_not_placeholder(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return _validate_dataverse_entity_set_name(v, field_name="entity_set_name")
+
+    @field_validator("select")
+    @classmethod
+    def validate_select_not_placeholder(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        stripped_fields: list[str] = []
+        for index, select_name in enumerate(v):
+            if not select_name or not select_name.strip():
+                raise ValueError(f"select[{index}] cannot be empty")
+            stripped = select_name.strip()
+            reject_operator_required_placeholder_value(stripped, field_name=f"select[{index}]")
+            stripped_fields.append(stripped)
+        return stripped_fields
+
+    @model_validator(mode="after")
+    def validate_query_mode(self) -> Self:
+        has_structured = self.entity is not None
+        has_fetchxml = self.fetch_xml is not None
+        if has_structured == has_fetchxml:
+            raise ValueError("Specify exactly one of: entity (structured query) or fetch_xml")
+        if not has_structured and any(f is not None for f in (self.select, self.filter, self.orderby, self.top)):
+            raise ValueError("select/filter/orderby/top require entity (structured query mode)")
+        return self
+
+    @model_validator(mode="after")
+    def validate_declared_field_reachability(self) -> Self:
+        """Reject declared schema names no row can ever carry (elspeth-3664e213c4).
+
+        Dataverse attribute names are normalized to lowercase identifiers at
+        the source boundary while declared names are used verbatim — the same
+        seam as the CSV/JSON sources. Sparse entities
+        (require_all_mapping_keys=False at load) do not change reachability:
+        field_mapping is applied after normalization on every path that
+        introduces an attribute, so a mapping key never survives as a final
+        name and mapping values stay reachable.
+        """
+        declared = declared_source_schema_field_names(self.schema_config)
+        if declared:
+            check_declared_fields_reachable(
+                declared,
+                columns=None,
+                field_mapping=self.field_mapping,
+                header_kind="Dataverse attribute names",
+            )
+        return self
+
+    @field_validator("on_validation_failure")
+    @classmethod
+    def validate_on_validation_failure(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("on_validation_failure must be a sink name or 'discard'")
+        return v.strip()
+
+    @field_validator("fetch_xml")
+    @classmethod
+    def validate_fetch_xml_syntax(cls, v: str | None) -> str | None:
+        """Validate FetchXML is parseable XML at config time.
+
+        Structural validation only — broken FetchXML can never produce valid
+        results for any row. Analogous to TemplateSyntaxError for Jinja2.
+        """
+        if v is not None:
+            try:
+                root = ET.fromstring(v)
+            except ET.ParseError as exc:
+                raise ValueError(
+                    f"fetch_xml contains invalid XML syntax: {exc}. A broken FetchXML query can never produce valid results."
+                ) from exc
+            if root.tag != "fetch":
+                raise ValueError(f"FetchXML root element must be <fetch>, got <{root.tag}>.")
+            entity_elem = root.find("entity")
+            if entity_elem is not None and "name" in entity_elem.attrib:
+                _validate_dataverse_logical_name(entity_elem.attrib["name"], field_name="FetchXML <entity name>")
+        return v
+
+
+# Rebuild model to resolve forward references for dynamic module loading
+DataverseSourceConfig.model_rebuild()
+
+
+class DataverseSource(BaseSource):
+    """Load rows from Microsoft Dataverse via OData v4 REST API.
+
+    Supports structured OData queries ($select, $filter, $orderby, $top)
+    and FetchXML queries with automatic pagination. All responses are
+    validated at the Tier 3 boundary (JSON parse, NaN/Infinity rejection).
+    """
+
+    _normalizes_external_names = True
+    name = "dataverse"
+    plugin_version = "1.0.0"
+    source_file_hash: str | None = "sha256:a993a9a403c9b3b8"
+    determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
+    config_model = DataverseSourceConfig
+
+    usage_when_to_use: str = (
+        "Use for an operator-approved, known Microsoft Dataverse deployment when a paginated, audited read should use an "
+        "entity/OData query or FetchXML."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use for Dataverse writes, webhooks, change streams, local files, or when the environment URL, entity, query, "
+        "or authentication facts would have to be invented."
+    )
+    example_use: str = """sources:
+  contacts:
+    plugin: dataverse
+    on_success: output
+    options:
+      environment_url: https://tenant.crm.dynamics.com
+      auth:
+        method: managed_identity
+      entity: contact
+      select:
+        - contactid
+        - fullname
+      schema:
+        mode: observed
+      on_validation_failure: discard
+"""
+    capability_tags: tuple[str, ...] = ("microsoft", "dataverse", "odata", "fetchxml", "batch")
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__(config)
+        cfg = DataverseSourceConfig.from_dict(config, plugin_name=self.name)
+
+        # Store config
+        self._environment_url = cfg.environment_url
+        self._auth_config = cfg.auth
+        self._api_version = cfg.api_version
+        self._entity = cfg.entity
+        self._entity_set_name = cfg.entity_set_name
+        self._select = cfg.select
+        self._filter = cfg.filter
+        self._orderby = cfg.orderby
+        self._top = cfg.top
+        self._fetch_xml = cfg.fetch_xml
+        self._field_mapping = cfg.field_mapping
+        self._include_formatted_values = cfg.include_formatted_values
+        self._additional_domains = tuple(cfg.additional_domains) if cfg.additional_domains else ()
+        self._on_validation_failure = cfg.on_validation_failure
+
+        # Store schema config
+        self._schema_config = cfg.schema_config
+        self._initialize_declared_guaranteed_fields(self._schema_config)
+
+        # CRITICAL: allow_coercion=True for sources (external data boundary)
+        self._schema_class: type[PluginSchema] = create_schema_from_config(
+            self._schema_config,
+            "DataverseRowSchema",
+            allow_coercion=True,
+        )
+        self.output_schema = self._schema_class
+
+        # Contract setup — Dataverse responses are JSON (no CSV header resolution needed)
+        initial_contract = create_contract_from_config(self._schema_config)
+        if initial_contract.locked:
+            self.set_schema_contract(initial_contract)
+            self._contract_builder: ContractBuilder | None = None
+        else:
+            self._contract_builder = ContractBuilder(initial_contract)
+
+        # Field resolution (populated during load)
+        self._field_resolution: FieldResolution | None = None
+
+        # Lazy-constructed client (needs lifecycle context)
+        self._client: DataverseClient | None = None
+        self._source_limiter: LimiterProtocol | None = None
+        self._pending_verify_source_call_id: str | None = None
+        self._pages_fetched = 0
+        self._rows_yielded = 0
+        self._quarantine_count = 0
+        self._load_state: Literal["not_started", "partial", "exhausted", "failed"] = "not_started"
+
+    def on_start(self, ctx: LifecycleContext) -> None:
+        """Construct credential and DataverseClient.
+
+        Called before load() — acquires resources from lifecycle context.
+        """
+        super().on_start(ctx)
+        self._pages_fetched = 0
+        self._rows_yielded = 0
+        self._quarantine_count = 0
+        self._load_state = "not_started"
+        # Obtain rate limiter (with null guard per spec)
+        limiter = ctx.rate_limit_registry.get_limiter("dataverse_source") if ctx.rate_limit_registry is not None else None
+        self._source_limiter = limiter
+
+        # VERIFY first binds the source-load operation to an archived call.
+        # Credential and HTTP client construction are deferred until load().
+        session = ctx.call_mode_session
+        if session is not None and session.mode is RunMode.VERIFY:
+            self._client = None
+            self._pending_verify_source_call_id = None
+            return
+
+        # Construct credential (azure-identity) — validates early in LIVE.
+        credential = self._auth_config.create_credential()
+
+        # Construct DataverseClient
+        self._client = DataverseClient(
+            environment_url=self._environment_url,
+            credential=credential,
+            api_version=self._api_version,
+            limiter=limiter,
+            additional_domains=self._additional_domains,
+        )
+
+    def _metadata_url(self, logical_name: str) -> str:
+        encoded_entity = urllib.parse.quote(logical_name, safe="")
+        return (
+            f"{self._environment_url.rstrip('/')}/api/data/{self._api_version}"
+            f"/EntityDefinitions(LogicalName='{encoded_entity}')?$select=LogicalName,EntitySetName"
+        )
+
+    @staticmethod
+    def _verify_request_data(url: str) -> _DataverseSourceRequest:
+        return {
+            "method": "GET",
+            "url": fingerprint_url(url),
+            "headers": {
+                "Accept": "application/json",
+                "OData-MaxVersion": "4.0",
+                "OData-Version": "4.0",
+            },
+        }
+
+    def _preflight_verify_request(self, ctx: SourceContext, url: str) -> None:
+        session = ctx.call_mode_session
+        if session is None or session.mode is not RunMode.VERIFY:
+            return
+        operation_id = ctx.operation_id
+        if operation_id is None:
+            raise AuditIntegrityError("Dataverse verify requires a source-load operation")
+        evidence = session.preflight_verify_operation_http_managed_identity(
+            request_data=self._verify_request_data(url),
+            current_operation_id=operation_id,
+        )
+        self._pending_verify_source_call_id = evidence.source_call_id
+
+    def _resolve_entity_set_name(self, ctx: SourceContext, logical_name: str) -> str:
+        """Resolve a logical table name to its authoritative Web API entity set."""
+        if self._client is None:
+            raise RuntimeError("on_start() must be called before _resolve_entity_set_name() — this is a bug")
+        metadata_url = self._metadata_url(logical_name)
+        try:
+            page = self._client.get_page(metadata_url)
+        except DataverseClientError as e:
+            if e.status_code == 404:
+                not_found = DataverseClientError(
+                    f"Entity '{logical_name}' not found in Dataverse. Check the entity logical name in your pipeline config.",
+                    retryable=False,
+                    status_code=404,
+                    latency_ms=e.latency_ms,
+                    error_category=e.error_category,
+                    request_url=e.request_url,
+                    request_headers=e.request_headers,
+                )
+                self._record_page_call(
+                    ctx,
+                    url=not_found.request_url,
+                    error=not_found,
+                    error_reason=not_found.error_category,
+                )
+                raise not_found from e
+            if e.status_code == 403:
+                if self._entity_set_name is not None:
+                    self._record_page_call(
+                        ctx,
+                        url=e.request_url,
+                        error=e,
+                        error_reason=e.error_category,
+                    )
+                    return self._entity_set_name
+                forbidden = DataverseClientError(
+                    "Dataverse metadata access was forbidden, so the Web API entity-set identity cannot be resolved. "
+                    "Configure options.entity_set_name explicitly or grant read access to EntityDefinitions.",
+                    retryable=False,
+                    status_code=403,
+                    latency_ms=e.latency_ms,
+                    error_category="metadata_access_forbidden",
+                    request_url=e.request_url,
+                    request_headers=e.request_headers,
+                )
+                self._record_page_call(
+                    ctx,
+                    url=forbidden.request_url,
+                    error=forbidden,
+                    error_reason=forbidden.error_category,
+                )
+                raise forbidden from e
+            self._record_page_call(
+                ctx,
+                url=e.request_url,
+                error=e,
+                error_reason=e.error_category,
+            )
+            if e.status_code == 401 and e.retryable:
+                self._client.reconstruct_credential(self._auth_config)
+            # 5xx, network errors, etc. — re-raise. Silently continuing
+            # after a server error means the pipeline proceeds with
+            # potentially invalid entity config.
+            raise
+        metadata_error_message: str | None = None
+        metadata_error_category = "metadata_identity_invalid"
+        returned_logical_name: str | None = None
+        entity_set_name: str | None = None
+        if len(page.rows) != 1:
+            metadata_error_message = (
+                "Dataverse entity metadata did not return exactly one identity record. "
+                "Check the configured logical name and metadata permissions."
+            )
+        else:
+            identity = page.rows[0]
+            if "LogicalName" not in identity:
+                metadata_error_message = (
+                    "Dataverse entity metadata did not provide a usable string LogicalName. "
+                    "Expected a lowercase ASCII identifier; check the metadata response and table configuration."
+                )
+            else:
+                raw_logical_name = identity["LogicalName"]
+                if (
+                    not isinstance(raw_logical_name, str)
+                    or is_operator_required_placeholder_value(raw_logical_name)
+                    or _DATAVERSE_LOGICAL_NAME_PATTERN.fullmatch(raw_logical_name) is None
+                ):
+                    metadata_error_message = (
+                        "Dataverse entity metadata did not provide a usable string LogicalName. "
+                        "Expected a lowercase ASCII identifier; check the metadata response and table configuration."
+                    )
+                else:
+                    returned_logical_name = raw_logical_name
+            if metadata_error_message is None:
+                if "EntitySetName" not in identity:
+                    metadata_error_message = (
+                        "Dataverse entity metadata did not provide a usable string EntitySetName. "
+                        "Expected an ASCII identifier; malformed metadata fails closed."
+                    )
+                else:
+                    raw_entity_set_name = identity["EntitySetName"]
+                    if (
+                        not isinstance(raw_entity_set_name, str)
+                        or is_operator_required_placeholder_value(raw_entity_set_name)
+                        or _DATAVERSE_ENTITY_SET_NAME_PATTERN.fullmatch(raw_entity_set_name) is None
+                    ):
+                        metadata_error_message = (
+                            "Dataverse entity metadata did not provide a usable string EntitySetName. "
+                            "Expected an ASCII identifier; malformed metadata fails closed."
+                        )
+                    else:
+                        entity_set_name = raw_entity_set_name
+            if metadata_error_message is None and returned_logical_name != logical_name:
+                metadata_error_message = (
+                    f"Dataverse metadata LogicalName did not match the requested logical name '{logical_name}'. "
+                    "Refusing to query a contradictory table identity."
+                )
+                metadata_error_category = "metadata_identity_conflict"
+            elif metadata_error_message is None and self._entity_set_name is not None and entity_set_name != self._entity_set_name:
+                metadata_error_message = (
+                    f"Resolved Dataverse EntitySetName does not match configured entity_set_name for logical name '{logical_name}'. "
+                    "Correct the explicit fallback before retrying."
+                )
+                metadata_error_category = "metadata_identity_conflict"
+
+        if metadata_error_message is not None:
+            metadata_error = DataverseClientError(
+                metadata_error_message,
+                retryable=False,
+                status_code=page.status_code,
+                latency_ms=page.latency_ms,
+                error_category=metadata_error_category,
+                request_url=page.request_url,
+                request_headers=page.request_headers,
+            )
+            self._record_page_call(
+                ctx,
+                url=metadata_error.request_url,
+                error=metadata_error,
+                error_reason=metadata_error.error_category,
+            )
+            raise metadata_error
+
+        assert entity_set_name is not None
+        self._record_page_call(ctx, url=page.request_url, page=page)
+        return entity_set_name
+
+    def _build_query_url(self, entity_set_name: str) -> str:
+        """Build the initial OData query URL for structured queries.
+
+        Percent-encodes the resolved entity-set name in the path segment and query parameter
+        values to prevent silent corruption from special characters.
+        OData $-prefixed parameter names are kept literal (servers require them).
+        """
+        if self._entity is None:
+            raise RuntimeError("_build_query_url() called outside structured query mode — this is a bug")
+        encoded_entity = urllib.parse.quote(entity_set_name, safe="")
+        url = f"{self._environment_url.rstrip('/')}/api/data/{self._api_version}/{encoded_entity}"
+
+        params: list[str] = []
+        if self._select:
+            # Column names are Dataverse identifiers — safe characters
+            params.append(f"$select={','.join(self._select)}")
+        if self._filter:
+            params.append(f"$filter={urllib.parse.quote(self._filter, safe='')}")
+        if self._orderby:
+            params.append(f"$orderby={urllib.parse.quote(self._orderby, safe='')}")
+        if self._top is not None:
+            params.append(f"$top={self._top}")
+
+        if params:
+            url += "?" + "&".join(params)
+
+        return url
+
+    def _strip_odata_metadata(self, row: dict[str, Any]) -> dict[str, Any]:
+        """Strip OData annotations from row data.
+
+        Optionally preserves formatted values as additional fields.
+
+        Args:
+            row: Raw row from Dataverse response
+
+        Returns:
+            Cleaned row with OData metadata removed
+        """
+        cleaned: dict[str, Any] = {}
+        formatted_values: dict[str, str] = {}
+
+        for key, value in row.items():
+            # Preserve formatted values if requested
+            if self._include_formatted_values and key.endswith(_FORMATTED_VALUE_SUFFIX):
+                # Extract field name: "statecode@OData.Community.Display.V1.FormattedValue" → "statecode"
+                field_name = key[: -len(_FORMATTED_VALUE_SUFFIX)]
+                formatted_values[field_name] = value
+                continue
+
+            # Strip OData annotations
+            if _ODATA_ANNOTATION_PATTERN.match(key):
+                continue
+
+            cleaned[key] = value
+
+        # Merge formatted values with __formatted suffix
+        if self._include_formatted_values:
+            for field_name, formatted in formatted_values.items():
+                formatted_key = f"{field_name}__formatted"
+                # Collision detection
+                if formatted_key in cleaned:
+                    raise ValueError(
+                        f"Formatted value field name collision: both '{formatted_key}' and "
+                        f"'{field_name}' with formatted value annotation exist in the entity. "
+                        f"Disable include_formatted_values or rename the conflicting field."
+                    )
+                cleaned[formatted_key] = formatted
+
+        return cleaned
+
+    def _prepare_normalized_row_fields(
+        self,
+        row: dict[str, JsonValue],
+        is_first_row: bool,
+    ) -> tuple[dict[str, JsonValue], FieldResolution]:
+        """Normalize field names and apply field mapping.
+
+        On first row, creates the field resolution mapping.
+
+        Args:
+            row: Row with original field names
+            is_first_row: Whether this is the first row being processed
+
+        Returns:
+            Row with normalized field names
+        """
+        if is_first_row or self._field_resolution is None:
+            raw_headers = list(row.keys())
+            prospective_resolution = resolve_field_names(
+                raw_headers=raw_headers,
+                field_mapping=self._field_mapping,
+                columns=None,
+                require_all_mapping_keys=False,  # sparse Dataverse entities may omit optional mapped attributes
+            )
+        else:
+            prospective_resolution = self._field_resolution
+
+        # Apply resolution mapping.
+        # Tier 3: Dataverse responses may include fields not in the first row
+        # (sparse entities, dynamic attributes). Normalize new fields using the
+        # same algorithm rather than passing them through raw — inconsistent
+        # normalization would break downstream template references.
+        # Schema validation (lines below) quarantines rows with unexpected fields.
+        mapping = prospective_resolution.resolution_mapping
+        result: dict[str, JsonValue] = {}
+        new_raw_keys: list[str] = []
+        for k, v in row.items():
+            if k in mapping:
+                normalized_name = mapping[k]
+            else:
+                # New key not in the cached resolution — normalize it, then apply
+                # field_mapping by normalized name so a mapped attribute that first
+                # appears in a LATER row still maps to its target. (Relaxing the
+                # strict resolve check for sparse entities unmasks this path —
+                # elspeth-594221617d.)
+                nk = normalize_field_name(k)
+                normalized_name = self._field_mapping[nk] if self._field_mapping and nk in self._field_mapping else nk
+                new_raw_keys.append(k)
+            result[normalized_name] = v
+
+        # If this row had fields not in the initial mapping, extend the cached
+        # resolution with just those new raw keys. This preserves B4.3 union
+        # semantics without re-normalizing every previously seen sparse key.
+        if new_raw_keys:
+            prospective_resolution = extend_field_resolution(
+                prospective_resolution,
+                raw_headers=new_raw_keys,
+                field_mapping=self._field_mapping,
+            )
+
+        return result, prospective_resolution
+
+    def _normalize_row_fields(self, row: dict[str, Any], is_first_row: bool) -> dict[str, Any]:
+        """Normalize and commit field resolution for direct trusted callers."""
+        normalized, prospective_resolution = self._prepare_normalized_row_fields(row, is_first_row)
+        self._field_resolution = prospective_resolution
+        return normalized
+
+    def _verify_recorded_page_call(
+        self,
+        ctx: SourceContext,
+        *,
+        call: Call | None,
+        request_data: Mapping[str, str | dict[str, str] | None],
+        status: CallStatus,
+        response_data: Mapping[str, int | bool | str | dict[str, str] | None] | None = None,
+        error_data: Mapping[str, int | str | None] | None = None,
+    ) -> None:
+        session = ctx.call_mode_session
+        if session is None or session.mode is not RunMode.VERIFY:
+            return
+        source_call_id = self._pending_verify_source_call_id
+        operation_id = ctx.operation_id
+        if call is None or source_call_id is None or operation_id is None:
+            raise AuditIntegrityError("Dataverse verify page has no recorded call or pre-token source admission")
+        admitted_call_id = session.admit_verify_operation_http_managed_identity(
+            request_data=request_data,
+            current_operation_id=operation_id,
+            current_call_index=call.call_index,
+            source_call_id=source_call_id,
+        )
+        if admitted_call_id != source_call_id:
+            raise AuditIntegrityError("Dataverse source call changed after pre-token admission")
+        session.verify_call(
+            call_type=CallType.HTTP,
+            request_data=request_data,
+            current_state_id=None,
+            current_operation_id=operation_id,
+            current_call_index=call.call_index,
+            current_call_id=call.call_id,
+            live_status=status,
+            live_response_data=response_data,
+            live_error_data=error_data,
+        )
+        self._pending_verify_source_call_id = None
+
+    def _record_page_call(
+        self,
+        ctx: SourceContext,
+        *,
+        url: str | None,
+        page: DataversePageResponse | None = None,
+        error: DataverseClientError | None = None,
+        error_reason: str | None = None,
+    ) -> None:
+        """Record a page fetch in the audit trail.
+
+        PluginContext.record_call() handles telemetry after the successful
+        audit write, preserving the shared audit-first contract.
+
+        Args:
+            ctx: Source context for record_call
+            url: URL that was requested
+            page: Response page (for success)
+            error: DataverseClientError (for errors)
+            error_reason: Additional error context
+        """
+        # After page 1 the url IS the server-supplied @odata.nextLink (Tier-3
+        # data), so every persisted copy rides fingerprint_url like the
+        # AuditedHTTPClient path; pagination keeps using the raw DTO values.
+        safe_url = fingerprint_url(url) if url is not None else None
+        if page is not None:
+            request_data: dict[str, Any] = {
+                "method": "GET",
+                "url": safe_url,
+                "headers": page.request_headers,  # Already fingerprinted by client
+            }
+            response_data: dict[str, int | bool | str | dict[str, str] | None] = {
+                "status_code": page.status_code,
+                "row_count": len(page.rows),
+                "headers": page.headers,
+                "next_link": fingerprint_url(page.next_link) if page.next_link is not None else None,
+                "paging_cookie": page.paging_cookie,
+                "more_records": page.more_records,
+            }
+            try:
+                recorded_call = ctx.record_call(
+                    call_type=CallType.HTTP,
+                    status=CallStatus.SUCCESS,
+                    request_data=request_data,
+                    response_data=response_data,
+                    latency_ms=page.latency_ms,
+                    provider="dataverse",
+                )
+                self._verify_recorded_page_call(
+                    ctx,
+                    call=recorded_call,
+                    request_data=request_data,
+                    status=CallStatus.SUCCESS,
+                    response_data=response_data,
+                )
+            except contract_errors.TIER_1_ERRORS:
+                raise
+            except Exception as exc:
+                raise AuditIntegrityError(
+                    f"Failed to record successful page fetch to audit trail "
+                    f"(url={safe_url!r}). "
+                    f"Page fetch completed but audit record is missing."
+                ) from exc
+        elif error is not None:
+            request_data = {
+                "method": "GET",
+                "url": safe_url,
+                "headers": error.request_headers,  # Fingerprinted by client; mirrors the success path
+            }
+            error_data: dict[str, int | str | None] = {
+                "error_type": type(error).__name__,
+                "message": str(error),
+                "status_code": error.status_code,
+                "reason": error_reason,
+            }
+            try:
+                recorded_call = ctx.record_call(
+                    call_type=CallType.HTTP,
+                    status=CallStatus.ERROR,
+                    request_data=request_data,
+                    error=error_data,
+                    latency_ms=error.latency_ms,
+                    provider="dataverse",
+                )
+                self._verify_recorded_page_call(
+                    ctx,
+                    call=recorded_call,
+                    request_data=request_data,
+                    status=CallStatus.ERROR,
+                    error_data=error_data,
+                )
+            except contract_errors.TIER_1_ERRORS:
+                raise
+            except Exception as exc:
+                raise AuditIntegrityError(
+                    f"Failed to record error page fetch to audit trail "
+                    f"(url={safe_url!r}, error={error!r}). "
+                    f"Error occurred but audit record is missing."
+                ) from exc
+
+    def load(self, ctx: SourceContext) -> Iterator[SourceRow]:
+        """Track source observations even when consumption stops before exhaustion."""
+        self._load_state = "partial"
+        try:
+            yield from self._load_rows(ctx)
+        except GeneratorExit:
+            raise
+        except BaseException:
+            self._load_state = "failed"
+            raise
+        else:
+            self._load_state = "exhausted"
+
+    def _load_rows(self, ctx: SourceContext) -> Iterator[SourceRow]:
+        """Load rows from Dataverse via OData pagination.
+
+        Yields SourceRow.valid() for validated rows and
+        SourceRow.quarantined() for rows failing schema validation.
+        """
+        # Instance-level flag — NOT reset per page (spec: schema lock scoping)
+        self._first_valid_row_processed = False
+        is_first_row = True
+        source_row_index = 0
+
+        if self._entity is not None:
+            logical_name = self._entity
+        else:
+            if self._fetch_xml is None:
+                raise RuntimeError("config validator ensures entity or fetch_xml — neither is set, this is a bug")
+            root = ET.fromstring(self._fetch_xml)
+            entity_elem = root.find("entity")
+            if entity_elem is None:
+                raise RuntimeError("FetchXML is missing <entity> element — cannot determine entity name for URL")
+            if "name" not in entity_elem.attrib:
+                raise RuntimeError("FetchXML <entity> element missing 'name' attribute")
+            logical_name = entity_elem.attrib["name"]
+
+        if self._client is None:
+            session = ctx.call_mode_session
+            if session is None or session.mode is not RunMode.VERIFY:
+                raise RuntimeError("on_start() must be called before load() — this is a bug")
+            self._preflight_verify_request(ctx, self._metadata_url(logical_name))
+            credential = self._auth_config.create_credential()
+            self._client = DataverseClient(
+                environment_url=self._environment_url,
+                credential=credential,
+                api_version=self._api_version,
+                limiter=self._source_limiter,
+                additional_domains=self._additional_domains,
+                before_request=lambda url: self._preflight_verify_request(ctx, url),
+            )
+
+        entity_set_name = self._resolve_entity_set_name(ctx, logical_name)
+        if self._entity is not None:
+            url = self._build_query_url(entity_set_name)
+
+        try:
+            if self._entity is not None:
+                # Structured OData query
+                page_iterator = self._client.paginate_odata(url)
+            else:
+                # FetchXML query
+                assert self._fetch_xml is not None
+                page_iterator = self._client.paginate_fetchxml(entity_set_name, self._fetch_xml)
+
+            for page in page_iterator:
+                # Record successful page fetch — use the actual URL from the
+                # response DTO, not the rebuilt initial URL. For pages 2+, the
+                # actual URL is the nextLink from the previous page.
+                self._record_page_call(ctx, url=page.request_url, page=page)
+                self._pages_fetched += 1
+
+                # Process rows
+                for raw_row in page.rows:
+                    current_source_row_index = source_row_index
+                    source_row_index += 1
+                    # Strip OData metadata
+                    try:
+                        cleaned_row = self._strip_odata_metadata(raw_row)
+                    except ValueError as e:
+                        # Formatted value collision — quarantine
+                        ctx.record_validation_error(
+                            row=raw_row,
+                            error=str(e),
+                            schema_mode="odata_strip",
+                            destination=self._on_validation_failure,
+                        )
+                        self._quarantine_count += 1
+                        if self._on_validation_failure != "discard":
+                            yield SourceRow.quarantined(
+                                row=raw_row,
+                                error=str(e),
+                                destination=self._on_validation_failure,
+                                source_row_index=current_source_row_index,
+                            )
+                        continue
+
+                    # Normalize field names -- Tier-3 boundary: field names from
+                    # Dataverse can be arbitrary strings. Catch only
+                    # ExternalHeaderError (data faults: header normalizes to empty,
+                    # normalization collision in the entity's own field names).
+                    # Plain ValueError (config faults: bad field_mapping collision,
+                    # mapping keys not found, non-identifier mapping value) must
+                    # propagate and crash -- they signal OUR config error, not bad
+                    # source data. Mirrors azure_blob_source.py _validate_and_yield
+                    # and the CSV _load_csv path (elspeth-594221617d).
+                    try:
+                        normalized_row, prospective_resolution = self._prepare_normalized_row_fields(cleaned_row, is_first_row)
+                    except ExternalHeaderError as e:
+                        ctx.record_validation_error(
+                            row=cleaned_row,
+                            error=f"Field normalization failed: {e}",
+                            schema_mode="field_normalization",
+                            destination=self._on_validation_failure,
+                        )
+                        self._quarantine_count += 1
+                        if self._on_validation_failure != "discard":
+                            yield SourceRow.quarantined(
+                                row=cleaned_row,
+                                error=f"Field normalization failed: {e}",
+                                destination=self._on_validation_failure,
+                                source_row_index=current_source_row_index,
+                            )
+                        continue
+                    is_first_row = False
+
+                    # Validate against schema
+                    try:
+                        validated = self._schema_class.model_validate(normalized_row)
+                        validated_row = validated.to_row()
+                    except ValidationError as e:
+                        # Input-free text: str(e) echoes the offending Tier-3
+                        # value into audit surfaces (elspeth-a300402c58).
+                        error_text = safe_validation_error_text(e, self._schema_class)
+                        ctx.record_validation_error(
+                            row=normalized_row,
+                            error=error_text,
+                            schema_mode="validation",
+                            destination=self._on_validation_failure,
+                        )
+                        self._quarantine_count += 1
+                        if self._on_validation_failure != "discard":
+                            yield SourceRow.quarantined(
+                                row=normalized_row,
+                                error=error_text,
+                                destination=self._on_validation_failure,
+                                source_row_index=current_source_row_index,
+                            )
+                        continue
+
+                    # Lock contract on first valid row (FLEXIBLE/OBSERVED)
+                    if not self._first_valid_row_processed and self._contract_builder is not None:
+                        resolution_map: Mapping[str, str]
+                        resolution_map = prospective_resolution.resolution_mapping
+
+                        try:
+                            self._contract_builder.process_first_row(validated_row, resolution_map)
+                        except ContractFieldLimitExceeded as e:
+                            ctx.record_validation_error(
+                                row=validated_row,
+                                error=str(e),
+                                schema_mode=self._schema_config.mode,
+                                destination=self._on_validation_failure,
+                            )
+                            self._quarantine_count += 1
+                            if self._on_validation_failure != "discard":
+                                yield SourceRow.quarantined(
+                                    row=validated_row,
+                                    error=str(e),
+                                    destination=self._on_validation_failure,
+                                    source_row_index=current_source_row_index,
+                                )
+                            continue
+                        self.set_schema_contract(self._contract_builder.contract)
+                        self._first_valid_row_processed = True
+
+                    # Validate against locked contract to catch type drift on
+                    # inferred fields. Pydantic extra="allow" accepts any type
+                    # for extras — the contract enforces inferred types here.
+                    contract = self._contract_builder.contract if self._contract_builder is not None else self.require_schema_contract()
+                    if self._contract_builder is not None and contract.mode in ("OBSERVED", "FLEXIBLE"):
+                        # Dataverse rows can be sparse across pages/FetchXML
+                        # result sets. If a later row emits a new attribute,
+                        # its SourceRow contract must carry the audit/header
+                        # metadata before validation and yield.
+                        try:
+                            contract = self._contract_builder.process_sparse_fields(
+                                validated_row,
+                                prospective_resolution.resolution_mapping,
+                            )
+                        except ContractFieldLimitExceeded as e:
+                            ctx.record_validation_error(
+                                row=validated_row,
+                                error=str(e),
+                                schema_mode=self._schema_config.mode,
+                                destination=self._on_validation_failure,
+                            )
+                            self._quarantine_count += 1
+                            if self._on_validation_failure != "discard":
+                                yield SourceRow.quarantined(
+                                    row=validated_row,
+                                    error=str(e),
+                                    destination=self._on_validation_failure,
+                                    source_row_index=current_source_row_index,
+                                )
+                            continue
+                        self.set_schema_contract(contract)
+
+                    self._field_resolution = prospective_resolution
+                    if contract.locked:
+                        violations = contract.validate(validated_row)
+                        if violations:
+                            error_msg = "; ".join(str(v) for v in violations)
+                            ctx.record_validation_error(
+                                row=validated_row,
+                                error=error_msg,
+                                schema_mode=self._schema_config.mode,
+                                destination=self._on_validation_failure,
+                            )
+                            self._quarantine_count += 1
+                            if self._on_validation_failure != "discard":
+                                yield SourceRow.quarantined(
+                                    row=validated_row,
+                                    error=error_msg,
+                                    destination=self._on_validation_failure,
+                                    source_row_index=current_source_row_index,
+                                )
+                            continue
+
+                    self._rows_yielded += 1
+                    yield SourceRow.valid(validated_row, contract=contract, source_row_index=current_source_row_index)
+
+        except DataverseClientError as e:
+            self._record_page_call(
+                ctx,
+                url=e.request_url,
+                error=e,
+                error_reason=e.error_category,
+            )
+            # 401 with retryable=True: reconstruct credential before engine retry
+            if e.status_code == 401 and e.retryable:
+                if self._client is None:
+                    raise RuntimeError("on_start() must be called before load() — this is a bug") from None
+                self._client.reconstruct_credential(self._auth_config)
+            raise
+
+        # Force-lock contract if no valid rows were yielded across ALL pages
+        if not self._first_valid_row_processed and self._contract_builder is not None:
+            self.set_schema_contract(self._contract_builder.contract.with_locked())
+
+    def on_complete(self, ctx: LifecycleContext) -> None:
+        """Emit observed work, independently of the downstream run outcome."""
+        super().on_complete(ctx)
+        if ctx.node_id is None:
+            raise FrameworkBugError("Dataverse statistics require a source node identity")
+        ctx.telemetry_emit(
+            DataverseLoadStatistics(
+                timestamp=datetime.now(UTC),
+                run_id=ctx.run_id,
+                node_id=ctx.node_id,
+                plugin_name=self.name,
+                pages_fetched=self._pages_fetched,
+                rows_yielded=self._rows_yielded,
+                rows_rejected=self._quarantine_count,
+                load_state=self._load_state,
+            )
+        )
+
+    def get_field_resolution(self) -> tuple[Mapping[str, str], str | None] | None:
+        """Return field normalization mapping for audit trail recovery."""
+        if self._field_resolution is None:
+            return None
+        return (
+            self._field_resolution.resolution_mapping,
+            self._field_resolution.normalization_version,
+        )
+
+    def close(self) -> None:
+        """Release DataverseClient resources."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    @classmethod
+    def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
+        if issue_code is None:
+            return PluginAssistance(
+                plugin_name="dataverse",
+                issue_code=None,
+                summary="Load rows from a Microsoft Dataverse entity via OData. Paginated, credential-scoped, with audit-recorded query.",
+                composer_hints=(
+                    "Tier-3 boundary: record what Dataverse provided. Don't infer absent fields from siblings — record None and let consumers decide.",
+                    "Authentication is per-environment via DataverseAuthConfig — credentials wire through the secrets store, never inline in YAML.",
+                    "Choose exactly one of entity (structured OData) or fetch_xml (FetchXML); select/filter/orderby/top require entity and cannot accompany fetch_xml.",
+                    "The audit trail records the exact OData/FetchXML query, page count, and quarantine count — verify these are visible before declaring success.",
+                    "If you have been asked to generate source rows yourself, do not pick `dataverse` — this source queries a live Microsoft Dataverse environment. Switch to a local-blob source (`csv`, `json`, or `text`) via `create_blob` plus `set_source_from_blob`.",
+                    "Never synthesise an `environment_url`, entity name, OData filter, or FetchXML for content you authored — Dataverse is the source of truth for the queried entity and the audit row must point at a real environment, not invented identifiers.",
+                ),
+            )
+        return None

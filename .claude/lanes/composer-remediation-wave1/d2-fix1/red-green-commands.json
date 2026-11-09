@@ -1,0 +1,63 @@
+[
+  {
+    "name": "red",
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-d2",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-d2/src:/workspace/elspeth/.claude/worktrees/composer-remediation-d2/elspeth-lints/src",
+    "argv": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-d2/.venv/bin/python",
+      "-m",
+      "pytest",
+      "-o",
+      "pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-d2/src /workspace/elspeth/.claude/worktrees/composer-remediation-d2/elspeth-lints/src",
+      "--basetemp=/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-tmp",
+      "-n",
+      "0",
+      "tests/unit/composer_mcp/test_configured_root_admission.py",
+      "tests/unit/web/execution/test_validation_authoring.py",
+      "tests/unit/web/execution/test_preflight_side_effects.py",
+      "-k",
+      "legacy_null_path or null_path_cannot or missing_source_sink or present_null or missing_keys_and_nullable or invalid_values_before_path or absent_path_options"
+    ],
+    "exit": 1
+  },
+  {
+    "name": "red-handlers",
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-d2",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-d2/src:/workspace/elspeth/.claude/worktrees/composer-remediation-d2/elspeth-lints/src",
+    "argv": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-d2/.venv/bin/python",
+      "-m",
+      "pytest",
+      "-o",
+      "pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-d2/src /workspace/elspeth/.claude/worktrees/composer-remediation-d2/elspeth-lints/src",
+      "--basetemp=/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp",
+      "-n",
+      "0",
+      "tests/unit/composer_mcp/test_configured_root_admission.py",
+      "-k",
+      "legacy_null_path"
+    ],
+    "exit": 1
+  },
+  {
+    "name": "green",
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-d2",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-d2/src:/workspace/elspeth/.claude/worktrees/composer-remediation-d2/elspeth-lints/src",
+    "argv": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-d2/.venv/bin/python",
+      "-m",
+      "pytest",
+      "-o",
+      "pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-d2/src /workspace/elspeth/.claude/worktrees/composer-remediation-d2/elspeth-lints/src",
+      "--basetemp=/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/green-tmp",
+      "-n",
+      "0",
+      "tests/unit/composer_mcp/test_configured_root_admission.py",
+      "tests/unit/web/execution/test_validation_authoring.py",
+      "tests/unit/web/execution/test_preflight_side_effects.py",
+      "-k",
+      "legacy_null_path or null_path_cannot or missing_source_sink or present_null or missing_keys_and_nullable or invalid_values_before_path or absent_path_options"
+    ],
+    "exit": 0
+  }
+]

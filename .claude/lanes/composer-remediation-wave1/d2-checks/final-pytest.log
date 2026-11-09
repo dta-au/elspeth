@@ -1,0 +1,61 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-d2
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 1579 items
+
+tests/unit/composer_mcp/test_audit.py ............                       [  0%]
+tests/unit/composer_mcp/test_call_tool_audit.py ........................ [  2%]
+......                                                                   [  2%]
+tests/unit/composer_mcp/test_checkout_diagnostics.py ....                [  2%]
+tests/unit/composer_mcp/test_configured_root_admission.py .............. [  3%]
+........................................................................ [  8%]
+........................................................................ [ 12%]
+.                                                                        [ 12%]
+tests/unit/composer_mcp/test_server.py ................................. [ 15%]
+................                                                         [ 16%]
+tests/unit/composer_mcp/test_session.py ................................ [ 18%]
+.................................                                        [ 20%]
+tests/unit/web/test_paths.py ........................................... [ 22%]
+...............                                                          [ 23%]
+tests/unit/web/composer/test_set_pipeline_candidate.py ................. [ 24%]
+........................................................................ [ 29%]
+........................................................................ [ 34%]
+                                                                         [ 34%]
+tests/unit/web/composer/test_source_rejection_contracts.py ............. [ 34%]
+........................................................................ [ 39%]
+........                                                                 [ 39%]
+tests/unit/web/composer/test_output_rejection_contracts.py ............. [ 40%]
+.....................................                                    [ 43%]
+tests/unit/web/composer/test_transform_rejection_contracts.py .......... [ 43%]
+........................................................................ [ 48%]
+...................................................                      [ 51%]
+tests/unit/web/composer/test_patch_source_options_noop.py .............. [ 52%]
+................................                                         [ 54%]
+tests/unit/web/composer/test_splice_transform_tool.py .................. [ 55%]
+............................                                             [ 57%]
+tests/unit/web/execution/test_validation_authoring.py .................. [ 58%]
+......................................                                   [ 60%]
+tests/unit/web/execution/test_validation_materialization.py ............ [ 61%]
+.......................................................................  [ 66%]
+tests/unit/web/execution/test_validation_identity_document.py ...        [ 66%]
+tests/unit/web/execution/test_validation.py ............................ [ 68%]
+........................................................................ [ 72%]
+........................................................................ [ 77%]
+..............................................................           [ 81%]
+tests/unit/web/execution/test_preflight_side_effects.py ................ [ 82%]
+..............                                                           [ 83%]
+tests/unit/web/execution/test_service.py ..................              [ 84%]
+tests/unit/web/test_sessions_composer_attribute_contracts.py .....       [ 84%]
+tests/unit/elspeth_lints/test_masquerade_gate.py ....................... [ 86%]
+........................................................................ [ 90%]
+........................................................................ [ 95%]
+........sss............................................................. [ 99%]
+.....                                                                    [100%]
+
+=========================== short test summary info ============================
+SKIPPED [3] tests/unit/elspeth_lints/test_masquerade_gate.py:1521: PEP 696 defaults need Python 3.13
+================= 1576 passed, 3 skipped in 782.86s (0:13:02) ==================

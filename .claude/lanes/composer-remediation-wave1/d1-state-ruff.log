@@ -1,0 +1,85 @@
+I001 [*] Import block is un-sorted or un-formatted
+  --> tests/integration/web/composer/test_freeform_proposal_prevalidation.py:3:1
+   |
+ 1 |   """Real-loop coverage for explicit-approval ``set_pipeline`` prevalidation."""
+ 2 |
+ 3 | / from __future__ import annotations
+ 4 | |
+ 5 | | import json
+ 6 | | from collections.abc import Iterator
+ 7 | | from contextlib import contextmanager
+ 8 | | from copy import deepcopy
+ 9 | | from dataclasses import dataclass, replace
+10 | | from datetime import UTC, datetime
+11 | | from pathlib import Path
+12 | | from typing import Any
+13 | | from unittest.mock import patch
+14 | | from uuid import UUID, uuid4
+15 | |
+16 | | import pytest
+17 | | from sqlalchemy import Engine, func, insert, select
+18 | | from sqlalchemy.pool import StaticPool
+19 | |
+20 | | from elspeth.contracts.composer_audit import ComposerToolStatus
+21 | | from elspeth.contracts.composer_llm_audit import ToolContractDialect
+22 | | from elspeth.contracts.freeze import deep_thaw
+23 | | from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
+24 | | from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem, WebSecretResolver
+25 | | from elspeth.contracts.session_operation import SessionOperationKind
+26 | | from elspeth.core.canonical import canonical_json, stable_hash
+27 | | from elspeth.web.blobs.protocol import BlobPendingProposalError
+28 | | from elspeth.web.blobs.service import BlobServiceImpl
+29 | | from elspeth.web.catalog.policy_view import PolicyCatalogView
+30 | | from elspeth.web.catalog.protocol import CatalogService
+31 | | from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+32 | | from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
+33 | | from elspeth.web.composer.anti_anchor import AntiAnchorTracker
+34 | | from elspeth.web.composer.audit import BufferingRecorder
+35 | | from elspeth.web.composer.authority_hashing import composer_authority_hash
+36 | | from elspeth.web.composer.diagnostic_evidence import (
+37 | |     ComposerDiagnosticEvidence,
+38 | |     diagnostic_evidence_identity,
+39 | |     is_diagnostic_evidence_envelope,
+40 | | )
+41 | | from elspeth.web.composer.pipeline_custody import inline_custody_audit_projection
+42 | | from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerPluginCrashError
+43 | | from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
+44 | | from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+45 | | from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec, ValidationEntry, ValidationSummary
+46 | | from elspeth.web.composer.tools import ToolResult, execute_tool as real_execute_tool
+47 | | from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate as real_build_set_pipeline_candidate
+48 | | from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
+49 | | from elspeth.web.coordination.lifecycle import SessionOperationLease
+50 | | from elspeth.web.dependencies import create_catalog_service
+51 | | from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
+52 | | from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+53 | | from elspeth.web.plugin_policy.validation import ProfileAwareValidationResult
+54 | | from elspeth.web.sessions.engine import create_session_engine
+55 | | from elspeth.web.sessions.models import (
+56 | |     blobs_table,
+57 | |     chat_messages_table,
+58 | |     composition_proposals_table,
+59 | |     composition_states_table,
+60 | |     proposal_events_table,
+61 | |     session_operation_fences_table,
+62 | |     sessions_table,
+63 | | )
+64 | | from elspeth.web.sessions.schema import initialize_session_schema
+65 | | from elspeth.web.sessions.service import SessionServiceImpl
+66 | | from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
+67 | | from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+68 | | from tests.unit.web.composer.conftest import (
+69 | |     _fake_llm_response as _raw_fake_llm_response,
+70 | | )
+71 | | from tests.unit.web.composer.conftest import (
+72 | |     _make_settings,
+73 | |     build_test_sessions_service,
+74 | | )
+   | |_^
+75 |
+76 |   _PROPOSAL_SESSION_ID = "00000000-0000-4000-8000-000000000001"
+   |
+help: Organize imports
+
+Found 1 error.
+[*] 1 fixable with the `--fix` option.

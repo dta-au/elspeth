@@ -1,0 +1,294 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 32 items
+
+tests/unit/web/composer/test_compose_loop_persistence.py ..F.FF          [ 18%]
+tests/unit/web/composer/test_service.py .                                [ 21%]
+tests/unit/web/composer/test_endpoint_affordance.py .........            [ 50%]
+tests/integration/web/composer/test_composer_against_gateway.py ........ [ 75%]
+......F.                                                                 [100%]
+
+=================================== FAILURES ===================================
+________ test_proposal_cap_excludes_schema_errors_and_semantic_refusals ________
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7fd1fe6eb5c0>
+result_session_id = '5d384fd9-ff1f-446c-9f81-475b5310386c'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fd1ff5223f0>
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-172/test_proposal_cap_excludes_sch0')
+
+    @pytest.mark.asyncio
+    async def test_proposal_cap_excludes_schema_errors_and_semantic_refusals(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+        with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+            conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+    
+        handler_calls = _record_real_tool_handlers(monkeypatch)
+        source_path = tmp_path / "input.csv"
+        source_path.write_text("customer_id\n1\n")
+        caught = await _capture_tool_batch_rejection(
+            composer_service_with_real_sessions,
+            session_id=result_session_id,
+            response=_tool_batch_response(
+                *((f"call_valid_attempt_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}}) for index in range(9)),
+                ("call_schema_invalid_attempt", "set_metadata", {}),
+                (
+                    "call_semantic_invalid_attempt",
+                    "set_pipeline",
+                    {
+                        "source": {
+                            "plugin": "csv",
+                            "options": {"path": str(source_path)},
+                            "on_success": "rows",
+                            "on_validation_failure": "discard",
+                        },
+                        "nodes": [],
+                        "edges": [],
+                        "outputs": [],
+                        "metadata": {"name": "semantically incomplete"},
+                    },
+                ),
+            ),
+        )
+    
+        assert caught is None
+>       assert handler_calls == ["set_metadata"] * 10
+E       AssertionError: assert ['set_metadat...etadata', ...] == ['set_metadat...etadata', ...]
+E         
+E         Right contains one more item: 'set_metadata'
+E         Use -v to get more diff
+
+tests/unit/web/composer/test_compose_loop_persistence.py:1429: AssertionError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 16:33:34 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 16:33:34 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 16:33:34 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[admitted-tenth] _
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7fd1fe741130>
+result_session_id = 'b01bbe18-88b0-4f11-ac63-55a41fa45ae9'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-172/test_proposal_attempt_cap_incl1')
+blob_case = 'admitted-tenth'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("blob_case", ("invalid-at-cap", "admitted-tenth", "admitted-eleventh"))
+    async def test_proposal_attempt_cap_includes_approval_required_blob_only_mutation(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        tmp_path: Path,
+        blob_case: str,
+    ) -> None:
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from tests.helpers.session_fences import fenced_operation_context
+        from tests.unit.web.composer.test_service import _blob_mutation_resources_for_test
+    
+        sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+        with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+            conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+    
+        arguments: dict[str, Any] = {}
+        if blob_case != "invalid-at-cap":
+            with fenced_operation_context(sessions_service._engine, result_session_id, operation_kind=SessionOperationKind.CREATE) as context:
+                blob = await BlobServiceImpl(sessions_service._engine, tmp_path).create_blob(
+                    UUID(result_session_id), "retained.txt", b"must remain untouched", "text/plain", session_operation_context=context
+                )
+            arguments = {"blob_id": str(blob.id)}
+        resources_before = _blob_mutation_resources_for_test(sessions_service._engine, tmp_path)
+        change_count = 9 if blob_case == "admitted-tenth" else 10
+    
+        caught = await _capture_tool_batch_rejection(
+            composer_service_with_real_sessions,
+            session_id=result_session_id,
+            response=_tool_batch_response(
+                *(
+                    (f"call_blob_boundary_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}})
+                    for index in range(change_count)
+                ),
+                ("call_approval_required_blob_only", "delete_blob", arguments),
+            ),
+        )
+    
+        expected_ids = {f"call_blob_boundary_proposal_{index}" for index in range(change_count)}
+        if blob_case == "admitted-eleventh":
+            assert type(caught) is ComposerConvergenceError
+            assert dict(caught.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
+            assert [inv.tool_call_id for inv in caught.tool_invocations] == [f"call_blob_boundary_proposal_{index}" for index in range(10)]
+            assert all(inv.version_before == inv.version_after == 1 for inv in caught.tool_invocations)
+        else:
+            assert caught is None
+            if blob_case == "admitted-tenth":
+                expected_ids.add("call_approval_required_blob_only")
+        with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+>           assert (
+                set(
+                    conn.execute(
+                        select(composition_proposals_table.c.tool_call_id).where(composition_proposals_table.c.session_id == result_session_id)
+                    ).scalars()
+                )
+                == expected_ids
+            )
+E           AssertionError: assert {'call_blob_b...posal_5', ...} == {'call_approv...posal_4', ...}
+E             
+E             Extra items in the right set:
+E             'call_approval_required_blob_only'
+E             Use -v to get more diff
+
+tests/unit/web/composer/test_compose_loop_persistence.py:1544: AssertionError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 16:33:36 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 16:33:36 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 16:33:36 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[admitted-eleventh] _
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7fd1fe82d100>
+result_session_id = '09401167-3801-49b5-ac91-297f0439d3ff'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-172/test_proposal_attempt_cap_incl2')
+blob_case = 'admitted-eleventh'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("blob_case", ("invalid-at-cap", "admitted-tenth", "admitted-eleventh"))
+    async def test_proposal_attempt_cap_includes_approval_required_blob_only_mutation(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        tmp_path: Path,
+        blob_case: str,
+    ) -> None:
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from tests.helpers.session_fences import fenced_operation_context
+        from tests.unit.web.composer.test_service import _blob_mutation_resources_for_test
+    
+        sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+        with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+            conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+    
+        arguments: dict[str, Any] = {}
+        if blob_case != "invalid-at-cap":
+            with fenced_operation_context(sessions_service._engine, result_session_id, operation_kind=SessionOperationKind.CREATE) as context:
+                blob = await BlobServiceImpl(sessions_service._engine, tmp_path).create_blob(
+                    UUID(result_session_id), "retained.txt", b"must remain untouched", "text/plain", session_operation_context=context
+                )
+            arguments = {"blob_id": str(blob.id)}
+        resources_before = _blob_mutation_resources_for_test(sessions_service._engine, tmp_path)
+        change_count = 9 if blob_case == "admitted-tenth" else 10
+    
+        caught = await _capture_tool_batch_rejection(
+            composer_service_with_real_sessions,
+            session_id=result_session_id,
+            response=_tool_batch_response(
+                *(
+                    (f"call_blob_boundary_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}})
+                    for index in range(change_count)
+                ),
+                ("call_approval_required_blob_only", "delete_blob", arguments),
+            ),
+        )
+    
+        expected_ids = {f"call_blob_boundary_proposal_{index}" for index in range(change_count)}
+        if blob_case == "admitted-eleventh":
+>           assert type(caught) is ComposerConvergenceError
+E           AssertionError: assert <class 'NoneType'> is ComposerConvergenceError
+E            +  where <class 'NoneType'> = type(None)
+
+tests/unit/web/composer/test_compose_loop_persistence.py:1535: AssertionError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 16:33:37 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 16:33:37 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 16:33:37 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+________ test_default_responses_bridge_is_refused_by_chat_only_gateway _________
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-172/test_default_responses_bridge_0')
+
+    @pytest.mark.asyncio
+    async def test_default_responses_bridge_is_refused_by_chat_only_gateway(tmp_path: Path) -> None:
+        """The shipped GPT-5.5 name reaches a real unsupported local route."""
+        from litellm.exceptions import NotFoundError
+    
+        app = _build_gateway_app()
+        requests: list[tuple[str, dict[str, Any]]] = []
+    
+        @app.middleware("http")
+        async def record_provider_request(request: Any, call_next: Any) -> Any:
+            if request.method == "POST":
+                requests.append((request.url.path, await request.json()))
+            return await call_next(request)
+    
+        with _running_gateway_server(app) as base_url:
+            sessions = _build_sessions_service(tmp_path)
+            service = _build_service(tmp_path, base_url, sessions, composer_model="gpt-5.5")
+            with pytest.raises(NotFoundError) as raised:
+>               await service._provider_gateway._call_llm([{"role": "user", "content": "hello gateway"}], [])
+
+tests/integration/web/composer/test_composer_against_gateway.py:1137: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/composer/provider_gateway.py:623: in _call_llm
+    response = await _litellm_acompletion(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+prompt_guard_mount = None, prompt_guard_mode = 'debug-when-unconfigured'
+prompt_guard_role = 'composer', prompt_guard_user_prompt = None
+prompt_guard_trusted_message_indexes = frozenset()
+prompt_guard_content_parts = None, prompt_guard_tool_argument_parts = None
+prompt_guard_thinking_parts = None
+
+    async def _litellm_acompletion(
+        *,
+        prompt_guard_mount: PromptGuardMount | None,
+        prompt_guard_mode: PromptGuardMode,
+        prompt_guard_role: PromptGuardRole,
+        prompt_guard_user_prompt: str | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prompt_guard_thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
+        prepared_advisor_content: tuple[PreparedAdvisorContent, ...] | None = None,
+        provider_custody: ProviderCallCustody | None = None,
+        on_provider_dispatch: Callable[[], None] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Call LiteLLM lazily so app startup never imports provider machinery.
+    
+        Brands OpenRouter-routed calls with ELSPETH's app-attribution headers (see
+        :func:`_apply_openrouter_app_identity`) so the OpenRouter dashboard credits
+        composer traffic to ELSPETH rather than LiteLLM's defaults, and pins
+        OpenRouter's usage-accounting opt-in (see
+        :func:`_apply_openrouter_usage_accounting`) so provider cost and cache
+        detail arrive in-band for the call audit.
+        """
+        if type(provider_custody) is not ProviderCallCustody:
+>           raise AuditIntegrityError("Physical provider requires exact explicit custody")
+E           elspeth.contracts.errors.AuditIntegrityError: Physical provider requires exact explicit custody
+
+src/elspeth/web/composer/provider_gateway.py:476: AuditIntegrityError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 16:33:48 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 16:33:48 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 16:33:48 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+=============================== warnings summary ===============================
+tests/integration/web/composer/test_composer_against_gateway.py::TestGatewayResponseShapeSatisfiesFreeformAttributeAccess::test_tool_call_response_shape
+  /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates/.venv/lib/python3.12/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0 - 2024-11-09
+
+tests/integration/web/composer/test_composer_against_gateway.py::TestGatewayResponseShapeSatisfiesFreeformAttributeAccess::test_tool_call_response_shape
+  /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates/.venv/lib/python3.12/site-packages/uvicorn/protocols/websockets/websockets_impl.py:17: DeprecationWarning: websockets.server.WebSocketServerProtocol is deprecated
+    from websockets.server import WebSocketServerProtocol
+
+tests/integration/web/composer/test_composer_against_gateway.py::TestGatewayResponseShapeSatisfiesFreeformAttributeAccess::test_tool_call_response_shape
+  /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates/.venv/lib/python3.12/site-packages/pydantic/_internal/_generate_schema.py:1480: UserWarning: Item 'summary' on TypedDict class 'ChatCompletionReasoningItem' is using the `ReadOnly` qualifier. Pydantic will not protect items from any mutation on dictionary instances.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_cap_excludes_schema_errors_and_semantic_refusals
+FAILED tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[admitted-tenth]
+FAILED tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[admitted-eleventh]
+FAILED tests/integration/web/composer/test_composer_against_gateway.py::test_default_responses_bridge_is_refused_by_chat_only_gateway
+================== 4 failed, 28 passed, 3 warnings in 20.49s ===================

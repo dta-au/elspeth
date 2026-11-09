@@ -1,0 +1,412 @@
+/**
+ * NarrativeResults — Phase 6B Task 6.
+ *
+ * Narrative-mode rendering for run results. Mounted when
+ * `useNarrativeMode().narrativeMode === true` (Task 7 dispatches).
+ *
+ * Layered model:
+ *
+ * **Layer 1 (primary): plugin-provided `summary` field.** The transform's
+ * output schema must include a `summary` field, pinned by Phase 6A
+ * Task 8's `capability_tags = ("narrative-summary",)`. The narrative
+ * panel surfaces this string verbatim (rendered as Markdown via the
+ * reused `MarkdownRenderer` from `components/chat/`). The read-only
+ * inspect view (Task 8) supplies `summaryOverride` from the frozen blob;
+ * live mode fetches the run's outputs manifest and walks the previews of
+ * file artifacts, extracting `summary` values per plan 19b:349.
+ *
+ * **Layer 2 (additive overlay): Phase 5b interpretation events.** When
+ * the `interpretationEventsStore` projection has resolved events for the
+ * active session, render them as "How user-supplied terms were
+ * interpreted." The overlay must NOT surface session-aggregate history;
+ * it filters to the selected run's wall-clock window so that resolutions
+ * from prior runs in the same session do not over-count. Pre-Phase-5b
+ * (or no events yet) the overlay short-circuits.
+ *
+ * **Run-filter (load-bearing — plan §Task 6 lines 311-337).** Phase 5b's
+ * `interpretationEventsStore` keys events by `session_id` only and the
+ * `interpretation_events_table` has no `run_id` column. To prevent the
+ * overlay from over-counting stale resolutions from earlier runs in the
+ * same session, the component filters by the selected run's wall-clock
+ * window:
+ *
+ *   - `runStart = new Date(run.started_at).getTime()`
+ *   - `runEnd   = run.finished_at != null
+ *                  ? new Date(run.finished_at).getTime()
+ *                  : Date.now()`   // in-flight upper bound is "now"
+ *
+ * Each event's effective time is `event.resolved_at ?? event.created_at`.
+ * The filter keeps events with `runStart <= eventTime <= runEnd`. This
+ * is approximate (a slow `resolved_at` write could land outside the
+ * window); tightening to an exact run-id requires a Phase 5b schema
+ * amendment that has been adjudicated out of scope. We do NOT fall back
+ * to a session-aggregate read — that is the explicit failure mode the
+ * plan guards against.
+ *
+ * Note: the plan calls the run-finished timestamp `completed_at`; the
+ * shipped `Run` interface (types/index.ts) uses `finished_at`. They are
+ * the same concept; the plan was written against an earlier shape.
+ *
+ * **Auto-interpreted opt-out rows are excluded from the per-event list.**
+ * They are already surfaced by the dedicated opt-out indicator below
+ * the per-event list, so listing each one would double-surface.
+ *
+ * **No-summary placeholder.** When the tagged plugin's output did not
+ * include a `summary` field (or no terminal run is available), render a
+ * placeholder rather than fabricating content. The existing tabular
+ * `RunOutputsPanel` remains the source of truth for raw outputs;
+ * narrative mode is a complementary surface.
+ *
+ * **Download affordance (plan 19b:342).** Alongside the narrative
+ * summary, the panel exposes a "Download full output" affordance against
+ * the selected run's first downloadable file artifact whose preview
+ * passed the backend's content verification. The backend
+ * `/content` endpoint requires `Authorization: Bearer` (api/client.ts
+ * lines 877-883) so the affordance is a button that invokes
+ * `downloadRunOutputContent` and triggers a synthetic anchor — not a
+ * plain `<a href>`, which would 401 on top-level navigation. The
+ * testid (`narrative-results-download-link`) is preserved from the
+ * plan's wording for cross-document grep continuity.
+ */
+
+import { type JSX, useEffect, useMemo, useState } from "react";
+
+import {
+  downloadRunOutputContent,
+  fetchRunOutputPreview,
+  fetchRunOutputs,
+} from "@/api/client";
+import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
+import { Button } from "@/components/ui";
+import { useExecutionStore } from "@/stores/executionStore";
+import {
+  selectApprovedInterpretations,
+  useInterpretationEventsStore,
+} from "@/stores/interpretationEventsStore";
+import { useSessionStore } from "@/stores/sessionStore";
+import type { RunOutputArtifact } from "@/types/index";
+
+interface NarrativeResultsProps {
+  /** Run selected by the parent results view, including completed history. */
+  runId: string | null;
+  /** If supplied, narrative pulls the summary from this run output rather
+   *  than the live execution store. Used by the read-only inspect view
+   *  in Task 8 where the run results live in a frozen blob. ``null`` means
+   *  "explicitly no summary"; ``undefined`` means "fall back to live mode." */
+  summaryOverride?: string | null;
+}
+
+/** Walk every row in a JSONL or JSON preview, return the rows whose
+ *  ``summary`` field is a non-empty string. Plan 19b:349 — "find the last
+ *  output row that has a `summary` field; if multiple, concatenate with
+ *  blank lines." The preview content is Tier-3 external data (parsed from
+ *  bytes the backend serialized to disk) so this is the coerce-and-record
+ *  boundary: malformed JSON lines are skipped rather than crashing.
+ *  CSV / binary / text content types carry no row-shaped `summary` field
+ *  and are skipped entirely (they would require column-name discovery and
+ *  full-text parsing the plan does not specify). */
+function extractSummariesFromPreviewText(
+  text: string,
+  contentType: string,
+): string[] {
+  const summaries: string[] = [];
+  if (contentType === "jsonl") {
+    for (const rawLine of text.split("\n")) {
+      const line = rawLine.trim();
+      if (line === "") continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        // Tier-3 boundary: a malformed line is recorded as absence, not
+        // a crash. Skip and continue.
+        continue;
+      }
+      if (typeof parsed !== "object" || parsed === null) continue;
+      const candidate = (parsed as Record<string, unknown>).summary;
+      if (typeof candidate === "string" && candidate.length > 0) {
+        summaries.push(candidate);
+      }
+    }
+  } else if (contentType === "json") {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return [];
+    }
+    if (Array.isArray(parsed)) {
+      for (const row of parsed) {
+        if (typeof row !== "object" || row === null) continue;
+        const candidate = (row as Record<string, unknown>).summary;
+        if (typeof candidate === "string" && candidate.length > 0) {
+          summaries.push(candidate);
+        }
+      }
+    } else if (typeof parsed === "object" && parsed !== null) {
+      const candidate = (parsed as Record<string, unknown>).summary;
+      if (typeof candidate === "string" && candidate.length > 0) {
+        summaries.push(candidate);
+      }
+    }
+  }
+  return summaries;
+}
+
+interface LiveOutputsState {
+  runId: string;
+  /** First downloadable file whose preview passed backend verification. */
+  downloadArtifact: RunOutputArtifact | null;
+  /** Concatenated non-empty `summary` strings extracted from the previews
+   *  of every file artifact in the manifest. ``null`` until the fetch
+   *  settles; empty-string when settled-with-no-summaries. */
+  extractedSummary: string | null;
+}
+
+function triggerBrowserDownload(data: Blob, filename: string): void {
+  // Mirrors the RunOutputsPanel:58-67 helper. The /content endpoint
+  // requires Authorization: Bearer, so we fetch-then-object-URL rather
+  // than rendering an <a href>.
+  const url = URL.createObjectURL(data);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  URL.revokeObjectURL(url);
+}
+
+export function NarrativeResults({ runId, summaryOverride }: NarrativeResultsProps): JSX.Element {
+  const activeSessionId = useSessionStore((s) => s.activeSessionId);
+  const optedOutBySession = useInterpretationEventsStore((s) => s.optedOutBySession);
+  const resolvedBySession = useInterpretationEventsStore((s) => s.resolvedBySession);
+  const runs = useExecutionStore((s) => s.runs);
+
+  // Live-mode outputs: fetched only when summaryOverride is undefined AND
+  // a runId is set. The fetch loads the manifest, then for each
+  // file artifact the bounded-preview endpoint, then walks rows looking
+  // for a `summary` field per plan 19b:349.
+  const [liveOutputs, setLiveOutputs] = useState<LiveOutputsState | null>(null);
+
+  useEffect(() => {
+    // When the inspect-view passes summaryOverride, skip the live fetch
+    // entirely — the frozen blob is the source of truth and a parallel
+    // fetch would only introduce a race the AC4-precedence test guards
+    // against.
+    if (summaryOverride !== undefined) return;
+    if (runId === null) {
+      setLiveOutputs(null);
+      return;
+    }
+
+    let cancelled = false;
+
+    (async () => {
+      // Tier-3 boundary: an unhealthy backend or in-flight run can return
+      // 4xx/5xx here. The narrative surface degrades to the placeholder
+      // rather than crashing the panel; the existing RunOutputsPanel
+      // remains the canonical surface for output-fetch error reporting.
+      let artifacts: ReadonlyArray<RunOutputArtifact>;
+      try {
+        const manifest = await fetchRunOutputs(runId);
+        artifacts = manifest.artifacts;
+      } catch {
+        if (cancelled) return;
+        setLiveOutputs({ runId, downloadArtifact: null, extractedSummary: "" });
+        return;
+      }
+
+      let downloadArtifact: RunOutputArtifact | null = null;
+
+      const summaries: string[] = [];
+      for (const artifact of artifacts) {
+        if (artifact.artifact_type !== "file") continue;
+        try {
+          const preview = await fetchRunOutputPreview(runId, artifact.artifact_id);
+          // A cumulative sink may overwrite an earlier publication's URI.
+          // The manifest preserves both descriptors; successful preview
+          // verifies these exact bytes before we offer that artifact.
+          if (downloadArtifact === null && artifact.downloadable) {
+            downloadArtifact = artifact;
+          }
+          summaries.push(
+            ...extractSummariesFromPreviewText(
+              preview.preview_text,
+              preview.content_type,
+            ),
+          );
+        } catch {
+          // A purge-race or content-type mismatch on one artifact must
+          // not abort summary extraction for the rest of the manifest.
+          continue;
+        }
+      }
+
+      if (cancelled) return;
+      setLiveOutputs({
+        runId,
+        downloadArtifact,
+        extractedSummary: summaries.join("\n\n"),
+      });
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [summaryOverride, runId]);
+
+  // A new selection renders before its fetch settles. Keep both text and
+  // download evidence bound to their producing run during that interval.
+  const selectedOutputs = liveOutputs?.runId === runId ? liveOutputs : null;
+
+  // Layer 1: locate the summary string. Precedence: explicit override
+  // (frozen-blob inspect view) → live-extracted concatenation → null.
+  // ``summaryOverride === null`` is "explicitly no summary"; ``""`` is
+  // empty; both surface the placeholder via the truthy gate below.
+  const summary: string | null =
+    summaryOverride !== undefined
+      ? summaryOverride
+      : selectedOutputs !== null && selectedOutputs.extractedSummary !== ""
+        ? selectedOutputs.extractedSummary
+        : null;
+
+  // Layer 2: opt-out indicator from the interpretation events store.
+  // Persists session-wide once flipped; the per-event list below adds
+  // the granular detail when there are resolved events in the active
+  // run's window.
+  const optedOut = activeSessionId !== null && optedOutBySession[activeSessionId] === true;
+
+  // Layer 2 (continued): the per-event run-window overlay.
+  //
+  // Memoise on the inputs so consumers of `resolvedEventsInWindow` don't
+  // re-derive on every render. The `Date.now()` branch for in-flight
+  // runs intentionally re-derives on each render-tick where the run is
+  // unfinished — the test suite uses `vi.setSystemTime()` to pin the
+  // clock for the in-flight test case.
+  const resolvedEventsInWindow = useMemo(() => {
+    if (activeSessionId === null) return [];
+    if (runId === null) return [];
+    const run = runs.find((r) => r.id === runId);
+    if (run === undefined) return [];
+    const runStart = new Date(run.started_at).getTime();
+    const runEnd =
+      run.finished_at !== null
+        ? new Date(run.finished_at).getTime()
+        : Date.now();
+    // Approved rows only (choice-classified by the store's shared
+    // selector, elspeth-3a8a843c47): the overlay narrates how
+    // user-supplied terms were reviewed and accepted, so declined-review
+    // rows are out of scope here — the auto_interpreted_* shapes (both
+    // CHECK-forced to choice='opted_out') are surfaced by the opt-out
+    // indicator below and by the F-22 opt_out_summary route, not by the
+    // per-event list. This also stops no-surfaces rows (all display
+    // fields null) rendering as empty bullets.
+    const candidates = selectApprovedInterpretations(
+      resolvedBySession[activeSessionId] ?? [],
+    );
+    return candidates.filter((event) => {
+      const eventTimeIso = event.resolved_at ?? event.created_at;
+      const eventTime = new Date(eventTimeIso).getTime();
+      return eventTime >= runStart && eventTime <= runEnd;
+    });
+  }, [activeSessionId, runId, runs, resolvedBySession]);
+
+  // Download affordance source: when the frozen-blob inspect view (Task 8)
+  // mounts NarrativeResults, there is no live executionStore run to fetch
+  // outputs from — the affordance is suppressed. Live mode surfaces the
+  // first downloadable file artifact with a verified preview.
+  const downloadArtifact: RunOutputArtifact | null =
+    summaryOverride !== undefined
+      ? null
+      : (selectedOutputs?.downloadArtifact ?? null);
+
+  const handleDownload = async (): Promise<void> => {
+    if (downloadArtifact === null) return;
+    if (runId === null) return;
+    try {
+      const { data, filename } = await downloadRunOutputContent(
+        runId,
+        downloadArtifact.artifact_id,
+      );
+      triggerBrowserDownload(data, filename);
+    } catch {
+      // Download failures are surfaced by the canonical RunOutputsPanel
+      // banner; the narrative affordance is a complementary entry point,
+      // not an error-reporting surface.
+    }
+  };
+
+  return (
+    <section
+      className="narrative-results"
+      aria-label="Narrative pipeline summary"
+      data-testid="narrative-results"
+    >
+      <h3>Pipeline summary</h3>
+      {summary !== null && summary !== "" ? (
+        <div data-testid="narrative-results-summary">
+          <MarkdownRenderer content={summary} />
+        </div>
+      ) : (
+        <p data-testid="narrative-results-no-summary" className="narrative-results-empty">
+          No narrative summary available for this run. The tagged plugin's
+          output did not include a <code>summary</code> field.
+        </p>
+      )}
+
+      {downloadArtifact !== null && (
+        <p className="narrative-results-download">
+          <Button
+            variant="bare"
+            type="button"
+            className="link-button"
+            data-testid="narrative-results-download-link"
+            onClick={() => void handleDownload()}
+          >
+            Download full output
+          </Button>
+        </p>
+      )}
+
+      {resolvedEventsInWindow.length > 0 && (
+        <div
+          className="narrative-results-interpretation-overlay"
+          data-testid="narrative-results-interpretation-overlay"
+        >
+          <h4>How user-supplied terms were interpreted</h4>
+          <ul>
+            {resolvedEventsInWindow.map((event) => {
+              // Approved rows carry the resolved `accepted_value`; the
+              // `llm_draft` fallback is wire-type narrowing (the field is
+              // nullable on the wire union), not a rendering path for
+              // declined rows — those never reach this list.
+              const displayValue = event.accepted_value ?? event.llm_draft;
+              return (
+                <li
+                  key={event.id}
+                  data-testid={`narrative-overlay-event-${event.id}`}
+                >
+                  &ldquo;{event.user_term}&rdquo; &rarr; {displayValue}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+
+      {optedOut && (
+        <div
+          className="narrative-results-interpretations"
+          data-testid="narrative-results-interpretations"
+        >
+          <h4>Auto-interpretation opt-out</h4>
+          <p>
+            Auto-interpretation opt-out — LLM-surfaced terms were resolved
+            without user review on this session.
+          </p>
+        </div>
+      )}
+    </section>
+  );
+}

@@ -1,0 +1,10 @@
+imports: exit 0, 0.06s
+before: exit 0, 0.62s
+pytest: exit 0, 264.49s
+ruff: exit 0, 0.03s
+format: exit 0, 0.03s
+mypy: exit 0, 4.08s
+contracts: exit 0, 32.82s
+whitespace: exit 0, 0.02s
+after: exit 0, 0.62s
+frozen=True

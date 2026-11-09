@@ -1,0 +1,84 @@
+mode=recovery; repository=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src/elspeth/web/coordination/repository.py; no checkout edits
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 1 item
+
+tests/unit/web/blobs/test_mutation_admission.py F                        [100%]
+
+=================================== FAILURES ===================================
+_ test_admission_refuses_actual_interrupted_debt_without_recovery[delete_blob-replacement-intent] _
+
+blob_service = <elspeth.web.blobs.service.BlobServiceImpl object at 0x7fc2e7bab410>
+db_engine = Engine(sqlite:///:memory:)
+compose_context = SessionOperationContext(fence=SessionOperationFence(session_id='75d8ae3f-6e3f-45ea-93d2-2fe71ac29e9d', operation_id='b...hT58fv4QgXuM0YyYTyCGcRFPnxAjx8NzaOM76-s', operation_epoch=3), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>)
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-87/test_admission_refuses_actual_0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fc2e7d715e0>
+producer = 'replacement', phase = 'intent', tool_name = 'delete_blob'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "producer,phase",
+        [
+            ("replacement", "intent"),
+            ("replacement", "swap_pending"),
+            ("replacement", "purge_pending"),
+            ("deletion", "intent"),
+            ("deletion", "staged"),
+            ("deletion", "purge_pending"),
+            ("atomic", None),
+        ],
+    )
+    @pytest.mark.parametrize("tool_name", ["update_blob", "delete_blob"])
+    async def test_admission_refuses_actual_interrupted_debt_without_recovery(
+        blob_service, db_engine, compose_context, tmp_path, monkeypatch, producer, phase, tool_name
+    ) -> None:
+        record = await _interrupt(blob_service, db_engine, compose_context, tmp_path, monkeypatch, producer, phase)
+        authority = blob_service._session_operation_authority
+        authority.release(compose_context)
+        compose_context = authority.acquire(
+            session_id=record.session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id="admission-successor",
+            lease_seconds=120,
+        )
+        before = _resources(db_engine, tmp_path)
+        from sqlalchemy import event
+    
+        with monkeypatch.context() as guards:
+            listener = _forbid_effects(guards, db_engine)
+            try:
+>               result = blobs.admit_blob_mutation(
+                    tool_name,
+                    {"blob_id": str(record.id), **({"content": "new"} if tool_name == "update_blob" else {})},
+                    _empty_state(),
+                    _context(blob_service, db_engine, compose_context, tmp_path),
+                )
+
+tests/unit/web/blobs/test_mutation_admission.py:281: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../../lanes/composer-remediation-wave1/d1-blob-oracle-mutants.py:46: in recover_instead
+    BlobReplacementCoordinator(engine=context.session_engine, data_dir=Path(context.data_dir), session_operation_authority=context.session_operation_authority).reconcile(context=context.session_operation_context)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+args = (<elspeth.web.blobs.replacement.BlobReplacementCoordinator object at 0x7fc2e7a59970>,)
+kwargs = {'context': SessionOperationContext(fence=SessionOperationFence(session_id='75d8ae3f-6e3f-45ea-93d2-2fe71ac29e9d', ope...T58fv4QgXuM0YyYTyCGcRFPnxAjx8NzaOM76-s', operation_epoch=3), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>)}
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+>       pytest.fail("admission executed a resource write or recovery")
+E       Failed: admission executed a resource write or recovery
+
+tests/unit/web/blobs/test_mutation_admission.py:112: Failed
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/_pytest/config/__init__.py:1309
+  /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/lib/python3.12/site-packages/_pytest/config/__init__.py:1309: PytestAssertRewriteWarning: Module already imported so cannot be rewritten; anyio
+    self._mark_plugins_for_rewrite(hook, disable_autoload)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/unit/web/blobs/test_mutation_admission.py::test_admission_refuses_actual_interrupted_debt_without_recovery[delete_blob-replacement-intent]
+========================= 1 failed, 1 warning in 0.53s =========================

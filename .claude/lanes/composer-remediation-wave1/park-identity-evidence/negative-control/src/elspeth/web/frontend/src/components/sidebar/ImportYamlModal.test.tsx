@@ -1,0 +1,1693 @@
+import { readFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { parseDocument } from "yaml";
+import {
+  ImportYamlModal,
+  ImportYamlModalHost,
+  analyseImportYamlDraft,
+  buildImportConfirmMessage,
+  buildImportSuccessMessage,
+  findImportYamlSourceBindingCandidates,
+  IMPORT_YAML_NOT_RUNNABLE_INTRO,
+  IMPORT_YAML_422_MESSAGE,
+  IMPORT_YAML_UNSAFE_MESSAGE,
+  IMPORT_YAML_SECTION_KEYS,
+  IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE,
+  IMPORT_YAML_SINGULAR_SOURCE_REMOVED_MESSAGE,
+} from "./ImportYamlModal";
+import { OPEN_IMPORT_YAML_MODAL_EVENT } from "@/lib/composer-events";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
+import { useSessionStore } from "@/stores/sessionStore";
+import { useExecutionStore } from "@/stores/executionStore";
+import {
+  _resetSubscriptionsForTesting,
+  initStoreSubscriptions,
+} from "@/stores/subscriptions";
+import * as api from "@/api/client";
+import type { BlobMetadata } from "@/types/api";
+import type { CompositionState } from "@/types/index";
+import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+import { unavailablePluginDisplayName } from "@/components/catalog/UnavailableComponentRow";
+
+vi.mock("yaml", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("yaml")>();
+  return {
+    ...actual,
+    parseDocument: vi.fn(actual.parseDocument),
+  };
+});
+
+vi.mock("@/api/client", () => ({
+  importCompositionYaml: vi.fn(),
+  listBlobs: vi.fn(),
+  uploadBlob: vi.fn(),
+  getPluginSchema: vi.fn(),
+}));
+
+function nonEmptyState(): CompositionState {
+  return {
+    id: "state-1",
+    ...compositionStateAuthorityFields,
+    version: 1,
+    sources: { source: { plugin: "csv", options: {} } },
+    nodes: [],
+    edges: [],
+    outputs: [],
+    metadata: { name: null, description: null },
+  };
+}
+
+function emptyState(): CompositionState {
+  return {
+    id: "state-0",
+    ...compositionStateAuthorityFields,
+    version: 1,
+    sources: {},
+    nodes: [],
+    edges: [],
+    outputs: [],
+    metadata: { name: null, description: null },
+  };
+}
+
+const PIPELINE_YAML =
+  "sources:\n" +
+  "  source:\n" +
+  "    plugin: csv\n" +
+  "    on_success: result\n" +
+  "sinks:\n" +
+  "  result:\n" +
+  "    plugin: json\n" +
+  "    on_write_failure: fail\n";
+
+const ADVANCED_EXPERIMENT_YAML =
+  "sources:\n" +
+  "  primary:\n" +
+  "    plugin: csv\n" +
+  "    on_success: experiment_in\n" +
+  "    options:\n" +
+  "      path: examples/statistical_batch_plugins/experiment_scores.csv\n" +
+  "      schema:\n" +
+  "        mode: observed\n" +
+  "    on_validation_failure: discard\n" +
+  "aggregations:\n" +
+  "  - name: prompt_experiment\n" +
+  "    plugin: batch_experiment_compare\n" +
+  "    input: experiment_in\n" +
+  "    on_success: output\n" +
+  "    on_error: discard\n" +
+  "    trigger:\n" +
+  "      count: 8\n" +
+  "    output_mode: transform\n" +
+  "    options:\n" +
+  "      variant_field: prompt_variant\n" +
+  "      score_field: score\n" +
+  "      baseline_variant: control\n" +
+  "sinks:\n" +
+  "  output:\n" +
+  "    plugin: json\n" +
+  "    on_write_failure: discard\n" +
+  "    options:\n" +
+  "      path: outputs/experiment_compare.jsonl\n" +
+  "      format: jsonl\n";
+
+// Two named sources publish into a declared `queue` named `inbound`; a
+// downstream transform consumes it. Exercises queue import preflight
+// recognition and step counting.
+const QUEUE_PIPELINE_YAML =
+  "sources:\n" +
+  "  orders:\n" +
+  "    plugin: csv\n" +
+  "    on_success: inbound\n" +
+  "  refunds:\n" +
+  "    plugin: csv\n" +
+  "    on_success: inbound\n" +
+  "queues:\n" +
+  "  inbound:\n" +
+  "    description: Orders and refunds interleave here\n" +
+  "transforms:\n" +
+  "  - name: summarize\n" +
+  "    plugin: llm\n" +
+  "    input: inbound\n" +
+  "    on_success: result\n" +
+  "sinks:\n" +
+  "  result:\n" +
+  "    plugin: json\n";
+
+// The top-level `queues` value is a mapping (so preflight counts it), but the
+// `inbound` entry is a bare scalar rather than a mapping — an entry-level
+// defect the SERVER validation path must catch, not one the client silently
+// discards.
+const QUEUE_MALFORMED_ENTRY_YAML =
+  "sources:\n" +
+  "  orders:\n" +
+  "    plugin: csv\n" +
+  "    on_success: inbound\n" +
+  "queues:\n" +
+  "  inbound: not-a-mapping\n" +
+  "sinks:\n" +
+  "  result:\n" +
+  "    plugin: json\n";
+
+const ROW_UNION_PIPELINE_YAML =
+  "sources:\n" +
+  "  experiments:\n" +
+  "    plugin: csv\n" +
+  "    on_success: routed\n" +
+  "row_unions:\n" +
+  "  - name: variant_union\n" +
+  "    branches:\n" +
+  "      control: control_done\n" +
+  "      treatment: treatment_done\n" +
+  "    on_success: experiment_rows\n" +
+  "    timeout_seconds: 12.5\n" +
+  "sinks:\n" +
+  "  results:\n" +
+  "    plugin: json\n";
+
+const COLLECTOR_SCOPE_PIPELINE_YAML =
+  "collectors:\n" +
+  "  - name: collect_pages\n" +
+  "    plugin: batch_summary\n" +
+  "    input: page_rows\n" +
+  "    on_success: summaries\n" +
+  "    options: {}\n" +
+  "scopes:\n" +
+  "  - name: page_group\n" +
+  "    opener: expand_pages\n" +
+  "    closer: collect_pages\n" +
+  "    policy: require_all\n";
+
+const SCOPE_ONLY_PIPELINE_YAML =
+  "scopes:\n" +
+  "  - name: page_group\n" +
+  "    opener: expand_pages\n" +
+  "    closer: collect_pages\n" +
+  "    policy: require_all\n";
+
+function makeBlob(overrides: Partial<BlobMetadata> = {}): BlobMetadata {
+  return {
+    id: "22222222-2222-2222-2222-222222222222",
+    session_id: "sess-1",
+    filename: "experiment_scores.csv",
+    mime_type: "text/csv",
+    size_bytes: 128,
+    content_hash: "hash",
+    created_at: "2026-07-10T00:00:00Z",
+    created_by: "user",
+    source_description: null,
+    status: "ready",
+    creation_modality: "verbatim",
+    created_from_message_id: null,
+    creating_model_identifier: null,
+    creating_model_version: null,
+    creating_provider: null,
+    creating_composer_skill_hash: null,
+    creating_arguments_hash: null,
+    ...overrides,
+  };
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
+describe("ImportYamlModal", () => {
+  const onClose = vi.fn();
+
+  beforeEach(() => {
+    // The post-import validation runs through the real auto-validation
+    // queue; reset its module-level bookkeeping so no test inherits another's
+    // in-flight or landed version.
+    _resetSubscriptionsForTesting();
+    onClose.mockReset();
+    vi.mocked(api.importCompositionYaml).mockReset();
+    vi.mocked(api.listBlobs).mockReset();
+    vi.mocked(api.listBlobs).mockResolvedValue([]);
+    vi.mocked(api.uploadBlob).mockReset();
+    vi.mocked(parseDocument).mockClear();
+    useSessionStore.setState({
+      activeSessionId: "sess-1",
+      compositionState: null,
+      // Loaded-and-empty is the default here; an unloaded state (false) makes
+      // the confirm step appear even for a null composition (its own test).
+      compositionStateLoaded: true,
+      // No exported sidecar by default: only the round-trip tests set one, so
+      // the common path stays a two-arg importCompositionYaml call. setState
+      // merges, so reset it here or a prior test's binding leaks forward.
+      exportedYamlBlobBinding: null,
+      // Stubbed rather than exercised: selectSession's own refetch fan-out
+      // (messages/proposals/preferences/blobs/interpretation-events) is
+      // sessionStore's concern, already covered by sessionStore's own tests.
+      // This test only asserts the import flow calls it with the right id.
+      selectSession: vi.fn().mockResolvedValue(undefined),
+    } as never);
+    useExecutionStore.setState({
+      validate: vi.fn().mockResolvedValue(true),
+    } as never);
+  });
+
+  afterEach(() => {
+    useSessionStore.setState({
+      activeSessionId: null,
+      compositionState: null,
+    } as never);
+  });
+
+  function typeYaml(text = PIPELINE_YAML): void {
+    fireEvent.change(screen.getByLabelText(/pipeline yaml/i), {
+      target: { value: text },
+    });
+  }
+
+  // Clicks that trigger the async import call resolve/reject on a
+  // microtask outside the synchronous fireEvent dispatch -- wrapping in
+  // act() keeps the resulting state update inside a tracked act boundary
+  // (avoiding a spurious "not wrapped in act" warning) without needing a
+  // real user-event pointer sequence for a plain click.
+  async function clickImport(): Promise<void> {
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^import$/i }));
+    });
+  }
+
+  async function clickConfirmReplace(): Promise<void> {
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: /replace pipeline/i }),
+      );
+    });
+  }
+
+  // ── Open / close / focus ──────────────────────────────────────────────────
+
+  it("renders a labelled textarea and moves focus to it on open", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+
+    const textarea = screen.getByLabelText(/pipeline yaml/i);
+    expect(textarea).toBeInTheDocument();
+    expect(textarea).toHaveFocus();
+  });
+
+  it("host opens on the app-level import event and closes through the modal action", () => {
+    render(<ImportYamlModalHost />);
+
+    expect(screen.queryByRole("dialog", { name: /import yaml/i })).toBeNull();
+
+    fireEvent(window, new CustomEvent(OPEN_IMPORT_YAML_MODAL_EVENT));
+
+    expect(
+      screen.getByRole("dialog", { name: /import yaml/i }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+
+    expect(screen.queryByRole("dialog", { name: /import yaml/i })).toBeNull();
+  });
+
+  it("host ignores the app-level import event without an active session", () => {
+    useSessionStore.setState({
+      activeSessionId: null,
+    } as never);
+    render(<ImportYamlModalHost />);
+
+    fireEvent(window, new CustomEvent(OPEN_IMPORT_YAML_MODAL_EVENT));
+
+    expect(screen.queryByRole("dialog", { name: /import yaml/i })).toBeNull();
+  });
+
+  it("host closes when the active session is cleared", () => {
+    render(<ImportYamlModalHost />);
+    fireEvent(window, new CustomEvent(OPEN_IMPORT_YAML_MODAL_EVENT));
+    expect(
+      screen.getByRole("dialog", { name: /import yaml/i }),
+    ).toBeInTheDocument();
+
+    act(() => {
+      useSessionStore.setState({
+        activeSessionId: null,
+      } as never);
+    });
+
+    expect(screen.queryByRole("dialog", { name: /import yaml/i })).toBeNull();
+  });
+
+  it("closes on Escape while drafting", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it("closes when the backdrop is clicked", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+
+    fireEvent.click(screen.getByTestId("import-yaml-modal-backdrop"));
+
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it("closes when the close button is clicked", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /close import yaml/i }),
+    );
+
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it("disables Import while the textarea is empty", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+
+    expect(screen.getByRole("button", { name: /^import$/i })).toBeDisabled();
+  });
+
+  it("disables Import with inline validation when YAML has no pipeline sections", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml("not: a pipeline document\n");
+
+    expect(screen.getByRole("button", { name: /^import$/i })).toBeDisabled();
+    expect(screen.getByText("Validation summary")).toBeInTheDocument();
+    expect(screen.getByText(IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE)).toBeInTheDocument();
+    expect(screen.queryByText("Parsed preview")).toBeNull();
+  });
+
+  it("disables Import with inline validation for a nested non-runtime pipeline wrapper", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(
+      "pipeline:\n" +
+        "  sources:\n" +
+        "    source:\n" +
+        "      plugin: csv\n",
+    );
+
+    expect(screen.getByRole("button", { name: /^import$/i })).toBeDisabled();
+    expect(screen.getByText(IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE)).toBeInTheDocument();
+  });
+
+  it("previews and enables Import for flow-style YAML the backend accepts", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(
+      '{"sources": {"primary": {"plugin": "csv", "on_success": "result"}}, ' +
+        '"sinks": {"result": {"plugin": "json", "on_write_failure": "fail"}}}',
+    );
+
+    expect(screen.getByRole("button", { name: /^import$/i })).not.toBeDisabled();
+    expect(screen.getByText("Parsed preview")).toBeInTheDocument();
+    expect(screen.getByText("1 source, 0 processing steps, 1 output")).toBeInTheDocument();
+    expect(screen.getByText(/Ready for server validation/i)).toBeInTheDocument();
+  });
+
+  it("disables Import with inline validation when YAML syntax is malformed", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml("sources: [this is: not: valid");
+
+    expect(screen.getByRole("button", { name: /^import$/i })).toBeDisabled();
+    expect(screen.getByText("Validation summary")).toBeInTheDocument();
+    expect(screen.getByText(/YAML parse failed near line 1/i)).toBeInTheDocument();
+    expect(screen.queryByText("Parsed preview")).toBeNull();
+  });
+
+  it("accepts uniformly indented top-level runtime YAML", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(
+      "  sources:\n" +
+        "    source:\n" +
+        "      plugin: csv\n" +
+        "      on_success: result\n" +
+        "  sinks:\n" +
+        "    result:\n" +
+        "      plugin: json\n" +
+        "      on_write_failure: fail\n",
+    );
+
+    expect(screen.getByText("Parsed preview")).toBeInTheDocument();
+    expect(screen.getByText("1 source, 0 processing steps, 1 output")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^import$/i })).not.toBeDisabled();
+  });
+
+  it("accepts top-level runtime keys with whitespace before the YAML colon", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(
+      "sources :\n" +
+        "  source:\n" +
+        "    plugin: csv\n" +
+        "    on_success: result\n" +
+        "sinks :\n" +
+        "  result:\n" +
+        "    plugin: json\n" +
+        "    on_write_failure: fail\n",
+    );
+
+    expect(screen.getByText("Parsed preview")).toBeInTheDocument();
+    expect(screen.getByText("1 source, 0 processing steps, 1 output")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^import$/i })).not.toBeDisabled();
+  });
+
+  it("accepts quoted top-level runtime keys", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(
+      '"sources":\n' +
+        "  source:\n" +
+        "    plugin: csv\n" +
+        "    on_success: result\n" +
+        '"sinks":\n' +
+        "  result:\n" +
+        "    plugin: json\n" +
+        "    on_write_failure: fail\n",
+    );
+
+    expect(screen.getByText("Parsed preview")).toBeInTheDocument();
+    expect(screen.getByText("1 source, 0 processing steps, 1 output")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^import$/i })).not.toBeDisabled();
+  });
+
+  it("shows a parsed preview and validation summary before Import is enabled", () => {
+    const { container } = render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(
+      "sources:\n" +
+        "  source:\n" +
+        "    plugin: csv\n" +
+        "    on_success: summarize\n" +
+        "transforms:\n" +
+        "  - name: summarize\n" +
+        "    plugin: llm\n" +
+        "    input: source\n" +
+        "    on_success: result\n" +
+        "    on_error: fail\n" +
+        "sinks:\n" +
+        "  result:\n" +
+        "    plugin: json\n" +
+        "    on_write_failure: fail\n",
+    );
+
+    expect(screen.getByText("Parsed preview")).toBeInTheDocument();
+    expect(
+      screen.getByText("1 source, 1 processing step, 1 output"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Validation summary")).toBeInTheDocument();
+    expect(screen.getByText(/Ready for server validation/i)).toBeInTheDocument();
+    expect(
+      screen.getByRole("status", { name: "Import YAML preflight" }),
+    ).toHaveAttribute("aria-live", "polite");
+    expect(screen.getByLabelText(/pipeline yaml/i)).toHaveAccessibleDescription(
+      /Ready for server validation/i,
+    );
+    expect(screen.getByRole("button", { name: /^import$/i })).not.toBeDisabled();
+    // Task 3's preflight surface under the wave's shared acceptance pin: the
+    // draft's own YAML keys (on_success, on_write_failure) are the INPUT, and
+    // none of them may reach the preview or the summary prose. The textarea is
+    // allowed — and ONLY the textarea — because React renders a controlled
+    // textarea's value as a real text node, and the reader's own paste is not
+    // composer copy. Everything else here is authored prose ("Parsed preview",
+    // "1 source, 1 processing step, 1 output", "Ready for server validation.").
+    expectNoIdentifiersInDefaultDom(container, { allowSelectors: ["textarea"] });
+  });
+
+  it("counts section body entries when the section header has an inline comment", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(
+      "sources:\n" +
+        "  source:\n" +
+        "    plugin: csv\n" +
+        "    on_success: summarize\n" +
+        "transforms: # generated steps\n" +
+        "  - name: summarize\n" +
+        "    plugin: llm\n" +
+        "  - name: normalize\n" +
+        "    plugin: lowercase\n" +
+        "sinks:\n" +
+        "  result:\n" +
+        "    plugin: json\n",
+    );
+
+    expect(screen.getByText("Parsed preview")).toBeInTheDocument();
+    expect(
+      screen.getByText("1 source, 2 processing steps, 1 output"),
+    ).toBeInTheDocument();
+  });
+
+  it("counts indentless block-sequence entries (PyYAML's default emitter style)", () => {
+    // The '-' marker of a YAML block sequence may sit at the SAME indent as
+    // its parent key ("transforms:" and "- name: a" both at column 0) -- a
+    // valid, common emitter style. countYamlSectionEntries used to break the
+    // scan the instant it saw indent <= start.indent, undercounting to 0.
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(
+      "sources:\n" +
+        "  source:\n" +
+        "    plugin: csv\n" +
+        "    on_success: a\n" +
+        "transforms:\n" +
+        "- name: a\n" +
+        "  plugin: uppercase\n" +
+        "- name: b\n" +
+        "  plugin: lowercase\n" +
+        "sinks:\n" +
+        "  result:\n" +
+        "    plugin: json\n",
+    );
+
+    expect(screen.getByText("Parsed preview")).toBeInTheDocument();
+    expect(
+      screen.getByText("1 source, 2 processing steps, 1 output"),
+    ).toBeInTheDocument();
+  });
+
+  it("recognises a top-level queues section and counts queue nodes as processing steps", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(QUEUE_PIPELINE_YAML);
+
+    expect(screen.getByText("Parsed preview")).toBeInTheDocument();
+    // Two sources; the queue node AND the transform each count as one
+    // processing step; one sink. A queue must not be flagged as an unknown
+    // section, nor counted as a source/output.
+    expect(
+      screen.getByText("2 sources, 2 processing steps, 1 output"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Ready for server validation/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^import$/i })).not.toBeDisabled();
+  });
+
+  it("previews a collector and its scope as one processing step", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(COLLECTOR_SCOPE_PIPELINE_YAML);
+
+    expect(screen.getByText("Parsed preview")).toBeInTheDocument();
+    expect(
+      screen.getByText("0 sources, 1 processing step, 0 outputs"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Ready for server validation/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^import$/i })).not.toBeDisabled();
+  });
+
+  it("recognises a top-level row_unions list and counts it as a processing step", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(ROW_UNION_PIPELINE_YAML);
+
+    expect(screen.getByText("Parsed preview")).toBeInTheDocument();
+    expect(
+      screen.getByText("1 source, 1 processing step, 1 output"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Ready for server validation/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^import$/i })).not.toBeDisabled();
+  });
+
+  it("preflights a very large paste without throwing", () => {
+    // Import preflight runs synchronously in render. Keep a large-paste guard
+    // so scanner/parser changes do not reintroduce RangeError or stack issues.
+    const bigBody = Array.from(
+      { length: 5000 },
+      (_, i) => `  field_${i}: value`,
+    ).join("\n");
+    const bigYaml = `sources:\n  source:\n    plugin: csv\n${bigBody}\nsinks:\n  result:\n    plugin: json\n`;
+
+    render(<ImportYamlModal onClose={onClose} />);
+
+    expect(() => typeYaml(bigYaml)).not.toThrow();
+    expect(screen.getByRole("button", { name: /^import$/i })).not.toBeDisabled();
+  });
+
+  it("does not close on Escape while the confirm step owns the keyboard", () => {
+    useSessionStore.setState({ compositionState: nonEmptyState() } as never);
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    fireEvent.click(screen.getByRole("button", { name: /^import$/i }));
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    // ConfirmDialog's own Escape handler cancels back to draft; the outer
+    // modal must not ALSO close (that would drop both dialogs on one key).
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.getByRole("dialog", { name: /import yaml/i })).toBeInTheDocument();
+  });
+
+  // ── File picker ────────────────────────────────────────────────────────────
+
+  it("reads a chosen .yaml file into the textarea client-side (no network call)", async () => {
+    render(<ImportYamlModal onClose={onClose} />);
+    const file = new File([PIPELINE_YAML], "pipeline.yaml", {
+      type: "text/yaml",
+    });
+    const input = screen.getByLabelText(
+      /choose a \.yaml file/i,
+    ) as HTMLInputElement;
+
+    await userEvent.upload(input, file);
+
+    await waitFor(() =>
+      expect(screen.getByLabelText(/pipeline yaml/i)).toHaveValue(
+        PIPELINE_YAML,
+      ),
+    );
+  });
+
+  it("finds file-backed sources that can be rebound to uploaded blobs", () => {
+    expect(
+      findImportYamlSourceBindingCandidates(ADVANCED_EXPERIMENT_YAML),
+    ).toEqual([
+      {
+        sourceName: "primary",
+        optionKey: "path",
+        path: "examples/statistical_batch_plugins/experiment_scores.csv",
+      },
+    ]);
+  });
+
+  it("does not offer blob bindings for the deleted singular source surface", () => {
+    expect(
+      findImportYamlSourceBindingCandidates(
+        "source:\n  plugin: csv\n  options:\n    path: rejected.csv\nsinks:\n  out: {}\n",
+      ),
+    ).toEqual([]);
+  });
+
+  it.each([
+    "sources: *missing\n",
+    "sources: &sources [*sources]\n",
+    "a: &a [one, two]\nb: &b [*a, *a]\nsources: [*b, *b]\n",
+    "defaults: &defaults {plugin: csv}\nsources:\n  source: *defaults\n",
+  ])("fails closed for aliases in both preflight consumers: %s", (yaml) => {
+    expect(analyseImportYamlDraft(yaml)).toMatchObject({
+      hasText: true,
+      canImport: false,
+      sectionsParsed: false,
+      validationMessage: IMPORT_YAML_UNSAFE_MESSAGE,
+    });
+    expect(findImportYamlSourceBindingCandidates(yaml)).toEqual([]);
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(yaml);
+    expect(screen.getByRole("button", { name: /^import$/i })).toBeDisabled();
+    typeYaml(PIPELINE_YAML);
+    expect(screen.getByText("Parsed preview")).toBeInTheDocument();
+  });
+
+  it("rejects over-limit input before calling the YAML parser", () => {
+    const analysis = analyseImportYamlDraft("sources: {}\n#" + "x".repeat(262_144));
+    expect(analysis.canImport).toBe(false);
+    expect(analysis.validationMessage).toBe(IMPORT_YAML_422_MESSAGE);
+    expect(parseDocument).not.toHaveBeenCalled();
+  });
+
+  it("counts Unicode characters like the backend rather than UTF-16 units", () => {
+    const prefix = PIPELINE_YAML + "#";
+    const yaml = prefix + "𐐀".repeat(262_144 - prefix.length);
+    expect(analyseImportYamlDraft(yaml).canImport).toBe(true);
+    vi.mocked(parseDocument).mockClear();
+    expect(analyseImportYamlDraft(yaml + "𐐀").canImport).toBe(false);
+    expect(parseDocument).not.toHaveBeenCalled();
+  });
+
+  it("refuses an impossibly large file before reading its contents", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+    const read = vi.spyOn(FileReader.prototype, "readAsText");
+    const file = new File(["x".repeat(4 * 262_144 + 1)], "large.yaml", { type: "text/yaml" });
+    fireEvent.change(screen.getByLabelText(/choose a \.yaml file/i), { target: { files: [file] } });
+    expect(read).not.toHaveBeenCalled();
+    expect(screen.getByText(IMPORT_YAML_422_MESSAGE)).toBeInTheDocument();
+    read.mockRestore();
+  });
+
+  it("contains parser exceptions and leaves source-binding discovery closed", () => {
+    vi.mocked(parseDocument).mockImplementationOnce(() => {
+      throw new RangeError("parser nesting limit");
+    });
+    expect(analyseImportYamlDraft("sources: {}\n").canImport).toBe(false);
+    vi.mocked(parseDocument).mockImplementationOnce(() => {
+      throw new RangeError("parser nesting limit");
+    });
+    expect(findImportYamlSourceBindingCandidates("sources: {}\n")).toEqual([]);
+  });
+
+  it("defers draft YAML analysis through one shared parse", () => {
+    const componentSource = readFileSync(
+      "src/components/sidebar/ImportYamlModal.tsx",
+      "utf8",
+    );
+    expect(componentSource).toContain("useDeferredValue");
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(ADVANCED_EXPERIMENT_YAML);
+
+    expect(screen.getByText("Parsed preview")).toBeInTheDocument();
+    expect(
+      screen.getByRole("combobox", { name: /uploaded file for source primary/i }),
+    ).toBeInTheDocument();
+    expect(parseDocument).toHaveBeenCalledTimes(1);
+    expect(parseDocument).toHaveBeenCalledWith(
+      ADVANCED_EXPERIMENT_YAML,
+      { prettyErrors: false },
+    );
+  });
+
+  it("imports a pasted advanced example with an explicit uploaded source binding", async () => {
+    useSessionStore.setState({ compositionState: emptyState() } as never);
+    const blob = makeBlob();
+    vi.mocked(api.listBlobs).mockResolvedValue([blob]);
+    vi.mocked(api.importCompositionYaml).mockResolvedValue({
+      id: "state-advanced",
+      version: 9,
+      is_valid: true,
+      validation_errors: null,
+    });
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(ADVANCED_EXPERIMENT_YAML);
+
+    const bindingSelect = await screen.findByRole("combobox", {
+      name: /uploaded file for source primary/i,
+    });
+    fireEvent.change(bindingSelect, { target: { value: blob.id } });
+    await clickImport();
+
+    await waitFor(() =>
+      expect(screen.getByText(buildImportSuccessMessage(9))).toBeInTheDocument(),
+    );
+    expect(api.importCompositionYaml).toHaveBeenCalledWith(
+      "sess-1",
+      ADVANCED_EXPERIMENT_YAML,
+      { primary: blob.id },
+    );
+  });
+
+  it("clears a selected source binding when the YAML source path changes", async () => {
+    useSessionStore.setState({ compositionState: emptyState() } as never);
+    const blob = makeBlob();
+    vi.mocked(api.listBlobs).mockResolvedValue([blob]);
+    vi.mocked(api.importCompositionYaml).mockResolvedValue({
+      id: "state-path-edited",
+      version: 11,
+      is_valid: true,
+      validation_errors: null,
+    });
+    const editedYaml = ADVANCED_EXPERIMENT_YAML.replace(
+      "examples/statistical_batch_plugins/experiment_scores.csv",
+      "examples/statistical_batch_plugins/other_scores.csv",
+    );
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(ADVANCED_EXPERIMENT_YAML);
+    const bindingSelect = await screen.findByRole("combobox", {
+      name: /uploaded file for source primary/i,
+    });
+    fireEvent.change(bindingSelect, { target: { value: blob.id } });
+    expect(bindingSelect).toHaveValue(blob.id);
+
+    typeYaml(editedYaml);
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", {
+          name: /uploaded file for source primary/i,
+        }),
+      ).toHaveValue(""),
+    );
+    await clickImport();
+
+    await waitFor(() =>
+      expect(screen.getByText(buildImportSuccessMessage(11))).toBeInTheDocument(),
+    );
+    expect(api.importCompositionYaml).toHaveBeenCalledWith("sess-1", editedYaml);
+  });
+
+  it("uploads a source file from the import modal and uses it as source_blob_ids", async () => {
+    useSessionStore.setState({ compositionState: emptyState() } as never);
+    const blob = makeBlob({ id: "33333333-3333-3333-3333-333333333333" });
+    vi.mocked(api.uploadBlob).mockResolvedValue(blob);
+    vi.mocked(api.importCompositionYaml).mockResolvedValue({
+      id: "state-uploaded",
+      version: 10,
+      is_valid: true,
+      validation_errors: null,
+    });
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(ADVANCED_EXPERIMENT_YAML);
+
+    const sourceFileInput = await screen.findByLabelText(
+      /upload file for source primary/i,
+    );
+    await userEvent.upload(
+      sourceFileInput,
+      new File(["id,prompt_variant,score\n1,control,0.5\n"], "experiment_scores.csv", {
+        type: "text/csv",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(api.uploadBlob).toHaveBeenCalledWith(
+        "sess-1",
+        expect.objectContaining({ name: "experiment_scores.csv" }),
+      ),
+    );
+    await clickImport();
+
+    await waitFor(() =>
+      expect(screen.getByText(buildImportSuccessMessage(10))).toBeInTheDocument(),
+    );
+    expect(api.importCompositionYaml).toHaveBeenCalledWith(
+      "sess-1",
+      ADVANCED_EXPERIMENT_YAML,
+      { primary: blob.id },
+    );
+  });
+
+  it("does not bind an upload that finishes after the YAML source path changes", async () => {
+    useSessionStore.setState({ compositionState: emptyState() } as never);
+    const upload = deferred<BlobMetadata>();
+    const blob = makeBlob({ id: "44444444-4444-4444-4444-444444444444" });
+    vi.mocked(api.uploadBlob).mockReturnValue(upload.promise);
+    vi.mocked(api.importCompositionYaml).mockResolvedValue({
+      id: "state-stale-upload",
+      version: 12,
+      is_valid: true,
+      validation_errors: null,
+    });
+    const editedYaml = ADVANCED_EXPERIMENT_YAML.replace(
+      "examples/statistical_batch_plugins/experiment_scores.csv",
+      "examples/statistical_batch_plugins/late_scores.csv",
+    );
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(ADVANCED_EXPERIMENT_YAML);
+    const sourceFileInput = await screen.findByLabelText(
+      /upload file for source primary/i,
+    );
+    await userEvent.upload(
+      sourceFileInput,
+      new File(["id,prompt_variant,score\n1,control,0.5\n"], "experiment_scores.csv", {
+        type: "text/csv",
+      }),
+    );
+    await waitFor(() => expect(api.uploadBlob).toHaveBeenCalledOnce());
+
+    typeYaml(editedYaml);
+    await act(async () => {
+      upload.resolve(blob);
+      await upload.promise;
+    });
+    await clickImport();
+
+    await waitFor(() =>
+      expect(screen.getByText(buildImportSuccessMessage(12))).toBeInTheDocument(),
+    );
+    expect(api.importCompositionYaml).toHaveBeenCalledWith("sess-1", editedYaml);
+  });
+
+  it("does not keep Import disabled for an upload tied to a removed source path", async () => {
+    useSessionStore.setState({ compositionState: emptyState() } as never);
+    const upload = deferred<BlobMetadata>();
+    vi.mocked(api.uploadBlob).mockReturnValue(upload.promise);
+    vi.mocked(api.importCompositionYaml).mockResolvedValue({
+      id: "state-stale-pending",
+      version: 13,
+      is_valid: true,
+      validation_errors: null,
+    });
+    const editedYaml = ADVANCED_EXPERIMENT_YAML.replace(
+      "examples/statistical_batch_plugins/experiment_scores.csv",
+      "examples/statistical_batch_plugins/current_scores.csv",
+    );
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(ADVANCED_EXPERIMENT_YAML);
+    const sourceFileInput = await screen.findByLabelText(
+      /upload file for source primary/i,
+    );
+    await userEvent.upload(
+      sourceFileInput,
+      new File(["id,prompt_variant,score\n1,control,0.5\n"], "experiment_scores.csv", {
+        type: "text/csv",
+      }),
+    );
+    expect(screen.getByRole("button", { name: /^import$/i })).toBeDisabled();
+
+    typeYaml(editedYaml);
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /^import$/i })).not.toBeDisabled(),
+    );
+    await clickImport();
+
+    await waitFor(() =>
+      expect(screen.getByText(buildImportSuccessMessage(13))).toBeInTheDocument(),
+    );
+    expect(api.importCompositionYaml).toHaveBeenCalledWith("sess-1", editedYaml);
+    await act(async () => {
+      upload.resolve(makeBlob({ id: "55555555-5555-5555-5555-555555555555" }));
+      await upload.promise;
+    });
+  });
+
+  // ── Happy path (no confirm needed — current composition is empty) ─────────
+
+  it("submits directly and shows the version on success when the current pipeline is empty", async () => {
+    useSessionStore.setState({ compositionState: emptyState() } as never);
+    vi.mocked(api.importCompositionYaml).mockResolvedValue({
+      id: "state-2",
+      version: 2,
+      is_valid: true,
+      validation_errors: null,
+    });
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    await clickImport();
+
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() =>
+      expect(
+        screen.getByText(buildImportSuccessMessage(2)),
+      ).toBeInTheDocument(),
+    );
+    expect(api.importCompositionYaml).toHaveBeenCalledWith(
+      "sess-1",
+      PIPELINE_YAML,
+    );
+    expect(useSessionStore.getState().selectSession).toHaveBeenCalledWith(
+      "sess-1",
+    );
+    // The stubbed selectSession publishes nothing, so the empty head stays
+    // and the queue's empty-composition guard holds: no direct validate()
+    // beside the refetch any more (Fix 2B). The queue path itself is pinned
+    // in the "post-import validation" describe below.
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(useExecutionStore.getState().validate).not.toHaveBeenCalled();
+  });
+
+  // ── Post-import validation runs through the queue (Fix 2B) ───────────────
+
+  describe("post-import validation", () => {
+    /** The head the import mints: same session, version 2. `sameContent`
+     *  keeps the authored content of nonEmptyState() (a content-equal
+     *  import); otherwise the source changes, as an ordinary import does. */
+    function importedHead(sameContent: boolean): CompositionState {
+      const base = nonEmptyState();
+      return {
+        ...base,
+        id: "state-2",
+        version: 2,
+        sources: sameContent
+          ? base.sources
+          : { source: { plugin: "csv", options: { path: "imported.csv" } } },
+      };
+    }
+
+    /** selectSession as the real one publishes: null head, then the
+     *  refetched (imported) head. */
+    function selectSessionPublishing(head: CompositionState) {
+      return vi.fn(async () => {
+        useSessionStore.setState({ compositionState: null } as never);
+        await Promise.resolve();
+        useSessionStore.setState({ compositionState: head } as never);
+      });
+    }
+
+    async function importReplacingCurrent(): Promise<void> {
+      render(<ImportYamlModal onClose={onClose} />);
+      typeYaml();
+      await clickImport();
+      await clickConfirmReplace();
+      await waitFor(() =>
+        expect(
+          screen.getByText(buildImportSuccessMessage(2)),
+        ).toBeInTheDocument(),
+      );
+      await act(async () => {
+        for (let i = 0; i < 6; i += 1) await Promise.resolve();
+      });
+    }
+
+    beforeEach(() => {
+      vi.mocked(api.importCompositionYaml).mockResolvedValue({
+        id: "state-2",
+        version: 2,
+        is_valid: true,
+        validation_errors: null,
+      });
+      useExecutionStore.setState({
+        rehydrateActiveRun: vi.fn().mockResolvedValue(undefined),
+        isExecuting: false,
+        progress: null,
+      } as never);
+    });
+
+    /** Seed: version 1 published and its verdict landed through the queue. */
+    async function seedValidatedHead(): Promise<void> {
+      initStoreSubscriptions();
+      useSessionStore.setState({ compositionState: nonEmptyState() } as never);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(useExecutionStore.getState().validate).toHaveBeenCalledTimes(1);
+      vi.mocked(useExecutionStore.getState().validate).mockClear();
+    }
+
+    it("an ordinary import issues exactly ONE validate, for the imported version", async () => {
+      await seedValidatedHead();
+      useSessionStore.setState({
+        selectSession: selectSessionPublishing(importedHead(false)),
+      } as never);
+
+      await importReplacingCurrent();
+
+      const validate = vi.mocked(useExecutionStore.getState().validate);
+      expect(validate).toHaveBeenCalledTimes(1);
+      expect(validate).toHaveBeenCalledWith("sess-1", { expectedVersion: 2 });
+    });
+
+    it("covers an import whose validate is still in flight when the refetch settles", async () => {
+      await seedValidatedHead();
+      let release!: (value: boolean) => void;
+      vi.mocked(useExecutionStore.getState().validate).mockReturnValueOnce(
+        new Promise<boolean>((resolve) => {
+          release = resolve;
+        }),
+      );
+      useSessionStore.setState({
+        selectSession: selectSessionPublishing(importedHead(false)),
+      } as never);
+
+      await importReplacingCurrent();
+      await act(async () => {
+        release(true);
+        for (let i = 0; i < 6; i += 1) await Promise.resolve();
+      });
+
+      expect(useExecutionStore.getState().validate).toHaveBeenCalledTimes(1);
+    });
+
+    it("a content-equal import (verdict carried, no auto POST) still validates exactly ONCE", async () => {
+      await seedValidatedHead();
+      useSessionStore.setState({
+        selectSession: selectSessionPublishing(importedHead(true)),
+      } as never);
+
+      await importReplacingCurrent();
+
+      const validate = vi.mocked(useExecutionStore.getState().validate);
+      expect(validate).toHaveBeenCalledTimes(1);
+      expect(validate).toHaveBeenCalledWith("sess-1", { expectedVersion: 2 });
+    });
+
+    it("negative control: the pre-fix direct validate() beside the refetch costs TWO", async () => {
+      // Replays the old doImport tail by hand against the same queue, so the
+      // ONE-validate assertions above cannot pass vacuously.
+      await seedValidatedHead();
+      const selectSession = selectSessionPublishing(importedHead(false));
+      void selectSession();
+      void useExecutionStore.getState().validate("sess-1");
+      await act(async () => {
+        for (let i = 0; i < 6; i += 1) await Promise.resolve();
+      });
+
+      expect(useExecutionStore.getState().validate).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not validate for a session the user left before the refetch settled", async () => {
+      await seedValidatedHead();
+      useSessionStore.setState({
+        selectSession: vi.fn(async () => {
+          useSessionStore.setState({
+            activeSessionId: "sess-2",
+            compositionState: { ...importedHead(false), id: "state-other" },
+          } as never);
+        }),
+      } as never);
+
+      await importReplacingCurrent();
+
+      const validate = vi.mocked(useExecutionStore.getState().validate);
+      expect(validate).not.toHaveBeenCalledWith("sess-1", expect.anything());
+      expect(validate).not.toHaveBeenCalledWith("sess-1");
+    });
+  });
+
+  it("confirms before importing when composition state is not yet loaded (unknown != empty)", () => {
+    // A transient session-load failure leaves compositionState null with
+    // compositionStateLoaded false. Treating that as "empty" would replace a
+    // real server-side pipeline with no confirmation — so the confirm step
+    // must appear.
+    useSessionStore.setState({
+      compositionState: null,
+      compositionStateLoaded: false,
+    } as never);
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    fireEvent.click(screen.getByRole("button", { name: /^import$/i }));
+
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+    expect(api.importCompositionYaml).not.toHaveBeenCalled();
+  });
+
+  // ── Confirm step (replacing a non-trivial pipeline) ────────────────────────
+
+  it("shows a confirm step before submitting when the current pipeline is non-trivial", () => {
+    useSessionStore.setState({
+      compositionState: nonEmptyState(),
+    } as never);
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    fireEvent.click(screen.getByRole("button", { name: /^import$/i }));
+
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+    expect(
+      screen.getByText(buildImportConfirmMessage()),
+    ).toBeInTheDocument();
+    expect(api.importCompositionYaml).not.toHaveBeenCalled();
+  });
+
+
+
+  it("submits after the confirm step is accepted", async () => {
+    useSessionStore.setState({ compositionState: nonEmptyState() } as never);
+    vi.mocked(api.importCompositionYaml).mockResolvedValue({
+      id: "state-3",
+      version: 3,
+      is_valid: true,
+      validation_errors: null,
+    });
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    fireEvent.click(screen.getByRole("button", { name: /^import$/i }));
+    await clickConfirmReplace();
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(buildImportSuccessMessage(3)),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("returns to the draft form without submitting when the confirm step is cancelled", () => {
+    useSessionStore.setState({ compositionState: nonEmptyState() } as never);
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    fireEvent.click(screen.getByRole("button", { name: /^import$/i }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /keep current pipeline/i }),
+    );
+
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(api.importCompositionYaml).not.toHaveBeenCalled();
+    expect(screen.getByLabelText(/pipeline yaml/i)).toHaveValue(
+      PIPELINE_YAML,
+    );
+  });
+
+  // ── is_valid:false outcome ──────────────────────────────────────────────────
+
+  it("shows the not-runnable framing and the validation errors when is_valid is false", async () => {
+    useSessionStore.setState({ compositionState: emptyState() } as never);
+    vi.mocked(api.importCompositionYaml).mockResolvedValue({
+      id: "state-4",
+      version: 4,
+      is_valid: false,
+      validation_errors: [{ message: "sinks: field required", error_code: null, component: null }],
+    });
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    await clickImport();
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(buildImportSuccessMessage(4)),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.getByText(IMPORT_YAML_NOT_RUNNABLE_INTRO)).toBeInTheDocument();
+    expect(screen.getByText("sinks: field required")).toBeInTheDocument();
+    // Tier-1 honesty: a 200 with is_valid:false must be framed as NOT ready
+    // to run -- never as an unqualified success.
+    expect(screen.getByText(/is not ready to run/i)).toBeInTheDocument();
+  });
+
+  it("does not render a dangling colon when is_valid is false with no validation_errors", async () => {
+    useSessionStore.setState({ compositionState: emptyState() } as never);
+    vi.mocked(api.importCompositionYaml).mockResolvedValue({
+      id: "state-5",
+      version: 5,
+      is_valid: false,
+      validation_errors: null,
+    });
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    await clickImport();
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(buildImportSuccessMessage(5)),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(IMPORT_YAML_NOT_RUNNABLE_INTRO)).toBeNull();
+    expect(
+      screen.getByText(/is not ready to run\.$/),
+    ).toBeInTheDocument();
+  });
+
+  it("renders sanitized disabled-component repair actions without fetching private schema", async () => {
+    useSessionStore.setState({ compositionState: emptyState() } as never);
+    vi.mocked(api.importCompositionYaml).mockResolvedValue({
+      id: "state-disabled",
+      version: 6,
+      is_valid: false,
+      validation_errors: [{ message: "A saved component is unavailable.", error_code: null, component: null }],
+      plugin_policy_findings: [
+        {
+          component_id: "legacy_output",
+          plugin_id: "sink:database",
+          reason_code: "credential_unavailable",
+          snapshot_fingerprint: "current-snapshot",
+        },
+      ],
+    });
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    await clickImport();
+
+    const repairRegion = await screen.findByRole("region", {
+      name: /unavailable saved components/i,
+    });
+    expect(repairRegion).toHaveTextContent("legacy_output");
+    expect(repairRegion).toHaveTextContent(unavailablePluginDisplayName("sink:database"));
+    expect(repairRegion).toHaveTextContent("Credential unavailable");
+    expect(within(repairRegion).getAllByTitle("sink:database").length).toBeGreaterThan(0);
+    expect(
+      screen.getByRole("button", {
+        name: new RegExp(
+          `remove disabled component legacy_output.*${unavailablePluginDisplayName("sink:database")}`,
+          "i",
+        ),
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: /replace disabled component legacy_output.*available sink/i,
+      }),
+    ).toBeInTheDocument();
+    expect(api.getPluginSchema).not.toHaveBeenCalled();
+  });
+
+  it("default DOM of the unavailable-components repair list passes the shared pin with the button names exempted", async () => {
+    useSessionStore.setState({ compositionState: emptyState() } as never);
+    vi.mocked(api.importCompositionYaml).mockResolvedValue({
+      id: "state-disabled",
+      version: 6,
+      is_valid: false,
+      validation_errors: [{ message: "A saved component is unavailable.", error_code: null, component: null }],
+      plugin_policy_findings: [
+        {
+          component_id: "legacy_output",
+          plugin_id: "sink:database",
+          reason_code: "credential_unavailable",
+          snapshot_fingerprint: "current-snapshot",
+        },
+      ],
+    });
+
+    const { container } = render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    await clickImport();
+
+    await screen.findByRole("region", { name: /unavailable saved components/i });
+    // The unavailable-components region only renders once `phase === "success"`
+    // (ImportYamlModal.tsx), which is mutually exclusive with the
+    // `phase !== "success"` block that mounts the textarea — by the time this
+    // region is present the textarea is already unmounted, so only the aria
+    // exemption is needed here (unlike the :486 pin, which scans the draft
+    // phase where the textarea is still mounted).
+    expectNoIdentifiersInDefaultDom(container, {
+      // SELF-only on the two buttons that carry the author-chosen component
+      // id in their names. The `.import-yaml-actions` SUBTREE form this
+      // replaces exempted the container and everything under it, so any
+      // aria-labelled control added inside later was silently exempt too —
+      // the growth channel defaultDomPins.ts's own docs warn about, and these
+      // two calls were the in-repo copy-paste source for the lazy form.
+      allowAriaLabelSelfSelectors: [".import-yaml-actions button"],
+    });
+  });
+
+  // ── Error classes ────────────────────────────────────────────────────────
+
+  it("maps a 422 to friendly copy naming the 256 KB limit", async () => {
+    useSessionStore.setState({ compositionState: emptyState() } as never);
+    vi.mocked(api.importCompositionYaml).mockRejectedValue({
+      status: 422,
+      detail: "Unprocessable Entity",
+    });
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    await clickImport();
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.getByText(IMPORT_YAML_422_MESSAGE)).toBeInTheDocument();
+  });
+
+  it("names the affected component and policy reason for a plugin-policy 422", async () => {
+    useSessionStore.setState({ compositionState: emptyState() } as never);
+    vi.mocked(api.importCompositionYaml).mockRejectedValue({
+      status: 422,
+      detail: "Unprocessable Entity",
+      error_type: "plugin_not_enabled",
+      component_id: "main",
+      plugin_id: "sink:database",
+      snapshot_fingerprint: "snapshot-a",
+    });
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    await clickImport();
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "Component main (sink:database) is not enabled under the current plugin policy.",
+    );
+    expect(screen.queryByText(IMPORT_YAML_422_MESSAGE)).not.toBeInTheDocument();
+  });
+
+  it("renders the backend detail verbatim for a 400 (structural defect)", async () => {
+    useSessionStore.setState({ compositionState: emptyState() } as never);
+    vi.mocked(api.importCompositionYaml).mockRejectedValue({
+      status: 400,
+      detail: "sources.source.plugin must be a non-empty string",
+    });
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    await clickImport();
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("sources.source.plugin must be a non-empty string"),
+      ).toBeInTheDocument(),
+    );
+    // Form content survives the failure so the user can fix and retry.
+    expect(screen.getByLabelText(/pipeline yaml/i)).toHaveValue(
+      PIPELINE_YAML,
+    );
+  });
+
+  it("renders the backend detail verbatim for a 404 (blob not found)", async () => {
+    useSessionStore.setState({ compositionState: emptyState() } as never);
+    vi.mocked(api.importCompositionYaml).mockRejectedValue({
+      status: 404,
+      detail: "Blob not found",
+    });
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    await clickImport();
+
+    await waitFor(() =>
+      expect(screen.getByText("Blob not found")).toBeInTheDocument(),
+    );
+  });
+
+  it("renders the backend detail verbatim for a 409 (blob service unavailable)", async () => {
+    useSessionStore.setState({ compositionState: emptyState() } as never);
+    vi.mocked(api.importCompositionYaml).mockRejectedValue({
+      status: 409,
+      detail: "Blob service unavailable for YAML import",
+    });
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    await clickImport();
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("Blob service unavailable for YAML import"),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  // ── source_blob_ids sidecar replay (blob-backed export round-trip) ──────────
+
+  const BLOB_UUID = "11111111-1111-1111-1111-111111111111";
+
+  it("replays the source_blob_ids sidecar when the pasted YAML matches the export verbatim", async () => {
+    // The export fetch stashed this binding for the current session. Pasting
+    // the exact exported YAML must re-supply the sidecar so a blob-backed
+    // source rebinds instead of 400-ing as unbound blob storage.
+    useSessionStore.setState({
+      compositionState: emptyState(),
+      exportedYamlBlobBinding: {
+        sessionId: "sess-1",
+        yaml: PIPELINE_YAML,
+        sourceBlobIds: { source: BLOB_UUID },
+      },
+    } as never);
+    vi.mocked(api.importCompositionYaml).mockResolvedValue({
+      id: "state-6",
+      version: 6,
+      is_valid: true,
+      validation_errors: null,
+    });
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    await clickImport();
+
+    await waitFor(() =>
+      expect(screen.getByText(buildImportSuccessMessage(6))).toBeInTheDocument(),
+    );
+    expect(api.importCompositionYaml).toHaveBeenCalledWith("sess-1", PIPELINE_YAML, {
+      source: BLOB_UUID,
+    });
+  });
+
+  it("does NOT replay the sidecar when the pasted YAML differs from the export", async () => {
+    // A hand-edited paste can no longer be trusted to match the sidecar's
+    // source names; sending it would risk an unknown-source 400. Degrade to a
+    // plain two-arg import (the backend then asks the user to re-provide).
+    useSessionStore.setState({
+      compositionState: emptyState(),
+      exportedYamlBlobBinding: {
+        sessionId: "sess-1",
+        yaml: PIPELINE_YAML,
+        sourceBlobIds: { source: BLOB_UUID },
+      },
+    } as never);
+    vi.mocked(api.importCompositionYaml).mockResolvedValue({
+      id: "state-7",
+      version: 7,
+      is_valid: true,
+      validation_errors: null,
+    });
+    const edited = `${PIPELINE_YAML}# hand edited\n`;
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(edited);
+    await clickImport();
+
+    await waitFor(() =>
+      expect(screen.getByText(buildImportSuccessMessage(7))).toBeInTheDocument(),
+    );
+    expect(api.importCompositionYaml).toHaveBeenCalledWith("sess-1", edited);
+  });
+
+  it("does NOT replay a sidecar that belongs to a different session", async () => {
+    // Blob refs are session-scoped; replaying another session's binding would
+    // 404 on the foreign blob. The sessionId guard drops it.
+    useSessionStore.setState({
+      activeSessionId: "sess-1",
+      compositionState: emptyState(),
+      exportedYamlBlobBinding: {
+        sessionId: "sess-other",
+        yaml: PIPELINE_YAML,
+        sourceBlobIds: { source: BLOB_UUID },
+      },
+    } as never);
+    vi.mocked(api.importCompositionYaml).mockResolvedValue({
+      id: "state-8",
+      version: 8,
+      is_valid: true,
+      validation_errors: null,
+    });
+
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml();
+    await clickImport();
+
+    await waitFor(() =>
+      expect(screen.getByText(buildImportSuccessMessage(8))).toBeInTheDocument(),
+    );
+    expect(api.importCompositionYaml).toHaveBeenCalledWith("sess-1", PIPELINE_YAML);
+  });
+});
+
+describe("analyseImportYamlDraft queue recognition", () => {
+  const expectedRequiredSectionsMessage = () => {
+    const finalSection =
+      IMPORT_YAML_SECTION_KEYS[IMPORT_YAML_SECTION_KEYS.length - 1];
+    const leadingSections = IMPORT_YAML_SECTION_KEYS.slice(0, -1).join(", ");
+    return `Pipeline YAML must define at least one pipeline section: ${leadingSections}, or ${finalSection}.`;
+  };
+
+  it("derives required-section guidance from the authoritative ordered tuple", () => {
+    expect(IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE).toBe(
+      expectedRequiredSectionsMessage(),
+    );
+  });
+
+  it.each([
+    {
+      section: "sources",
+      yaml: "sources:\n  first: {}\n  second: {}\n",
+      expected: { sourceCount: 2, stepCount: 0, outputCount: 0 },
+    },
+    {
+      section: "queues",
+      yaml: "queues:\n  first: {}\n  second: {}\n",
+      expected: { sourceCount: 0, stepCount: 2, outputCount: 0 },
+    },
+    {
+      section: "sinks",
+      yaml: "sinks:\n  first: {}\n  second: {}\n",
+      expected: { sourceCount: 0, stepCount: 0, outputCount: 2 },
+    },
+    ...[
+      "transforms",
+      "gates",
+      "row_unions",
+      "aggregations",
+      "coalesce",
+      "collectors",
+    ].map((section) => ({
+      section,
+      yaml: `${section}:\n  - {}\n  - {}\n`,
+      expected: { sourceCount: 0, stepCount: 2, outputCount: 0 },
+    })),
+    {
+      section: "scopes",
+      yaml: "scopes:\n  - {}\n  - {}\n",
+      expected: { sourceCount: 0, stepCount: 0, outputCount: 0 },
+    },
+  ])("uses the canonical container shape and count role for $section", ({ yaml, expected }) => {
+    const analysis = analyseImportYamlDraft(yaml);
+
+    expect(analysis).toMatchObject({
+      sectionsParsed: true,
+      canImport: true,
+      ...expected,
+    });
+  });
+
+  it("rejects the deleted singular source surface during client preflight", () => {
+    const analysis = analyseImportYamlDraft("source:\n  plugin: csv\n");
+
+    expect(analysis).toMatchObject({
+      sectionsParsed: false,
+      canImport: false,
+      sourceCount: 0,
+      stepCount: 0,
+      outputCount: 0,
+      validationMessage: IMPORT_YAML_SINGULAR_SOURCE_REMOVED_MESSAGE,
+    });
+  });
+
+  it.each([
+    "source:\n  plugin: csv\nsinks:\n  out: {}\n",
+    "source:\n  plugin: csv\nsources:\n  primary: {}\n",
+  ])("rejects singular source even when another accepted section is present", (yaml) => {
+    const analysis = analyseImportYamlDraft(yaml);
+
+    expect(analysis).toMatchObject({
+      sectionsParsed: false,
+      canImport: false,
+      sourceCount: 0,
+      stepCount: 0,
+      outputCount: 0,
+      validationMessage: IMPORT_YAML_SINGULAR_SOURCE_REMOVED_MESSAGE,
+    });
+  });
+
+  it("counts a queue section as a processing step, not a source or output", () => {
+    const analysis = analyseImportYamlDraft(QUEUE_PIPELINE_YAML);
+    expect(analysis.sectionsParsed).toBe(true);
+    expect(analysis.canImport).toBe(true);
+    expect(analysis.sourceCount).toBe(2);
+    // queue `inbound` + transform `summarize`.
+    expect(analysis.stepCount).toBe(2);
+    expect(analysis.outputCount).toBe(1);
+  });
+
+  it("keeps a malformed queue entry importable so the server validates it", () => {
+    const analysis = analyseImportYamlDraft(QUEUE_MALFORMED_ENTRY_YAML);
+    // The `queues` section is a mapping (so the queue still counts as a
+    // structural step); the bad entry value is left for the server rather than
+    // being silently discarded client-side.
+    expect(analysis.canImport).toBe(true);
+    expect(analysis.stepCount).toBe(1);
+  });
+
+  it("leaves queue-free import preflight unchanged", () => {
+    const analysis = analyseImportYamlDraft(PIPELINE_YAML);
+    expect(analysis.sourceCount).toBe(1);
+    expect(analysis.stepCount).toBe(0);
+    expect(analysis.outputCount).toBe(1);
+    expect(analysis.canImport).toBe(true);
+  });
+
+  it("names queues in the required-section message", () => {
+    expect(IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE).toContain("queues");
+  });
+
+  it("counts row_unions as a list of processing steps", () => {
+    const analysis = analyseImportYamlDraft(ROW_UNION_PIPELINE_YAML);
+
+    expect(analysis.sectionsParsed).toBe(true);
+    expect(analysis.canImport).toBe(true);
+    expect(analysis.sourceCount).toBe(1);
+    expect(analysis.stepCount).toBe(1);
+    expect(analysis.outputCount).toBe(1);
+    expect(IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE).toContain("row_unions");
+  });
+
+  it("counts collectors as processing steps without counting scope bindings as nodes", () => {
+    const analysis = analyseImportYamlDraft(COLLECTOR_SCOPE_PIPELINE_YAML);
+
+    expect(analysis.sectionsParsed).toBe(true);
+    expect(analysis.canImport).toBe(true);
+    expect(analysis.sourceCount).toBe(0);
+    expect(analysis.stepCount).toBe(1);
+    expect(analysis.outputCount).toBe(0);
+  });
+
+  it("recognises a scopes-only document for server validation without inventing a processing step", () => {
+    const analysis = analyseImportYamlDraft(SCOPE_ONLY_PIPELINE_YAML);
+
+    expect(analysis.sectionsParsed).toBe(true);
+    expect(analysis.canImport).toBe(true);
+    expect(analysis.stepCount).toBe(0);
+  });
+
+  it("names collectors and scopes in the required-section message", () => {
+    expect(IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE).toContain("collectors");
+    expect(IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE).toContain("scopes");
+  });
+});

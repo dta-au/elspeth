@@ -1,0 +1,306 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0 -- /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1/.venv/bin/python
+cachedir: .pytest_cache
+hypothesis profile 'ci' -> deadline=None, phases=(Phase.explicit, Phase.reuse, Phase.generate, Phase.shrink)
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 2 items
+
+tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_cap_excludes_schema_errors_and_semantic_refusals FAILED [ 50%]
+tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[admitted-tenth] FAILED [100%]
+
+=================================== FAILURES ===================================
+________ test_proposal_cap_excludes_schema_errors_and_semantic_refusals ________
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f2e0ada2810>
+result_session_id = 'ad4f8931-b015-422f-ab37-4f62af9c3316'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f2e0aeaaf60>
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-180/test_proposal_cap_excludes_sch0')
+
+    @pytest.mark.asyncio
+    async def test_proposal_cap_excludes_schema_errors_and_semantic_refusals(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+        with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+            conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+    
+        handler_calls = _record_real_tool_handlers(monkeypatch)
+        events = _record_real_batch_progress(monkeypatch)
+        source_path = tmp_path / "input.csv"
+        source_path.write_text("customer_id\n1\n")
+        caught = await _capture_tool_batch_rejection(
+            composer_service_with_real_sessions,
+            session_id=result_session_id,
+            response=_tool_batch_response(
+                *((f"call_valid_attempt_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}}) for index in range(9)),
+                ("call_schema_invalid_attempt", "set_metadata", {}),
+                (
+                    "call_semantic_invalid_attempt",
+                    "set_pipeline",
+                    {
+                        "source": {
+                            "plugin": "csv",
+                            "options": {"path": str(source_path)},
+                            "on_success": "rows",
+                            "on_validation_failure": "discard",
+                        },
+                        "nodes": [],
+                        "edges": [],
+                        "outputs": [],
+                        "metadata": {"name": "semantically incomplete"},
+                    },
+                ),
+            ),
+        )
+    
+        assert caught is None
+        # Schema validation fails before handler dispatch; only the nine admitted
+        # metadata handlers execute. The canonical refusal has its own builder.
+        assert handler_calls == ["set_metadata"] * 9
+        with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+            assert set(
+                conn.execute(
+                    select(composition_proposals_table.c.tool_call_id).where(composition_proposals_table.c.session_id == result_session_id)
+                ).scalars()
+            ) == {f"call_valid_attempt_{index}" for index in range(9)}
+            assert (
+                len(conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).all()) == 9
+            )
+            feedback = conn.execute(
+                select(chat_messages_table.c.tool_call_id, chat_messages_table.c.content)
+                .where(chat_messages_table.c.session_id == result_session_id)
+                .where(chat_messages_table.c.role == "tool")
+                .order_by(chat_messages_table.c.sequence_no)
+            ).all()
+        assert [row.tool_call_id for row in feedback] == [
+            *(f"call_valid_attempt_{index}" for index in range(9)),
+            "call_schema_invalid_attempt",
+            "call_semantic_invalid_attempt",
+        ]
+        assert json.loads(feedback[-2].content)["error_class"] == "ToolArgumentError"
+>       assert json.loads(feedback[-1].content)["data"]["status"] == "PREVALIDATION_REJECTED"
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'data'
+
+caught     = None
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f2e0ada2810>
+conn       = <sqlalchemy.engine.base.Connection object at 0x7f2e05bb52b0>
+events     = [ComposerProgressEvent(phase='using_tools', headline='The model is updating the pipeline graph.', evidence=('A pipeline-editing tool was requested.',), likely_next='ELSPETH will validate the result before saving it.', reason=None)]
+feedback   = [('call_valid_attempt_0', '{"_unknown_response":"<redacted-unknown-response-key>","affected_nodes":[],"success":true,"validation":{"errors":[{"coalesce_union_type":null,"compon ... (381 characters truncated) ... _schema":null,"severity":"high"}],"graph_repair_suggestions":[],"is_valid":false,"semantic_contracts":[],"suggestions":[],"warnings":[]},"version":1}'),
+ ('call_valid_attempt_1', '{"_unknown_response":"<redacted-unknown-response-key>","affected_nodes":[],"success":true,"validation":{"errors":[{"coalesce_union_type":null,"compon ... (381 characters truncated) ... _schema":null,"severity":"high"}],"graph_repair_suggestions":[],"is_valid":false,"semantic_contracts":[],"suggestions":[],"warnings":[]},"version":1}'),
+ ('call_valid_attempt_2', '{"_unknown_response":"<redacted-unknown-response-key>","affected_nodes":[],"success":true,"validation":{"errors":[{"coalesce_union_type":null,"compon ... (381 characters truncated) ... _schema":null,"severity":"high"}],"graph_repair_suggestions":[],"is_valid":false,"semantic_contracts":[],"suggestions":[],"warnings":[]},"version":1}'),
+ ('call_valid_attempt_3', '{"_unknown_response":"<redacted-unknown-response-key>","affected_nodes":[],"success":true,"validation":{"errors":[{"coalesce_union_type":null,"compon ... (381 characters truncated) ... _schema":null,"severity":"high"}],"graph_repair_suggestions":[],"is_valid":false,"semantic_contracts":[],"suggestions":[],"warnings":[]},"version":1}'),
+ ('call_valid_attempt_4', '{"_unknown_response":"<redacted-unknown-response-key>","affected_nodes":[],"success":true,"validation":{"errors":[{"coalesce_union_type":null,"compon ... (381 characters truncated) ... _schema":null,"severity":"high"}],"graph_repair_suggestions":[],"is_valid":false,"semantic_contracts":[],"suggestions":[],"warnings":[]},"version":1}'),
+ ('call_valid_attempt_5', '{"_unknown_response":"<redacted-unknown-response-key>","affected_nodes":[],"success":true,"validation":{"errors":[{"coalesce_union_type":null,"compon ... (381 characters truncated) ... _schema":null,"severity":"high"}],"graph_repair_suggestions":[],"is_valid":false,"semantic_contracts":[],"suggestions":[],"warnings":[]},"version":1}'),
+ ('call_valid_attempt_6', '{"_unknown_response":"<redacted-unknown-response-key>","affected_nodes":[],"success":true,"validation":{"errors":[{"coalesce_union_type":null,"compon ... (381 characters truncated) ... _schema":null,"severity":"high"}],"graph_repair_suggestions":[],"is_valid":false,"semantic_contracts":[],"suggestions":[],"warnings":[]},"version":1}'),
+ ('call_valid_attempt_7', '{"_unknown_response":"<redacted-unknown-response-key>","affected_nodes":[],"success":true,"validation":{"errors":[{"coalesce_union_type":null,"compon ... (381 characters truncated) ... _schema":null,"severity":"high"}],"graph_repair_suggestions":[],"is_valid":false,"semantic_contracts":[],"suggestions":[],"warnings":[]},"version":1}'),
+ ('call_valid_attempt_8', '{"_unknown_response":"<redacted-unknown-response-key>","affected_nodes":[],"success":true,"validation":{"errors":[{"coalesce_union_type":null,"compon ... (381 characters truncated) ... _schema":null,"severity":"high"}],"graph_repair_suggestions":[],"is_valid":false,"semantic_contracts":[],"suggestions":[],"warnings":[]},"version":1}'),
+ ('call_schema_invalid_attempt', '{"_redaction_status":"arg_error","error_category":"missing_required_path","error_class":"ToolArgumentError","error_message":"<redacted-arg-error-message>"}'),
+ ('call_semantic_invalid_attempt', '{"_redaction_status":"arg_error","error_category":"wire_envelope","error_class":"ToolArgumentError","error_message":"<redacted-arg-error-message>"}')]
+handler_calls = ['set_metadata',
+ 'set_metadata',
+ 'set_metadata',
+ 'set_metadata',
+ 'set_metadata',
+ 'set_metadata',
+ 'set_metadata',
+ 'set_metadata',
+ 'set_metadata']
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f2e0aeaaf60>
+result_session_id = 'ad4f8931-b015-422f-ab37-4f62af9c3316'
+sessions_service = <tests.unit.web.sessions.session_test_authority.FencedSessionServiceHarness object at 0x7f2e0adb7e90>
+source_path = PosixPath('/tmp/pytest-of-agent/pytest-180/test_proposal_cap_excludes_sch0/input.csv')
+tmp_path   = PosixPath('/tmp/pytest-of-agent/pytest-180/test_proposal_cap_excludes_sch0')
+
+tests/unit/web/composer/test_compose_loop_persistence.py:1497: KeyError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 17:01:09 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 17:01:11 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 17:01:11 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[admitted-tenth] _
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f2e0496d5b0>
+result_session_id = 'eb0fab78-0984-4a01-a524-9ff51eb83867'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-180/test_proposal_attempt_cap_incl0')
+blob_case = 'admitted-tenth'
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f2e0aeab620>
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("blob_case", ("invalid-at-cap", "admitted-tenth", "admitted-eleventh"))
+    async def test_proposal_attempt_cap_includes_approval_required_blob_only_mutation(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        tmp_path: Path,
+        blob_case: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from tests.helpers.session_fences import fenced_operation_context
+        from tests.unit.web.composer.test_service import _blob_mutation_resources_for_test
+    
+        sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+        monkeypatch.setattr(composer_service_with_real_sessions, "_session_engine", sessions_service._engine)
+        with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+            conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+    
+        arguments: dict[str, Any] = {}
+        if blob_case != "invalid-at-cap":
+            with fenced_operation_context(sessions_service._engine, result_session_id, operation_kind=SessionOperationKind.CREATE) as context:
+                blob = await BlobServiceImpl(sessions_service._engine, tmp_path).create_blob(
+                    UUID(result_session_id), "retained.txt", b"must remain untouched", "text/plain", session_operation_context=context
+                )
+            arguments = {"blob_id": str(blob.id)}
+        resources_before = _blob_mutation_resources_for_test(sessions_service._engine, tmp_path)
+        events = _record_real_batch_progress(monkeypatch)
+        change_count = 9 if blob_case == "admitted-tenth" else 10
+    
+        caught = await _capture_tool_batch_rejection(
+            composer_service_with_real_sessions,
+            session_id=result_session_id,
+            response=_tool_batch_response(
+                *(
+                    (f"call_blob_boundary_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}})
+                    for index in range(change_count)
+                ),
+                ("call_approval_required_blob_only", "delete_blob", arguments),
+            ),
+        )
+    
+        expected_ids = {f"call_blob_boundary_proposal_{index}" for index in range(change_count)}
+        if blob_case == "admitted-eleventh":
+            assert type(caught) is ComposerConvergenceError
+            assert dict(caught.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
+            assert [inv.tool_call_id for inv in caught.tool_invocations] == [f"call_blob_boundary_proposal_{index}" for index in range(10)]
+            assert all(inv.version_before == inv.version_after == 1 for inv in caught.tool_invocations)
+        else:
+            assert caught is None
+            if blob_case == "admitted-tenth":
+                expected_ids.add("call_approval_required_blob_only")
+        with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+            assert (
+                set(
+                    conn.execute(
+                        select(composition_proposals_table.c.tool_call_id).where(composition_proposals_table.c.session_id == result_session_id)
+                    ).scalars()
+                )
+                == expected_ids
+            )
+            assert (
+                len(conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).all()) == 10
+            )
+            blob_feedback = conn.execute(
+                select(chat_messages_table.c.content).where(
+                    chat_messages_table.c.session_id == result_session_id,
+                    chat_messages_table.c.role == "tool",
+                    chat_messages_table.c.tool_call_id == "call_approval_required_blob_only",
+                )
+            ).all()
+        if blob_case == "admitted-eleventh":
+            assert blob_feedback == []
+        else:
+            assert len(blob_feedback) == 1
+            payload = json.loads(blob_feedback[0].content)
+            if blob_case == "invalid-at-cap":
+                assert payload["error_class"] == "ToolArgumentError"
+            else:
+>               assert payload["data"]["status"] == "APPROVAL_REQUIRED"
+                       ^^^^^^^^^^^^^^^
+E               KeyError: 'data'
+
+BlobServiceImpl = <class 'elspeth.web.blobs.service.BlobServiceImpl'>
+_blob_mutation_resources_for_test = <function _blob_mutation_resources_for_test at 0x7f2e041a09a0>
+arguments  = {'blob_id': '894d509e-c8f7-492b-9868-8a08d370ec22'}
+blob       = BlobRecord(id=UUID('894d509e-c8f7-492b-9868-8a08d370ec22'),
+           session_id=UUID('eb0fab78-0984-4a01-a524-9ff51eb83867'),
+           filename='retained.txt',
+           mime_type='text/plain',
+           size_bytes=21,
+           content_hash='ab3452f88ef6d53b794a3ea50eb09fa1d8835c1b49c6ac354505184a4c99fb1c',
+           storage_path='/tmp/pytest-of-agent/pytest-180/test_proposal_attempt_cap_incl0/blobs/eb0fab78-0984-4a01-a524-9ff51eb83867/894d509e-c8f7-492b-9868-8a08d370ec22_retained.txt',
+           created_at=datetime.datetime(2026, 11, 9, 17, 1, 13, 254327, tzinfo=datetime.timezone.utc),
+           created_by='user',
+           source_description=None,
+           status='ready',
+           creation_modality=<CreationModality.VERBATIM: 'verbatim'>,
+           created_from_message_id=None,
+           creating_model_identifier=None,
+           creating_model_version=None,
+           creating_provider=None,
+           creating_composer_skill_hash=None,
+           creating_arguments_hash=None)
+blob_case  = 'admitted-tenth'
+blob_feedback = [('{"_unknown_response":"<redacted-unknown-response-key>","affected_nodes":[],"success":true,"validation":{"errors":[{"coalesce_union_type":null,"compon ... (381 characters truncated) ... _schema":null,"severity":"high"}],"graph_repair_suggestions":[],"is_valid":false,"semantic_contracts":[],"suggestions":[],"warnings":[]},"version":1}',)]
+caught     = None
+change_count = 9
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7f2e0496d5b0>
+conn       = <sqlalchemy.engine.base.Connection object at 0x7f2e04c564b0>
+context    = SessionOperationContext(fence=SessionOperationFence(session_id='eb0fab78-0984-4a01-a524-9ff51eb83867',
+                                                    operation_id='9e53c764-55e9-4fd5-ac37-b3fc7167c476',
+                                                    lease_token='C4M8GRW3qAjBazhN08LHZxaLYf6OtJV9-vT_SbDJ1l4',
+                                                    operation_epoch=2),
+                        operation_kind=<SessionOperationKind.CREATE: 'create'>)
+events     = [ComposerProgressEvent(phase='using_tools', headline='The model is updating the pipeline graph.', evidence=('A pipeline-editing tool was requested.',), likely_next='ELSPETH will validate the result before saving it.', reason=None)]
+expected_ids = {'call_approval_required_blob_only',
+ 'call_blob_boundary_proposal_0',
+ 'call_blob_boundary_proposal_1',
+ 'call_blob_boundary_proposal_2',
+ 'call_blob_boundary_proposal_3',
+ 'call_blob_boundary_proposal_4',
+ 'call_blob_boundary_proposal_5',
+ 'call_blob_boundary_proposal_6',
+ 'call_blob_boundary_proposal_7',
+ 'call_blob_boundary_proposal_8'}
+fenced_operation_context = <function fenced_operation_context at 0x7f2e0ae45120>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f2e0aeab620>
+payload    = {'_unknown_response': '<redacted-unknown-response-key>',
+ 'affected_nodes': [],
+ 'success': True,
+ 'validation': {'errors': [{'coalesce_union_type': None,
+                            'component': '<redacted-response-text>',
+                            'contract': None,
+                            'error_code': 'no_source_configured',
+                            'message': '<redacted-response-text>',
+                            'rejected_component': None,
+                            'row_union_schema': None,
+                            'severity': 'high'},
+                           {'coalesce_union_type': None,
+                            'component': '<redacted-response-text>',
+                            'contract': None,
+                            'error_code': 'no_sinks_configured',
+                            'message': '<redacted-response-text>',
+                            'rejected_component': None,
+                            'row_union_schema': None,
+                            'severity': 'high'}],
+                'graph_repair_suggestions': [],
+                'is_valid': False,
+                'semantic_contracts': [],
+                'suggestions': [],
+                'warnings': []},
+ 'version': 1}
+resources_before = (((('894d509e-c8f7-492b-9868-8a08d370ec22', 'eb0fab78-0984-4a01-a524-9ff51eb83867', 'retained.txt', 'text/plain', 21, 'ab3452f88ef6d53b794a3ea50eb09fa1d8835c1b49c6ac354505184a4c99fb1c', '/tmp/pytest-of-agent/pytest-180/test_proposal_attempt_cap_incl0/blobs/eb0fab78-0984-4a01-a524-9ff51eb83867/894d509e-c8f7-492b-9868-8a08d370ec22_retained.txt', datetime.datetime(2026, 11, 9, 17, 1, 13, 254327), 'user', None, 'ready', 'verbatim', None, None, None, None, None, None, None, None, None),),
+  (),
+  (),
+  (),
+  ()),
+ (('blobs/eb0fab78-0984-4a01-a524-9ff51eb83867/894d509e-c8f7-492b-9868-8a08d370ec22_retained.txt',
+   b'must remain untouched'),))
+result_session_id = 'eb0fab78-0984-4a01-a524-9ff51eb83867'
+sessions_service = <tests.unit.web.sessions.session_test_authority.FencedSessionServiceHarness object at 0x7f2e0496e690>
+tmp_path   = PosixPath('/tmp/pytest-of-agent/pytest-180/test_proposal_attempt_cap_incl0')
+
+tests/unit/web/composer/test_compose_loop_persistence.py:1626: KeyError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 17:01:13 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 17:01:13 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 17:01:13 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_cap_excludes_schema_errors_and_semantic_refusals - KeyError: 'data'
+FAILED tests/unit/web/composer/test_compose_loop_persistence.py::test_proposal_attempt_cap_includes_approval_required_blob_only_mutation[admitted-tenth] - KeyError: 'data'
+============================== 2 failed in 5.04s ===============================

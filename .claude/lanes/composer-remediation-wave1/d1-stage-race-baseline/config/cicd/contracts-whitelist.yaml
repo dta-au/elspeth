@@ -1,0 +1,1179 @@
+# Types intentionally defined outside contracts/
+# These are internal to their module and not used across boundaries
+allowed_external_types:
+  # TUI display types - presentation-specific, not cross-boundary contracts
+  - "tui/types:TokenDisplayInfo"
+  # DAG wiring helper type shared between runtime instantiation and graph construction.
+  # It carries live plugin instances, so it is not a serializable L0 contract DTO.
+  - "core/dag/wiring:WiredTransform"
+  # DAG validation warnings stay with graph construction; web validation only projects them
+  # into API-facing ValidationWarning rows and does not own their construction semantics.
+  - "core/dag/models:GraphValidationWarning"
+  # Unified FORK/EXPAND group-binding registry (barrier-scopes spec §3). Built
+  # once at graph-construction time (core/dag/builder.py) and stored on the
+  # ExecutionGraph; WS3's settle-member seam (spec §6.1) reads it at runtime
+  # from RowProcessor/TokenManager (engine/processor.py, engine/tokens.py) via
+  # graph.get_group_bindings() — same instance, never copied (graph.py's
+  # set_group_bindings docstring). Not a serializable L0 contract DTO: its
+  # runtime _expand_groups index mutates after the build-metadata freeze
+  # (register_expand_group, WS3's mint-path call site).
+  - "core/dag/group_bindings:GroupBinding"
+  - "core/dag/group_bindings:GroupBindingRegistry"
+  # Plugin bundle type shared between runtime construction, CLI, and web preflight
+  - "plugins/infrastructure/runtime_factory:PluginBundle"
+  # Application loading carries plugin-owned archived operational models into
+  # runtime construction. These DTOs are not consumed by the engine layer.
+  - "plugins/infrastructure/power_automate_nonlive:PowerAutomateArchive"
+  - "plugins/infrastructure/power_automate_nonlive:PowerAutomateNonliveConstruction"
+  # The identity-retirement outcome and the Landscape auth recorder cross from
+  # web/ into the CLI: `composer users remove` audits its retirement to the
+  # same Landscape row the web app writes, through the same recorder. Neither
+  # is a serializable L0 DTO -- the outcome carries an IdentityRecord the
+  # authority just wrote, the recorder holds a Landscape URL and passphrase.
+  - "web/coordination/identity_authority:IdentityRetired"
+  - "web/auth/audit:AuthAuditRecorder"
+  # `composer users bootstrap-admin` (identity sprint step D) makes the first
+  # admin through the SAME authority call the login-worker seed uses: it
+  # constructs the owned IdentityClaims the authority binds a row to, and
+  # its record callback is typed by the IdentityActivated outcome that
+  # callback receives. Neither is a serializable L0 DTO (the outcome carries
+  # the IdentityRecord and RoleGrant the authority just wrote).
+  - "web/auth/models:IdentityClaims"
+  - "web/coordination/identity_authority:IdentityActivated"
+  # SSRF safety type - security infrastructure, tightly coupled to validation logic
+  - "core/security/web:SSRFSafeRequest"
+  # Engine types used in testing factories - test infrastructure wraps these for convenience
+  - "engine/orchestrator/types:PipelineConfig"
+  - "engine/orchestrator/types:AggregationFlushResult"
+  - "engine/orchestrator/types:ExecutionCounters"
+  # BufferEntry moved to contracts/engine.py — no longer an external type exception
+  # Secret loader types - used by web secret stores (user_store, server_store)
+  - "core/security/secret_loader:SecretRef"
+  # Composition state types - shared between web composer and composer MCP server
+  - "web/composer/state:CompositionState"
+  - "web/composer/state:PipelineMetadata"
+  # The wire dict ValidationEntry.to_dict() emits. The composer MCP server
+  # serializes the same objects and used to hand-copy this shape (a 3-key
+  # mirror of an 8-key dict — elspeth-e405ad7cd2, systems ledger #41);
+  # importing the producer's own TypedDict is the honest form. (EdgeContractDict
+  # is shared the same way but is a functional-form TypedDict the checker
+  # does not index, so it needs no entry.)
+  - "web/composer/state:ValidationEntryDict"
+  # Runtime preflight coordination types - shared between web execution and composer MCP
+  - "web/execution/runtime_preflight:RuntimePreflightKey"
+  - "web/execution/runtime_preflight:RuntimePreflightFailure"
+  # Delivery-specific diagnostic/policy/storage-probe records. These are
+  # converted at their consumer boundaries rather than persisted as domain DTOs.
+  - "web/deployment_contract:ContractCheck"
+  - "web/plugin_policy/models:PluginAvailabilitySnapshot"
+  - "core/landscape/database:LandscapeSchemaShape"
+  # Provider-neutral LLM profile runtime dataclass — lives in core because
+  # elspeth.core must never import elspeth.plugins at module scope, while
+  # elspeth.plugins (and eventually the pipeline gateway provider) import it
+  # from core. Web plugin policy is one of several intended consumers, not a
+  # violation of a contracts/-only boundary.
+  - "core/llm_profiles:RuntimeLLMProfile"
+  # Rasterize worker protocol messages. protocol.py's own docstring is explicit
+  # that these are "picklable messages crossing the rasterize worker process
+  # boundary" and are loaded by BOTH the parent and the spawned worker — they
+  # are subsystem-internal wire types for PoolRenderer, not universal contracts.
+  # elspeth.testing.rasterize_fakes (a different top-level package) imports them
+  # to build test-double worker callables, because a spawned child's sys.path is
+  # copied from the parent verbatim and must resolve through the INSTALLED
+  # package rather than pytest's tests/ rootdir insertion (controller ruling,
+  # pdf_rasterize Task 2). Lift when the rasterize protocol types are promoted
+  # to elspeth/contracts/ or the fakes leave elspeth.testing — elspeth-1788fc5dc8.
+  - "plugins/infrastructure/rasterize/protocol:RasterizeRequest"
+  - "plugins/infrastructure/rasterize/protocol:RasterizeResponse"
+
+# dict[str, Any] patterns that are intentional
+# Format: "file_path:context:param_name"
+allowed_dict_patterns:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ROW DATA (THEIR DATA)
+  # User pipeline data is inherently dynamic - we cannot know the schema.
+  # These are wrapped in typed containers (TokenInfo) but the row content itself
+  # can be anything the user's pipeline produces.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # Engine - row data handling
+  - "src/elspeth/engine/tokens.py:TokenManager.expand_token:expanded_rows (list)"
+  - "src/elspeth/core/expression_parser.py:_ExpressionEvaluator.__init__:context"
+  - "src/elspeth/core/expression_parser.py:ExpressionParser.evaluate:context"
+
+
+  # Node state guard - row data is Tier 2 pipeline data
+  - "src/elspeth/engine/executors/state_guard.py:NodeStateGuard.__init__:input_data"
+  - "src/elspeth/engine/executors/state_guard.py:NodeStateGuard.complete:output_data"
+
+  # Aggregation executor - row data handling (checkpoint state now typed via AggregationCheckpointState)
+  - "src/elspeth/engine/executors/aggregation.py:AggregationExecutor.get_buffered_rows:return (list)"
+
+  # Coalesce executor - merged row data is Tier 2 pipeline data (union merge resolves
+  # field-level collisions; merged dict and collision_values carry opaque row values)
+  - "src/elspeth/engine/coalesce_executor.py:_resolve_first_wins:merged"
+
+  # Protocols - row data in plugin interface
+  - "src/elspeth/contracts/plugin_protocols.py:SinkProtocol.write:rows (list)"
+
+  # Base classes - row data in plugin implementations
+  - "src/elspeth/plugins/infrastructure/base.py:BaseSink.write:rows (list)"
+
+  # Plugin utilities
+  - "src/elspeth/plugins/infrastructure/utils.py:get_nested_field:data"
+
+  # Tutorial artifact projection - row data is read back from user pipeline
+  # sink artifacts. The schema is intentionally arbitrary and is carried in
+  # typed response/cache containers at the boundary.
+  - "src/elspeth/web/composer/tutorial_service.py:_rows_from_artifacts:return (list)"
+  # ``_parse_rows_file`` returns ``list[dict] | None`` after the C3 fix
+  # (None = non-row-format suffix; caller skips). The pre-C3 entry for
+  # ``return (list)`` no longer matches the checker's context and was
+  # pruned during the post-ca9bc05bd residual closeout.
+
+  # Sink plugins - row output (batch writes)
+  - "src/elspeth/plugins/sinks/database_sink.py:DatabaseSink.write:rows (list)"
+  - "src/elspeth/plugins/sinks/database_sink.py:DatabaseSink._serialize_any_typed_fields:rows (list)"
+  - "src/elspeth/plugins/sinks/database_sink.py:DatabaseSink._serialize_any_typed_fields:return (list)"
+  - "src/elspeth/plugins/sinks/csv_sink.py:CSVSink.write:rows (list)"
+  - "src/elspeth/plugins/sinks/csv_sink.py:CSVSink._get_field_names_and_display:row"
+  - "src/elspeth/plugins/sinks/json_sink.py:JSONSink.write:rows (list)"
+  - "src/elspeth/plugins/sinks/power_automate.py:PowerAutomateSink.write:rows (list)"
+  - "src/elspeth/plugins/infrastructure/display_headers.py:apply_display_headers:rows (list)"
+  - "src/elspeth/plugins/infrastructure/display_headers.py:apply_display_headers:return (list)"
+
+  # Source plugins - row validation
+  - "src/elspeth/plugins/sources/text_source.py:TextSource._validate_and_yield:row"
+  - "src/elspeth/plugins/sources/blob_rows.py:BlobRowsSource._validate_and_yield:row"
+
+  # Pooling executor - row processing
+  # _execute_single.row is now Mapping[str, Any] (IM-2 fix — freeze_fields
+  # replaces the bound value with MappingProxyType, so the annotation must
+  # describe the read-only runtime type).
+  - "src/elspeth/plugins/infrastructure/pooling/executor.py:PooledExecutor.get_stats:return"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PLUGIN CONFIG (TRUST BOUNDARY)
+  # Plugin config comes from external YAML and is validated internally by
+  # Pydantic schemas before use. The dict[str, Any] is the input type before
+  # validation - our code validates it into typed Pydantic models.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # Protocols - config input
+  - "src/elspeth/contracts/plugin_protocols.py:SourceProtocol.__init__:config"
+  - "src/elspeth/contracts/plugin_protocols.py:TransformProtocol.__init__:config"
+  - "src/elspeth/contracts/plugin_protocols.py:SinkProtocol.__init__:config"
+  - "src/elspeth/contracts/plugin_protocols.py:BatchTransformProtocol.__init__:config"
+
+  # Base classes - config input
+  - "src/elspeth/plugins/infrastructure/base.py:BaseTransform.__init__:config"
+  - "src/elspeth/plugins/infrastructure/base.py:BaseSink.__init__:config"
+  - "src/elspeth/plugins/infrastructure/base.py:BaseSource.__init__:config"
+  - "src/elspeth/plugins/sources/power_automate.py:PowerAutomateSource.__init__:config"
+  - "src/elspeth/plugins/sinks/power_automate.py:PowerAutomateSink.__init__:config"
+  - "src/elspeth/plugins/sinks/power_automate.py:PowerAutomateSink._initialize:config"
+  # config_base.py:PluginConfig.from_dict:config — removed: config param now typed 'object'
+
+  # Base classes - get_config_model dispatchers (config is user YAML, Tier 3 boundary)
+  - "src/elspeth/plugins/infrastructure/base.py:BaseTransform.get_config_model:config"
+  - "src/elspeth/plugins/infrastructure/base.py:BaseSink.get_config_model:config"
+  - "src/elspeth/plugins/infrastructure/base.py:BaseSource.get_config_model:config"
+  # Composer construction probes retain dynamic plugin config shape after
+  # detaching authoring state and replacing deferred secret references.
+  - "src/elspeth/web/composer/_validation_probe.py:prepare_validation_probe_options:return"
+  - "src/elspeth/plugins/transforms/llm/transform.py:LLMTransform.get_config_model:config"
+  - "src/elspeth/plugins/sources/llm/source.py:LLMSource.get_config_model:config"
+
+  # probe_config classmethod (ADR-009 §Clause 4) — returns the exact shape
+  # the constructor accepts (dict[str, Any]). A TypedDict would require
+  # duplicating every plugin's config schema; the base contract is the
+  # constructor's signature, which is already whitelisted above.
+  - "src/elspeth/plugins/infrastructure/base.py:BaseTransform.probe_config:return"
+  - "src/elspeth/plugins/transforms/passthrough.py:PassThrough.probe_config:return"
+  - "src/elspeth/plugins/transforms/batch_replicate.py:BatchReplicate.probe_config:return"
+  - "src/elspeth/plugins/transforms/keyword_filter.py:KeywordFilter.probe_config:return"
+  - "src/elspeth/plugins/transforms/truncate.py:Truncate.probe_config:return"
+  - "src/elspeth/plugins/transforms/type_coerce.py:TypeCoerce.probe_config:return"
+  - "src/elspeth/plugins/transforms/value_transform.py:ValueTransform.probe_config:return"
+  - "src/elspeth/plugins/transforms/batch_stats.py:BatchStats.probe_config:return"
+  - "src/elspeth/plugins/transforms/batch_distribution_profile.py:BatchDistributionProfile.probe_config:return"
+  - "src/elspeth/plugins/transforms/batch_experiment_compare.py:BatchExperimentCompare.probe_config:return"
+  - "src/elspeth/plugins/transforms/batch_classifier_metrics.py:BatchClassifierMetrics.probe_config:return"
+  - "src/elspeth/plugins/transforms/batch_paired_preference.py:BatchPairedPreference.probe_config:return"
+  - "src/elspeth/plugins/transforms/batch_drift_compare.py:BatchDriftCompare.probe_config:return"
+  - "src/elspeth/plugins/transforms/batch_duplicate_annotator.py:BatchDuplicateAnnotator.probe_config:return"
+  - "src/elspeth/plugins/transforms/batch_outlier_annotator.py:BatchOutlierAnnotator.probe_config:return"
+  - "src/elspeth/plugins/transforms/batch_rank.py:BatchRank.probe_config:return"
+  - "src/elspeth/plugins/transforms/batch_data_quality_report.py:BatchDataQualityReport.probe_config:return"
+  - "src/elspeth/plugins/transforms/batch_top_k.py:BatchTopK.probe_config:return"
+  - "src/elspeth/plugins/transforms/report_assemble.py:ReportAssemble.probe_config:return"
+  - "src/elspeth/plugins/transforms/batch_threshold_summary.py:BatchThresholdSummary.probe_config:return"
+  - "src/elspeth/plugins/transforms/batch_effect_size.py:BatchEffectSize.probe_config:return"
+  - "src/elspeth/plugins/transforms/field_mapper.py:FieldMapper.probe_config:return"
+  - "src/elspeth/plugins/transforms/json_explode.py:JSONExplode.probe_config:return"
+  - "src/elspeth/plugins/transforms/line_explode.py:LineExplode.probe_config:return"
+  - "src/elspeth/plugins/transforms/web_scrape.py:WebScrapeTransform.probe_config:return"
+  - "src/elspeth/plugins/transforms/blob_fetch.py:BlobFetch.probe_config:return"
+  - "src/elspeth/plugins/transforms/blob_csv_expand.py:BlobCSVExpand.probe_config:return"
+  - "src/elspeth/plugins/transforms/blob_json_expand.py:BlobJSONExpand.probe_config:return"
+  - "src/elspeth/plugins/transforms/blob_text_expand.py:BlobTextExpand.probe_config:return"
+  - "src/elspeth/plugins/transforms/reference_join.py:ReferenceJoin.probe_config:return"
+  - "src/elspeth/plugins/transforms/pdf_rasterize.py:PDFRasterize.probe_config:return"
+  - "src/elspeth/plugins/transforms/azure/content_safety.py:AzureContentSafety.probe_config:return"
+  - "src/elspeth/plugins/transforms/azure/document_intelligence.py:AzureDocumentIntelligence.probe_config:return"
+  - "src/elspeth/plugins/transforms/azure/prompt_shield.py:AzurePromptShield.probe_config:return"
+  - "src/elspeth/plugins/transforms/aws/textract_document_analysis.py:AWSTextractDocumentAnalysis.probe_config:return"
+  - "src/elspeth/plugins/transforms/aws/textract_inline_analysis.py:AWSTextractInlineAnalysis.probe_config:return"
+  - "src/elspeth/plugins/transforms/llm/transform.py:LLMTransform.probe_config:return"
+  - "src/elspeth/plugins/sources/llm/source.py:LLMSource.probe_config:return"
+  - "src/elspeth/plugins/transforms/rag/transform.py:RAGRetrievalTransform.probe_config:return"
+  - "src/elspeth/plugins/transforms/azure/ai_search.py:AzureAISearchTransform.probe_config:return"
+  # Sink probe_config, same contract as the transform hook above: a sink that
+  # declares input_semantic_requirements() must be instantiable in isolation
+  # so tests/invariants/test_semantic_requirements_are_satisfiable can read it.
+  - "src/elspeth/plugins/infrastructure/base.py:BaseSink.probe_config:return"
+  - "src/elspeth/plugins/sinks/text_sink.py:TextSink.probe_config:return"
+  - "src/elspeth/plugins/sinks/document_sink.py:DocumentSink.probe_config:return"
+  - "src/elspeth/plugins/sinks/power_automate.py:PowerAutomateSink.probe_config:return"
+
+  # Plugin implementations - config input
+  - "src/elspeth/plugins/sinks/chroma_sink.py:ChromaSink.__init__:config"
+  - "src/elspeth/plugins/sinks/chroma_sink.py:ChromaSink.write:rows (list)"
+  - "src/elspeth/plugins/sinks/database_sink.py:DatabaseSink.__init__:config"
+  - "src/elspeth/plugins/sinks/csv_sink.py:CSVSink.__init__:config"
+  - "src/elspeth/plugins/sinks/json_sink.py:JSONSink.__init__:config"
+  - "src/elspeth/plugins/transforms/passthrough.py:PassThrough.__init__:config"
+  - "src/elspeth/plugins/transforms/field_mapper.py:FieldMapper.__init__:config"
+  - "src/elspeth/plugins/transforms/batch_replicate.py:BatchReplicate.__init__:config"
+  - "src/elspeth/plugins/transforms/batch_stats.py:BatchStats.__init__:config"
+  - "src/elspeth/plugins/transforms/batch_distribution_profile.py:BatchDistributionProfile.__init__:config"
+  - "src/elspeth/plugins/transforms/batch_experiment_compare.py:BatchExperimentCompare.__init__:config"
+  - "src/elspeth/plugins/transforms/batch_classifier_metrics.py:BatchClassifierMetrics.__init__:config"
+  - "src/elspeth/plugins/transforms/batch_paired_preference.py:BatchPairedPreference.__init__:config"
+  - "src/elspeth/plugins/transforms/batch_drift_compare.py:BatchDriftCompare.__init__:config"
+  - "src/elspeth/plugins/transforms/batch_duplicate_annotator.py:BatchDuplicateAnnotator.__init__:config"
+  - "src/elspeth/plugins/transforms/batch_outlier_annotator.py:BatchOutlierAnnotator.__init__:config"
+  - "src/elspeth/plugins/transforms/batch_rank.py:BatchRank.__init__:config"
+  - "src/elspeth/plugins/transforms/batch_data_quality_report.py:BatchDataQualityReport.__init__:config"
+  - "src/elspeth/plugins/transforms/batch_top_k.py:BatchTopK.__init__:config"
+  - "src/elspeth/plugins/transforms/report_assemble.py:ReportAssemble.__init__:config"
+  - "src/elspeth/plugins/transforms/batch_threshold_summary.py:BatchThresholdSummary.__init__:config"
+  - "src/elspeth/plugins/transforms/batch_effect_size.py:BatchEffectSize.__init__:config"
+  - "src/elspeth/plugins/transforms/keyword_filter.py:KeywordFilter.__init__:config"
+  - "src/elspeth/plugins/transforms/truncate.py:Truncate.__init__:config"
+  - "src/elspeth/plugins/transforms/json_explode.py:JSONExplode.__init__:config"
+  - "src/elspeth/plugins/transforms/line_explode.py:LineExplode.__init__:config"
+  - "src/elspeth/plugins/transforms/type_coerce.py:TypeCoerce.__init__:config"
+  - "src/elspeth/plugins/transforms/value_transform.py:ValueTransform.__init__:config"
+  - "src/elspeth/plugins/transforms/web_scrape.py:WebScrapeTransform.__init__:options"
+  - "src/elspeth/plugins/transforms/blob_fetch.py:BlobFetch.__init__:options"
+  - "src/elspeth/plugins/transforms/blob_csv_expand.py:BlobCSVExpand.__init__:options"
+  - "src/elspeth/plugins/transforms/blob_json_expand.py:BlobJSONExpand.__init__:options"
+  - "src/elspeth/plugins/transforms/blob_text_expand.py:BlobTextExpand.__init__:options"
+  - "src/elspeth/plugins/transforms/reference_join.py:ReferenceJoin.__init__:options"
+  - "src/elspeth/plugins/transforms/pdf_rasterize.py:PDFRasterize.__init__:options"
+  - "src/elspeth/plugins/transforms/azure/document_intelligence.py:AzureDocumentIntelligence.__init__:config"
+  - "src/elspeth/plugins/transforms/aws/textract_document_analysis.py:AWSTextractDocumentAnalysis.__init__:config"
+  - "src/elspeth/plugins/transforms/aws/textract_inline_analysis.py:AWSTextractInlineAnalysis.__init__:config"
+  - "src/elspeth/plugins/sources/json_source.py:JSONSource.__init__:config"
+  - "src/elspeth/plugins/sources/csv_source.py:CSVSource.__init__:config"
+  - "src/elspeth/plugins/sources/blob_rows.py:BlobRowsSource.__init__:config"
+  - "src/elspeth/plugins/sources/null_source.py:NullSource.__init__:config"
+  - "src/elspeth/plugins/sources/text_source.py:TextSource.__init__:config"
+  - "src/elspeth/plugins/sources/llm/source.py:LLMSource.__init__:config"
+
+  # Plugin manager - factory methods for creating plugins from config
+  - "src/elspeth/plugins/infrastructure/manager.py:PluginManager.create_source:config"
+  - "src/elspeth/plugins/infrastructure/manager.py:PluginManager.create_transform:config"
+  - "src/elspeth/plugins/infrastructure/manager.py:PluginManager.create_sink:config"
+
+  # Plugin validation - config validation before plugin instantiation
+  - "src/elspeth/plugins/infrastructure/validation.py:validate_source_config:config"
+  - "src/elspeth/plugins/infrastructure/validation.py:validate_transform_config:config"
+  - "src/elspeth/plugins/infrastructure/validation.py:validate_sink_config:config"
+  - "src/elspeth/plugins/infrastructure/validation.py:validate_schema_config:schema_config"
+
+  # CLI - plugin instantiation from configuration
+  # NOTE: _build_resume_graph, _orchestrator_context, _execute_pipeline_with_instances,
+  # _execute_resume_with_instances, and instantiate_plugins_from_config:return were removed
+  # as part of T11 (PluginBundle extraction) — dict[str, Any] replaced with frozen dataclass.
+  - "src/elspeth/cli.py:_load_raw_yaml:return"
+
+  # Secret refs resolver - walks arbitrary pipeline config trees to replace secret refs
+  - "src/elspeth/core/secrets.py:resolve_secret_refs:config"
+  - "src/elspeth/core/secrets.py:redact_secret_refs_for_validation:config"
+  - "src/elspeth/core/secrets.py:redact_secret_refs_for_validation:return"
+
+  # Blob inline resolver - walks arbitrary pipeline YAML trees to discover,
+  # validate, and substitute widened blob_ref markers inside plugin options.
+  # The marker/value grammar is centralized in contracts/blobs_inline.py; the
+  # surrounding config dict remains dynamic because source/node/output plugin
+  # options are open-ended YAML.
+  - "src/elspeth/core/blobs_inline.py:_discover_blob_content_refs:config"
+  - "src/elspeth/core/blobs_inline.py:_validate_blob_content_refs_sync:config"
+  - "src/elspeth/core/blobs_inline.py:_substitute_blob_content_refs:config"
+  - "src/elspeth/core/blobs_inline.py:_substitute_blob_content_refs_for_validation:config"
+  - "src/elspeth/core/blobs_inline.py:_substitute_blob_content_refs_for_validation:return"
+  - "src/elspeth/core/blobs_inline.py:_substitute_at_path:config"
+  - "src/elspeth/core/blobs_inline.py:_source_options:config"
+  - "src/elspeth/core/blobs_inline.py:_source_options:return"
+  - "src/elspeth/core/blobs_inline.py:_node_options:config"
+  - "src/elspeth/core/blobs_inline.py:_node_options:return"
+  - "src/elspeth/core/blobs_inline.py:_output_options:config"
+  - "src/elspeth/core/blobs_inline.py:_output_options:return"
+  - "src/elspeth/core/blobs_inline.py:_assign_nested_option:container"
+  - "src/elspeth/core/blobs_inline.py:_walk_source:config"
+  - "src/elspeth/core/blobs_inline.py:_walk_sources:config"
+  - "src/elspeth/core/blobs_inline.py:_walk_nodes:config"
+  - "src/elspeth/core/blobs_inline.py:_walk_outputs:config"
+
+  # Config - runtime configuration dicts
+  - "src/elspeth/core/config.py:resolve_config:return"
+  - "src/elspeth/core/config.py:_expand_env_vars:config"
+  - "src/elspeth/core/config.py:_expand_env_vars:return"
+  - "src/elspeth/core/config.py:_fingerprint_secrets:options"
+  - "src/elspeth/core/config.py:_fingerprint_secrets:return"
+  - "src/elspeth/core/config.py:_expand_config_templates:raw_config"
+  - "src/elspeth/core/config.py:_expand_config_templates:return"
+  # Raw pre-pydantic config dict rewrite for the batch/CLI llm_profiles
+  # catalog lowering pass — same shape as _expand_env_vars/_expand_config_templates above.
+  - "src/elspeth/core/config.py:_lower_llm_profile_nodes:raw_config"
+  - "src/elspeth/core/config.py:_lower_llm_profile_nodes:return"
+  - "src/elspeth/core/config.py:_fingerprint_config_for_audit:config_dict"
+  - "src/elspeth/core/config.py:_fingerprint_config_for_audit:return"
+  # In-place DSN-password sanitiser for audit copy (placement-based, e.g. database sink url).
+  - "src/elspeth/core/config.py:_sanitize_dsn_option_for_audit:options"
+  - "src/elspeth/core/config.py:_recurse:d"
+  - "src/elspeth/core/config.py:_recurse:return"
+
+  # Config template materialization - walks arbitrary plugin option dicts while
+  # expanding file-backed template/lookup/system-prompt options.
+  - "src/elspeth/core/template_materialization.py:TemplateOptionMaterializer.materialize_config:return"
+  - "src/elspeth/core/template_materialization.py:TemplateOptionMaterializer.materialize_options:return"
+  - "src/elspeth/core/template_materialization.py:_expand_template_files:options"
+  - "src/elspeth/core/template_materialization.py:_expand_template_files:return"
+
+  # Canonical representation - deterministic JSON for hashing
+  - "src/elspeth/core/canonical.py:_edge_to_canonical_dict:return"
+
+  # Result type serialization - to_dict() thaws MappingProxyType for JSON export
+  - "src/elspeth/contracts/run_result.py:RunResult.to_dict:return"
+  - "src/elspeth/engine/orchestrator/types.py:AggregationFlushResult.to_dict:return"
+
+  # JSON parsing - object_pairs_hook must return dict (json.loads contract)
+  - "src/elspeth/contracts/json_parser.py:_reject_duplicate_keys:return"
+
+  # Plugin schema emission - model_json_schema() / Pydantic TypeAdapter output
+  # is a standard JSON Schema dict. Base implementations on BaseSource,
+  # BaseTransform, BaseSink, plus the LLMTransform discriminated-union override.
+  - "src/elspeth/plugins/infrastructure/base.py:BaseTransform.get_config_schema:return"
+  - "src/elspeth/plugins/infrastructure/base.py:BaseSink.get_config_schema:return"
+  - "src/elspeth/plugins/infrastructure/base.py:BaseSource.get_config_schema:return"
+  - "src/elspeth/plugins/transforms/llm/transform.py:LLMTransform.get_config_schema:return"
+  - "src/elspeth/plugins/sources/llm/source.py:LLMSource.get_config_schema:return"
+  # MCP tool registration mutates and freezes JSON Schema property dicts before
+  # exposing them through mcp.types.Tool.inputSchema.
+  - "src/elspeth/mcp/server.py:_schema_properties_with_int_bounds:return"
+  - "src/elspeth/mcp/server.py:_freeze_schema_properties:return"
+
+  # Catalog service - JSON Schema traversal (helpers receive raw Pydantic-
+  # generated schema dicts and walk them; there is no stable TypedDict for
+  # arbitrary JSON Schema, including discriminated unions with $defs).
+  - "src/elspeth/web/catalog/service.py:CatalogServiceImpl._catalog_schema:return"
+  - "src/elspeth/web/catalog/service.py:CatalogServiceImpl._without_declared_input_fields:schema"
+  - "src/elspeth/web/catalog/service.py:CatalogServiceImpl._without_declared_input_fields:return"
+  - "src/elspeth/web/catalog/service.py:CatalogServiceImpl._extract_config_fields:schema"
+  - "src/elspeth/web/catalog/service.py:CatalogServiceImpl._fields_from_discriminated:schema"
+
+  # Schema reconstruction - deserializing schemas from landscape database (refactored into orchestrator/export.py)
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # AGGREGATION STATE — Now typed via AggregationCheckpointState (elspeth-rapid-095ec6)
+  # Only row_data inside tokens remains dict[str, Any] (pipeline data, Tier 2)
+  # ═══════════════════════════════════════════════════════════════════════════
+  - "src/elspeth/engine/executors/aggregation.py:_AggregationNodeState.snapshot_rows:return (list)"
+
+  # Transform executor row-data handoff points. These are PipelineRow.to_dict()
+  # projections used for schema validation and node-state audit persistence; the
+  # row payload shape is determined by upstream plugin contracts at runtime.
+  - "src/elspeth/engine/executors/transform.py:TransformExecutor._run_preflight:input_dict"
+  - "src/elspeth/engine/executors/transform.py:TransformExecutor._prepare_success_completion:return"
+
+  # Audit CSV export records are heterogeneous formatter output; individual
+  # record-type contracts live in formatter/export-record types.
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PLUGIN CONTEXT - Recording and routing
+  # PluginContext methods handle dynamic data from pipeline execution
+  # ═══════════════════════════════════════════════════════════════════════════
+  - "src/elspeth/contracts/plugin_context.py:PluginContext.record_call:request_data"
+  - "src/elspeth/contracts/plugin_context.py:PluginContext.record_call:response_data"
+  - "src/elspeth/contracts/plugin_context.py:PluginContext.record_call:error"
+  - "src/elspeth/contracts/plugin_context.py:PluginContext.record_transform_error:row"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # LANDSCAPE RECORDER MIXINS - Audit trail recording
+  # The recorder was refactored into mixins; these methods handle dynamic
+  # pipeline data from execution.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # Execution repository and recorder — narrowed to Mapping[str, object] (Task 5)
+
+  # (Call recording entries moved to Execution repository block above)
+
+  # Operations tracking - source/sink I/O audit trail
+  - "src/elspeth/core/operations.py:track_operation:input_data"
+  - "src/elspeth/core/operations.py:OperationHandle.__init__:output_data"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # FORMATTERS - Record formatting for export
+  # Formatters work with audit records that have dynamic structure
+  # ═══════════════════════════════════════════════════════════════════════════
+  - "src/elspeth/core/landscape/formatters.py:JSONFormatter.format:record"
+  - "src/elspeth/core/landscape/formatters.py:CSVFormatter.flatten:return"
+  - "src/elspeth/core/landscape/formatters.py:CSVFormatter.format:record"
+  - "src/elspeth/core/landscape/formatters.py:CSVFormatter.format:return"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # EXPORTER - Record signing
+  # Exporter works with dynamic audit records
+  # ═══════════════════════════════════════════════════════════════════════════
+  - "src/elspeth/core/landscape/exporter.py:LandscapeExporter._sign_record:record"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # LLM PLUGINS - External API trust boundary
+  # LLM transforms handle dynamic row data and external API responses
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # LLM templates
+  - "src/elspeth/plugins/transforms/llm/templates.py:PromptTemplate.__init__:lookup_data"
+  - "src/elspeth/plugins/transforms/llm/templates.py:PromptTemplate.render:row"
+  - "src/elspeth/plugins/transforms/llm/templates.py:PromptTemplate.render_with_metadata:row"
+
+  # LLM multi-query
+  - "src/elspeth/plugins/transforms/llm/multi_query.py:QuerySpec.build_template_context:return"
+
+  # LLM provider protocol — response_format follows the OpenAI API spec
+  # (varies between {"type": "json_object"} and {"type": "json_schema", ...})
+  - "src/elspeth/plugins/transforms/llm/provider.py:LLMProvider.execute_query:response_format"
+  - "src/elspeth/plugins/transforms/llm/providers/azure.py:AzureLLMProvider.execute_query:response_format"
+  - "src/elspeth/plugins/transforms/llm/providers/openrouter.py:OpenRouterLLMProvider.execute_query:response_format"
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider.execute_query:response_format"
+
+  # LLM tracing — extra_metadata is provider-specific (deployment, model, query keys vary per caller)
+  - "src/elspeth/plugins/transforms/llm/langfuse.py:LangfuseTracer.record_success:extra_metadata"
+  - "src/elspeth/plugins/transforms/llm/langfuse.py:LangfuseTracer.record_error:extra_metadata"
+  - "src/elspeth/plugins/transforms/llm/langfuse.py:NoOpLangfuseTracer.record_success:extra_metadata"
+  - "src/elspeth/plugins/transforms/llm/langfuse.py:NoOpLangfuseTracer.record_error:extra_metadata"
+  - "src/elspeth/plugins/transforms/llm/langfuse.py:ActiveLangfuseTracer.record_success:extra_metadata"
+  - "src/elspeth/plugins/transforms/llm/langfuse.py:ActiveLangfuseTracer.record_error:extra_metadata"
+
+  # LLM tracing config
+  - "src/elspeth/plugins/transforms/llm/tracing.py:parse_tracing_config:config"
+
+  # Unified LLM transform (T10 consolidation — dispatches to Azure/OpenRouter providers)
+  - "src/elspeth/plugins/transforms/llm/transform.py:LLMTransform.__init__:config"
+
+  # RAG retrieval transform (config is user YAML — Tier 3 boundary, parsed into RAGRetrievalConfig)
+  - "src/elspeth/plugins/transforms/rag/transform.py:RAGRetrievalTransform.__init__:config"
+  # Shared retrieval core — forwards the same raw plugin config to BaseTransform
+  - "src/elspeth/plugins/transforms/rag/core.py:RetrievalTransformBase.__init__:config"
+  # Azure AI Search transform (config is user YAML — Tier 3 boundary, parsed into AzureAISearchConfig)
+  - "src/elspeth/plugins/transforms/azure/ai_search.py:AzureAISearchTransform.__init__:config"
+  # _process_fn.work is now Mapping[str, Any] (IM-2 fix — the pool hands off
+  # ctx.row, which is MappingProxyType after RowContext.__post_init__
+  # freezes it). _QuerySuccess.fields is likewise Mapping[str, Any].
+
+  # BaseSink diversion — row_data is the pipeline row dict (Tier 2 data) being diverted to failsink
+  - "src/elspeth/plugins/infrastructure/base.py:BaseSink._divert_row:row_data"
+
+  # Plugin validation dispatcher — config is user YAML (Tier 3 boundary)
+  - "src/elspeth/plugins/infrastructure/validation.py:get_transform_config_model:config"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # AZURE PLUGINS - External cloud service trust boundary
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # Azure blob storage
+  - "src/elspeth/plugins/sources/azure_blob_source.py:AzureBlobSource.__init__:config"
+
+  # Dataverse plugins
+  - "src/elspeth/plugins/sources/dataverse.py:DataverseSource.__init__:config"
+  - "src/elspeth/plugins/sources/dataverse.py:DataverseSource._strip_odata_metadata:row"
+  - "src/elspeth/plugins/sources/dataverse.py:DataverseSource._strip_odata_metadata:return"
+  - "src/elspeth/plugins/sources/dataverse.py:DataverseSource._normalize_row_fields:row"
+  - "src/elspeth/plugins/sources/dataverse.py:DataverseSource._normalize_row_fields:return"
+  - "src/elspeth/plugins/sources/json_source.py:JSONSource._normalize_row_keys:return"
+  - "src/elspeth/plugins/sinks/dataverse.py:DataverseSink.__init__:config"
+  - "src/elspeth/plugins/sinks/dataverse.py:DataverseSink._map_row:row"
+  - "src/elspeth/plugins/sinks/dataverse.py:DataverseSink._map_row:return"
+  - "src/elspeth/plugins/sinks/dataverse.py:DataverseSink.write:rows (list)"
+  - "src/elspeth/plugins/infrastructure/clients/dataverse.py:DataverseClient._execute_request:json_body"
+  - "src/elspeth/plugins/infrastructure/clients/dataverse.py:DataverseClient.upsert:body"
+  - "src/elspeth/plugins/sinks/azure_blob_sink.py:AzureBlobSink.__init__:config"
+  - "src/elspeth/plugins/sinks/azure_blob_sink.py:AzureBlobSink._serialize_rows:rows (list)"
+  - "src/elspeth/plugins/sinks/azure_blob_sink.py:AzureBlobSink._serialize_csv:rows (list)"
+  - "src/elspeth/plugins/sinks/azure_blob_sink.py:AzureBlobSink._serialize_json:rows (list)"
+  - "src/elspeth/plugins/sinks/azure_blob_sink.py:AzureBlobSink._serialize_jsonl:rows (list)"
+  - "src/elspeth/plugins/sinks/azure_blob_sink.py:AzureBlobSink.write:rows (list)"
+  - "src/elspeth/plugins/sinks/azure_blob_sink.py:AzureBlobSink._get_field_names_and_display:rows (list)"
+
+  # Azure safety transforms (base + content_safety + prompt_shield)
+  - "src/elspeth/plugins/transforms/azure/base.py:BaseAzureSafetyTransform.__init__:config"
+  - "src/elspeth/plugins/transforms/azure/content_safety.py:AzureContentSafety.__init__:config"
+  - "src/elspeth/plugins/transforms/azure/prompt_shield.py:AzurePromptShield.__init__:config"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # RETRIEVAL CLIENTS - External search API trust boundary
+  # Azure AI Search API returns untyped JSON; response_data and body are
+  # inherently dict[str, Any] at the Tier 3 boundary before validation.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - "src/elspeth/plugins/infrastructure/clients/retrieval/azure_search.py:AzureSearchProvider._execute_search:return"
+  - "src/elspeth/plugins/infrastructure/clients/retrieval/azure_search.py:AzureSearchProvider._build_request_body:return"
+  - "src/elspeth/plugins/infrastructure/clients/retrieval/azure_search.py:AzureSearchProvider._parse_response:response_data"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # HTTP CLIENTS - External API trust boundary
+  # ═══════════════════════════════════════════════════════════════════════════
+  # OpenRouter direct provider — OpenAI-compatible response_format and raw
+  # provider JSON are dynamic API payload shapes. LLMCallRequest and
+  # LLMCallResponse are the typed audit contracts around these mappings.
+  - "src/elspeth/plugins/transforms/llm/providers/openrouter.py:OpenRouterLLMProvider._build_llm_request_payload:response_format"
+  - "src/elspeth/plugins/transforms/llm/providers/openrouter.py:OpenRouterLLMProvider._record_logical_llm_success:raw_response"
+
+  # ELSPETH LLM Gateway provider — same OpenAI-compatible wire shapes as
+  # OpenRouter above (request_body IS the JSON POST body sent verbatim;
+  # raw_response is the gateway's parsed chat-completion JSON kept for audit).
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider._post_chat_completion:request_body"
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider._build_llm_request_payload:response_format"
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider._record_logical_llm_success:raw_response"
+  - "src/elspeth/plugins/infrastructure/clients/replayer.py:ReplayMissError.__init__:request_data"
+  - "src/elspeth/plugins/infrastructure/clients/replayer.py:CallReplayer.replay:request_data"
+  - "src/elspeth/plugins/infrastructure/clients/verifier.py:CallVerifier.verify:request_data"
+  - "src/elspeth/plugins/infrastructure/clients/verifier.py:CallVerifier.verify:live_response"
+  # VerificationResult dataclass fields and factory classmethod inputs were
+  # narrowed to Mapping[str, Any] in IM-2 (frozen-field type-lie fix) — the
+  # fields are deep-frozen to MappingProxyType via freeze_fields, so the
+  # dict[str, Any] whitelist entries that used to exempt them are no longer
+  # needed. External API response content remains Tier-3; the redaction
+  # discipline is unchanged.
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TUI - Display of dynamic audit data
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # Node detail panel - validation of JSON-parsed audit data (Tier 1 trust boundary)
+  # These functions receive raw dicts from json.loads() and validate them into TypedDicts.
+  # The input must be dict[str, Any] because it's the unvalidated type before validation.
+  - "src/elspeth/tui/widgets/node_detail.py:_validate_execution_error:data"
+  - "src/elspeth/tui/widgets/node_detail.py:_validate_transform_error:data"
+  - "src/elspeth/tui/widgets/node_detail.py:_validate_coalesce_error:data"
+  - "src/elspeth/tui/widgets/node_detail.py:_validate_artifact:data"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TELEMETRY EXPORTERS - External observability trust boundary
+  # Exporter serialization returns dict[str, Any] by design for OTLP/JSON payloads.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - "src/elspeth/telemetry/exporters/azure_monitor.py:AzureMonitorExporter._serialize_event_attributes:return"
+  - "src/elspeth/telemetry/exporters/otlp.py:OTLPExporter._serialize_event_attributes:return"
+  - "src/elspeth/telemetry/exporters/console.py:ConsoleExporter._serialize_event:return"
+  - "src/elspeth/telemetry/serialization.py:serialize_event_attributes:return"
+  - "src/elspeth/telemetry/serialization.py:SyntheticReadableSpan.__init__:attributes"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # SPAN FACTORY - OTel attribute bag
+  # OpenTelemetry span attributes are inherently dict[str, Any] — the OTel SDK
+  # accepts str/bool/int/float/Sequence thereof, so a TypedDict cannot express
+  # the full attribute space. _make_span is a private helper that receives the
+  # already-validated attribute dict built by each public span method.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - "src/elspeth/engine/spans.py:SpanFactory._make_span:attributes"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STRUCTLOG PROCESSORS - Framework boundary
+  # Structlog defines the event_dict type as dict[str, Any]. Processors receive
+  # and return this type as part of structlog's processing pipeline.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - "src/elspeth/core/logging.py:_remove_internal_fields:event_dict"
+  - "src/elspeth/core/logging.py:_remove_internal_fields:return"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # MCP SERVER + ANALYZER - Genuinely dynamic patterns
+  # SQL query results have user-defined columns; call_tool receives MCP protocol input.
+  # MOST other MCP returns are typed via TypedDicts in mcp/types.py. Three are NOT,
+  # and were invisible here until 2026-09-04: RunDetail / NodeDetail / CallDetail
+  # (mcp/types.py:297-303) are `dict[str, Any]` ALIASES, so the six returns annotated
+  # with them read as typed and scanned as untyped. The previous wording of this
+  # header claimed "all other MCP returns are now typed via TypedDicts", which was
+  # false for exactly those six. The scanner now resolves module-level aliases, so
+  # they appear as the entries below instead of as nothing at all.
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Facade (mcp/analyzer.py) - delegates to submodules
+  - "src/elspeth/mcp/analyzer.py:LandscapeAnalyzer.query:params"
+  - "src/elspeth/mcp/analyzer.py:LandscapeAnalyzer.query:return (list)"
+  # ---------------------------------------------------------------------------
+  # Alias-typed returns: dataclass_to_dict() projections of ONE owned dataclass.
+  #
+  # ADR-032 says nominally type what ELSPETH owns, and `Run` (contracts/audit.py:131),
+  # `Node` (:169) and `Call` (:523) ARE owned — each alias is produced from exactly one
+  # of them, not from a variant family. MEASURED 2026-09-04: run_lifecycle.get_run ->
+  # `Run | None`, data_flow.get_nodes -> `list[Node]`, query.get_calls -> `list[Call]`.
+  # So the comment at mcp/types.py that once read "the exact shape depends on the
+  # dataclass variant" did not describe these three; it has been corrected.
+  #
+  # They are whitelisted anyway, and the honest reason is NOT dynamism. The value is a
+  # recursive JSON projection built by `dataclass_to_dict` (core/landscape/serialization.py:56,
+  # itself `Any -> Any`). Writing a TypedDict for it would hand-copy 20+ fields of `Run`
+  # and its nested dataclasses into a second declaration with NOTHING pinning the two
+  # equal — the same two-copies-of-one-authority hazard tracked elsewhere, traded for a
+  # type that only looks stronger. The real fix is a mirror DERIVED from the dataclass,
+  # or returning the dataclass and serializing at the MCP boundary. Both are design
+  # work, not an annotation change; tracked separately.
+  # ---------------------------------------------------------------------------
+  - "src/elspeth/mcp/analyzer.py:LandscapeAnalyzer.get_run:return"
+  - "src/elspeth/mcp/analyzer.py:LandscapeAnalyzer.list_nodes:return (list)"
+  - "src/elspeth/mcp/analyzer.py:LandscapeAnalyzer.get_calls:return (list)"
+  - "src/elspeth/mcp/analyzers/queries.py:get_run:return"
+  - "src/elspeth/mcp/analyzers/queries.py:list_nodes:return (list)"
+  - "src/elspeth/mcp/analyzers/queries.py:get_calls:return (list)"
+  # Submodule functions (mcp/analyzers/)
+  - "src/elspeth/mcp/analyzers/queries.py:explain_token:return"
+  - "src/elspeth/mcp/analyzers/queries.py:get_errors:return"
+  - "src/elspeth/mcp/analyzers/queries.py:query:params"
+  - "src/elspeth/mcp/analyzers/queries.py:query:return (list)"
+  # MCP server machinery
+  - "src/elspeth/mcp/server.py:call_tool:arguments"
+  # _validate_tool_args bridges Tier 3 (MCP protocol) to validated args.
+  # Input is dict[str, Any] by protocol; return is validated but dynamic per-tool.
+  - "src/elspeth/mcp/server.py:_validate_tool_args:arguments"
+  - "src/elspeth/mcp/server.py:_validate_tool_args:return"
+  # Composer MCP server — same pattern as Landscape MCP, tool args are Tier 3
+  - "src/elspeth/composer_mcp/server.py:_build_tool_defs:return (list)"
+  - "src/elspeth/composer_mcp/server.py:_dispatch_tool:arguments"
+  - "src/elspeth/composer_mcp/server.py:_dispatch_tool:return"
+  - "src/elspeth/composer_mcp/server.py:_session_id_argument:arguments"
+  - "src/elspeth/composer_mcp/server.py:_dispatch_session_tool:arguments"
+  - "src/elspeth/composer_mcp/server.py:_dispatch_session_tool:return"
+  - "src/elspeth/composer_mcp/server.py:call_tool:arguments"
+  - "src/elspeth/composer_mcp/session.py:SessionManager.list_sessions:return (list)"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TESTING UTILITIES - Test infrastructure (not production code)
+  # Test factories accept arbitrary dicts for convenience — they wrap typed
+  # constructors, so dict[str, Any] is the input type before factory conversion.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - "src/elspeth/testing/__init__.py:make_pipeline_row:data"
+  - "src/elspeth/testing/__init__.py:make_contract:data"
+  - "src/elspeth/testing/__init__.py:make_row:data"
+  - "src/elspeth/testing/__init__.py:make_source_row:data"
+  - "src/elspeth/testing/__init__.py:make_source_row_quarantined:data"
+  - "src/elspeth/testing/__init__.py:make_success:data"
+  - "src/elspeth/testing/__init__.py:make_gate_continue:data"
+  - "src/elspeth/testing/__init__.py:make_gate_route:data"
+  - "src/elspeth/testing/__init__.py:make_gate_fork:data"
+  - "src/elspeth/testing/__init__.py:make_token_info:data"
+  - "src/elspeth/testing/__init__.py:make_row_result:data"
+  - "src/elspeth/testing/__init__.py:make_pipeline_config:sinks"
+  - "src/elspeth/testing/__init__.py:make_success_reason:metadata"
+  - "src/elspeth/testing/__init__.py:make_success_reason:return"
+  - "src/elspeth/testing/__init__.py:make_error_reason:return"
+  - "src/elspeth/testing/__init__.py:make_contract_audit_record:data"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # BATCHING INFRASTRUCTURE - Row buffering for batch operations
+  # ═══════════════════════════════════════════════════════════════════════════
+  - "src/elspeth/plugins/infrastructure/batching/row_reorder_buffer.py:RowReorderBuffer.get_metrics:return"
+  - "src/elspeth/plugins/infrastructure/batching/mixin.py:BatchTransformMixin.get_batch_metrics:return"
+
+  # Azure blob sink - row serialization
+  - "src/elspeth/plugins/sinks/azure_blob_sink.py:AzureBlobSink._get_fieldnames_from_schema_or_rows:rows (list)"
+
+  # LLM finish-reason error builder — constructs dynamic error reason dicts with optional fields
+  - "src/elspeth/plugins/transforms/llm/transform.py:_build_reason:return"
+
+  # Multi-query config base (JSON schema building for LLM structured output)
+  - "src/elspeth/plugins/transforms/llm/multi_query.py:OutputFieldConfig.to_json_schema:return"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PRE-FLIGHT CONTEXT (COMMENCEMENT GATES)
+  # Gate evaluation context is a namespace dict assembled from heterogeneous
+  # probe results and dependency metadata. ExpressionParser already accepts
+  # dict[str, Any] (whitelisted above). These are the assembly and evaluation
+  # functions that build and consume the context.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - "src/elspeth/engine/commencement.py:build_preflight_context:dependency_results"
+  - "src/elspeth/engine/commencement.py:build_preflight_context:collection_probes"
+  - "src/elspeth/engine/commencement.py:build_preflight_context:return"
+  - "src/elspeth/engine/commencement.py:evaluate_commencement_gates:context"
+
+  # Serializer thaws MappingProxyType back to dict for Pydantic JSON round-trip
+  - "src/elspeth/core/dependency_config.py:CollectionProbeConfig._serialize_provider_config:return"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # WEB AUTH — ID-token validation (Tier 3 boundary)
+  # The two boundaries whose input is PyJWT's own return type (dict[str, Any]
+  # from jwt.decode and jwt.get_unverified_header). Each parses that dict ONCE
+  # into an owned type (IdTokenClaims / the header's kid); everything past
+  # them is nominally typed, and the JWKS document crosses its boundary as
+  # unparsed JSON (typed Any) into the owned JwkSet.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - "src/elspeth/web/auth/id_token.py:parse_id_token_claims:payload"
+  - "src/elspeth/web/auth/id_token.py:JWKSTokenValidator._header_key_id:header"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # WEB AUTH — Session service protocol
+  # tool_calls is pipeline composition data (Tier 2 — user-defined graph structure).
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ═══════════════════════════════════════════════════════════════════════════
+  # WEB COMPOSER — CompositionState serialization and factory methods
+  # from_dict() accepts plain dicts from JSON deserialization (Tier 1 read).
+  # to_dict() returns plain dicts for YAML/JSON serialization.
+  # with_metadata() accepts partial patch dicts from LLM tool calls.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - "src/elspeth/web/composer/state.py:PipelineMetadata.from_dict:d"
+  - "src/elspeth/web/composer/state.py:SourceSpec.from_dict:d"
+  - "src/elspeth/web/composer/state.py:NodeSpec.from_dict:d"
+  - "src/elspeth/web/composer/state.py:EdgeSpec.from_dict:d"
+  - "src/elspeth/web/composer/state.py:OutputSpec.from_dict:d"
+  - "src/elspeth/web/composer/state.py:CompositionState.from_dict:d"
+  - "src/elspeth/web/composer/state.py:CompositionState.with_metadata:patch"
+  - "src/elspeth/web/composer/state.py:CompositionState.to_dict:return"
+  - "src/elspeth/web/composer/yaml_generator.py:_source_entry:source"
+  - "src/elspeth/web/composer/yaml_generator.py:_source_entry:return"
+  # Reads a serialized node dict from the same CompositionState shape as
+  # _source_entry:source above. Which fields are mandatory depends on the
+  # node's own node_type — that is why the helper takes the key as an
+  # argument — so no single TypedDict can express the contract it enforces.
+  - "src/elspeth/web/composer/yaml_generator.py:_require_node_key:node"
+  # Web execution path-rewrite helper operates on raw YAML-parsed config dicts.
+  # Pre-existing helper brushed by G4 (ADR-025) migration neighbouring lines;
+  # the rewrite shape will become typed when CompositionStateRecord migrates
+  # (elspeth-b0fe0ec050) and the web/execution preflight surface settles.
+  - "src/elspeth/web/execution/preflight.py:_rewrite_component_path_options:component"
+
+  # YAML generator — strips web-specific metadata from plugin options dicts
+  # Options are dynamic (vary by plugin) so dict[str, Any] is the correct type
+  - "src/elspeth/web/composer/yaml_generator.py:_strip_web_metadata:options"
+  - "src/elspeth/web/composer/yaml_generator.py:_strip_web_metadata:return"
+  - "src/elspeth/web/composer/yaml_generator.py:_strip_profile_lowering_provenance:options"
+  - "src/elspeth/web/composer/yaml_generator.py:_strip_profile_lowering_provenance:return"
+
+  # Redaction — shared traversal iterator (§4.2.5)
+  # The value_provider closure receives the model's serialised root dict.
+  # The schema (BaseModel) is the typed contract; the dict is the run-time
+  # JSON-shape view the consumer passes in for path extraction. Typing the
+  # parameter more strictly would require generic-parameterising TraversalNode
+  # against an arbitrary BaseModel subclass, which the path-based abstraction
+  # is intentionally model-agnostic to avoid.
+  - "src/elspeth/web/composer/redaction.py:provider:root"
+
+  # Tier-3 LLM tool-call argument boundary.  Task 4 introduces
+  # SetSourceArgumentsModel (Pydantic, extra="forbid"); the runtime walker
+  # consumes the LLM-supplied dict and emits the redacted dict ready for
+  # serialization to chat_messages.tool_calls.  The unstructured shape
+  # (dict[str, Any]) is intrinsic to the tool-call schema crossing the
+  # boundary; the structured shape exists on the model side via model_validate.
+  - "src/elspeth/web/composer/redaction.py:_redact_via_schema:return"
+  - "src/elspeth/web/composer/redaction.py:_redact_via_policy:arguments"
+  - "src/elspeth/web/composer/redaction.py:_redact_via_policy:return"
+  - "src/elspeth/web/composer/redaction.py:redact_tool_call_arguments:arguments"
+  - "src/elspeth/web/composer/redaction.py:redact_tool_call_arguments:return"
+  - "src/elspeth/web/composer/redaction.py:redact_tool_call_response:response"
+  - "src/elspeth/web/composer/redaction.py:redact_tool_call_response:return"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # WEB — Interpretation review options patching (Tier 3 node options dict)
+  # Composer node ``options`` are operator-supplied open-ended dicts; helpers
+  # that strip / patch them return dict[str, Any] because the value space is
+  # the unbounded plugin-options surface, not a fixed contract. Pre-existing
+  # on RC5.2 from commit 714152a57 (interpretation readiness contract); listed
+  # here when the composer-tools-rearchitect refactor unmasked them by clearing
+  # the stale ``tools.py`` allowlist entries that previously short-circuited
+  # the check.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - "src/elspeth/web/interpretation_state.py:strip_authoring_options:return"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # WEB COMPOSER — Compose-loop helpers (Tier 3 LiteLLM API shapes)
+  # The compose-loop decomposition (P1-P4 + Steps 6-7, RC5.2 commits
+  # 424953783, 2a8f5d92d, db462b547, 3ba3e617b, 39d55fddd, 6d63f6075) extracted
+  # helpers from compose() that thread the LiteLLM messages/tools payloads.
+  # Both list[dict[str, Any]] surfaces are external-API contracts owned by
+  # LiteLLM, not internal data; the dict shape is fixed by the LLM provider
+  # API, not by our codebase. Unmasked by the contracts-whitelist path-remap
+  # in commit 1e7e42d7a; listed here as part of the rearchitect merge into
+  # RC5.2 (pre-existing on RC5.2 from the listed commits).
+  # ═══════════════════════════════════════════════════════════════════════════
+  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_model_turn:llm_messages (list)"
+  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_model_turn:tools (list)"
+  # Deep-copy the same selected SDK message/tool wires before dispatch and
+  # derive the exact cache-marked request digest; no internal evidence DTO.
+  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._prepare_primary_delivery:messages (list)"
+  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._prepare_primary_delivery:tools (list)"
+  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._dispatch_tool_batch:llm_messages (list)"
+  # Extracted body of _dispatch_tool_batch: the verbatim move to the module-level
+  # run_tool_batch (composer/service.py decomposition) carries the same OpenAI
+  # chat-completion message list. The service.py:_dispatch_tool_batch entry above
+  # remains valid for the thin delegator that still builds and forwards the list.
+  - "src/elspeth/web/composer/tool_batch.py:run_tool_batch:llm_messages (list)"
+  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._classify_and_budget_turn:llm_messages (list)"
+  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._classify_and_budget_turn:tools (list)"
+  - "src/elspeth/web/composer/composition_completion.py:CompositionCompletion._try_terminate_no_tools:llm_messages (list)"
+
+  # Shared pipeline planner provider/tool wire shapes. These are ephemeral
+  # JSON contracts fixed by the OpenAI-compatible chat/tool protocol or by
+  # the registered composer JSON Schemas; they are never durable internal
+  # domain records.
+  - "src/elspeth/web/composer/pipeline_planner.py:planner_terminal_tool_definition:return"
+  - "src/elspeth/web/composer/pipeline_planner.py:planner_tool_definitions:return (list)"
+  - "src/elspeth/web/composer/pipeline_planner.py:_assistant_tool_calls_message:return"
+  # The provider-authored pipeline is open JSON until the canonical
+  # SetPipelineArgumentsModel validates it. This helper only rejects and
+  # reports invalid structure; it never rewrites the candidate.
+  - "src/elspeth/web/composer/pipeline_planner.py:_validate_terminal_payload:payload"
+  - "src/elspeth/web/composer/pipeline_planner.py:_AuditedDiscoveryResult.to_dict:return"
+  # Public accessor returns a defensive copy of the registered dynamic JSON
+  # Schema; a TypedDict would duplicate and drift from that authority.
+  - "src/elspeth/web/composer/tools/schema_contract.py:canonical_set_pipeline_schema:return"
+
+  # Azure Document Intelligence forward-invariant probe fake response payload.
+  # Mirrors an HTTP JSON body emitted by the local fake client, not an internal
+  # durable contract.
+  - "src/elspeth/plugins/transforms/azure/document_intelligence.py:_ProbeResponse.__init__:payload"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # WEB COMPOSER — Tool executor (Tier 3 LLM tool call arguments)
+  # args dicts come from json.loads(tool_call.function.arguments) in the
+  # LLM tool-use loop. Tool JSON schemas define optional fields.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - "src/elspeth/web/composer/tools/_common.py:ToolResult.to_dict:return"
+  - "src/elspeth/web/composer/tools/_common.py:_secret_ref_placement_error:options"
+  - "src/elspeth/web/composer/tools/_dispatch.py:get_tool_definitions:return (list)"
+  - "src/elspeth/web/composer/tools/_dispatch.py:execute_tool:arguments"
+  # JSON Schema meta-validation helper for the two non-declared inline
+  # tool definitions emitted by get_tool_definitions(). The ``defn``
+  # parameter is a literal dict at the call site (declared in this
+  # module, not LLM-supplied); Tier-1 audit-readiness is enforced by
+  # the validity check inside the helper before the dict is deep-frozen.
+  - "src/elspeth/web/composer/tools/_dispatch.py:_validate_and_freeze_tool_definition:defn"
+  # OpenAI strict-mode checker: each ``node`` is one subschema of an owned
+  # tool JSON Schema (the flat registry S or the wire projection W built from
+  # it). A JSON Schema node is an open keyword map by definition, so a
+  # TypedDict would have to enumerate every keyword the checker exists to
+  # reject; the helpers read it only after a ``type(x) is dict`` check.
+  - "src/elspeth/web/composer/tools/strict_profile.py:_type_names:node"
+  - "src/elspeth/web/composer/tools/strict_profile.py:_is_object:node"
+  - "src/elspeth/web/composer/tools/strict_profile.py:_is_array:node"
+  - "src/elspeth/web/composer/tools/strict_profile.py:_Walker.check_keywords:node"
+  - "src/elspeth/web/composer/tools/strict_profile.py:_Walker.check_object:node"
+  # Static wire projection W of the tool registry: every ``node``,
+  # ``parameters`` and ``function`` below is an owned JSON Schema subschema
+  # or LiteLLM function object derived at import from the registry S, and
+  # the returns are the provider wire format itself (OpenAI-compatible tool
+  # JSON). A JSON Schema node is an open keyword map by definition; the
+  # helpers read it only after a ``type(x) is dict`` check.
+  - "src/elspeth/web/composer/tools/wire_projection.py:_envelope:parameters"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_envelope:return"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_nullable:node"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_nullable:return"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_resolve_description:function"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_apply_overrides:function"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_subschemas:node"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_is_container_schema:node"
+  - "src/elspeth/web/composer/tools/wire_projection.py:wire_tool_definitions:return (list)"
+  - "src/elspeth/web/composer/tools/wire_projection.py:stamp_planner_terminal:return"
+  - "src/elspeth/web/composer/tools/wire_projection.py:WireTool.thawed_function:return"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_StrictProjection._ledger_sentence:node"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_StrictProjection.project:node"
+  # Wire decode/encode: ``raw`` is the JSON object a provider sent as tool-call
+  # arguments (Tier 3, parsed at the ``@trust_boundary`` on
+  # ``decode_wire_arguments``), ``arguments`` is decode's private working
+  # copy of it, and encode returns the provider wire form. Each is open
+  # model-authored JSON whose keys are exactly what the flat schema S admits;
+  # a TypedDict per tool would duplicate S, which stays the only contract.
+  - "src/elspeth/web/composer/tools/wire_projection.py:decode_wire_arguments:raw"
+  - "src/elspeth/web/composer/tools/wire_projection.py:_strip_null:arguments"
+  - "src/elspeth/web/composer/tools/wire_projection.py:encode_semantic_arguments:return"
+  - "src/elspeth/web/composer/tools/sources.py:_execute_set_source:args"
+  - "src/elspeth/web/composer/tools/transforms.py:_execute_upsert_node:args"
+  - "src/elspeth/web/composer/tools/transforms.py:_execute_upsert_edge:args"
+  - "src/elspeth/web/composer/tools/transforms.py:_execute_remove_node:args"
+  - "src/elspeth/web/composer/tools/transforms.py:_execute_remove_edge:args"
+  - "src/elspeth/web/composer/tools/transforms.py:_execute_set_metadata:args"
+  - "src/elspeth/web/composer/tools/outputs.py:_execute_set_output:args"
+  - "src/elspeth/web/composer/tools/outputs.py:_execute_remove_output:args"
+  # Handler wrappers normalize signatures for the tool registry (Sub-4x).
+  # Arguments are LLM-provided JSON dicts — inherently dynamic.
+  - "src/elspeth/web/composer/tools/sources.py:_handle_set_source:arguments"
+  - "src/elspeth/web/composer/tools/sources.py:_handle_list_sources:arguments"
+  - "src/elspeth/web/composer/tools/transforms.py:_handle_list_transforms:arguments"
+  - "src/elspeth/web/composer/tools/transforms.py:_handle_list_sinks:arguments"
+  - "src/elspeth/web/composer/tools/generation.py:_handle_get_plugin_schema:arguments"
+  - "src/elspeth/web/composer/tools/generation.py:_handle_get_expression_grammar:arguments"
+  - "src/elspeth/web/composer/tools/transforms.py:_handle_upsert_node:arguments"
+  - "src/elspeth/web/composer/tools/transforms.py:_handle_upsert_edge:arguments"
+  - "src/elspeth/web/composer/tools/transforms.py:_handle_remove_node:arguments"
+  - "src/elspeth/web/composer/tools/transforms.py:_handle_remove_edge:arguments"
+  - "src/elspeth/web/composer/tools/transforms.py:_handle_set_metadata:arguments"
+  - "src/elspeth/web/composer/tools/outputs.py:_handle_set_output:arguments"
+  - "src/elspeth/web/composer/tools/outputs.py:_handle_remove_output:arguments"
+  # Blob tool handlers — same pattern as above, LLM-provided arguments
+  - "src/elspeth/web/composer/tools/blobs.py:_handle_list_blobs:arguments"
+  - "src/elspeth/web/composer/tools/blobs.py:_handle_list_composer_blobs:arguments"
+  - "src/elspeth/web/composer/tools/blobs.py:_handle_get_blob_metadata:arguments"
+  # Blob inline marker patching writes into dynamic plugin option dicts; the
+  # validated marker grammar lives in contracts/blobs_inline.py.
+  - "src/elspeth/web/composer/tools/blobs.py:_set_nested_option:container"
+  - "src/elspeth/web/composer/tools/blobs.py:_set_nested_option:return"
+  - "src/elspeth/web/composer/tools/blobs.py:_apply_inline_blob_marker:marker"
+  - "src/elspeth/web/composer/tools/sources.py:_execute_set_source_from_blob:arguments"
+  - "src/elspeth/web/composer/tools/sources.py:_execute_set_source_from_blobs:arguments"
+  - "src/elspeth/web/composer/tools/sources.py:_execute_inspect_source:arguments"
+  # Recipe slot validation — operator-supplied slot dicts (Tier-3) and the
+  # set_pipeline-shaped args dict each recipe builds. Both shapes are
+  # documented contracts but inherently dynamic key spaces; capturing them
+  # in a TypedDict per recipe would duplicate the SlotSpec table.
+  # Source inspection — operator-supplied JSON sample objects (Tier-3) and
+  # the JSON-safe dict returned to the LLM tool channel.
+  - "src/elspeth/web/composer/source_inspection.py:_facts_from_objects:objects (list)"
+  - "src/elspeth/web/composer/source_inspection.py:facts_to_dict:return"
+  # proof_diagnostics — JSON-safe dicts returned to the LLM tool channel.
+  # Each entry has {code, severity, message, suggested_repair, evidence_locator}
+  # and is consumed by the forced-repair loop (service.py) and the convergence
+  # eval harness (evals/lib/composer_rgr_score.py).
+  # Blocking-diagnostic payloads use a local TypedDict; the dynamic dict
+  # allowance remains only for the top-level LLM-visible diagnostics list.
+  # _attempt_proof_repair appends a synthesised user-role message to the
+  # OpenAI-format chat completion list. Each entry is the documented chat
+  # message shape ({role, content, ...}) which is inherently dynamic.
+  - "src/elspeth/web/composer/composition_completion.py:CompositionCompletion._attempt_proof_repair:llm_messages (list)"
+  # Deterministic advisor checkpoints (elspeth-dac6602a2b): the early/preflight
+  # advisory passes append their guidance to the SAME OpenAI chat-completion
+  # ``llm_messages`` list ({role, content, ...}) shared across the compose loop,
+  # the same shape exemption the proof-repair entries above already carry.
+  # ``_build_checkpoint_arguments`` returns the checkpoint tool-call argument dict
+  # (heterogeneous {phase, state-derived scalars}), not reducible to a TypedDict —
+  # same rationale as ``_build_session_aware_kwargs:return`` below.
+  - "src/elspeth/web/composer/composition_completion.py:CompositionCompletion._attempt_preflight_repair:llm_messages (list)"
+  - "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._maybe_run_early_checkpoint:llm_messages (list)"
+  - "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._build_checkpoint_arguments:return"
+  # R2-F14 (elspeth-5403f346c0): the format-retry helper returns a COPY of that
+  # same checkpoint-argument dict with the verdict-format re-prompt appended to
+  # ``problem_summary``. Identical shape, identical rationale — it cannot be a
+  # TypedDict without ``_build_checkpoint_arguments`` becoming one first.
+  - "src/elspeth/web/composer/advisor_policy.py:advisor_arguments_with_format_reprompt:return"
+  # Phase 5b Task 5 follow-on: session-aware async tool dispatch. The
+  # ``arguments`` dict is Tier-3 LLM-supplied JSON; the per-handler
+  # Pydantic boundary inside the tool surface validates the shape. The
+  # ``llm_messages`` list is the OpenAI chat-completion list shared with
+  # the rest of the compose loop, with the same {role, content, ...}
+  # shape exemption that the proof-repair path already enjoys. The
+  # ``_build_session_aware_kwargs`` return is a dict[str, Any] because
+  # each handler in ``_SESSION_AWARE_TOOL_HANDLERS`` accepts a
+  # heterogeneous kwarg set (state, service-method references, snapshot
+  # scalars) that cannot be reduced to a single TypedDict.
+  - "src/elspeth/web/composer/session_tool.py:SessionToolOwner._dispatch_session_aware_tool:arguments"
+  - "src/elspeth/web/composer/session_tool.py:SessionToolOwner._dispatch_session_aware_tool:llm_messages (list)"
+  - "src/elspeth/web/composer/session_tool.py:SessionToolOwner._build_session_aware_kwargs:arguments"
+  - "src/elspeth/web/composer/session_tool.py:SessionToolOwner._build_session_aware_kwargs:return"
+  # ``_apply_openrouter_app_identity`` mutates the LiteLLM ``acompletion``
+  # kwargs in place to brand OpenRouter-routed composer calls as ELSPETH. The
+  # kwargs are LiteLLM's open-ended completion surface (``acompletion(**kwargs:
+  # Any)``) — the same untyped external-library boundary as the entries above —
+  # so it cannot be reduced to a TypedDict without shadowing LiteLLM's own API.
+  - "src/elspeth/web/composer/provider_gateway.py:_apply_openrouter_app_identity:kwargs"
+  # ``_apply_endpoint_kwargs`` (Phase 3 Task 2 endpoint affordance) adds
+  # ``api_base``/``api_key`` to the same open-ended LiteLLM ``acompletion``
+  # kwargs dict as the entry above, for the same reason: it is LiteLLM's
+  # untyped external-library completion surface, not a contract this
+  # codebase owns the shape of.
+  - "src/elspeth/web/composer/provider_gateway.py:_apply_endpoint_kwargs:kwargs"
+  # ``_apply_openrouter_usage_accounting`` pins OpenRouter's usage-accounting
+  # opt-in (elspeth-190a5c4668) on the same open-ended LiteLLM ``acompletion``
+  # kwargs dict as the two entries above, for the same reason: it is LiteLLM's
+  # untyped external-library completion surface, not a contract this codebase
+  # owns the shape of.
+  - "src/elspeth/web/composer/provider_gateway.py:_apply_openrouter_usage_accounting:kwargs"
+  # Native thinking augments an external LiteLLM message while preserving all
+  # existing wire fields and producer guard partitions. The native blocks are
+  # admitted separately by parse_native_thinking_blocks; this helper does not
+  # claim ownership of LiteLLM's open message schema.
+  - "src/elspeth/web/composer/provider_thinking.py:attach_provider_thinking:message"
+  - "src/elspeth/web/composer/provider_thinking.py:attach_provider_thinking:return"
+  # Secret tool handlers — same pattern as above, LLM-provided arguments
+  - "src/elspeth/web/composer/tools/secrets.py:_handle_list_secret_refs:arguments"
+  - "src/elspeth/web/composer/tools/secrets.py:_handle_validate_secret_ref:arguments"
+  - "src/elspeth/web/composer/tools/secrets.py:_execute_wire_secret_ref:arguments"
+  # RFC 7386 merge-patch helper — patch dict is Tier 3 (LLM-provided)
+  - "src/elspeth/web/composer/tools/_common.py:_apply_merge_patch:patch"
+  - "src/elspeth/web/composer/tools/_common.py:_apply_merge_patch:return"
+  # Pipeline-level set/patch tool handlers — same pattern as above
+  - "src/elspeth/web/composer/tools/sessions.py:_execute_set_pipeline:args"
+  - "src/elspeth/web/composer/tools/sessions.py:_handle_set_pipeline:arguments"
+  - "src/elspeth/web/composer/tools/sources.py:_execute_patch_source_options:args"
+  - "src/elspeth/web/composer/tools/sources.py:_handle_patch_source_options:arguments"
+  - "src/elspeth/web/composer/tools/transforms.py:_execute_patch_node_options:args"
+  - "src/elspeth/web/composer/tools/transforms.py:_handle_patch_node_options:arguments"
+  - "src/elspeth/web/composer/tools/outputs.py:_execute_patch_output_options:args"
+  - "src/elspeth/web/composer/tools/outputs.py:_handle_patch_output_options:arguments"
+  - "src/elspeth/web/composer/tools/_common.py:_source_options_for_prevalidation:return"
+  # Wave 4 tool handlers — same pattern as above, LLM-provided arguments
+  - "src/elspeth/web/composer/tools/sources.py:_execute_clear_source:args"
+  - "src/elspeth/web/composer/tools/sources.py:_handle_clear_source:arguments"
+  - "src/elspeth/web/composer/tools/generation.py:_execute_explain_validation_error:args"
+  - "src/elspeth/web/composer/tools/generation.py:_execute_get_plugin_assistance:args"
+  - "src/elspeth/web/composer/tools/generation.py:_execute_list_models:args"
+  - "src/elspeth/web/composer/tools/generation.py:_execute_get_audit_info:args"
+  - "src/elspeth/web/composer/tools/generation.py:_execute_preview_pipeline:args"
+  - "src/elspeth/web/composer/tools/_common.py:diff_states:return"
+  - "src/elspeth/web/composer/redaction.py:redact_source_storage_path:state_dict"
+  - "src/elspeth/web/composer/redaction.py:redact_source_storage_path:return"
+  # Planner-visible projection of a serialized CompositionState (elspeth-c67fbbbd83):
+  # same serialized-state dict shape as redact_source_storage_path above.
+  - "src/elspeth/web/composer/prompts.py:project_server_owned_option_metadata:serialized"
+  - "src/elspeth/web/composer/prompts.py:project_server_owned_option_metadata:return"
+  - "src/elspeth/web/interpretation_state.py:project_planner_context_interpretation_requirement:return"
+  - "src/elspeth/web/composer/tools/blobs.py:_execute_create_blob:arguments"
+  - "src/elspeth/web/composer/tools/blobs.py:_execute_update_blob:arguments"
+  - "src/elspeth/web/composer/tools/blobs.py:_execute_delete_blob:arguments"
+  - "src/elspeth/web/composer/tools/blobs.py:_execute_get_blob_content:arguments"
+  # Same LLM-owned arguments as the paged reader above; parsed immediately
+  # through ReadAttachmentArgumentsModel before any blob access.
+  - "src/elspeth/web/composer/tools/blobs.py:_execute_read_attachment:arguments"
+  - "src/elspeth/web/composer/tools/blobs.py:_execute_wire_blob_inline_ref:arguments"
+  - "src/elspeth/web/composer/tools/generation.py:_execute_diff_pipeline:args"
+  - "src/elspeth/web/composer/tools/sessions.py:_execute_get_pipeline_state:args"
+  # Serialization helpers — produce JSON dicts for LLM tool responses.
+  # ``_serialize_node`` left this list at elspeth-e405ad7cd2 (RED5-2): its return is now the
+  # ``_SetPipelineNodePayload`` TypedDict the envelope census reads, so there is no bare dict
+  # pattern left to exempt.
+  - "src/elspeth/web/composer/tools/_common.py:_serialize_source:return"
+  - "src/elspeth/web/composer/tools/_common.py:_serialize_output:return"
+  - "src/elspeth/web/composer/tools/_common.py:_serialize_edge:return"
+  - "src/elspeth/web/composer/tools/generation.py:_serialize_plugin_assistance_example:return"
+  # Prevalidation helpers — options dicts are user-authored plugin config (Tier 3)
+  - "src/elspeth/web/composer/tools/_common.py:_compute_validation_delta:return"
+  - "src/elspeth/web/composer/tools/_common.py:_mask_pending_interpretation_placeholders_for_authoring_validation:options"
+  - "src/elspeth/web/composer/tools/_common.py:_validate_sink_path:options"
+  - "src/elspeth/web/composer/tools/_common.py:_prevalidate_plugin_options:options"
+  - "src/elspeth/web/composer/tools/_common.py:_prevalidate_plugin_options:injected_fields"
+  - "src/elspeth/web/composer/tools/_common.py:_deferred_value_source_error:options"
+  - "src/elspeth/web/composer/tools/_common.py:_prevalidate_sink:options"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # WEB SECRETS — Dialect-specific SQLAlchemy upsert builders
+  # `values` is the SQLAlchemy Core `insert().values(**mapping)` input — a
+  # column-name → column-value dict. SQLAlchemy dispatches per-column type
+  # handling internally, so a TypedDict here would duplicate Column metadata
+  # without adding safety. `_upsert_update_mapping` builds the same shape
+  # from the dialect-specific excluded/inserted namespace.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - "src/elspeth/web/secrets/user_store.py:_upsert_update_mapping:return"
+
+  # WEB COMPOSER — provider-bound LLM message lists. In-process persisted
+  # history uses ComposerHistoryMessage; only the outbound provider shapes
+  # remain dynamic because LiteLLM defines them as list[dict[str, Any]].
+  - "src/elspeth/web/composer/llm_response_parsing.py:build_llm_call_record:messages (list)"
+  # Late-binding capture of the per-tool-call arguments inside the
+  # dispatch_with_audit closure. The loop-local `arguments` is a Tier-3
+  # parsed dict (LLM-supplied tool call arguments — no schema available
+  # at this site, validation already happened above) and the closure
+  # default-argument pattern shadows it as `_arguments` to silence B023.
+  # Moved service.py -> tool_batch.py: the _do_dispatch closure was extracted
+  # verbatim into the module-level run_tool_batch (composer/service.py
+  # decomposition); same Tier-3 parsed-dict semantics, no enclosing class now.
+  - "src/elspeth/web/composer/tool_batch.py:_do_dispatch:_arguments"
+  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._build_messages:return (list)"
+  # Reply-only requests quote tool protocol records within the same external
+  # LiteLLM message shape; persisted history remains nominally typed.
+  - "src/elspeth/web/composer/service.py:_reply_only_messages:llm_messages (list)"
+  - "src/elspeth/web/composer/service.py:_reply_only_messages:return (list)"
+  - "src/elspeth/web/composer/provider_gateway.py:composer_loop_tool_definitions:return (list)"
+  # LiteLLM request kwargs for the compose loop and the pipeline planner,
+  # built once so the boot probe sends exactly what production sends.
+  # ``litellm.acompletion(**kwargs)`` takes an open keyword mapping.
+  - "src/elspeth/web/composer/provider_gateway.py:build_composer_loop_request_kwargs:return"
+  - "src/elspeth/web/composer/pipeline_planner.py:build_planner_request_kwargs:return"
+  - "src/elspeth/web/composer/boot_probe.py:ComposerProbeRequest.to_litellm_kwargs:return"
+  - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm:messages (list)"
+  - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm:tools (list)"
+  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm_before_deadline:messages (list)"
+  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm_before_deadline:tools (list)"
+  - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm_with_audit:messages (list)"
+  - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm_with_audit:tools (list)"
+  # Advisor argument validator (F3 fix). Receives the same LLM-tool-call
+  # payload; returns the admitted model or an owned AdvisorArgumentRejection.
+  - "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._validate_advisor_arguments:arguments"
+  # Advisor transcript wire adapters carry heterogeneous provider messages and
+  # ordinary chat/audit event variants. Owned history/event classes validate
+  # session, call, parent and payload bindings; these mappings only serialize,
+  # redact or enrich that evidence and never confer dispatch authority.
+  - "src/elspeth/web/composer/advisor_transcript.py:_json_object:return"
+  - "src/elspeth/web/composer/advisor_transcript.py:_visible_calls:return (list)"
+  - "src/elspeth/web/composer/advisor_transcript.py:_wire_event:return"
+  - "src/elspeth/web/composer/advisor_transcript.py:_redacted_events:events (list)"
+  - "src/elspeth/web/composer/advisor_transcript.py:_recover_read_bodies:events (list)"
+  - "src/elspeth/web/composer/visible_tool_event.py:VisibleToolEvent.to_envelope:return"
+  - "src/elspeth/web/composer/visible_tool_event.py:visible_response_gap:return"
+  # elspeth-4e79436719 §Phase 3: Anthropic cache_control marker transform
+  # operates on the same provider-call payload shape as the call sites above.
+  # The `tools` parameter is typed `list | None`, so the contracts check
+  # treats it as a separate shape; only `messages (list)` is whitelisted here.
+  - "src/elspeth/web/composer/llm_response_parsing.py:apply_anthropic_cache_markers:messages (list)"
+  - "src/elspeth/web/composer/prompts.py:build_messages:return (list)"
+
+  # WEB BLOB/SESSION PIPELINE ADAPTERS — canonical runtime/YAML dict shape.
+  # These helpers bridge SQL composition rows to the existing YAML/runtime
+  # serializer surface, whose canonical representation is intentionally a
+  # dynamic pipeline dict keyed by plugin graph sections.
+
+  # Contract checker import-indexing reconciliation (elspeth-b05961e6c2).
+  # Editing scripts/check_contracts.py triggers the full contracts gate. The
+  # rows below are existing web/API JSON payload surfaces that remain dynamic:
+  # provider message lists, JSON Schema dicts, recovery/API response payloads,
+  # and discovery tool descriptors. They are
+  # allowlisted here so the stricter import index can land without rewriting
+  # web source in the checker bugfix.
+  - "src/elspeth/web/interpretation_state.py:refine_prompt_shield_warnings_for_availability:return (list)"
+  - "src/elspeth/web/composer/audit.py:_public_llm_call_audit_payload:return"
+  - "src/elspeth/web/composer/yaml_generator.py:_has_blob_binding:options"
+  - "src/elspeth/web/composer/yaml_generator.py:_has_bind_source_mode:options"
+  - "src/elspeth/web/composer/composition_completion.py:CompositionCompletion._evaluate_terminal_no_tool_advisor_gate:llm_messages (list)"
+  - "src/elspeth/web/composer/discovery_cache.py:make_cache_key:arguments"
+  - "src/elspeth/web/catalog/service.py:CatalogServiceImpl._secret_requirements:schema"
+  - "src/elspeth/web/catalog/schema_parse.py:required_secret_fields_from_json_schema:schema"
+  - "src/elspeth/web/catalog/schema_parse.py:common_required_secret_fields_from_discriminated:schema"
+  - "src/elspeth/web/execution/diagnostics.py:llm_safe_diagnostics_snapshot:return"
+  - "src/elspeth/web/sessions/routes/_helpers.py:_recovery_partial_state_response:return"
+  - "src/elspeth/web/composer/tools/_dispatch.py:_closed_root_schema:return"
+  # Current branch reconciliation: intentional heterogeneous telemetry,
+  # framework kwargs, Tier-3 payloads, plugin config, and pipeline-row shapes.
+  - "src/elspeth/telemetry/serialization.py:serialize_otlp_event_attributes:return"
+  - "src/elspeth/web/interpretation_state.py:serialize_authoring_review_options:return"
+  - "src/elspeth/web/readiness.py:_readiness_engine_kwargs:return"
+  - "src/elspeth/web/execution/preflight.py:_authored_options:return"
+  - "src/elspeth/web/execution/preflight.py:audit_safe_resolved_config:return"
+  - "src/elspeth/web/execution/preflight.py:restore_options:component"
+  # Authored YAML is an open plugin config until ElspethSettings validates it.
+  # Operator marking copies only the export subtree; all other keys survive.
+  - "src/elspeth/web/execution/export_marking.py:operator_marked_config_dict:config"
+  - "src/elspeth/web/execution/export_marking.py:operator_marked_config_dict:return"
+  - "src/elspeth/web/execution/service.py:_trained_operator_catalog_and_snapshot:kwargs"
+  - "src/elspeth/web/composer/tools/transforms.py:_normalized_splice_node_projection:return"
+  - "src/elspeth/web/composer/tools/transforms.py:_execute_splice_transform:args"
+  - "src/elspeth/web/composer/tools/transforms.py:_handle_splice_transform:arguments"
+  - "src/elspeth/plugins/sinks/text_sink.py:TextSink.__init__:config"
+  - "src/elspeth/plugins/sinks/text_sink.py:TextSink.write:rows (list)"
+  - "src/elspeth/plugins/sinks/document_sink.py:DocumentSink.__init__:config"
+  - "src/elspeth/plugins/sinks/document_sink.py:DocumentSink.write:rows (list)"
+  - "src/elspeth/plugins/sinks/aws_s3_sink.py:AWSS3Sink.__init__:config"
+  - "src/elspeth/plugins/sinks/aws_s3_sink.py:AWSS3Sink.write:rows (list)"
+  - "src/elspeth/plugins/sources/aws_s3_source.py:_new_json_object:return"
+  - "src/elspeth/plugins/sources/aws_s3_source.py:_record_download_call:response_data"
+  - "src/elspeth/plugins/sources/aws_s3_source.py:_record_download_call:error_data"
+  - "src/elspeth/plugins/sources/aws_s3_source.py:AWSS3Source.__init__:config"
+  - "src/elspeth/plugins/transforms/aws/_guardrail_transform.py:BedrockGuardrailTransformBase.__init__:config"
+  - "src/elspeth/plugins/transforms/aws/_guardrail_transform.py:BedrockGuardrailTransformBase.probe_config:return"
+  - "src/elspeth/plugins/transforms/aws/bedrock_prompt_shield.py:AWSBedrockPromptShield.__init__:config"
+  - "src/elspeth/plugins/transforms/aws/bedrock_content_safety.py:AWSBedrockContentSafety.__init__:config"
+  - "src/elspeth/plugins/transforms/llm/providers/bedrock.py:BedrockLLMProvider.execute_query:response_format"

@@ -1,0 +1,14 @@
+per_file_rules:
+- pattern: core/dag/group_bindings.py
+  rules:
+  - FG3
+  reason: GroupBindingRegistry._expand_groups is the runtime EXPAND-group mint-path index
+    (register_expand_group writes it after construction, potentially after the graph is
+    frozen) — freezing it would defeat its purpose. The two container fields that ARE
+    build-time-derivable, _fork_binding_by_member and _expand_binding_by_opener, ARE frozen
+    via object.__setattr__(self, ..., deep_freeze(...)) in __post_init__; only the
+    genuinely-mutable runtime index is exempted here. Reviewed precedent is
+    config/cicd/enforce_frozen_annotations/existing.yaml's ToolBatchContext.discovery_cache
+    entry (same shape — a frozen dataclass holding one deliberately-mutable cache/index).
+  expires: null
+  max_hits: 1

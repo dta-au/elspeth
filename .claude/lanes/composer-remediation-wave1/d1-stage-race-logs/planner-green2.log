@@ -1,0 +1,76 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 45 items / 28 deselected / 17 selected
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py ............. [ 76%]
+...                                                                      [ 94%]
+tests/unit/web/composer/test_audit_cohort_settlement.py F                [100%]
+
+=================================== FAILURES ===================================
+_ test_resource_race_after_planner_admission_preserves_cohort_once_and_no_candidate_verdict _
+
+composer_service_with_real_sessions = <elspeth.web.composer.service.ComposerServiceImpl object at 0x7ff13a74dd90>
+result_session_id = 'b9ce52eb-90b1-4799-9877-f64e4d02cf3e'
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-118/test_resource_race_after_plann0')
+
+    @pytest.mark.asyncio
+    async def test_resource_race_after_planner_admission_preserves_cohort_once_and_no_candidate_verdict(
+        composer_service_with_real_sessions: ComposerServiceImpl,
+        result_session_id: str,
+        tmp_path,
+    ) -> None:
+        from dataclasses import replace
+    
+        from sqlalchemy import update
+    
+        from elspeth.web.blobs.service import BlobServiceImpl
+        from elspeth.web.sessions.models import blobs_table, composition_states_table, proposal_events_table
+        from elspeth.web.sessions.proposal_blob_refs import validate_proposal_blob_references
+        from tests.integration.web.composer.test_freeform_proposal_prevalidation import _valid_pipeline_args
+    
+        service = composer_service_with_real_sessions
+        sessions = service._sessions_service
+        user_message_id = await _seed_user_message(sessions, result_session_id)
+        state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+        async with acquire_compose_context(sessions, result_session_id) as context:
+            blob = await BlobServiceImpl(sessions._engine, tmp_path).create_blob(
+                UUID(result_session_id), "input.csv", b"value\n1\n", "text/csv", session_operation_context=context
+            )
+            arguments = _valid_pipeline_args(tmp_path)
+            arguments["source"]["blob_id"] = str(blob.id)
+>           candidate = CompositionState.from_dict({**arguments, "version": 2,
+                "outputs": [{**output, "name": output["sink_name"]} for output in arguments["outputs"]]})
+
+tests/unit/web/composer/test_audit_cohort_settlement.py:737: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/composer/state.py:8437: in from_dict
+    metadata=PipelineMetadata.from_dict(d["metadata"]),
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+cls = <class 'elspeth.web.composer.state.PipelineMetadata'>
+d = {'name': 'proposal-valid'}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Self:
+        """Reconstruct from a plain dict (inverse of to_dict serialisation)."""
+        return cls(
+            name=d["name"],
+>           description=d["description"],
+                        ^^^^^^^^^^^^^^^^
+        )
+E       KeyError: 'description'
+
+src/elspeth/web/composer/state.py:680: KeyError
+---------------------------- Captured stdout setup -----------------------------
+2026-11-09 13:17:58 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:17:58 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:17:58 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_audit_cohort_settlement.py::test_resource_race_after_planner_admission_preserves_cohort_once_and_no_candidate_verdict
+================= 1 failed, 16 passed, 28 deselected in 18.05s =================

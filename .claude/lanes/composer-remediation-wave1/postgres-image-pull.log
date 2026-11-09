@@ -1,0 +1,50 @@
+16-alpine: Pulling from library/postgres
+881fc932939e: Pulling fs layer
+fd818ebd7c87: Pulling fs layer
+07e60219949d: Pulling fs layer
+ec3414c15456: Pulling fs layer
+a8b9fccd8d77: Pulling fs layer
+850c0285d2f3: Pulling fs layer
+ac5e852d5d1d: Pulling fs layer
+55cd3be29a9d: Pulling fs layer
+108fda73eb54: Pulling fs layer
+45a91a95fdfe: Pulling fs layer
+9df8a060171e: Pulling fs layer
+ec3414c15456: Waiting
+a8b9fccd8d77: Waiting
+850c0285d2f3: Waiting
+55cd3be29a9d: Waiting
+ac5e852d5d1d: Waiting
+108fda73eb54: Waiting
+45a91a95fdfe: Waiting
+9df8a060171e: Waiting
+fd818ebd7c87: Verifying Checksum
+fd818ebd7c87: Download complete
+07e60219949d: Download complete
+881fc932939e: Download complete
+881fc932939e: Pull complete
+ec3414c15456: Download complete
+fd818ebd7c87: Pull complete
+a8b9fccd8d77: Verifying Checksum
+a8b9fccd8d77: Download complete
+07e60219949d: Pull complete
+ec3414c15456: Pull complete
+a8b9fccd8d77: Pull complete
+ac5e852d5d1d: Verifying Checksum
+ac5e852d5d1d: Download complete
+55cd3be29a9d: Verifying Checksum
+55cd3be29a9d: Download complete
+108fda73eb54: Download complete
+45a91a95fdfe: Download complete
+9df8a060171e: Download complete
+850c0285d2f3: Verifying Checksum
+850c0285d2f3: Download complete
+850c0285d2f3: Pull complete
+ac5e852d5d1d: Pull complete
+55cd3be29a9d: Pull complete
+108fda73eb54: Pull complete
+45a91a95fdfe: Pull complete
+9df8a060171e: Pull complete
+Digest: sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139
+Status: Downloaded newer image for postgres:16-alpine
+docker.io/library/postgres:16-alpine

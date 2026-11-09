@@ -1,0 +1,474 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 8 items
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py ......FF      [100%]
+
+=================================== FAILURES ===================================
+_ test_real_canonical_terminal_refusal_http_rejects_once_without_state_publication[executor-argument-public] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-141/test_real_canonical_terminal_r6/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fd314a88fb0>, UUID('b4b22ccc-e628-49c1-9287-900f39a50660'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-141/test_real_canonical_terminal_r6')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fd3146c0e30>
+owned = False, recovered = False, argument_site = 'executor'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owned", [False, True], ids=["public", "owned"])
+    @pytest.mark.parametrize(
+        "recovered,argument_site",
+        [(False, None), (True, None), (False, "build"), (False, "executor")],
+        ids=["fresh", "persisted-success", "build-argument", "executor-argument"],
+    )
+    async def test_real_canonical_terminal_refusal_http_rejects_once_without_state_publication(
+        operation_store, tmp_path, monkeypatch, owned, recovered, argument_site
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import func
+    
+        from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+        from elspeth.core.canonical import stable_hash
+        from elspeth.web.catalog.policy_view import PolicyCatalogView
+        from elspeth.web.composer.audit import begin_dispatch, dispatch_with_audit
+        from elspeth.web.composer.pipeline_commit import _bind_executor_content_hash
+        from elspeth.web.composer.pipeline_proposal import (
+            PipelineProposal,
+            PresentBase,
+            composition_content_hash,
+            owned_composition_state_authority,
+            owned_composition_state_review_arguments,
+        )
+        from elspeth.web.composer.protocol import ToolArgumentError
+        from elspeth.web.composer.redaction import redact_tool_call_arguments
+        from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+        from elspeth.web.composer.tools import ToolContext, build_set_pipeline_candidate, execute_tool
+        from elspeth.web.dependencies import create_catalog_service
+        from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+        from elspeth.web.sessions.models import chat_messages_table, composition_states_table
+        from elspeth.web.sessions.protocol import CompositionStateData
+        from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
+        from tests.integration.web.composer.test_pipeline_proposal_lifecycle import _runnable_pipeline
+        from tests.unit.web.coordination.test_composer_operation_authority import start
+    
+        engine, repository, _authority, service, sid = operation_store
+        record, running = start(operation_store)
+        context = running.session_operation_context
+        from uuid import UUID
+    
+        user = await service.add_message_with_transcript(
+            sid,
+            "user",
+            "Keep the current pipeline",
+            operation_id=UUID(record.operation_id),
+            requested_state_id=None,
+            writer_principal="route_user_message",
+            session_operation_context=context,
+            running=running,
+        )
+        catalog = create_catalog_service()
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+        public = _runnable_pipeline(tmp_path, sid)
+        empty = _initial_composition_state()
+        candidate = build_set_pipeline_candidate(
+            public,
+            empty,
+            ToolContext(
+                catalog=policy,
+                plugin_snapshot=snapshot,
+                data_dir=str(tmp_path),
+                session_id=str(sid),
+                session_engine=engine,
+                session_operation_context=context,
+                session_operation_authority=service.session_operation_authority,
+                user_id="alice",
+                require_data_dir_for_paths=True,
+            ),
+        )
+        assert candidate.acceptable
+        state = replace(candidate.result.updated_state, version=7)
+        payload = state.to_dict()
+        saved = await service.save_composition_state(
+            sid,
+            CompositionStateData(
+                sources=payload["sources"],
+                nodes=payload["nodes"],
+                edges=payload["edges"],
+                outputs=payload["outputs"],
+                metadata_=payload["metadata"],
+            ),
+            provenance="tool_call",
+            session_operation_context=context,
+        )
+        proposed = state
+        if argument_site == "executor":
+            proposed = replace(state, metadata=replace(state.metadata, name="Changed candidate"))
+            public["metadata"] = {"name": proposed.metadata.name, "description": proposed.metadata.description}
+        arguments = owned_composition_state_authority(proposed) if owned else public
+        plan = PipelinePlanResult(
+            proposal=PipelineProposal.create(
+                pipeline=arguments, base=PresentBase(saved.id, composition_content_hash(state)), repair_count=0, skill_hash=stable_hash("skill")
+            ),
+            tool_call_id="equal-terminal",
+            custody_result="not_required",
+            model_identifier="model",
+            model_version="v1",
+            provider="test",
+        )
+        row = await service.create_pipeline_composition_proposal(
+            session_id=sid,
+            plan=plan,
+            summary="Keep pipeline",
+            rationale="Requested",
+            affects=("graph",),
+            actor="composer-web:user:alice",
+            arguments_redacted_json=redact_tool_call_arguments(
+                "set_pipeline", owned_composition_state_review_arguments(arguments) if owned else arguments, telemetry=NoopRedactionTelemetry()
+            ),
+            composer_model_identifier="model",
+            composer_model_version="v1",
+            composer_provider="test",
+            session_operation_context=context,
+            user_message_id=user.message.id,
+        )
+        binding = None
+        if recovered:
+            recorder = BufferingRecorder()
+    
+            async def dispatch():
+                return execute_tool(
+                    "set_pipeline",
+                    public,
+                    state,
+                    policy,
+                    plugin_snapshot=snapshot,
+                    data_dir=str(tmp_path),
+                    session_id=str(sid),
+                    session_engine=engine,
+                    session_operation_context=context,
+                    session_operation_authority=service.session_operation_authority,
+                    user_id="alice",
+                )
+    
+            outcome = await dispatch_with_audit(
+                recorder=recorder,
+                audit=begin_dispatch(row.tool_call_id, "set_pipeline", arguments, version_before=state.version, actor="user:alice"),
+                do_dispatch=dispatch,
+                version_after_provider=lambda result: result.updated_state.version,
+                arg_error_payload_factory=lambda exc: {"error_class": "ToolArgumentError", "error_code": exc.category.value},
+            )
+            assert outcome.result.success
+            invocation = _bind_executor_content_hash(
+                recorder.invocations[0], executor_content_hash=composition_content_hash(outcome.result.updated_state)
+            )
+            bindings = await _persist_tool_invocations(
+                service, sid, (invocation,), None, plugin_crash_pending=False, session_operation_context=context
+            )
+            (binding,) = bindings
+        repository.release(context)
+        app = mounted_app(operation_store, tmp_path)
+        import elspeth.web.composer.pipeline_commit as commit
+    
+        def forbid_execution(*args, **kwargs):
+            pytest.fail("equal pending acceptance dispatched the executor")
+    
+        argument_error = ToolArgumentError(
+            argument="set_pipeline arguments",
+            expected="object conforming to SetPipelineArgumentsModel",
+            actual_type="invalid_schema",
+            code="SCHEMA_VALIDATION",
+            category=ToolArgumentErrorCategory.SCHEMA_SHAPE,
+        )
+    
+        def refuse_argument(*args, **kwargs):
+            raise argument_error
+    
+        monkeypatch.setattr(commit, "execute_tool", refuse_argument if argument_site == "executor" else forbid_execution)
+        if argument_site == "build":
+            monkeypatch.setattr(commit, "build_set_pipeline_candidate", refuse_argument)
+        with engine.connect() as conn:
+            before = conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            url = f"/api/sessions/{sid}/proposals/{row.id}/accept"
+            response = await client.post(url, json={"draft_hash": plan.proposal.draft_hash})
+            assert response.status_code == 422, response.text
+            assert response.json()["detail"]["error_type"] == ("proposal_argument_invalid" if argument_site else "proposal_no_change")
+            diagnosis = (
+                f"The composer's proposed change has invalid arguments: {argument_error.safe_message} "
+                if argument_site
+                else "The composer's proposed change does not change the current composition. "
+            )
+            assert response.json()["detail"]["detail"] == (
+                diagnosis + "The proposal has been automatically rejected. Ask the composer to revise and resubmit."
+            )
+            repeat = await client.post(url, json={"draft_hash": plan.proposal.draft_hash})
+            assert repeat.status_code == 409
+        reloaded = await service.get_authoritative_pipeline_proposal(session_id=sid, proposal_id=row.id)
+        assert reloaded.row.status == "rejected"
+        assert reloaded.row.committed_state_id is None
+        assert (await service.get_current_state(sid)).id == saved.id
+        events = proposal_events(engine, row.id)
+        assert len(events) == 1
+        assert events[0].actor == "system:pipeline_commit:user:alice"
+        assert events[0].payload["reason_code"] == ("validation_failed" if argument_site else "no_change")
+        assert events[0].payload["dispatch"] == (binding.to_dict() if binding is not None else None)
+        with engine.connect() as conn:
+            assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 1
+            if argument_site != "executor":
+                assert conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one() == before
+            else:
+                audit_rows = conn.execute(select(chat_messages_table.c.tool_calls).where(chat_messages_table.c.role == "audit")).scalars().all()
+                invocations = [
+                    item
+                    for calls in audit_rows
+                    if calls
+                    for item in calls
+>                   if item["_kind"] == "audit" and item["tool_call_id"] == row.tool_call_id
+                                                    ^^^^^^^^^^^^^^^^^^^^
+                ]
+E               KeyError: 'tool_call_id'
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:261: KeyError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:52:29 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:52:30 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:52:31 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:52:31 [warning  ] http_error_envelope            request_id=e9ea3ab9-0169-44cb-8dba-54e5f6623124 status_code=422
+_ test_real_canonical_terminal_refusal_http_rejects_once_without_state_publication[executor-argument-owned] _
+
+operation_store = (Engine(sqlite:////tmp/pytest-of-agent/pytest-141/test_real_canonical_terminal_r7/operations.db), <elspeth.web.coordin...lspeth.web.sessions.service.SessionServiceImpl object at 0x7fd316e7c830>, UUID('1b6f629a-5a5c-476a-a449-56277d2736a8'))
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-141/test_real_canonical_terminal_r7')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fd31423e4b0>
+owned = True, recovered = False, argument_site = 'executor'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owned", [False, True], ids=["public", "owned"])
+    @pytest.mark.parametrize(
+        "recovered,argument_site",
+        [(False, None), (True, None), (False, "build"), (False, "executor")],
+        ids=["fresh", "persisted-success", "build-argument", "executor-argument"],
+    )
+    async def test_real_canonical_terminal_refusal_http_rejects_once_without_state_publication(
+        operation_store, tmp_path, monkeypatch, owned, recovered, argument_site
+    ):
+        from dataclasses import replace
+    
+        from sqlalchemy import func
+    
+        from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+        from elspeth.core.canonical import stable_hash
+        from elspeth.web.catalog.policy_view import PolicyCatalogView
+        from elspeth.web.composer.audit import begin_dispatch, dispatch_with_audit
+        from elspeth.web.composer.pipeline_commit import _bind_executor_content_hash
+        from elspeth.web.composer.pipeline_proposal import (
+            PipelineProposal,
+            PresentBase,
+            composition_content_hash,
+            owned_composition_state_authority,
+            owned_composition_state_review_arguments,
+        )
+        from elspeth.web.composer.protocol import ToolArgumentError
+        from elspeth.web.composer.redaction import redact_tool_call_arguments
+        from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+        from elspeth.web.composer.tools import ToolContext, build_set_pipeline_candidate, execute_tool
+        from elspeth.web.dependencies import create_catalog_service
+        from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+        from elspeth.web.sessions.models import chat_messages_table, composition_states_table
+        from elspeth.web.sessions.protocol import CompositionStateData
+        from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
+        from tests.integration.web.composer.test_pipeline_proposal_lifecycle import _runnable_pipeline
+        from tests.unit.web.coordination.test_composer_operation_authority import start
+    
+        engine, repository, _authority, service, sid = operation_store
+        record, running = start(operation_store)
+        context = running.session_operation_context
+        from uuid import UUID
+    
+        user = await service.add_message_with_transcript(
+            sid,
+            "user",
+            "Keep the current pipeline",
+            operation_id=UUID(record.operation_id),
+            requested_state_id=None,
+            writer_principal="route_user_message",
+            session_operation_context=context,
+            running=running,
+        )
+        catalog = create_catalog_service()
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+        public = _runnable_pipeline(tmp_path, sid)
+        empty = _initial_composition_state()
+        candidate = build_set_pipeline_candidate(
+            public,
+            empty,
+            ToolContext(
+                catalog=policy,
+                plugin_snapshot=snapshot,
+                data_dir=str(tmp_path),
+                session_id=str(sid),
+                session_engine=engine,
+                session_operation_context=context,
+                session_operation_authority=service.session_operation_authority,
+                user_id="alice",
+                require_data_dir_for_paths=True,
+            ),
+        )
+        assert candidate.acceptable
+        state = replace(candidate.result.updated_state, version=7)
+        payload = state.to_dict()
+        saved = await service.save_composition_state(
+            sid,
+            CompositionStateData(
+                sources=payload["sources"],
+                nodes=payload["nodes"],
+                edges=payload["edges"],
+                outputs=payload["outputs"],
+                metadata_=payload["metadata"],
+            ),
+            provenance="tool_call",
+            session_operation_context=context,
+        )
+        proposed = state
+        if argument_site == "executor":
+            proposed = replace(state, metadata=replace(state.metadata, name="Changed candidate"))
+            public["metadata"] = {"name": proposed.metadata.name, "description": proposed.metadata.description}
+        arguments = owned_composition_state_authority(proposed) if owned else public
+        plan = PipelinePlanResult(
+            proposal=PipelineProposal.create(
+                pipeline=arguments, base=PresentBase(saved.id, composition_content_hash(state)), repair_count=0, skill_hash=stable_hash("skill")
+            ),
+            tool_call_id="equal-terminal",
+            custody_result="not_required",
+            model_identifier="model",
+            model_version="v1",
+            provider="test",
+        )
+        row = await service.create_pipeline_composition_proposal(
+            session_id=sid,
+            plan=plan,
+            summary="Keep pipeline",
+            rationale="Requested",
+            affects=("graph",),
+            actor="composer-web:user:alice",
+            arguments_redacted_json=redact_tool_call_arguments(
+                "set_pipeline", owned_composition_state_review_arguments(arguments) if owned else arguments, telemetry=NoopRedactionTelemetry()
+            ),
+            composer_model_identifier="model",
+            composer_model_version="v1",
+            composer_provider="test",
+            session_operation_context=context,
+            user_message_id=user.message.id,
+        )
+        binding = None
+        if recovered:
+            recorder = BufferingRecorder()
+    
+            async def dispatch():
+                return execute_tool(
+                    "set_pipeline",
+                    public,
+                    state,
+                    policy,
+                    plugin_snapshot=snapshot,
+                    data_dir=str(tmp_path),
+                    session_id=str(sid),
+                    session_engine=engine,
+                    session_operation_context=context,
+                    session_operation_authority=service.session_operation_authority,
+                    user_id="alice",
+                )
+    
+            outcome = await dispatch_with_audit(
+                recorder=recorder,
+                audit=begin_dispatch(row.tool_call_id, "set_pipeline", arguments, version_before=state.version, actor="user:alice"),
+                do_dispatch=dispatch,
+                version_after_provider=lambda result: result.updated_state.version,
+                arg_error_payload_factory=lambda exc: {"error_class": "ToolArgumentError", "error_code": exc.category.value},
+            )
+            assert outcome.result.success
+            invocation = _bind_executor_content_hash(
+                recorder.invocations[0], executor_content_hash=composition_content_hash(outcome.result.updated_state)
+            )
+            bindings = await _persist_tool_invocations(
+                service, sid, (invocation,), None, plugin_crash_pending=False, session_operation_context=context
+            )
+            (binding,) = bindings
+        repository.release(context)
+        app = mounted_app(operation_store, tmp_path)
+        import elspeth.web.composer.pipeline_commit as commit
+    
+        def forbid_execution(*args, **kwargs):
+            pytest.fail("equal pending acceptance dispatched the executor")
+    
+        argument_error = ToolArgumentError(
+            argument="set_pipeline arguments",
+            expected="object conforming to SetPipelineArgumentsModel",
+            actual_type="invalid_schema",
+            code="SCHEMA_VALIDATION",
+            category=ToolArgumentErrorCategory.SCHEMA_SHAPE,
+        )
+    
+        def refuse_argument(*args, **kwargs):
+            raise argument_error
+    
+        monkeypatch.setattr(commit, "execute_tool", refuse_argument if argument_site == "executor" else forbid_execution)
+        if argument_site == "build":
+            monkeypatch.setattr(commit, "build_set_pipeline_candidate", refuse_argument)
+        with engine.connect() as conn:
+            before = conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            url = f"/api/sessions/{sid}/proposals/{row.id}/accept"
+            response = await client.post(url, json={"draft_hash": plan.proposal.draft_hash})
+            assert response.status_code == 422, response.text
+            assert response.json()["detail"]["error_type"] == ("proposal_argument_invalid" if argument_site else "proposal_no_change")
+            diagnosis = (
+                f"The composer's proposed change has invalid arguments: {argument_error.safe_message} "
+                if argument_site
+                else "The composer's proposed change does not change the current composition. "
+            )
+            assert response.json()["detail"]["detail"] == (
+                diagnosis + "The proposal has been automatically rejected. Ask the composer to revise and resubmit."
+            )
+            repeat = await client.post(url, json={"draft_hash": plan.proposal.draft_hash})
+            assert repeat.status_code == 409
+        reloaded = await service.get_authoritative_pipeline_proposal(session_id=sid, proposal_id=row.id)
+        assert reloaded.row.status == "rejected"
+        assert reloaded.row.committed_state_id is None
+        assert (await service.get_current_state(sid)).id == saved.id
+        events = proposal_events(engine, row.id)
+        assert len(events) == 1
+        assert events[0].actor == "system:pipeline_commit:user:alice"
+        assert events[0].payload["reason_code"] == ("validation_failed" if argument_site else "no_change")
+        assert events[0].payload["dispatch"] == (binding.to_dict() if binding is not None else None)
+        with engine.connect() as conn:
+            assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 1
+            if argument_site != "executor":
+                assert conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one() == before
+            else:
+                audit_rows = conn.execute(select(chat_messages_table.c.tool_calls).where(chat_messages_table.c.role == "audit")).scalars().all()
+                invocations = [
+                    item
+                    for calls in audit_rows
+                    if calls
+                    for item in calls
+>                   if item["_kind"] == "audit" and item["tool_call_id"] == row.tool_call_id
+                                                    ^^^^^^^^^^^^^^^^^^^^
+                ]
+E               KeyError: 'tool_call_id'
+
+tests/unit/web/sessions/test_pipeline_rejection_callers.py:261: KeyError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 13:52:32 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:52:32 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 13:52:32 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 13:52:33 [warning  ] http_error_envelope            request_id=ed784211-b9d9-42de-8198-c46142375c28 status_code=422
+=========================== short test summary info ============================
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_real_canonical_terminal_refusal_http_rejects_once_without_state_publication[executor-argument-public]
+FAILED tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_real_canonical_terminal_refusal_http_rejects_once_without_state_publication[executor-argument-owned]
+========================= 2 failed, 6 passed in 17.00s =========================

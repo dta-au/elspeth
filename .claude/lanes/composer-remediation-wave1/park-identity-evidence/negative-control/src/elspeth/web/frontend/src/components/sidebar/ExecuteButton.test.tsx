@@ -1,0 +1,2193 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import {
+  ExecuteButton,
+  INTERPRETATION_PENDING_RUN_BLOCK_TITLE,
+  buildRunEgressSummary,
+  isRunGatingReadinessRow,
+  primaryRunBlockReason,
+} from "./ExecuteButton";
+import * as api from "@/api/client";
+import { useExecutionStore } from "@/stores/executionStore";
+import { useSessionStore } from "@/stores/sessionStore";
+import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
+import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
+import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
+import { resetStore } from "@/test/store-helpers";
+import type {
+  CompositionState,
+  PluginSummary,
+  ValidationResult,
+} from "@/types/index";
+import type { InterpretationEvent } from "@/types/interpretation";
+import type { AuditReadinessSnapshot } from "@/types/api";
+import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+import {
+  REQUEST_ARTIFACT_VIEW_EVENT,
+  REQUEST_RUN_EVENT,
+  type RequestArtifactViewDetail,
+} from "@/lib/composer-events";
+
+const READY_READINESS: ValidationResult["readiness"] = {
+  authoring_valid: true,
+  execution_ready: true,
+  completion_ready: true,
+  blockers: [],
+};
+
+const NOT_READY_READINESS = {
+  authoring_valid: false,
+  execution_ready: false,
+  completion_ready: false,
+  blockers: [],
+} as const;
+
+function makeInterpretationEvent(
+  overrides: Partial<InterpretationEvent> = {},
+): InterpretationEvent {
+  return {
+    id: "evt-1",
+    session_id: "sess-1",
+    composition_state_id: "state-1",
+    affected_node_id: "llm_classify",
+    tool_call_id: "tc-1",
+    user_term: "cool",
+    kind: "vague_term",
+    llm_draft: "engaging",
+    accepted_value: null,
+    choice: "pending",
+    created_at: "2026-05-18T10:00:00Z",
+    resolved_at: null,
+    actor: "user:owner:u-1",
+    interpretation_source: "user_approved",
+    model_identifier: "anthropic/claude-opus-4-7",
+    model_version: "20260518",
+    provider: "anthropic",
+    composer_skill_hash: "deadbeef",
+    arguments_hash: null,
+    hash_domain_version: null,
+    runtime_model_identifier_at_resolve: null,
+    runtime_model_version_at_resolve: null,
+    approved_prompt_artifact_hash: null,
+    ...overrides,
+  };
+}
+
+function makePluginSummary(
+  overrides: Partial<PluginSummary> = {},
+): PluginSummary {
+  return {
+    name: "stub_transform",
+    plugin_type: "transform",
+    description: "",
+    config_fields: [],
+    usage_when_to_use: null,
+    usage_when_not_to_use: null,
+    example_use: null,
+    capability_tags: [],
+    audit_characteristics: [],
+    ...overrides,
+  };
+}
+
+function makeComposition(
+  overrides: Partial<CompositionState> = {},
+): CompositionState {
+  return {
+    id: "state-1",
+    ...compositionStateAuthorityFields,
+    version: 1,
+    sources: {},
+    nodes: [],
+    edges: [],
+    outputs: [],
+    metadata: { name: null, description: null },
+    ...overrides,
+  };
+}
+
+describe("ExecuteButton", () => {
+  beforeEach(() => {
+    useExecutionStore.setState({
+      validationResult: null,
+      isExecuting: false,
+      progress: null,
+      error: null,
+      execute: vi.fn(),
+      runDisclosureAckBySession: {},
+    } as never);
+    useSessionStore.setState({
+      activeSessionId: null,
+      compositionState: null,
+      isComposing: false,
+    } as never);
+    resetStore(useInterpretationEventsStore);
+    resetStore(useAuditReadinessStore);
+    resetStore(usePluginCatalogStore);
+  });
+
+  it("renders nothing when there is no active session", () => {
+    const { container } = render(<ExecuteButton />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it("renders a Run pipeline button when validation has passed", () => {
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+
+    expect(
+      screen.getByRole("button", { name: /run pipeline/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("blocks Run and its shortcut while composing, then re-enables Run", () => {
+      useExecutionStore.setState({
+        validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS },
+        runDisclosureAckBySession: { "sess-1": true },
+      });
+      useSessionStore.setState({ activeSessionId: "sess-1" });
+      render(<ExecuteButton />);
+      const button = screen.getByRole("button", { name: "Run pipeline" });
+      expect(button).toBeEnabled();
+
+      act(() => useSessionStore.setState({ isComposing: true }));
+      expect(button).toBeDisabled();
+      expect(button).toHaveAttribute("aria-disabled", "true");
+      expect(screen.getByText("Wait for the composer to finish thinking.")).toBeInTheDocument();
+      fireEvent.click(button);
+      fireEvent(window, new CustomEvent(REQUEST_RUN_EVENT));
+      expect(useExecutionStore.getState().execute).not.toHaveBeenCalled();
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+
+      act(() => useSessionStore.setState({ isComposing: false }));
+      expect(button).toBeEnabled();
+      expect(button).not.toHaveAttribute("aria-disabled");
+      fireEvent.click(button);
+      expect(useExecutionStore.getState().execute).toHaveBeenCalledWith("sess-1");
+  });
+
+  it("blocks Run while a proposal decision or review resolve for this session is in flight (#352)", async () => {
+    useExecutionStore.setState({
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS },
+      runDisclosureAckBySession: { "sess-1": true },
+      isValidating: false,
+    });
+    useSessionStore.setState({ activeSessionId: "sess-1", proposalActionPendingIds: [] });
+    render(<ExecuteButton />);
+    const button = screen.getByRole("button", { name: "Run pipeline" });
+    expect(button).toBeEnabled();
+
+    // A proposal accept/reject POST holds the session's COMPOSE fence: the
+    // current version's verdict is still execution-ready, so only the
+    // in-flight gate keeps Run from a 409.
+    act(() => useSessionStore.setState({ proposalActionPendingIds: ["proposal-1"] }));
+    expect(button).toBeDisabled();
+    expect(
+      screen.getByText("Wait for your last change to finish saving and checking."),
+    ).toBeInTheDocument();
+    fireEvent.click(button);
+    fireEvent(window, new CustomEvent(REQUEST_RUN_EVENT));
+    expect(useExecutionStore.getState().execute).not.toHaveBeenCalled();
+    act(() => useSessionStore.setState({ proposalActionPendingIds: [] }));
+    expect(button).toBeEnabled();
+
+    // A resolve POST for this session in flight gates Run the same way.
+    let release!: (value: never) => void;
+    const resolveSpy = vi
+      .spyOn(api, "resolveInterpretation")
+      .mockReturnValueOnce(new Promise((resolve) => { release = resolve; }));
+    let resolution!: Promise<unknown>;
+    act(() => {
+      resolution = useInterpretationEventsStore
+        .getState()
+        .resolveEvent("sess-1", "evt-1", { choice: "accepted_as_drafted" })
+        .catch(() => undefined);
+    });
+    expect(button).toBeDisabled();
+    await act(async () => {
+      release({ event: makeInterpretationEvent({ id: "evt-1", choice: "accepted_as_drafted" }), new_state: null } as never);
+      await resolution;
+    });
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+    expect(useExecutionStore.getState().execute).toHaveBeenCalledWith("sess-1");
+    resolveSpy.mockRestore();
+  });
+
+  it("blocks an open Run confirmation when Composer starts thinking", () => {
+    useExecutionStore.setState({
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS },
+    });
+    useSessionStore.setState({ activeSessionId: "sess-1" });
+    render(<ExecuteButton />);
+    fireEvent.click(screen.getByRole("button", { name: "Run pipeline" }));
+    const dialog = screen.getByRole("alertdialog", { name: "Run pipeline" });
+
+    act(() => useSessionStore.setState({ isComposing: true }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Run pipeline" }));
+    expect(useExecutionStore.getState().execute).not.toHaveBeenCalled();
+  });
+
+  describe("launch failure beside Run (operator placement ruling 2026-09-13)", () => {
+    const READY_VALIDATION = {
+      is_valid: true,
+      checks: [],
+      errors: [],
+      warnings: [],
+      readiness: READY_READINESS,
+    };
+
+    it("shows the stored execution error beside Run as an alert", () => {
+      useExecutionStore.setState({
+        validationResult: READY_VALIDATION as never,
+        error: "A run is already in progress for this pipeline.",
+      } as never);
+      useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+      const { container } = render(<ExecuteButton />);
+
+      const alert = screen.getByRole("alert");
+      expect(alert).toHaveTextContent(
+        "A run is already in progress for this pipeline.",
+      );
+      expect(alert).toHaveClass("side-rail-execute-reason");
+      // DOM order: the reason slot precedes Run (workspace.css adjacency).
+      expect(alert.nextElementSibling).toBe(
+        screen.getByRole("button", { name: /run pipeline/i }),
+      );
+      // Exactly one reason-slot <p> — a second grid child would wrap the bar.
+      expect(container.querySelectorAll(".side-rail-execute-reason")).toHaveLength(1);
+    });
+
+    it("surfaces a launch failure that execute() writes after a Run click", async () => {
+      const execute = vi.fn(async () => {
+        useExecutionStore.setState({
+          isExecuting: false,
+          error: "Server readiness refused this run.",
+        } as never);
+        return null;
+      });
+      useExecutionStore.setState({
+        validationResult: READY_VALIDATION as never,
+        execute,
+        runDisclosureAckBySession: { "sess-1": true },
+      } as never);
+      useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+      render(<ExecuteButton />);
+      expect(screen.queryByRole("alert")).toBeNull();
+
+      fireEvent.click(screen.getByRole("button", { name: /run pipeline/i }));
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "Server readiness refused this run.",
+      );
+      expect(execute).toHaveBeenCalledWith("sess-1");
+    });
+
+    it("dismisses the failure line and clears the stored error", () => {
+      useExecutionStore.setState({
+        validationResult: READY_VALIDATION as never,
+        error: "Pipeline execution failed.",
+      } as never);
+      useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+      render(<ExecuteButton />);
+      fireEvent.click(
+        screen.getByRole("button", { name: /dismiss run failure/i }),
+      );
+
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(useExecutionStore.getState().error).toBeNull();
+    });
+
+    it("renders nothing extra when there is no stored error", () => {
+      useExecutionStore.setState({
+        validationResult: READY_VALIDATION as never,
+        error: null,
+      } as never);
+      useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+      const { container } = render(<ExecuteButton />);
+
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(container.querySelector(".side-rail-execute-reason")).toBeNull();
+    });
+
+    it("renders no empty alert for an empty stored error (Checks banner parity)", () => {
+      useExecutionStore.setState({
+        validationResult: READY_VALIDATION as never,
+        error: "",
+      } as never);
+      useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+      render(<ExecuteButton />);
+
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(
+        screen.queryByRole("button", { name: /dismiss run failure/i }),
+      ).toBeNull();
+    });
+
+    it("puts a stored error ahead of a live gate reason, and dismissing reveals the gate reason", () => {
+      // Realistic both-present case: validate()'s fetch failed, so the
+      // error is set AND validationResult is null (gate reason = not
+      // validated). The failure the user just hit takes the single slot.
+      useExecutionStore.setState({
+        validationResult: null,
+        error: "Validation encountered an internal error. Please try again.",
+      } as never);
+      useSessionStore.setState({
+        activeSessionId: "sess-1",
+        compositionState: null,
+      } as never);
+
+      const { container } = render(<ExecuteButton />);
+
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Validation encountered an internal error. Please try again.",
+      );
+      expect(container.querySelector("[data-run-block-reason]")).toBeNull();
+      expect(container.querySelectorAll(".side-rail-execute-reason")).toHaveLength(1);
+
+      fireEvent.click(
+        screen.getByRole("button", { name: /dismiss run failure/i }),
+      );
+
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(container.querySelector("[data-run-block-reason]")).not.toBeNull();
+    });
+  });
+
+  it("disables the Run pipeline button when validation is failing", () => {
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: false,
+        checks: [],
+        errors: [
+          {
+            component_type: "source",
+            component_id: "csv_source",
+            message: "x",
+          } as never,
+        ],
+        warnings: [],
+        readiness: NOT_READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+
+    expect(screen.getByRole("button", { name: /run pipeline/i })).toBeDisabled();
+  });
+
+  it("disables Run with the backend execution-readiness blocker when validation is green", () => {
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: {
+          authoring_valid: true,
+          execution_ready: false,
+          completion_ready: false,
+          blockers: [
+            {
+              code: "runtime_admission",
+              component_id: "pipeline",
+              component_type: "pipeline",
+              detail: "The selected runtime policy does not admit this pipeline.",
+            },
+          ],
+        },
+      },
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+
+    expect(screen.getByRole("button", { name: /run pipeline/i })).toBeDisabled();
+    expect(
+      screen.getByText("The selected runtime policy does not admit this pipeline."),
+    ).toHaveAttribute("data-run-block-reason", "readiness");
+  });
+
+  it("disables Run when a malformed validation response omits readiness", () => {
+    useExecutionStore.setState({
+      // Deliberately model untrusted wire data that violates the mandatory
+      // TypeScript contract. The action must fail closed instead of crashing.
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+      } as unknown as ValidationResult,
+      isExecuting: false,
+      progress: null,
+    });
+    useSessionStore.setState({ activeSessionId: "sess-1" });
+
+    render(<ExecuteButton />);
+
+    expect(screen.getByRole("button", { name: /run pipeline/i })).toBeDisabled();
+  });
+
+  it("keeps Run enabled for a completion-only advisor blocker", () => {
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [
+          {
+            name: "advisor_signoff",
+            passed: false,
+            detail: "Advisor sign-off is pending.",
+            affected_nodes: [],
+            outcome_code: null,
+          },
+        ],
+        errors: [],
+        warnings: [],
+        readiness: {
+          authoring_valid: true,
+          execution_ready: true,
+          completion_ready: false,
+          blockers: [
+            {
+              code: "advisor_signoff_blocked",
+              component_id: "pipeline",
+              component_type: "pipeline",
+              detail: "Advisor sign-off is pending.",
+            },
+          ],
+        },
+      },
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+
+    expect(screen.getByRole("button", { name: /run pipeline/i })).not.toBeDisabled();
+    expect(document.querySelector("[data-run-block-reason]")).toBeNull();
+  });
+
+  it("carries the danger emphasis (btn-danger, never btn-primary) when runnable", () => {
+    // Deliberate 2026-08-15 operator decision superseding the earlier
+    // no-emphasis rule (elspeth-0d37694c8c): Run is the one verb with
+    // consequences outside the composer (provider egress and spend), so it
+    // is the lone red-filled button in the bar in both themes. btn-primary
+    // stays forbidden — green-as-valid was the exact reading 0d37694c8c
+    // removed. The co-equal contract survives as geometry only
+    // (workspaceChrome.test.ts pins the equal widths).
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+
+    const button = screen.getByRole("button", { name: /run pipeline/i });
+    expect(button).not.toBeDisabled();
+    expect(button).toHaveClass("btn");
+    expect(button).toHaveClass("btn-danger");
+    expect(button).not.toHaveClass("btn-primary");
+  });
+
+  // ── Pre-run egress disclosure (elspeth-c18ad229cc) ────────────────────────
+  //
+  // The tutorial's Run step disclosures before firing; the production Run —
+  // the surface touching live credentials — must too. A ConfirmDialog gates
+  // execute(), summarising what the run will reach (derived from the live
+  // composition), with a per-session "don't ask again" opt-out.
+
+  it("opens the egress disclosure instead of executing directly, then executes on confirm", () => {
+    const execute = vi.fn();
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+    } as never);
+    useSessionStore.setState({
+      activeSessionId: "sess-1",
+      compositionState: makeComposition({
+        sources: {
+          source: { plugin: "csv", options: {}, on_success: "classify_in" },
+        },
+        nodes: [
+          {
+            id: "classify",
+            node_type: "transform",
+            plugin: "llm",
+            input: "classify_in",
+            on_success: "results",
+            on_error: null,
+            options: { model: "openrouter/anthropic/claude-sonnet-4.6" },
+          },
+        ],
+        outputs: [{ name: "results", plugin: "csv", options: {} }],
+      }),
+    } as never);
+
+    render(<ExecuteButton />);
+    fireEvent.click(screen.getByRole("button", { name: /run pipeline/i }));
+
+    // Confirm gates execute(): nothing fired yet.
+    expect(execute).not.toHaveBeenCalled();
+    const dialog = screen.getByRole("alertdialog", { name: "Run pipeline" });
+    // The summary derives from the actual composition, in the reader register.
+    // Asserted in the CASED form: the lower-case identifier sentence is also
+    // in `textContent` (via the .sr-only span), so a case-insensitive
+    // assertion here would pass even with the reader text missing.
+    expect(dialog).toHaveTextContent("Source (CSV)");
+    // The model keeps its provider path: on this consent surface the path IS
+    // the egress destination (elspeth-59631ec7f7 / R2-F7).
+    expect(dialog).toHaveTextContent(
+      "Classify (model Claude Sonnet 4.6 via openrouter/anthropic)",
+    );
+    expect(dialog).toHaveTextContent("Results (CSV)");
+
+    const line = within(dialog).getAllByRole("listitem")[0];
+    expect(line).toHaveTextContent("Reads source data: Source (CSV).");
+    // Identifier register reachable by AT and by keyboard, not hover-only: it
+    // is in-flow content of the <li> itself (a `.sr-only` child span, no
+    // `aria-describedby` — that would announce it a second time).
+    expect(line).toHaveTextContent("Reads source data: source (csv).");
+    // FRAMED, so a screen reader hears a disclosure instead of the same
+    // sentence twice: case and parentheses do not survive speech, so the
+    // unframed span read "Reads source data: Source (CSV). Reads source data:
+    // source (csv)." as one stutter per line. Asserted on RAW textContent, not
+    // toHaveTextContent, which normalises whitespace and so cannot see the
+    // leading space — and without that space speech runs the reader sentence
+    // straight into the disclosure.
+    expect(line.textContent).toBe(
+      "Reads source data: Source (CSV). (exact identifiers: Reads source data: source (csv).)",
+    );
+    expect(line).not.toHaveAttribute("aria-describedby");
+    // `title` kept for sighted mouse hover — a convenience, not the only route.
+    expect(line).toHaveAttribute("title", "Reads source data: source (csv).");
+
+    // The .sr-only spans carry the identifier register ON PURPOSE, so they are
+    // exempted — scoped to the egress list, never `.sr-only` globally, which
+    // would silently excuse every visually-hidden string in any future dialog.
+    expectNoIdentifiersInDefaultDom(dialog, {
+      allowSelectors: [".run-disclosure-summary .sr-only"],
+    });
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /^run pipeline$/i }),
+    );
+    expect(execute).toHaveBeenCalledWith("sess-1");
+  });
+
+  it("routes an external run intent through the egress disclosure", () => {
+    const execute = vi.fn();
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+    fireEvent(window, new CustomEvent(REQUEST_RUN_EVENT));
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("alertdialog", { name: "Run pipeline" }),
+    ).toBeInTheDocument();
+  });
+
+  it("executes an acknowledged external run intent exactly once", () => {
+    const execute = vi.fn();
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+      runDisclosureAckBySession: { "sess-1": true },
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+    fireEvent(window, new CustomEvent(REQUEST_RUN_EVENT));
+
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledWith("sess-1");
+  });
+
+  it("rechecks live execution readiness before confirming an open disclosure", () => {
+    const execute = vi.fn();
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+      runDisclosureAckBySession: {},
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+    fireEvent(window, new CustomEvent(REQUEST_RUN_EVENT));
+    const dialog = screen.getByRole("alertdialog", { name: "Run pipeline" });
+    fireEvent.click(
+      within(dialog).getByRole("checkbox", { name: /don't ask again/i }),
+    );
+    act(() => {
+      useExecutionStore.setState({
+        validationResult: {
+          is_valid: true,
+          checks: [],
+          errors: [],
+          warnings: [],
+          readiness: {
+            ...READY_READINESS,
+            execution_ready: false,
+          },
+        } as never,
+      });
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /^run pipeline$/i }),
+    );
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(
+      useExecutionStore.getState().runDisclosureAckBySession["sess-1"],
+    ).not.toBe(true);
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  });
+
+  it("uses the live source catalog when building the disclosure", () => {
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({
+      activeSessionId: "sess-1",
+      compositionState: makeComposition({
+        sources: {
+          generated: {
+            plugin: "catalogued_generator",
+            options: { profile: "approved-generation" },
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+      }),
+    } as never);
+    usePluginCatalogStore.setState({
+      sources: [
+        makePluginSummary({
+          name: "catalogued_generator",
+          plugin_type: "source",
+          capability_tags: ["llm"],
+        }),
+      ],
+      transforms: [],
+      isLoading: false,
+      error: null,
+    });
+
+    render(<ExecuteButton />);
+    fireEvent.click(screen.getByRole("button", { name: /run pipeline/i }));
+
+    const dialog = screen.getByRole("alertdialog", { name: "Run pipeline" });
+    expect(dialog).toHaveTextContent(
+      "Sends one authored prompt to the configured LLM: source:generated (profile approved-generation).",
+    );
+    expect(dialog).not.toHaveTextContent("Reads source data");
+  });
+
+  it("does not execute when the disclosure is cancelled", () => {
+    const execute = vi.fn();
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+    fireEvent.click(screen.getByRole("button", { name: /run pipeline/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  });
+
+  it("skips the disclosure once 'don't ask again' has been confirmed for the session", () => {
+    const execute = vi.fn();
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+
+    // First run: tick the opt-out, confirm.
+    fireEvent.click(screen.getByRole("button", { name: /run pipeline/i }));
+    const dialog = screen.getByRole("alertdialog", { name: "Run pipeline" });
+    fireEvent.click(
+      within(dialog).getByRole("checkbox", { name: /don't ask again/i }),
+    );
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /^run pipeline$/i }),
+    );
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(
+      useExecutionStore.getState().runDisclosureAckBySession["sess-1"],
+    ).toBe(true);
+
+    // Second run: no dialog, executes directly.
+    fireEvent.click(screen.getByRole("button", { name: /run pipeline/i }));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+
+  it("executes directly when the session already opted out of the disclosure", () => {
+    const execute = vi.fn();
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+      runDisclosureAckBySession: { "sess-1": true },
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+    fireEvent.click(screen.getByRole("button", { name: /run pipeline/i }));
+
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(execute).toHaveBeenCalledWith("sess-1");
+  });
+
+  // ── Post-launch Run-artifact switch (elspeth-3a7b7c7b37) ──────────────────
+  //
+  // All run-lifecycle feedback mounts only inside the Run artifact panel, so
+  // a successful launch must switch the workspace there. The switch keys on
+  // execute()'s returned run_id being a real id: the null returns (428
+  // fanout guard, 409, interpretation block, stale-session drop) must not
+  // move the user off their current tab.
+
+  function collectArtifactRequests(): {
+    requests: RequestArtifactViewDetail[];
+    detach: () => void;
+  } {
+    const requests: RequestArtifactViewDetail[] = [];
+    const listener = (event: Event): void => {
+      requests.push((event as CustomEvent<RequestArtifactViewDetail>).detail);
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, listener);
+    return {
+      requests,
+      detach: () =>
+        window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, listener),
+    };
+  }
+
+  it("switches to the Run artifact after a confirmed launch returns a run id", async () => {
+    const execute = vi.fn().mockResolvedValue("run-123");
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    const { requests, detach } = collectArtifactRequests();
+
+    render(<ExecuteButton />);
+    fireEvent.click(screen.getByRole("button", { name: /run pipeline/i }));
+    const dialog = screen.getByRole("alertdialog", { name: "Run pipeline" });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /^run pipeline$/i }),
+    );
+
+    expect(execute).toHaveBeenCalledWith("sess-1");
+    await waitFor(() =>
+      expect(requests).toEqual([
+        { tab: "run", focusMode: false, sessionId: "sess-1" },
+      ]),
+    );
+    detach();
+  });
+
+  it("switches to the Run artifact on the acknowledged fast path", async () => {
+    const execute = vi.fn().mockResolvedValue("run-456");
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+      runDisclosureAckBySession: { "sess-1": true },
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    const { requests, detach } = collectArtifactRequests();
+
+    render(<ExecuteButton />);
+    fireEvent(window, new CustomEvent(REQUEST_RUN_EVENT));
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(requests).toEqual([
+        { tab: "run", focusMode: false, sessionId: "sess-1" },
+      ]),
+    );
+    detach();
+  });
+
+  it("does not switch artifacts when execute resolves null (fanout guard / block)", async () => {
+    // executionStore.execute returns null for the 428 fanout guard, a 409
+    // conflict, and the interpretation block — none of which launched a run.
+    const execute = vi.fn().mockResolvedValue(null);
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+      runDisclosureAckBySession: { "sess-1": true },
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    const { requests, detach } = collectArtifactRequests();
+
+    render(<ExecuteButton />);
+    fireEvent.click(screen.getByRole("button", { name: /run pipeline/i }));
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    await act(async () => Promise.resolve());
+    expect(requests).toEqual([]);
+    detach();
+  });
+
+  // ── Phase 5b.18b.7 — interpretation-review run gating ──────────────────────
+  //
+  // Three tests pin the spec contract (18b lines 702-722, test §6-§8):
+  //
+  //  §6 — pending event AND NOT opted out → aria-disabled + focusable +
+  //       no-op activation + title + aria-describedby. Native `disabled`
+  //       must NOT be set: it removes the button from the tab order and
+  //       makes the blocked reason unreachable for exactly the keyboard/
+  //       screen-reader users it exists for (WCAG 4.1.2, elspeth-94c32de486).
+  //  §7 — last pending event resolved → button re-enables.
+  //  §8 — opted-out session → button enabled regardless of any residual
+  //       store entries (opt-out clears pendingBySession in production, but
+  //       this test guards the predicate logic directly so a future
+  //       store-reorder doesn't silently regress the contract).
+
+  it("blocks Run pipeline as focusable aria-disabled when a pending interpretation event exists and the session is NOT opted out (Phase 5b.18b.7 §6)", () => {
+    const execute = vi.fn();
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    useInterpretationEventsStore.setState({
+      pendingBySession: { "sess-1": { "evt-1": makeInterpretationEvent() } },
+      optedOutBySession: {},
+    });
+
+    render(<ExecuteButton />);
+
+    const button = screen.getByRole("button", { name: /run pipeline/i });
+    // NOT native-disabled: the button must stay in the tab order so the
+    // aria-describedby reason is reachable (elspeth-94c32de486).
+    expect(button).not.toBeDisabled();
+    expect(button).toHaveAttribute("aria-disabled", "true");
+    button.focus();
+    expect(button).toHaveFocus();
+    expect(button).toHaveAttribute(
+      "title",
+      INTERPRETATION_PENDING_RUN_BLOCK_TITLE,
+    );
+    // aria-describedby points at a visually-hidden span that carries the same
+    // text — the WCAG-canonical announcement path.
+    const describedById = button.getAttribute("aria-describedby");
+    expect(describedById).toBeTruthy();
+    const desc = document.getElementById(describedById!);
+    expect(desc).not.toBeNull();
+    expect(desc?.textContent).toBe(INTERPRETATION_PENDING_RUN_BLOCK_TITLE);
+    // Activation is a no-op while blocked.
+    fireEvent.click(button);
+    expect(execute).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  });
+
+  it("re-enables Run pipeline after the last pending interpretation event is resolved (Phase 5b.18b.7 §7)", () => {
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    // Start with a pending event so the button is initially disabled.
+    useInterpretationEventsStore.setState({
+      pendingBySession: { "sess-1": { "evt-1": makeInterpretationEvent() } },
+      optedOutBySession: {},
+    });
+
+    const { rerender } = render(<ExecuteButton />);
+    expect(
+      screen.getByRole("button", { name: /run pipeline/i }),
+    ).toHaveAttribute("aria-disabled", "true");
+
+    // Clear the pending map (simulating resolveEvent's store mutation).
+    useInterpretationEventsStore.setState({
+      pendingBySession: { "sess-1": {} },
+    });
+    rerender(<ExecuteButton />);
+
+    const button = screen.getByRole("button", { name: /run pipeline/i });
+    expect(button).not.toBeDisabled();
+    expect(button).not.toHaveAttribute("title");
+    expect(button).not.toHaveAttribute("aria-describedby");
+  });
+
+  it("keeps Run pipeline enabled when the session is opted out, even with residual store entries (Phase 5b.18b.7 §8)", () => {
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    // Opt-out true AND a residual pending entry. The production opt-out
+    // flow clears pendingBySession; this test pins the predicate's NOT-
+    // opted-out conjunction so a regression that flipped the conjunction
+    // (or omitted the opt-out check) would be caught here.
+    useInterpretationEventsStore.setState({
+      pendingBySession: { "sess-1": { "evt-1": makeInterpretationEvent() } },
+      optedOutBySession: { "sess-1": true },
+    });
+
+    render(<ExecuteButton />);
+
+    const button = screen.getByRole("button", { name: /run pipeline/i });
+    expect(button).not.toBeDisabled();
+    expect(button).not.toHaveAttribute("title");
+  });
+
+  // ── Gate legibility (elspeth-088bf83922 T-2, option (a)) ──────────────────
+  //
+  // canExecute itself is untouched by any of this (pinned by the tests
+  // above, which are unmodified). These tests cover the two NEW, purely
+  // additive affordances: a visible one-line reason when Run is disabled,
+  // naming which of the three gates is active; and a one-line note when Run
+  // is enabled but an advisory audit-readiness row is non-green.
+
+  function seedAuditSnapshot(
+    rows: AuditReadinessSnapshot["rows"],
+    compositionVersion = 1,
+  ): void {
+    useAuditReadinessStore.setState({
+      snapshotsBySession: {
+        "sess-1": {
+          session_id: "sess-1",
+          composition_version: compositionVersion,
+          checked_at: new Date().toISOString(),
+          rows,
+          validation_result: {
+            is_valid: true,
+            checks: [],
+            errors: [],
+            warnings: [],
+            readiness: READY_READINESS,
+          } as never,
+        },
+      },
+    });
+  }
+
+  it("shows 'The pipeline is already running.' when isExecuting is true", () => {
+    useExecutionStore.setState({
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
+      isExecuting: true,
+      progress: null,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+
+    expect(
+      screen.getByText(
+        "The pipeline is already running.",
+        { selector: "p" },
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows 'The pipeline is already running.' when progress.status is 'running' even if isExecuting has reset to false", () => {
+    // isExecuting flips back to false shortly after the POST resolves
+    // (executionStore.ts); progress.status keeps updating via WebSocket.
+    // canExecute's `progress?.status !== "running"` condition covers this
+    // window — the reason text must too.
+    useExecutionStore.setState({
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
+      isExecuting: false,
+      progress: { status: "running" } as never,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+
+    expect(
+      screen.getByText("The pipeline is already running.", { selector: "p" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the validation reason when structural validation is failing", () => {
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: false,
+        checks: [],
+        errors: [{ component_type: "source", component_id: "csv_source", message: "x" } as never],
+        warnings: [],
+        readiness: NOT_READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+
+    const reason = screen.getByText(
+      "Fix the validation errors shown in the Checks tab before running.",
+      { selector: "p" },
+    );
+    expect(reason).toHaveAttribute("data-run-block-reason", "validation");
+  });
+
+  it("shows the interpretation-pending reason as visible text, in addition to the existing sr-only/title pair", () => {
+    useExecutionStore.setState({
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    useInterpretationEventsStore.setState({
+      pendingBySession: { "sess-1": { "evt-1": makeInterpretationEvent() } },
+      optedOutBySession: {},
+    });
+
+    render(<ExecuteButton />);
+
+    // Same string now renders twice: the pre-existing sr-only span (wired
+    // to aria-describedby) and the new visible <p>. Both must be present.
+    const matches = screen.getAllByText(INTERPRETATION_PENDING_RUN_BLOCK_TITLE);
+    expect(matches).toHaveLength(2);
+    const visible = screen.getByText(INTERPRETATION_PENDING_RUN_BLOCK_TITLE, {
+      selector: "p",
+    });
+    expect(visible).toHaveAttribute("data-run-block-reason", "interpretation");
+  });
+
+  it("shows no reason paragraph when canExecute is true", () => {
+    useExecutionStore.setState({
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+
+    expect(document.querySelector("[data-run-block-reason]")).toBeNull();
+  });
+
+  it("shows a one-line advisory note when Run is enabled but a non-gating audit row is non-green", () => {
+    useExecutionStore.setState({
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({
+      activeSessionId: "sess-1",
+      compositionState: makeComposition(),
+    } as never);
+    seedAuditSnapshot([
+      { id: "validation", label: "Validation", status: "ok", summary: "ok", detail: null, component_ids: [] },
+      { id: "secrets", label: "Secrets", status: "warning", summary: "1 secret unresolved", detail: null, component_ids: [] },
+    ]);
+
+    render(<ExecuteButton />);
+
+    expect(
+      screen.getByText("Advisory checks don't block Run."),
+    ).toBeInTheDocument();
+    expect(document.querySelector("[data-run-block-reason]")).toBeNull();
+  });
+
+  it("does not show the advisory note when every audit row is green", () => {
+    useExecutionStore.setState({
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({
+      activeSessionId: "sess-1",
+      compositionState: makeComposition(),
+    } as never);
+    seedAuditSnapshot([
+      { id: "validation", label: "Validation", status: "ok", summary: "ok", detail: null, component_ids: [] },
+      { id: "secrets", label: "Secrets", status: "ok", summary: "ok", detail: null, component_ids: [] },
+    ]);
+
+    render(<ExecuteButton />);
+
+    expect(
+      screen.queryByText("Advisory checks don't block Run."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not show the advisory note from a stale (composition-version-mismatched) audit snapshot", () => {
+    useExecutionStore.setState({
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({
+      activeSessionId: "sess-1",
+      compositionState: makeComposition({ version: 2 }),
+    } as never);
+    // Snapshot is for v1; the live composition is already at v2.
+    seedAuditSnapshot(
+      [
+        { id: "secrets", label: "Secrets", status: "error", summary: "stale", detail: null, component_ids: [] },
+      ],
+      1,
+    );
+
+    render(<ExecuteButton />);
+
+    expect(
+      screen.queryByText("Advisory checks don't block Run."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("surfaces the advisory note for an execution-ready validation warning", () => {
+    // Backend execution readiness is authoritative: a non-green validation
+    // row can represent completion-only advisor pending while Run remains
+    // admitted, so the note must classify it as advisory.
+    useExecutionStore.setState({
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({
+      activeSessionId: "sess-1",
+      compositionState: makeComposition(),
+    } as never);
+    seedAuditSnapshot([
+      { id: "validation", label: "Validation", status: "warning", summary: "stale warning", detail: null, component_ids: [] },
+    ]);
+
+    render(<ExecuteButton />);
+
+    expect(
+      screen.queryByText("Advisory checks don't block Run."),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("isRunGatingReadinessRow", () => {
+  it("classifies validation from backend execution readiness and llm_interpretations as gating", () => {
+    expect(isRunGatingReadinessRow("validation", false)).toBe(true);
+    expect(isRunGatingReadinessRow("validation", true)).toBe(false);
+    expect(isRunGatingReadinessRow("llm_interpretations", true)).toBe(true);
+  });
+
+  it("classifies plugin_trust, provenance, retention, and secrets as advisory", () => {
+    expect(isRunGatingReadinessRow("plugin_trust", false)).toBe(false);
+    expect(isRunGatingReadinessRow("provenance", false)).toBe(false);
+    expect(isRunGatingReadinessRow("retention", false)).toBe(false);
+    expect(isRunGatingReadinessRow("secrets", false)).toBe(false);
+  });
+});
+
+describe("primaryRunBlockReason", () => {
+  const allClear = {
+    isExecuting: false,
+    progressRunning: false,
+    composerBusy: false,
+    sessionOperationInFlight: false,
+    isRunBlocked: false,
+    validationFailing: false,
+    executionReadinessBlocked: false,
+    validationNotRun: false,
+  };
+
+  it("returns null when nothing blocks", () => {
+    expect(primaryRunBlockReason(allClear)).toBeNull();
+  });
+
+  it("returns 'not_validated' when validation has not run (distinct from failing)", () => {
+    expect(
+      primaryRunBlockReason({ ...allClear, validationNotRun: true }),
+    ).toBe("not_validated");
+  });
+
+  it("reports 'settling' for an in-flight session operation, after composing and before interpretation (#352)", () => {
+    expect(
+      primaryRunBlockReason({
+        ...allClear,
+        sessionOperationInFlight: true,
+        isRunBlocked: true,
+        validationNotRun: true,
+      }),
+    ).toBe("settling");
+    expect(
+      primaryRunBlockReason({ ...allClear, composerBusy: true, sessionOperationInFlight: true }),
+    ).toBe("composing");
+  });
+
+  it("prioritises 'interpretation' over an unrun validation", () => {
+    expect(
+      primaryRunBlockReason({
+        ...allClear,
+        isRunBlocked: true,
+        validationNotRun: true,
+      }),
+    ).toBe("interpretation");
+  });
+
+  it("prioritises 'running' over interpretation and validation", () => {
+    expect(
+      primaryRunBlockReason({
+        ...allClear,
+        isExecuting: true,
+        isRunBlocked: true,
+        validationFailing: true,
+      }),
+    ).toBe("running");
+    expect(
+      primaryRunBlockReason({ ...allClear, progressRunning: true }),
+    ).toBe("running");
+  });
+
+  it("prioritises 'interpretation' over validation when not running", () => {
+    expect(
+      primaryRunBlockReason({
+        ...allClear,
+        isRunBlocked: true,
+        validationFailing: true,
+      }),
+    ).toBe("interpretation");
+  });
+
+  it("falls back to 'validation' when only structural validation fails", () => {
+    expect(
+      primaryRunBlockReason({ ...allClear, validationFailing: true }),
+    ).toBe("validation");
+  });
+});
+
+describe("buildRunEgressSummary", () => {
+  it("returns no lines for a null composition", () => {
+    expect(buildRunEgressSummary(null)).toEqual([]);
+  });
+
+  const llmSourceCatalog = [
+    makePluginSummary({
+      name: "llm",
+      plugin_type: "source",
+      capability_tags: ["llm", "generation", "single-row"],
+    }),
+  ];
+
+  it.each([
+    {
+      catalogState: "current",
+      sources: llmSourceCatalog,
+      loadFailed: false,
+      isLoading: false,
+    },
+    {
+      catalogState: "failed",
+      sources: null,
+      loadFailed: true,
+      isLoading: false,
+    },
+    {
+      catalogState: "stale",
+      sources: llmSourceCatalog,
+      loadFailed: false,
+      isLoading: true,
+    },
+    {
+      catalogState: "not yet loaded",
+      sources: null,
+      loadFailed: false,
+      isLoading: false,
+    },
+    {
+      catalogState: "unknown",
+      sources: [makePluginSummary({ name: "csv", plugin_type: "source" })],
+      loadFailed: false,
+      isLoading: false,
+    },
+  ])(
+    "discloses one authored prompt exactly once when the source catalog is $catalogState",
+    ({ sources, loadFailed, isLoading }) => {
+      const lines = buildRunEgressSummary(
+        makeComposition({
+          sources: {
+            source: {
+              plugin: "llm",
+              options: {
+                profile: "approved-generation",
+                prompt_template: "private authored prompt sentinel",
+              },
+              on_success: "results",
+              on_validation_failure: "discard",
+            },
+          },
+        }),
+        [],
+        loadFailed,
+        sources,
+        isLoading,
+      );
+
+      expect(lines.map((line) => line.identifiers)).toEqual([
+        "Sends one authored prompt to the configured LLM: source (profile approved-generation).",
+      ]);
+      expect([...lines.map((l) => l.text), ...lines.map((l) => l.identifiers)].join(" ")).not.toContain("Reads source data");
+      expect([...lines.map((l) => l.text), ...lines.map((l) => l.identifiers)].join(" ")).not.toContain("private authored prompt sentinel");
+    },
+  );
+
+  it("names a described source and output the way the Spec tab does (ux M-4)", () => {
+    // The consent dialog resolved components through `stepLabelForNodeId`
+    // alone, which consults a description for NODES only — so a source
+    // described "Quarterly invoices from finance" read that way on the Spec
+    // tab and in validation prose, but "Intake (CSV)" here, on the surface
+    // where recognition matters most. Both now go through the shared
+    // description-first ladder (specRouting.componentPhrase).
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          intake: {
+            plugin: "csv",
+            options: {},
+            on_success: "rows",
+            description: "Quarterly invoices from finance",
+          },
+        },
+        outputs: [
+          {
+            name: "results",
+            plugin: "csv",
+            options: {},
+            description: "Approved invoice ledger",
+          },
+        ],
+      } as unknown as Partial<CompositionState>),
+      [],
+    );
+
+    expect(lines.map((line) => line.text)).toEqual([
+      "Reads source data: Quarterly invoices from finance (CSV).",
+      "Writes output: Approved invoice ledger (CSV).",
+    ]);
+    // The identifier register is untouched: it still names every component
+    // and plugin by id (R2-F7).
+    expect(lines.map((line) => line.identifiers)).toEqual([
+      "Reads source data: source:intake (csv).",
+      "Writes output: results (csv).",
+    ]);
+  });
+
+  it("emits every disclosure line, in order, in both registers", () => {
+    // The refactor's residual risk is a DROPPED or REORDERED emission — one
+    // walk now decides both registers, so a mistake takes a whole line out of
+    // both at once and no per-line test would notice. Every other test here
+    // drives one or two lines; this one drives all six (ordinary source, LLM
+    // source, LLM node with a model, network transform, unverifiable
+    // transform, output) and pins the full ordered array in both registers.
+    // The catalog-load-failure path is what makes the uncertainty line
+    // reachable alongside the confident one.
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          intake: { plugin: "csv", options: {}, on_success: "rows" },
+          drafts: { plugin: "llm", options: { profile: "approved-generation" }, on_success: "rows" },
+        },
+        nodes: [
+          { id: "classify", node_type: "transform", plugin: "llm", input: "rows", on_success: "scored", on_error: null, options: { model: "claude-sonnet" } },
+          { id: "fetch_pages", node_type: "transform", plugin: "web_scrape", input: "scored", on_success: "fetched", on_error: null, options: {} },
+          { id: "map_fields", node_type: "transform", plugin: "field_mapper", input: "fetched", on_success: "results", on_error: null, options: {} },
+        ],
+        outputs: [{ name: "results", plugin: "csv", options: {} }],
+      } as unknown as Partial<CompositionState>),
+      null,
+      true,
+      null,
+      false,
+    );
+
+    expect(lines.map((line) => line.text)).toEqual([
+      "Reads source data: Intake (CSV).",
+      "Sends one authored prompt to the configured LLM: Drafts (profile approved-generation).",
+      "Sends rows to the configured LLM: Classify (model Claude Sonnet).",
+      "Fetches over the network: Fetch Pages (Web Scrape).",
+      "Plugin catalog unavailable — external-service effects could not be fully enumerated for: Map Fields (Field Mapper).",
+      "Writes output: Results (CSV).",
+    ]);
+    expect(lines.map((line) => line.identifiers)).toEqual([
+      "Reads source data: source:intake (csv).",
+      "Sends one authored prompt to the configured LLM: source:drafts (profile approved-generation).",
+      "Sends rows to the configured LLM: classify (model claude-sonnet).",
+      "Fetches over the network: fetch_pages (web_scrape).",
+      "Plugin catalog unavailable — external-service effects could not be fully enumerated for: map_fields (field_mapper).",
+      "Writes output: results (csv).",
+    ]);
+  });
+
+  it("uses a current source catalog to classify a capability-tagged LLM source", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          generated: {
+            plugin: "catalogued_generator",
+            options: { profile: "approved-generation" },
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+      }),
+      [],
+      false,
+      [
+        makePluginSummary({
+          name: "catalogued_generator",
+          plugin_type: "source",
+          capability_tags: ["llm"],
+        }),
+      ],
+      false,
+    );
+
+    expect(lines.map((line) => line.identifiers)).toEqual([
+      "Sends one authored prompt to the configured LLM: source:generated (profile approved-generation).",
+    ]);
+  });
+
+  it("keeps ordinary-source and LLM-transform wording unchanged beside an LLM source", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          generated: {
+            plugin: "llm",
+            options: { profile: "approved-generation" },
+            on_success: "rows",
+            on_validation_failure: "discard",
+          },
+          source: { plugin: "csv", options: {}, on_success: "rows" },
+        },
+        nodes: [
+          {
+            id: "classify",
+            node_type: "transform",
+            plugin: "llm",
+            input: "rows",
+            on_success: "results",
+            on_error: null,
+            options: { model: "openrouter/anthropic/claude-sonnet-4.6" },
+          },
+        ],
+      }),
+      [],
+      false,
+      llmSourceCatalog,
+    );
+
+    expect(lines.map((line) => line.identifiers)).toEqual([
+      "Reads source data: source (csv).",
+      "Sends one authored prompt to the configured LLM: source:generated (profile approved-generation).",
+      "Sends rows to the configured LLM: classify (model openrouter/anthropic/claude-sonnet-4.6).",
+    ]);
+  });
+
+  it("uses a safe authored model only when no profile provenance is present", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          source: {
+            plugin: "llm",
+            options: { model: "bedrock/anthropic.claude-3-haiku-20240307-v1:0" },
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+      }),
+      [],
+      false,
+      llmSourceCatalog,
+    );
+
+    expect(lines.map((line) => line.identifiers)).toEqual([
+      "Sends one authored prompt to the configured LLM: source (model bedrock/anthropic.claude-3-haiku-20240307-v1:0).",
+    ]);
+    // An LLM SOURCE's binding label is unchanged in both registers BY DESIGN
+    // (it establishes egress safety, and phrasing an operator-chosen token
+    // would make it look like a product name), so `modelDisplayName` never
+    // runs on this line. Pinned so the two registers cannot silently diverge
+    // here — the node path, where the phrasing does run, is pinned separately.
+    // The component NAME still switches register ("Source" vs "source"); it is
+    // the model binding that is carried through verbatim.
+    expect(lines.map((line) => line.text)).toEqual([
+      "Sends one authored prompt to the configured LLM: Source (model bedrock/anthropic.claude-3-haiku-20240307-v1:0).",
+    ]);
+  });
+
+  it("carries a non-wordish model id raw into the reader register rather than mangling it", () => {
+    // The consent surface the review named: an LLM NODE's model goes through
+    // `modelDisplayName`, and a Bedrock id used to read "(model
+    // Anthropic.claude 3 Haiku 20240307 V1:0 via bedrock)" — a date stamp and
+    // a version suffix title-cased as if they were words. On a dialog whose
+    // whole job is earning consent, a garbled model name undermines the trust
+    // the phrasing exists to build. The provider path is still split off, so
+    // the guard changed the PHRASING only.
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          source: { plugin: "csv", options: {}, on_success: "classify_in", on_validation_failure: "discard" },
+        },
+        nodes: [
+          {
+            id: "classify",
+            node_type: "transform",
+            plugin: "llm",
+            input: "classify_in",
+            on_success: "results",
+            on_error: null,
+            options: { model: "bedrock/anthropic.claude-3-haiku-20240307-v1:0" },
+          },
+        ],
+        outputs: [{ name: "results", plugin: "csv", options: {} }],
+      }),
+    );
+
+    expect(lines.map((line) => line.text)).toContain(
+      "Sends rows to the configured LLM: Classify (model anthropic.claude-3-haiku-20240307-v1:0 via bedrock).",
+    );
+    // The identifier register is untouched by the guard: it never phrased.
+    expect(lines.map((line) => line.identifiers)).toContain(
+      "Sends rows to the configured LLM: classify (model bedrock/anthropic.claude-3-haiku-20240307-v1:0).",
+    );
+  });
+
+  it("shows only the authored profile alias and never private resolved values", () => {
+    const privateSentinels = [
+      "private-resolved-model-sentinel",
+      "https://private-endpoint.invalid/v1",
+      "private-api-key-sentinel",
+      "PRIVATE_CREDENTIAL_REF_SENTINEL",
+      "private-profile-alias-sentinel",
+    ];
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          source: {
+            plugin: "llm",
+            options: {
+              profile: "approved-generation",
+              model: privateSentinels[0],
+              endpoint: privateSentinels[1],
+              api_key: privateSentinels[2],
+              credential_ref: privateSentinels[3],
+              profile_alias: privateSentinels[4],
+            },
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+      }),
+      [],
+      false,
+      llmSourceCatalog,
+    );
+
+    expect(lines.map((line) => line.identifiers)).toEqual([
+      "Sends one authored prompt to the configured LLM: source (profile approved-generation).",
+    ]);
+    for (const sentinel of privateSentinels) {
+      expect([...lines.map((l) => l.text), ...lines.map((l) => l.identifiers)].join(" ")).not.toContain(sentinel);
+    }
+  });
+
+  it.each([
+    { label: "unsafe profile provenance", options: { profile: { secret_ref: "PRIVATE_PROFILE" }, model: "private-resolved-model" } },
+    { label: "private profile alias", options: { profile_alias: "operator-resolved", model: "private-resolved-model" } },
+    { label: "secret-reference model", options: { model: "${PRIVATE_MODEL}" } },
+    { label: "non-string model", options: { model: { secret_ref: "PRIVATE_MODEL" } } },
+  ])("falls back to configured LLM for $label", ({ options }) => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          source: {
+            plugin: "llm",
+            options,
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+      }),
+      [],
+      false,
+      llmSourceCatalog,
+    );
+
+    expect(lines.map((line) => line.identifiers)).toEqual([
+      "Sends one authored prompt to the configured LLM: source (configured LLM).",
+    ]);
+    expect([...lines.map((l) => l.text), ...lines.map((l) => l.identifiers)].join(" ")).not.toContain("PRIVATE_MODEL");
+    expect([...lines.map((l) => l.text), ...lines.map((l) => l.identifiers)].join(" ")).not.toContain("private-resolved-model");
+  });
+
+  it("derives sources, LLM/model nodes, network fetches, and sinks from the composition", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          source: { plugin: "csv", options: {}, on_success: "fetch_in" },
+        },
+        nodes: [
+          {
+            id: "fetch_page",
+            node_type: "transform",
+            plugin: "web_scrape",
+            input: "fetch_in",
+            on_success: "classify_in",
+            on_error: null,
+            options: {},
+          },
+          {
+            id: "classify",
+            node_type: "transform",
+            plugin: "llm",
+            input: "classify_in",
+            on_success: "results",
+            on_error: null,
+            options: { model: "openrouter/anthropic/claude-sonnet-4.6" },
+          },
+        ],
+        outputs: [
+          { name: "results", plugin: "csv", options: {} },
+          { name: "errors", plugin: "json", options: {} },
+        ],
+      }),
+    );
+
+    expect(lines.map((line) => line.identifiers)).toEqual([
+      "Reads source data: source (csv).",
+      "Sends rows to the configured LLM: classify (model openrouter/anthropic/claude-sonnet-4.6).",
+      "Fetches over the network: fetch_page (web_scrape).",
+      "Writes output: results (csv), errors (json).",
+    ]);
+  });
+
+  it("omits categories the composition does not contain", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        outputs: [{ name: "results", plugin: "csv", options: {} }],
+      }),
+    );
+    expect(lines.map((line) => line.identifiers)).toEqual(["Writes output: results (csv)."]);
+  });
+
+  it("shows an LLM source's profile alias verbatim — it is the only disclosable binding (elspeth-59631ec7f7)", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          ask_model: {
+            plugin: "llm",
+            options: { profile: "finance_default" },
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+        nodes: [],
+        outputs: [{ name: "results", plugin: "csv", options: {} }],
+      }),
+      [],
+      false,
+      llmSourceCatalog,
+      false,
+    );
+    // The alias stays raw BY DESIGN: llmSourceBindingLabel keeps provider,
+    // model, endpoint and credential bindings operator-private, and the alias
+    // is the one binding the user may see. Phrasing it would invent a name.
+    // It is therefore an identifier-surface value inside a prose sentence —
+    // which is why the whole-dialog default-DOM pin's fixture uses an LLM
+    // NODE rather than an LLM source.
+    expect(lines.map((line) => line.text).join(" ")).toContain("finance_default");
+  });
+
+  // Argument tuples lifted from the call sites above — deliberately the
+  // BRANCHY ones (catalogLoadFailed, catalogIsLoading, the LLM-source path,
+  // and the network/unverifiable sites), which have identifier coverage and
+  // no reader coverage of their own. Every tuple must yield at least one line.
+  const EGRESS_FIXTURE_CASES: Parameters<typeof buildRunEgressSummary>[] = [
+    [
+      makeComposition({
+        sources: {
+          source: {
+            plugin: "llm",
+            options: { profile: "approved-generation" },
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+      }),
+      [],
+      false,
+      llmSourceCatalog,
+      false,
+    ],
+    [
+      makeComposition({
+        sources: {
+          source: {
+            plugin: "llm",
+            options: { profile: "approved-generation" },
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+      }),
+      [],
+      true,
+      null,
+      false,
+    ],
+    [
+      makeComposition({
+        sources: {
+          source: {
+            plugin: "llm",
+            options: { profile: "approved-generation" },
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+      }),
+      [],
+      false,
+      llmSourceCatalog,
+      true,
+    ],
+    [
+      makeComposition({
+        sources: { source: { plugin: "csv", options: {}, on_success: "fetch_in" } },
+        nodes: [
+          { id: "fetch_page", node_type: "transform", plugin: "web_scrape", input: "fetch_in", on_success: "classify_in", on_error: null, options: {} },
+          { id: "classify", node_type: "transform", plugin: "llm", input: "classify_in", on_success: "results", on_error: null, options: { model: "openrouter/anthropic/claude-sonnet-4.6" } },
+        ],
+        outputs: [
+          { name: "results", plugin: "csv", options: {} },
+          { name: "errors", plugin: "json", options: {} },
+        ],
+      }),
+    ],
+    [
+      makeComposition({
+        nodes: [
+          { id: "fetch_page", node_type: "transform", plugin: "web_scrape", input: "in", on_success: "extract_in", on_error: null, options: {} },
+          { id: "extract", node_type: "transform", plugin: "aws_textract_document_analysis", input: "extract_in", on_success: "out", on_error: null, options: {} },
+        ],
+      }),
+      null,
+      true,
+    ],
+    [
+      makeComposition({
+        nodes: [
+          { id: "extract", node_type: "transform", plugin: "aws_textract_document_analysis", input: "in", on_success: "out", on_error: null, options: {} },
+        ],
+      }),
+      [
+        makePluginSummary({
+          name: "aws_textract_document_analysis",
+          audit_characteristics: ["external_call"],
+        }),
+      ],
+    ],
+    [
+      makeComposition({
+        nodes: [
+          { id: "fetch_page", node_type: "transform", plugin: "web_scrape", input: "in", on_success: "out", on_error: null, options: {} },
+        ],
+      }),
+      null,
+    ],
+    [makeComposition({ outputs: [{ name: "results", plugin: "csv", options: {} }] })],
+  ];
+
+  it("keeps the two egress registers aligned line-for-line across every branch", () => {
+    // The `reader.length !== identifiers.length` throw guards an alignment
+    // that holds "by construction" — register substitutes label TEXT and
+    // never gates whether a sentence is emitted. This exercises the property
+    // over the file's branchy fixtures rather than forcing the throw.
+    for (const args of EGRESS_FIXTURE_CASES) {
+      const lines = buildRunEgressSummary(...args);
+      // `every` returns true on an empty array, so a tuple that yields no
+      // lines would pass vacuously. Guard the guard.
+      expect(lines.length).toBeGreaterThan(0);
+      // THE assertion: a short `identifiers` array yields `undefined` at the
+      // tail, which is exactly what misalignment looks like.
+      expect(lines.every((line) => typeof line.identifiers === "string")).toBe(true);
+    }
+  });
+
+  it("renders reader-register text beside the identifier sentence (elspeth-d74ab492dd)", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: { source: { plugin: "csv", options: {}, on_success: "classify" } },
+        nodes: [{ id: "fetch_page", node_type: "transform", plugin: "web_scrape", input: "source", on_success: "results", on_error: null, options: {} }],
+        outputs: [{ name: "results", plugin: "csv", options: {} }],
+      }),
+    );
+    expect(lines.map((line) => line.text)).toEqual([
+      "Reads source data: Source (CSV).",
+      "Fetches over the network: Fetch Page (Web Scrape).",
+      "Writes output: Results (CSV).",
+    ]);
+  });
+
+  // ── Catalog-driven external-effect classification (R2-F7, elspeth-27bc704359) ──
+  //
+  // The hardcoded NETWORK_FETCH_PLUGINS set only covered the Azure-backed
+  // network transforms; the AWS externals (Textract, Bedrock content_safety /
+  // prompt_shield — all Determinism.EXTERNAL_CALL backend-side) never
+  // appeared, under-disclosing the consent dialog. Catalog-driven
+  // classification (audit_characteristics containing "external_call") is now
+  // primary whenever the catalog has loaded; the hardcoded set is only a
+  // catalog-not-yet-loaded fallback.
+
+  it("includes a catalog-classified external_call transform (e.g. AWS Textract) in the network-egress line", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        nodes: [
+          {
+            id: "extract",
+            node_type: "transform",
+            plugin: "aws_textract_document_analysis",
+            input: "in",
+            on_success: "out",
+            on_error: null,
+            options: {},
+          },
+        ],
+      }),
+      [
+        makePluginSummary({
+          name: "aws_textract_document_analysis",
+          audit_characteristics: ["external_call"],
+        }),
+      ],
+    );
+
+    expect(lines.map((line) => line.identifiers)).toEqual([
+      "Fetches over the network: extract (aws_textract_document_analysis).",
+    ]);
+  });
+
+  it("does not flag a deterministic transform as network egress even with a loaded catalog", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        nodes: [
+          {
+            id: "normalize",
+            node_type: "transform",
+            plugin: "csv_transform",
+            input: "in",
+            on_success: "out",
+            on_error: null,
+            options: {},
+          },
+        ],
+      }),
+      [
+        makePluginSummary({
+          name: "csv_transform",
+          audit_characteristics: ["deterministic"],
+        }),
+      ],
+    );
+
+    expect(lines.map((line) => line.identifiers)).toEqual([]);
+  });
+
+  it("falls back to the hardcoded network set when the catalog has not loaded yet", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        nodes: [
+          {
+            id: "fetch_page",
+            node_type: "transform",
+            plugin: "web_scrape",
+            input: "in",
+            on_success: "out",
+            on_error: null,
+            options: {},
+          },
+        ],
+      }),
+      null,
+    );
+
+    expect(lines.map((line) => line.identifiers)).toEqual([
+      "Fetches over the network: fetch_page (web_scrape).",
+    ]);
+  });
+
+  // ── Catalog-load-failure uncertainty (review follow-up, elspeth-27bc704359) ──
+  //
+  // `pluginCatalogStore.transforms` is `null` for BOTH "not loaded yet" and
+  // "load failed" — the store's catch block resets `transforms` to `null`
+  // on error too. Silently falling back to the same hardcoded set for both
+  // states would reproduce R2-F7's exact under-disclosure the moment a
+  // catalog fetch errors, with no signal to the user. `catalogLoadFailed`
+  // (from `pluginCatalogStore.error !== null`) disambiguates: only the
+  // failed-load state adds an explicit uncertainty line.
+
+  it("names an unverifiable transform in an explicit uncertainty line when the catalog failed to load, while still confidently naming a hardcoded-set node", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        nodes: [
+          {
+            id: "fetch_page",
+            node_type: "transform",
+            plugin: "web_scrape",
+            input: "in",
+            on_success: "extract_in",
+            on_error: null,
+            options: {},
+          },
+          {
+            id: "extract",
+            node_type: "transform",
+            plugin: "aws_textract_document_analysis",
+            input: "extract_in",
+            on_success: "out",
+            on_error: null,
+            options: {},
+          },
+        ],
+      }),
+      null,
+      true,
+    );
+
+    expect(lines.map((line) => line.identifiers)).toEqual([
+      "Fetches over the network: fetch_page (web_scrape).",
+      "Plugin catalog unavailable — external-service effects could not be " +
+        "fully enumerated for: extract (aws_textract_document_analysis).",
+    ]);
+  });
+
+  it("does not double-count an LLM node in the load-failure uncertainty line", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        nodes: [
+          {
+            id: "classify",
+            node_type: "transform",
+            plugin: "llm",
+            input: "in",
+            on_success: "out",
+            on_error: null,
+            options: { model: "openrouter/anthropic/claude-sonnet-4.6" },
+          },
+        ],
+      }),
+      null,
+      true,
+    );
+
+    expect(lines.map((line) => line.identifiers)).toEqual([
+      "Sends rows to the configured LLM: classify (model openrouter/anthropic/claude-sonnet-4.6).",
+    ]);
+  });
+
+  it("stays on the plain fallback (no uncertainty line) when the catalog simply hasn't loaded yet", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        nodes: [
+          {
+            id: "extract",
+            node_type: "transform",
+            plugin: "aws_textract_document_analysis",
+            input: "in",
+            on_success: "out",
+            on_error: null,
+            options: {},
+          },
+        ],
+      }),
+      null,
+      false,
+    );
+
+    expect(lines.map((line) => line.identifiers)).toEqual([]);
+  });
+
+  it("fails open (no network line, no uncertainty line) for a transform absent from a loaded catalog", () => {
+    // Defensive pin, not a design goal: a plugin name with no matching
+    // catalog entry (renamed/policy-revoked since the composition was
+    // saved) is currently treated as non-network rather than flagged —
+    // see the `catalogFlagsExternalCall` doc comment.
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        nodes: [
+          {
+            id: "mystery",
+            node_type: "transform",
+            plugin: "renamed_or_revoked_plugin",
+            input: "in",
+            on_success: "out",
+            on_error: null,
+            options: {},
+          },
+        ],
+      }),
+      [
+        makePluginSummary({
+          name: "csv_transform",
+          audit_characteristics: ["deterministic"],
+        }),
+      ],
+    );
+
+    expect(lines.map((line) => line.identifiers)).toEqual([]);
+  });
+});

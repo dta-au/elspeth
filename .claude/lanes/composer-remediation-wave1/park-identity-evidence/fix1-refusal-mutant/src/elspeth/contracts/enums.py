@@ -1,0 +1,632 @@
+"""All status codes, modes, and kinds used across subsystem boundaries.
+
+CRITICAL: Every plugin MUST declare a Determinism value at registration.
+There is no "unknown" - undeclared determinism crashes at registration time.
+This is per ELSPETH's principle: "I don't know what happened" is never acceptable.
+"""
+
+from enum import StrEnum
+
+
+class RunStatus(StrEnum):
+    """Status of a pipeline run.
+
+    Stored in the database (runs.status).
+
+    The four-value terminal taxonomy (COMPLETED / COMPLETED_WITH_FAILURES /
+    FAILED / EMPTY) was introduced in Phase 2.2 (elspeth-0de989c56d) so an
+    operator scanning ``/api/runs/{rid}`` can distinguish "ran cleanly" from
+    "ran but no row succeeded" without reading diagnostics.  RUNNING is
+    non-terminal; INTERRUPTED is signal-bounded (SIGINT/SIGTERM).
+
+    The presence-indicator predicate that maps row-count shapes to status
+    values is enforced in :class:`elspeth.contracts.run_result.RunResult`'s
+    ``__post_init__`` (the in-memory engine record carries the row counters).
+    The web sessions DB and the Pydantic API schemas mirror the same
+    invariant; the Landscape audit ``Run`` dataclass has no row-count
+    fields so the enum widening alone is sufficient at that layer.
+    """
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    COMPLETED_WITH_FAILURES = "completed_with_failures"
+    FAILED = "failed"
+    EMPTY = "empty"
+    INTERRUPTED = "interrupted"
+
+
+class NodeStateStatus(StrEnum):
+    """Status of a node processing a token.
+
+    Stored in database (node_states.status).
+    """
+
+    OPEN = "open"
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class ExportStatus(StrEnum):
+    """Status of run export operation.
+
+    Stored in the database.
+    """
+
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class BatchStatus(StrEnum):
+    """Status of an aggregation batch.
+
+    Stored in database (batches.status).
+    """
+
+    DRAFT = "draft"
+    EXECUTING = "executing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class TriggerType(StrEnum):
+    """Type of trigger that caused an aggregation batch to execute.
+
+    Stored in database (batches.trigger_type).
+
+    Values:
+        COUNT: Batch reached configured row count threshold
+        TIMEOUT: Batch reached configured time limit
+        CONDITION: Custom condition expression evaluated to true
+        END_OF_SOURCE: Source exhausted, flush remaining rows
+    """
+
+    COUNT = "count"
+    TIMEOUT = "timeout"
+    CONDITION = "condition"
+    END_OF_SOURCE = "end_of_source"
+
+
+class NodeType(StrEnum):
+    """Type of node in the execution graph.
+
+    Stored in database (nodes.node_type).
+    """
+
+    SOURCE = "source"
+    QUEUE = "queue"
+    TRANSFORM = "transform"
+    GATE = "gate"
+    AGGREGATION = "aggregation"
+    COALESCE = "coalesce"
+    ROW_UNION = "row_union"
+    COLLECTOR = "collector"
+    SINK = "sink"
+
+
+# The rule text every node-name collision reports, generated ONCE from the
+# authority above. It used to be hand-typed three times across core/config
+# and web/composer/state and drifted between them (elspeth-1768ad240c).
+UNIQUE_NODE_NAMES_RULE = "All node names must be unique across every node kind: " + ", ".join(member.value for member in NodeType) + "."
+
+
+class Determinism(StrEnum):
+    """Plugin determinism classification for reproducibility.
+
+    Every plugin MUST declare one of these at registration. No default.
+    Undeclared determinism = crash at registration time.
+
+    Each value tells you what to do for replay/verify:
+    - DETERMINISTIC: Just re-run, expect identical output
+    - SEEDED: Capture seed, replay with same seed
+    - IO_READ: Capture what was read (time, files, env)
+    - IO_WRITE: Be careful - has side effects on replay
+    - EXTERNAL_CALL: Record request/response for replay
+    - NON_DETERMINISTIC: Must record output, cannot reproduce
+
+    Stored in database (nodes.determinism).
+    """
+
+    DETERMINISTIC = "deterministic"
+    SEEDED = "seeded"
+    IO_READ = "io_read"
+    IO_WRITE = "io_write"
+    EXTERNAL_CALL = "external_call"
+    NON_DETERMINISTIC = "non_deterministic"
+
+
+class RoutingKind(StrEnum):
+    """Kind of routing action a gate returns.
+
+    Each kind pairs with specific destination and ``RoutingMode``
+    invariants enforced in ``contracts.routing.RoutingAction.__post_init__``:
+
+    - CONTINUE: Token continues to the next node in the pipeline.
+      No destinations (``destinations == ()``); MOVE mode only.
+    - ROUTE: Token is sent to a single labeled destination (sink or
+      "continue"); exactly one destination; MOVE or DIVERT mode (COPY
+      is rejected to preserve the single-terminal-state-per-token
+      audit invariant).
+    - FORK_TO_PATHS: Token clones to multiple parallel paths; one or
+      more destinations; COPY mode only (fork always copies).
+
+    Stored in routing_events.
+    """
+
+    CONTINUE = "continue"
+    ROUTE = "route"
+    FORK_TO_PATHS = "fork_to_paths"
+
+
+class RoutingMode(StrEnum):
+    """Mode for routing edges.
+
+    MOVE: Token exits current path, goes to destination only
+    COPY: Token clones to destination AND continues on current path
+    DIVERT: Token is diverted from normal flow to error/quarantine sink.
+            Like MOVE, but semantically distinct: represents failure handling,
+            not intentional routing. Used for source quarantine, transform
+            on_error, and config-gate on_error edges. These are structural
+            markers in the DAG — rows reach these sinks via exception handling,
+            not by traversing the edge.
+
+    Stored in the database.
+    """
+
+    MOVE = "move"
+    COPY = "copy"
+    DIVERT = "divert"
+
+
+# ADR-019 (two-axis terminal model): TerminalOutcome and TerminalPath split the
+# terminal state into a lifecycle answer (outcome) and a provenance answer
+# (path).  See ``docs/architecture/adr/019-two-axis-terminal-model.md``
+# § "Counter derivation contract — public API field names preserved" (round-4
+# amendment, 2026-05-04) for the normative ``(outcome, path) → counter
+# increment`` mapping.
+class TerminalOutcome(StrEnum):
+    """Lifecycle answer for a row that has reached a terminal state.
+
+    ADR-019 § Decision: when ``completed=True``, ``outcome`` is one of three
+    values; when ``completed=False`` (only ``BUFFERED`` today), ``outcome`` is
+    NULL.  ``SUCCESS`` and ``FAILURE`` are predicate inputs to
+    ``RunResult.__post_init__``'s ``RunStatus`` derivation; ``TRANSIENT`` is
+    explicitly NOT a predicate input — it marks parent-token bookkeeping
+    (``FORK_PARENT``, ``EXPAND_PARENT``), batch absorption (``BATCH_CONSUMED``),
+    and sink-fallback-to-failsink absorptions whose lifecycle answers live on
+    a paired ``token_outcomes`` row, ``node_state``, or ``artifacts`` row
+    elsewhere.
+
+    See ADR-019 § "Why TRANSIENT exists as a third outcome value" for the
+    rationale that admits this third value.
+    """
+
+    SUCCESS = "success"
+    FAILURE = "failure"
+    TRANSIENT = "transient"
+
+
+class TerminalPath(StrEnum):
+    """Provenance answer for a row's terminal — how did it get there?
+
+    Producer-declared, producer-emitted; never inferred from graph topology
+    or counter context.  See ADR-019 § "Classification is producer-declared,
+    not topology-derivable" — ``ON_ERROR_ROUTED`` and
+    ``SINK_FALLBACK_TO_FAILSINK`` are structurally identical at the audit
+    layer (both write a paired ``NodeStateStatus.COMPLETED`` ``node_state``
+    plus an ``artifacts`` row at a different node), so only the producer
+    knows whether the lifecycle answer is FAILURE (transform threw, on-error
+    sink received) or TRANSIENT (sink-write fallback for visibility).
+
+    Stored alongside ``TerminalOutcome`` in the post-Stage-2 ``token_outcomes``
+    schema.  Two paths are non-terminal, both pairing with ``outcome IS
+    NULL``: ``BUFFERED`` marks a row that hasn't decided yet and may still
+    decide; ``ABANDONED`` (ADR-038) marks a row that never decided and never
+    will — its run terminated in a state no resume can recover, recorded by
+    run finalization, never by an executor.
+    """
+
+    DEFAULT_FLOW = "default_flow"
+    GATE_ROUTED = "gate_routed"
+    GATE_DISCARDED = "gate_discarded"
+    GATE_ERROR_DISCARDED = "gate_error_discarded"
+    ON_ERROR_ROUTED = "on_error_routed"
+    FILTER_DROPPED = "filter_dropped"
+    COALESCED = "coalesced"
+    UNROUTED = "unrouted"
+    QUARANTINED_AT_SOURCE = "quarantined_at_source"
+    SINK_FALLBACK_TO_FAILSINK = "sink_fallback_to_failsink"
+    SINK_DISCARDED = "sink_discarded"
+    FORK_PARENT = "fork_parent"
+    EXPAND_PARENT = "expand_parent"
+    BATCH_CONSUMED = "batch_consumed"
+    BUFFERED = "buffered"
+    ABANDONED = "abandoned"
+
+
+# Closed-set partition over the cross-product of TerminalOutcome and
+# TerminalPath per the ADR-019 mapping table at lines 99-115.  Every legal
+# terminal pair is enumerated below; the assertion that follows verifies every
+# ``TerminalPath`` is either covered by a legal terminal pair OR present in
+# ``_NON_TERMINAL_PATHS``.
+_LEGAL_TERMINAL_PAIRS: frozenset[tuple[TerminalOutcome, TerminalPath]] = frozenset(
+    {
+        (TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW),
+        (TerminalOutcome.SUCCESS, TerminalPath.GATE_ROUTED),
+        (TerminalOutcome.SUCCESS, TerminalPath.GATE_DISCARDED),
+        (TerminalOutcome.FAILURE, TerminalPath.GATE_ERROR_DISCARDED),
+        (TerminalOutcome.FAILURE, TerminalPath.ON_ERROR_ROUTED),
+        (TerminalOutcome.SUCCESS, TerminalPath.FILTER_DROPPED),
+        (TerminalOutcome.SUCCESS, TerminalPath.COALESCED),
+        (TerminalOutcome.FAILURE, TerminalPath.UNROUTED),
+        (TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE),
+        (TerminalOutcome.TRANSIENT, TerminalPath.SINK_FALLBACK_TO_FAILSINK),
+        (TerminalOutcome.FAILURE, TerminalPath.SINK_DISCARDED),
+        (TerminalOutcome.TRANSIENT, TerminalPath.FORK_PARENT),
+        (TerminalOutcome.TRANSIENT, TerminalPath.EXPAND_PARENT),
+        (TerminalOutcome.TRANSIENT, TerminalPath.BATCH_CONSUMED),
+    }
+)
+
+_NON_TERMINAL_PATHS: frozenset[TerminalPath] = frozenset(
+    {
+        TerminalPath.BUFFERED,
+        TerminalPath.ABANDONED,
+    }
+)
+
+
+# Exhaustiveness: every TerminalPath value MUST be covered by either a legal
+# terminal pair (paired with some TerminalOutcome) or the non-terminal set.
+# An unclassified path would silently land in the ``case _:`` arm of any
+# future (outcome, path) match in the recorder/accumulator and corrupt the
+# audit-integrity invariant the way an unclassified terminal value would.
+_paths_in_terminal_pairs: frozenset[TerminalPath] = frozenset(path for _, path in _LEGAL_TERMINAL_PAIRS)
+_all_terminal_paths: frozenset[TerminalPath] = frozenset(TerminalPath)
+_classified_terminal_paths: frozenset[TerminalPath] = _paths_in_terminal_pairs | _NON_TERMINAL_PATHS
+if _classified_terminal_paths != _all_terminal_paths:
+    _unclassified_paths = _all_terminal_paths - _classified_terminal_paths
+    raise AssertionError(
+        f"TerminalPath members {sorted(p.name for p in _unclassified_paths)} are "
+        f"not classified into _LEGAL_TERMINAL_PAIRS or _NON_TERMINAL_PATHS in "
+        f"contracts/enums.py — every new TerminalPath value must be added to "
+        f"exactly one (paired with a TerminalOutcome in _LEGAL_TERMINAL_PAIRS, "
+        f"or listed alone in _NON_TERMINAL_PATHS)."
+    )
+
+# Mutual exclusion: a path cannot be both terminal-paired and non-terminal.
+_paths_overlap = _paths_in_terminal_pairs & _NON_TERMINAL_PATHS
+if _paths_overlap:
+    raise AssertionError(
+        f"TerminalPath members {sorted(p.name for p in _paths_overlap)} appear in "
+        f"BOTH _LEGAL_TERMINAL_PAIRS and _NON_TERMINAL_PATHS — these sets must be "
+        f"disjoint (a path is either terminal-paired or non-terminal, never both)."
+    )
+
+
+class GroupSettlementReason(StrEnum):
+    """Closed vocabulary for coalesce / scope-failure group-settlement
+    dispositions (unified-lineage spec §2/§6.4, ADR-042).
+
+    The StrEnum IS the vocabulary: emission sites reference these members,
+    never string literals. ``SCOPE_GROUP_FAILED`` is the reason for a member
+    terminated because its group had already FAILED when the member arrived
+    — never ``LATE_ARRIVAL_AFTER_MERGE``, which is reserved for arrival after
+    a SUCCESSFUL merge. The durable discriminator is release status at the
+    closer (``has_released_group_for_node``: a status-COMPLETED node_state),
+    not completion — a failed closure sets ``completed_at`` too.
+
+    SCOPE (META-9.3): coalesce and scope/collector closers only. row_union's
+    own closed reasons (``row_union_branch_lost``, ``late_arrival_after_release``,
+    ``row_union_group_failed`` in ``engine/row_union_executor.py``) are a
+    sibling vocabulary and stay outside this enum by ruling.
+    """
+
+    LATE_ARRIVAL_AFTER_MERGE = "late_arrival_after_merge"
+    SCOPE_GROUP_FAILED = "scope_group_failed"
+    EMPTY_EXPANSION = "empty_expansion"
+    ALL_MEMBERS_LOST = "all_members_lost"
+
+
+class CollectorGroupFailureReason(StrEnum):
+    """Closed vocabulary for why a collector group FAILED as a whole.
+
+    The StrEnum IS the vocabulary: ``CollectorExecutor`` names these members,
+    never string literals. ``collector_group_failures.failure_reason`` carries
+    a CHECK over exactly these values (Landscape epoch 45), each member hold's
+    ``CollectorGroupFailure`` context carries the same value, and the counting
+    readers render it as a failure category. A value is an engine-authored
+    code, never row data.
+
+    - ``COLLECTOR_MISSING_MEMBERS``: a ``require_all`` roster closed with lost
+      members; the plugin never ran.
+    - ``COLLECTOR_TRANSFORM_ERROR``: the plugin ran and returned
+      ``TransformResult.error``.
+    - ``COLLECTOR_CONTRACT_VIOLATION``: a Tier-2 ``PluginContractViolation``
+      from the plugin or the engine's pre/postflight checks.
+    - ``EMPTY_EXPANSION``: a zero-member group closed under ``require_all``.
+      It shares its value with :attr:`GroupSettlementReason.EMPTY_EXPANSION`,
+      which names the same closure as a settlement disposition
+      (``closed_without_plugin``).
+    """
+
+    COLLECTOR_MISSING_MEMBERS = "collector_missing_members"
+    COLLECTOR_TRANSFORM_ERROR = "collector_transform_error"
+    COLLECTOR_CONTRACT_VIOLATION = "collector_contract_violation"
+    EMPTY_EXPANSION = "empty_expansion"
+
+
+# Outcome exhaustiveness: every TerminalOutcome value MUST be the lifecycle
+# answer for at least one legal terminal pair.  An unused outcome would mean
+# the enum has dead values that no producer can emit — drift from the ADR.
+_outcomes_in_terminal_pairs: frozenset[TerminalOutcome] = frozenset(outcome for outcome, _ in _LEGAL_TERMINAL_PAIRS)
+_all_terminal_outcomes: frozenset[TerminalOutcome] = frozenset(TerminalOutcome)
+if _outcomes_in_terminal_pairs != _all_terminal_outcomes:
+    _orphaned_outcomes = _all_terminal_outcomes - _outcomes_in_terminal_pairs
+    raise AssertionError(
+        f"TerminalOutcome members {sorted(o.name for o in _orphaned_outcomes)} "
+        f"do not appear in any pair in _LEGAL_TERMINAL_PAIRS in contracts/enums.py "
+        f"— every TerminalOutcome value must be the lifecycle answer for at least "
+        f"one legal (outcome, path) pair per the ADR-019 mapping table."
+    )
+
+
+class CallType(StrEnum):
+    """Type of external call (Phase 6).
+
+    Stored in database (calls.call_type).
+    """
+
+    LLM = "llm"
+    HTTP = "http"
+    HTTP_REDIRECT = "http_redirect"
+    SQL = "sql"
+    VECTOR = "vector"
+    FILESYSTEM = "filesystem"
+
+
+class CallStatus(StrEnum):
+    """Status of an external call (Phase 6).
+
+    Stored in database (calls.status).
+    """
+
+    SUCCESS = "success"
+    ERROR = "error"
+
+
+class RunMode(StrEnum):
+    """Pipeline execution mode for live/replay/verify behavior.
+
+    Stored in database (runs.run_mode).
+
+    Values:
+        LIVE: Make real API calls, record everything
+        REPLAY: Use recorded responses, skip live calls
+        VERIFY: Make real calls, compare to recorded
+    """
+
+    LIVE = "live"
+    REPLAY = "replay"
+    VERIFY = "verify"
+
+
+class TelemetryGranularity(StrEnum):
+    """Granularity of telemetry events emitted by the TelemetryManager.
+
+    Values:
+        LIFECYCLE: Only run start/complete/failed events (minimal overhead)
+        ROWS: Lifecycle + row-level events (row_started, row_completed, etc.)
+        FULL: Rows + external call events (LLM requests, HTTP calls, etc.)
+    """
+
+    LIFECYCLE = "lifecycle"
+    ROWS = "rows"
+    FULL = "full"
+
+
+class BackpressureMode(StrEnum):
+    """How to handle backpressure when telemetry exporters can't keep up.
+
+    Values:
+        BLOCK: Block the pipeline until exporters catch up (safest, may slow pipeline)
+        DROP: Drop events when buffer is full (lossy, no pipeline impact)
+        SLOW: Adaptive rate limiting (not yet implemented)
+    """
+
+    BLOCK = "block"
+    DROP = "drop"
+    SLOW = "slow"
+
+
+# Backpressure modes that are currently implemented.
+# Used by RuntimeTelemetryConfig.from_settings() to fail fast on unimplemented modes.
+_IMPLEMENTED_BACKPRESSURE_MODES = frozenset({BackpressureMode.BLOCK, BackpressureMode.DROP})
+
+
+class ReproducibilityGrade(StrEnum):
+    """Reproducibility levels for a completed run.
+
+    Grades:
+    - FULL_REPRODUCIBLE: All nodes are deterministic or seeded. The run can be
+      fully re-executed with identical results (given the same seed).
+    - REPLAY_REPRODUCIBLE: At least one node is nondeterministic (e.g., LLM calls).
+      Results can only be replayed using recorded external call responses.
+    - ATTRIBUTABLE_ONLY: Payloads have been purged. We can verify what happened
+      via hashes, but cannot replay the run.
+
+    Stored in database (runs.reproducibility_grade).
+    """
+
+    FULL_REPRODUCIBLE = "full_reproducible"
+    REPLAY_REPRODUCIBLE = "replay_reproducible"
+    ATTRIBUTABLE_ONLY = "attributable_only"
+
+
+class OutputMode(StrEnum):
+    """Output mode for aggregation batches.
+
+    Stored in database.
+
+    Values:
+        PASSTHROUGH: Preserve corresponding input identities; output data may be enriched
+        TRANSFORM: Emit transformed output from aggregation plugin
+    """
+
+    PASSTHROUGH = "passthrough"
+    TRANSFORM = "transform"
+
+    def expected_output_count_error(self, count: int | None) -> str | None:
+        """Return the intrinsic error for a count unused by this output mode."""
+        if self is OutputMode.PASSTHROUGH and count is not None:
+            return "expected_output_count requires output_mode='transform' (the default); omit expected_output_count for 'passthrough'."
+        return None
+
+
+class AggregationMemberAction(StrEnum):
+    """Durable action a successful aggregation result applies to one member."""
+
+    CONSUME_BATCH = "consume_batch"
+    QUARANTINE = "quarantine"
+    DROP_FILTERED = "drop_filtered"
+    CONTINUE_PASSTHROUGH = "continue_passthrough"
+
+
+# ── Plugin catalog types (Phase 7A) ──────────────────────────────────────
+#
+# These types are referenced by base plugin classes (L3) and protocols (L0)
+# and by catalog/audit-readiness services (L3).  They live here at L0 so
+# every layer can import them without violating the dependency rules.
+
+
+class AuditCharacteristic(StrEnum):
+    """Closed vocabulary of audit-characteristic flags rendered on catalog cards.
+
+    Determinism-derived (composed from Determinism enum via
+    _DETERMINISM_TO_AUDIT_FLAG in web/catalog/service.py):
+        IO_READ, IO_WRITE, EXTERNAL_CALL, DETERMINISTIC, SEEDED, NON_DETERMINISTIC
+    Author-declared (per 08-catalog-reshape.md vocabulary):
+        PROVENANCE, RETENTION, QUARANTINE, COERCE, SIGNED, CREDENTIALS
+
+    External-network behaviour is signalled exclusively through
+    ``EXTERNAL_CALL`` (derived from ``Determinism.EXTERNAL_CALL``). An
+    earlier ``NETWORK`` author-declared variant was deleted: no plugin
+    declared it, and its rendered chip ("Network call", attention tone)
+    was visually identical to ``EXTERNAL_CALL``'s. Add it back only when
+    a concrete plugin needs to signal a network call that the
+    determinism derivation rules can't infer, AND pair the addition
+    with a distinguishing UI label.
+
+    The StrEnum IS the closed vocabulary: a typo at the declaration site
+    (e.g. ``frozenset({"io-read"})``) fails mypy rather than silently
+    disappearing from the rendered catalog card.  When a new visual cue is
+    added to the UI, extend this enum together with 08-catalog-reshape.md.
+    """
+
+    # Determinism-derived
+    IO_READ = "io_read"
+    IO_WRITE = "io_write"
+    EXTERNAL_CALL = "external_call"
+    DETERMINISTIC = "deterministic"
+    SEEDED = "seeded"
+    NON_DETERMINISTIC = "non_deterministic"
+    # Author-declared (08-catalog-reshape.md vocabulary)
+    PROVENANCE = "provenance"
+    RETENTION = "retention"
+    QUARANTINE = "quarantine"
+    COERCE = "coerce"
+    SIGNED = "signed"
+    CREDENTIALS = "credentials"
+
+
+# Wire-format asymmetry for audit characteristics:
+#   - Declared on plugin classes as an *unordered* frozenset (set semantics
+#     match the author's intent — "this plugin has flags X, Y, Z").
+#   - Derived on PluginSummary as a *sorted* tuple for stable wire-format
+#     ordering (the catalog API response is canonical-byte-stable across
+#     reordered declarations).
+type DeclaredAuditCharacteristics = frozenset[AuditCharacteristic]
+type DerivedAuditCharacteristics = tuple[AuditCharacteristic, ...]
+
+
+# ── Inline-blob provenance (Phase 5a) ──────────────────────────────────
+#
+# CLOSED LIST — do not extend without design review.
+# Describes how an inline-blob source's content was produced.  Mirrored by
+# the ``ck_blobs_creation_modality`` CHECK constraint in
+# ``web/sessions/models.py``: the StrEnum is the canonical declaration,
+# the SQL CHECK is the DB-side enforcement. Both must change together.
+#
+# Adding a fifth value MUST include:
+#   (a) a spec amendment documenting the new modality and its audit
+#       semantics;
+#   (b) an integration test exercising the new write/read path;
+#   (c) a GitHub issue linking the change back to this enum.
+#
+# An auditor calling ``explain(recorder, run_id, token_id)`` reaches the
+# originating blob row's ``creation_modality`` field through the
+# inline-source provenance projection (Task 2.5 / Phase 5a); the closed
+# vocabulary keeps the rendered chip set bounded so the UI's switch
+# arms remain exhaustive.
+class CreationModality(StrEnum):
+    VERBATIM = "verbatim"
+    """User typed content directly; content is byte-identical to the
+    triggering chat-message body."""
+
+    LLM_GENERATED = "llm_generated"
+    """LLM generated rows; user confirmed without amendment."""
+
+    DISAMBIGUATED = "disambiguated"
+    """LLM interpreted ambiguous user input into structured rows; user
+    confirmed the interpretation."""
+
+    LLM_GENERATED_THEN_AMENDED = "llm_generated_then_amended"
+    """LLM generated rows, user then amended the content before
+    finalisation."""
+
+    def requires_llm_provenance(self) -> bool:
+        """Return whether this modality requires LLM-provenance fields."""
+        return self in _LLM_AUTHORED_CREATION_MODALITIES
+
+
+# The set of modalities that require LLM-provenance fields (the five
+# ``creating_*`` columns on ``blobs_table``).  Mirrored by the
+# ``ck_blobs_creating_llm_provenance_nullability`` CHECK constraint in
+# ``web/sessions/models.py``.  An auditor querying ``creating_provider IS
+# NOT NULL`` MUST get exactly the rows whose modality is in this set.
+_LLM_AUTHORED_CREATION_MODALITIES: frozenset[CreationModality] = frozenset(
+    {
+        CreationModality.LLM_GENERATED,
+        CreationModality.DISAMBIGUATED,
+        CreationModality.LLM_GENERATED_THEN_AMENDED,
+    }
+)
+
+
+def is_llm_authored_creation_modality(modality: CreationModality) -> bool:
+    """Return whether a blob modality requires LLM-provenance fields."""
+    return modality.requires_llm_provenance()
+
+
+def error_edge_label(producer_id: str) -> str:
+    """Canonical label for a processing-node error DIVERT edge.
+
+    Shared between DAG construction and the transform, config-gate and
+    aggregation error-routing audit recording to prevent label drift.
+
+    Args:
+        producer_id: Stable transform, config-gate or aggregation name for
+            error-route labels.
+    """
+    return f"__error_{producer_id}__"
+
+
+# Lineage-frame kinds (unified lineage spec rev 3.2, §4.1). Closed vocabulary:
+# a FORK group is opened by a fork gate (member_key = declared branch name); an
+# EXPAND group by a multi-row transform activation (member_key = member
+# token_id). A new kind requires a spec amendment — the frames table and
+# group_records both carry a CHECK over this enum.
+class FrameKind(StrEnum):
+    FORK = "fork"
+    EXPAND = "expand"

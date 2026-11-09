@@ -1,0 +1,170 @@
+/* animations.css — @keyframes (composing-bounce, progress-stripe, spin) plus
+   the rules that consume them (.composing-dot, .progress-bar*, .spinner)
+   plus the global @media (prefers-reduced-motion: reduce) that silences
+   them. */
+
+/* ---------------------------------------------------------------------------
+   Keyframe Animations
+   --------------------------------------------------------------------------- */
+
+/* Composing dots — staggered bounce animation.
+   Apply .composing-dot to each dot, with animation-delay of 0s, 0.15s, 0.3s. */
+@keyframes composing-bounce {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-6px);
+    opacity: 1;
+  }
+}
+
+.composing-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background-color: var(--color-text-muted);
+  margin: 0 var(--space-2xs);
+  animation: composing-bounce 1.2s ease-in-out infinite;
+}
+
+.composing-dot:nth-child(1) {
+  animation-delay: 0s;
+}
+
+.composing-dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.composing-dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+/* Indeterminate progress bar stripe animation.
+   Applied to .progress-bar-stripe inside a progress container.
+   The keyframe distance MUST equal .progress-bar-stripe's background-size so
+   one iteration advances exactly one gradient period and the loop is seamless
+   (elspeth-14523219ee). */
+@keyframes progress-stripe {
+  0% {
+    background-position: 0 0;
+  }
+  100% {
+    background-position: 16px 0;
+  }
+}
+
+.progress-bar {
+  width: 100%;
+  /* 8px, not 4px: the only element carrying this class also carries
+     .progress-bar-outer (execution.css, ProgressView.tsx:189), which used to
+     declare height: 8px at the same specificity from a LATER barrel import
+     and therefore shipped. The 4px here never rendered and the shipped height
+     was decided by import order alone (elspeth-58903688f2). This rule is now
+     the single owner of the track height — execution.css declares none and
+     primitiveGeometry.test.ts pins that — while the tutorial's separate 10px
+     track (tutorial.css:402) is still unreconciled. */
+  height: 8px;
+  background-color: var(--color-surface-elevated);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  position: relative;
+}
+
+.progress-bar-stripe {
+  width: 100%;
+  height: 100%;
+  background-image: linear-gradient(
+    45deg,
+    var(--color-info) 25%,
+    transparent 25%,
+    transparent 50%,
+    var(--color-info) 50%,
+    var(--color-info) 75%,
+    transparent 75%,
+    transparent
+  );
+  /* The gradient period must be chosen WITH the bar height, not independently:
+     at 40px against the shipped 8px track the hatching rendered as ~36 chunky
+     slabs marching across the run panel (elspeth-14523219ee). 16px is 2x the
+     track height, which reads as fine diagonal hatching rather than a 1990s
+     download bar, and the slower 0.6s cycle over the shorter period drops the
+     travel from 50px/s to ~27px/s — restrained and functional, as the motion
+     standard asks. Keep background-size, the keyframe distance above, and
+     .progress-bar's height in step if any one of them changes. */
+  background-size: 16px 16px;
+  animation: progress-stripe 0.6s linear infinite;
+}
+
+.progress-bar-complete {
+  width: 100%;
+  height: 100%;
+  background-color: var(--color-success);
+  transition: background-color var(--transition-normal);
+}
+
+/* Spinner for button loading states (Validate, etc.) */
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--color-text-muted);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+/* Page-scale modifier for full-viewport loading frames (elspeth-b2a677d661).
+   The two boot frames — AuthGuard's auth check and LoginPage's config load —
+   are consecutive full-viewport states, so they must show ONE affordance at
+   ONE size. AuthGuard previously inlined 32px/3px while LoginPage used the
+   bare button-scale .spinner above (14px), so the app appeared to stutter
+   between its first two frames. Compose `spinner spinner-page`; the bare
+   .spinner stays what its comment says it is — a button loading state. */
+.spinner-page {
+  width: 32px;
+  height: 32px;
+  border-width: 3px;
+}
+
+/* ---------------------------------------------------------------------------
+   Reduced Motion — respect OS-level motion preferences
+   --------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  .composing-dot {
+    animation: none;
+    opacity: 0.7;
+  }
+
+  .progress-bar-stripe {
+    animation: none;
+  }
+
+  .spinner {
+    animation: none;
+    border-top-color: var(--color-text-muted);
+    opacity: 0.6;
+  }
+
+  .progress-bar-complete {
+    transition: none;
+  }
+
+  .react-flow__edge.animated path {
+    animation: none;
+  }
+
+}

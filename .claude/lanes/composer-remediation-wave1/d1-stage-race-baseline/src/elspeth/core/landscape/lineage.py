@@ -1,0 +1,351 @@
+"""Lineage query functionality for ELSPETH Landscape.
+
+Provides the explain() function to compose query results into
+complete lineage for a token or row.
+"""
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Protocol, cast
+
+from elspeth.contracts import (
+    Call,
+    NodeState,
+    RoutingEvent,
+    RowLineage,
+    SchedulerEvent,
+    Token,
+    TokenOutcome,
+    TokenParent,
+    TransformErrorRecord,
+    ValidationErrorRecord,
+)
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.core.landscape.query_repository import QueryRepository
+
+
+class LineageDataFlowReadPort(Protocol):
+    """Read-only data-flow methods needed to compose lineage."""
+
+    def get_token_outcomes_for_row(self, run_id: str, row_id: str) -> list[TokenOutcome]: ...
+
+    def get_validation_errors_for_row(
+        self,
+        run_id: str,
+        row_hash: str | None = None,
+        *,
+        row_id: str | None = None,
+    ) -> list[ValidationErrorRecord]: ...
+
+    def get_transform_errors_for_token(self, token_id: str) -> list[TransformErrorRecord]: ...
+
+    def get_token_outcome(self, token_id: str) -> TokenOutcome | None: ...
+
+
+class LineageParentReadPort(Protocol):
+    """Read-only token-parent methods needed by lineage integrity checks."""
+
+    def get_token_parents(self, token_id: str) -> list[TokenParent]: ...
+
+    def get_tokens_by_ids(self, token_ids: Sequence[str]) -> list[Token]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class LineageIntegrityValidator:
+    """Validate and hydrate parent-lineage relationships from audit data."""
+
+    def get_parent_tokens_checked(
+        self,
+        query: LineageParentReadPort,
+        token: Token,
+        run_id: str,
+    ) -> tuple[Token, ...]:
+        """Return parent tokens after enforcing lineage integrity invariants."""
+        if token.run_id != run_id:
+            raise AuditIntegrityError(
+                f"Audit integrity violation: requested run '{run_id}' does not match child token "
+                f"'{token.token_id}' run '{token.run_id}'. Parent lineage must be checked against "
+                f"the child token's recorded run."
+            )
+        parents = query.get_token_parents(token.token_id)
+        kind = self._lineage_kind_for(token)
+        self._validate_parent_link_shape(token.token_id, kind, parents)
+        return self._hydrate_parent_tokens(query, token.token_id, run_id, parents)
+
+    @staticmethod
+    def _lineage_kind_for(token: Token) -> str | None:
+        """The operation that minted this token: 'join' (merge event), the innermost
+        frame's kind, or None for a source-row token."""
+        if token.join_group_id is not None:
+            return "join"
+        if token.lineage_path:
+            return token.lineage_path[-1].kind.value
+        return None
+
+    @staticmethod
+    def _validate_parent_link_shape(
+        token_id: str,
+        kind: str | None,
+        parents: list[TokenParent],
+    ) -> None:
+        if kind == "join":
+            if len(parents) < 2:
+                raise AuditIntegrityError(
+                    f"Audit integrity violation: token '{token_id}' has join_group_id set (a merge event) "
+                    f"but has {len(parents)} parent relationships in token_parents table; a join requires "
+                    f"at least 2. This indicates missing join metadata or audit corruption."
+                )
+        elif kind in ("fork", "expand"):
+            if len(parents) != 1:
+                raise AuditIntegrityError(
+                    f"Audit integrity violation: token '{token_id}' has an innermost {kind} lineage frame "
+                    f"but has {len(parents)} parent relationships in token_parents table; a {kind} child "
+                    f"requires exactly 1. This indicates missing {kind} metadata or audit corruption."
+                )
+        elif parents:
+            parent_ids = [p.parent_token_id for p in parents]
+            raise AuditIntegrityError(
+                f"Audit integrity violation: token '{token_id}' has parent relationships "
+                f"{parent_ids} but no lineage operation (join/fork/expand) minted it. Parent tokens must "
+                f"be associated with a lineage operation."
+            )
+
+    @staticmethod
+    def _hydrate_parent_tokens(
+        query: LineageParentReadPort,
+        token_id: str,
+        run_id: str,
+        parents: list[TokenParent],
+    ) -> tuple[Token, ...]:
+        parent_token_ids = [parent.parent_token_id for parent in parents]
+        parent_tokens_by_id = {parent.token_id: parent for parent in query.get_tokens_by_ids(parent_token_ids)}
+        parent_tokens: list[Token] = []
+        for parent in parents:
+            parent_token = parent_tokens_by_id.get(parent.parent_token_id)
+            if parent_token is None:
+                # This indicates audit DB corruption - a token_parents record
+                # references a parent that doesn't exist. This should be impossible
+                # with FK constraints enabled, but we crash as defense-in-depth.
+                raise AuditIntegrityError(
+                    f"Audit integrity violation: parent token '{parent.parent_token_id}' "
+                    f"not found for token '{token_id}'. The token_parents table references "
+                    f"a non-existent parent. This indicates database corruption."
+                )
+            # Parent must belong to the same run. Cross-run parent references are
+            # corruption — lineage operations (fork/coalesce/expand) are always
+            # within a single run. (Note: cross-row parents ARE valid for coalesce,
+            # where multiple rows merge into one output token.)
+            if parent_token.run_id != run_id:
+                raise AuditIntegrityError(
+                    f"Audit integrity violation: parent token '{parent.parent_token_id}' "
+                    f"belongs to run '{parent_token.run_id}' but child token '{token_id}' "
+                    f"belongs to run '{run_id}'. Cross-run parent lineage is impossible — "
+                    f"this indicates database corruption in token_parents."
+                )
+            parent_tokens.append(parent_token)
+        return tuple(parent_tokens)
+
+
+@dataclass(frozen=True, slots=True)
+class LineageResult:
+    """Complete lineage for a token.
+
+    Contains all information needed to explain how a row
+    was processed through the pipeline, including any errors
+    encountered during validation or transformation.
+    """
+
+    token: Token
+    """The token being explained."""
+
+    source_row: RowLineage
+    """The original source row with resolved payload."""
+
+    node_states: tuple[NodeState, ...]
+    """All node states visited by this token, in order."""
+
+    routing_events: tuple[RoutingEvent, ...]
+    """All routing events for this token's states."""
+
+    calls: tuple[Call, ...]
+    """All external calls made during processing."""
+
+    parent_tokens: tuple[Token, ...]
+    """Parent tokens (for tokens created by fork/coalesce)."""
+
+    validation_errors: tuple[ValidationErrorRecord, ...] = ()
+    """Validation errors for this row (from source validation)."""
+
+    transform_errors: tuple[TransformErrorRecord, ...] = ()
+    """Transform errors for this token (from transform processing)."""
+
+    scheduler_events: tuple[SchedulerEvent, ...] = ()
+    """Scheduler lease and work-item transitions for this token."""
+
+    outcome: TokenOutcome | None = None
+    """Terminal outcome for this token (COMPLETED, ROUTED, FAILED, etc.)."""
+
+    def __post_init__(self) -> None:
+        if self.token.row_id != self.source_row.row_id:
+            raise AuditIntegrityError(
+                f"Token row_id mismatch: token '{self.token.token_id}' has row_id "
+                f"'{self.token.row_id}' but source_row has row_id '{self.source_row.row_id}'. "
+                f"This indicates an audit integrity violation."
+            )
+        if self.token.run_id != self.source_row.run_id:
+            raise AuditIntegrityError(
+                f"Token run_id mismatch: token '{self.token.token_id}' belongs to run "
+                f"'{self.token.run_id}' but source_row belongs to run '{self.source_row.run_id}'. "
+                f"This indicates an audit integrity violation."
+            )
+
+
+def explain(
+    query: QueryRepository,
+    data_flow: LineageDataFlowReadPort,
+    run_id: str,
+    token_id: str | None = None,
+    row_id: str | None = None,
+    sink: str | None = None,
+) -> LineageResult | None:
+    """Query complete lineage for a token or row.
+
+    Args:
+        query: QueryRepository for token/row/state lookups.
+        data_flow: DataFlowRepository for outcomes and error lookups.
+        run_id: Run ID to query.
+        token_id: Token ID for precise lineage (preferred for DAGs with forks).
+        row_id: Row ID (requires disambiguation if multiple terminal tokens exist).
+        sink: Sink name to disambiguate when row has multiple terminal tokens.
+
+    Returns:
+        LineageResult with complete lineage, or None if:
+        - Token/row not found
+        - No terminal tokens exist yet (e.g., all tokens BUFFERED)
+        - Specified sink has no terminal tokens from this row
+
+    Raises:
+        ValueError: If neither token_id nor row_id provided.
+        ValueError: If row_id has multiple terminal tokens and sink not specified.
+        ValueError: If row_id with sink has multiple tokens (pipeline config issue).
+        AuditIntegrityError: If a token resolved from token_outcomes is missing
+            from the tokens table, or if a row referenced by a token doesn't
+            exist (Tier 1 database corruption).
+    """
+    if token_id is None and row_id is None:
+        raise ValueError("Must provide either token_id or row_id")
+
+    # Track whether we resolved token_id ourselves from Tier 1 data (token_outcomes).
+    # If so, the token MUST exist — a missing token is database corruption, not "not found".
+    caller_provided_token_id = token_id is not None
+
+    # Resolve token_id from row_id if needed
+    if token_id is None and row_id is not None:
+        # BATCH QUERY: Get all outcomes for this row in one query (avoid N+1)
+        outcomes = data_flow.get_token_outcomes_for_row(run_id, row_id)
+
+        if not outcomes:
+            return None  # Row not found or no outcomes recorded yet
+
+        # Filter to terminal outcomes only
+        terminal_outcomes = [o for o in outcomes if o.completed]
+
+        if not terminal_outcomes:
+            # All tokens are non-terminal (e.g., BUFFERED awaiting aggregation)
+            return None
+
+        # If sink specified, filter to that sink
+        if sink is not None:
+            matching_outcomes = [o for o in terminal_outcomes if o.sink_name == sink]
+
+            if not matching_outcomes:
+                return None  # No tokens reached this sink
+
+            if len(matching_outcomes) > 1:
+                # Multiple tokens to same sink - ambiguous, fail explicitly
+                token_ids = [o.token_id for o in matching_outcomes]
+                raise ValueError(
+                    f"Row {row_id} has {len(matching_outcomes)} tokens at sink '{sink}'. "
+                    f"This may indicate fork paths reaching the same sink. "
+                    f"Use token_id for precision: {token_ids[:5]}"
+                    f"{'...' if len(token_ids) > 5 else ''}"
+                )
+
+            token_id = matching_outcomes[0].token_id
+        else:
+            # No sink - require exactly one terminal token
+            if len(terminal_outcomes) > 1:
+                sink_names = {o.sink_name for o in terminal_outcomes if o.sink_name}
+                raise ValueError(
+                    f"Row {row_id} has {len(terminal_outcomes)} terminal tokens "
+                    f"across sinks: {sink_names}. "
+                    f"Provide sink parameter to disambiguate, or use token_id for precision."
+                )
+
+            token_id = terminal_outcomes[0].token_id
+
+    # At this point token_id is guaranteed to be set (either passed in or resolved from row_id)
+    # The token_id is guaranteed non-None at this point by control flow
+    token_id = cast(str, token_id)
+
+    # Caller-provided tokens are external lookup keys, so scope them to the
+    # requested run before loading row lineage. Tokens resolved from run-scoped
+    # token_outcomes remain Tier 1 data and keep fail-closed corruption checks.
+    token = query.get_token_for_run(run_id, token_id) if caller_provided_token_id else query.get_token(token_id)
+    if token is None:
+        if not caller_provided_token_id:
+            # Token was resolved from our own token_outcomes table — it MUST exist
+            raise AuditIntegrityError(
+                f"Token '{token_id}' resolved from token_outcomes for row '{row_id}' "
+                f"but does not exist in tokens table — database corruption (Tier 1 violation)"
+            )
+        return None  # Caller-provided token_id, genuinely not found
+
+    # Get source row with resolved payload via explain_row
+    source_row = query.explain_row(run_id, token.row_id)
+    if source_row is None:
+        # token.row_id is Tier 1 data — the row MUST exist
+        raise AuditIntegrityError(
+            f"Row '{token.row_id}' for token '{token_id}' does not exist in rows table "
+            f"— foreign key violation, database corruption (Tier 1 violation)"
+        )
+
+    # Get node states for this token, sorted by step_index
+    node_states = sorted(query.get_node_states_for_token(token_id), key=lambda s: s.step_index)
+
+    # Batch query: Get routing events and calls for all states at once (N+1 fix)
+    state_ids = [s.state_id for s in node_states]
+    routing_events = query.get_routing_events_for_states(state_ids)
+    calls = query.get_calls_for_states(state_ids)
+
+    # TIER 1 TRUST: token_parents is audit data - crash on any anomaly.
+    parent_tokens = LineageIntegrityValidator().get_parent_tokens_checked(query, token, run_id)
+
+    # Get validation errors for this row (by hash)
+    validation_errors = data_flow.get_validation_errors_for_row(
+        run_id,
+        source_row.source_data_hash,
+        row_id=source_row.row_id,
+    )
+
+    # Get transform errors for this token
+    transform_errors = data_flow.get_transform_errors_for_token(token_id)
+
+    # Get durable scheduler transition history for this token.
+    scheduler_events = query.get_scheduler_events(run_id=run_id, token_id=token_id)
+
+    # Get token outcome if recorded
+    outcome = data_flow.get_token_outcome(token_id)
+
+    return LineageResult(
+        token=token,
+        source_row=source_row,
+        node_states=tuple(node_states),
+        routing_events=tuple(routing_events),
+        calls=tuple(calls),
+        parent_tokens=parent_tokens,
+        validation_errors=tuple(validation_errors),
+        transform_errors=tuple(transform_errors),
+        scheduler_events=tuple(scheduler_events),
+        outcome=outcome,
+    )

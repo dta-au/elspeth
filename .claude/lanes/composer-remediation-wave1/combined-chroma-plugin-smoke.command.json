@@ -1,0 +1,19 @@
+{
+  "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata",
+  "argv": [
+    "/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv/bin/python",
+    "-m",
+    "pytest",
+    "-n",
+    "1",
+    "-o",
+    "pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/src /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/elspeth-lints/src",
+    "-p",
+    "composer_test_cache",
+    "-o",
+    "pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/src /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/elspeth-lints/src /workspace/elspeth/.claude/lanes/composer-remediation-wave1/runtime-deps/pytest_plugins",
+    "tests/unit/plugins/infrastructure/clients/retrieval/test_chroma.py::TestChromaSearchProvider::test_search_returns_retrieval_chunks",
+    "tests/integration/pipeline/test_rag_indexed_smoke.py::TestRAGIndexedSmoke::test_full_pipeline_sequence"
+  ],
+  "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/src:/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/elspeth-lints/src"
+}

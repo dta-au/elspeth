@@ -1,0 +1,64 @@
+
+> elspeth-frontend@0.0.0 test
+> npm run test:dependencies && vitest run --maxWorkers=2
+
+
+> elspeth-frontend@0.0.0 test:dependencies
+> node --test scripts/braces-depth-guard.test.mjs scripts/release-dependencies.test.mjs
+
+✔ stylelint: parse bounds brace and parenthesis nesting (2.819514ms)
+✔ stylelint: compile bounds brace and parenthesis nesting (1.770435ms)
+✔ stylelint: expand bounds brace and parenthesis nesting (3.445626ms)
+✔ stylelint: stringify bounds brace and parenthesis nesting (0.713885ms)
+✔ stylelint: compile bounds caller-supplied AST depth (0.564269ms)
+✔ stylelint: expand bounds caller-supplied AST depth (2.255786ms)
+✔ stylelint: stringify bounds caller-supplied AST depth (0.408465ms)
+✔ stylelint: ordinary brace expansion and glob matching remain intact (2.807866ms)
+✔ openapi-typescript/fast-glob: parse bounds brace and parenthesis nesting (0.643459ms)
+✔ openapi-typescript/fast-glob: compile bounds brace and parenthesis nesting (1.291104ms)
+✔ openapi-typescript/fast-glob: expand bounds brace and parenthesis nesting (1.99284ms)
+✔ openapi-typescript/fast-glob: stringify bounds brace and parenthesis nesting (0.374684ms)
+✔ openapi-typescript/fast-glob: compile bounds caller-supplied AST depth (0.120711ms)
+✔ openapi-typescript/fast-glob: expand bounds caller-supplied AST depth (1.595873ms)
+✔ openapi-typescript/fast-glob: stringify bounds caller-supplied AST depth (0.425621ms)
+✔ openapi-typescript/fast-glob: ordinary brace expansion and glob matching remain intact (0.484128ms)
+✔ fast-glob discovers the same CSS files with and without brace expansion (6.414726ms)
+✔ fast-glob rejects excessive nesting before recursive expansion (0.182925ms)
+✔ Mermaid KaTeX preserves ordinary mathml output (5.45429ms)
+✔ Mermaid KaTeX ignores inherited trust in mathml options (2.054462ms)
+✔ Mermaid KaTeX preserves ordinary htmlAndMathml output (6.509908ms)
+✔ Mermaid KaTeX ignores inherited trust in htmlAndMathml options (0.905313ms)
+✔ Mermaid KaTeX ignores Object.prototype trust pollution (0.496528ms)
+✔ Stylelint selector parser preserves flat selectors and ordinary CSS (20.099154ms)
+✔ source-map consumer /workspace/elspeth/src/elspeth/web/frontend/node_modules/source-map-js/source-map.js bounds indexed offsets (2.393874ms)
+✔ source-map consumer /workspace/elspeth/src/elspeth/web/frontend/node_modules/source-map-js/source-map.js bounds indexed offsets (0.302576ms)
+ℹ tests 26
+ℹ suites 0
+ℹ pass 26
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 161.636158
+npm notice
+npm notice New major version of npm available! 11.9.0 -> 12.2.2
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v12.2.2
+npm notice To update run: npm install -g npm@12.2.2
+npm notice
+
+ RUN  v4.1.11 /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src/elspeth/web/frontend
+
+Not implemented: navigation to another Document
+Not implemented: navigation to another Document
+Not implemented: navigation to another Document
+
+ Test Files  265 passed (265)
+      Tests  4447 passed (4447)
+   Start at  11:16:31
+   Duration  172.50s (transform 7.17s, setup 31.69s, import 45.76s, tests 71.91s, environment 158.41s)
+
+npm notice
+npm notice New major version of npm available! 11.9.0 -> 12.2.2
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v12.2.2
+npm notice To update run: npm install -g npm@12.2.2
+npm notice

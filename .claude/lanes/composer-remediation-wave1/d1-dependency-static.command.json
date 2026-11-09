@@ -1,0 +1,18 @@
+{
+  "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-wave1",
+  "argv": [
+    "/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/python",
+    "-m",
+    "pytest",
+    "-n",
+    "0",
+    "-o",
+    "pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src",
+    "tests/unit/deployment/test_aws_ecs_terraform_package.py",
+    "tests/e2e/examples/test_shipped_examples.py::TestShippedExamples::test_multi_worker_showcase_stats_use_completed_terminal_outcomes",
+    "tests/e2e/examples/test_shipped_examples.py::TestShippedExamples::test_multi_worker_showcase_stats_reject_invalid_inputs"
+  ],
+  "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src:/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src",
+  "TF_PLUGIN_CACHE_DIR": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/runtime-deps/terraform-plugins/main",
+  "sqlite_cli_directory": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/runtime-deps/sqlite3/bin"
+}

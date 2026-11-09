@@ -1,0 +1,650 @@
+"""Batch outlier annotation transform plugin."""
+
+from __future__ import annotations
+
+import math
+import statistics
+from dataclasses import dataclass
+from typing import Annotated, Any
+
+from pydantic import Field, field_validator, model_validator
+
+from elspeth.contracts import Determinism
+from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.emitted_option import EmittedToOutput
+from elspeth.contracts.errors import RowErrorEntry, TransformErrorReason
+from elspeth.contracts.field_collision import detect_field_collisions
+from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.plugins.infrastructure.base import BaseTransform
+from elspeth.plugins.infrastructure.config_base import PluginConfigError, TransformDataConfig
+from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowFieldCollisionError, BatchRowTypeError
+
+type BatchOutlierAnnotationRow = dict[str, object]
+
+# Every annotation suffix with the type the plugin's code fixes (ADR-050).
+# ``value`` is the row's own ``value_field`` value copied onto the annotation
+# unconverted (an int stays an int); only finite int and float values are
+# annotated at all (``_finite_entries_for``), so it is declared ``float``: an
+# int value satisfies a float declaration (ADR-050 Decision 5, ruling C3), and
+# any other type would be this plugin's filter failing. ``value_field`` is the
+# configured name and ``reason`` the joined reason labels. Only int and float values
+# reach the arithmetic (``_finite_entries_for`` fails the batch on any other
+# type), and ``_stats_for`` converts each one with ``float(...)`` before
+# computing, so the mean, median, stdev and MAD are floats; the thresholds are
+# the config model's floats and the counts are ints. A z-score is undefined
+# when the batch has no spread (stdev, MAD and mean absolute deviation all
+# zero) and is emitted None then, never 0.0 (B4.5-c). The index lists are
+# lists the schema DSL has no type for.
+_ANNOTATION_CREATED_SUFFIXES: tuple[FieldDefinition, ...] = (
+    FieldDefinition("batch_size", "int"),
+    FieldDefinition("is_outlier", "bool"),
+    FieldDefinition("mad", "float"),
+    FieldDefinition("mean", "float"),
+    FieldDefinition("median", "float"),
+    FieldDefinition("missing_count", "int"),
+    FieldDefinition("missing_indices", "any"),
+    FieldDefinition("non_finite_count", "int"),
+    FieldDefinition("non_finite_indices", "any"),
+    FieldDefinition("reason", "str"),
+    FieldDefinition("robust_z_score", "float", nullable=True),
+    FieldDefinition("robust_z_threshold", "float"),
+    FieldDefinition("row_index", "int"),
+    FieldDefinition("skipped_count", "int"),
+    FieldDefinition("stdev", "float"),
+    FieldDefinition("valid_count", "int"),
+    FieldDefinition("value", "float"),
+    FieldDefinition("value_field", "str"),
+    FieldDefinition("z_score", "float", nullable=True),
+    FieldDefinition("z_threshold", "float"),
+)
+_ANNOTATION_FIELD_SUFFIXES = tuple(field.name for field in _ANNOTATION_CREATED_SUFFIXES)
+_BACKWARD_INVARIANT_DROPPED_FIELD = "batch_outlier_annotator_dropped_probe_field"
+_MAX_BATCH_ROWS = 4096
+_MAX_SKIPPED_INDEX_DETAILS = 128
+
+
+def _annotation_fields(output_prefix: str) -> frozenset[str]:
+    return frozenset(f"{output_prefix}_{suffix}" for suffix in _ANNOTATION_FIELD_SUFFIXES)
+
+
+@dataclass(frozen=True, slots=True)
+class _FiniteEntry:
+    row_index: int
+    row: PipelineRow
+    value: int | float
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchStats:
+    batch_size: int
+    mean: float
+    median: float
+    stdev: float
+    mad: float
+    mean_abs_dev: float
+    missing_indices: tuple[int, ...]
+    non_finite_indices: tuple[int, ...]
+
+    @property
+    def valid_count(self) -> int:
+        return self.batch_size - self.missing_count - self.non_finite_count
+
+    @property
+    def missing_count(self) -> int:
+        return len(self.missing_indices)
+
+    @property
+    def non_finite_count(self) -> int:
+        return len(self.non_finite_indices)
+
+    @property
+    def skipped_count(self) -> int:
+        return self.missing_count + self.non_finite_count
+
+
+class BatchOutlierAnnotatorConfig(TransformDataConfig):
+    """Configuration for batch outlier annotator transform."""
+
+    value_field: Annotated[
+        str,
+        EmittedToOutput("batch_outlier_annotator copies this configured input-field name into every emitted annotation row"),
+    ] = Field(description="Name of the numeric field to annotate")
+    output_prefix: Annotated[
+        str,
+        EmittedToOutput(
+            "batch_outlier_annotator builds its emitted annotation field NAMES from this prefix, "
+            "so the value becomes a key in row data and a column in the artifact header"
+        ),
+    ] = Field(
+        default="outlier",
+        description="Prefix used for emitted annotation fields",
+    )
+    z_threshold: Annotated[
+        float,
+        EmittedToOutput("batch_outlier_annotator copies this configured threshold into every emitted annotation row"),
+    ] = Field(
+        default=3.0,
+        gt=0,
+        description="Absolute sample z-score threshold for outlier annotation",
+    )
+    robust_z_threshold: Annotated[
+        float,
+        EmittedToOutput("batch_outlier_annotator copies this configured threshold into every emitted annotation row"),
+    ] = Field(
+        default=3.5,
+        gt=0,
+        description="Absolute modified z-score threshold based on median absolute deviation",
+    )
+
+    @field_validator("value_field")
+    @classmethod
+    def _reject_empty_value_field(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("value_field must not be empty")
+        return v
+
+    @field_validator("output_prefix")
+    @classmethod
+    def _reject_invalid_output_prefix(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("output_prefix must not be empty")
+        if not v.isidentifier():
+            raise ValueError("output_prefix must be a valid Python identifier prefix")
+        return v
+
+    @model_validator(mode="after")
+    def _reject_value_field_collision(self) -> BatchOutlierAnnotatorConfig:
+        output_fields = _annotation_fields(self.output_prefix)
+        if self.value_field in output_fields:
+            raise ValueError(
+                f"value_field '{self.value_field}' collides with outlier annotation output key. "
+                f"Choose a value_field that is not one of: {', '.join(sorted(output_fields))}"
+            )
+        return self
+
+
+class BatchOutlierAnnotator(BaseTransform):
+    """Annotate batch rows with z-score and robust-z outlier signals.
+
+    The transform emits one row per finite numeric input value. Missing values
+    and non-finite floats are skipped and reported on every emitted row so the
+    audit trail remains canonical while preserving data-quality context.
+    """
+
+    name = "batch_outlier_annotator"
+    determinism = Determinism.DETERMINISTIC
+    plugin_version = "1.0.0"
+    source_file_hash: str | None = "sha256:2501c11261dd8660"
+    config_model = BatchOutlierAnnotatorConfig
+    is_batch_aware = True
+    # Not passthrough-capable: a row whose value is null or non-finite is not emitted, and a one-row emission is TransformResult.success.
+    flush_emits_one_row_per_buffered_row = False
+    preserves_input_values = True
+    usage_when_to_use: str = (
+        "Use for window-local z-score and robust-z annotations on finite numeric rows, preserving each valid "
+        "source row with added outlier fields."
+    )
+    usage_when_not_to_use: str = (
+        "Not for a durable anomaly model or tolerant pass-through of bad values; invalid numeric rows are "
+        "reported but not emitted in the successful output."
+    )
+    example_use: str = """aggregations:
+  - name: latency_outliers
+    plugin: batch_outlier_annotator
+    input: latency_rows
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 100
+    output_mode: transform
+    options:
+      value_field: latency_ms
+      output_prefix: outlier
+      z_threshold: 3.0
+      robust_z_threshold: 3.5
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "outlier", "annotation")
+    passes_through_input = False
+
+    @classmethod
+    def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
+        if issue_code is None:
+            return PluginAssistance(
+                plugin_name=cls.name,
+                issue_code=None,
+                summary="Annotates finite numeric rows with batch z-score and robust-z outlier fields.",
+                composer_hints=(
+                    "Use batch_outlier_annotator under aggregations with a trigger; it needs the batch distribution.",
+                    "value_field must be numeric; missing and non-finite values are skipped and reported, and a present non-numeric value fails the whole batch.",
+                    "output_prefix creates many annotation fields, so choose a prefix that cannot collide with input fields; an input row already carrying one fails the whole batch.",
+                    "It emits one annotated row per finite input value and may drop skipped rows from success output.",
+                    "Use output_mode: transform; skipped invalid rows prevent the one-row-per-buffered-row guarantee required by passthrough. A failed batch applies on_error to all buffered rows; discard records quarantine outcomes.",
+                ),
+            )
+        return None
+
+    @classmethod
+    def probe_config(cls) -> dict[str, Any]:
+        """Minimal config for the ADR-009 backward invariant."""
+        return {
+            "schema": {"mode": "observed"},
+            "value_field": "batch_outlier_annotator_probe_value",
+        }
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__(config)
+        cfg = BatchOutlierAnnotatorConfig.from_dict(config, plugin_name=self.name)
+        self._initialize_declared_input_fields(cfg)
+        self._value_field = cfg.value_field
+        self._output_prefix = cfg.output_prefix
+        self._z_threshold = cfg.z_threshold
+        self._robust_z_threshold = cfg.robust_z_threshold
+        self.declared_output_fields = _annotation_fields(cfg.output_prefix)
+
+        # Every emitted row is `**entry.row.to_dict()` plus the annotations, so
+        # no input FIELD is ever dropped; what this transform drops is whole
+        # ROWS (missing or non-finite values are skipped), which is why
+        # `passes_through_input` stays False. The extras direction only asks
+        # what a surviving row carries, so it declares forwarding with an empty
+        # removal set (elspeth-15c72686f2).
+        self.forwards_input_fields = True
+        self.removed_input_fields = frozenset()
+
+        base_required = set(cfg.schema_config.required_fields or ())
+        base_required.add(cfg.value_field)
+        if base_required != set(cfg.schema_config.required_fields or ()):
+            schema_config = SchemaConfig(
+                mode=cfg.schema_config.mode,
+                fields=cfg.schema_config.fields,
+                guaranteed_fields=cfg.schema_config.guaranteed_fields,
+                audit_fields=cfg.schema_config.audit_fields,
+                required_fields=tuple(base_required),
+            )
+        else:
+            schema_config = cfg.schema_config
+
+        self._schema_config = schema_config
+        self._reject_explicit_output_field_collision(cfg)
+        self.input_schema, self.output_schema = self._create_schemas(
+            schema_config,
+            "BatchOutlierAnnotator",
+            adds_fields=True,
+        )
+        self._output_schema_config = self._build_output_schema_config(schema_config)
+
+    def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Inject a finite batch so the value-preservation harness reaches emission."""
+        return [self._augment_invariant_probe_row(probe, field_name=self._value_field, value=value) for value in (1.0, 1.0, 1.0)]
+
+    def _reject_explicit_output_field_collision(self, cfg: BatchOutlierAnnotatorConfig) -> None:
+        """Reject explicit schemas that would always collide with annotations."""
+        if cfg.schema_config.fields is None:
+            return
+
+        declared_schema_fields = {field.name for field in cfg.schema_config.fields}
+        collisions = detect_field_collisions(declared_schema_fields, self.declared_output_fields)
+        if collisions is None:
+            return
+
+        cause = (
+            "BatchOutlierAnnotator schema declares field(s) "
+            f"{collisions!r}, but annotation output would overwrite them. "
+            "Remove the colliding field from the explicit schema or choose a different output_prefix."
+        )
+        raise PluginConfigError(
+            cause,
+            cause=cause,
+            plugin_class=self.config_model.__name__,
+            plugin_name=self.name,
+            component_type="transform",
+        )
+
+    def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Exercise the skipped-row path for the backward invariant."""
+        dropped_row = self._augment_invariant_probe_row(
+            probe,
+            field_name=_BACKWARD_INVARIANT_DROPPED_FIELD,
+            value=True,
+        )
+        return [
+            self._augment_invariant_probe_row(
+                probe,
+                field_name=self._value_field,
+                value=1.0,
+            ),
+            self._augment_invariant_probe_row(
+                dropped_row,
+                field_name=self._value_field,
+                value=None,
+            ),
+        ]
+
+    def _reject_runtime_output_field_collision(self, rows: list[PipelineRow]) -> None:
+        """Fail the batch when a buffered row already carries an annotation field.
+
+        Under an observed upstream only the row data decides whether such a
+        field arrives, so this is a row fault, routed like any failed batch
+        (ruling on elspeth-d90495084c); an explicit schema declaring one is
+        refused at construction by ``_reject_explicit_output_field_collision``.
+        """
+        for row_index, row in enumerate(rows):
+            collisions = detect_field_collisions(set(row.keys()), self.declared_output_fields)
+            if collisions is None:
+                continue
+            raise BatchRowFieldCollisionError(row_index=row_index, collisions=collisions)
+
+    def _finite_entries_for(
+        self,
+        rows: list[PipelineRow],
+    ) -> tuple[list[_FiniteEntry], tuple[int, ...], tuple[int, ...]]:
+        entries: list[_FiniteEntry] = []
+        missing_indices: list[int] = []
+        non_finite_indices: list[int] = []
+
+        for row_index, row in enumerate(rows):
+            raw_value = row[self._value_field]
+            if raw_value is None:
+                missing_indices.append(row_index)
+                continue
+
+            # No coercion: a str that is not a number is not a number. A
+            # present wrong-typed value fails the WHOLE batch (the None and
+            # non-finite branches either side keep skip-and-report).
+            if type(raw_value) not in (int, float):
+                raise BatchRowTypeError(
+                    field=self._value_field,
+                    row_index=row_index,
+                    expected="numeric (int or float)",
+                    found=type(raw_value).__name__,
+                )
+
+            if type(raw_value) is float and not math.isfinite(raw_value):
+                non_finite_indices.append(row_index)
+                continue
+
+            entries.append(_FiniteEntry(row_index=row_index, row=row, value=raw_value))
+
+        return entries, tuple(missing_indices), tuple(non_finite_indices)
+
+    @staticmethod
+    def _error_for_no_finite_values(
+        *,
+        batch_size: int,
+        missing_indices: tuple[int, ...],
+        non_finite_indices: tuple[int, ...],
+    ) -> TransformResult:
+        row_errors: list[RowErrorEntry] = []
+        for row_index in missing_indices:
+            row_errors.append({"row_index": row_index, "reason": "missing_value"})
+        for row_index in non_finite_indices:
+            row_errors.append({"row_index": row_index, "reason": "non_finite_value"})
+        reason: TransformErrorReason = {
+            "reason": "validation_failed",
+            "cause": "no_finite_values",
+            "batch_size": batch_size,
+            "valid_count": 0,
+            "skipped_count": len(missing_indices) + len(non_finite_indices),
+            "row_errors": row_errors,
+        }
+        return TransformResult.error(reason, retryable=False)
+
+    @staticmethod
+    def _require_finite_float(value: float, *, operation: str) -> float:
+        if not math.isfinite(value):
+            raise OverflowError(operation)
+        return value
+
+    @classmethod
+    def _coerce_finite_float(cls, value: int | float, *, operation: str) -> float:
+        try:
+            coerced = float(value)
+        except OverflowError as exc:
+            raise OverflowError(operation) from exc
+        return cls._require_finite_float(coerced, operation=operation)
+
+    @staticmethod
+    def _float_overflow_error(*, operation: str, batch_size: int, valid_count: int) -> TransformResult:
+        reason: TransformErrorReason = {
+            "reason": "float_overflow",
+            "operation": operation or "outlier_annotation",
+            "batch_size": batch_size,
+            "valid_count": valid_count,
+        }
+        return TransformResult.error(reason, retryable=False)
+
+    @staticmethod
+    def _error_for_batch_too_large(*, batch_size: int) -> TransformResult:
+        reason: TransformErrorReason = {
+            "reason": "validation_failed",
+            "cause": "batch_too_large",
+            "batch_size": batch_size,
+            "expected": f"at most {_MAX_BATCH_ROWS} rows",
+        }
+        return TransformResult.error(reason, retryable=False)
+
+    @staticmethod
+    def _median(values: list[float]) -> float:
+        return float(statistics.median(values))
+
+    def _stats_for(
+        self,
+        *,
+        batch_size: int,
+        entries: list[_FiniteEntry],
+        missing_indices: tuple[int, ...],
+        non_finite_indices: tuple[int, ...],
+    ) -> tuple[_BatchStats, TransformResult | None]:
+        try:
+            values = [self._coerce_finite_float(entry.value, operation="float_conversion") for entry in entries]
+            mean = self._require_finite_float(sum(values) / len(values), operation="mean")
+            median = self._require_finite_float(self._median(values), operation="median")
+            deviations = [abs(value - median) for value in values]
+            mad = self._require_finite_float(self._median(deviations), operation="mad")
+            mean_abs_dev = self._require_finite_float(sum(deviations) / len(deviations), operation="mean_abs_dev")
+            stdev = 0.0 if len(values) == 1 else self._require_finite_float(statistics.stdev(values), operation="stdev")
+        except OverflowError as exc:
+            return (
+                _BatchStats(
+                    batch_size=batch_size,
+                    mean=0.0,
+                    median=0.0,
+                    stdev=0.0,
+                    mad=0.0,
+                    mean_abs_dev=0.0,
+                    missing_indices=missing_indices,
+                    non_finite_indices=non_finite_indices,
+                ),
+                self._float_overflow_error(
+                    operation=str(exc),
+                    batch_size=batch_size,
+                    valid_count=len(entries),
+                ),
+            )
+
+        return (
+            _BatchStats(
+                batch_size=batch_size,
+                mean=mean,
+                median=median,
+                stdev=stdev,
+                mad=mad,
+                mean_abs_dev=mean_abs_dev,
+                missing_indices=missing_indices,
+                non_finite_indices=non_finite_indices,
+            ),
+            None,
+        )
+
+    def _field(self, suffix: str) -> str:
+        return f"{self._output_prefix}_{suffix}"
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The typed suffix table above under the configured prefix (ADR-050)."""
+        return tuple(
+            FieldDefinition(self._field(field.name), field.field_type, required=field.required, nullable=field.nullable)
+            for field in _ANNOTATION_CREATED_SUFFIXES
+        )
+
+    def _annotation_for(self, entry: _FiniteEntry, stats: _BatchStats) -> dict[str, object]:
+        value = self._coerce_finite_float(entry.value, operation="float_conversion")
+        missing_indices = stats.missing_indices[:_MAX_SKIPPED_INDEX_DETAILS]
+        non_finite_indices = stats.non_finite_indices[:_MAX_SKIPPED_INDEX_DETAILS]
+        # z_score = (x - mean) / stdev is undefined when stdev==0 (all-identical
+        # batch); emit None (honest-absence), never 0.0 (B4.5-c)
+        z_score: float | None = (
+            None if stats.stdev == 0.0 else self._require_finite_float((value - stats.mean) / stats.stdev, operation="z_score")
+        )
+        robust_z_score: float | None
+        if stats.mad != 0.0:
+            robust_z_score = self._require_finite_float(0.6745 * (value - stats.median) / stats.mad, operation="robust_z_score")
+        elif stats.mean_abs_dev != 0.0:
+            # Iglewicz-Hoaglin fallback: MAD collapses to 0 whenever >50% of values
+            # are identical (common for score/count data), but real spread remains.
+            # The mean-absolute-deviation modified z-score keeps robust detection
+            # alive instead of fabricating 0.0 for a masked outlier.
+            robust_z_score = self._require_finite_float(
+                0.7979 * (value - stats.median) / stats.mean_abs_dev, operation="robust_z_score_meanad"
+            )
+        else:
+            # All values identical — no spread at all. The robust z-score is
+            # genuinely undefined; emit None (honest-absence doctrine), never 0.0.
+            robust_z_score = None
+
+        reasons: list[str] = []
+        if z_score is not None and abs(z_score) >= self._z_threshold:
+            reasons.append("z_score")
+        if robust_z_score is not None and abs(robust_z_score) >= self._robust_z_threshold:
+            reasons.append("robust_z_score")
+
+        return {
+            self._field("value_field"): self._value_field,
+            self._field("value"): entry.value,
+            self._field("row_index"): entry.row_index,
+            self._field("batch_size"): stats.batch_size,
+            self._field("valid_count"): stats.valid_count,
+            self._field("missing_count"): stats.missing_count,
+            self._field("non_finite_count"): stats.non_finite_count,
+            self._field("skipped_count"): stats.skipped_count,
+            self._field("missing_indices"): missing_indices,
+            self._field("non_finite_indices"): non_finite_indices,
+            self._field("mean"): stats.mean,
+            self._field("median"): stats.median,
+            self._field("stdev"): stats.stdev,
+            self._field("mad"): stats.mad,
+            self._field("z_threshold"): self._z_threshold,
+            self._field("robust_z_threshold"): self._robust_z_threshold,
+            self._field("z_score"): z_score,
+            self._field("robust_z_score"): robust_z_score,
+            self._field("is_outlier"): bool(reasons),
+            self._field("reason"): ",".join(reasons),
+        }
+
+    def _output_contract_for(self, entries: list[_FiniteEntry]) -> SchemaContract:
+        """Build one shared output contract for annotated rows."""
+        first_contract = entries[0].row.contract
+        for entry in entries[1:]:
+            if entry.row.contract.mode != first_contract.mode:
+                raise ValueError(
+                    f"Heterogeneous contract modes in batch: row 0 has mode "
+                    f"'{first_contract.mode}', row {entry.row_index} has mode '{entry.row.contract.mode}'. "
+                    f"All rows in a batch must share the same contract mode."
+                )
+
+        merged_fields: dict[str, FieldContract] = {}
+        for entry in entries:
+            for field in entry.row.contract.fields:
+                if field.normalized_name not in merged_fields:
+                    merged_fields[field.normalized_name] = field
+
+        # Each annotation enters as a placeholder; the ONE stamp rewrites it to
+        # the plugin's declaration (ADR-050) and the batch postflight checks
+        # every declared concrete type against the emitted values.
+        for field_name in sorted(self.declared_output_fields):
+            merged_fields[field_name] = FieldContract(
+                normalized_name=field_name,
+                original_name=field_name,
+                python_type=object,
+                required=False,
+                source="inferred",
+            )
+
+        output_contract = SchemaContract(
+            mode=first_contract.mode,
+            fields=tuple(merged_fields.values()),
+            locked=True,
+        )
+        return self._align_output_contract(self._apply_declared_output_field_contracts(output_contract))
+
+    def process(  # type: ignore[override] # Batch signature: list[PipelineRow] instead of PipelineRow
+        self, rows: list[PipelineRow], ctx: TransformContext
+    ) -> TransformResult:
+        """Annotate finite numeric rows in a batch with outlier metrics."""
+        if not rows:
+            return TransformResult.error({"reason": "empty_batch"}, retryable=False)
+        if len(rows) > _MAX_BATCH_ROWS:
+            return self._error_for_batch_too_large(batch_size=len(rows))
+
+        try:
+            self._reject_runtime_output_field_collision(rows)
+            entries, missing_indices, non_finite_indices = self._finite_entries_for(rows)
+        except (BatchRowFieldCollisionError, BatchRowTypeError) as exc:
+            # The batch records that it failed and WHY — which row, which
+            # field(s) — never a row value (elspeth-d5034647f0). The caller
+            # owns disposition: an aggregation's on_error receives every
+            # buffered row, a collector fails the group.
+            return TransformResult.error(exc.as_reason(), retryable=False)
+        if not entries:
+            return self._error_for_no_finite_values(
+                batch_size=len(rows),
+                missing_indices=missing_indices,
+                non_finite_indices=non_finite_indices,
+            )
+
+        stats, error = self._stats_for(
+            batch_size=len(rows),
+            entries=entries,
+            missing_indices=missing_indices,
+            non_finite_indices=non_finite_indices,
+        )
+        if error is not None:
+            return error
+
+        output_contract = self._output_contract_for(entries)
+        fields_added = sorted(self.declared_output_fields)
+        try:
+            pipeline_rows = [
+                PipelineRow(
+                    {
+                        **entry.row.to_dict(),
+                        **self._annotation_for(entry, stats),
+                    },
+                    output_contract,
+                )
+                for entry in entries
+            ]
+        except OverflowError as exc:
+            return self._float_overflow_error(
+                operation=str(exc),
+                batch_size=len(rows),
+                valid_count=len(entries),
+            )
+
+        if len(pipeline_rows) > 1:
+            return TransformResult.success_multi(
+                pipeline_rows,
+                success_reason={"action": "processed", "fields_added": fields_added},
+            )
+
+        return TransformResult.success(
+            pipeline_rows[0],
+            success_reason={"action": "processed", "fields_added": fields_added},
+        )
+
+    def close(self) -> None:
+        """No resources to release."""
+        pass

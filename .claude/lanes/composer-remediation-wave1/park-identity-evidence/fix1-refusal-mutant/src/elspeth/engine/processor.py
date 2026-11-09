@@ -1,0 +1,5523 @@
+"""RowProcessor: Orchestrates row processing through pipeline.
+
+Coordinates:
+- Token creation
+- Transform execution
+- Gate evaluation (config-driven)
+- Aggregation handling
+- Final outcome recording
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from datetime import UTC
+from hashlib import sha256
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, cast
+
+from rfc8785 import CanonicalizationError
+
+import elspeth.contracts.errors as contract_errors
+from elspeth.contracts import (
+    AggregationMemberAction,
+    PayloadNotFoundError,
+    RouteDestination,
+    RowResult,
+    SourceRow,
+    TokenInfo,
+    TransformResult,
+)
+from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.audit_evidence import AuditEvidenceBase
+from elspeth.contracts.barrier_scalars import BarrierScalars, CoalescePendingScalars
+from elspeth.contracts.coordination import DEFAULT_ITEM_STALL_BUDGET_SECONDS, CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.freeze import deep_freeze
+from elspeth.contracts.identity import LineageFrame, innermost_own_frame, truncate_at_closer_frame
+from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, NodeID, RowUnionName, SinkName, StepResolver
+from elspeth.engine._best_effort import best_effort
+from elspeth.engine._error_hash import compute_error_hash
+from elspeth.engine.aggregation_result import (
+    aggregation_parent_dispositions,
+)
+from elspeth.engine.aggregation_result import (
+    validated_quarantined_indices as _validated_quarantined_indices,
+)
+from elspeth.engine.barrier_coordination import (
+    GROUP_FAILED_REASON,
+    BarrierIntakeCoordinator,
+    BarrierJournalRestoreContext,
+    BarrierRecoveryCoordinator,
+    _LiveBarrierHold,
+)
+from elspeth.engine.dag_navigator import DAGNavigator
+from elspeth.engine.scheduler_drain import (
+    MAX_WORK_QUEUE_ITERATIONS as MAX_WORK_QUEUE_ITERATIONS,  # re-export: tests import from here
+)
+from elspeth.engine.scheduler_drain import (
+    SCHEDULER_MAINTENANCE_INTERVAL as SCHEDULER_MAINTENANCE_INTERVAL,  # re-export: tests import from here
+)
+from elspeth.engine.scheduler_drain import (
+    ProcessorMode,
+    SchedulerDrainCoordinator,
+    is_scheduler_sink_bound_result,
+    require_scheduler_outcome,
+    require_scheduler_sink_name,
+    scheduler_error_hash,
+    scheduler_error_message,
+    with_scheduler_pending_sink_handoffs,
+)
+from elspeth.engine.scheduler_work_codec import SchedulerWorkCodec
+from elspeth.engine.token_traversal import TokenTraversalEngine
+from elspeth.engine.token_traversal import (
+    _GateContinue as _GateContinue,  # re-export: callers import the union types from here
+)
+from elspeth.engine.token_traversal import (
+    _GateOutcome as _GateOutcome,  # re-export
+)
+from elspeth.engine.token_traversal import (
+    _GateTerminal as _GateTerminal,  # re-export
+)
+from elspeth.engine.token_traversal import (
+    _TransformContinue as _TransformContinue,  # re-export: tests import from here
+)
+from elspeth.engine.token_traversal import (
+    _TransformOutcome as _TransformOutcome,  # re-export
+)
+from elspeth.engine.token_traversal import (
+    _TransformTerminal as _TransformTerminal,  # re-export
+)
+from elspeth.engine.work_items import WorkItem, WorkItemFactory, resolve_merged_branch_barrier
+
+if TYPE_CHECKING:
+    from elspeth.contracts import (
+        CommittedAggregationOutputReceipt,
+        CommittedAggregationResidual,
+        CommittedCoalesceResidual,
+        RecordedAggregationFailure,
+    )
+    from elspeth.contracts.events import TelemetryEvent
+    from elspeth.contracts.payload_store import PayloadStore
+    from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
+    from elspeth.engine.clock import Clock
+    from elspeth.engine.coalesce_executor import CoalesceExecutor
+    from elspeth.engine.executors import GateOutcome
+    from elspeth.engine.executors.collector import CollectorExecutor
+    from elspeth.engine.orchestrator.plugin_types import RowPlugin
+    from elspeth.engine.orchestrator.ports import TelemetryManagerProtocol
+    from elspeth.engine.row_union_executor import RowUnionExecutor
+
+from elspeth.contracts import BatchTransformProtocol, SourceProtocol, TransformProtocol
+from elspeth.contracts.declaration_contracts import (
+    AggregateDeclarationContractViolation,
+    BatchFlushInputs,
+    BatchFlushOutputs,
+    BoundaryInputs,
+    BoundaryOutputs,
+    DeclarationContractViolation,
+    derive_effective_input_fields,
+)
+from elspeth.contracts.enums import (
+    FrameKind,
+    GroupSettlementReason,
+    NodeStateStatus,
+    OutputMode,
+    RoutingKind,
+    RoutingMode,
+    TerminalOutcome,
+    TerminalPath,
+    TriggerType,
+)
+from elspeth.contracts.errors import (
+    AuditIntegrityError,
+    BatchDeclaredInputFieldsViolation,
+    BatchPassthroughShapeError,
+    BatchPassthroughShapeKind,
+    BatchQuarantineContradictionError,
+    BatchQuarantineContradictionKind,
+    CapacityError,
+    ExecutionError,
+    FrameworkBugError,
+    MaxRetriesExceeded,
+    OrchestrationInvariantError,
+    PluginContractViolation,
+    PluginRetryableError,
+    TransformErrorCategory,
+    TransformErrorReason,
+)
+from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.results import FailureInfo, failed_barrier_group_results
+from elspeth.contracts.scheduler import (
+    BarrierEmission,
+    BarrierTerminalOutcomeSpec,
+    GroupLossSpec,
+    SourceIngestSpec,
+    TokenWorkItem,
+    TokenWorkStatus,
+)
+from elspeth.contracts.secret_scrub import scrub_text_for_audit
+from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.core.checkpoint.serialization import checkpoint_dumps, checkpoint_loads
+from elspeth.core.config import AggregationSettings, GateSettings
+from elspeth.core.dag.group_bindings import CloserKind, GroupBinding, GroupBindingRegistry
+from elspeth.core.ids import generate_id
+from elspeth.core.landscape.data_flow_repository import DataFlowRepository
+from elspeth.core.landscape.errors import LandscapeRecordError
+from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+from elspeth.core.landscape.scheduler.restore_read_model import collector_scoped_completion_conflict
+from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
+from elspeth.core.landscape.scheduler_repository import (
+    TokenSchedulerRepository,
+)
+from elspeth.engine.clock import DEFAULT_CLOCK
+from elspeth.engine.executors import (
+    AggregationExecutor,
+    GateExecutor,
+    TransformExecutor,
+)
+from elspeth.engine.executors.batch_violation_outcomes import BatchSeamViolation, record_batch_violation_failures
+from elspeth.engine.executors.declaration_dispatch import run_batch_flush_checks, run_boundary_checks
+from elspeth.engine.executors.non_canonical_output import non_canonical_source_row_violation
+from elspeth.engine.executors.state_guard import NodeStateGuard, stamped_node_state_id
+from elspeth.engine.executors.transform import record_transform_error_with_routing
+from elspeth.engine.retry import RetryManager
+from elspeth.engine.spans import SpanFactory
+from elspeth.engine.tokens import TokenManager, ingest_source_quarantine
+
+logger = logging.getLogger(__name__)
+
+type _SourceBoundaryFailure = (
+    DeclarationContractViolation
+    | AggregateDeclarationContractViolation
+    | PluginContractViolation
+    | FrameworkBugError
+    | OrchestrationInvariantError
+)
+
+
+@dataclass(frozen=True, slots=True)
+class DAGTraversalContext:
+    """Precomputed DAG traversal data for the processor. Built by orchestrator.
+
+    All dict fields are stored as MappingProxyType to enforce true
+    immutability — frozen=True only prevents attribute reassignment,
+    not mutation of mutable values held by those attributes.
+    """
+
+    node_step_map: Mapping[NodeID, int]
+    node_to_plugin: Mapping[NodeID, RowPlugin | GateSettings]
+    node_to_next: Mapping[NodeID, NodeID | None]
+    coalesce_node_map: Mapping[CoalesceName, NodeID]
+    branch_first_node: Mapping[str, NodeID] = MappingProxyType({})
+    row_union_node_map: Mapping[RowUnionName, NodeID] = MappingProxyType({})
+    # Collector barriers (EXPAND-group closers, barrier-scopes spec §3): the
+    # traversal never executes a collector's plugin itself — the arrival is
+    # held and the CollectorExecutor runs the flush at intake — so, exactly
+    # like coalesce/row_union, the node is structural for traversal.
+    collector_node_map: Mapping[CollectorName, NodeID] = MappingProxyType({})
+    # Explicit allowlist of non-plugin traversal nodes (sources, queues,
+    # coalesce points, row_union and collector barriers). Nodes in
+    # node_to_next that are neither plugin-bearing nor in this set fail
+    # closed at resolution instead of being skipped. Barrier nodes are
+    # structural by definition and always unioned in.
+    structural_node_ids: frozenset[NodeID] = frozenset()
+    # The build's declared-input proof (ExecutionGraph.get_declared_input_proof):
+    # node_id -> the declared input fields every arriving row provably carries.
+    # The transform preflight and the batch seams classify a declared-input
+    # miss by it (ADR-013 Amendment 2026-09-27). The empty default serves the
+    # hand-built contexts of tests whose nodes declare no input; a node that
+    # does declare one and has no entry is refused on its first row
+    # (OrchestrationInvariantError), never read as "proves nothing".
+    declared_input_proof: Mapping[NodeID, frozenset[str]] = MappingProxyType({})
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "node_step_map", deep_freeze(self.node_step_map))
+        object.__setattr__(self, "node_to_plugin", deep_freeze(self.node_to_plugin))
+        object.__setattr__(self, "node_to_next", deep_freeze(self.node_to_next))
+        object.__setattr__(self, "coalesce_node_map", deep_freeze(self.coalesce_node_map))
+        object.__setattr__(self, "branch_first_node", deep_freeze(self.branch_first_node))
+        object.__setattr__(self, "row_union_node_map", deep_freeze(self.row_union_node_map))
+        object.__setattr__(self, "collector_node_map", deep_freeze(self.collector_node_map))
+        object.__setattr__(self, "declared_input_proof", deep_freeze(self.declared_input_proof))
+        object.__setattr__(
+            self,
+            "structural_node_ids",
+            frozenset(self.structural_node_ids)
+            | frozenset(self.coalesce_node_map.values())
+            | frozenset(self.row_union_node_map.values())
+            | frozenset(self.collector_node_map.values()),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CollectorRelease:
+    """Where a collector's released output goes — exactly one lane populated.
+
+    ``items``: READY continuations at the node after the barrier (non-terminal
+    collector). ``sink_results``: sink-bound results for a terminal collector
+    whose ``on_success`` names a sink. Both empty only for an M=0 release.
+    """
+
+    items: tuple[WorkItem, ...]
+    sink_results: tuple[RowResult, ...]
+
+    def __post_init__(self) -> None:
+        if self.items and self.sink_results:
+            raise OrchestrationInvariantError("CollectorRelease: a release is either READY continuations or sink-bound results, never both")
+
+
+@dataclass(frozen=True, slots=True)
+class _FlushContext:
+    """Parametric context for aggregation flush handling.
+
+    Captures the differences between timeout/end-of-source flushes
+    (handle_timeout_flush) and count-triggered flushes
+    (_process_batch_aggregation_node) so shared helpers can handle both.
+
+    Parametric differences:
+    - expand_parent_token: buffered_tokens[0] (timeout) vs current_token (count)
+    - triggering_token: None (timeout) vs current_token (count)
+    - coalesce info: derived from tokens (timeout) vs passed from WorkItem (count)
+    - CONSUMED_IN_BATCH recording: not needed (timeout) vs needed for triggering token (count)
+    """
+
+    node_id: NodeID
+    transform: TransformProtocol
+    settings: AggregationSettings
+    buffered_tokens: tuple[TokenInfo, ...]
+    batch_id: str
+    expand_parent_token: TokenInfo
+    triggering_token: TokenInfo | None
+    coalesce_node_id: NodeID | None
+    coalesce_name: CoalesceName | None
+    row_union_node_id: NodeID | None = None
+    row_union_name: RowUnionName | None = None
+
+    def __post_init__(self) -> None:
+        if not self.node_id:
+            raise ValueError("_FlushContext.node_id must not be empty")
+        # Freeze before validation so emptiness check works on generators too
+        object.__setattr__(self, "buffered_tokens", tuple(self.buffered_tokens))
+        if not self.buffered_tokens:
+            raise ValueError("_FlushContext.buffered_tokens must not be empty")
+        if not self.batch_id:
+            raise ValueError("_FlushContext.batch_id must not be empty")
+        # coalesce_node_id and coalesce_name must be both-or-neither
+        has_id = self.coalesce_node_id is not None
+        has_name = self.coalesce_name is not None
+        if has_id != has_name:
+            raise ValueError(
+                f"_FlushContext: coalesce_node_id and coalesce_name must be both set or both None, "
+                f"got node_id={self.coalesce_node_id!r}, name={self.coalesce_name!r}"
+            )
+        has_row_union_id = self.row_union_node_id is not None
+        has_row_union_name = self.row_union_name is not None
+        if has_row_union_id != has_row_union_name:
+            raise ValueError(
+                f"_FlushContext: row_union_node_id and row_union_name must be both set or both None, "
+                f"got node_id={self.row_union_node_id!r}, name={self.row_union_name!r}"
+            )
+        if has_id and has_row_union_id:
+            raise ValueError("_FlushContext cannot target both coalesce and row_union barriers")
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedAggregationRoute:
+    """Purely validated aggregation receipt route plan."""
+
+    context: _FlushContext
+    result: TransformResult
+    output_mode: OutputMode
+    output_rows: tuple[PipelineRow, ...]
+    quarantined_indices: frozenset[int]
+    expansion_parent: TokenInfo | None
+
+
+@dataclass(frozen=True, slots=True)
+class _FailedFlushDisposition:
+    """A FAILED batch verdict's disposition inputs: live flush or recorded verdict on resume.
+
+    ``error_detail`` is the reason's canonical JSON — the recorded text every
+    member's message and error_hash derive from.
+    """
+
+    node_id: NodeID
+    on_error: str
+    buffered_tokens: tuple[TokenInfo, ...]
+    batch_id: str
+    error_detail: str
+
+
+def make_step_resolver(
+    node_step_map: Mapping[NodeID, int],
+    source_node_id: NodeID,
+) -> StepResolver:
+    """Create a StepResolver from a precomputed step map.
+
+    Single source of truth for audit step resolution. Used by both RowProcessor
+    (for its internal executors) and the orchestrator (for CoalesceExecutor and
+    its TokenManager, which are constructed before the processor).
+
+    Resolution order:
+    1. Known node in step_map → return mapped step
+    2. Source node (not in map) → return 0
+    3. Unknown node → raise OrchestrationInvariantError
+    """
+    # Defensive copy so callers can't mutate the map after creation
+    _map = dict(node_step_map)
+    _source = source_node_id
+
+    def resolve(node_id: NodeID) -> int:
+        if node_id in _map:
+            return _map[node_id]
+        if node_id == _source:
+            return 0
+        raise OrchestrationInvariantError(f"Node ID '{node_id}' missing from traversal step map")
+
+    return resolve
+
+
+class RowProcessor:
+    """Processes rows through the DAG-defined pipeline topology.
+
+    Processing follows the DAG topology built from explicit input/on_success
+    connections. Transforms, gates, and aggregations are interleaved per their
+    declared wiring — there is no fixed "transforms first, then gates" order.
+
+    Handles:
+    1. Creating initial tokens from source rows
+    2. Executing transforms, gates, and aggregations per DAG traversal order
+    3. Routing tokens to sinks or downstream processing nodes
+    4. Recording final outcomes via Landscape audit trail
+
+    Example:
+        processor = RowProcessor(
+            execution, data_flow, span_factory, run_id, source_node_id,
+            traversal=traversal_context,
+        )
+
+        result = processor.process_row(
+            row_index=0,
+            source_row_index=0,
+            ingest_sequence=0,
+            source_row=SourceRow.valid({"value": 42}, contract=contract, source_row_index=0),
+            transforms=[transform1, transform2],
+            ctx=ctx,
+        )
+    """
+
+    def __init__(
+        self,
+        execution: ExecutionRepository,
+        data_flow: DataFlowRepository,
+        span_factory: SpanFactory,
+        run_id: str,
+        source_node_id: NodeID,
+        *,
+        source_on_success: str,
+        source_plugin: SourceProtocol | None = None,
+        edge_map: dict[tuple[NodeID, str], str] | None = None,
+        route_resolution_map: dict[tuple[NodeID, str], RouteDestination] | None = None,
+        traversal: DAGTraversalContext,
+        aggregation_settings: dict[NodeID, AggregationSettings] | None = None,
+        retry_manager: RetryManager | None = None,
+        coalesce_executor: CoalesceExecutor | None = None,
+        branch_to_coalesce: dict[BranchName, CoalesceName] | None = None,
+        row_union_executor: RowUnionExecutor | None = None,
+        branch_to_row_union: dict[BranchName, RowUnionName] | None = None,
+        collector_executor: CollectorExecutor | None = None,
+        collector_on_success_map: dict[CollectorName, str] | None = None,
+        group_bindings: GroupBindingRegistry | None = None,
+        branch_to_sink: dict[BranchName, SinkName] | None = None,
+        unbound_branch_first_node: dict[BranchName, NodeID] | None = None,
+        sink_names: frozenset[str] | None = None,
+        coalesce_on_success_map: dict[CoalesceName, str] | None = None,
+        barrier_restore: BarrierJournalRestoreContext | None = None,
+        barrier_restore_reads: BarrierRestoreReadModel | None = None,
+        payload_store: PayloadStore | None = None,
+        clock: Clock | None = None,
+        max_workers: int | None = None,
+        telemetry_manager: TelemetryManagerProtocol | None = None,
+        scheduler: TokenSchedulerRepository,
+        scheduler_lease_owner: str | None = None,
+        scheduler_lease_seconds: int = 300,
+        scheduler_heartbeat_seconds: int = 60,
+        coordination_token: CoordinationToken | None = None,
+        member_token: WorkerMembershipToken | None = None,
+        run_coordination: RunCoordinationRepository | None = None,
+        follower_barrier_node_ids: frozenset[NodeID] | None = None,
+        mode: ProcessorMode = ProcessorMode.LEADER,
+        max_expand_group_width: int | None = None,
+    ) -> None:
+        """Initialize processor.
+
+        Args:
+            execution: Execution repository for node states, routing, operations
+            data_flow: Data flow repository for token outcomes, schema contracts
+            span_factory: Span factory for tracing
+            run_id: Current run ID
+            source_node_id: Source node ID
+            source_on_success: Source's on_success sink name for COMPLETED routing
+            source_plugin: Optional source plugin instance. Production
+                orchestrator passes the concrete source so source-boundary
+                contracts can evaluate runtime declarations after token creation.
+            edge_map: Map of (node_id, label) -> edge_id
+            route_resolution_map: Map of (node_id, label) -> resolved route destination
+            traversal: Precomputed DAG traversal context from orchestrator
+            aggregation_settings: Map of node_id -> AggregationSettings for trigger evaluation
+            retry_manager: Optional retry manager for transform execution
+            coalesce_executor: Optional coalesce executor for fork/join operations
+            branch_to_coalesce: Map of branch_name -> coalesce_name for fork/join routing
+            collector_executor: Optional collector executor (EXPAND-group closers,
+                barrier-scopes spec §5). Leader-only, like the coalesce and row_union
+                executors; ``None`` on followers and on pipelines without collectors.
+            collector_on_success_map: Map of collector_name -> terminal sink_name for
+                collectors whose flush output routes straight to a sink (the
+                coalesce_on_success_map twin; a non-terminal collector has no entry
+                and its release continues at the node after the barrier).
+            group_bindings: The unified FORK/EXPAND group-binding registry (barrier-scopes
+                spec §3, §6.1). ``_settle_member_losses`` walks a failing token's
+                ``lineage_path`` against ``group_bindings.binding_for(frame)`` to find
+                the first bound frame — THE settlement seam. Defaults to an empty
+                registry (every frame resolves inert) rather than None, so the walk
+                never needs a None branch. Also threaded to this processor's own
+                TokenManager so ``expand_token`` can register runtime-minted EXPAND
+                group ids on the SAME registry instance the walk reads (identity
+                matters: a copy would make registration permanently invisible).
+            unbound_branch_first_node: Map of branch_name -> first node id for
+                fork branches with no barrier (spec §7 E2): consumed by
+                exactly one ordinary downstream transform/gate, pure fan-out.
+            sink_names: Set of valid sink names for route resolution validation.
+                If None, sink validation on jump-target resolution is skipped.
+            coalesce_on_success_map: Map of coalesce_name -> terminal sink_name
+                for COALESCED outcomes produced at terminal coalesce points
+            barrier_restore: Resume-only inputs for the journal-based barrier
+                restore (F1). Non-None means this processor is being built on
+                the resume path: barrier buffers are rebuilt from journal
+                BLOCKED rows + audit tables before the first row is processed.
+            barrier_restore_reads: Restore-owned token-outcome read model for
+                ADR-030 duplicate-acceptance and crash-window reconciliation.
+                Required when ``barrier_restore`` is supplied.
+            payload_store: Optional PayloadStore for persisting source row payloads
+            clock: Optional clock for time access. Defaults to system clock.
+                   Inject MockClock for deterministic testing.
+            max_workers: Maximum concurrent workers for transform execution (None = no limit)
+            telemetry_manager: Optional TelemetryManager for emitting telemetry events.
+                               If None, telemetry emission is disabled.
+            scheduler: Durable token scheduler. Every continuation is persisted,
+                leased, and terminally marked as it advances.
+            coordination_token: Leader fencing token (epoch 21, ADR-030).
+                Carried by value for the slice-2 step-4 fenced verbs this
+                processor drives (repair sweep, recover_expired_leases, the
+                fenced ingest verb). Strict recovery derives both run scope
+                and caller identity from this token. The orchestrator also
+                passes ``scheduler_lease_owner=token.worker_id`` — the §A.1
+                registered worker identity IS the lease owner. A distinct
+                leader lease owner is rejected at construction.
+            member_token: Membership fencing token (ADR-030 D4's second
+                fence; ADR-048 amendment 2026-09-07). Carried by value for
+                the membership-fenced verbs a FOLLOWER drives; the value
+                ``admit_follower`` returned, never constructed here. The two
+                authority types are a TYPE distinction, not a flag: FOLLOWER
+                requires ``member_token`` and forbids ``coordination_token``;
+                LEADER forbids ``member_token`` (a leader derives its own
+                membership from its coordination token). Its ``worker_id``
+                must equal ``scheduler_lease_owner`` and its ``run_id`` this
+                processor's run.
+            run_coordination: Optional RunCoordinationRepository for leader
+                housekeeping (§C.2 path 1, slice 4): enumerating dead non-leader
+                workers and calling ``evict_worker`` for each. None = no
+                dead-member enumeration; it never selects unfenced recovery,
+                and leader maintenance still requires ``coordination_token``.
+            follower_barrier_node_ids: ADR-030 §B (slice 5, follower aggregation
+                barrier hand-off): frozenset of aggregation node IDs that this
+                follower must NOT execute locally.  When a batch-aware transform
+                is encountered at one of these node IDs, the processor returns
+                (None, []) which triggers mark_blocked so the leader's next
+                journal-intake adopts the arrival and runs trigger evaluation
+                (§B.2: trigger evaluation is leader-only).  Non-follower
+                processors leave this None (no-op path).
+            max_expand_group_width: The expand-width fence
+                (elspeth-258bd49d81, settings.max_expand_group_width). The
+                traversal's multi-row arm refuses a wider expansion ahead of
+                the mint and routes the row through the transform error
+                channel (reason ``expand_width_exceeded``); the same value is
+                threaded to this processor's TokenManager as the fail-closed
+                backstop at the mint seam itself. None = unfenced (direct
+                test constructions); the production factory always passes
+                the settings value.
+            mode: Explicit processor role (elspeth-577179bba1). LEADER (the
+                default) is the production role: maintenance requires
+                ``coordination_token`` and always uses strict recovery. Direct
+                tokenless harnesses recover through the repository's named
+                legacy adapter rather than this processor mode.
+                FOLLOWER is validated fail-closed below: it requires
+                ``coordination_token=None``, ``run_coordination=None``, an
+                explicit ``scheduler_lease_owner`` and a ``member_token``
+                naming that owner; it gates the public
+                :meth:`drain_follower_ready_work` surface and the follower
+                skip of scheduler maintenance (ADR-030 §C.3).
+        """
+        if scheduler is None:
+            raise TypeError("scheduler repository is required; RowProcessor no longer supports the legacy in-memory drain")
+
+        self._execution = execution
+        self._data_flow = data_flow
+        self._spans = span_factory
+        self._run_id = run_id
+        self._source_node_id: NodeID = source_node_id
+        self._source_on_success: str = source_on_success
+        self._traversal = traversal
+        self._node_step_map: Mapping[NodeID, int] = traversal.node_step_map
+        self._step_resolver: StepResolver = make_step_resolver(traversal.node_step_map, source_node_id)
+        self._node_to_plugin: Mapping[NodeID, RowPlugin | GateSettings] = traversal.node_to_plugin
+        # Traversal metadata intentionally excludes the source node. Callers
+        # that want source-boundary checks must pass the concrete source plugin.
+        self._source_plugin: SourceProtocol | None = source_plugin
+        self._node_to_next: Mapping[NodeID, NodeID | None] = traversal.node_to_next
+        self._retry_manager = retry_manager
+        self._coalesce_executor = coalesce_executor
+        self._coalesce_node_ids: dict[CoalesceName, NodeID] = dict(traversal.coalesce_node_map)
+        self._coalesce_name_by_node_id: dict[NodeID, CoalesceName] = {
+            node_id: coalesce_name for coalesce_name, node_id in self._coalesce_node_ids.items()
+        }
+        # Explicit allowlist from the traversal context (elspeth-c522931bd1):
+        # never derived as the complement of node_to_plugin, which silently
+        # skipped plugin nodes missing from the mapping (fail-open).
+        self._structural_node_ids: frozenset[NodeID] = traversal.structural_node_ids
+        self._branch_to_coalesce: dict[BranchName, CoalesceName] = branch_to_coalesce or {}
+        self._row_union_executor = row_union_executor
+        self._row_union_node_ids: dict[RowUnionName, NodeID] = dict(traversal.row_union_node_map)
+        self._branch_to_row_union: dict[BranchName, RowUnionName] = branch_to_row_union or {}
+        self._collector_executor = collector_executor
+        self._collector_node_ids: dict[CollectorName, NodeID] = dict(traversal.collector_node_map)
+        self._collector_on_success_map: dict[CollectorName, str] = dict(collector_on_success_map or {})
+        # THE settle-member walk's frame resolver (spec §6.1). Defaults to an
+        # empty registry — every frame is inert, nothing staged — rather than
+        # None, so _settle_member_losses never needs a None branch.
+        self._group_bindings: GroupBindingRegistry = group_bindings if group_bindings is not None else GroupBindingRegistry(bindings=())
+        # opener node -> its scope binding, the same cached index TokenManager
+        # keeps for register_expand_group: the expand path consults it to give
+        # a bound opener's children their collector cursor.
+        self._opener_binding_by_node_id: dict[NodeID, GroupBinding] = self._group_bindings.by_opener_node()
+        # Declared EXPAND openers only (scope openers): the META-9.1
+        # re-derivation below iterates exactly these; a pipeline with no
+        # declared scope never pays a durable read for an EXPAND frame.
+        self._expand_opener_binding_by_node_id: dict[NodeID, GroupBinding] = {
+            node_id: binding for node_id, binding in self._opener_binding_by_node_id.items() if binding.kind is FrameKind.EXPAND
+        }
+        # EXPAND group ids this process has already re-derived as UNDECLARED
+        # (META-9.1): an undeclared expansion's frame is inert forever, and
+        # the durable re-derivation is a DB read per miss — remember the
+        # verdict so an ordinary multi-row transform's children cost one read
+        # per group, not one per settled loss. Only a POSITIVELY undeclared
+        # group enters (mint step at no declared opener); a declared opener
+        # with a missing node_state raises and is never remembered.
+        self._inert_expand_groups: set[str] = set()
+        self._branch_to_sink: dict[BranchName, SinkName] = branch_to_sink or {}
+        self._unbound_branch_first_node: dict[BranchName, NodeID] = unbound_branch_first_node or {}
+        overlap = set(self._branch_to_coalesce.keys()) & set(self._branch_to_sink.keys())
+        if overlap:
+            raise OrchestrationInvariantError(
+                f"Branch names {sorted(overlap)} appear in both branch_to_coalesce and branch_to_sink. "
+                "A fork branch must route to EITHER a coalesce node OR a direct sink, not both."
+            )
+        barrier_overlap = set(self._branch_to_coalesce.keys()) & set(self._branch_to_row_union.keys())
+        if barrier_overlap:
+            raise OrchestrationInvariantError(
+                f"Branch names {sorted(barrier_overlap)} appear in both branch_to_coalesce and branch_to_row_union. "
+                "A fork branch must join at exactly one barrier."
+            )
+        unbound_overlap = set(self._unbound_branch_first_node.keys()) & (
+            set(self._branch_to_coalesce.keys()) | set(self._branch_to_row_union.keys()) | set(self._branch_to_sink.keys())
+        )
+        if unbound_overlap:
+            raise OrchestrationInvariantError(
+                f"Branch names {sorted(unbound_overlap)} appear in unbound_branch_first_node as well as a barrier or "
+                "sink map. A fork branch is exactly one of closer-bound, sink-bound, or consumer-fed."
+            )
+        self._sink_names: frozenset[str] = sink_names or frozenset()
+        self._coalesce_on_success_map: dict[CoalesceName, str] = coalesce_on_success_map or {}
+        self._aggregation_settings: dict[NodeID, AggregationSettings] = aggregation_settings or {}
+        # ADR-030 §B (slice 5): aggregation node IDs that a follower must NOT
+        # execute locally — these are barrier nodes whose trigger evaluation is
+        # leader-only.  Empty frozenset on any non-follower processor (no-op).
+        self._follower_barrier_node_ids: frozenset[NodeID] = follower_barrier_node_ids or frozenset()
+        self._clock = clock if clock is not None else DEFAULT_CLOCK
+
+        # DAG navigator: pure topology queries extracted from RowProcessor
+        self._nav = DAGNavigator.from_traversal_context(
+            traversal,
+            coalesce_on_success_map=self._coalesce_on_success_map,
+            collector_on_success_map=self._collector_on_success_map,
+            sink_names=self._sink_names,
+        )
+        self._work_items = WorkItemFactory(self._nav)
+
+        # Build error edge map: processing node_id -> DIVERT edge_id.
+        # Scans edge_map for __error_{name}__ labels created for transforms,
+        # config gates and aggregations whose on_error points to a real sink,
+        # not "discard".
+        _edge_map = edge_map or {}
+        error_edge_ids: dict[NodeID, str] = {}
+        for (node_id, label), edge_id in _edge_map.items():
+            if label.startswith("__error_") and label.endswith("__"):
+                error_edge_ids[node_id] = edge_id
+        self._error_edge_ids = error_edge_ids
+
+        self._max_expand_group_width = max_expand_group_width
+        self._token_manager = TokenManager(
+            data_flow,
+            step_resolver=self._step_resolver,
+            group_bindings=self._group_bindings,
+            max_expand_group_width=max_expand_group_width,
+        )
+        self._transform_executor = TransformExecutor(
+            execution,
+            span_factory,
+            self._step_resolver,
+            max_workers=max_workers,
+            error_edge_ids=error_edge_ids,
+            data_flow=data_flow,
+            before_terminal_audit=self._heartbeat_active_claim,
+            declared_input_proof=traversal.declared_input_proof,
+        )
+        self._gate_executor = GateExecutor(
+            execution,
+            span_factory,
+            self._step_resolver,
+            edge_map,
+            route_resolution_map,
+            error_edge_ids=error_edge_ids,
+        )
+        self._aggregation_executor = AggregationExecutor(
+            execution,
+            span_factory,
+            self._step_resolver,
+            run_id,
+            aggregation_settings=aggregation_settings,
+            error_edge_ids=error_edge_ids,
+            declared_input_proof=traversal.declared_input_proof,
+            clock=self._clock,
+        )
+        self._telemetry_manager = telemetry_manager
+        self._scheduler = scheduler
+        self._payload_store = payload_store
+        # One codec for the WorkItem <-> durable scheduler payload mapping
+        # (elspeth-6291c51766): ingest, enqueue, READY barrier emission, and
+        # rehydrate must derive byte-identical field bundles (deterministic
+        # work_item_id + strict field-equality reconciliation), so the
+        # derivation lives in one place instead of four hand-synced encoders.
+        self._work_codec = SchedulerWorkCodec(
+            serialize_row_payload=scheduler.serialize_row_payload,
+            deserialize_row_payload=scheduler.deserialize_row_payload,
+            resolve_node_cursor=self._scheduler_node_id,
+            resolve_step_index=self._scheduler_step_index,
+            resolve_ingest_sequence=data_flow.resolve_row_ingest_sequence,
+            queue_key_for_item=self._queue_key_for_blocked_item,
+            barrier_key_for_item=self._barrier_key_for_blocked_item,
+            create_work_item=self._work_items.create,
+        )
+        if coordination_token is not None and not isinstance(coordination_token, CoordinationToken):
+            raise OrchestrationInvariantError(
+                "The coordination_token parameter requires a CoordinationToken: membership alone "
+                "cannot authorize leader maintenance or recovery."
+            )
+        self._coordination_token = coordination_token
+        self._member_token = member_token
+        self._run_coordination = run_coordination
+        # Lease identity is the admitted worker carried by the authority.
+        if (
+            mode is ProcessorMode.LEADER
+            and coordination_token is not None
+            and scheduler_lease_owner is not None
+            and scheduler_lease_owner != coordination_token.worker_id
+        ):
+            raise OrchestrationInvariantError(
+                "ProcessorMode.LEADER requires scheduler_lease_owner to equal coordination_token.worker_id; "
+                "leader-fenced recovery derives caller identity from the token and must not hold leases under a second identity."
+            )
+        # Explicit processor role (elspeth-577179bba1): follower-ness is a
+        # STORED construction-time decision, never re-derived from the
+        # coordination_token/run_coordination None-sentinels. On the follower
+        # path those sentinels remain correct ABSENCES (no epoch fence, no
+        # §C.2 housekeeping) — the mode flag, not their None-ness, drives
+        # branch selection. FOLLOWER wiring is validated fail-closed HERE so
+        # a wrong-mode construction crashes instead of silently taking a
+        # leader-only arm. (The follower barrier-intake no-op needs no mode
+        # gate: it is already structural — empty aggregation_settings plus
+        # coalesce_executor=None make the intake pass a no-op.)
+        self._mode = mode
+        # ADR-030 D4 / ADR-048 amendment: the two authority types are a TYPE
+        # distinction, never a flag. A follower carries exactly a
+        # WorkerMembershipToken; a leader carries exactly a CoordinationToken
+        # (its membership is derived, never carried alongside). A processor
+        # holding both — or the wrong one — is the wrong-mode bug this guard
+        # exists to catch, before any verb can be reached.
+        if mode is ProcessorMode.FOLLOWER:
+            if coordination_token is not None:
+                raise OrchestrationInvariantError(
+                    "ProcessorMode.FOLLOWER forbids a coordination_token: a follower must never "
+                    "present an epoch fence (ADR-030 §B.1 — the leader-fenced verbs are leader-only). "
+                    "A follower carrying a leader fence is the wrong-mode bug this flag exists to catch."
+                )
+            if run_coordination is not None:
+                raise OrchestrationInvariantError(
+                    "ProcessorMode.FOLLOWER forbids run_coordination: a follower must never run "
+                    "the §C.2 housekeeping/eviction sweep (leader-only). A follower holding the "
+                    "coordination repository is the wrong-mode bug this flag exists to catch."
+                )
+            if scheduler_lease_owner is None:
+                raise OrchestrationInvariantError(
+                    "ProcessorMode.FOLLOWER requires an explicit scheduler_lease_owner: the "
+                    "follower's registered run_workers identity IS its lease owner and "
+                    "membership-fence key (ADR-030 §A.1/§G); an anonymous minted owner cannot "
+                    "pass the claim fence."
+                )
+            if member_token is None:
+                raise OrchestrationInvariantError(
+                    "ProcessorMode.FOLLOWER requires a member_token: a follower's authority is its "
+                    "WorkerMembershipToken (ADR-030 D4 membership fence), the value admit_follower "
+                    "returned. A follower without one cannot present membership to any fenced verb."
+                )
+            if not isinstance(member_token, WorkerMembershipToken):
+                raise OrchestrationInvariantError(
+                    "ProcessorMode.FOLLOWER requires a WorkerMembershipToken: matching run and worker "
+                    "identities do not make a leader token membership authority."
+                )
+            if member_token.run_id != run_id or member_token.worker_id != scheduler_lease_owner:
+                raise OrchestrationInvariantError(
+                    "ProcessorMode.FOLLOWER requires member_token to name this processor's run and its "
+                    f"scheduler_lease_owner: got member_token=({member_token.run_id!r}, {member_token.worker_id!r}) "
+                    f"for run_id={run_id!r}, scheduler_lease_owner={scheduler_lease_owner!r} (ADR-030 §A.1)."
+                )
+        elif member_token is not None:
+            raise OrchestrationInvariantError(
+                "ProcessorMode.LEADER forbids a member_token: a leader's membership is derived from its "
+                "coordination_token (CoordinationToken.membership), never carried alongside it. A leader "
+                "holding a follower's authority type is the wrong-mode bug this guard exists to catch."
+            )
+        elif coordination_token is None or coordination_token.run_id != run_id:
+            raise OrchestrationInvariantError("ProcessorMode.LEADER requires leadership authority for this run")
+        self._scheduler_lease_owner = self._require_member_token().worker_id
+        self._scheduler_lease_seconds = scheduler_lease_seconds
+        if scheduler_heartbeat_seconds <= 0:
+            raise OrchestrationInvariantError(f"scheduler_heartbeat_seconds must be positive, got {scheduler_heartbeat_seconds}")
+        if scheduler_heartbeat_seconds >= scheduler_lease_seconds:
+            raise OrchestrationInvariantError(
+                f"scheduler_heartbeat_seconds ({scheduler_heartbeat_seconds}) must be less than "
+                f"scheduler_lease_seconds ({scheduler_lease_seconds}); otherwise the heartbeat "
+                "cannot refresh the lease before it expires under any slow-work scenario."
+            )
+
+        # ADR-030 §E.2 (slice 3, journal-first barrier acceptance): live-token
+        # stash keyed by token_id. `_process_batch_aggregation_node` and
+        # `_maybe_coalesce_token` deposit the CURRENT (post-transform) token
+        # plus its barrier_key the moment they decide to block; the drain
+        # reads the barrier_key for mark_blocked and the next iteration's
+        # intake (`_run_barrier_intake_pass`) pops the token to feed executor
+        # memory with exact N=1 parity. Entries for rows this process never
+        # adopts (lease lost to a peer mid-claim) linger harmlessly for the
+        # processor's lifetime — bounded by run size.
+        # RowProcessor is single-threaded per row, so no concurrent access.
+        self._live_barrier_holds: dict[str, _LiveBarrierHold] = {}
+        # §6.2 record-then-notify: GroupLossSpecs accumulated by
+        # `_settle_member_losses`/`_stage_group_loss` during the current claim/flush;
+        # consumed by the disposition that commits the member's terminal state
+        # (the drain's mark_failed/mark_pending_sink/mark_terminal, or the
+        # flush's complete_barrier) so the durable loss record rides the SAME
+        # transaction as the disposition.
+        self._pending_group_losses: list[GroupLossSpec] = []
+
+        # F1 (THE RESTORE INVERSION): on resume, barrier buffers are rebuilt
+        # FROM journal BLOCKED rows + audit tables. The old direction —
+        # materializing journal rows from checkpoint blobs — is gone; the
+        # checkpoint contributes only scalars (via barrier_restore).
+        # The checkpoint id is retained for re-drive provenance: a PENDING_SINK
+        # re-drive whose token already has node_states (the original run's
+        # crashed sink attempt) must stamp resume_attempt_offset/-checkpoint_id
+        # so the re-driven sink node_state does not collide at attempt 0.
+        self._resume_checkpoint_id: str | None = barrier_restore.resume_checkpoint_id if barrier_restore is not None else None
+        restore_reads = barrier_restore_reads if barrier_restore_reads is not None else execution
+        # Retained for the row_union post-release divert discriminator: a
+        # released group's status-COMPLETED node state is the durable proof
+        # that a later terminal divert is not a pre-barrier branch loss.
+        self._barrier_restore_reads = restore_reads
+        # The typed restore read model alone (never the ExecutionRepository
+        # fallback): the META-9.1 EXPAND re-derivation needs its
+        # node-scoped attempt read and the durable closer-node resolver.
+        # Production always wires factory.barrier_restore here.
+        self._barrier_restore_read_model: BarrierRestoreReadModel | None = barrier_restore_reads
+        # Barrier subsystem (elspeth-e76a186916): the intake and recovery
+        # coordinators own the crash-window adoption/restore ordering (open
+        # batch -> fenced adopt -> feed memory -> evaluate trigger) behind one
+        # boundary; the processor keeps thin delegates plus the continuation
+        # seams (flush execution, coalesce fire completion, telemetry).
+        self._barrier_intake = BarrierIntakeCoordinator(
+            run_id=run_id,
+            scheduler=scheduler,
+            data_flow=data_flow,
+            execution=execution,
+            barrier_restore_reads=restore_reads,
+            aggregation_executor=self._aggregation_executor,
+            coalesce_executor=self._coalesce_executor,
+            nav=self._nav,
+            work_items=self._work_items,
+            clock=self._clock,
+            aggregation_settings=self._aggregation_settings,
+            coalesce_node_ids=self._coalesce_node_ids,
+            branch_to_coalesce=self._branch_to_coalesce,
+            group_bindings=self._group_bindings,
+            coordination_token=coordination_token,
+            scheduler_lease_owner=self._scheduler_lease_owner,
+            live_barrier_holds=self._live_barrier_holds,
+            resume_checkpoint_id=self._resume_checkpoint_id,
+            flush_batch=self.handle_timeout_flush,
+            complete_coalesce_fire=self._complete_coalesce_fire,
+            terminal_coalesce_row_result=self._terminal_coalesce_row_result,
+            emit_token_completed=self._emit_token_completed,
+            settle_failed_coalesce_group=self.settle_failed_coalesce_group,
+            record_group_member_terminals=self.record_group_member_terminals,
+            take_pending_group_losses=self.take_pending_group_losses,
+            row_union_executor=self._row_union_executor,
+            row_union_node_ids=self._row_union_node_ids,
+            branch_to_row_union=self._branch_to_row_union,
+            complete_row_union_fire=self._complete_row_union_fire,
+            released_row_union_items=self.released_row_union_items,
+            collector_executor=self._collector_executor,
+            collector_node_ids=self._collector_node_ids,
+            complete_collector_fire=self._complete_collector_fire,
+            route_collector_release=self.route_collector_release,
+            merged_continuation_cursor=self._merged_continuation_cursor,
+        )
+        # Scheduler-drain subsystem (elspeth-c49f33d6e4 component 3): the
+        # coordinator owns the durable claim/drain loop, dispositions,
+        # pending-sink recovery, the active-claim heartbeat, and the
+        # maintenance cadence. It shares the live-holds dict and the
+        # branch-loss stage BY REFERENCE with the barrier subsystem and the
+        # processor-side producers, and drives token processing through this
+        # processor at call time (the traversal engine is component 4 of the
+        # same split).
+        self._scheduler_drain = SchedulerDrainCoordinator(
+            processor=self,
+            mode=mode,
+            run_id=run_id,
+            scheduler=scheduler,
+            work_codec=self._work_codec,
+            execution=execution,
+            barrier_restore_reads=restore_reads,
+            clock=self._clock,
+            span_factory=self._spans,
+            run_coordination=run_coordination,
+            coordination_token=coordination_token,
+            member_token=self._require_member_token(),
+            scheduler_lease_owner=self._scheduler_lease_owner,
+            scheduler_lease_seconds=scheduler_lease_seconds,
+            scheduler_heartbeat_seconds=scheduler_heartbeat_seconds,
+            resume_checkpoint_id=self._resume_checkpoint_id,
+            live_barrier_holds=self._live_barrier_holds,
+            pending_group_losses=self._pending_group_losses,
+        )
+        # Component 4 (c49): the DAG token-traversal state machine. Holds only a
+        # back-reference and resolves processor seams at call time, so tests that
+        # patch _process_single_token / _handle_transform_node on the processor
+        # still intercept traversal.
+        self._token_traversal = TokenTraversalEngine(self)
+        if barrier_restore is not None:
+            if barrier_restore_reads is None:
+                raise OrchestrationInvariantError("barrier_restore_reads is required when barrier_restore is supplied")
+            BarrierRecoveryCoordinator(
+                run_id=run_id,
+                scheduler=scheduler,
+                barrier_restore_reads=barrier_restore_reads,
+                execution=execution,
+                aggregation_executor=self._aggregation_executor,
+                coalesce_executor=self._coalesce_executor,
+                clock=self._clock,
+                aggregation_settings=self._aggregation_settings,
+                coalesce_node_ids=self._coalesce_node_ids,
+                coordination_token=self._require_coordination_token(),
+                scheduler_lease_owner=self._scheduler_lease_owner,
+                row_union_executor=self._row_union_executor,
+                row_union_node_ids=self._row_union_node_ids,
+                released_row_union_items=self.released_row_union_items,
+                complete_row_union_fire=self._complete_row_union_fire,
+                emit_token_completed=self._emit_token_completed,
+                complete_committed_aggregation_residual=self._complete_committed_aggregation_residual,
+                prepare_committed_aggregation_output=self._prepare_committed_aggregation_output,
+                complete_committed_aggregation_output=self._complete_committed_aggregation_output,
+                prepare_recorded_aggregation_failure=self._prepare_recorded_aggregation_failure,
+                complete_recorded_aggregation_failure=self._dispose_failed_flush,
+                complete_committed_coalesce_residual=self._complete_committed_coalesce_residual,
+                collector_executor=self._collector_executor,
+                collector_node_ids=self._collector_node_ids,
+            ).restore_from_journal(barrier_restore)
+
+    @property
+    def row_union_executor(self) -> RowUnionExecutor | None:
+        """The leader's row_union barrier executor (None on followers)."""
+        return self._row_union_executor
+
+    @property
+    def collector_executor(self) -> CollectorExecutor | None:
+        """The leader's collector barrier executor (None on followers)."""
+        return self._collector_executor
+
+    @property
+    def coordination_token(self) -> CoordinationToken | None:
+        """The leader fencing token bound at construction (ADR-030).
+
+        Exposed so source-iteration helpers (quarantine ingest) can thread it
+        into their own fenced row writes. None for follower processors and
+        tokenless direct harness construction. Neither case selects unfenced
+        recovery: followers skip maintenance, while recovery-specific direct
+        harnesses call the named repository legacy adapter outside RowProcessor.
+        """
+        return self._coordination_token
+
+    @property
+    def run_id(self) -> str:
+        """Run identifier owned by this processor."""
+        return self._run_id
+
+    def resolve_node_step(self, node_id: NodeID) -> int:
+        """Resolve a node ID to processor step index (0-indexed)."""
+        if node_id not in self._node_step_map:
+            raise OrchestrationInvariantError(f"Node ID '{node_id}' missing from traversal step map")
+        return self._node_step_map[node_id]
+
+    def resolve_sink_step(self) -> int:
+        """Resolve the audit step index for sink writes.
+
+        Sinks are always the last step in processing, after all transforms,
+        gates, aggregations, and coalesce nodes. Returns max(step_map) + 1.
+        """
+        if not self._node_step_map:
+            raise OrchestrationInvariantError(
+                "Cannot resolve sink step: node step map is empty. Pipeline must have at least one processing node."
+            )
+        return max(self._node_step_map.values()) + 1
+
+    def _resolve_audit_step_for_node(self, node_id: NodeID) -> int:
+        """Resolve 1-indexed audit step for a processing node.
+
+        Delegates to the factory-produced StepResolver (make_step_resolver).
+        """
+        return self._step_resolver(node_id)
+
+    def _emit_telemetry(self, event: TelemetryEvent) -> None:
+        """Emit telemetry event if manager is configured.
+
+        Telemetry is emitted AFTER Landscape recording succeeds. Landscape is
+        the legal record; telemetry is operational visibility.
+
+        Args:
+            event: The telemetry event to emit
+        """
+        if self._telemetry_manager is not None:
+            self._telemetry_manager.handle_event(event)
+
+    def _emit_transform_completed(
+        self,
+        token: TokenInfo,
+        transform: TransformProtocol,
+        transform_result: TransformResult,
+    ) -> None:
+        """Emit TransformCompleted telemetry event.
+
+        Called AFTER Landscape recording succeeds in TransformExecutor.
+
+        Args:
+            token: Token that was processed
+            transform: Transform that was executed
+            transform_result: Result from the transform execution
+        """
+        if self._telemetry_manager is None:
+            return
+
+        from datetime import datetime
+
+        from elspeth.contracts import TransformCompleted
+        from elspeth.contracts.enums import NodeStateStatus
+
+        status = NodeStateStatus.COMPLETED if transform_result.status == "success" else NodeStateStatus.FAILED
+
+        # node_id is assigned during DAG construction in from_plugin_instances()
+        if transform.node_id is None:
+            raise OrchestrationInvariantError("node_id must be assigned by DAG construction before execution")
+        self._emit_telemetry(
+            TransformCompleted(
+                timestamp=datetime.now(UTC),
+                run_id=self._run_id,
+                row_id=token.row_id,
+                token_id=token.token_id,
+                node_id=transform.node_id,
+                plugin_name=transform.name,
+                status=status,
+                duration_ms=transform_result.duration_ms if transform_result.duration_ms is not None else 0.0,
+                input_hash=transform_result.input_hash,
+                output_hash=transform_result.output_hash,
+            )
+        )
+
+    def _emit_gate_evaluated(
+        self,
+        token: TokenInfo,
+        gate_name: str,
+        gate_node_id: str,
+        routing_mode: RoutingMode,
+        destinations: tuple[str, ...],
+    ) -> None:
+        """Emit GateEvaluated telemetry event.
+
+        Called AFTER Landscape recording succeeds in GateExecutor.
+
+        Args:
+            token: Token that was routed
+            gate_name: Name of the gate (from GateSettings)
+            gate_node_id: Node ID of the gate
+            routing_mode: How routing was performed (move, copy)
+            destinations: Destination node/sink names
+        """
+        if self._telemetry_manager is None:
+            return
+
+        from datetime import datetime
+
+        from elspeth.contracts import GateEvaluated
+
+        self._emit_telemetry(
+            GateEvaluated(
+                timestamp=datetime.now(UTC),
+                run_id=self._run_id,
+                row_id=token.row_id,
+                token_id=token.token_id,
+                node_id=gate_node_id,
+                plugin_name=gate_name,
+                routing_mode=routing_mode,
+                destinations=destinations,
+            )
+        )
+
+    def _emit_token_completed(
+        self,
+        token: TokenInfo,
+        *,
+        outcome: TerminalOutcome | None,
+        path: TerminalPath,
+        sink_name: str | None = None,
+    ) -> None:
+        """Emit TokenCompleted telemetry event.
+
+        Called AFTER Landscape recording succeeds (record_token_outcome).
+
+        Args:
+            token: Token that reached terminal state
+            outcome: Lifecycle outcome (None for non-terminal BUFFERED)
+            path: Terminal provenance path
+            sink_name: Destination sink if applicable
+        """
+        if self._telemetry_manager is None:
+            return
+
+        from datetime import datetime
+
+        from elspeth.contracts import TokenCompleted
+
+        self._emit_telemetry(
+            TokenCompleted(
+                timestamp=datetime.now(UTC),
+                run_id=self._run_id,
+                row_id=token.row_id,
+                token_id=token.token_id,
+                outcome=outcome,
+                path=path,
+                sink_name=sink_name,
+            )
+        )
+
+    def _get_gate_destinations(self, outcome: GateOutcome) -> tuple[str, ...]:
+        """Extract destination names from gate outcome for telemetry.
+
+        Args:
+            outcome: The gate outcome containing routing information
+
+        Returns:
+            Tuple of destination names (sink names or path names for forks)
+        """
+        if outcome.sink_name is not None:
+            return (outcome.sink_name,)
+        elif outcome.discarded is True:
+            return ("discard",)
+        elif outcome.result.action.kind == RoutingKind.FORK_TO_PATHS:
+            # For forks, return the branch names of child tokens
+            return tuple(child.branch_name for child in outcome.child_tokens if child.branch_name)
+        elif outcome.next_node_id is not None and outcome.result.action.kind == RoutingKind.ROUTE:
+            # For route-label processing branches, report the chosen route label.
+            return outcome.result.action.destinations
+        else:
+            # Continue routing - destination is "continue"
+            return ("continue",)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Public facade for aggregation timeout checking
+    # Provides clean API for orchestrator timeout checks
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def check_aggregation_timeout(self, node_id: NodeID) -> tuple[bool, TriggerType | None]:
+        """Check if an aggregation should flush due to timeout.
+
+        This is a public facade for orchestrator to check timeout conditions
+        without directly accessing private _aggregation_executor.
+
+        Note: This method is called in the hot path (before every row is processed),
+        so it uses the optimized check_flush_status() which does a single dict
+        lookup instead of two separate calls.
+
+        Args:
+            node_id: The aggregation node ID to check
+
+        Returns:
+            Tuple of (should_flush, trigger_type):
+            - should_flush: True if trigger condition is met
+            - trigger_type: The type of trigger that fired (TIMEOUT, COUNT, etc.) or None
+        """
+        return self._aggregation_executor.check_flush_status(node_id)
+
+    def get_aggregation_buffer_count(self, node_id: NodeID) -> int:
+        """Get the number of rows buffered in an aggregation.
+
+        Args:
+            node_id: The aggregation node ID
+
+        Returns:
+            Number of rows currently buffered
+        """
+        return self._aggregation_executor.get_buffer_count(node_id)
+
+    def get_barrier_scalars(self) -> BarrierScalars:
+        """Compose the underivable barrier scalars for the checkpoint row.
+
+        F1 design D3: the checkpoint persists only scalar barrier metadata —
+        buffered tokens live in journal BLOCKED rows; counters and state ids
+        derive from audit tables at restore. The live executors each emit only
+        nodes/keys with actual state (latched trigger fire offsets, recorded
+        lost branches — see the executors' ``get_barrier_scalars``), so a
+        quiescent pipeline composes an empty BarrierScalars (``has_state``
+        False), which the checkpoint manager serializes as NULL.
+
+        On restore a missing aggregation entry means unlatched ``(None, None)``;
+        a missing coalesce key means no recorded losses.
+
+        Returns:
+            BarrierScalars with aggregation latches keyed by str(node_id) and
+            coalesce lost-branch records keyed by (coalesce_name, fork_group_id).
+        """
+        coalesce: dict[tuple[str, str], CoalescePendingScalars] = (
+            dict(self._coalesce_executor.get_barrier_scalars()) if self._coalesce_executor is not None else {}
+        )
+        return BarrierScalars(
+            aggregation={str(node_id): scalars for node_id, scalars in self._aggregation_executor.get_barrier_scalars().items()},
+            coalesce=coalesce,
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Aggregation flush helpers (shared by handle_timeout_flush and
+    # _process_batch_aggregation_node flush path)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _derive_coalesce_from_tokens(
+        self,
+        buffered_tokens: list[TokenInfo],
+    ) -> tuple[NodeID | None, CoalesceName | None]:
+        """Derive coalesce metadata from buffered tokens' branch_name.
+
+        For timeout/end-of-source flushes, coalesce info isn't passed in from
+        a WorkItem — it must be derived from the tokens' branch membership.
+        """
+        if buffered_tokens:
+            branch_name = buffered_tokens[0].branch_name
+            if branch_name and BranchName(branch_name) in self._branch_to_coalesce:
+                coalesce_name = self._branch_to_coalesce[BranchName(branch_name)]
+                return self._coalesce_node_ids[coalesce_name], coalesce_name
+        return None, None
+
+    def _derive_row_union_from_scheduler(
+        self,
+        node_id: NodeID,
+        buffered_tokens: list[TokenInfo],
+    ) -> tuple[NodeID | None, RowUnionName | None]:
+        """Recover pending row_union context from the durable aggregation arrivals.
+
+        ``branch_name`` survives a row_union release by design, so it cannot
+        prove that an aggregation is still upstream of that barrier.  The
+        scheduler row is the authority: its ``row_union_name`` is present only
+        while the work item still owes that barrier.
+        """
+        token_ids = {token.token_id for token in buffered_tokens}
+        if not token_ids:
+            return None, None
+        names = {
+            row.row_union_name
+            for row in self._scheduler.list_blocked_barrier_items(run_id=self._run_id)
+            if row.barrier_key == str(node_id) and row.token_id in token_ids
+        }
+        if len(names) > 1:
+            raise AuditIntegrityError(
+                f"Aggregation {node_id!r} buffered tokens with inconsistent durable row_union context: {sorted(str(name) for name in names)}"
+            )
+        if names:
+            raw_name = next(iter(names))
+            if raw_name is not None:
+                row_union_name = RowUnionName(raw_name)
+                return self._row_union_node_ids[row_union_name], row_union_name
+        return None, None
+
+    def _dispose_failed_flush(self, disposition: _FailedFlushDisposition) -> tuple[RowResult, ...]:
+        """Apply a FAILED batch verdict's ``on_error`` to every member — the one disposition.
+
+        Serves the live flush (``handle_timeout_flush``) and resume of a
+        verdict recorded before a crash (``_prepare_recorded_aggregation_failure``),
+        so crash timing cannot change what happens to a member. Each member
+        carries its ORIGINAL row (``token.row_data``, the pre-batch input) and
+        the one recorded batch reason:
+
+        - ``discard`` matches the per-row discard (operator ruling B3): every
+          member ``(FAILURE, QUARANTINED_AT_SOURCE)``, its terminal written
+          inside the SAME ``complete_barrier`` transaction that releases its
+          BLOCKED row, with an error_hash that binds to the reason (B4);
+        - a named sink gets the whole batch: every member moves BLOCKED ->
+          PENDING_SINK as ``(FAILURE, ON_ERROR_ROUTED)`` in ONE journal
+          transaction, and the sink records each outcome after durability. No
+          processor-side terminal (that would be a second terminal for the
+          same token).
+        """
+        failure = FailureInfo(exception_type="TransformError", message=disposition.error_detail)
+        if disposition.on_error == "discard":
+            results = tuple(
+                RowResult(
+                    token=token,
+                    final_data=token.row_data,
+                    outcome=TerminalOutcome.FAILURE,
+                    path=TerminalPath.QUARANTINED_AT_SOURCE,
+                    error=failure,
+                )
+                for token in disposition.buffered_tokens
+            )
+            discarded_results, _no_handoffs = self._complete_aggregation_flush(
+                disposition.node_id,
+                results,
+                disposition.buffered_tokens,
+                [],
+                batch_id=disposition.batch_id,
+                members_terminate=True,
+                quarantine_error_hash=compute_error_hash(disposition.error_detail),
+            )
+            return discarded_results
+        results = tuple(
+            RowResult(
+                token=token,
+                final_data=token.row_data,
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.ON_ERROR_ROUTED,
+                sink_name=disposition.on_error,
+                error=failure,
+            )
+            for token in disposition.buffered_tokens
+        )
+        routed_results, _pending_sink_token_ids = self._complete_aggregation_flush(
+            disposition.node_id,
+            results,
+            disposition.buffered_tokens,
+            [],
+            batch_id=disposition.batch_id,
+            members_terminate=False,
+        )
+        return routed_results
+
+    def _cross_check_flush_output(
+        self,
+        fctx: _FlushContext,
+        result: TransformResult,
+        *,
+        record_violation: bool = True,
+    ) -> frozenset[int]:
+        """Batch-flush declaration dispatch before any terminal emissions.
+
+        ADR-009 §Clause 2 — this closes the gap ADR-008 left open. The batch
+        aggregation flush path previously trusted the static annotation; a
+        mis-annotated batch-aware transform (e.g., ``BatchReplicate``) could
+        silently drop fields from emitted rows without any audit record.
+
+        Semantic decisions (ADR-009 §§2.3, 2.4):
+
+        - **PASSTHROUGH mode (1:1).** Each output token pairs with exactly one
+          input token. The cross-check walks pairs and uses that specific
+          input token's effective input fields as ``input_fields``. A
+          heterogeneous batch is not a hazard — each pair is checked
+          independently.
+        - **TRANSFORM mode (N:M, batch-homogeneous).** Every output row is
+          checked against the intersection of the effective input fields of
+          the buffered tokens that produced output (ADR-007 table line 53) —
+          a transform claiming ``passes_through_input=True`` must preserve
+          every field that every one of those inputs carried. Mixed-validity
+          batches may quarantine inputs; the pass-through contract applies to
+          emitted rows, and an input the plugin quarantined in-batch emits
+          nothing (routing records it FAILURE / QUARANTINED_AT_SOURCE and
+          expands the outputs from the non-quarantined tokens only), so it is
+          excluded from the intersection. Were it included, a quarantined
+          input lacking a field would drop that field from the intersection
+          and a plugin could strip it from every output although every
+          emitting input carried it. A non-empty emission with every input
+          quarantined contradicts the plugin's own quarantine record and
+          raises ``OrchestrationInvariantError``. A zero-row emission keeps
+          the intersection over every buffered token (``can_drop_rows``
+          governs it). Outputs are not attributed to inputs in this mode, so
+          a drop of a field only some emitting inputs carried is not detected
+          here (ADR-009 2026-09-26 note).
+
+        The quarantined set comes from ``validated_quarantined_indices`` —
+        the engine's validation of the plugin's
+        ``success_reason.metadata.quarantined_indices`` — computed ONCE here
+        and returned, so transform-mode routing (``_prepare_transform_route``)
+        consumes the same validated set instead of re-deriving it.
+
+        A token's effective input fields come from
+        ``derive_effective_input_fields``, the helper the single-token path
+        uses: the fields its contract declares AND its payload carries. An
+        optional field a row does not carry is not an input the transform could
+        have dropped, so a batch mixing rows with and without it is honest.
+
+        Called BEFORE ``_emit_transform_completed`` and the routing methods
+        (§2.5): a failed cross-check must not follow a COMPLETED or
+        CONSUMED_IN_BATCH terminal-state emission on any token, which would
+        violate the "Every token reaches exactly one terminal state — no silent
+        drops" invariant (docs/contracts/system-operations.md).
+
+        Returns:
+            The validated in-batch quarantined indices (empty when the plugin
+            quarantined nothing).
+
+        Raises:
+            FrameworkBugError: A buffered token has no input contract.
+            BatchQuarantineContradictionError: The quarantine metadata is
+                malformed, or a TRANSFORM-mode emission is non-empty while
+                every buffered input was quarantined (a Tier-1
+                ``OrchestrationInvariantError``). Both are detected before the
+                declaration dispatch, because the TRANSFORM intersection needs
+                the validated set. ``_record_flush_violation`` writes
+                per-token FAILED audit entries before re-raising.
+            BatchPassthroughShapeError: A PASSTHROUGH flush is not a
+                ``success_multi`` of one row per buffered row (or of none), or
+                it quarantines an input (a Tier-1
+                ``OrchestrationInvariantError``: build admits only a plugin
+                declaring ``flush_emits_one_row_per_buffered_row``). Detected
+                before the declaration dispatch; ``_record_flush_violation``
+                writes per-token FAILED audit entries before re-raising.
+            DeclarationContractViolation | PluginContractViolation:
+                Any batch-flush declaration contract fires.
+                ``_record_flush_violation`` writes per-token FAILED audit
+                entries before re-raising.
+        """
+        # Gather emitted rows uniformly across both output modes.
+        if result.is_multi_row:
+            emitted: list[PipelineRow] = list(result.rows) if result.rows is not None else []
+        elif result.row is not None:
+            emitted = [result.row]
+        else:
+            emitted = []
+        used_success_empty = result.rows is not None and len(result.rows) == 0
+
+        identity_token = fctx.triggering_token or fctx.buffered_tokens[0]
+        transform_node_id_str = str(fctx.node_id)
+
+        try:
+            # The quarantine set is validated BEFORE the declaration dispatch:
+            # the TRANSFORM intersection is computed over it, so there is no
+            # honest input field set to dispatch against until it is known. Its
+            # two contradictions therefore pre-empt the dispatch, and each is
+            # recorded on every buffered token like a declaration violation.
+            try:
+                quarantined_indices = frozenset(
+                    _validated_quarantined_indices(
+                        result,
+                        buffered_token_count=len(fctx.buffered_tokens),
+                        aggregation_name=fctx.settings.name,
+                    )
+                )
+            except OrchestrationInvariantError as invariant:
+                raise self._quarantine_contradiction(
+                    fctx,
+                    str(invariant),
+                    failure_kind="quarantine_metadata_invalid",
+                    emitted_row_count=len(emitted),
+                ) from invariant
+
+            # _FlushContext.__post_init__ guarantees buffered_tokens is non-empty;
+            # no defensive emptiness guard (docs/guides/data-trust-and-error-handling.md
+            # §The Defensive Programming Prohibition — forbidden for internal paths).
+            for i, token in enumerate(fctx.buffered_tokens):
+                if token.row_data.contract is None:
+                    raise FrameworkBugError(
+                        f"Batch flush: buffered token {i} "
+                        f"(token_id={token.token_id!r}) has no contract "
+                        f"(transform={fctx.transform.name!r}, node={fctx.node_id!r}). "
+                        "Framework invariant violated."
+                    )
+
+            # A buffered token's input fields are the ones its contract declares
+            # AND its payload carries — the single-token path's derivation, not
+            # the contract alone. An optional field the row does not carry is
+            # not an input the transform can drop (elspeth-5887fb7928 S4).
+            per_input_field_sets = [derive_effective_input_fields(token.row_data) for token in fctx.buffered_tokens]
+
+            static_contract = fctx.transform.effective_static_contract()
+
+            if fctx.settings.output_mode == OutputMode.PASSTHROUGH:
+                # Passthrough carries only a success_multi of exactly one row per
+                # buffered row (or none) with nothing quarantined; build admits
+                # only a plugin declaring flush_emits_one_row_per_buffered_row.
+                # Any other shape is that plugin breaking its declaration,
+                # recorded on every buffered token before the Tier-1 abort.
+                shape_violation = self._passthrough_shape_violation(fctx, result, emitted=emitted, quarantined_indices=quarantined_indices)
+                if shape_violation is not None:
+                    raise shape_violation
+                # 1:1 pairing. Dispatch each pair through the audit-complete
+                # batch-flush dispatcher (ADR-010 §Semantics amendment
+                # 2026-04-20). Each pair's effective_input_fields is derived
+                # per-token — the PASSTHROUGH carve-out preserves per-token identity.
+                if emitted:
+                    for token, emitted_row, token_fields in zip(
+                        fctx.buffered_tokens,
+                        emitted,
+                        per_input_field_sets,
+                        strict=True,
+                    ):
+                        run_batch_flush_checks(
+                            inputs=BatchFlushInputs(
+                                plugin=fctx.transform,
+                                node_id=transform_node_id_str,
+                                run_id=self._run_id,
+                                row_id=token.row_id,
+                                token_id=token.token_id,
+                                buffered_tokens=(token,),
+                                static_contract=static_contract,
+                                effective_input_fields=token_fields,
+                            ),
+                            outputs=BatchFlushOutputs(
+                                emitted_rows=(emitted_row,),
+                                used_success_empty=used_success_empty,
+                            ),
+                        )
+                else:
+                    # Zero-emission success has no 1:1 pairing witness, but the
+                    # dispatcher still must evaluate governance contracts and the
+                    # pass-through empty-emission path. The honest batch-level
+                    # surface is the shared intersection across buffered tokens.
+                    input_fields = frozenset.intersection(*per_input_field_sets)
+                    identity_token = fctx.triggering_token or fctx.buffered_tokens[0]
+                    run_batch_flush_checks(
+                        inputs=BatchFlushInputs(
+                            plugin=fctx.transform,
+                            node_id=transform_node_id_str,
+                            run_id=self._run_id,
+                            row_id=identity_token.row_id,
+                            token_id=identity_token.token_id,
+                            buffered_tokens=tuple(fctx.buffered_tokens),
+                            static_contract=static_contract,
+                            effective_input_fields=input_fields,
+                        ),
+                        outputs=BatchFlushOutputs(
+                            emitted_rows=(),
+                            used_success_empty=used_success_empty,
+                        ),
+                    )
+            else:
+                # TRANSFORM mode: batch-homogeneous intersection (ADR-009 §Clause 2)
+                # over the inputs that produced output — an input quarantined
+                # in-batch emits nothing and must not shrink the intersection.
+                # The batch-flush dispatcher surfaces the intersection via
+                # ``BatchFlushInputs.effective_input_fields`` (panel F1
+                # resolution: caller-computed; contracts don't re-derive).
+                if emitted:
+                    emitting_field_sets = [fields for index, fields in enumerate(per_input_field_sets) if index not in quarantined_indices]
+                    if not emitting_field_sets:
+                        raise self._quarantine_contradiction(
+                            fctx,
+                            f"Aggregation {fctx.settings.name!r} emitted {len(emitted)} output row(s) "
+                            f"but all {len(fctx.buffered_tokens)} buffered token(s) were quarantined",
+                            failure_kind="every_input_quarantined_with_emission",
+                            emitted_row_count=len(emitted),
+                        )
+                    input_fields = frozenset.intersection(*emitting_field_sets)
+                else:
+                    input_fields = frozenset.intersection(*per_input_field_sets)
+                run_batch_flush_checks(
+                    inputs=BatchFlushInputs(
+                        plugin=fctx.transform,
+                        node_id=transform_node_id_str,
+                        run_id=self._run_id,
+                        row_id=identity_token.row_id,
+                        token_id=identity_token.token_id,
+                        buffered_tokens=tuple(fctx.buffered_tokens),
+                        static_contract=static_contract,
+                        effective_input_fields=input_fields,
+                    ),
+                    outputs=BatchFlushOutputs(
+                        emitted_rows=tuple(emitted),
+                        used_success_empty=used_success_empty,
+                    ),
+                )
+        except PluginContractViolation as violation:
+            if record_violation:
+                self._record_flush_violation(fctx, violation)
+            raise
+        except BatchQuarantineContradictionError as contradiction:
+            if record_violation:
+                self._record_flush_violation(fctx, contradiction)
+            raise
+        except BatchPassthroughShapeError as shape_violation:
+            if record_violation:
+                self._record_flush_violation(fctx, shape_violation)
+            raise
+        except DeclarationContractViolation as violation:
+            if record_violation:
+                self._record_flush_violation(fctx, violation)
+            raise
+        except AggregateDeclarationContractViolation as aggregate:
+            # Audit-complete multi-fire case: every buffered token gets a
+            # FAILED outcome carrying the aggregate evidence bundle.
+            if record_violation:
+                self._record_flush_violation(fctx, aggregate)
+            raise
+        return quarantined_indices
+
+    def _passthrough_shape_violation(
+        self,
+        fctx: _FlushContext,
+        result: TransformResult,
+        *,
+        emitted: Sequence[PipelineRow],
+        quarantined_indices: frozenset[int],
+    ) -> BatchPassthroughShapeError | None:
+        """Return the passthrough flush's shape violation, or None when it is one row per buffered row."""
+        buffered_token_count = len(fctx.buffered_tokens)
+        failure_kind: BatchPassthroughShapeKind
+        if quarantined_indices:
+            failure_kind = "quarantined_indices_declared"
+            message = f"passthrough aggregation {fctx.settings.name!r} cannot declare quarantined_indices"
+        elif not result.is_multi_row:
+            failure_kind = "single_row_result"
+            message = (
+                f"Passthrough mode requires multi-row result, but transform {fctx.transform.name!r} returned single row. "
+                "Use TransformResult.success_multi() for passthrough."
+            )
+        elif len(emitted) not in {0, buffered_token_count}:
+            failure_kind = "row_count_mismatch"
+            message = (
+                f"Passthrough mode requires same number of output rows as input rows. Transform {fctx.transform.name!r} "
+                f"returned {len(emitted)} rows but received {buffered_token_count} input rows."
+            )
+        else:
+            return None
+        return BatchPassthroughShapeError(
+            f"{message} Passthrough admits only a plugin that declares flush_emits_one_row_per_buffered_row, "
+            "so this flush breaks the plugin's own declaration.",
+            failure_kind=failure_kind,
+            plugin=fctx.transform.name,
+            node_id=str(fctx.node_id),
+            run_id=self._run_id,
+            buffered_token_count=buffered_token_count,
+            emitted_row_count=len(emitted),
+        )
+
+    def _quarantine_contradiction(
+        self,
+        fctx: _FlushContext,
+        message: str,
+        *,
+        failure_kind: BatchQuarantineContradictionKind,
+        emitted_row_count: int,
+    ) -> BatchQuarantineContradictionError:
+        """Build the flush's quarantine-contradiction error with its value-free audit identities."""
+        return BatchQuarantineContradictionError(
+            message,
+            failure_kind=failure_kind,
+            plugin=fctx.transform.name,
+            node_id=str(fctx.node_id),
+            run_id=self._run_id,
+            buffered_token_count=len(fctx.buffered_tokens),
+            emitted_row_count=emitted_row_count,
+        )
+
+    def _record_flush_violation(self, fctx: _FlushContext, violation: BatchSeamViolation) -> None:
+        """Record FAILED audit entries for every buffered token on flush failure.
+
+        The per-token terminal writes are the batch seams' one recorder
+        (``record_batch_violation_failures``, shared with the collector's
+        flush); this adds the TokenCompleted telemetry the aggregation path
+        emits for each recorded token.
+        """
+        record_batch_violation_failures(
+            self._data_flow,
+            coordination_token=self._require_coordination_token(),
+            run_id=self._run_id,
+            tokens=fctx.buffered_tokens,
+            violation=violation,
+            transform_name=fctx.transform.name,
+            node_id=fctx.node_id,
+            triggering_token_id=fctx.triggering_token.token_id if fctx.triggering_token is not None else None,
+        )
+        for token in fctx.buffered_tokens:
+            with best_effort(
+                "TokenCompleted telemetry after batch-flush violation audit",
+                run_id=self._run_id,
+                token_id=token.token_id,
+                transform_node_id=fctx.node_id,
+                transform_name=fctx.transform.name,
+            ):
+                self._emit_token_completed(
+                    token,
+                    outcome=TerminalOutcome.FAILURE,
+                    path=TerminalPath.UNROUTED,
+                )
+
+    def _record_dropped_by_filter_outcome(
+        self,
+        *,
+        token: TokenInfo,
+        transform_name: str,
+        node_id: NodeID,
+        path_label: str,
+        ctx: PluginContext,
+    ) -> None:
+        """Record DROPPED_BY_FILTER or raise AuditIntegrityError on recorder failure."""
+        try:
+            self._data_flow.record_token_outcome(
+                member_token=ctx.require_member_token(),
+                work_item=ctx.require_work_item(),
+                ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
+                outcome=TerminalOutcome.SUCCESS,
+                path=TerminalPath.FILTER_DROPPED,
+            )
+        except LandscapeRecordError as record_failure:
+            raise AuditIntegrityError(
+                f"Failed to record DROPPED_BY_FILTER outcome for token {token.token_id!r} "
+                f"{path_label} (transform={transform_name!r}, node={node_id!r}). "
+                f"Audit trail is INCOMPLETE — the transform node state is already COMPLETED "
+                f"but the terminal token_outcome is missing. Recorder failure: "
+                f"{type(record_failure).__name__}: {record_failure}"
+            ) from record_failure
+
+    def _record_gate_discarded_outcome(
+        self,
+        *,
+        token: TokenInfo,
+        gate_name: str,
+        node_id: NodeID,
+        ctx: PluginContext,
+    ) -> None:
+        """Record terminal gate discard outcome or raise on audit failure."""
+        try:
+            self._data_flow.record_token_outcome(
+                member_token=ctx.require_member_token(),
+                work_item=ctx.require_work_item(),
+                ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
+                outcome=TerminalOutcome.SUCCESS,
+                path=TerminalPath.GATE_DISCARDED,
+            )
+        except LandscapeRecordError as record_failure:
+            raise AuditIntegrityError(
+                f"Failed to record GATE_DISCARDED outcome for token {token.token_id!r} "
+                f"(gate={gate_name!r}, node={node_id!r}). "
+                f"Audit trail is INCOMPLETE — the gate node state is already COMPLETED "
+                f"but the terminal token_outcome is missing. Recorder failure: "
+                f"{type(record_failure).__name__}: {record_failure}"
+            ) from record_failure
+
+    def _route_empty_emission_results(
+        self,
+        fctx: _FlushContext,
+        *,
+        quarantined_indices: frozenset[int] = frozenset(),
+    ) -> tuple[tuple[RowResult, ...], list[WorkItem]]:
+        """Plan terminal outcomes for a successful batch flush with zero rows.
+
+        If these buffered tokens were fork branches awaiting a downstream
+        barrier, each loss is staged but deliberately not notified in memory.
+        The outcome rows and branch-loss evidence commit with scheduler
+        completion first; durable loss intake may trigger downstream barrier
+        consequences only after that transaction succeeds.
+        """
+        results: list[RowResult] = []
+        child_items: list[WorkItem] = []
+        for index, token in enumerate(fctx.buffered_tokens):
+            quarantined = index in quarantined_indices
+            outcome = TerminalOutcome.FAILURE if quarantined else TerminalOutcome.SUCCESS
+            path = TerminalPath.QUARANTINED_AT_SOURCE if quarantined else TerminalPath.FILTER_DROPPED
+            loss_reason = "quarantined" if quarantined else "dropped_by_filter"
+            results.append(
+                RowResult(
+                    token=token,
+                    final_data=token.row_data,
+                    outcome=outcome,
+                    path=path,
+                )
+            )
+            results.extend(
+                self._settle_member_losses(
+                    token,
+                    loss_reason,
+                    child_items,
+                    notify_in_memory=False,
+                )
+            )
+        return tuple(results), child_items
+
+    def _route_passthrough_results(
+        self,
+        fctx: _FlushContext,
+        result: TransformResult,
+    ) -> tuple[tuple[RowResult, ...], list[WorkItem]]:
+        """Route passthrough aggregation results after successful flush.
+
+        Passthrough mode: original tokens continue with enriched data.
+        Updates token data (the 1:1 shape was checked by the flush
+        cross-check) and routes to downstream processing or COMPLETED outcome.
+        """
+        # _cross_check_flush_output ran first and refused every other shape
+        # (BatchPassthroughShapeError), so this is a success_multi of one row
+        # per buffered token, or of none.
+        if result.rows is None:
+            raise FrameworkBugError(
+                f"Passthrough aggregation {fctx.settings.name!r} reached routing with result.rows None; "
+                "the flush cross-check admits only a success_multi row list."
+            )
+        pipeline_rows = result.rows
+        if not pipeline_rows:
+            return self._route_empty_emission_results(fctx)
+        has_downstream = self._nav.resolve_next_node(fctx.node_id) is not None
+        first_branch = fctx.buffered_tokens[0].branch_name if fctx.buffered_tokens else None
+        needs_coalesce = fctx.coalesce_node_id is not None and fctx.coalesce_name is not None and first_branch is not None
+        needs_row_union = fctx.row_union_node_id is not None and fctx.row_union_name is not None and first_branch is not None
+
+        results: list[RowResult] = []
+        child_items: list[WorkItem] = []
+
+        if has_downstream or needs_coalesce or needs_row_union:
+            work_item_coalesce_name = fctx.coalesce_name if needs_coalesce else None
+            work_item_row_union_name = fctx.row_union_name if needs_row_union else None
+            for token, enriched_data in zip(fctx.buffered_tokens, pipeline_rows, strict=True):
+                updated_token = token.with_updated_data(enriched_data)
+                if needs_row_union and not has_downstream:
+                    child_items.append(
+                        self._work_items.create(
+                            token=updated_token,
+                            current_node_id=fctx.row_union_node_id,
+                            row_union_name=work_item_row_union_name,
+                        )
+                    )
+                else:
+                    child_items.append(
+                        self._work_items.create_continuation(
+                            token=updated_token,
+                            current_node_id=fctx.node_id,
+                            coalesce_name=work_item_coalesce_name,
+                            row_union_name=work_item_row_union_name,
+                        )
+                    )
+        else:
+            for token, enriched_data in zip(fctx.buffered_tokens, pipeline_rows, strict=True):
+                updated_token = token.with_updated_data(enriched_data)
+                results.append(
+                    RowResult(
+                        token=updated_token,
+                        final_data=enriched_data,
+                        outcome=TerminalOutcome.SUCCESS,
+                        path=TerminalPath.DEFAULT_FLOW,
+                        sink_name=fctx.transform.on_success,
+                    )
+                )
+
+        return tuple(results), child_items
+
+    def _prepare_transform_route(
+        self,
+        fctx: _FlushContext,
+        result: TransformResult,
+        *,
+        quarantined_indices: frozenset[int],
+    ) -> _PreparedAggregationRoute:
+        """Validate every transform-route precondition without mutating state.
+
+        ``quarantined_indices`` is the set ``_cross_check_flush_output``
+        validated and returned for this same flush result — the one
+        derivation both the cross-check and routing consume. That check has
+        already refused a non-empty emission with every input quarantined,
+        so a non-empty route always has a non-quarantined expansion parent.
+        """
+        # Extract output rows
+        if result.is_multi_row:
+            if result.rows is None:
+                raise RuntimeError("Multi-row result has rows=None")
+            output_rows = result.rows
+        else:
+            if result.row is None:
+                raise RuntimeError(
+                    f"Aggregation transform '{fctx.transform.name}' returned None for result.row "
+                    f"in 'transform' mode. Batch-aware transforms must return a row via "
+                    f"TransformResult.success(row) or rows via TransformResult.success_multi(rows). "
+                    f"This is a plugin bug."
+                )
+            output_rows = (result.row,)
+        if len(output_rows) == 0:
+            return _PreparedAggregationRoute(fctx, result, OutputMode.TRANSFORM, (), quarantined_indices, None)
+
+        # Enforce expected_output_count if configured
+        if fctx.settings.expected_output_count is not None:
+            actual_count = len(output_rows)
+            if actual_count != fctx.settings.expected_output_count:
+                raise RuntimeError(
+                    f"Aggregation '{fctx.settings.name}' produced {actual_count} output row(s), "
+                    f"but expected_output_count={fctx.settings.expected_output_count}. "
+                    f"This is a plugin contract violation."
+                )
+
+        non_quarantined_tokens = tuple(token for index, token in enumerate(fctx.buffered_tokens) if index not in quarantined_indices)
+        expand_parent_token = (
+            fctx.expand_parent_token
+            if any(token.token_id == fctx.expand_parent_token.token_id for token in non_quarantined_tokens)
+            else non_quarantined_tokens[0]
+        )
+        return _PreparedAggregationRoute(
+            context=fctx,
+            result=result,
+            output_mode=OutputMode.TRANSFORM,
+            output_rows=tuple(output_rows),
+            quarantined_indices=quarantined_indices,
+            expansion_parent=expand_parent_token,
+        )
+
+    def _route_transform_results(
+        self,
+        fctx: _FlushContext,
+        result: TransformResult,
+        *,
+        prepared: _PreparedAggregationRoute,
+    ) -> tuple[tuple[RowResult, ...], list[WorkItem]]:
+        """Apply a fully validated transform-mode aggregation route."""
+        if prepared.context is not fctx or prepared.result is not result:
+            raise OrchestrationInvariantError("prepared transform route does not belong to the supplied flush result")
+        if prepared.output_mode is not OutputMode.TRANSFORM:
+            raise OrchestrationInvariantError("prepared transform route has the wrong aggregation output mode")
+        output_rows = prepared.output_rows
+        quarantined_index_set = set(prepared.quarantined_indices)
+        if not output_rows:
+            return self._route_empty_emission_results(fctx, quarantined_indices=frozenset(quarantined_index_set))
+        if prepared.expansion_parent is None:  # pragma: no cover - guaranteed by preparation
+            raise OrchestrationInvariantError("non-empty prepared transform route lacks an expansion parent")
+
+        results: list[RowResult] = []
+        child_items: list[WorkItem] = []
+        expand_parent_token = prepared.expansion_parent
+        if fctx.buffered_tokens:
+            output_contract = output_rows[0].contract
+            parent_dispositions = aggregation_parent_dispositions(
+                fctx.buffered_tokens,
+                run_id=self._run_id,
+                batch_id=fctx.batch_id,
+                quarantined_indices=quarantined_index_set,
+            )
+            try:
+                expanded_tokens, _expand_group_id = self._token_manager.expand_token(
+                    parent_token=expand_parent_token,
+                    expanded_rows=[row.to_dict() for row in output_rows],
+                    output_contract=output_contract,
+                    node_id=fctx.node_id,
+                    member_token=self._require_member_token(),
+                    parent_path=TerminalPath.BATCH_CONSUMED,
+                    parent_batch_id=fctx.batch_id,
+                    aggregation_parent_dispositions=parent_dispositions,
+                )
+            except LandscapeRecordError as record_failure:
+                raise AuditIntegrityError(
+                    f"Failed to atomically record aggregation expansion and parent terminal outcomes "
+                    f"(transform={fctx.transform.name!r}, node={fctx.node_id!r}, batch_id={fctx.batch_id!r}): "
+                    f"{type(record_failure).__name__}: {record_failure}."
+                ) from record_failure
+
+            # Expansion atomically recorded every parent's terminal disposition;
+            # emit the matching telemetry and construct the triggering RowResult.
+            #
+            # Spec §6.1 item 2 / ruling 25 (2026-08-24 review I1): a quarantined
+            # batch member's lineage_path can carry a BOUND frame only if
+            # ruling 25's aggregator-inside-bound-region ban
+            # (bound_regions.py::validate_no_aggregations_in_regions, wired at
+            # build time via builder.py, covering COALESCE/ROW_UNION/EXPAND
+            # regions alike) has somehow been bypassed — no buildable graph can
+            # reach this flush with a bound frame, since an aggregation node
+            # inside ANY bound region is a GraphValidationError at construction.
+            # Fail fast HERE, at cause, rather than calling the settle-member
+            # seam: this non-empty flush path has no committed consumer for a
+            # staged GroupLossSpec (unlike the empty-flush path, which drains
+            # _pending_group_losses into complete_barrier's own transaction —
+            # see _route_empty_emission_results / complete_barrier below) — a
+            # spec staged here would survive until some LATER, unrelated
+            # claim's take_claim_group_losses guard, and wedge that claim
+            # instead of this one.
+            for i, token in enumerate(fctx.buffered_tokens):
+                if i in quarantined_index_set:
+                    outcome = TerminalOutcome.FAILURE
+                    path = TerminalPath.QUARANTINED_AT_SOURCE
+                    resolved = self._first_bound_frame(token)
+                    if resolved is not None:
+                        frame, binding = resolved
+                        raise OrchestrationInvariantError(
+                            f"Quarantined batch member {token.token_id!r} carries lineage frame "
+                            f"(group_id={frame.group_id!r}, member_key={frame.member_key!r}) bound to "
+                            f"closer {binding.closer_name!r}, inside a non-empty aggregation flush. "
+                            f"Ruling 25 (spec §7 rule 6) bans aggregators inside every bound region "
+                            f"precisely to prevent this: a bound region's roster must never lose a "
+                            f"member through a batch consume it cannot see. This graph should have "
+                            f"failed GraphValidationError at build time (validate_no_aggregations_in_regions) — "
+                            f"reaching this state at runtime is a processor/builder integrity bug, not a "
+                            f"row-level failure."
+                        )
+                else:
+                    outcome = TerminalOutcome.TRANSIENT
+                    path = TerminalPath.BATCH_CONSUMED
+                self._emit_token_completed(
+                    token,
+                    outcome=outcome,
+                    path=path,
+                )
+
+            # Build triggering RowResult if applicable (count-triggered only).
+            # The triggering token is always the last buffered token (buffered
+            # immediately before flush), so its index is len(buffered_tokens) - 1.
+            # Its outcome must match what the recorder loop recorded —
+            # QUARANTINED if in quarantined_index_set, CONSUMED_IN_BATCH otherwise.
+            if fctx.triggering_token is not None:
+                triggering_index = len(fctx.buffered_tokens) - 1
+                if triggering_index in quarantined_index_set:
+                    triggering_outcome = TerminalOutcome.FAILURE
+                    triggering_path = TerminalPath.QUARANTINED_AT_SOURCE
+                else:
+                    triggering_outcome = TerminalOutcome.TRANSIENT
+                    triggering_path = TerminalPath.BATCH_CONSUMED
+                results.append(
+                    RowResult(
+                        token=fctx.triggering_token,
+                        final_data=fctx.triggering_token.row_data,
+                        outcome=triggering_outcome,
+                        path=triggering_path,
+                    )
+                )
+
+            if quarantined_index_set:
+                triggering_index_val = len(fctx.buffered_tokens) - 1 if fctx.triggering_token is not None else -1
+                for i, token in enumerate(fctx.buffered_tokens):
+                    if i in quarantined_index_set and i != triggering_index_val:
+                        results.append(
+                            RowResult(
+                                token=token,
+                                final_data=token.row_data,
+                                outcome=TerminalOutcome.FAILURE,
+                                path=TerminalPath.QUARANTINED_AT_SOURCE,
+                            )
+                        )
+
+            # Route expanded tokens downstream
+            has_downstream = self._nav.resolve_next_node(fctx.node_id) is not None
+            first_expanded_branch = expanded_tokens[0].branch_name if expanded_tokens else None
+            needs_coalesce = fctx.coalesce_node_id is not None and fctx.coalesce_name is not None and first_expanded_branch is not None
+            needs_row_union = fctx.row_union_node_id is not None and fctx.row_union_name is not None and first_expanded_branch is not None
+
+            if has_downstream or needs_coalesce or needs_row_union:
+                work_item_coalesce_name = fctx.coalesce_name if needs_coalesce else None
+                work_item_row_union_name = fctx.row_union_name if needs_row_union else None
+                for token in expanded_tokens:
+                    if needs_row_union and not has_downstream:
+                        child_items.append(
+                            self._work_items.create(
+                                token=token,
+                                current_node_id=fctx.row_union_node_id,
+                                row_union_name=work_item_row_union_name,
+                            )
+                        )
+                    else:
+                        child_items.append(
+                            self._work_items.create_continuation(
+                                token=token,
+                                current_node_id=fctx.node_id,
+                                coalesce_name=work_item_coalesce_name,
+                                row_union_name=work_item_row_union_name,
+                            )
+                        )
+            else:
+                for token in expanded_tokens:
+                    results.append(
+                        RowResult(
+                            token=token,
+                            final_data=token.row_data,
+                            outcome=TerminalOutcome.SUCCESS,
+                            path=TerminalPath.DEFAULT_FLOW,
+                            sink_name=fctx.transform.on_success,
+                        )
+                    )
+
+        return tuple(results), child_items
+
+    def handle_timeout_flush(
+        self,
+        node_id: NodeID,
+        transform: TransformProtocol,
+        ctx: PluginContext,
+        trigger_type: TriggerType,
+    ) -> tuple[tuple[RowResult, ...], list[WorkItem]]:
+        """Handle an aggregation flush triggered outside normal row processing.
+
+        Handles TIMEOUT (between row arrivals) and END_OF_SOURCE (remaining buffers)
+        flushes. Delegates to shared flush helpers after building _FlushContext.
+
+        Args:
+            node_id: The aggregation node ID
+            transform: The batch-aware transform to execute
+            ctx: Plugin context
+            trigger_type: The trigger type (TIMEOUT or END_OF_SOURCE)
+
+        Returns:
+            Tuple of (results, work_items):
+            - results: RowResults for completed tokens (terminal state)
+            - work_items: WorkItem list for tokens needing further processing
+        """
+        settings = self._aggregation_settings[node_id]
+
+        def build_flush_context(buffered_tokens: Sequence[TokenInfo], batch_id: str) -> _FlushContext:
+            coalesce_node_id, coalesce_name = self._derive_coalesce_from_tokens(list(buffered_tokens))
+            row_union_node_id, row_union_name = self._derive_row_union_from_scheduler(node_id, list(buffered_tokens))
+            return _FlushContext(
+                node_id=node_id,
+                transform=transform,
+                settings=settings,
+                buffered_tokens=tuple(buffered_tokens),
+                batch_id=batch_id,
+                expand_parent_token=buffered_tokens[0],
+                triggering_token=None,
+                coalesce_node_id=coalesce_node_id,
+                coalesce_name=coalesce_name,
+                row_union_node_id=row_union_node_id,
+                row_union_name=row_union_name,
+            )
+
+        validated_context: list[tuple[_FlushContext, frozenset[int]]] = []
+
+        def validate_success(result: TransformResult, buffered_tokens: Sequence[TokenInfo], batch_id: str) -> None:
+            fctx = build_flush_context(buffered_tokens, batch_id)
+            quarantined_indices = self._cross_check_flush_output(fctx, result)
+            validated_context.append((fctx, quarantined_indices))
+
+        def record_input_violation(
+            violation: BatchDeclaredInputFieldsViolation, buffered_tokens: Sequence[TokenInfo], batch_id: str
+        ) -> None:
+            self._record_flush_violation(build_flush_context(buffered_tokens, batch_id), violation)
+
+        result, buffered_tokens, batch_id = self._aggregation_executor.execute_flush(
+            node_id=node_id,
+            transform=cast(BatchTransformProtocol, transform),
+            ctx=ctx,
+            trigger_type=trigger_type,
+            validate_success=validate_success,
+            record_input_violation=record_input_violation,
+        )
+
+        # Test doubles and compatibility adapters may return without invoking
+        # the executor-owned precompletion callback; validate before their
+        # result can route. The production executor always fills this list
+        # before committing its receipt.
+        if result.status == "success" and not validated_context:
+            validate_success(result, buffered_tokens, batch_id)
+        if result.status != "success":
+            # The executor has already scrubbed the reason, written it back and
+            # recorded the batch's FAILED verdict in one transaction.
+            if not result.reason:
+                raise OrchestrationInvariantError(
+                    f"Aggregation {settings.name!r} flush failed without a reason; refusing to fabricate one for audit hashing"
+                )
+            # The reason renders as its canonical JSON: byte for byte the
+            # recorded transform_errors.error_details_json / node_states.error_json
+            # a resume reads back (RecordedAggregationFailure.reason_json), so
+            # every member's message and error_hash are identical whether the
+            # disposition runs here or after a crash.
+            disposition = _FailedFlushDisposition(
+                node_id=node_id,
+                on_error=settings.on_error,
+                buffered_tokens=tuple(buffered_tokens),
+                batch_id=batch_id,
+                error_detail=canonical_json(result.reason),
+            )
+            return self._dispose_failed_flush(disposition), []
+
+        fctx, quarantined_indices = validated_context[0]
+
+        # Emit TransformCompleted telemetry for all buffered tokens
+        for token in buffered_tokens:
+            self._emit_transform_completed(token=token, transform=transform, transform_result=result)
+
+        # Out-of-claim (timeout/EOF) flush: ONE atomic journal transition
+        # consumes the buffered BLOCKED rows and makes every sink-bound flush
+        # output journal-durable (PENDING_SINK) before the in-process sink
+        # write runs (F1/D6). The returned flush_results (tagged
+        # ``scheduler_pending_sink=True`` by ``_complete_aggregation_flush``)
+        # feed the in-process sink write; the post-sink callback terminalizes
+        # the emitted rows.
+        if settings.output_mode == OutputMode.PASSTHROUGH:
+            flush_results, child_items = self._route_passthrough_results(fctx, result)
+            flush_results, _pending_sink_token_ids = self._complete_aggregation_flush(
+                node_id,
+                flush_results,
+                buffered_tokens,
+                child_items,
+                batch_id=batch_id,
+                members_terminate=result.rows == (),
+            )
+            return flush_results, child_items
+        if settings.output_mode == OutputMode.TRANSFORM:
+            prepared = self._prepare_transform_route(fctx, result, quarantined_indices=quarantined_indices)
+            flush_results, child_items = self._route_transform_results(fctx, result, prepared=prepared)
+            flush_results, _pending_sink_token_ids = self._complete_aggregation_flush(
+                node_id,
+                flush_results,
+                buffered_tokens,
+                child_items,
+                batch_id=batch_id,
+                members_terminate=result.rows == (),
+            )
+            return flush_results, child_items
+        raise OrchestrationInvariantError(f"Unknown output_mode: {settings.output_mode}")
+
+    def _process_batch_aggregation_node(
+        self,
+        transform: TransformProtocol,
+        current_token: TokenInfo,
+        ctx: PluginContext,
+        child_items: list[WorkItem],
+        coalesce_node_id: NodeID | None = None,
+        coalesce_name: CoalesceName | None = None,
+    ) -> tuple[RowResult | tuple[RowResult, ...], list[WorkItem]]:
+        """Process a row at an aggregation node using engine buffering.
+
+        Engine buffers rows and calls transform.process(rows: list[dict])
+        when the trigger fires. Flush handling is delegated to shared helpers
+        (_dispose_failed_flush, _route_passthrough_results,
+        _route_transform_results).
+
+        TEMPORAL DECOUPLING:
+
+        Both modes now record BUFFERED (non-terminal) at buffer time, with
+        terminal outcomes deferred to flush time. This enables per-token
+        QUARANTINED recording when batch transforms quarantine individual rows.
+
+        - **Landscape (audit trail)**: Records BUFFERED at buffer time.
+          Terminal outcome (CONSUMED_IN_BATCH, QUARANTINED, FAILED) at flush.
+
+        - **Telemetry (observability)**: Emits TokenCompleted at flush time.
+          Deferred to maintain ordering invariant (TransformCompleted before
+          TokenCompleted for each token).
+
+        Args:
+            transform: The batch-aware transform
+            current_token: Current row token
+            ctx: Plugin context
+            child_items: Work items to return with result
+            coalesce_node_id: Node ID at which fork children should coalesce (optional)
+            coalesce_name: Name of the coalesce point for merging (optional)
+
+        Returns:
+            (RowResult or list[RowResult], child_items) tuple
+            - Single RowResult for non-flush buffering
+            - List of RowResults for flush (passthrough or transform mode)
+        """
+        raw_node_id = transform.node_id
+        if raw_node_id is None:
+            raise OrchestrationInvariantError("Node ID is None during edge resolution")
+        node_id = NodeID(raw_node_id)
+        if node_id not in self._aggregation_settings:
+            raise OrchestrationInvariantError(f"Batch-aware transform {transform.name!r} at node {node_id!r} has no aggregation settings.")
+
+        # ADR-030 §E.2 (slice 3, THE owned flush-timing change): record NOTHING
+        # durable in-claim. The arriving token returns a (None, BUFFERED)
+        # RowResult unconditionally; the drain marks its journal row BLOCKED
+        # (the durable arrival), and the NEXT drain iteration's journal-first
+        # intake adopts it (batch_members + BUFFERED token_outcome inside the
+        # fenced adoption transaction, backdated to barrier_blocked_at) and
+        # feeds executor memory. Count/condition triggers fire from that
+        # intake step — the in-claim flush arm is deleted; the trigger fire
+        # time is invariant under takeover (§H 476).
+        #
+        # The live token is stashed so the intake feeds the executor the exact
+        # post-transform payload the old in-claim accept used (N=1 parity);
+        # the barrier_key rides the same stash for the drain's mark_blocked
+        # (the historical derivation read the in-claim BUFFERED outcome's
+        # batch_id, which no longer exists at block time).
+        #
+        # NOTE: Do NOT emit TokenCompleted telemetry here!
+        # TokenCompleted must be deferred to flush time so that
+        # TransformCompleted can be emitted first.
+        self._record_barrier_arrival(current_token, barrier_key=str(node_id))
+        return (
+            RowResult(
+                token=current_token,
+                final_data=current_token.row_data,
+                outcome=None,
+                path=TerminalPath.BUFFERED,
+            ),
+            child_items,
+        )
+
+    def _convert_retryable_to_error_result(
+        self,
+        exc: BaseException,
+        transform: Any,
+        token: TokenInfo,
+        ctx: Any,
+        reason: TransformErrorCategory,
+        *,
+        state_id: str | None,
+        retryable: bool = True,
+        attempts: int | None = None,
+    ) -> tuple[TransformResult, TokenInfo, str | None]:
+        """Convert a retryable exception into a routable transform error.
+
+        Shared handler for PluginRetryableError (retryable) and transient exceptions
+        (ConnectionError, TimeoutError, OSError, CapacityError), including
+        shutdown and retry-exhaustion dispositions. Records the error in the
+        audit trail and emits a DIVERT routing event if on_error routes to a
+        sink.
+
+        ``state_id`` is the failed attempt's node-state id, carried out of the
+        executor on the exception via NodeStateGuard's stamp (ctx.state_id is
+        scope-restored during unwind and must not be read here). None is only
+        possible when no attempt ever opened a node state (e.g. shutdown
+        before the first retry attempt); record_transform_error_with_routing
+        rejects None for named sinks.
+        """
+        on_error = transform.on_error
+        # on_error is always set (required by TransformSettings) — Tier 1 invariant
+        if on_error is None:
+            raise OrchestrationInvariantError(
+                f"Transform '{transform.name}' has on_error=None — this should be impossible since TransformSettings requires on_error"
+            )
+
+        error_details: TransformErrorReason = {"reason": reason, "error": scrub_text_for_audit(str(exc))}
+        if attempts is not None:
+            error_details["attempts"] = attempts
+        # Shared error-audit routine (elspeth-aeb0a8f756): identical
+        # transform_error + DIVERT routing_event recording as the executor's
+        # error-result branch. Here the guard already auto-failed the state on
+        # exception exit, so recording happens after completion by design —
+        # the helper is sequencing-agnostic.
+        record_transform_error_with_routing(
+            ctx=ctx,
+            execution=self._execution,
+            error_edge_ids=self._error_edge_ids,
+            state_id=state_id,
+            token=token,
+            transform=transform,
+            row=token.row_data,
+            error_details=error_details,
+            on_error=on_error,
+        )
+
+        return (
+            TransformResult.error(error_details, retryable=retryable),
+            token,
+            on_error,
+        )
+
+    def _convert_contract_violation_to_error_result(
+        self,
+        exc: PluginContractViolation,
+        transform: Any,
+        token: TokenInfo,
+        ctx: Any,
+        *,
+        state_id: str | None = None,
+    ) -> tuple[TransformResult, TokenInfo, str | None]:
+        """Convert a Tier-2 plugin contract violation into a routable transform error.
+
+        ``PluginContractViolation`` is Tier 2 by declaration: a row-level plugin
+        bug the engine can record as a FAILED node state, not framework or
+        audit corruption. ADR-008 §"TIER_1 registration is load-bearing" makes
+        that concrete — registering a subclass in ``TIER_1_ERRORS`` is what
+        stops ``on_error`` from absorbing it, so an UNREGISTERED violation must
+        reach ``on_error``. Both call sites therefore re-raise
+        ``TIER_1_ERRORS`` first; only what survives that check arrives here.
+
+        Before elspeth-181db83da7 no clause matched the base class at all, so
+        every Tier-2 violation raised anywhere inside ``execute_transform`` —
+        preflight collision and input-schema checks alike, and equally from a
+        plugin's own ``process()`` — escaped this seam and aborted the run: the
+        operator saw a raw traceback, the configured error sink was never
+        written, and the row was not even counted as failed.
+
+        ``retryable=False``: a contract violation is deterministic in the row,
+        so re-running the same input reproduces it. ``state_id`` defaults to
+        the stamp ``NodeStateGuard.__exit__`` places on the exception (it
+        stamps on every exception path, auto-fail included); the RetryManager
+        branch passes the tracked last-failed attempt instead, matching the
+        shutdown and retry-exhaustion conversions beside it.
+        """
+        on_error = transform.on_error
+        # on_error is always set (required by TransformSettings) — Tier 1 invariant
+        if on_error is None:
+            raise OrchestrationInvariantError(
+                f"Transform '{transform.name}' has on_error=None — this should be impossible since TransformSettings requires on_error"
+            )
+
+        error_details = exc.to_transform_error_reason()
+        record_transform_error_with_routing(
+            ctx=ctx,
+            execution=self._execution,
+            error_edge_ids=self._error_edge_ids,
+            state_id=state_id if state_id is not None else stamped_node_state_id(exc),
+            token=token,
+            transform=transform,
+            row=token.row_data,
+            error_details=error_details,
+            on_error=on_error,
+        )
+
+        return (
+            TransformResult.error(error_details, retryable=False),
+            token,
+            on_error,
+        )
+
+    def _record_pre_attempt_shutdown_state(
+        self,
+        *,
+        exc: InterruptedError,
+        transform: TransformProtocol,
+        token: TokenInfo,
+        attempt: int,
+    ) -> str:
+        """Record the failed node visit for shutdown before plugin invocation."""
+        node_id = transform.node_id
+        if node_id is None:
+            raise OrchestrationInvariantError(f"Transform '{transform.name}' executed without node_id - orchestrator bug")
+        with NodeStateGuard(
+            self._execution,
+            token_id=token.token_id,
+            node_id=node_id,
+            member_token=self._require_member_token(),
+            step_index=self.resolve_node_step(NodeID(node_id)),
+            input_data=token.row_data.to_dict(),
+            attempt=token.resume_attempt_offset + attempt,
+            resume_checkpoint_id=token.resume_checkpoint_id,
+            auto_fail_phase="retry_pre_attempt_shutdown",
+        ) as guard:
+            guard.complete(
+                NodeStateStatus.FAILED,
+                duration_ms=0.0,
+                error=ExecutionError(
+                    exception=scrub_text_for_audit(str(exc)),
+                    exception_type=type(exc).__name__,
+                    phase="retry_pre_attempt_shutdown",
+                ),
+            )
+            return guard.state_id
+
+    def _execute_transform_with_retry(
+        self,
+        transform: Any,
+        token: TokenInfo,
+        ctx: PluginContext,
+        *,
+        attempt_offset: int,
+    ) -> tuple[TransformResult, TokenInfo, str | None]:
+        """Execute transform with optional retry for transient failures.
+
+        Retry behavior:
+        - If retry_manager is None: single attempt, no retry
+        - If retry_manager is set: retry on transient exceptions
+
+        Each attempt is recorded separately in the audit trail with attempt number.
+
+        Note: TransformResult.error() is NOT retried - that's a processing error,
+        not a transient failure. Only exceptions trigger retry.
+
+        Resume state (attempt offset and checkpoint provenance) is read from the
+        token itself (token.resume_attempt_offset, token.resume_checkpoint_id) and
+        flows through to execute_transform. No explicit threading needed.
+
+        Args:
+            transform: Transform to execute
+            token: Current token; token.resume_attempt_offset and
+                token.resume_checkpoint_id carry the resume state.
+            ctx: Plugin context
+
+        Returns:
+            Tuple of (TransformResult, updated TokenInfo, error_sink)
+        """
+        if self._retry_manager is None:
+            # No retry configured - single attempt
+            # Must still catch retryable exceptions and convert to error results
+            # to keep failures row-scoped (don't abort entire run)
+            try:
+                return self._transform_executor.execute_transform(
+                    transform=transform,
+                    token=token,
+                    ctx=ctx,
+                    attempt=attempt_offset,
+                )
+            except InterruptedError as e:
+                return self._convert_retryable_to_error_result(
+                    e,
+                    transform,
+                    token,
+                    ctx,
+                    reason="shutdown_requested",
+                    state_id=stamped_node_state_id(e),
+                    retryable=False,
+                )
+            except PluginRetryableError as e:
+                return self._convert_retryable_to_error_result(
+                    e,
+                    transform,
+                    token,
+                    ctx,
+                    reason="transient_error_no_retry" if e.retryable else "permanent_error",
+                    state_id=stamped_node_state_id(e),
+                )
+            except (ConnectionError, TimeoutError, CapacityError) as e:
+                return self._convert_retryable_to_error_result(
+                    e,
+                    transform,
+                    token,
+                    ctx,
+                    reason="transient_error_no_retry",
+                    state_id=stamped_node_state_id(e),
+                )
+            except contract_errors.TIER_1_ERRORS:
+                raise
+            except PluginContractViolation as e:
+                return self._convert_contract_violation_to_error_result(e, transform, token, ctx)
+
+        # Track attempt number for audit; track the last failed attempt's
+        # node-state id so a shutdown InterruptedError raised INSIDE the
+        # RetryManager (pre-attempt check or backoff wait — never crosses a
+        # NodeStateGuard, so it carries no stamp) can still attribute its
+        # DIVERT routing_event to the state that actually failed.
+        attempt_tracker = {"current": attempt_offset}
+        state_tracker: dict[str, str | None] = {"last_failed_state_id": None}
+
+        def execute_attempt() -> tuple[TransformResult, TokenInfo, str | None]:
+            attempt = attempt_tracker["current"]
+            attempt_tracker["current"] += 1
+            # The state id belongs to this attempt, never merely the most
+            # recent stamped attempt. Keep it across RetryManager backoff so a
+            # shutdown there can cite the attempt that just failed, but clear
+            # it once the next plugin invocation actually begins. An
+            # unstamped final failure must fail closed rather than attach its
+            # DIVERT to an earlier attempt.
+            state_tracker["last_failed_state_id"] = None
+            try:
+                return self._transform_executor.execute_transform(
+                    transform=transform,
+                    token=token,
+                    ctx=ctx,
+                    attempt=attempt,
+                )
+            except BaseException as e:
+                stamped = stamped_node_state_id(e)
+                if stamped is not None:
+                    state_tracker["last_failed_state_id"] = stamped
+                raise
+
+        def is_retryable(e: BaseException) -> bool:
+            if isinstance(e, InterruptedError):
+                return False
+            if isinstance(e, PluginRetryableError):
+                return e.retryable
+            # Engine-classified transport signals (see PluginRetryableError's
+            # contract): ConnectionError/TimeoutError are the Python runtime's
+            # canonical transient network failures beneath provider SDKs, and
+            # CapacityError is retryable by nominal classification. Bare OSError is
+            # deliberately NOT here: it spans plugin bug-classes
+            # (FileNotFoundError, PermissionError) that must crash, not retry.
+            return isinstance(e, ConnectionError | TimeoutError | CapacityError)
+
+        try:
+            return self._retry_manager.execute_with_retry(
+                operation=execute_attempt,
+                is_retryable=is_retryable,
+                shutdown_event=ctx.shutdown_event,
+            )
+        except InterruptedError as e:
+            state_id = stamped_node_state_id(e) or state_tracker["last_failed_state_id"]
+            if state_id is None:
+                state_id = self._record_pre_attempt_shutdown_state(
+                    exc=e,
+                    transform=transform,
+                    token=token,
+                    attempt=attempt_tracker["current"],
+                )
+            return self._convert_retryable_to_error_result(
+                e,
+                transform,
+                token,
+                ctx,
+                reason="shutdown_requested",
+                # Stamped when the shutdown fired inside execute_transform
+                # (batch waiter); otherwise the RetryManager raised it and the
+                # last failed attempt's state is the divert attribution point.
+                state_id=state_id,
+                retryable=False,
+            )
+        except MaxRetriesExceeded as e:
+            return self._convert_retryable_to_error_result(
+                e.last_error,
+                transform,
+                token,
+                ctx,
+                reason="retry_exhausted",
+                state_id=state_tracker["last_failed_state_id"],
+                retryable=False,
+                attempts=e.attempts,
+            )
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except PluginContractViolation as e:
+            # ``is_retryable`` rejects a contract violation, so tenacity
+            # re-raises the ORIGINAL exception here rather than wrapping it in
+            # MaxRetriesExceeded — this clause is the only conversion it meets.
+            return self._convert_contract_violation_to_error_result(
+                e,
+                transform,
+                token,
+                ctx,
+                state_id=state_tracker["last_failed_state_id"],
+            )
+
+    def _record_source_node_state(
+        self,
+        *,
+        token: TokenInfo,
+        input_data: dict[str, object],
+        status: NodeStateStatus,
+        source_node_id: NodeID | None = None,
+        error: ExecutionError | None = None,
+    ) -> None:
+        """Record the source node state for a token.
+
+        Source "processing" already happened in the plugin iterator, so the
+        state is recorded immediately as COMPLETED or FAILED with duration 0.
+        """
+        effective_source_node_id = source_node_id or self._source_node_id
+        if status == NodeStateStatus.COMPLETED:
+            self._execution.record_completed_node_state(
+                token_id=token.token_id,
+                node_id=effective_source_node_id,
+                coordination_token=self._require_coordination_token(),
+                step_index=0,
+                input_data=input_data,
+                output_data=input_data,
+                duration_ms=0,
+            )
+            return
+        source_state = self._execution.begin_node_state(
+            token_id=token.token_id,
+            node_id=effective_source_node_id,
+            member_token=self._require_member_token(),
+            step_index=0,
+            input_data=input_data,
+        )
+        if status == NodeStateStatus.FAILED:
+            self._execution.complete_node_state(
+                member_token=self._require_member_token(),
+                state_id=source_state.state_id,
+                status=NodeStateStatus.FAILED,
+                duration_ms=0,
+                error=error,
+            )
+            return
+        raise OrchestrationInvariantError(f"Source node states may only be recorded as COMPLETED or FAILED, not {status!r}.")
+
+    def _record_source_boundary_failure(
+        self,
+        *,
+        token: TokenInfo,
+        input_data: dict[str, object],
+        failure: _SourceBoundaryFailure,
+        source_node_id: NodeID | None = None,
+    ) -> None:
+        """Record terminal audit evidence for a source-boundary failure.
+
+        Source boundary validation runs after token creation so the failure
+        can use the real row/token identity. Because the failure happens before
+        DAG traversal begins, the processor must record BOTH the terminal token
+        outcome and the FAILED source node state before re-raising the Tier 1
+        exception. If either audit write fails, raise ``AuditIntegrityError`` so
+        the recorder failure outranks the original failure.
+
+        AuditEvidenceBase exceptions contribute structured context via
+        ``to_audit_dict()``; framework/orchestration bugs are still recorded
+        as FAILED outcomes and node states, but without a fabricated context
+        payload. ``TokenCompleted`` telemetry is emitted only after both audit
+        writes succeed. Telemetry is operational visibility, not part of the
+        source-boundary audit pair; telemetry failures are logged and never
+        outrank the original failure or a recorder failure.
+        """
+        effective_source_node_id = source_node_id or self._source_node_id
+        audit_context = failure.to_audit_dict() if isinstance(failure, AuditEvidenceBase) else None
+        original_label = (
+            "violation"
+            if isinstance(
+                failure,
+                (
+                    DeclarationContractViolation,
+                    AggregateDeclarationContractViolation,
+                    PluginContractViolation,
+                ),
+            )
+            else "failure"
+        )
+        error_hash = compute_error_hash(f"{type(failure).__name__}:{effective_source_node_id}")
+        try:
+            self._data_flow.record_token_outcome_leader(
+                coordination_token=self._require_coordination_token(),
+                ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.UNROUTED,
+                error_hash=error_hash,
+                context=audit_context,
+            )
+        except LandscapeRecordError as record_failure:
+            raise AuditIntegrityError(
+                f"Failed to record {type(failure).__name__} FAILED outcome for token {token.token_id!r} "
+                f"on source boundary (node={effective_source_node_id!r}). Audit trail is INCOMPLETE — "
+                f"the FAILED token outcome may be missing. Recorder failure: "
+                f"{type(record_failure).__name__}: {record_failure}. Original {original_label}: {failure!s}"
+            ) from record_failure
+        try:
+            self._record_source_node_state(
+                token=token,
+                input_data=input_data,
+                status=NodeStateStatus.FAILED,
+                source_node_id=effective_source_node_id,
+                error=ExecutionError(
+                    exception=str(failure),
+                    exception_type=type(failure).__name__,
+                    phase="source_boundary_check",
+                    context=audit_context,
+                ),
+            )
+        except LandscapeRecordError as record_failure:
+            raise AuditIntegrityError(
+                f"Failed to record FAILED source node state for token {token.token_id!r} "
+                f"on source boundary (node={effective_source_node_id!r}). Audit trail is INCOMPLETE — "
+                f"the FAILED source node state may be missing. Recorder failure: "
+                f"{type(record_failure).__name__}: {record_failure}. Original {original_label}: {failure!s}"
+            ) from record_failure
+        with best_effort(
+            "TokenCompleted telemetry after source-boundary FAILED audit",
+            run_id=self._run_id,
+            token_id=token.token_id,
+            source_node_id=effective_source_node_id,
+        ):
+            self._emit_token_completed(
+                token,
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.UNROUTED,
+            )
+
+    def _initial_work_item_for_source_token(
+        self,
+        *,
+        token: TokenInfo,
+        transforms: Sequence[Any],
+        source_node_id: NodeID,
+        source_on_success: str,
+        coalesce_node_id: NodeID | None,
+        coalesce_name: CoalesceName | None,
+    ) -> WorkItem:
+        """Resolve the source continuation and build the initial WorkItem.
+
+        ``process_row`` needs the WorkItem BEFORE the fenced ingest so the
+        composed transaction can journal the initial cursor. Per ADR-025 §2 the DAG builder always populates node_to_next
+        for every source node — missing entries are a construction bug, not
+        a state we silently work around with a "first transform" fallback.
+        """
+        if source_node_id not in self._node_to_next:
+            raise OrchestrationInvariantError(
+                f"Traversal context is missing source continuation for {source_node_id!r}. "
+                "This is a graph construction bug — every source node must have a node_to_next entry."
+            )
+        initial_node_id = self._node_to_next[source_node_id]
+        if transforms and initial_node_id == source_node_id:
+            raise OrchestrationInvariantError("Traversal context is missing a source continuation for non-empty transform pipeline")
+        return self._work_items.create(
+            token=token,
+            current_node_id=initial_node_id,
+            coalesce_node_id=coalesce_node_id,
+            coalesce_name=coalesce_name,
+            on_success_sink=source_on_success if initial_node_id is None else None,
+        )
+
+    def _ingest_source_row_with_initial_claim(
+        self,
+        *,
+        item: WorkItem,
+        source_node_id: NodeID,
+        row_index: int,
+        source_row_index: int,
+        ingest_sequence: int,
+        data: Mapping[str, object],
+        source_contract_json: str,
+    ) -> TokenWorkItem:
+        """Drive the fenced leader INGEST verb for one source row (§C.4 row 9).
+
+        The scheduler composes source row, token and completion inserts with
+        the initial enqueue-and-claim in one epoch-fenced transaction.
+        Scheduler fields come from
+        the shared work codec (deterministic work_item_id + strict field
+        equality reconciliation downstream); ``ingest_sequence`` is passed
+        explicitly because the row is inserted in this same transaction and
+        is not yet resolvable.
+        """
+        coordination_token = self._require_coordination_token()
+        fields = self._work_codec.ready_fields(item, ingest_sequence=ingest_sequence)
+        _row, _token_record, scheduled = self._scheduler.ingest_row_with_initial_claim(
+            coordination_token=coordination_token,
+            source=SourceIngestSpec(
+                source_node_id=str(source_node_id),
+                row_index=row_index,
+                data=data,
+                source_contract_json=source_contract_json,
+                source_row_index=source_row_index,
+                ingest_sequence=fields.ingest_sequence,
+                row_id=fields.row_id,
+                token_id=fields.token_id,
+            ),
+            data_flow=self._data_flow,
+            execution=self._execution,
+            node_id=fields.node_id,
+            step_index=fields.step_index,
+            row_payload_json=fields.row_payload_json,
+            lease_owner=self._scheduler_lease_owner,
+            lease_seconds=self._scheduler_lease_seconds,
+            queue_key=fields.queue_key,
+            barrier_key=fields.barrier_key,
+            on_success_sink=fields.on_success_sink,
+            join_group_id=fields.join_group_id,
+            lineage_path=fields.lineage_path,
+            coalesce_node_id=fields.coalesce_node_id,
+            coalesce_name=fields.coalesce_name,
+            row_union_name=fields.row_union_name,
+        )
+        return scheduled
+
+    def ingest_quarantined_row(
+        self,
+        *,
+        source_node_id: NodeID,
+        row_index: int,
+        source_row_index: int,
+        ingest_sequence: int,
+        row: object,
+        validation_error_id: str | None,
+        quarantine_sink: str,
+        quarantine_error: str,
+        quarantine_edge_id: str,
+    ) -> RowResult:
+        """Record a source-quarantined row and hand it to its quarantine sink durably, in ONE fenced transaction.
+
+        ``row`` is the already-sanitised rejected data; ``quarantine_error`` is
+        the bounded, non-empty plugin error text. The fenced quarantine ingest
+        writes the row, its token, the FAILED step-0 source state, the DIVERT
+        routing event and a PENDING_SINK handoff whose payload is the exact
+        audit row the quarantine sink writes. The returned result is the
+        token's sink-bound ``(FAILURE, QUARANTINED_AT_SOURCE)`` result — the
+        same accumulator every other sink-bound token goes through routes it,
+        carrying the audited error hash (never recomputed downstream). Resume
+        re-drives the parked item through the pending-sink drain; the rejected
+        row is never re-validated.
+        """
+        return ingest_source_quarantine(
+            scheduler=self._scheduler,
+            data_flow=self._data_flow,
+            execution=self._execution,
+            coordination_token=self._require_coordination_token(),
+            source_node_id=source_node_id,
+            row_index=row_index,
+            source_row_index=source_row_index,
+            ingest_sequence=ingest_sequence,
+            row=row,
+            validation_error_id=validation_error_id,
+            quarantine_sink=quarantine_sink,
+            quarantine_error=quarantine_error,
+            quarantine_edge_id=quarantine_edge_id,
+            terminal_step_index=self._scheduler_step_index(None),
+        )
+
+    def process_row(
+        self,
+        row_index: int,
+        source_row: SourceRow,
+        transforms: Sequence[Any],
+        ctx: PluginContext,
+        *,
+        coalesce_node_id: NodeID | None = None,
+        coalesce_name: CoalesceName | None = None,
+        source_node_id: NodeID | None = None,
+        source_plugin: SourceProtocol | None = None,
+        source_on_success: str | None = None,
+        source_row_index: int,
+        ingest_sequence: int,
+    ) -> list[RowResult]:
+        """Process a row through all transforms.
+
+        Uses a work queue to handle fork operations - when a fork creates
+        child tokens, they are added to the queue and processed through
+        the remaining transforms.
+
+        Args:
+            row_index: Position in source
+            source_row: SourceRow from source (must have contract)
+            transforms: List of transform plugins
+            ctx: Plugin context
+            coalesce_node_id: Node ID at which fork children should coalesce
+            coalesce_name: Name of the coalesce point for merging
+            source_on_success: Source-specific terminal sink. Required by
+                multi-source callers when a source row may terminalize without
+                entering a transform.
+            source_row_index: Position within the active source stream. Required
+                to preserve per-source row identity in the audit trail.
+            ingest_sequence: Global ingest-order position across all sources.
+                Required to preserve deterministic resume ordering.
+
+        Returns:
+            List of RowResults, one per terminal token (parent + children)
+        """
+        effective_source_node_id = source_node_id or self._source_node_id
+        # Pre-mint the row/token identities (client-generated ids) so the
+        # source-boundary checks can run BEFORE any durable write (ADR-030
+        # §C.4 row 9): a boundary-failed row keeps its rows+tokens audit
+        # record but gets NO scheduler row; the happy path composes rows +
+        # tokens + initial enqueue into ONE fenced IMMEDIATE transaction.
+        if source_row.contract is None:
+            raise OrchestrationInvariantError(
+                "SourceRow must have contract to create token. Source plugins must set contract on all valid rows."
+            )
+        pipeline_row = source_row.to_pipeline_row()
+        token = TokenInfo(
+            row_id=generate_id(),
+            token_id=generate_id(),
+            row_data=pipeline_row,
+        )
+
+        # Valid SourceRows always carry mapping-shaped row payloads; once the
+        # row enters the processor we treat the values as opaque objects.
+        source_input = cast(dict[str, object], source_row.row)
+        effective_source_plugin = source_plugin or self._source_plugin
+        if effective_source_plugin is not None:
+            try:
+                run_boundary_checks(
+                    inputs=BoundaryInputs(
+                        plugin=effective_source_plugin,
+                        node_id=str(effective_source_node_id),
+                        run_id=self._run_id,
+                        row_id=token.row_id,
+                        token_id=token.token_id,
+                        static_contract=effective_source_plugin.declared_guaranteed_fields,
+                        row_data=source_input,
+                        row_contract=source_row.contract,
+                    ),
+                    outputs=BoundaryOutputs(),
+                )
+            except (
+                DeclarationContractViolation,
+                AggregateDeclarationContractViolation,
+                PluginContractViolation,
+                FrameworkBugError,
+                OrchestrationInvariantError,
+            ) as failure:
+                # The failed row still gets its durable rows+tokens audit
+                # record (fenced when a coordination token is held) — but
+                # never a scheduler row.
+                self._token_manager.create_initial_token(
+                    source_node_id=effective_source_node_id,
+                    row_index=row_index,
+                    source_row_index=source_row_index,
+                    ingest_sequence=ingest_sequence,
+                    source_row=source_row,
+                    row_id=token.row_id,
+                    token_id=token.token_id,
+                    coordination_token=self._require_coordination_token(),
+                )
+                self._record_source_boundary_failure(
+                    token=token,
+                    input_data=source_input,
+                    failure=failure,
+                    source_node_id=effective_source_node_id,
+                )
+                raise
+
+        effective_source_on_success = source_on_success if source_on_success is not None else self._source_on_success
+        initial_item = self._initial_work_item_for_source_token(
+            token=token,
+            transforms=transforms,
+            source_node_id=effective_source_node_id,
+            source_on_success=effective_source_on_success,
+            coalesce_node_id=coalesce_node_id,
+            coalesce_name=coalesce_name,
+        )
+
+        # Source ingest always uses the acquired leader's fenced transaction.
+        try:
+            preclaimed = self._ingest_source_row_with_initial_claim(
+                item=initial_item,
+                source_node_id=effective_source_node_id,
+                row_index=row_index,
+                source_row_index=source_row_index,
+                ingest_sequence=ingest_sequence,
+                data=pipeline_row.to_dict(),
+                source_contract_json=checkpoint_dumps(source_row.contract.to_checkpoint_format()),
+            )
+        except CanonicalizationError as exc:
+            # The ingest transaction hashes the valid row (a valid row is
+            # trusted canonical, so this is the source's contract breach and
+            # the run ends). rfc8785's text is the offending value itself
+            # (``<the integer> exceeds safe integer domain``), so it is never
+            # the message and never chained: the abort prints the traceback.
+            # Caught by rfc8785's class, not the (TypeError, ValueError) the
+            # other non-canonical seams catch: they wrap only a hash call,
+            # this wraps a whole fenced transaction.
+            raise non_canonical_source_row_violation(
+                producer=f"Source {effective_source_plugin.name!r}" if effective_source_plugin is not None else "Source",
+                declared_fields=(effective_source_plugin.output_schema.model_fields if effective_source_plugin is not None else ()),
+                row=pipeline_row,
+                source_row_index=source_row_index,
+                exc=exc,
+            ) from None
+        return self._drain_work_queue(initial_item, ctx, preclaimed=preclaimed)
+
+    def _terminal_coalesce_row_result(
+        self,
+        token: TokenInfo,
+        coalesce_name: CoalesceName,
+        *,
+        join_group_id: str,
+        context: str,
+    ) -> RowResult:
+        """Build the terminal-coalesce RowResult (SUCCESS/COALESCED routed to the coalesce sink).
+
+        Single source of truth for the terminal-coalesce sites (barrier-fire via the
+        barrier coordinator, lost-branch in _notify_coalesce_closer_of_loss) so the audit
+        RowResult shape cannot drift between them.
+
+        This constructs ONLY the RowResult — it does NOT emit telemetry or record outcomes.
+        Each call site retains its own telemetry handling (e.g. _notify_coalesce_closer_of_loss
+        deliberately does not emit TokenCompleted here, deferring to accumulate_row_outcomes).
+        """
+        sink_name = self._nav.resolve_coalesce_sink(coalesce_name, context=context)
+        return RowResult(
+            token=token,
+            final_data=token.row_data,
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.COALESCED,
+            sink_name=sink_name,
+            join_group_id=join_group_id,
+        )
+
+    def _maybe_coalesce_token(
+        self,
+        current_token: TokenInfo,
+        *,
+        current_node_id: NodeID,
+        coalesce_node_id: NodeID | None,
+        coalesce_name: CoalesceName | None,
+        child_items: list[WorkItem],
+    ) -> tuple[bool, RowResult | None]:
+        # Structural guard: only handle when we're actually at the coalesce node
+        # for this branch token's assigned coalesce point.
+        if current_token.branch_name is None or coalesce_name is None or coalesce_node_id is None or current_node_id != coalesce_node_id:
+            return False, None
+
+        # ADR-030 §B (slice 5, follower barrier hand-off): a follower has no
+        # in-process CoalesceExecutor.  When a follower arrives at a coalesce
+        # node it must mark_blocked (durable barrier hold, no in-memory accept)
+        # so the leader's next journal-intake adopts the arrival and runs the
+        # trigger evaluation (§B.2: trigger evaluation is leader-only).
+        # Returning (True, None) with no child items triggers the
+        # `result is None and not child_items` arm of _drain_scheduler_claims
+        # which calls mark_blocked (§E.2) with the arrival recorded below.
+        if self._coalesce_executor is None:
+            logger.debug(
+                "follower: coalesce barrier hold for token %r at node %r (coalesce=%r) — marking blocked; leader adopts via journal-intake",
+                current_token.token_id,
+                current_node_id,
+                coalesce_name,
+            )
+
+        # ADR-030 §E.2 (slice 3, journal-first barrier acceptance): the
+        # arriving branch token is NOT accepted in-claim. It is held
+        # unconditionally — the drain marks its journal row BLOCKED under
+        # barrier_key=coalesce_name (the durable arrival) and the NEXT drain
+        # iteration's intake adopts the row (fenced CAS marker; the coalesce
+        # arm's durable payload is the marker alone) and runs the executor
+        # accept with the backdated arrival time. Merge fires, group failures
+        # and late-arrival releases (§E.3a) all surface from that intake step.
+        # The live token is stashed so intake feeds the executor the exact
+        # post-transform token the old in-claim accept used (N=1 parity).
+        self._record_barrier_arrival(current_token, barrier_key=str(coalesce_name))
+        return True, None
+
+    def _maybe_row_union_token(
+        self,
+        current_token: TokenInfo,
+        *,
+        current_node_id: NodeID,
+        row_union_node_id: NodeID | None,
+        row_union_name: RowUnionName | None,
+    ) -> tuple[bool, RowResult | None]:
+        """Hold a fork-branch token arriving at its row_union barrier.
+
+        Same journal-first shape as ``_maybe_coalesce_token`` (§E.2): the
+        arrival is never accepted in-claim — the live token is stashed and
+        the drain marks its journal row BLOCKED under
+        ``barrier_key=row_union_name``; the leader's next intake adopts it
+        and runs the executor accept. A follower records the same arrival:
+        the drain persists the arriving token's row from it.
+        """
+        if current_token.branch_name is None or row_union_name is None or row_union_node_id is None or current_node_id != row_union_node_id:
+            return False, None
+
+        if self._row_union_executor is None:
+            logger.debug(
+                "follower: row_union barrier hold for token %r at node %r (row_union=%r) — marking blocked; leader adopts via journal-intake",
+                current_token.token_id,
+                current_node_id,
+                row_union_name,
+            )
+        self._record_barrier_arrival(current_token, barrier_key=str(row_union_name))
+        return True, None
+
+    def _collector_node_for_cursor(self, collector_name: CollectorName) -> NodeID:
+        """The collector node a work-item cursor names, or a NAMED integrity error.
+
+        A cursor naming a collector this build does not configure is the
+        same two-authorities-disagree fact the intake and restore classifiers
+        refuse ("orphan" / journal corruption) — never a bare KeyError from
+        a subscript (C1 review M-2).
+        """
+        if collector_name not in self._collector_node_ids:
+            raise AuditIntegrityError(
+                f"Work item cursor names collector {collector_name!r} (run {self._run_id!r}) but this build configures "
+                f"only {sorted(str(name) for name in self._collector_node_ids)}; the cursor and the graph disagree."
+            )
+        return self._collector_node_ids[collector_name]
+
+    def _maybe_collector_token(
+        self,
+        current_token: TokenInfo,
+        *,
+        current_node_id: NodeID,
+        collector_name: CollectorName | None,
+    ) -> tuple[bool, RowResult | None]:
+        """Hold an EXPAND member arriving at its collector barrier (spec §5).
+
+        Same journal-first shape as ``_maybe_coalesce_token`` /
+        ``_maybe_row_union_token`` (§E.2): never accepted in-claim — the live
+        token is stashed under the compound ``collector:<name>:<group_id>``
+        key (``collector_barrier_key``, the single construction site) and
+        the drain marks its journal row BLOCKED; the leader's next intake
+        adopts it and runs ``CollectorExecutor.accept``. Followers hold
+        without stashing. The cursor (``collector_name`` on the work item),
+        not the token, decides "which collector": a follower that never ran
+        the opener cannot resolve the EXPAND frame's binding
+        (``GroupBindingRegistry._expand_groups`` is process-local), so the
+        durable cursor is the only authority that survives a hand-off.
+        """
+        if collector_name is None or current_node_id != self._collector_node_for_cursor(collector_name):
+            return False, None
+        # META-38 amendment 1: the member's OWN group frame via the guarded
+        # walk — a collector-in-collector release carries its release-group
+        # frame above the outer group's frame; keying the barrier on [-1]
+        # would hold it under the release group and the outer roster would
+        # never fill.
+        own = innermost_own_frame(
+            current_token.lineage_path, is_release_group=lambda gid: self._token_manager.is_release_group(self._run_id, gid)
+        )
+        frame = None if own is None else own[1]
+        if frame is None or frame.kind is not FrameKind.EXPAND:
+            raise OrchestrationInvariantError(
+                f"Token {current_token.token_id!r} arrived at collector {collector_name!r} (node {current_node_id!r}) "
+                f"without an innermost EXPAND frame (lineage_path={current_token.lineage_path!r}, searched below "
+                "collector release-group frames); a collector member's innermost non-release frame is always its "
+                "own group's (spec §7 rule 5)."
+            )
+        if self._collector_executor is None:
+            logger.debug(
+                "follower: collector barrier hold for token %r at node %r (collector=%r) — marking blocked; leader adopts via journal-intake",
+                current_token.token_id,
+                current_node_id,
+                collector_name,
+            )
+        self._record_barrier_arrival(current_token, barrier_key=collector_barrier_key(str(collector_name), frame.group_id))
+        return True, None
+
+    def _first_bound_frame(self, current_token: TokenInfo) -> tuple[LineageFrame, GroupBinding] | None:
+        """The settle-member walk's frame resolver (spec §6.1): the failing
+        token's lineage_path, INNERMOST frame outward, to the FIRST BOUND
+        frame. Inert frames — no closer bound — are pure provenance and are
+        skipped (spec §2). Shared by `_settle_member_losses` (stage + notify)
+        and the fail-fast check at the non-empty aggregation flush's
+        quarantined loop (ruling 25 makes a bound frame unreachable there in
+        a buildable graph; the check exists to fail AT that impossible state
+        rather than stage a loss the flush has no consumer for).
+
+        WS3 Task 9 EXPAND-safety note: this walk's skip-unbound-frames
+        behaviour is what makes a row_union closer's resolved `frame.group_id`
+        provably its own FORK group today, even though an EXPAND frame can
+        legally stack on top of a row_union's FORK frame before the union
+        (`_note_row_union_group_failed_from_token`'s docstring in
+        barrier_coordination.py explains why that stacking is legal). An
+        EXPAND frame resolves a binding via `GroupBindingRegistry.
+        binding_for` only when it is in `_expand_groups`, which is populated
+        solely by `register_expand_group` — called only by a declared
+        scope's collector opener (integration item 14 re-adjudication: with
+        the collector executor wired, an EXPAND frame minted by a declared
+        opener IS bound, and this walk stops at it — the collector, being
+        the innermost closer, settles that loss; only an UNDECLARED
+        expansion's frame stays inert and is resolved past). A row_union
+        closer's resolved frame is therefore still its own FORK group: a
+        bound EXPAND frame stacked above it belongs to a collector that
+        closes BEFORE the union (SESE nesting), so the token has had that
+        frame popped by the time it reaches the union.
+        """
+        for frame in reversed(current_token.lineage_path):
+            binding = self._group_bindings.binding_for(frame)
+            if binding is None and frame.kind is FrameKind.EXPAND:
+                binding = self._rederive_expand_binding(frame)
+            if binding is not None:
+                return frame, binding
+        return None
+
+    def _rederive_expand_binding(self, frame: LineageFrame) -> GroupBinding | None:
+        """Resolve an EXPAND frame the in-memory registry does not know (META-9.1).
+
+        ``GroupBindingRegistry._expand_groups`` is populated only at mint
+        time, by the opener's OWN process. A follower that never ran the
+        opener, or any process after a crash/resume, therefore resolves every
+        EXPAND frame to None — and before this method that meant a lost
+        collector member was treated as UNBOUND (nothing staged), stranding
+        its group's roster forever with no ``group_losses`` row to explain
+        why. FORK frames are immune (their roster is static config).
+
+        Durable re-derivation: the group's ``group_records`` row names the
+        opener TOKEN; the opener NODE is the declared opener node at which
+        that token holds a node_state (an opener token visits exactly one
+        declared opener — it terminates there as EXPAND_PARENT); the binding
+        is config's, keyed on that node. The result is registered on the
+        registry so later frames of the same group are an in-memory hit.
+
+        Inert is a POSITIVE verdict, never an absence (elspeth-353d097dbb).
+        A group with no opener node_state at any declared opener is inert —
+        remembered per group id — only when it is a collector RELEASE group
+        (``group_records.closes_group_id``, META-38's written fact: its
+        "opener" is a group member) or when its member's mint step
+        (``tokens.step_in_pipeline``, written in the mint transaction, and
+        injective over processing nodes: ``ExecutionGraph.build_step_map``)
+        is the step of NO declared opener. A mint step that IS a declared
+        opener's, with no node_state there, raises: memoising that as inert
+        would strand the roster with nothing staged. The state is
+        unreachable on a sound store — ``begin_node_state`` commits in its
+        own transaction before the opener executes, nothing deletes
+        node_states, an aggregation flush can never be a declared opener
+        (scopes name ``transforms:`` entries), and resume refuses any
+        node-id/config drift (full topology hash) — so reaching it means
+        the audit store or the config it is read under is wrong.
+
+        META-22.1 cross-check, MEMBERSHIP over COLLECTOR-SCOPED evidence
+        (META-35): ``resolve_group_collector_node`` is ANY-node completion
+        evidence — a member completing an ordinary transform between the
+        opener and the collector puts that node in the set, so checking
+        against the raw set raised on the realistic
+        opener → transform → collector shape. The shared
+        ``collector_scoped_completion_conflict`` predicate (also the
+        restore cross-check's, ``CollectorJournalRestorer.restore``)
+        intersects the durable set with this config's collector closer
+        nodes first, then tests membership — never equality, since nesting
+        legitimately adds an inner collector's node to an outer group's
+        set. Durable is authoritative: a config closer absent from
+        non-empty SCOPED evidence is a node-id mismatch and fails closed.
+        Empty scoped evidence — no completion yet, or completion only at
+        non-collector nodes — leaves nothing to check.
+        """
+        if not self._expand_opener_binding_by_node_id or frame.group_id in self._inert_expand_groups:
+            return None
+        reads = self._barrier_restore_read_model
+        if reads is None:
+            raise OrchestrationInvariantError(
+                f"EXPAND frame for group {frame.group_id!r} (run {self._run_id!r}) is not in the in-memory binding "
+                "registry and this processor has no barrier restore read model to re-derive it from; production "
+                "wires factory.barrier_restore (META-9.1)."
+            )
+        record = reads.get_group_record(run_id=self._run_id, group_id=frame.group_id)
+        if record is None:
+            raise AuditIntegrityError(
+                f"Token lineage carries EXPAND frame for group {frame.group_id!r} (run {self._run_id!r}) but "
+                "group_records has no such group — the opener's expansion mints it unconditionally (spec §4.3)."
+            )
+        if record.kind != FrameKind.EXPAND.value:
+            raise AuditIntegrityError(
+                f"EXPAND frame for group {frame.group_id!r} (run {self._run_id!r}) resolves to a group_records row of "
+                f"kind {record.kind!r}; lineage/roster disagreement."
+            )
+        candidates: list[GroupBinding] = []
+        for opener_node_id, binding in self._expand_opener_binding_by_node_id.items():
+            visited = reads.get_max_node_state_attempts_for_node(self._run_id, [record.opener_token_id], node_id=str(opener_node_id))
+            if record.opener_token_id in visited:
+                candidates.append(binding)
+        if not candidates:
+            # Inert needs POSITIVE evidence (elspeth-353d097dbb): "no
+            # node_state at a declared opener" alone is an absence, and
+            # memoising an absence turns one bad read into a permanently
+            # stranded roster. The member's mint step places the expansion
+            # independently of node_states, so the two are cross-checked.
+            if record.closes_group_id is not None:
+                # A collector RELEASE group (META-38's written fact): its
+                # "opener" is a group member, so no declared opener minted it.
+                self._inert_expand_groups.add(frame.group_id)
+                return None
+            mint_step = reads.get_token_mint_step(run_id=self._run_id, token_id=frame.member_key)
+            if mint_step is None:
+                raise AuditIntegrityError(
+                    f"EXPAND group {frame.group_id!r} (run {self._run_id!r}) member {frame.member_key!r} records no mint "
+                    "step, so the group cannot be classified as declared or undeclared; expand_token stamps the "
+                    "expanding node's step on every member it mints."
+                )
+            declared_at_step = sorted(
+                str(opener_node_id)
+                for opener_node_id in self._expand_opener_binding_by_node_id
+                if self._step_resolver(opener_node_id) == mint_step
+            )
+            if declared_at_step:
+                raise AuditIntegrityError(
+                    f"EXPAND group {frame.group_id!r} (run {self._run_id!r}) was minted at step {mint_step}, the step of "
+                    f"declared opener node(s) {declared_at_step}, but opener token {record.opener_token_id!r} holds no "
+                    "node_state there. begin_node_state commits before the opener executes, so the group cannot exist "
+                    "without it; refusing to classify the group inert and strand its roster."
+                )
+            self._inert_expand_groups.add(frame.group_id)
+            return None
+        if len(candidates) > 1:
+            raise AuditIntegrityError(
+                f"Opener token {record.opener_token_id!r} of EXPAND group {frame.group_id!r} (run {self._run_id!r}) holds "
+                f"node_states at {len(candidates)} declared opener nodes "
+                f"({sorted(str(b.opener_node_id) for b in candidates)}); an opener token visits exactly one."
+            )
+        binding = candidates[0]
+        durable_closer_nodes = reads.resolve_group_collector_node(run_id=self._run_id, group_id=frame.group_id)
+        conflicting = collector_scoped_completion_conflict(
+            durable_node_ids=durable_closer_nodes,
+            configured_collector_node_ids=[str(b.closer_node_id) for b in self._expand_opener_binding_by_node_id.values()],
+            config_node_id=str(binding.closer_node_id),
+        )
+        if conflicting is not None:
+            raise AuditIntegrityError(
+                f"EXPAND group {frame.group_id!r} (run {self._run_id!r}) has durable completion evidence at "
+                f"configured collector nodes {sorted(conflicting)} but config binds opener {binding.opener_name!r} "
+                f"to closer node {binding.closer_node_id!r}, which is not among them; durable is authoritative — "
+                "node-id mismatch."
+            )
+        self._group_bindings.register_expand_group(frame.group_id, opener_name=binding.opener_name)
+        return binding
+
+    def _resolve_member_token_id(self, frame: LineageFrame) -> str:
+        """The honest `GroupLossSpec.token_id` for an ESCALATED loss (fix
+        round 2, Ruling 42): the token that WAS the lost outer member — the
+        LIVE token at `frame` — not whichever inner sibling's failure
+        happened to discover the loss. `ExecutionRepository.
+        resolve_group_member_token` resolves it structurally (final review
+        F1): among the tokens whose own lineage terminates at `frame`, a
+        successor minted by an earlier successful closer supersedes the
+        token it consumed (via `token_parents`), so a sequential
+        fork→merge→fork→merge chain resolves to the latest merged token.
+        `BarrierIntakeCoordinator._escalated_member_token_id` derives the
+        intake-path identity through the SAME call, which is what keeps the
+        two escalation write sites on one token per natural key."""
+        return self._execution.resolve_group_member_token(
+            run_id=self._run_id,
+            kind=frame.kind,
+            group_id=frame.group_id,
+            member_key=frame.member_key,
+        )
+
+    def _settle_member_losses(
+        self,
+        current_token: TokenInfo,
+        reason: str,
+        child_items: list[WorkItem],
+        *,
+        notify_in_memory: bool = True,
+        escalated: bool = False,
+    ) -> list[RowResult]:
+        """THE single settlement seam (spec §6.1) — now actually single.
+
+        ``escalated`` (fix round 2, Ruling 42): the ONLY caller that passes
+        `True` is `_record_group_member_terminals`'s escalation walk. There,
+        `current_token` is a synthetic remaining-lineage token built from
+        whichever consumed sibling's call happened to run — its `token_id`
+        is NOT the identity of the thing that was actually lost (the OUTER
+        member), it is one of potentially several inner siblings that each
+        independently notice the SAME outer loss. `GroupLossSpec.token_id`
+        is derived instead via `_resolve_member_token_id` (the token whose
+        OWN lineage terminates at the resolved bound frame — the honest
+        "what was lost", not "who happened to report it"). Every OTHER
+        caller (direct losses — the failing token IS the member) is
+        untouched: `current_token.token_id` stays authoritative there,
+        exactly as before.
+
+        Every terminal disposition that CAN CARRY A MEMBER LOSS either calls
+        this or fails closed at cause instead (2026-08-24 re-review N1,
+        tightened re-review round 2: the quantifier is scoped to what this
+        seam owns, not to every terminal disposition in the processor —
+        two classes of terminal disposition are excluded by design, not by
+        omission:
+          1. `_route_transform_results`'s `else` arm in the same quarantined
+             loop — (TRANSIENT, BATCH_CONSUMED) on a successful aggregation
+             flush's non-quarantined members. This is the NORMAL SUCCESS
+             path: it carries no loss at all and never inspects the
+             token's frames.
+          2. `CoalesceExecutor`'s direct `record_token_outcome(FAILURE,
+             UNROUTED)` write in `_execute_merge`'s except-cleanup arm
+             (`coalesce_executor.py:~1264`) — KEPT deliberately (Ruling 36,
+             not an oversight): this is crash-path cleanup ahead of a
+             `raise` nothing catches, so the run aborts before any claim
+             transaction could carry a staged GroupLossSpec durably; audit
+             completeness for that arm stays the executor's own
+             responsibility. No group loss is ever staged for a token
+             consumed on this arm — WS5/6 resume sees only its direct
+             terminal, and Task 8 escalation must NOT expect a loss from
+             this specific site. Task 6 retired the OTHER two direct writes
+             (late arrival, `_fail_pending`'s group-failure arm): callers
+             now route their consumed siblings through
+             `_record_group_member_terminals`, which both records the
+             terminal AND runs this walk again over each sibling's
+             REMAINING lineage (spec §6.1 — what makes escalation, Task 8,
+             observable, for those two sites).
+        Within its actual scope — a disposition that COULD carry a member
+        loss — ruling 25 makes exactly one shape unreachable, not absent:
+        the non-empty aggregation flush's QUARANTINED_AT_SOURCE disposition
+        raises `OrchestrationInvariantError` at `_route_transform_results`'s
+        quarantined loop rather than ever reaching this method, because
+        that path has no committed consumer for a staged loss; see the
+        raise site's comment). Every path that DOES call this walks the
+        failing token's lineage_path from the INNERMOST frame outward to
+        the FIRST BOUND frame and stages exactly one GroupLossSpec for that
+        frame's member (record-then-notify: staged unconditionally, before
+        any in-memory notify; the staged record rides this claim's
+        disposition transaction via take_claim_group_losses, or the
+        flush's complete_barrier). Inert frames — no closer bound — are
+        pure provenance and are skipped. Followers stage the innermost
+        bound loss only; the in-memory notify is leader-only (each
+        closer-kind arm no-ops without its executor — see
+        `_notify_closer_of_loss`).
+        """
+        resolved = self._first_bound_frame(current_token)
+        if resolved is None:
+            return []
+        frame, binding = resolved
+        # 2026-08-24 review M2: resolve the coalesce node id BEFORE staging
+        # when the COALESCE arm will need it (notify_in_memory and this
+        # closer kind — the only arm with an unconditional dict lookup). A
+        # missing entry then raises the plain KeyError itself, here, rather
+        # than leaving a GroupLossSpec staged that only surfaces later — as
+        # a masking claim-guard error against a later, unrelated claim.
+        if notify_in_memory and binding.closer_kind is CloserKind.COALESCE:
+            _ = self._coalesce_node_ids[CoalesceName(binding.closer_name)]
+        member_token_id = self._resolve_member_token_id(frame) if escalated else current_token.token_id
+        # An escalated resolution IS the "inner group's failure consumed the
+        # outer member" case by construction (the caller passed
+        # escalated=True precisely because it's walking a consumed sibling's
+        # REMAINING lineage) — the staged reason is always the bare
+        # "group_failed" category token (spec §6.3 item 5), never the inner
+        # disposition's own reason string. `_stage_pending_escalations`
+        # (barrier_coordination.py) writes the SAME natural key with the
+        # SAME constant for its own (intake-only, roster-settled) path;
+        # without this, whichever of the two commits first wins the
+        # natural-key race and can leave the inner reason ("quarantined",
+        # "late_arrival_after_merge", ...) durably recorded against the
+        # OUTER member instead — measured live via the WS3 Task 9 end-to-end
+        # pin (test_nested_inner_failure_settles_outer_member).
+        effective_reason = GROUP_FAILED_REASON if escalated else reason
+        self._stage_group_loss(
+            GroupLossSpec(
+                closer_name=binding.closer_name,
+                group_id=frame.group_id,
+                member_key=frame.member_key,
+                token_id=member_token_id,
+                reason=effective_reason,
+            )
+        )
+        if not notify_in_memory:
+            return []
+        return self._notify_closer_of_loss(binding, frame, current_token, effective_reason, child_items)
+
+    def _stage_group_loss(self, spec: GroupLossSpec) -> None:
+        for staged in self._pending_group_losses:
+            if (staged.group_id, staged.member_key) != (spec.group_id, spec.member_key):
+                continue
+            if staged.token_id == spec.token_id:
+                # Fix round 2 (Ruling 42): a cross-call restage of the SAME
+                # outer member's loss — two independent observers (e.g. an
+                # inner _fail_pending consumption and a separate late
+                # arrival) noticing the identical fact through different
+                # inner siblings. Once both derive the member's own token_id
+                # (see _resolve_member_token_id / `escalated=True`), this
+                # arrives as an identical (group_id, member_key, token_id)
+                # triple — duplicate OBSERVATION, not corruption. No-op,
+                # matching record_group_loss's own idempotent-natural-key
+                # tolerance one layer down.
+                return
+            raise OrchestrationInvariantError(
+                f"Settlement staged a second loss for group {spec.group_id!r} member "
+                f"{spec.member_key!r} within one claim with a DIFFERENT token_id "
+                f"(existing={staged.token_id!r}, new={spec.token_id!r}); at most one loss per "
+                "bound frame per claim. Processor bug."
+            )
+        self._pending_group_losses.append(spec)
+
+    def _take_pending_group_losses(self) -> tuple[GroupLossSpec, ...]:
+        """Drain whatever is currently staged in `_pending_group_losses`
+        (Ruling 39 / C2 fix): the out-of-claim sweep counterpart to
+        `SchedulerDrainCoordinator.take_claim_group_losses`. No
+        frame-authentication against a claimed token — there is no claimed
+        token in sweep context, and the spec's own provenance is already
+        authoritative (it came from `_first_bound_frame`'s binding-registry
+        lookup, inside the SAME synchronous call that staged it, immediately
+        before this drains it). The caller commits the drained spec(s)
+        durably in the same transaction as its own disposition (e.g.
+        `mark_blocked_barrier_terminal(group_losses=...)`), never leaving
+        anything behind here.
+        """
+        if not self._pending_group_losses:
+            return ()
+        staged = tuple(self._pending_group_losses)
+        self._pending_group_losses.clear()
+        return staged
+
+    def take_pending_group_losses(self) -> tuple[GroupLossSpec, ...]:
+        """Public surface for `_take_pending_group_losses` (Ruling 39): the
+        BarrierIntakeCoordinator injection point for its out-of-claim
+        collector and late-arrival arms (coalesce group failures drain inside
+        `settle_failed_coalesce_group`)."""
+        return self._take_pending_group_losses()
+
+    def _record_group_member_terminals(
+        self,
+        consumed_tokens: tuple[TokenInfo, ...],
+        *,
+        group_id: str,
+        failure_reason: str,
+        child_items: list[WorkItem],
+        group_failed: bool,
+        frame_kind: FrameKind = FrameKind.FORK,
+        outcome: TerminalOutcome = TerminalOutcome.FAILURE,
+        path: TerminalPath = TerminalPath.UNROUTED,
+        already_terminal: frozenset[str] = frozenset(),
+    ) -> list[RowResult]:
+        """Terminalize a closer's consumed members through the standard
+        channel (spec §6.1: no closer writes token terminals directly —
+        Task 6 retires the coalesce executor's three direct
+        `record_token_outcome` writes for held siblings it consumes on a
+        failure arm).
+
+        ``frame_kind`` (integration item 14) names the closer's OWN frame
+        kind — FORK for coalesce/row_union members, EXPAND for collector
+        members — and is passed explicitly rather than read off the anchor
+        so the "innermost frame is the closer's own" guard stays a real
+        check. ``outcome``/``path`` are the disposition to write: the
+        FAILURE/UNROUTED default is every failure arm; a collector's
+        SUCCESSFUL flush writes its surviving members' (SUCCESS, COALESCED)
+        through the same channel (the disposition a consumed coalesce member
+        carries, ``sink_name`` None — see ``is_counted_coalesced_output``),
+        with ``group_failed=False`` because a successful closure consumes no
+        enclosing member. ``error_hash`` is derived from ``failure_reason``
+        only for a FAILURE outcome.
+
+        ``group_failed`` (final review F1) is the caller's statement of
+        WHICH closure this is: ``True`` when this call IS the group's
+        failure (the consumed tokens are the held members a require_all/
+        quorum/timeout failure took down — every failure arm), ``False``
+        when the group had ALREADY closed and the consumed token is a late
+        arrival being terminalized on its own (`CoalesceOutcome.late_arrival`).
+        Only a group FAILURE consumes the enclosing member; a late arrival
+        after a successful merge leaves the merged token carrying that
+        member forward, so escalating it would stage a semantically false
+        outer loss (and a late arrival after a FAILED closure finds the
+        escalation already owned by the failure arm plus the intake pass's
+        roster-settled staging). With ``group_failed=False`` this method
+        writes the terminals and returns without walking.
+
+        When ``group_failed`` this ALSO runs the settlement walk ONCE over
+        the consumed tokens' shared REMAINING lineage — the frames OUTSIDE
+        the closer frame that just consumed all of them, innermost of THAT
+        to the first bound frame — so a loss inside a nested bound region
+        reaches its enclosing region instead of stopping at the closer that
+        happened to notice it first (what makes escalation, Task 8,
+        observable). ONCE,
+        not once per consumed token (fix round 1, Ruling 38 / C1): consumed
+        siblings SHARE their enclosing frame by construction — that is what
+        makes them siblings — so running the walk per token stages the same
+        enclosing (group_id, member_key) N times and trips
+        `_stage_group_loss`'s duplicate guard on a topology that builds and
+        runs today (nested fork-in-fork; see
+        `tests/integration/core/dag/test_nested_fork_coalesce.py`).
+
+        The pop itself mirrors the two ratified siblings doing the same
+        strict pop over the same kind of token set — `TokenManager.
+        coalesce_tokens` and the durable Tier-1 twin in
+        `core/landscape/data_flow/tokens.py` (Ruling 41 / I3): derive the
+        expected group id from an ANCHOR (the first consumed token's own
+        innermost FORK frame — by construction the frame this closer
+        itself closes; bound-region SESE nesting guarantees it, the token
+        could not have arrived here otherwise), pop EVERY consumed token
+        against that SAME shared id (never each token's own observed
+        group_id, which would make `truncate_at_closer_frame`'s group check
+        unfalsifiable), and collapse the results into a set: more than one
+        distinct remaining path means the siblings disagree about their
+        enclosing frame, which is lineage corruption, not a config shape —
+        crash loudly rather than silently walk one of them. Reuses
+        `_settle_member_losses` — the ONE settlement walk in this module —
+        rather than re-deriving frame resolution here.
+
+        Ordering (M3): the pop-and-agreement-check runs FIRST, over every
+        consumed token, before any terminal is written — a lineage
+        disagreement (or a missing FORK frame) now crashes before a single
+        write, not after some. Once that passes, every consumed token's
+        terminal is written, THEN the single escalation walk runs — so a
+        raise from the walk (an enclosing-frame duplicate, or any other
+        `_settle_member_losses` failure) never hides a token's own recorded
+        terminal. The remaining risk is a `record_token_outcome` write
+        itself raising mid-loop, leaving earlier tokens in this call
+        recorded and later ones not — audit-first is the accepted trade
+        over the alternative (write nothing until every token is written),
+        which would leave a genuinely-failed token with NO terminal at all
+        on the exact same class of failure.
+
+        ``already_terminal`` names consumed members whose terminal a previous
+        process already wrote before it crashed: resume completing a RECORDED
+        collector failure verdict (elspeth-5887fb7928 AC-R4). Their write is
+        skipped, but they still take part in the lineage agreement check and
+        the ONE escalation walk. The walk's staged losses ride the journal
+        release, which that crash never committed. Every other caller passes
+        nothing, so its duplicate terminal still fails loudly.
+        """
+        if not consumed_tokens:
+            return []
+
+        # META-38: the closer's own group id is the CALLER's fact (every
+        # caller holds it — the collector outcome's group_id, the arriving
+        # token's FORK frame, the replayed loss's group_id), never re-derived
+        # from a consumed token's innermost frame: a consumed member that is
+        # itself a collector release carries its own release-group EXPAND
+        # frame above the frame this closer closes. Every token is truncated
+        # PER TOKEN through release-group frames only (the written
+        # closes_group_id fact, memoised on the token manager) before the
+        # shared-path agreement check; the innermost-frame case never reads.
+        first = consumed_tokens[0]
+        if not any(frame.kind is frame_kind and frame.group_id == group_id for frame in first.lineage_path):
+            raise OrchestrationInvariantError(
+                f"_record_group_member_terminals: consumed token {first.token_id!r} has no innermost {frame_kind.name} "
+                f"frame to close for group {group_id!r} (searched below collector release-group frames; "
+                f"lineage_path={first.lineage_path!r})"
+            )
+        shared_group_id = group_id
+
+        def is_release_group(candidate_group_id: str) -> bool:
+            return self._token_manager.is_release_group(self._run_id, candidate_group_id)
+
+        remaining_paths = {
+            truncate_at_closer_frame(consumed.lineage_path, kind=frame_kind, group_id=shared_group_id, is_release_group=is_release_group)
+            for consumed in consumed_tokens
+        }
+        if len(remaining_paths) != 1:
+            raise OrchestrationInvariantError(
+                f"_record_group_member_terminals: consumed tokens do not share their remaining lineage "
+                f"path after the pop (group={shared_group_id!r}); {len(remaining_paths)} distinct paths."
+            )
+        remaining_path = remaining_paths.pop()
+
+        # META-40 (spec §6.3 "survivors terminate scope_group_failed"): a
+        # member consumed by its group's FAILURE terminates under the closed
+        # settlement vocabulary, for every closer kind — never under the
+        # executor's cause. The cause is not lost: the executor wrote it
+        # structurally on each survivor's own hold node_state
+        # (CoalesceFailureReason.failure_reason / CollectorGroupFailure's
+        # context.failure_reason) beside this same disposition, and the
+        # escalation walk below still stages the bare "group_failed" for the
+        # enclosing frame. A non-group-failed FAILURE (the late-arrival arm)
+        # already passes its settlement reason as ``failure_reason``.
+        terminal_reason = GroupSettlementReason.SCOPE_GROUP_FAILED.value if group_failed else failure_reason
+        error_hash = compute_error_hash(terminal_reason) if outcome is TerminalOutcome.FAILURE else None
+        for consumed in consumed_tokens:
+            if consumed.token_id in already_terminal:
+                continue
+            self._data_flow.record_token_outcome_leader(
+                coordination_token=self._require_coordination_token(),
+                ref=TokenRef(token_id=consumed.token_id, run_id=self._run_id),
+                outcome=outcome,
+                path=path,
+                error_hash=error_hash,
+            )
+
+        if not group_failed:
+            return []
+        remaining_token = replace(consumed_tokens[0], lineage_path=remaining_path)
+        return self._settle_member_losses(remaining_token, failure_reason, child_items, escalated=True)
+
+    def record_group_member_terminals(
+        self,
+        consumed_tokens: tuple[TokenInfo, ...],
+        *,
+        group_id: str,
+        failure_reason: str,
+        child_items: list[WorkItem],
+        group_failed: bool,
+        frame_kind: FrameKind = FrameKind.FORK,
+        outcome: TerminalOutcome = TerminalOutcome.FAILURE,
+        path: TerminalPath = TerminalPath.UNROUTED,
+        already_terminal: frozenset[str] = frozenset(),
+    ) -> list[RowResult]:
+        """Public surface for `_record_group_member_terminals` (spec §6.1
+        Task 6): the BarrierIntakeCoordinator injection point for its
+        collector and late-arrival arms, mirroring how `emit_token_completed` and
+        `settle_failed_coalesce_group` are already threaded to callers
+        outside this class.
+        """
+        return self._record_group_member_terminals(
+            consumed_tokens,
+            group_id=group_id,
+            failure_reason=failure_reason,
+            child_items=child_items,
+            group_failed=group_failed,
+            frame_kind=frame_kind,
+            outcome=outcome,
+            path=path,
+            already_terminal=already_terminal,
+        )
+
+    def settle_failed_coalesce_group(
+        self,
+        consumed_tokens: tuple[TokenInfo, ...],
+        *,
+        coalesce_name: CoalesceName,
+        group_id: str,
+        failure_reason: str,
+        child_items: list[WorkItem],
+        losses_ride_claim: bool,
+    ) -> list[RowResult]:
+        """Terminalize a FAILED coalesce group and surface it — the ONE seam
+        every coalesce group-failure arm uses (arrival intake, durable loss
+        replay, live loss notification, timeout/EOF sweeps).
+
+        In order: (1) record every consumed token's terminal through the
+        settlement channel, which also walks their REMAINING lineage for an
+        enclosing bound frame (escalation; cascaded results/child_items
+        surface); (2) release every consumed token's BLOCKED scheduler row;
+        (3) emit TokenCompleted per consumed token, AFTER the audit record;
+        (4) return one (FAILURE, UNROUTED) result PER consumed token
+        (``failed_barrier_group_results``: exactly one carries the
+        ``rows_coalesce_failed`` marker) followed by any cascaded results.
+        Per-token surfacing is what keeps the live ``rows_failed`` equal to
+        the audit derive, which counts one terminal per consumed token.
+
+        ``losses_ride_claim`` names who commits a loss the escalation walk
+        stages — it is NOT an optimisation switch. True for the loss
+        notification (``_notify_coalesce_closer_of_loss``): in a claim, the
+        staged list rides the CLAIM's disposition transaction
+        (``take_claim_group_losses``, frame-authenticated; the claimed token's
+        own triggering loss is staged in the same list, so draining it here
+        would steal that loss from its claim); reached through another
+        settlement's escalation walk, the OUTER out-of-claim caller drains
+        after its walk returns. False for the out-of-claim roots (intake,
+        durable replay, sweeps): there is no claim to ride, so the staged
+        losses are drained and committed in the SAME transaction as this
+        release (Rulings 39/43).
+
+        An empty ``consumed_tokens`` (a zero-arrival failure) has nothing to
+        terminalize or surface and returns before touching the staged-loss
+        list, so an out-of-claim caller never drains a loss it would not
+        commit.
+        """
+        if not consumed_tokens:
+            return []
+        cascaded = self._record_group_member_terminals(
+            consumed_tokens,
+            group_id=group_id,
+            failure_reason=failure_reason,
+            child_items=child_items,
+            group_failed=True,
+        )
+        group_losses = () if losses_ride_claim else self._take_pending_group_losses()
+        self._mark_coalesce_consumed_scheduler_work_terminal(
+            coalesce_name=coalesce_name,
+            consumed_tokens=consumed_tokens,
+            group_losses=group_losses,
+        )
+        for consumed in consumed_tokens:
+            self._emit_token_completed(consumed, outcome=TerminalOutcome.FAILURE, path=TerminalPath.UNROUTED)
+        return [
+            *failed_barrier_group_results(consumed_tokens, exception_type="CoalesceFailure", failure_reason=failure_reason),
+            *cascaded,
+        ]
+
+    def _notify_closer_of_loss(
+        self,
+        binding: GroupBinding,
+        frame: LineageFrame,
+        current_token: TokenInfo,
+        reason: str,
+        child_items: list[WorkItem],
+    ) -> list[RowResult]:
+        """Leader-only in-memory notify, dispatched on the bound frame's closer kind.
+
+        Called only after `_settle_member_losses` has already staged the
+        durable loss for `frame` (record-then-notify, spec §6.2). A follower
+        reaches here too — `notify_in_memory` defaults True at every live
+        call site — but each arm below no-ops without its own executor; the
+        durable record staged above is what the leader's next journal-intake
+        replays.
+        """
+        if binding.closer_kind is CloserKind.COALESCE:
+            return self._notify_coalesce_closer_of_loss(binding, frame, current_token, reason, child_items)
+        if binding.closer_kind is CloserKind.ROW_UNION:
+            return self._notify_row_union_closer_of_loss(binding, frame, current_token, reason)
+        if binding.closer_kind is CloserKind.COLLECTOR:
+            # COLLECTOR arm: stage only. A collector loss can complete the
+            # roster and FLUSH (a plugin call needing the PluginContext), and
+            # this seam carries no ctx — so the in-memory notify runs at the
+            # next intake's durable-loss replay
+            # (BarrierIntakeCoordinator._replay_group_losses, which has ctx
+            # and disposes the outcome exactly like an arrival). Same
+            # stage-then-replay shape the empty-aggregation flush already
+            # uses; latency is one drain iteration. Replay dedups on
+            # CollectorExecutor.has_replayed_member_loss (in-memory) — NEVER
+            # on has_recorded_member_loss, whose durable ledger fallback
+            # would report every just-committed loss as already recorded
+            # and make the replay a permanent no-op.
+            return []
+        raise OrchestrationInvariantError(
+            f"Unhandled closer kind {binding.closer_kind!r} for closer {binding.closer_name!r}"
+        )  # pragma: no cover
+
+    def _notify_row_union_closer_of_loss(
+        self,
+        binding: GroupBinding,
+        frame: LineageFrame,
+        current_token: TokenInfo,
+        reason: str,
+    ) -> list[RowResult]:
+        """ROW_UNION arm of `_notify_closer_of_loss` (spec §6.1).
+
+        Body of the retired `_notify_row_union_of_lost_branch`, after its
+        staging block (now unconditionally done by `_settle_member_losses`
+        before this is ever reached) and minus the deleted released-group
+        guard: ruling 27 pops a released group's FORK frame
+        (`RowUnionExecutor._pop_released_group`), so a post-release
+        terminal's lineage_path no longer carries the frame the walk needs
+        to resolve back to this union — the guard is structurally
+        impossible to need now, not merely redundant.
+        """
+        row_union_name = RowUnionName(binding.closer_name)
+        if self._row_union_executor is None:
+            return []
+        outcome = self._row_union_executor.notify_branch_lost(
+            coordination_token=self._require_coordination_token(),
+            row_union_name=str(row_union_name),
+            fork_group_id=frame.group_id,
+            lost_branch=frame.member_key,
+            reason=reason,
+        )
+        if outcome is None or not outcome.consumed_tokens:
+            return []
+        # notify_branch_lost only ever fails a v1 row_union group closed
+        # (``_fail_pending``); refuse before any journal write otherwise.
+        failure_reason = outcome.failure_reason
+        if not failure_reason:
+            raise OrchestrationInvariantError(
+                f"row_union {row_union_name!r} branch-loss notification consumed {len(outcome.consumed_tokens)} token(s) "
+                "without a failure_reason; a v1 row_union loss only ever fails the group closed."
+            )
+        self._barrier_intake.note_group_failed(closer_name=str(row_union_name), group_id=frame.group_id, reason=failure_reason)
+        self._complete_row_union_fire(
+            row_union_name=row_union_name,
+            consumed_tokens=outcome.consumed_tokens,
+            scope_row_id=current_token.row_id,
+        )
+        for consumed in outcome.consumed_tokens:
+            with best_effort(
+                "TokenCompleted telemetry after row_union branch-loss audit",
+                run_id=self._run_id,
+                token_id=consumed.token_id,
+                row_union_name=row_union_name,
+            ):
+                self._emit_token_completed(
+                    consumed,
+                    outcome=TerminalOutcome.FAILURE,
+                    path=TerminalPath.UNROUTED,
+                )
+        return list(failed_barrier_group_results(outcome.consumed_tokens, exception_type="RowUnionFailure", failure_reason=failure_reason))
+
+    def _notify_coalesce_closer_of_loss(
+        self,
+        binding: GroupBinding,
+        frame: LineageFrame,
+        current_token: TokenInfo,
+        reason: str,
+        child_items: list[WorkItem],
+    ) -> list[RowResult]:
+        """COALESCE arm of `_notify_closer_of_loss` (spec §6.1).
+
+        Body of the retired `_notify_coalesce_of_lost_branch`, after its
+        staging block (now unconditionally done by `_settle_member_losses`
+        before this is ever reached). `lost_branch=frame.member_key`: the
+        walk resolves the FIRST BOUND frame outward from innermost, which in
+        a nested-fork shape need not be the token's own immediate branch —
+        this is the ratified WS3 replacement for the old dispatcher's
+        implicit "own branch only" framing (its "do not extend on a
+        one-arm assumption" warning is retired with it: this arm always
+        settles exactly the ONE frame the walk resolved to).
+
+        Args:
+            child_items: Mutable work queue — merged tokens are appended here
+
+        Returns:
+            List of RowResults for sibling tokens that failed as a consequence
+            of the branch loss, or a COALESCED RowResult if the merge triggered
+            at a terminal coalesce step. Empty if no consequences yet.
+        """
+        coalesce_name = CoalesceName(binding.closer_name)
+        coalesce_node_id = self._coalesce_node_ids[coalesce_name]
+
+        # In-memory notify: only possible when this worker has a coalesce
+        # executor (leader). Followers skip the in-memory notify; the durable
+        # record staged by `_settle_member_losses` is sufficient for the
+        # leader's next intake.
+        if self._coalesce_executor is None:
+            return []
+
+        outcome = self._coalesce_executor.notify_branch_lost(
+            coordination_token=self._require_coordination_token(),
+            coalesce_name=coalesce_name,
+            fork_group_id=frame.group_id,
+            lost_branch=frame.member_key,
+            reason=reason,
+        )
+
+        if outcome is None:
+            return []
+
+        if outcome.merged_token is not None:
+            # CoalesceOutcome.__post_init__ requires join_group_id whenever
+            # merged_token is set — narrow the type for the callers below.
+            if outcome.join_group_id is None:
+                raise OrchestrationInvariantError("CoalesceOutcome.merged_token is set but join_group_id is None — invariant violated")
+            if self._nav.resolve_next_node(coalesce_node_id) is None:
+                self._complete_coalesce_fire(
+                    coalesce_name=coalesce_name,
+                    consumed_tokens=tuple(outcome.consumed_tokens),
+                    scope_row_id=current_token.row_id,
+                )
+                # Terminal coalesce — no downstream transforms.
+                # Do NOT emit TokenCompleted here: the merged token still
+                # needs to flow through the sink write for durable recording.
+                # Telemetry is emitted later by accumulate_row_outcomes.
+                return [
+                    self._terminal_coalesce_row_result(
+                        outcome.merged_token,
+                        coalesce_name,
+                        join_group_id=outcome.join_group_id,
+                        context=f"branch-loss notification for row '{current_token.row_id}'",
+                    ),
+                ]
+            # Non-terminal — consume held siblings and emit the merged child's
+            # READY continuation in ONE atomic journal transition (F1/D6),
+            # then resume the merged token at the coalesce step.
+            #
+            # This is a THIRD merge-release path alongside _fire_coalesce_merge
+            # and complete_coalesce_merge (a LOSS event can itself trigger
+            # CoalesceAction.MERGE under quorum/best_effort/first, not only an
+            # arrival) — a nested inner coalesce's loss-triggered release needs
+            # the same fresh barrier resolution those two already apply
+            # (elspeth-0bd2cde19a round-2 F1; the durable REPLAY of the
+            # identical loss via _replay_group_losses -> _fire_coalesce_merge
+            # was already correct — only this LIVE path was missing it).
+            # completed_coalesce_name=coalesce_name, same call shape as the
+            # other two sites: for the flat/unnested case this is NOT
+            # load-bearing here (this branch is reached only when
+            # resolve_next_node(coalesce_node_id) is already known non-None,
+            # and _maybe_coalesce_token's arrival guard keys on the token's
+            # own branch_name, not this field) — measured control-vs-patched
+            # byte-identical (elspeth-0bd2cde19a round-2 F1's p8
+            # measurement — see
+            # .superpowers/sdd/2026-08-21-unified-lineage-ws2-config-validation/task-e1-review.md).
+            # See resolve_merged_branch_barrier's docstring.
+            continuation_coalesce_name, continuation_row_union_name, continuation_collector_name = self._merged_continuation_cursor(
+                outcome.merged_token, coalesce_name
+            )
+            merged_item = self._work_items.create(
+                token=outcome.merged_token,
+                current_node_id=coalesce_node_id,
+                # Flat/unnested: the resolved name is unchanged from the
+                # just-completed barrier, so supply coalesce_node_id too —
+                # restoring WorkItemFactory.create's mismatch cross-check on
+                # this path, same as the other two sites (elspeth-0bd2cde19a
+                # round-2 F4/N3). Nested: only the resolved name is known
+                # here; create() re-derives the node id. Inside a scope the
+                # collector cursor replaces the coalesce cursor entirely.
+                coalesce_node_id=(coalesce_node_id if continuation_coalesce_name == coalesce_name else None),
+                coalesce_name=continuation_coalesce_name,
+                row_union_name=continuation_row_union_name,
+                collector_name=continuation_collector_name,
+                join_group_id=outcome.join_group_id,
+            )
+            self._complete_coalesce_fire(
+                coalesce_name=coalesce_name,
+                consumed_tokens=tuple(outcome.consumed_tokens),
+                scope_row_id=current_token.row_id,
+                merged_item=merged_item,
+            )
+            child_items.append(merged_item)
+            return []
+
+        if outcome.failure_reason:
+            self._barrier_intake.note_group_failed(closer_name=str(coalesce_name), group_id=frame.group_id, reason=outcome.failure_reason)
+            # A staged escalation loss is committed by this call's context
+            # (the claim, or the outer out-of-claim settlement) — see the helper.
+            return self.settle_failed_coalesce_group(
+                tuple(outcome.consumed_tokens),
+                coalesce_name=coalesce_name,
+                group_id=frame.group_id,
+                failure_reason=outcome.failure_reason,
+                child_items=child_items,
+                losses_ride_claim=True,
+            )
+
+        return []
+
+    def _drain_work_queue(
+        self,
+        initial_item: WorkItem,
+        ctx: PluginContext,
+        *,
+        preclaimed: TokenWorkItem | None = None,
+    ) -> list[RowResult]:
+        """Drain scheduler-backed work, processing tokens until empty.
+
+        Each work item is durably persisted and leased before it advances;
+        child continuations become READY in the same transaction that disposes
+        the current parent lease.
+
+        ``preclaimed`` (ADR-030 §C.4 row 9): the fenced ingest verb already
+        persisted AND claimed the initial item inside its composed
+        transaction; passing the returned LEASED row here skips the drain's
+        own enqueue-and-claim.
+        """
+        return self._drain_durable_work_queue(initial_item, ctx, preclaimed=preclaimed)
+
+    def drain_scheduled_work(self, ctx: PluginContext) -> list[RowResult]:
+        """Advance already-persisted READY scheduler work for this run.
+
+        This is the recovery entry point: a fresh processor can resume work
+        items that were persisted by an earlier process without re-reading the
+        source or re-running source-boundary validation.
+
+        **Admission gate (ADR-030 §G, slice 4).** Under multi-worker
+        deployment, concurrent workers are EXPECTED to share a run_id.
+        Registry admission (the ``active_worker_fence_clause`` membership fence
+        compiled into ``claim_ready`` / ``claim_pending_sink`` / ``enqueue_ready``
+        CAS UPDATEs) is the correctness mechanism: a non-member's claim fails the
+        EXISTS fence and surfaces ``RunWorkerEvictedError``, so a concurrent peer
+        is a normal multi-worker state, not a precondition violation.
+
+        ``peer_active_leases`` is **diagnostic only** from slice 4 onward. Its
+        result is logged for observability but no longer causes a refusal. The
+        old ADR-026 Precondition #9 single-active-resume enforcement is replaced
+        by the membership fence on the claim verbs (archived issue elspeth-66be4216cd,
+        G3 — the original concern was duplicate RowResult emission; the fence CAS
+        prevents non-members from claiming, closing that race structurally).
+        """
+        repaired_source_states = self._execution.reconcile_source_completions_from_scheduler(
+            coordination_token=self._require_coordination_token(),
+        )
+        if repaired_source_states:
+            logger.info(
+                "Reconciled %d source COMPLETED state(s) from fully witnessed scheduler ingress for run_id=%r",
+                repaired_source_states,
+                self._run_id,
+            )
+
+        peer_owners = self._scheduler.peer_active_leases(
+            run_id=self._run_id,
+            caller_owner=self._scheduler_lease_owner,
+        )
+        if peer_owners:
+            logger.debug(
+                "drain_scheduled_work: peer workers %r hold unexpired leases on run_id=%r (diagnostic only; "
+                "admission fence on claim verbs is the correctness gate)",
+                list(peer_owners),
+                self._run_id,
+            )
+        return self._drain_scheduler_claims(ctx=ctx, pending_items={}, recover_pending_sinks=True)
+
+    def has_scheduled_work(self) -> bool:
+        """Return whether this run has non-terminal durable scheduler work."""
+        return self._scheduler.count_active_work(run_id=self._run_id) > 0
+
+    def has_peer_active_leases(self) -> bool:
+        """Return True if any peer worker holds an unexpired LEASED item.
+
+        ADR-030 multi-worker: the leader polls this after its source loop to
+        detect follower workers that are still processing items (LEASED).  The
+        leader must not call finalize_run while followers still hold leases,
+        because those items will become PENDING_SINK and block the quiescence
+        predicate in complete_run.
+        """
+        return bool(
+            self._scheduler.peer_active_leases(
+                run_id=self._run_id,
+                caller_owner=self._scheduler_lease_owner,
+            )
+        )
+
+    def peer_lease_wait_budget_seconds(self) -> float:
+        """Return the bounded wait budget for peer-held active item leases."""
+        return float(self._scheduler_lease_seconds) + DEFAULT_ITEM_STALL_BUDGET_SECONDS
+
+    def peer_active_lease_owners(self) -> tuple[str, ...]:
+        """Return the distinct peer lease_owners holding unexpired LEASED rows.
+
+        Diagnostic surface for the leader's bounded peer-wait: names the peers
+        still blocking finalization when the wait times out.
+        """
+        return self._scheduler.peer_active_leases(
+            run_id=self._run_id,
+            caller_owner=self._scheduler_lease_owner,
+        )
+
+    def reap_expired_peer_leases(self) -> int:
+        """Drive lease maintenance once so dead peers are actively reaped.
+
+        ADR-030: the leader's bounded peer-wait calls this each iteration so a
+        peer that died mid-lease (heartbeat stopped, lease expired) is recovered
+        to READY within the liveness window instead of waiting out the full item
+        lease TTL.  Returns the number of leases recovered this pass.
+        """
+        return self._scheduler_drain.run_maintenance()
+
+    def summarize_scheduled_work(self) -> tuple[str, ...]:
+        """Return grouped active scheduler work for invariant diagnostics."""
+        return self._scheduler.summarize_active_work(run_id=self._run_id)
+
+    def has_unresolved_scheduler_work(self) -> bool:
+        """Return whether scheduler work remains short of a durable sink handoff.
+
+        PENDING_SINK handoffs (and pending sinks re-claimed during resume)
+        are excluded: they are terminalized only after sink durability via
+        ``mark_sink_bound_scheduler_terminal_many``, which runs during sink
+        writes — after the pre-sink completion invariants that call this.
+        """
+        return self._scheduler.count_unresolved_work(run_id=self._run_id) > 0
+
+    def summarize_unresolved_scheduler_work(self) -> tuple[str, ...]:
+        """Return grouped unresolved scheduler work for invariant diagnostics."""
+        return self._scheduler.summarize_unresolved_work(run_id=self._run_id)
+
+    def mark_blocked_barrier_terminal(
+        self,
+        barrier_key: str,
+        token_ids: tuple[str, ...],
+        *,
+        group_losses: tuple[GroupLossSpec, ...] = (),
+    ) -> int:
+        """Mark durable scheduler work consumed by a barrier as terminal.
+
+        The scheduler repository is the one authority for the consumed set:
+        inside its write transaction it refuses an empty, duplicated,
+        not-BLOCKED or short-terminalized set with ``AuditIntegrityError``
+        before anything commits, so the returned count is always the number
+        of distinct ``token_ids`` and callers do not re-check it.
+
+        ``group_losses`` (Ruling 39): passed straight through to
+        `complete_barrier`'s existing durable write — the out-of-claim sweep
+        caller's own drained-and-not-otherwise-committed stage. See
+        `take_pending_group_losses`.
+        """
+        return self._scheduler.mark_blocked_barrier_terminal(
+            barrier_key=barrier_key,
+            token_ids=token_ids,
+            coordination_token=self._require_coordination_token(),
+            group_losses=group_losses,
+        )
+
+    def _mark_coalesce_consumed_scheduler_work_terminal(
+        self,
+        *,
+        coalesce_name: CoalesceName,
+        consumed_tokens: tuple[TokenInfo, ...],
+        group_losses: tuple[GroupLossSpec, ...] = (),
+    ) -> None:
+        """Terminalize scheduler rows for coalesce branches consumed by a failure.
+
+        FAILURE arms only (merge failed / branch loss without a merged
+        output): no emission accompanies the consumption, and the legacy
+        partial-release wrapper semantics are kept. Successful coalesce fires
+        go through ``_complete_coalesce_fire`` — ONE atomic journal
+        transition (F1/D6).
+
+        §E.2 (journal-first intake): every consumed branch — including the
+        arrival whose intake-time accept produced this failure — holds a
+        BLOCKED journal row, so the whole consumed set is released here. (The
+        historical LEASED-arrival exclusion died with the in-claim arms.)
+
+        ``group_losses`` (fix round 3, Ruling 43): the caller's own drained
+        `take_pending_group_losses()` — an escalation staged from this
+        out-of-claim intake pass, threaded through to the existing
+        `mark_blocked_barrier_terminal`/`complete_barrier`/`record_group_loss`
+        channel so it commits durably in the SAME transaction as this
+        release, exactly like Ruling 39 did for the sweep path.
+        """
+        blocked_token_ids = tuple(token.token_id for token in consumed_tokens)
+        if blocked_token_ids:
+            self.mark_blocked_barrier_terminal(str(coalesce_name), blocked_token_ids, group_losses=group_losses)
+
+    def _sink_emission_from_result(self, result: RowResult) -> BarrierEmission:
+        """Build the sink-bound barrier emission for one flush output result.
+
+        Carries the full insert bundle: for a buffered passthrough token only
+        the handoff fields are read (BLOCKED -> PENDING_SINK in place); for a
+        generated output (transform-mode aggregate, with NO blocked row) the
+        cursor fields (``row_id``/``step_index``/``ingest_sequence``,
+        ``node_id=None``) drive a fresh PENDING_SINK insert on the terminal
+        lane. The emission's ``token_id`` is the result token's REAL token_id,
+        so the post-sink callback (``mark_sink_bound_scheduler_terminal_many``)
+        terminalizes exactly the rows inserted here.
+        """
+        token = result.token
+        return BarrierEmission(
+            token_id=token.token_id,
+            row_payload_json=self._scheduler.serialize_row_payload(token.row_data),
+            sink_name=require_scheduler_sink_name(result),
+            outcome=require_scheduler_outcome(result).value,
+            path=result.path.value,
+            error_hash=scheduler_error_hash(result),
+            error_message=scheduler_error_message(result),
+            row_id=token.row_id,
+            node_id=None,
+            step_index=self._scheduler_step_index(None),
+            ingest_sequence=self._data_flow.resolve_row_ingest_sequence(token.row_id),
+            join_group_id=result.join_group_id,
+            lineage_path=token.lineage_path,
+        )
+
+    def _complete_committed_aggregation_residual(
+        self,
+        residual: CommittedAggregationResidual,
+        blocked_items: Sequence[TokenWorkItem],
+    ) -> None:
+        """Publish a committed aggregation result without replaying its plugin.
+
+        Transform-mode aggregation commits its batch/node result and expanded
+        child payloads before the scheduler barrier completion.  A process
+        death in that narrow window leaves an exact durable result receipt but
+        no READY/PENDING_SINK continuation.  Reconstruct the continuation from
+        that receipt and consume the original BLOCKED snapshot atomically.
+        """
+        if self._payload_store is None:
+            raise OrchestrationInvariantError(f"Committed aggregation residual {residual.batch_id!r} requires a configured payload store")
+
+        blocked_by_token = {item.token_id: item for item in blocked_items}
+        if tuple(sorted(blocked_by_token)) != tuple(sorted(residual.member_token_ids)):
+            raise AuditIntegrityError(f"Committed aggregation residual {residual.batch_id!r} does not match its exact BLOCKED membership")
+
+        child_tokens: list[TokenInfo] = []
+        for child in residual.children:
+            parent_item = blocked_by_token[child.parent_token_id]
+            child_tokens.append(
+                TokenInfo(
+                    row_id=child.row_id,
+                    token_id=child.token_id,
+                    row_data=self._load_committed_barrier_payload(
+                        token_id=child.token_id,
+                        token_data_ref=child.token_data_ref,
+                        receipt_name=f"aggregation batch {residual.batch_id!r}",
+                    ),
+                    lineage_path=(
+                        *parent_item.lineage_path,
+                        # 2026-08-24 review I3: this EXPAND frame's group_id
+                        # is never registered on self._group_bindings — the
+                        # only production register_expand_group call is
+                        # TokenManager.expand_token's mint path, which this
+                        # resume-path reconstruction bypasses entirely. If a
+                        # scope opener's residual is rebuilt here, the rebuilt
+                        # frame resolves on its next settle through the
+                        # META-9.1 durable re-derivation
+                        # (_rederive_expand_binding) rather than staying inert.
+                        LineageFrame(kind=FrameKind.EXPAND, group_id=child.expand_group_id, member_key=child.token_id),
+                    ),
+                )
+            )
+
+        child_rows = [token.row_data.to_dict() for token in child_tokens]
+        candidate_hashes = [stable_hash(child_rows)]
+        if len(child_rows) == 1:
+            candidate_hashes.append(stable_hash(child_rows[0]))
+        if candidate_hashes.count(residual.output_hash) != 1:
+            raise AuditIntegrityError(
+                f"Committed aggregation residual {residual.batch_id!r} child payloads do not match "
+                f"the completed node output hash {residual.output_hash!r}"
+            )
+
+        node_id = NodeID(residual.aggregation_node_id)
+        parent_item = blocked_by_token[residual.children[0].parent_token_id]
+        coalesce_name = CoalesceName(parent_item.coalesce_name) if parent_item.coalesce_name is not None else None
+        row_union_name = RowUnionName(parent_item.row_union_name) if parent_item.row_union_name is not None else None
+        next_node = self._nav.resolve_next_node(node_id)
+        emitted_ready: list[BarrierEmission] = []
+        emitted_pending_sink: list[BarrierEmission] = []
+        for token in child_tokens:
+            if row_union_name is not None and next_node is None:
+                item = self._work_items.create(
+                    token=token,
+                    current_node_id=self._nav.resolve_row_union_node(row_union_name),
+                    row_union_name=row_union_name,
+                )
+                emitted_ready.append(self._work_codec.ready_emission(item))
+            elif next_node is not None or coalesce_name is not None or row_union_name is not None:
+                item = self._work_items.create_continuation(
+                    token=token,
+                    current_node_id=node_id,
+                    coalesce_name=coalesce_name,
+                    row_union_name=row_union_name,
+                )
+                emitted_ready.append(self._work_codec.ready_emission(item))
+            else:
+                result = RowResult(
+                    token=token,
+                    final_data=token.row_data,
+                    outcome=TerminalOutcome.SUCCESS,
+                    path=TerminalPath.DEFAULT_FLOW,
+                    sink_name=self._aggregation_settings[node_id].on_success,
+                )
+                emitted_pending_sink.append(self._sink_emission_from_result(result))
+
+        self._scheduler.complete_barrier(
+            barrier_key=str(node_id),
+            consumed_token_ids=residual.member_token_ids,
+            emitted_pending_sink=tuple(emitted_pending_sink),
+            emitted_ready=tuple(emitted_ready),
+            intake_snapshot_token_ids=frozenset(residual.member_token_ids),
+            coordination_token=self._require_coordination_token(),
+            pending_sink_lease_owner=self._scheduler_lease_owner,
+            release_context={"reason": "committed_aggregation_residual_recovery", "batch_id": residual.batch_id},
+        )
+
+    def _prepare_committed_aggregation_output(
+        self,
+        receipt: CommittedAggregationOutputReceipt,
+        blocked_items: Sequence[TokenWorkItem],
+    ) -> _PreparedAggregationRoute:
+        """Load and purely validate a receipt before restore mutates."""
+        rows = tuple(
+            self._load_committed_barrier_payload(
+                token_id=f"aggregation-output:{receipt.batch_id}:{ordinal}",
+                token_data_ref=token_data_ref,
+                receipt_name=f"aggregation output {receipt.batch_id!r}",
+            )
+            for ordinal, token_data_ref in enumerate(receipt.output_refs)
+        )
+        if rows:
+            shared_contract = rows[0].contract
+            if any(row.contract != shared_contract for row in rows[1:]):
+                raise AuditIntegrityError(f"Committed aggregation output {receipt.batch_id!r} payloads carry divergent schema contracts")
+            # The payload envelope is deliberately self-contained, so each
+            # row deserializes its own equal contract object. Multi-row
+            # TransformResult construction requires the stronger runtime
+            # invariant that every row shares one contract identity.
+            rows = tuple(PipelineRow(row.to_dict(), shared_contract) for row in rows)
+        output_data: object = rows[0].to_dict() if receipt.output_shape == "single" else [row.to_dict() for row in rows]
+        if stable_hash(output_data) != receipt.output_hash:
+            raise AuditIntegrityError(f"Committed aggregation output {receipt.batch_id!r} payloads disagree with its output hash")
+        fctx, recovered_result = self._build_committed_aggregation_output_context(receipt, blocked_items, rows)
+        # The recovered result carries the receipt's QUARANTINE members as its
+        # quarantined_indices, so the re-check applies the live rule: the
+        # TRANSFORM intersection excludes inputs quarantined in-batch.
+        quarantined_indices = self._cross_check_flush_output(fctx, recovered_result, record_violation=False)
+        if receipt.output_mode == OutputMode.TRANSFORM.value:
+            return self._prepare_transform_route(fctx, recovered_result, quarantined_indices=quarantined_indices)
+        if receipt.output_mode != OutputMode.PASSTHROUGH.value:
+            raise AuditIntegrityError(f"Committed aggregation output {receipt.batch_id!r} has unknown output mode")
+        return _PreparedAggregationRoute(
+            context=fctx,
+            result=recovered_result,
+            output_mode=OutputMode.PASSTHROUGH,
+            output_rows=rows,
+            quarantined_indices=frozenset(),
+            expansion_parent=None,
+        )
+
+    def _build_committed_aggregation_output_context(
+        self,
+        receipt: CommittedAggregationOutputReceipt,
+        blocked_items: Sequence[TokenWorkItem],
+        output_rows: Sequence[PipelineRow],
+    ) -> tuple[_FlushContext, TransformResult]:
+        """Build the deterministic, mutation-free recovery routing context."""
+        items_by_id = {item.token_id: item for item in blocked_items}
+        if len(items_by_id) != len(blocked_items) or frozenset(items_by_id) != frozenset(receipt.member_token_ids):
+            raise AuditIntegrityError(f"Committed aggregation output {receipt.batch_id!r} does not match exact BLOCKED membership")
+        ordered_items = tuple(items_by_id[token_id] for token_id in receipt.member_token_ids)
+        buffered_tokens = tuple(self._work_codec.work_item_from_scheduler(item).token for item in ordered_items)
+        tokens_by_id = {token.token_id: token for token in buffered_tokens}
+        try:
+            node_id = NodeID(receipt.aggregation_node_id)
+            plugin = self._node_to_plugin[node_id]
+            settings = self._aggregation_settings[node_id]
+        except (KeyError, ValueError) as exc:
+            raise AuditIntegrityError(f"Committed aggregation output {receipt.batch_id!r} has unknown routing authority") from exc
+        # Nominal (negative) dispatch — elspeth-8783933d99: a gate at the
+        # receipt's aggregation node must not flow onward as a transform. The
+        # bare cast this replaces let it, and protocol conformance is
+        # deliberately not measured (node_to_plugin is closed by construction).
+        if isinstance(plugin, GateSettings):
+            raise AuditIntegrityError(
+                f"Committed aggregation output {receipt.batch_id!r} routing authority {node_id!r} "
+                f"resolves to gate {plugin.name!r}, not a batch-aware transform"
+            )
+        transform = plugin
+        if settings.output_mode.value != receipt.output_mode:
+            raise AuditIntegrityError(
+                f"Committed aggregation output {receipt.batch_id!r} mode {receipt.output_mode!r} "
+                f"disagrees with current graph mode {settings.output_mode.value!r}"
+            )
+        if receipt.expansion_parent_token_id is None:
+            expand_parent = buffered_tokens[0]
+        else:
+            try:
+                expand_parent = tokens_by_id[receipt.expansion_parent_token_id]
+            except KeyError as exc:
+                raise AuditIntegrityError(f"Committed aggregation output {receipt.batch_id!r} has unknown expansion parent") from exc
+        quarantined_indices = [index for index, member in enumerate(receipt.members) if member.action is AggregationMemberAction.QUARANTINE]
+        success_reason: dict[str, Any] = {"action": "recovered_aggregation_result"}
+        if quarantined_indices:
+            success_reason["metadata"] = {"quarantined_indices": quarantined_indices}
+        if receipt.output_shape == "empty":
+            recovered_result = TransformResult.success_empty(success_reason=cast(Any, success_reason))
+        elif receipt.output_shape == "single":
+            recovered_result = TransformResult.success(output_rows[0], success_reason=cast(Any, success_reason))
+        else:
+            recovered_result = TransformResult.success_multi(tuple(output_rows), success_reason=cast(Any, success_reason))
+        coalesce_node_id, coalesce_name = self._derive_coalesce_from_tokens(list(buffered_tokens))
+        row_union_node_id, row_union_name = self._derive_row_union_from_scheduler(node_id, list(buffered_tokens))
+        return (
+            _FlushContext(
+                node_id=node_id,
+                transform=transform,
+                settings=settings,
+                buffered_tokens=buffered_tokens,
+                batch_id=receipt.batch_id,
+                expand_parent_token=expand_parent,
+                triggering_token=None,
+                coalesce_node_id=coalesce_node_id,
+                coalesce_name=coalesce_name,
+                row_union_node_id=row_union_node_id,
+                row_union_name=row_union_name,
+            ),
+            recovered_result,
+        )
+
+    def _complete_committed_aggregation_output(
+        self,
+        prepared: _PreparedAggregationRoute,
+    ) -> None:
+        """Materialize a durable pre-expansion result and complete its barrier."""
+        fctx = prepared.context
+        if prepared.output_mode is OutputMode.TRANSFORM:
+            results, child_items = self._route_transform_results(fctx, prepared.result, prepared=prepared)
+        else:
+            results, child_items = self._route_passthrough_results(fctx, prepared.result)
+        self._complete_aggregation_flush(
+            fctx.node_id,
+            results,
+            list(fctx.buffered_tokens),
+            child_items,
+            batch_id=fctx.batch_id,
+            members_terminate=not prepared.output_rows,
+        )
+
+    def _prepare_recorded_aggregation_failure(
+        self,
+        verdict: RecordedAggregationFailure,
+        blocked_items: Sequence[TokenWorkItem],
+    ) -> _FailedFlushDisposition:
+        """Purely validate a recorded FAILED verdict's disposition before restore mutates.
+
+        The members come back from their BLOCKED journal rows in batch order;
+        the recorded destination must still be this aggregation's
+        ``on_error`` (the error edge moves the topology hash, so a changed
+        route cannot pass the resume topology check — a mismatch is
+        corruption, never a re-route).
+
+        The restore then hands the result to ``_dispose_failed_flush``, the
+        same disposition the live flush runs. Nothing is re-recorded: the
+        verdict (transform_errors rows, DIVERT, FAILED state and batch) was
+        committed whole before the crash, and the batch plugin is never
+        re-invoked. A named sink's members become PENDING_SINK handoffs that
+        the resume sink drain delivers.
+        """
+        items_by_id = {item.token_id: item for item in blocked_items}
+        if len(items_by_id) != len(blocked_items) or frozenset(items_by_id) != frozenset(verdict.member_token_ids):
+            raise AuditIntegrityError(f"Recorded FAILED verdict of batch {verdict.batch_id!r} does not match its exact BLOCKED membership")
+        node_id = NodeID(verdict.aggregation_node_id)
+        try:
+            settings = self._aggregation_settings[node_id]
+        except KeyError as exc:
+            raise AuditIntegrityError(
+                f"Recorded FAILED verdict of batch {verdict.batch_id!r} names aggregation node {node_id!r}, which this graph lacks"
+            ) from exc
+        if settings.on_error != verdict.destination:
+            raise AuditIntegrityError(
+                f"Recorded FAILED verdict of batch {verdict.batch_id!r} was routed to {verdict.destination!r}, but aggregation "
+                f"{settings.name!r} now declares on_error={settings.on_error!r}"
+            )
+        return _FailedFlushDisposition(
+            node_id=node_id,
+            on_error=verdict.destination,
+            buffered_tokens=tuple(
+                self._work_codec.work_item_from_scheduler(items_by_id[token_id]).token for token_id in verdict.member_token_ids
+            ),
+            batch_id=verdict.batch_id,
+            error_detail=verdict.reason_json,
+        )
+
+    def _load_committed_barrier_payload(
+        self,
+        *,
+        token_id: str,
+        token_data_ref: str,
+        receipt_name: str,
+    ) -> PipelineRow:
+        """Load and validate a self-contained barrier-result payload."""
+        if self._payload_store is None:
+            raise OrchestrationInvariantError(f"Committed {receipt_name} requires a configured payload store")
+        try:
+            payload_bytes = self._payload_store.retrieve(token_data_ref)
+        except PayloadNotFoundError as exc:
+            raise AuditIntegrityError(f"Committed {receipt_name} token {token_id!r} payload {token_data_ref!r} is unavailable") from exc
+        if sha256(payload_bytes).hexdigest() != token_data_ref:
+            raise AuditIntegrityError(f"Committed {receipt_name} token {token_id!r} payload does not match its content address")
+        envelope = checkpoint_loads(payload_bytes.decode("utf-8"))
+        if type(envelope) is not dict or "data" not in envelope or "contract" not in envelope:
+            raise AuditIntegrityError(
+                f"Committed {receipt_name} token {token_id!r} does not have a valid {{data, contract}} payload envelope"
+            )
+        data = envelope["data"]
+        contract_data = envelope["contract"]
+        if type(data) is not dict or type(contract_data) is not dict:
+            raise AuditIntegrityError(f"Committed {receipt_name} token {token_id!r} payload envelope has invalid data or contract fields")
+        return PipelineRow(data, SchemaContract.from_checkpoint(contract_data))
+
+    def _complete_committed_coalesce_residual(
+        self,
+        residual: CommittedCoalesceResidual,
+        blocked_items: Sequence[TokenWorkItem],
+    ) -> None:
+        """Publish a completed coalesce effect without repeating the merge."""
+        if frozenset(item.token_id for item in blocked_items) != frozenset(residual.member_token_ids):
+            raise AuditIntegrityError(f"Committed coalesce residual {residual.effect_id!r} does not match its exact BLOCKED membership")
+        token = TokenInfo(
+            row_id=residual.row_id,
+            token_id=residual.result_token_id,
+            row_data=self._load_committed_barrier_payload(
+                token_id=residual.result_token_id,
+                token_data_ref=residual.token_data_ref,
+                receipt_name=f"coalesce effect {residual.effect_id!r}",
+            ),
+        )
+        node_id = NodeID(residual.coalesce_node_id)
+        coalesce_name = CoalesceName(residual.coalesce_name)
+        next_node = self._nav.resolve_next_node(node_id)
+        merged_item = None
+        merged_sink_result = None
+        if next_node is not None:
+            merged_item = self._work_items.create_continuation(
+                token=token, current_node_id=node_id, join_group_id=residual.result_join_group_id
+            )
+        else:
+            merged_sink_result = RowResult(
+                token=token,
+                final_data=token.row_data,
+                outcome=TerminalOutcome.SUCCESS,
+                path=TerminalPath.COALESCED,
+                sink_name=self._nav.resolve_coalesce_sink(
+                    coalesce_name,
+                    context="committed coalesce residual recovery",
+                ),
+                join_group_id=residual.result_join_group_id,
+            )
+        self._scheduler.complete_barrier(
+            barrier_key=str(coalesce_name),
+            consumed_token_ids=residual.member_token_ids,
+            emitted_pending_sink=(() if merged_sink_result is None else (self._sink_emission_from_result(merged_sink_result),)),
+            emitted_ready=(() if merged_item is None else (self._work_codec.ready_emission(merged_item),)),
+            intake_snapshot_token_ids=frozenset(residual.member_token_ids),
+            scope_row_id=residual.row_id,
+            coordination_token=self._require_coordination_token(),
+            pending_sink_lease_owner=self._scheduler_lease_owner,
+            release_context={"reason": "committed_coalesce_residual_recovery", "effect_id": residual.effect_id},
+        )
+
+    def _complete_aggregation_flush(
+        self,
+        node_id: NodeID,
+        results: tuple[RowResult, ...],
+        buffered_tokens: Sequence[TokenInfo],
+        child_items: list[WorkItem],
+        *,
+        batch_id: str,
+        members_terminate: bool,
+        quarantine_error_hash: str | None = None,
+    ) -> tuple[tuple[RowResult, ...], frozenset[str]]:
+        """Complete an aggregation flush as ONE atomic journal transition.
+
+        Serves every successful flush and both arms of a FAILED flush: the
+        named-sink arm hands every member off as a sink-bound ON_ERROR_ROUTED
+        result (none consumed), and the discard arm terminates every member
+        (FAILURE, QUARANTINED_AT_SOURCE) here. The batch of a failed flush is
+        FAILED, so the COMPLETED-receipt restore arms below never see it.
+
+        ``members_terminate``: every buffered member's terminal is planned in
+        ``results`` and is written inside ``complete_barrier`` — an empty
+        successful output (filter-dropped / quarantined members) or a
+        discarded failed batch. ``quarantine_error_hash`` is the error_hash
+        every QUARANTINED_AT_SOURCE member of this completion carries: the
+        failed batch's reason hash on the discard arm. ``None`` derives the
+        per-ordinal ``quarantined_in_batch`` witness of a successful batch
+        that quarantined some members.
+
+        Consumes the buffered tokens' BLOCKED rows and emits every sink-bound
+        flush output as a durable PENDING_SINK row, plus every non-sink
+        continuation as a durable READY row, in the same transaction (F1/D6):
+        the moment the inputs are consumed, every output is journal-durable,
+        so a crash before the next in-process step can no longer strand a
+        flush output in memory while its inputs are TERMINAL.
+
+        ORDERING vs batch status: ``execute_flush`` finalizes the batches row
+        (``complete_batch`` -> COMPLETED) BEFORE this journal transition. A
+        crash in that window leaves BLOCKED rows with a COMPLETED batch and a
+        durable epoch-32 result receipt. Restore validates all such receipts
+        before mutating any candidate, then routes transform, passthrough, or
+        empty results without replaying the plugin. Do not reorder the two
+        writes without re-deriving those restore arms.
+
+        ``intake_snapshot_token_ids`` (ADR-030 §E.3, slice 3): the firing
+        group is exactly this batch's adopted members (``buffered_tokens`` —
+        executor memory is fed ONLY by the journal-first intake, so memory ==
+        adopted set by construction). Durable BLOCKED rows outside the
+        snapshot are late arrivals that legitimately stay BLOCKED and join the
+        NEXT batch at the next intake. Every in-claim exclusion arm
+        (``leased_token_id`` / ``emit_sink_outputs=False``) died with the
+        §E.2 journal-first intake — flushes always run out-of-claim and every
+        member, including the trigger arrival, is a consumed BLOCKED row.
+
+        §E.5: branch-loss records staged by empty-emission routing
+        (``_route_empty_emission_results`` -> ``_settle_member_losses``)
+        ride this completion transaction.
+
+        Returns the results (sink-handoff results tagged
+        ``scheduler_pending_sink=True``) and the emitted token_ids.
+        """
+        emissions: list[BarrierEmission] = []
+        emitted_token_ids: set[str] = set()
+        for result in results:
+            token_id = result.token.token_id
+            if not is_scheduler_sink_bound_result(result):
+                continue
+            if token_id in emitted_token_ids:
+                raise AuditIntegrityError(
+                    f"Aggregation flush for node {node_id!r} produced duplicate sink-bound result for token_id={token_id!r}; "
+                    "cannot create an unambiguous scheduler pending-sink handoff."
+                )
+            emissions.append(self._sink_emission_from_result(result))
+            emitted_token_ids.add(token_id)
+
+        consumed_token_ids = tuple(token.token_id for token in buffered_tokens if token.token_id not in emitted_token_ids)
+        terminal_outcomes: list[BarrierTerminalOutcomeSpec] = []
+        buffered_by_id = {token.token_id: token for token in buffered_tokens}
+        if members_terminate:
+            terminal_results: dict[str, RowResult] = {}
+            for result in results:
+                token_id = result.token.token_id
+                if token_id not in buffered_by_id:
+                    continue
+                if token_id in terminal_results:
+                    raise AuditIntegrityError(
+                        f"Aggregation flush for node {node_id!r} produced duplicate terminal plans for token_id={token_id!r}."
+                    )
+                terminal_results[token_id] = result
+            if frozenset(terminal_results) != frozenset(buffered_by_id):
+                raise AuditIntegrityError(f"Aggregation flush for node {node_id!r} lacks an exact terminal plan for every batch member.")
+            for ordinal, token in enumerate(buffered_tokens):
+                result = terminal_results[token.token_id]
+                if result.outcome is TerminalOutcome.SUCCESS and result.path is TerminalPath.FILTER_DROPPED:
+                    error_hash = None
+                elif result.outcome is TerminalOutcome.FAILURE and result.path is TerminalPath.QUARANTINED_AT_SOURCE:
+                    error_hash = (
+                        quarantine_error_hash
+                        if quarantine_error_hash is not None
+                        else compute_error_hash(f"quarantined_in_batch:{batch_id}:{ordinal}")
+                    )
+                else:
+                    raise AuditIntegrityError(
+                        f"Aggregation flush for node {node_id!r} has illegal terminal plan "
+                        f"({result.outcome!r}, {result.path!r}) for token_id={token.token_id!r}."
+                    )
+                terminal_outcomes.append(
+                    BarrierTerminalOutcomeSpec(
+                        token_id=token.token_id,
+                        outcome=result.outcome,
+                        path=result.path,
+                        error_hash=error_hash,
+                    )
+                )
+
+        group_losses = tuple(self._pending_group_losses)
+        self._scheduler.complete_barrier(
+            barrier_key=str(node_id),
+            consumed_token_ids=consumed_token_ids,
+            emitted_pending_sink=tuple(emissions),
+            # These same WorkItems are advanced after the commit: in a claim by
+            # the drain's intake enqueue, outside one by
+            # drain_released_continuations. Either enqueue reconciles against
+            # the rows inserted here by deterministic work_item_id and strict
+            # field equality; a crash before that leaves durable READY work
+            # for resume instead of losing the continuation.
+            emitted_ready=tuple(self._work_codec.ready_emission(item) for item in child_items),
+            # §E.3 per-firing-group snapshot: this batch's adopted members.
+            intake_snapshot_token_ids=frozenset(token.token_id for token in buffered_tokens),
+            coordination_token=self._require_coordination_token(),
+            # Attributed park (ADR-030): the post-sink strict owner CAS
+            # terminalizes these handoffs under this worker's lease identity.
+            pending_sink_lease_owner=self._scheduler_lease_owner,
+            group_losses=group_losses,
+            terminal_outcomes=tuple(terminal_outcomes),
+        )
+        if group_losses:
+            # The producer transaction is now authoritative. Only after it
+            # commits may loss intake mutate a coalesce/row-union executor or
+            # fire that downstream barrier. A crash before this replay leaves
+            # an unadopted durable ledger row for the next intake/restore.
+            del self._pending_group_losses[: len(group_losses)]
+            for disposition in self._barrier_intake.replay_durable_group_losses():
+                results = (*results, *disposition.results)
+                child_items.extend(disposition.child_items)
+
+        for terminal_outcome in terminal_outcomes:
+            with best_effort(
+                "TokenCompleted telemetry after atomic batch-flush member terminals",
+                run_id=self._run_id,
+                token_id=terminal_outcome.token_id,
+                transform_node_id=node_id,
+            ):
+                self._emit_token_completed(
+                    buffered_by_id[terminal_outcome.token_id],
+                    outcome=terminal_outcome.outcome,
+                    path=terminal_outcome.path,
+                )
+
+        if not emitted_token_ids:
+            return results, frozenset()
+        pending_sink_token_ids = frozenset(emitted_token_ids)
+        tagged_results = cast(
+            tuple[RowResult, ...],
+            with_scheduler_pending_sink_handoffs(results, pending_sink_token_ids),
+        )
+        return tagged_results, pending_sink_token_ids
+
+    def _complete_coalesce_fire(
+        self,
+        *,
+        coalesce_name: CoalesceName,
+        consumed_tokens: tuple[TokenInfo, ...],
+        scope_row_id: str,
+        merged_item: WorkItem | None = None,
+        merged_sink_result: RowResult | None = None,
+    ) -> None:
+        """Complete a fired coalesce barrier as ONE atomic journal transition.
+
+        Consumes the fired group's BLOCKED rows and emits the merged output in
+        the same transaction (F1/D6) — a crash after the branches are consumed
+        can no longer lose the merged output. Non-terminal coalesces pass
+        ``merged_item`` (a READY continuation); intake-fired TERMINAL
+        coalesces pass ``merged_sink_result`` (the COALESCED sink-bound
+        result), emitted as a fresh PENDING_SINK row on the terminal lane so
+        the merged output is journal-durable before the in-process sink write
+        (closing the historical in-claim memory-only ride).
+
+        COALESCE barriers share ONE ``barrier_key`` (the coalesce_name) across
+        every row pending at the coalesce, so ``scope_row_id`` (the firing
+        group's row_id) is mandatory: it narrows both the membership and
+        exhaustiveness checks to this row's pending group.
+
+        §E.2/§E.3 (journal-first intake): every consumed branch — including
+        the arrival whose intake-time accept fired the merge — holds a BLOCKED
+        journal row; the firing-group snapshot is exactly the consumed set
+        (executor memory is fed only by adoption, so memory == adopted set by
+        construction). A branch row blocked-but-not-yet-adopted at fire time
+        is a late arrival: it stays BLOCKED and is released by the next
+        intake's late-arrival arm (§E.3a). (The historical LEASED-trigger
+        ``active_token_id`` exclusion died with the in-claim arms.)
+        """
+        consumed_token_ids = tuple(token.token_id for token in consumed_tokens)
+        if not consumed_token_ids and merged_item is None and merged_sink_result is None:
+            return
+        self._scheduler.complete_barrier(
+            barrier_key=str(coalesce_name),
+            consumed_token_ids=consumed_token_ids,
+            emitted_pending_sink=() if merged_sink_result is None else (self._sink_emission_from_result(merged_sink_result),),
+            # READY continuation fields come from the shared work codec: the
+            # drain loop (or ``_drain_work_queue``'s initial claim) later runs
+            # the idempotent enqueue for the same WorkItem, which reconciles
+            # against the row inserted here by deterministic ``work_item_id``
+            # and strict field equality.
+            emitted_ready=() if merged_item is None else (self._work_codec.ready_emission(merged_item),),
+            # §E.3 per-firing-group snapshot: the fired group's adopted branches.
+            intake_snapshot_token_ids=frozenset(consumed_token_ids),
+            scope_row_id=scope_row_id,
+            coordination_token=self._require_coordination_token(),
+            # Attributed park (ADR-030): the post-sink strict owner CAS
+            # terminalizes the merged handoff under this worker's identity.
+            pending_sink_lease_owner=self._scheduler_lease_owner,
+        )
+
+    def _complete_row_union_fire(
+        self,
+        *,
+        row_union_name: RowUnionName,
+        consumed_tokens: tuple[TokenInfo, ...],
+        scope_row_id: str,
+        released_items: tuple[WorkItem, ...] = (),
+    ) -> None:
+        """Complete a fired row_union barrier as ONE atomic journal transition.
+
+        Consumes the group's BLOCKED rows and emits every released branch
+        token as a READY continuation in the same F1 ``complete_barrier``
+        transaction — the emission order is the declared branch order, so
+        in-group release order is durable. A failure fire passes no
+        ``released_items`` and only consumes the failed group's rows.
+        """
+        consumed_token_ids = tuple(token.token_id for token in consumed_tokens)
+        if not consumed_token_ids and not released_items:
+            return
+        self._scheduler.complete_barrier(
+            barrier_key=str(row_union_name),
+            consumed_token_ids=consumed_token_ids,
+            emitted_pending_sink=(),
+            emitted_ready=tuple(self._work_codec.ready_emission(item) for item in released_items),
+            intake_snapshot_token_ids=frozenset(consumed_token_ids),
+            scope_row_id=scope_row_id,
+            coordination_token=self._require_coordination_token(),
+            pending_sink_lease_owner=self._scheduler_lease_owner,
+        )
+
+    def released_row_union_items(
+        self,
+        *,
+        row_union_name: RowUnionName,
+        released_tokens: tuple[TokenInfo, ...],
+    ) -> tuple[WorkItem, ...]:
+        """Build READY continuations for a released group, in declared order.
+
+        Continuations start at the node AFTER the barrier, with no row_union
+        fields: the barrier is passed (the executor already completed each
+        member's node state there), so the group must not re-enter it —
+        ``released_tokens`` arrive with their innermost FORK frame already
+        popped (ruling 27, ``RowUnionExecutor._pop_released_group``), so
+        ``branch_name`` on a released token reflects an OUTER frame (or None),
+        never the branch this union just closed.
+
+        The cursor must ADVANCE rather than sit on the union node. Unlike
+        coalesce — whose merged output is a fresh ``token_id`` — a row_union
+        releases the ORIGINAL tokens, so a continuation parked on the union
+        node would derive the same ``work_item_id``
+        (run_id, token_id, node_id, attempt) as the very BLOCKED row this
+        fire consumes. For an identity branch, whose blocked row already
+        sits on the union node, that collides inside the atomic completion
+        and the emission is rejected as a duplicate audit write.
+        """
+        union_node_id = self._row_union_node_ids[row_union_name]
+        continuation_node_id = self._nav.resolve_next_node(union_node_id)
+        if continuation_node_id is None:
+            raise OrchestrationInvariantError(
+                f"row_union '{row_union_name}' has no downstream node to release into. "
+                "A row_union must continue on a processing connection; terminal "
+                "row_union -> sink release is rejected at build time."
+            )
+        # A union inside a scope releases the scope's members: the released
+        # tokens' remaining innermost frame is the bound EXPAND frame, and the
+        # continuation must hold at the collector (spec §7 rules 2/5).
+        return tuple(
+            self._work_items.create(
+                token=token,
+                current_node_id=continuation_node_id,
+                collector_name=self._enclosing_collector_cursor(token),
+            )
+            for token in released_tokens
+        )
+
+    def _released_collector_cursor(self, token: TokenInfo) -> tuple[CoalesceName | None, RowUnionName | None, CollectorName | None]:
+        """Barrier cursor for a token a collector just released (spec §7 rules 2/5).
+
+        ``collect_tokens`` popped the closed group's EXPAND frame and minted
+        the release with its OWN release-group EXPAND frame INNERMOST
+        (META-37: ``(EXPAND, release_group_id, own token_id)``,
+        data_flow ``collect_tokens``) — so the innermost frame is never the
+        enclosing region, and reading ``lineage_path[-1]`` alone left a
+        release inside a fork with no cursor at all (it then terminal-
+        defaulted past the coalesce to a nonexistent sink). Walk OUTWARD
+        past inert/unbound frames — the ``_first_bound_frame`` discipline —
+        to the first frame that names an enclosing barrier: a FORK frame
+        resolves through the branch maps
+        (``resolve_merged_branch_barrier``'s nested arm; a branch feeding
+        neither map has no barrier and the walk continues), an EXPAND frame
+        through the binding registry with the META-9.1 re-derivation (a
+        collector-in-collector nest). The release-group frame itself
+        resolves INERT structurally, not heuristically: its
+        ``group_records.opener_token_id`` is the representative MEMBER,
+        which holds no node_state at any declared opener node
+        (``collect_tokens`` never calls ``register_expand_group``), so the
+        re-derivation classifies it undeclared and the walk moves outward.
+        A release with no remaining bound frame carries no cursor — an
+        ordinary consumer or a sink awaits it.
+        """
+        for frame in reversed(token.lineage_path):
+            if frame.kind is FrameKind.FORK:
+                branch_key = BranchName(frame.member_key)
+                if branch_key in self._branch_to_coalesce:
+                    return self._branch_to_coalesce[branch_key], None, None
+                if branch_key in self._branch_to_row_union:
+                    return None, self._branch_to_row_union[branch_key], None
+                continue
+            if frame.kind is FrameKind.EXPAND:
+                binding = self._group_bindings.binding_for(frame)
+                if binding is None:
+                    binding = self._rederive_expand_binding(frame)
+                if binding is not None and binding.closer_kind is CloserKind.COLLECTOR:
+                    return None, None, CollectorName(binding.closer_name)
+        return None, None, None
+
+    def _enclosing_collector_cursor(self, token: TokenInfo) -> CollectorName | None:
+        """The collector cursor a token owes its ENCLOSING scope, if its
+        innermost frame is a bound EXPAND frame (spec §7 rules 2/5).
+
+        Resolved through the registry with the META-9.1 re-derivation, so a
+        release on a worker that never ran the opener still finds the
+        binding. None when the innermost frame is not EXPAND, or the
+        expansion is undeclared (inert).
+        """
+        if not token.lineage_path:
+            return None
+        frame = token.lineage_path[-1]
+        if frame.kind is not FrameKind.EXPAND:
+            return None
+        binding = self._group_bindings.binding_for(frame)
+        if binding is None:
+            binding = self._rederive_expand_binding(frame)
+        if binding is not None and binding.closer_kind is CloserKind.COLLECTOR:
+            return CollectorName(binding.closer_name)
+        return None
+
+    def _merged_continuation_cursor(
+        self,
+        merged_token: TokenInfo,
+        completed_coalesce_name: CoalesceName,
+    ) -> tuple[CoalesceName | None, RowUnionName | None, CollectorName | None]:
+        """Barrier cursor for a coalesce merge's released continuation.
+
+        ``resolve_merged_branch_barrier`` covers the flat case (the completed
+        name, load-bearing for a terminal coalesce's sink resolution) and the
+        nested-fork case (the enclosing branch's own barrier). A coalesce
+        INSIDE A SCOPE is the third shape: the merged token's remaining
+        innermost frame is the scope's bound EXPAND frame, so the
+        continuation is that group's member and must hold at the collector —
+        the collector cursor REPLACES the completed coalesce name (such a
+        coalesce is never terminal: its output has to reach the collector,
+        so the flat name is not load-bearing there). One cursor per item
+        (``WorkItem``'s one-barrier rule).
+        """
+        coalesce_name, row_union_name = resolve_merged_branch_barrier(
+            merged_token.branch_name,
+            completed_coalesce_name=completed_coalesce_name,
+            branch_to_coalesce=self._branch_to_coalesce,
+            branch_to_row_union=self._branch_to_row_union,
+        )
+        if merged_token.branch_name is None:
+            enclosing = self._enclosing_collector_cursor(merged_token)
+            if enclosing is not None:
+                return None, None, enclosing
+        return coalesce_name, row_union_name, None
+
+    def route_collector_release(
+        self,
+        *,
+        collector_name: CollectorName,
+        released_tokens: tuple[TokenInfo, ...],
+    ) -> CollectorRelease:
+        """Where a collector's released output goes (spec §5): READY continuations
+        at the node after the barrier, or sink-bound results for a terminal
+        collector (``on_success`` names a sink). Exactly one of the two lanes is
+        populated. Like ``released_row_union_items`` the cursor must ADVANCE past
+        the collector node — the released tokens are fresh ids (``collect_tokens``
+        mints them), so no work_item_id collision arises, but re-entering the
+        collector would hold the release at the barrier it just left.
+        """
+        collector_node_id = self._collector_node_for_cursor(collector_name)
+        continuation_node_id = self._nav.resolve_next_node(collector_node_id)
+        if continuation_node_id is None:
+            if collector_name not in self._collector_on_success_map:
+                raise OrchestrationInvariantError(
+                    f"Collector {collector_name!r} has no downstream node and no terminal on_success sink; "
+                    "a collector must release into a processing connection or a declared sink."
+                )
+            sink_name = self._collector_on_success_map[collector_name]
+            return CollectorRelease(
+                items=(),
+                sink_results=tuple(
+                    RowResult(
+                        token=token,
+                        final_data=token.row_data,
+                        outcome=TerminalOutcome.SUCCESS,
+                        path=TerminalPath.DEFAULT_FLOW,
+                        sink_name=sink_name,
+                    )
+                    for token in released_tokens
+                ),
+            )
+        items: list[WorkItem] = []
+        for token in released_tokens:
+            coalesce_name, row_union_name, enclosing_collector = self._released_collector_cursor(token)
+            items.append(
+                self._work_items.create(
+                    token=token,
+                    current_node_id=continuation_node_id,
+                    coalesce_name=coalesce_name,
+                    row_union_name=row_union_name,
+                    collector_name=enclosing_collector,
+                )
+            )
+        return CollectorRelease(items=tuple(items), sink_results=())
+
+    def _complete_collector_fire(
+        self,
+        *,
+        collector_name: CollectorName,
+        group_id: str,
+        consumed_tokens: tuple[TokenInfo, ...],
+        scope_row_id: str,
+        release: CollectorRelease,
+        group_losses: tuple[GroupLossSpec, ...] = (),
+    ) -> None:
+        """Complete a fired collector group as ONE atomic journal transition.
+
+        Consumes the group's BLOCKED rows (all under the compound
+        ``collector:<name>:<group_id>`` key) and emits the release — READY
+        continuations, or PENDING_SINK rows for a terminal collector — in the
+        same F1 ``complete_barrier`` transaction, exactly as
+        ``_complete_coalesce_fire``/``_complete_row_union_fire`` do. Because
+        the key already carries the group id, ``scope_row_id`` narrows nothing
+        further here but is threaded for the repository's membership check
+        parity. ``group_losses``: an escalated loss the settle seam staged
+        while terminalising this group's members rides this same commit
+        (Ruling 43).
+        """
+        consumed_token_ids = tuple(token.token_id for token in consumed_tokens)
+        if not consumed_token_ids and not release.items and not release.sink_results:
+            return
+        self._scheduler.complete_barrier(
+            barrier_key=collector_barrier_key(str(collector_name), group_id),
+            consumed_token_ids=consumed_token_ids,
+            emitted_pending_sink=tuple(self._sink_emission_from_result(result) for result in release.sink_results),
+            emitted_ready=tuple(self._work_codec.ready_emission(item) for item in release.items),
+            intake_snapshot_token_ids=frozenset(consumed_token_ids),
+            scope_row_id=scope_row_id,
+            coordination_token=self._require_coordination_token(),
+            pending_sink_lease_owner=self._scheduler_lease_owner,
+            group_losses=group_losses,
+        )
+
+    def complete_coalesce_merge(
+        self,
+        *,
+        coalesce_name: CoalesceName,
+        consumed_tokens: tuple[TokenInfo, ...],
+        merged_token: TokenInfo,
+        coalesce_node_id: NodeID,
+        ctx: PluginContext,
+    ) -> list[RowResult]:
+        """Atomically complete an out-of-claim coalesce fire and drive the merged token.
+
+        Orchestrator-facing verb for timeout/EOF coalesce fires (outcomes.py):
+        the consumed branches' BLOCKED rows and the merged child's READY row
+        transition in ONE ``complete_barrier`` call, then the merged token is
+        processed from the coalesce node. The drain's initial enqueue
+        reconciles idempotently against the READY row inserted here (same
+        deterministic work_item_id and field derivation).
+        """
+        # A nested branch's release still carries an OUTER fork frame (this
+        # coalesce's own frame is popped) — resolve the continuation's
+        # barrier context FRESH from that branch identity, never reuse
+        # coalesce_name (the barrier it was just released from): see
+        # resolve_merged_branch_barrier's docstring (elspeth-0bd2cde19a / E1b).
+        continuation_coalesce_name, continuation_row_union_name, continuation_collector_name = self._merged_continuation_cursor(
+            merged_token, coalesce_name
+        )
+        merged_item = self._work_items.create(
+            token=merged_token,
+            current_node_id=coalesce_node_id,
+            # Flat/unnested: the resolved name is unchanged from the
+            # just-completed barrier, so supply coalesce_node_id too —
+            # restoring WorkItemFactory.create's mismatch cross-check on
+            # this path (elspeth-0bd2cde19a round-2 F4). Nested: only the
+            # resolved name is known here; create() re-derives the node id.
+            # Inside a scope the collector cursor replaces the coalesce cursor.
+            coalesce_node_id=(coalesce_node_id if continuation_coalesce_name == coalesce_name else None),
+            coalesce_name=continuation_coalesce_name,
+            row_union_name=continuation_row_union_name,
+            collector_name=continuation_collector_name,
+        )
+        self._complete_coalesce_fire(
+            coalesce_name=coalesce_name,
+            consumed_tokens=consumed_tokens,
+            scope_row_id=merged_token.row_id,
+            merged_item=merged_item,
+        )
+        return self._drain_work_queue(merged_item, ctx)
+
+    def _drain_durable_work_queue(
+        self,
+        initial_item: WorkItem,
+        ctx: PluginContext,
+        *,
+        preclaimed: TokenWorkItem | None = None,
+    ) -> list[RowResult]:
+        """Drain the scheduler-backed work queue for a single source token."""
+        pending_items: dict[str, WorkItem] = {}
+
+        if preclaimed is not None:
+            # The fenced ingest already enqueued AND claimed this item in its
+            # composed transaction. Mirror _enqueue_scheduler_work_item's
+            # pending-item registration so the drain rehydrates the live
+            # payload instead of deserializing the journal row.
+            initial_claim = preclaimed
+            if initial_claim.status is TokenWorkStatus.READY or (
+                initial_claim.status is TokenWorkStatus.LEASED and initial_claim.lease_owner == self._scheduler_lease_owner
+            ):
+                pending_items[initial_claim.work_item_id] = initial_item
+        else:
+            initial_claim = self._enqueue_scheduler_work_item(initial_item, pending_items, claim_immediately=True)
+        preclaimed_items = (
+            [initial_claim]
+            if initial_claim.status is TokenWorkStatus.LEASED and initial_claim.lease_owner == self._scheduler_lease_owner
+            else []
+        )
+
+        results = self._drain_scheduler_claims(
+            ctx=ctx,
+            pending_items=pending_items,
+            recover_pending_sinks=False,
+            preclaimed_items=preclaimed_items,
+        )
+
+        return results
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Journal-first barrier intake (ADR-030 §E.2/§E.3/§E.3a/§E.5, slice 3)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _require_coordination_token(self) -> CoordinationToken:
+        """Return the authority required by every leader-fenced scheduler verb."""
+        if not isinstance(self._coordination_token, CoordinationToken):
+            raise OrchestrationInvariantError(
+                "Leader-fenced scheduler operations require the coordination token (ADR-030): "
+                "lease recovery and barrier adoption have no unfenced production arm. "
+                "Construct RowProcessor with coordination_token — the orchestrator "
+                "binds it at begin_run (epoch 1) or at the resume takeover CAS."
+            )
+        return self._coordination_token
+
+    def _require_member_token(self) -> WorkerMembershipToken:
+        """Return the registered worker authority supplied at construction."""
+        if isinstance(self._coordination_token, CoordinationToken):
+            return self._coordination_token.membership
+        if not isinstance(self._member_token, WorkerMembershipToken):
+            raise OrchestrationInvariantError("RowProcessor requires registered worker membership")
+        return self._member_token
+
+    def _run_barrier_intake_pass(self, ctx: PluginContext) -> tuple[list[RowResult], list[WorkItem]]:
+        """One §E.2 intake pass, delegated to the barrier subsystem.
+
+        The BarrierIntakeCoordinator owns the adoption/replay/trigger
+        ordering (elspeth-e76a186916) and returns typed dispositions;
+        flattening them preserves the historical (results, child_items)
+        contract for the drain loop and the orchestrator's EOF loop.
+        """
+        outcome = self._barrier_intake.run_intake_pass(ctx)
+        return outcome.results, outcome.child_items
+
+    def run_barrier_intake(self, ctx: PluginContext) -> list[RowResult]:
+        """Public §E.2 intake entry for the orchestrator's EOF loop (§D step 3).
+
+        Runs one intake pass and drives its continuation items (merged
+        coalesce children, flush continuations) through ONE durable drain
+        (:meth:`drain_released_continuations`), returning every produced
+        RowResult for the caller's outcome accumulation.
+        """
+        results, child_items = self._run_barrier_intake_pass(ctx)
+        results.extend(self.drain_released_continuations(child_items, ctx))
+        return results
+
+    def drain_released_continuations(self, continuations: Sequence[WorkItem], ctx: PluginContext) -> list[RowResult]:
+        """Advance every continuation of one out-of-claim barrier release in ONE drain.
+
+        The single authority for the continuations of a release made outside a
+        claim: a timeout or end-of-source aggregation flush
+        (``orchestrator/aggregation.py``) and the orchestrator's end-of-input
+        intake (:meth:`run_barrier_intake`). The release already inserted every
+        continuation READY in its own ``complete_barrier`` transaction, so each
+        enqueue here only reconciles against that row and registers the live
+        item; nothing is claimed early. One claim loop then advances all of
+        them, exactly as the in-claim drain does for its intake children.
+
+        Driving each continuation through its own drain is wrong because a
+        drain claims every READY row of the run: the first continuation's drain
+        also advances its siblings, and the next per-item enqueue then replays
+        a work item that has already moved on (for example a sibling that
+        opened a scope and went terminal as its expand parent), which the
+        scheduler rightly refuses as an incompatible replay.
+
+        An empty release drains nothing: entering the claim loop with no
+        continuation would advance unrelated READY work under this call.
+        """
+        if not continuations:
+            return []
+        pending_items: dict[str, WorkItem] = {}
+        for continuation in continuations:
+            self._enqueue_scheduler_work_item(continuation, pending_items)
+        return self._drain_scheduler_claims(
+            ctx=ctx,
+            pending_items=pending_items,
+            recover_pending_sinks=False,
+        )
+
+    def has_blocked_barrier_work(self) -> bool:
+        """Whether any durable BLOCKED barrier holds remain (§D step-3 loop condition)."""
+        return bool(self._scheduler.list_blocked_barrier_items(run_id=self._run_id))
+
+    def count_unquiesced_scheduler_work(self) -> int:
+        """§D step-2 journal quiescence: READY + LEASED (non-pending-sink) rows."""
+        return self._scheduler.count_unquiesced_work(run_id=self._run_id)
+
+    def summarize_unquiesced_scheduler_work(self) -> tuple[str, ...]:
+        """Grouped §D step-2 unquiesced work for invariant diagnostics."""
+        return self._scheduler.summarize_unquiesced_work(run_id=self._run_id)
+
+    def drain_follower_ready_work(
+        self,
+        ctx: PluginContext,
+        *,
+        before_claim: Callable[[], None] | None = None,
+    ) -> list[RowResult]:
+        """Follower drain surface: claim and advance READY work only (ADR-030 §B.1/§C.3).
+
+        The explicit follower entry point driven by orchestrator/follower.py's
+        drain loop. The follower-mode contract is owned HERE, not by caller
+        flag wiring: ``claim_ready`` only — never ``claim_pending_sink`` or
+        pending-sink recovery (sink work is leader-only) — and no pre-claimed
+        items. ``before_claim`` is the follower's leader-liveness probe,
+        invoked before every claim attempt.
+
+        Fails closed on mode: driving a LEADER-mode processor through the
+        follower surface is exactly the wrong-mode bug this named contract
+        exists to catch (elspeth-577179bba1).
+        """
+        if self._mode is not ProcessorMode.FOLLOWER:
+            raise OrchestrationInvariantError(
+                f"drain_follower_ready_work called on a {self._mode.value!r}-mode RowProcessor: "
+                "the follower drain surface requires ProcessorMode.FOLLOWER. Leader/N=1 paths "
+                "drain via process_row / drain_scheduled_work."
+            )
+        return self._scheduler_drain.drain_claims(
+            ctx=ctx,
+            pending_items={},
+            recover_pending_sinks=False,
+            before_claim=before_claim,
+        )
+
+    def _drain_scheduler_claims(
+        self,
+        *,
+        ctx: PluginContext,
+        pending_items: dict[str, WorkItem],
+        recover_pending_sinks: bool,
+        preclaimed_items: list[TokenWorkItem] | None = None,
+        before_claim: Callable[[], None] | None = None,
+    ) -> list[RowResult]:
+        """Claim and advance scheduler work until no READY work remains.
+
+        Thin delegate to the scheduler-drain subsystem (elspeth-c49f33d6e4):
+        ``SchedulerDrainCoordinator.drain_claims`` owns the claim loop, the
+        per-iteration journal-first barrier intake ordering, the disposition
+        arms, and pending-sink recovery. The keyword-only signature here is
+        load-bearing — the ADR-030 invariant-guard tests call this private
+        name. (orchestrator/follower.py now enters via the public
+        :meth:`drain_follower_ready_work` surface instead.)
+        """
+        return self._scheduler_drain.drain_claims(
+            ctx=ctx,
+            pending_items=pending_items,
+            recover_pending_sinks=recover_pending_sinks,
+            preclaimed_items=preclaimed_items,
+            before_claim=before_claim,
+        )
+
+    def mark_sink_bound_scheduler_terminal(self, token_id: str) -> None:
+        """Terminalize scheduler work after sink outcome durability."""
+        terminalized = self._scheduler.mark_pending_sink_terminal(
+            token_id=token_id,
+            expected_lease_owner=self._scheduler_lease_owner,
+            coordination_token=self._require_coordination_token(),
+        )
+        if terminalized != 1:
+            raise AuditIntegrityError(
+                f"Scheduler pending-sink terminalization for run_id={self._run_id!r} token_id={token_id!r} "
+                f"terminalized {terminalized} rows; expected exactly one durable scheduler handoff."
+            )
+
+    def mark_sink_bound_scheduler_terminal_many(self, token_ids: tuple[str, ...]) -> None:
+        """Terminalize a durable sink batch after sink outcome durability."""
+        terminalized = self._scheduler.mark_pending_sink_terminal_many(
+            token_ids=token_ids,
+            expected_lease_owner=self._scheduler_lease_owner,
+            coordination_token=self._require_coordination_token(),
+        )
+        if terminalized != len(token_ids):
+            raise AuditIntegrityError(
+                f"Scheduler pending-sink batch terminalization for run_id={self._run_id!r} terminalized "
+                f"{terminalized} rows for {len(token_ids)} durable sink outcomes."
+            )
+
+    def _row_result_from_pending_sink(self, scheduled: TokenWorkItem) -> RowResult:
+        """Rebuild a sink-bound row result without re-running its producer node (delegate)."""
+        return self._scheduler_drain.row_result_from_pending_sink(scheduled)
+
+    def _take_claim_group_losses(self, claimed: TokenWorkItem) -> tuple[GroupLossSpec, ...]:
+        """Take the staged loss records for the claim being disposed (delegate, spec §6.2)."""
+        return self._scheduler_drain.take_claim_group_losses(claimed)
+
+    def _heartbeat_active_claim(self) -> None:
+        """Refresh the active scheduler lease if the heartbeat interval elapsed.
+
+        Delegate: ``SchedulerDrainCoordinator.heartbeat_active_claim`` owns the
+        active-claim state and the at-most-once-per-interval write.
+        ``_process_single_token`` calls this on every node-iteration boundary
+        (ADR-026 RC6, archived issue elspeth-ddde8144b6); it raises
+        ``SchedulerLeaseLostError`` when the lease was reaped by a peer and
+        ``RunWorkerEvictedError`` when the active-membership CAS refuses.
+        """
+        self._scheduler_drain.heartbeat_active_claim()
+
+    def _live_barrier_hold(self, token_id: str) -> _LiveBarrierHold:
+        """Resolve the recorded arrival of a token about to be marked BLOCKED (delegate)."""
+        return self._scheduler_drain.live_barrier_hold(token_id)
+
+    def _record_barrier_arrival(self, token: TokenInfo, *, barrier_key: str) -> None:
+        """Record a token arriving at a barrier, as the drain will persist it.
+
+        The ONE producer of ``_LiveBarrierHold`` (aggregation, coalesce,
+        row_union, collector; leader and follower alike). The drain writes the
+        BLOCKED row's barrier_key and row from it, so the durable row is the
+        token as it arrived after any transforms run earlier in the same claim.
+        On a leader the next intake then consumes it for the exact live token
+        and arrival instant (N=1 parity); on a follower the drain drops it once
+        the row is durable.
+        """
+        self._live_barrier_holds[token.token_id] = _LiveBarrierHold(
+            token=token,
+            barrier_key=barrier_key,
+            arrived_monotonic=self._clock.monotonic(),
+        )
+
+    def _enqueue_scheduler_work_item(
+        self,
+        item: WorkItem,
+        pending_items: dict[str, WorkItem],
+        *,
+        claim_immediately: bool = False,
+    ) -> TokenWorkItem:
+        """Persist a READY scheduler item and retain the live token payload (delegate)."""
+        return self._scheduler_drain.enqueue_work_item(item, pending_items, claim_immediately=claim_immediately)
+
+    def _scheduler_node_id(self, node_id: NodeID | None) -> str | None:
+        """Return the persisted node cursor for a work item."""
+        if node_id is None:
+            return None
+        return str(node_id)
+
+    def _scheduler_step_index(self, node_id: NodeID | None) -> int:
+        """Return the durable scheduler ordering step for a work item."""
+        if node_id is None:
+            return max(self._node_step_map.values(), default=0) + 1
+        if node_id in self._node_step_map:
+            return self._node_step_map[node_id]
+        if node_id == self._source_node_id:
+            return 0
+        raise OrchestrationInvariantError(f"Cannot schedule unknown node cursor {node_id!r}")
+
+    def _queue_key_for_blocked_item(self, item: WorkItem) -> str | None:
+        """Return a queue key for structural queue blocking, if applicable.
+
+        Barrier-bound items are excluded by BOTH barrier kinds: an identity
+        fork branch is parked AT its barrier node (the gate->barrier COPY
+        edge carries no intermediate transform), so without the row_union
+        arm such an item blocks under a structural queue key with a NULL
+        barrier_key and its group is never adopted by the intake.
+        """
+        if item.current_node_id is None:
+            return None
+        if (
+            item.current_node_id in self._structural_node_ids
+            and item.coalesce_name is None
+            and item.row_union_name is None
+            and item.collector_name is None
+        ):
+            return str(item.current_node_id)
+        return None
+
+    def _barrier_key_for_blocked_item(self, item: WorkItem) -> str | None:
+        """Return a barrier key for coalesce/aggregation blocking, if applicable.
+
+        On a leader this checks ``_aggregation_settings`` (which is populated).
+        On a follower ``_aggregation_settings`` is empty but
+        ``_follower_barrier_node_ids`` carries the aggregation node IDs; both
+        paths produce the same barrier key (``str(node_id)``).
+        """
+        if item.current_node_id in self._aggregation_settings:
+            return str(item.current_node_id)
+        # ADR-030 §B (slice 5): follower path — aggregation_settings is empty
+        # but follower_barrier_node_ids carries the aggregation node IDs.
+        if item.current_node_id in self._follower_barrier_node_ids:
+            return str(item.current_node_id)
+        if item.coalesce_name is not None:
+            return str(item.coalesce_name)
+        if item.row_union_name is not None:
+            return str(item.row_union_name)
+        if item.collector_name is not None:
+            # THE producer of collector barrier_keys (integration item 1): the
+            # compound address pairs the cursor's collector with the member's
+            # own EXPAND group — a single collector spans many concurrent
+            # groups, so the bare name is not an address.
+            frame = item.token.lineage_path[-1] if item.token.lineage_path else None
+            if frame is None or frame.kind is not FrameKind.EXPAND:
+                raise OrchestrationInvariantError(
+                    f"Work item for token {item.token.token_id!r} carries collector cursor {item.collector_name!r} "
+                    f"but no innermost EXPAND frame (lineage_path={item.token.lineage_path!r}); cannot derive its "
+                    "barrier_key. Processor bug."
+                )
+            return collector_barrier_key(str(item.collector_name), frame.group_id)
+        return None
+
+    # --- TokenTraversalEngine delegates (c49 component 4) ---
+    # The traversal state machine lives in engine/token_traversal.py. These three
+    # names are the cluster's external surface and stay on RowProcessor: the
+    # SchedulerDrainHost seam calls self._processor._process_single_token at call
+    # time (10+ tests patch it), and test_processor.py drives _handle_transform_node
+    # / _handle_transform_error_status directly. Every other handler in the family
+    # is engine-internal.
+
+    def _process_single_token(
+        self,
+        token: TokenInfo,
+        ctx: PluginContext,
+        current_node_id: NodeID | None,
+        coalesce_node_id: NodeID | None = None,
+        coalesce_name: CoalesceName | None = None,
+        on_success_sink: str | None = None,
+        row_union_node_id: NodeID | None = None,
+        row_union_name: RowUnionName | None = None,
+        collector_name: CollectorName | None = None,
+        *,
+        attempt_offset: int,
+    ) -> tuple[RowResult | tuple[RowResult, ...] | None, list[WorkItem]]:
+        return self._token_traversal.process_single_token(
+            token,
+            ctx,
+            current_node_id,
+            coalesce_node_id,
+            coalesce_name,
+            on_success_sink,
+            row_union_node_id,
+            row_union_name,
+            collector_name,
+            attempt_offset=attempt_offset,
+        )
+
+    def _handle_transform_node(
+        self,
+        transform: TransformProtocol,
+        current_token: TokenInfo,
+        ctx: PluginContext,
+        node_id: NodeID,
+        child_items: list[WorkItem],
+        coalesce_node_id: NodeID | None,
+        coalesce_name: CoalesceName | None,
+        current_on_success_sink: str,
+        *,
+        attempt_offset: int,
+    ) -> _TransformOutcome:
+        return self._token_traversal.handle_transform_node(
+            transform,
+            current_token,
+            ctx,
+            node_id,
+            child_items,
+            coalesce_node_id,
+            coalesce_name,
+            current_on_success_sink,
+            attempt_offset=attempt_offset,
+        )
+
+    def _handle_transform_error_status(
+        self,
+        transform_result: TransformResult,
+        current_token: TokenInfo,
+        error_sink: str | None,
+        child_items: list[WorkItem],
+        *,
+        ctx: PluginContext,
+    ) -> _TransformTerminal:
+        return self._token_traversal.handle_transform_error_status(
+            transform_result,
+            current_token,
+            error_sink,
+            child_items,
+            ctx=ctx,
+        )

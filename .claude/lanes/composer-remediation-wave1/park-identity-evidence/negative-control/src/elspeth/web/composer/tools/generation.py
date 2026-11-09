@@ -1,0 +1,4723 @@
+"""Composer generation plane — preview, diff, explain, plugin schema, proof diagnostics."""
+
+from __future__ import annotations
+
+import ast
+import csv
+import hmac
+import io
+import re
+from collections import Counter
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Final, Literal, TypedDict, final
+from uuid import UUID
+
+from opentelemetry import metrics
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from sqlalchemy import Engine
+
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
+from elspeth.contracts.schema import FieldDefinition, get_aggregation_contract_options, get_raw_schema_config
+from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+from elspeth.contracts.value_source import get_catalog_values
+from elspeth.core.expression_parser import ExpressionEvaluationError, ExpressionParser
+from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.infrastructure.manager import (
+    get_shared_plugin_manager,
+    http_fetch_transform_names,
+)
+from elspeth.plugins.sources.json_source import JSONSourceConfig
+from elspeth.plugins.transforms.llm.model_catalog import (
+    MODEL_CATALOG_OPENROUTER,
+    OPENROUTER_LITELLM_PREFIX,
+    read_litellm_model_list,
+)
+from elspeth.web.blobs.protocol import BlobIntegrityError
+from elspeth.web.catalog.protocol import PluginKind
+from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver, is_source_producer_id, source_producer_id
+from elspeth.web.composer._validation_probe import prepare_validation_probe_options
+from elspeth.web.composer.redaction import _JsonInteger, _OmittableString
+from elspeth.web.composer.response_contracts import SelectedResponseContract
+from elspeth.web.composer.source_inspection import (
+    ConfiguredJsonInspection,
+    SourceInspectionFacts,
+    derive_extra_column_risk,
+    derive_required_header_mismatch_risk,
+    inspect_blob_content,
+    inspect_csv_source_content,
+    inspect_json_source_content,
+)
+from elspeth.web.composer.state import (
+    _LLM_SYSTEM_PROMPT_MISSING_EXPLANATION,
+    _LLM_SYSTEM_PROMPT_MISSING_FIX,
+    _LLM_USER_PROMPT_MISSING_EXPLANATION,
+    _LLM_USER_PROMPT_MISSING_FIX,
+    _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION,
+    _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX,
+    _QUERY_GENERATED_FIELDS_REQUIRED_EXPLANATION,
+    _QUERY_GENERATED_FIELDS_REQUIRED_FIX,
+    _QUERY_INPUT_COLUMNS_UNDECLARED_EXPLANATION,
+    _QUERY_INPUT_COLUMNS_UNDECLARED_FIX,
+    _TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION,
+    _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX,
+    _TRANSFORM_OUTPUT_COLLISION_EXPLANATION,
+    _TRANSFORM_OUTPUT_COLLISION_FIX,
+    CompositionState,
+    NodeSpec,
+    SourceSpec,
+    ValidationEntryDict,
+    _coalesce_branch_connections,
+    _is_config_probe_exception,
+    _runtime_nodes_downstream_of_connection,
+    _source_options_have_schema,
+    _validate_gate_expression,
+)
+from elspeth.web.composer.tool_result_envelope import ValidationCodeGuidance, ValidationGuidance
+from elspeth.web.composer.tools._common import (
+    _PLUGIN_UNAVAILABLE_EXPLANATIONS,
+    EmptyToolArgumentsModel,
+    ToolContext,
+    ToolResult,
+    _discovery_result,
+    _plugin_selection_violation,
+    _saved_graph_plugin_policy_failure,
+    _saved_graph_rejection_result,
+    _source_options_for_prevalidation,
+    _validate_mutation_arguments,
+    diff_states,
+)
+from elspeth.web.composer.tools._generation_responses import (
+    DIFF_PIPELINE_RESPONSE_CONTRACT,
+    EXPLAIN_VALIDATION_ERROR_RESPONSE_CONTRACT,
+    LIST_MODELS_RESPONSE_CONTRACT,
+    PLUGIN_ASSISTANCE_RESPONSE_CONTRACT,
+    PREVIEW_PIPELINE_RESPONSE_CONTRACT,
+)
+from elspeth.web.composer.tools._generation_schema_response import PLUGIN_SCHEMA_RESPONSE_CONTRACT
+from elspeth.web.composer.tools.blobs import (
+    BlobToolRecord,
+    _locked_read_ready_blob,
+)
+from elspeth.web.composer.tools.declarations import (
+    ToolDeclaration,
+    ToolKind,
+)
+from elspeth.web.execution.schemas import CHECK_OUTCOME_SKIPPED_AFTER_FAILURE, ValidationResult
+from elspeth.web.interpretation_state import (
+    RAW_HTML_CLEANUP_REVIEW_DRAFT,
+    RAW_HTML_CLEANUP_USER_TERM,
+    materialize_state_for_authoring,
+)
+from elspeth.web.plugin_policy.models import PluginUnavailableReason
+from elspeth.web.sessions.protocol import SessionOperationAuthority
+
+_AUTHORING_VALIDATION_COUNTER = metrics.get_meter("elspeth.web.composer.tools").create_counter(
+    "composer.authoring_validation.total",
+    description="Total authoring (Stage 1) validation outcomes from preview_pipeline",
+)
+
+
+@trust_boundary(
+    tier=3,
+    source="CSV-source 'delimiter' option from external / LLM-authored composer source options",
+    source_param="options",
+    suppresses=("R1",),
+    invariant="raises ValueError when 'delimiter' is present but not a single-character str; never coerces",
+    test_ref="tests/unit/web/composer/test_generation_source_option_boundaries.py::test_csv_source_delimiter_rejects_non_string",
+    test_fingerprint="70dcc85656bdccb86ef9d40258841bfbb2ef3123bbe836f9a7ca4266091d3716",
+)
+def _csv_source_delimiter(options: Mapping[str, Any]) -> str:
+    raw = options.get("delimiter")
+    if raw is None:
+        return ","
+    if type(raw) is not str:
+        raise ValueError(f"csv source delimiter must be str when present; got {type(raw).__name__}")
+    if len(raw) != 1:
+        raise ValueError(f"csv source delimiter must be one character; got {raw!r}")
+    return raw
+
+
+@trust_boundary(
+    tier=3,
+    source="CSV-source 'skip_rows' option from external / LLM-authored composer source options",
+    source_param="options",
+    suppresses=("R1",),
+    invariant="raises ValueError when 'skip_rows' is present but not a non-negative int; never coerces",
+    test_ref="tests/unit/web/composer/test_generation_source_option_boundaries.py::test_csv_source_skip_rows_rejects_non_int",
+    test_fingerprint="975c5318f2f88801e228ad4934c33851d6bf6ecb82891032a22d305ccf7b2f21",
+)
+def _csv_source_skip_rows(options: Mapping[str, Any]) -> int:
+    raw = options.get("skip_rows")
+    if raw is None:
+        return 0
+    if type(raw) is not int:
+        raise ValueError(f"csv source skip_rows must be int when present; got {type(raw).__name__}")
+    if raw < 0:
+        raise ValueError(f"csv source skip_rows must be non-negative; got {raw}")
+    return raw
+
+
+@trust_boundary(
+    tier=3,
+    source="CSV-source 'columns' option from external / LLM-authored composer source options",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="raises ValueError when 'columns' is present but not a list/tuple of str; never coerces",
+    test_ref="tests/unit/web/composer/test_generation_source_option_boundaries.py::test_csv_source_columns_rejects_non_sequence",
+    test_fingerprint="b5bb902a03d873d14c816d002ab58e9dd8d99c5f51c2136166480bdaf6ac94e6",
+)
+def _csv_source_columns(options: Mapping[str, Any]) -> tuple[str, ...] | None:
+    raw = options.get("columns")
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(f"csv source columns must be a list of strings when present; got {type(raw).__name__}")
+    columns: list[str] = []
+    for idx, item in enumerate(raw):
+        if type(item) is not str:
+            raise ValueError(f"csv source columns[{idx}] must be str; got {type(item).__name__}")
+        columns.append(item)
+    return tuple(columns)
+
+
+@trust_boundary(
+    tier=3,
+    source="CSV-source 'field_mapping' option from external / LLM-authored composer source options",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="raises ValueError when 'field_mapping' is present but not a Mapping of str→str; never coerces",
+    test_ref="tests/unit/web/composer/test_generation_field_mapping.py::test_csv_source_field_mapping_rejects_non_mapping",
+    test_fingerprint="0b60b2320a348028e1b74cecfe0ed49335417a9844e7478f1a652eb2725e68ac",
+)
+def _csv_source_field_mapping(options: Mapping[str, Any]) -> dict[str, str] | None:
+    raw = options["field_mapping"] if "field_mapping" in options else None
+    if raw is None:
+        return None
+    # Accept any Mapping, not just dict: CompositionState options are deep-frozen,
+    # so field_mapping arrives as a MappingProxyType. A `type(raw) is dict` check
+    # wrongly rejects the frozen mapping (Tier-3 structural validation of external/
+    # LLM-authored config — isinstance is the correct, subtype-aware guard here).
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"csv source field_mapping must be a mapping when present; got {type(raw).__name__}")
+    mapping: dict[str, str] = {}
+    for key, value in raw.items():
+        if type(key) is not str:
+            raise ValueError(f"csv source field_mapping keys must be str; got {type(key).__name__}")
+        if type(value) is not str:
+            raise ValueError(f"csv source field_mapping[{key!r}] must be str; got {type(value).__name__}")
+        mapping[key] = value
+    return mapping
+
+
+_EXPRESSION_GRAMMAR = """\
+Expression Syntax Reference
+===========================
+Applies to gate conditions, value_transform expressions and LLM result_checks.
+
+Variables:
+  row      - The current row as a dict. Access fields via row['field_name'].
+
+Field access:
+  row['field_name']       Direct access (expression evaluation fails if missing)
+  row.get('field_name')   Returns None if missing (NO default argument allowed)
+
+Operators:
+  ==, !=, <, >, <=, >=   Comparison
+  is, is not              Identity (None checks only, e.g. row.get('x') is not None)
+  and, or, not            Boolean logic
+  in, not in              Membership test
+  +, -, *, /, //, %       Arithmetic
+  x if condition else y   Ternary conditional
+
+Literals:
+  Strings, numbers, and the constants True, False, None
+  [..] lists, (..) tuples, {..} sets, {'k': v} dicts — consume sets inside expressions (e.g. membership or len); never store a set in a row value
+
+Built-in functions (only these are allowed):
+  len()       Length of a sequence or string
+  abs()       Absolute value of a number
+  lower()     Lowercase a string, e.g. lower(row['name'])
+  upper()     Uppercase a string
+  strip()     Trim whitespace (or given characters: strip(row['x'], 'z'))
+  casefold()  Aggressive lowercase for caseless matching
+  starts_with(value, prefix)  Exact case-sensitive leading prefix; exactly two strings, no offsets or tuple prefixes
+  word_count(value)  Whitespace-delimited token count of a string; punctuation within a token does not split it
+  decimal_within(left, right, tolerance)  Inclusive absolute difference of numeric decimal spellings, no epsilon
+
+decimal_within requires finite int/float values (not bool or strings) and a nonnegative tolerance.
+It compares the values received; it does not recover source text or undo earlier binary-float arithmetic.
+word_count scans the full string and temporarily splits on Python whitespace; empty/all-whitespace text gives zero.
+
+Helpers are function-call form only — row['x'].lower(), .startswith(), .split() and slices are rejected.
+Type coercion functions (int, str, float, bool) are NOT available.
+Types come from upstream declarations (source, conversions, and authored outputs); expressions never coerce.
+A stored value_transform result cannot be a set: use a list. Its target type is
+derived when the expression is provable over declared inputs; otherwise it is any.
+Nested subscript results may be any.
+
+Examples:
+  row['confidence'] >= 0.85
+  row['status'] == 'approved'
+  row['category'] in ('A', 'B', 'C')
+  row.get('optional_field') is not None
+  row['score'] > 0.5 and row['status'] != 'rejected'
+  len(row['name']) > 0
+
+Forbidden:
+  row.get('field', default)   Default values fabricate data — use 'is not None' test
+  int(row['x'])               Type coercion — coerce at source schema instead
+  row['x'] is row['y']        'is'/'is not' compare against None only
+  Imports, lambdas, comprehensions, attribute access (except row.get)
+"""
+
+
+def get_expression_grammar() -> str:
+    """Return the gate expression syntax reference."""
+    return _EXPRESSION_GRAMMAR
+
+
+class GetPluginSchemaArgumentsModel(BaseModel):
+    plugin_type: PluginKind
+    name: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ExplainValidationErrorArgumentsModel(BaseModel):
+    error_text: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class GetPluginAssistanceArgumentsModel(BaseModel):
+    plugin_type: PluginKind
+    plugin_name: str
+    issue_code: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ListModelsArgumentsModel(BaseModel):
+    provider: _OmittableString = None
+    limit: _JsonInteger = Field(default=50, ge=1)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+def _handle_get_plugin_schema(
+    arguments: dict[str, Any],
+    state: CompositionState,
+    context: ToolContext,
+) -> ToolResult:
+    validated = _validate_mutation_arguments(GetPluginSchemaArgumentsModel, arguments, "get_plugin_schema arguments")
+    plugin_type = validated.plugin_type
+    name = validated.name
+    policy_error = _plugin_selection_violation(context, plugin_type, name)
+    if policy_error is not None:
+        return _saved_graph_plugin_policy_failure(state, policy_error, component=None, rejected_component=None)
+    schema = context.catalog.get_schema(plugin_type, name)
+    return _discovery_result(state, schema)
+
+
+_GET_PLUGIN_SCHEMA_DECLARATION = ToolDeclaration(
+    response_contract=PLUGIN_SCHEMA_RESPONSE_CONTRACT,
+    name="get_plugin_schema",
+    handler=_handle_get_plugin_schema,
+    kind=ToolKind.DISCOVERY,
+    description=(
+        "Get the full configuration schema for a plugin. Result `data` carries `name`, `plugin_type`, "
+        "`description`, `json_schema`, `knob_schema`, `composer_hints`, `secret_requirements`, and "
+        "`web_config_authority` (`user_configurable` — author raw `options` directly; "
+        "`user_configurable_with_policy` — author raw `options` the same way; `operator_profiled` — do not "
+        "author raw options, author `options.profile` instead)."
+    ),
+    json_schema={
+        "type": "object",
+        "properties": {
+            "plugin_type": {
+                "type": "string",
+                "enum": ["source", "transform", "sink"],
+                "description": "Plugin type.",
+            },
+            "name": {
+                "type": "string",
+                "description": "Plugin name (e.g. 'csv').",
+            },
+        },
+        "required": ["plugin_type", "name"],
+        "additionalProperties": False,
+    },
+    cacheable=True,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ExpressionGrammarResponse:
+    grammar: str
+
+
+def _admit_expression_grammar(value: object) -> ExpressionGrammarResponse:
+    if type(value) is ExpressionGrammarResponse:
+        grammar = value.grammar
+    elif isinstance(value, Mapping) and value.keys() == {"grammar"}:
+        grammar = value["grammar"]
+    else:
+        raise FrameworkBugError("Malformed expression grammar response")
+    if type(grammar) is not str:
+        raise FrameworkBugError("Malformed expression grammar response")
+    return ExpressionGrammarResponse(grammar)
+
+
+def _encode_expression_grammar(value: ExpressionGrammarResponse) -> JsonValue:
+    return {"grammar": value.grammar}
+
+
+EXPRESSION_GRAMMAR_RESPONSE_CONTRACT = SelectedResponseContract(_admit_expression_grammar, _encode_expression_grammar)
+
+
+def _handle_get_expression_grammar(
+    arguments: dict[str, Any],
+    state: CompositionState,
+    context: ToolContext,
+) -> ToolResult:
+    _validate_mutation_arguments(EmptyToolArgumentsModel, arguments, "get_expression_grammar arguments")
+    del context  # unused; signature uniformity with the other handlers.
+    # A closed one-key payload, not the bare reference string: ``ToolResult``
+    # admits only mapping / sequence / model payloads (elspeth-e405ad7cd2,
+    # D2), and a scalar was the one discovery shape that slipped past the
+    # scoped gate runs until the planner suite constructed this result.
+    return _discovery_result(state, {"grammar": get_expression_grammar()})
+
+
+_GET_EXPRESSION_GRAMMAR_DECLARATION = ToolDeclaration(
+    response_contract=EXPRESSION_GRAMMAR_RESPONSE_CONTRACT,
+    name="get_expression_grammar",
+    handler=_handle_get_expression_grammar,
+    kind=ToolKind.DISCOVERY,
+    description="Get the gate expression syntax reference. The result carries the full reference text under `grammar`.",
+    json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+    cacheable=True,
+)
+
+
+# One suggested fix per plugin-unavailability reason. Every
+# ``PluginUnavailableReason`` value is emitted as a tool ``error_code``
+# (``_plugin_policy_failure`` -> ``_failure_result(..., error_code=reason.value)``),
+# so the planner's redacted repair feedback can carry any of them — yet the whole
+# family resolved to NOTHING through ``explain_validation_code`` until now: the
+# model saw a bare token like ``credential_unavailable`` and had no way to learn
+# whether to pick a different plugin, wait for an operator, or stop trying. This
+# dict is TOTAL over the enum (a new reason KeyErrors here at import time rather
+# than silently degrading to an unexplained code), and the *explanation* half is
+# reused verbatim from ``_PLUGIN_UNAVAILABLE_EXPLANATIONS`` so the copy the model
+# reads cannot drift from the copy the tool failure already carries.
+_PLUGIN_UNAVAILABLE_FIXES: Final[dict[PluginUnavailableReason, str]] = {
+    PluginUnavailableReason.NOT_AUTHORIZED: (
+        "Pick a plugin from the live catalogue (list_sources / list_sinks / list_transforms return only usable ones) — "
+        "re-emitting the same plugin cannot enable it. If the user needs this one specifically, say plainly that an "
+        "operator must turn it on in this deployment's plugin policy."
+    ),
+    PluginUnavailableReason.NOT_INSTALLED: (
+        "Pick an installed plugin from list_sources / list_sinks / list_transforms; check the name for a typo first. "
+        "No change to the options can conjure a plugin this deployment does not have."
+    ),
+    PluginUnavailableReason.LOCAL_REQUIREMENT_MISSING: (
+        "Pick a different plugin from the live catalogue, or tell the user an operator must install the missing "
+        "requirement in this deployment — the pipeline itself cannot supply it."
+    ),
+    PluginUnavailableReason.CREDENTIAL_MISSING: (
+        "Pick a plugin whose credential this deployment already holds, or tell the user an operator must configure "
+        "this plugin's credential. Never invent a literal credential value or a secret_ref name to work around it."
+    ),
+    PluginUnavailableReason.PROFILE_UNAVAILABLE: (
+        "Pick a plugin the live catalogue offers, or tell the user an operator must configure an operator profile "
+        "for this one before it can be used."
+    ),
+    PluginUnavailableReason.WEB_SURFACE_PROHIBITED: (
+        "Use an operator-controlled connector, allowlisted ingestion job, or batch/CLI runtime instead. This refusal is "
+        "categorical: no option change, no credential, and no operator setting can make this plugin usable here, so do "
+        "not re-emit it."
+    ),
+}
+
+
+_LEGACY_PLUGIN_UNAVAILABLE_REASONS: Final = (
+    PluginUnavailableReason.NOT_AUTHORIZED,
+    PluginUnavailableReason.NOT_INSTALLED,
+    PluginUnavailableReason.LOCAL_REQUIREMENT_MISSING,
+    PluginUnavailableReason.CREDENTIAL_MISSING,
+    PluginUnavailableReason.PROFILE_UNAVAILABLE,
+    PluginUnavailableReason.WEB_SURFACE_PROHIBITED,
+)
+
+
+_VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
+    (
+        r"diff_baseline_unavailable|No baseline available",
+        "diff_pipeline has nothing to compare against: the session was created without a loaded baseline state.",
+        "Do not retry diff_pipeline in this session. Use get_pipeline_state to read the current state instead.",
+    ),
+    (
+        r"No source configured",
+        "The pipeline has no data source. Every pipeline needs exactly one source to read input data from.",
+        "Use set_source to configure a source plugin (e.g. csv, json, dataverse).",
+    ),
+    (
+        r"No sinks configured",
+        "The pipeline has no outputs. At least one sink is needed to write results.",
+        "Use set_output to add an output (e.g. csv, json).",
+    ),
+    (
+        r"references unknown node '(.+)' as from_node",
+        "An edge references a node that doesn't exist in the pipeline as its source.",
+        "Check the edge's from_node value. Either add the missing node with upsert_node or fix the edge with upsert_edge.",
+    ),
+    (
+        r"references unknown node '(.+)' as to_node",
+        "An edge references a node or output that doesn't exist in the pipeline as its target.",
+        "Check the edge's to_node value. Either add the missing node/output or fix the edge.",
+    ),
+    (
+        r"Duplicate node ID: '(.+)'",
+        "Two nodes have the same ID. Each node must have a unique identifier.",
+        "Rename one of the duplicate nodes using upsert_node with a different id.",
+    ),
+    (
+        r"Duplicate output name: '(.+)'",
+        "Two outputs have the same name. Each output must have a unique name.",
+        "Rename one of the duplicate outputs using set_output with a different sink_name.",
+    ),
+    (
+        r"Duplicate edge ID: '(.+)'",
+        "Two edges have the same ID. Each edge must have a unique identifier.",
+        "Remove the duplicate edge with remove_edge and re-add with a unique id.",
+    ),
+    (
+        r"Gate '(.+)' is missing required field '(.+)'",
+        "A gate node is missing a required configuration field (condition or routes).",
+        "Update the gate with upsert_node, providing the missing field.",
+    ),
+    (
+        r"Transform '(.+)' must not have '(.+)' field",
+        "A transform node has a field that only gates should have (condition or routes).",
+        "Update the node with upsert_node. Set node_type to 'gate' if routing is needed, or remove the field.",
+    ),
+    (
+        r"Coalesce '(.+)' is missing required field '(.+)'",
+        "A coalesce node is missing a required field (branches or policy).",
+        "Update the coalesce node with upsert_node, providing the missing field.",
+    ),
+    (
+        r"coalesce_config_invalid|Coalesce '(.+)' does not accept options",
+        "A coalesce is a built-in structural node; it has no runtime options contract, so authored options cannot be preserved.",
+        "Remove options from the coalesce and author only its input, branches, policy, merge, and optional timeout_seconds.",
+    ),
+    (
+        r"row_union_config_invalid",
+        "A row_union contains plugin, options, routing, aggregation, or coalesce-only configuration that the structural barrier forbids.",
+        "Keep only id, node_type='row_union', input, branches, on_success, and an optional finite positive timeout_seconds.",
+    ),
+    (
+        r"row_union_name_invalid",
+        "The row_union name does not satisfy the runtime identifier contract.",
+        "Choose a name of 1-38 characters that starts with a letter and contains only letters, digits, underscores, "
+        "and hyphens; do not use a reserved label or a name beginning with '__'.",
+    ),
+    (
+        r"row_union_branches_invalid",
+        "A row_union needs at least two declared fork branches.",
+        "Provide an ordered branches mapping with at least two unique branch names and input connections.",
+    ),
+    (
+        r"row_union_branch_invalid",
+        "A row_union branch name or connection is empty, duplicated, or otherwise invalid.",
+        "Give every branch a non-empty unique alias and a non-empty unique incoming connection.",
+    ),
+    (
+        r"row_union_input_mismatch",
+        "The row_union adapter input does not equal the first declared branch connection.",
+        "Set input to the first value in the ordered branches mapping.",
+    ),
+    (
+        r"row_union_on_success_invalid",
+        "A row_union must publish released rows through a non-empty on_success connection.",
+        "Set on_success to a downstream processing connection.",
+    ),
+    (
+        r"row_union_timeout_invalid",
+        "The row_union timeout is not a finite positive number.",
+        "Omit timeout_seconds or set it to a finite number greater than zero.",
+    ),
+    (
+        r"row_union_branch_alias_unreachable",
+        "A row_union branch alias does not match a fork branch declared upstream.",
+        "Use the upstream gate's fork_to branch names as the row_union branches keys.",
+    ),
+    (
+        r"row_union_branch_unreachable",
+        "A row_union branch connection is not produced by the corresponding fork branch.",
+        "Wire each branch transform's on_success to the matching row_union branches value.",
+    ),
+    (
+        r"row_union_branch_not_downstream",
+        "A row_union branch alias maps to a connection that is not downstream of that alias's own fork edge.",
+        "Wire each branches[alias] value through processing that starts at the matching gate fork branch.",
+    ),
+    (
+        r"row_union_branch_aggregation_invalid",
+        "A transform-mode aggregation inside a fork branch loses the per-row identity required to satisfy the row_union group.",
+        "Move the aggregation upstream of the fork that feeds the row_union, or downstream of its release — "
+        "aggregators are banned inside every bound region regardless of output_mode (spec §7 rule 6, ruling 25).",
+    ),
+    (
+        r"row_union_nested_fork_invalid",
+        "A nested fork inside a row_union branch replaces the enclosing branch identity, so the require-all group cannot complete.",
+        "Move the nested fork before the fork that feeds the row_union, or terminate the nested branch at a sink.",
+    ),
+    (
+        r"row_union_downstream_group_invalid",
+        "A row_union release reaches a downstream early-trigger aggregation or correlated barrier that can split, "
+        "drop, or duplicate members of the indivisible N-to-N group.",
+        "For an aggregation, omit trigger or use trigger: {} so only end_of_source flushes, or move it upstream of "
+        "the fork. For a downstream coalesce or row_union, move that barrier upstream of the fork or terminate the "
+        "released group at a sink.",
+    ),
+    (
+        r"row_union_schema_incompatible",
+        "Row_union branch schemas cannot feed one long-format stream: fixed schemas must share the same complete declared "
+        "shape; flexible schemas may add branch-only fields but not conflicting types on shared fields. "
+        "'row_union_schema' facts, when present, describe the first incompatible pair. 'branches' holds exactly two "
+        "records, distinct from the row_union's branches option; each record's 'branch' is the node's branch label. "
+        "'mode' ('fixed' or 'flexible') and complete 'fields' come from the schema resolved for that branch's connection "
+        "— declared, or computed from a transform's or aggregation's options, never from the row_union itself. Each "
+        "'fields' entry carries 'name', 'field_type' (str, int, float, bool or any), 'required' and 'nullable'. "
+        "'conflicting_fields' names the fields to fix: for fixed pairs, every field on only one branch plus every field "
+        "whose 'field_type', 'required' or 'nullable' differ; for flexible pairs, only shared fields with differing "
+        "'field_type' ('any' never conflicts).",
+        "Use the row_union_schema facts; the branches option only names inputs. Resolve each 'branch' to its connection "
+        "(list entry, or mapping value), then to its publisher: on_success, on_error, a routes value, a fork_to entry, "
+        "or, for an aggregation that omits on_success, its own node id. From a gate, walk upstream from its input to that "
+        "producer and edit its schema — declared, or a transform's/aggregation's output computed from options. Both "
+        "'mode' 'fixed': for 'conflicting_fields' names missing from one branch's 'fields', add or remove; for names in "
+        "both, make 'field_type', 'required' and 'nullable' identical. Either 'mode' 'flexible': change only 'field_type' "
+        "of those names to agree, or use 'any'; disjoint flexible-only fields stay. Only the first pair is reported — "
+        "repeat per branch. Only without 'row_union_schema' facts: call preview_pipeline where it is offered — its errors "
+        "on the saved state carry the same facts — else apply these rules to each producer's schema in your candidate.",
+    ),
+    (
+        r"fork_branch_multiple_barriers",
+        "One fork branch is declared by two barriers (coalesce and/or row_union). A fork branch delivers its arrival to "
+        "exactly one barrier, so the engine rejects the second claim at graph build time.",
+        "Keep the branch on a single barrier: delete it from the other barrier's branches, or give each barrier its own "
+        "fork branch name in the gate's fork_to and wire that branch to it.",
+    ),
+    (
+        r"fork_mixed_closure_invalid",
+        "A fork routes some branches to a barrier and others direct to sinks. A fork is either fully "
+        "bound (every branch reaches its one closer) or fully unbound (pure fan-out).",
+        "Route every fork branch to the same coalesce/row_union, or route every branch direct to sinks. "
+        "For a partial merge, use nested forks: an outer fan-out whose branch contains its own fork and closer.",
+    ),
+    (
+        r"fork_multiple_closers_invalid",
+        "One fork's branches close at two different barriers, so no single roster can settle the group.",
+        "Give each barrier its own fork: split into nested forks, each closing whole-roster at one barrier.",
+    ),
+    (
+        r"fork_roster_mismatch",
+        "The barrier's declared branches do not equal the fork's declared branch list — whole-roster closure requires exact equality.",
+        "Make the coalesce/row_union branches keys exactly the gate's fork_to list — same names, none added, none missing.",
+    ),
+    (
+        r"bound_region_sink_inside",
+        "A path inside a bound group (fork→coalesce/row_union, or scope opener→collector) reaches a sink "
+        "before the group's closer, so a member could leave the group without settling.",
+        "Route the in-region chain to the group's closer and move the sink after it; only the closer "
+        "releases tokens out of a bound region.",
+    ),
+    (
+        r"bound_region_undeclared_expand|Multi-row transform '(.+)' inside bound region",
+        "A row-expanding transform sits inside a bound group without being a declared scope, so the "
+        "group's roster cannot account for its children.",
+        "Add a scopes: entry: name the expanding transform as opener and bind a collector that closes "
+        "before the enclosing group's closer (coalesce/row_union/collector).",
+    ),
+    (
+        # Ordered before the unbound-fork entry: both headlines start
+        # "Fork gate '...' inside bound region", and patterns match in list
+        # order against raw text (specific-first).
+        r"bound_region_row_union_fork|Fork gate '(.+)' inside bound region '(.+)' closes at row_union",
+        "A fork inside a bound group closes at a row_union. A row_union passes the original branch "
+        "tokens through instead of merging them, so every member of the enclosing group would arrive "
+        "at the group's closer once per branch — violating the one-token-per-member guarantee "
+        "(spec §7 rule 5).",
+        "Close the in-group fork at a coalesce (which merges to one token per member), or move the "
+        "fork and its row_union outside the group.",
+    ),
+    (
+        r"bound_region_unbound_fork|Fork gate '(.+)' inside bound region '(.+)' is unbound",
+        "A fork sits inside a bound group (a scope, or a fork→coalesce/row_union region) without a coalesce or "
+        "row_union of its own, so its branches multiply the group's members with no roster accounting for them "
+        "(spec §7 rule 5).",
+        "Close the fork at a coalesce inside the group before the group's closer (a row_union cannot close "
+        "an in-group fork — it passes branch tokens through instead of merging them), or move the fork outside the group.",
+    ),
+    (
+        r"bound_region_aggregation_invalid",
+        "An aggregation sits inside a bound group (fork→coalesce, fork→row_union, or scope). A batch flush "
+        "consumes members the group's roster must account for, so losses inside the batch would be invisible.",
+        "Move the aggregation before the group's opener or after its closer; batch work inside a bound "
+        "region belongs to a scoped multi-row transform closed by a collector.",
+    ),
+    (
+        r"on_error_closer_out_of_region|names closer .* but .* is not inside that closer's bound region",
+        "on_error names a barrier closer, but the failing node is not inside that closer's bound region, "
+        "so the closer has no membership to settle for it.",
+        "From inside a bound region, on_error may name the region's own closer; elsewhere use a sink name or 'discard'.",
+    ),
+    # ── Collector node kind (barrier-scopes spec §3, Task 12) ──────────────
+    (
+        r"collector_missing_scope|has no complete scope binding|no scopes: entry",
+        "A collector is an EXPAND-group closer and requires a complete scope binding (spec §7 rule 1); "
+        "without one it has no group to close.",
+        "Set scope_name (the scope identifier), scope_opener (the multi-row transform that opens the "
+        "group), and scope_policy ('require_all' or 'best_effort') on the collector node.",
+    ),
+    (
+        r"collector_scope_policy_invalid|scope_policy .* is not a valid policy",
+        "The collector's scope_policy is outside the closed group-arrival vocabulary.",
+        "Set scope_policy to 'require_all' (a lost member fails the group) or 'best_effort' (the group "
+        "settles with what arrived). There is no default — the author decides.",
+    ),
+    (
+        r"scope_opener_unknown|scope_opener '(.+)' does not name a transform",
+        "The collector's scope_opener does not name a transform node in the pipeline, so no expansion "
+        "opens the group this collector would close.",
+        "Set scope_opener to the multi-row transform (creates_tokens=True) whose expanded rows this "
+        "collector reassembles, and declare that transform in the pipeline.",
+    ),
+    (
+        r"scope_opener_not_multi_row|opener '(.+)' is not a multi-row transform",
+        "The collector's scope_opener names a transform that does not expand rows (creates_tokens=False), "
+        "so nothing opens the group this collector would close and no row can reach it.",
+        "Set scope_opener to an expanding transform (for example json_explode or line_explode) — the one "
+        "whose expanded rows this collector reassembles — or remove the collector if no expansion exists.",
+    ),
+    (
+        r"collector_has_trigger_invalid|Collector '(.+)' does not accept 'trigger'",
+        "A collector flushes on end_of_group only; count/timeout/condition triggers are inexpressible "
+        "on a closer (a timeout would silently short the group).",
+        "Remove the trigger field from the collector node. For early-trigger batching use an "
+        "aggregation node outside any bound region instead.",
+    ),
+    (
+        r"collector_has_on_error_invalid|Collector '(.+)' does not accept 'on_error'",
+        "A collector failure is a whole-group verdict settled through the scope's group policy and nesting; "
+        "there is no per-row collector error route.",
+        "Remove on_error from the collector. Use scope_policy to choose require_all or best_effort group "
+        "arrival semantics; nesting determines whether a failed group escalates outward or terminates.",
+    ),
+    (
+        r"collector_missing_plugin|Collector '(.+)' is missing required field 'plugin'",
+        "A collector node needs a batch-transform plugin to reassemble its group.",
+        "Set plugin on the collector node to a batch-aware transform (the same plugin contract aggregations use).",
+    ),
+    (
+        r"collector_plugin_not_batch_aware|is_batch_aware=False",
+        "The collector's plugin is a row-level transform; collectors reuse the batch-transform plugin "
+        "contract and flush the whole group as one batch.",
+        "Set plugin to a batch-aware transform, or use a transform node if per-row processing was intended.",
+    ),
+    (
+        r"collector_config_invalid|Collector '(.+)' does not accept field",
+        "The collector node carries fields outside its shape (gate, coalesce, or aggregation fields).",
+        "Re-emit the collector with only plugin/input/on_success/options plus its scope "
+        "binding fields (scope_name/scope_opener/scope_policy).",
+    ),
+    (
+        r"collector_on_success_dangling|Collector '(.+)' on_success '(.+)' is neither a sink",
+        "The collector's flush destination resolves to neither a declared sink nor a connection any downstream node consumes.",
+        "Set the collector's on_success to a declared sink name, or add a downstream node whose input equals it.",
+    ),
+    (
+        r"scope_name_duplicate|Scope name '(.+)' is declared twice",
+        "Two collectors declare the same scope_name, so the scope identifier is ambiguous.",
+        "Give each collector its own unique scope_name.",
+    ),
+    (
+        r"scope_opener_duplicate|Transform '(.+)' opens two scopes",
+        "Two collectors bind the same opener transform — one scope per opener.",
+        "Point each collector's scope_opener at its own multi-row transform, or remove the duplicate collector.",
+    ),
+    (
+        r"scope_name_invalid|Scope name '(.+)' (?:is reserved|contains invalid characters)|Scope name exceeds max length",
+        "The collector's scope_name violates the runtime name rules (length, character class, or a reserved label).",
+        "Set scope_name to a name that starts with a letter and uses only letters, digits, underscores, "
+        "and hyphens, avoiding reserved labels.",
+    ),
+    (
+        r"node_scope_fields_unsupported|does not accept collector scope field",
+        "A non-collector node carries scope_name/scope_opener/scope_policy, which bind an EXPAND group only on collector nodes.",
+        "Remove the scope_* fields from this node, or re-emit it as node_type='collector' if it is the group's closer.",
+    ),
+    (
+        r"gate_duplicate_fork_branch",
+        "A gate declares the same fork branch name more than once, so the declared branch set is ambiguous.",
+        "Remove duplicate entries from the gate's fork_to list while preserving the intended unique branch order.",
+    ),
+    (
+        r"row_union_on_success_must_be_connection",
+        "A row_union release target names a sink, but the barrier may only release into downstream processing.",
+        "Set row_union.on_success to a connection consumed by a downstream node, then route that node to the sink.",
+    ),
+    (
+        r"row_union_on_success_dangling",
+        "No downstream node consumes the row_union release connection.",
+        "Add a downstream processing node whose input equals row_union.on_success.",
+    ),
+    (
+        r"aggregation_missing_plugin|Aggregation '(.+)' is missing required field 'plugin'",
+        "An aggregation node needs a plugin to define its aggregation behaviour.",
+        "Update the aggregation with upsert_node, specifying the plugin name.",
+    ),
+    (
+        r"coalesce_branch_unreachable|branches .* are not reachable",
+        "A coalesce branches mapping names an incoming connection that no runtime routing field produces. The usual cause is "
+        "the WIRING AROUND the coalesce, not the coalesce itself: a branch transform's on_success routes past the coalesce "
+        "(e.g. straight to a sink), so nothing arrives under the connection name the branches value claims. The rejection's "
+        "'connectivity' facts, when present, carry 'unreachable_branches' — one record per broken branch, each naming the "
+        "branch ('branch'), the connection it consumes that nothing produces ('consumed_connection'), and — only for a "
+        "MAPPED branch, whose key differs from its value — when that branch's transform chain ends by publishing to a sink, "
+        "the node that did it ('sink_lure', carrying 'node_id' and 'publishes_to_sink'). An identity branch (a list-form "
+        "entry, or a key equal to its value) never carries 'sink_lure', so its absence there says nothing about the wiring; "
+        "such a branch is unreachable only when its name is not a gate fork_to name, and 'coalesce_branch_alias_unreachable' "
+        "fires alongside. Also carried: 'produced_connections', the connections the reachability check accepts, with sink "
+        "names, the coalesce's own id and the fork keyword removed because they pass that check but are never a correct "
+        "branch value. Membership in 'produced_connections' does NOT make a value correct for a given branch: the right "
+        "value is whatever THAT branch's own transform publishes.",
+        "Wire each fork branch end-to-end: the gate fork_to name is the branch transform's input; that transform's on_success "
+        "must be a unique connection name (NOT a sink); the coalesce branches VALUE for that branch is exactly that connection. "
+        "A branch with no transforms uses its fork branch name as the value. If a branches value names a connection nothing "
+        "produces, repair that branch's transform — point its on_success at the branches value — rather than merely swapping "
+        "the branches value for one of the produced_connections. Where a branch record carries 'sink_lure', that node_id IS "
+        "the transform to repair: set its on_success to that record's 'consumed_connection' instead of the sink it currently "
+        "publishes to.",
+    ),
+    (
+        r"coalesce_branch_alias_unreachable",
+        "A coalesce branches KEY — the branch alias; for list-form branches, the entry itself — is not a fork_to name on any "
+        "gate. Arrival at a coalesce is tracked by fork branch name, so a key no gate forks can never be satisfied whatever "
+        "its value names. No 'connectivity' facts accompany this code: compare every coalesce branches key against "
+        "every gate's fork_to names yourself.",
+        "Use the upstream gate's fork_to branch names, spelled exactly, as the coalesce branches keys (or list entries); do "
+        "not invent an alias. Add a name to the gate's fork_to only when that fork genuinely lacks the branch. When "
+        "'coalesce_branch_unreachable' fires for the same branch, fix the alias first — its record carries no 'sink_lure' "
+        "for an identity branch.",
+    ),
+    (
+        r"node_input_not_reachable|input '(.+)' is not reachable",
+        "A node's input connection point is not produced by the runtime routing fields.",
+        "Set source.on_success or an upstream node's on_success/on_error/route/fork_to so it matches this node's input.",
+    ),
+    (
+        r"Unknown .+ plugin '(.+)'",
+        "The specified plugin name is not available in the catalog.",
+        "Use list_sources, list_transforms, or list_sinks to see available plugins.",
+    ),
+    (
+        r"Path violation \(S2\).*[Ss]ource",
+        "The source file path is outside the allowed directories.",
+        "Source paths must be under the blobs/ directory. Upload a file first or use set_source_from_blob.",
+    ),
+    (
+        r"Path violation \(S2\).*[Ss]ink",
+        "The sink output path is outside the allowed directories.",
+        "Sink output paths must be under the outputs/ or blobs/ directory.",
+    ),
+    (
+        r"Path violation \(S2\)",
+        "A file path is outside the allowed directories.",
+        "Source paths must be under the blobs/ directory. Sink output paths must be under the outputs/ or blobs/ directory.",
+    ),
+    (
+        r"Invalid options for source '(.+)':",
+        "The source plugin configuration is invalid. A required option may be missing or have an invalid value.",
+        "Use get_pipeline_state with component='source' to see current options, then use patch_source_options to fix.",
+    ),
+    (
+        r"Invalid options for transform '(.+)':",
+        "A transform node has invalid configuration. A required option may be missing or have an invalid value.",
+        "Use get_pipeline_state to see the node's current options, then use patch_node_options to fix.",
+    ),
+    (
+        r"Invalid options for sink '(.+)':",
+        "A sink output has invalid configuration. A required option may be missing (e.g. path for file-based sinks).",
+        "Use get_pipeline_state to see the output's current options, then use patch_output_options to fix.",
+    ),
+    # Contract-family entries are ORDER-SENSITIVE: the extras (locked-input)
+    # messages and the sink-edge messages both start with "Schema contract
+    # violation:", so the more specific patterns must precede the generic one.
+    (
+        r"sink_locked_extras|Extra fields rejected by sink input contract",
+        "The sink schema is locked (mode: fixed) and the upstream producer emits extra fields the sink does not accept. "
+        "The rejection's 'contract' facts, when present, name that edge in YOUR rejected candidate: 'producer' ('source', "
+        "'source:<name>', or a node id) is the emitting end, 'consumer' is the sink written as 'output:<sink name>' (the "
+        "sink's own name is the part after 'output:'), and 'extra_fields' are the field names the producer emits that the "
+        "sink schema does not declare.",
+        "Change ONLY that edge: relax the sink schema (mode: flexible), add every name in 'extra_fields' to the sink "
+        "schema fields, or insert a field_mapper with select_only: true before the sink to drop them.",
+    ),
+    (
+        r"locked_input_extras|Extra fields rejected by consumer input contract",
+        "The consumer node's input schema is locked (mode: fixed) and the upstream producer emits fields it does not "
+        "declare. The rejection's 'contract' facts, when present, name the edge in YOUR rejected candidate: 'consumer' is "
+        "the locked node's id; 'producer' is 'source', 'source:<name>' (a named source) or a node id; 'extra_fields' are "
+        "the field names the producer emits that the consumer schema does not declare.",
+        "Change ONLY that edge: relax the consumer schema (mode: flexible), add every name in 'extra_fields' to the "
+        "consumer schema's fields, or insert a field_mapper with select_only: true upstream to drop them — except when "
+        "'consumer' is itself a field_mapper, where a second field_mapper is redundant: adjust upstream config instead so "
+        "the extras are not emitted — patch_source_options when 'producer' is a source (source_name is the part after "
+        "'source:'; bare 'source' is the default), patch_node_options when it is a node id; a row_union producer emits "
+        "what its arms emit, so change the emitting arm, not the row_union. Only without contract facts: set schema.mode: "
+        "flexible on the rejected component with patch_node_options.",
+    ),
+    # Rule C precedes Rule D: both headlines start "Transform ", and this pass
+    # matches in list order (see the order-sensitivity note above). The two rules
+    # carry distinct codes since elspeth-920bd88299 — one code served both, so
+    # whichever text was written last was wrong for the other rule.
+    #
+    # Both entries import their prose from ``composer.state``, which is where the
+    # rendered messages are built. That import is the ONLY thing keeping the
+    # planner's two paths in agreement: the repair turn sees this catalogue and
+    # never the message, while a tool call sees the message and never this
+    # catalogue, so a second copy here drifts silently and did.
+    (
+        r"transform_declared_output_not_guaranteed|Transform output guarantee violation:",
+        _TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION,
+        _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX,
+    ),
+    (
+        r"transform_contract_violation|Transform contract violation:",
+        _TRANSFORM_OUTPUT_COLLISION_EXPLANATION,
+        _TRANSFORM_OUTPUT_COLLISION_FIX,
+    ),
+    (
+        r"semantic_contract_violation|Semantic contract violation:|Semantic contract:",
+        "A consumer requires a field to satisfy a semantic contract (content kind, framing, or value type) that its upstream "
+        "producer does not declare or actively conflicts with. The rejection's 'contract' facts, when present, name that "
+        "edge: 'producer' ('source', 'source:<name>', or a node id) and 'consumer' (the requiring node's id).",
+        "Call get_plugin_assistance for the consumer plugin to see which producers satisfy its semantic requirements, then "
+        "change ONLY that edge: swap the producer, or route through a transform that produces the required content kind.",
+    ),
+    (
+        r"contract_config_invalid|Invalid contract config:",
+        "A schema or contract declaration failed to parse — malformed fields spec, required_fields/required_input_fields with "
+        "the wrong shape (must be a list of strings), or an invalid mode.",
+        "Re-emit ONLY the offending component's schema options. Field specs are single-key dicts like {'field_name': 'str'} or "
+        "strings like 'field_name: str'; required_input_fields is a list of field-name strings; mode is one of observed, "
+        "flexible, fixed.",
+    ),
+    (
+        r"coalesce_schema_mode_mixed|mixed observed/explicit schemas",
+        "A union coalesce has both observed and explicit branch schemas. Runtime cannot safely merge those modes because an "
+        "observed branch may omit fields promised by an explicit branch.",
+        "Keep the intended union row shape and make branch schemas homogeneous. Declare compatible fields on every branch's last node (mode: flexible). All-observed does not resolve an independent shared-field type conflict.",
+    ),
+    (
+        r"coalesce_union_type_incompatible|[Ii]ncompatible types for field",
+        "A union coalesce merges its branches into one row, so a field carried by more than one branch must have the same "
+        "type on each; here two branches carry the same field with different types. 'any' is a distinct type, NOT a "
+        "wildcard: 'any' against 'int' conflicts. A branch can also carry a field it never declared: a transform "
+        "contributes its own output fields to a branch's schema — a value_transform target uses its authored type or the type its expression proves over declared inputs, and 'any' only when unresolved. "
+        "A field_mapper adds a target as 'any' only when neither the target nor, for a rename, the "
+        "renamed source is declared (a rename inherits the source's type when the source is declared). So the named field "
+        "may appear in neither branch's authored schema. The rejection's 'coalesce_union_type' facts name the conflict, "
+        "when present: 'field' is the shared field name; 'branch_a' and 'branch_b' are the two branch names as declared "
+        "on branches, and 'type_a'/'type_b' are the type (str, int, float, bool, or any) each branch's producer carries "
+        "for it.",
+        "Read the field and branch names off the rejection's facts, not your schemas. Resolve each branch name to its "
+        "connection (its branches entry), then to the producer publishing it: on_success, on_error, a routes value, a "
+        "fork_to entry, or, for an aggregation with no on_success, its own node id; if that producer is a gate (it has no "
+        "schema), repeat from its input. That producer's schema, never the coalesce's branches, is where type_a/type_b "
+        "come from; when that schema is observed, the type is still fixed before any row: the one the producer stamps on "
+        "a value it computes (derived from declared inputs where provable, otherwise 'any') or, for a field it passes through or renames, the declaration it "
+        "carries from upstream (often the source's) — the rejection message names each declaring node. Declare the "
+        "merged type on EVERY branch's producer (mode: flexible); the declaration wins over the type a transform would "
+        "otherwise contribute. Authored types must admit actual results; a provably incompatible value_transform target is refused at build, and residual value-dependent mismatches route at runtime. "
+        "Three producers need another move: a type_coerce conversion's type is its 'to', so retype 'to'; a "
+        "value_transform that rewrites a field arriving with another type reads that declaration as its input "
+        "contract too, so write the result under a new name instead; for a field_mapper rename you may instead declare "
+        "its SOURCE field upstream. If the branches genuinely carry different kinds of value, rename one, or convert "
+        "the diverging branch's type before the coalesce. Only without "
+        "'coalesce_union_type' facts: call preview_pipeline where it is offered — its errors carry the same facts against "
+        "the current saved state.",
+    ),
+    (
+        r"sink_contract_violation|Schema contract violation: '.*' -> 'output:[^']+'",
+        "A sink schema requires fields that its upstream producer does not guarantee. The rejection's 'contract' facts, "
+        "when present, name that edge: 'producer' ('source', 'source:<name>', or a node id) is the guaranteeing end, "
+        "'consumer' is the sink written as 'output:<sink name>', and 'missing_fields' are the field names the sink "
+        "requires that the producer does not guarantee — required by the sink's schema block or by a sink option that "
+        "names the field it writes from (e.g. a text or document sink's 'field').",
+        "Fix 'consumer' (sink_name = after 'output:') via patch_output_options, resending the full 'schema': remove each "
+        "'missing_fields' name from required_fields and, if declared in fields, append '?' to its type; or make "
+        "'producer' guarantee it via patch_source_options ('source'/'source:<name>'; source_name is the part after "
+        "'source:') or, for a transform, aggregation or collector id, patch_node_options. A queue, row_union or "
+        "non-require_all union coalesce guarantees the INTERSECTION of its arms — find them in your own candidate (the "
+        "nodes whose routing publishes into it, or its branches' producers) and patch every one. A nested coalesce "
+        "guarantees its branch NAMES only under require_all — repoint there; else it guarantees nothing: use union merge "
+        "or require_all. Call preview_pipeline until the violation is gone: that edge_contracts row stops being a "
+        "violation once EVERY 'missing_fields' name is gone from what the sink REQUIRES — it then reads satisfied "
+        "true, or disappears entirely where the sink is left requiring nothing. Emptying required_fields is not the "
+        "whole repair: a name the sink still requires through its 'fields', or through a writing option such as a "
+        "text or document sink's 'field', keeps the violation standing. For uploaded or path-bound sources, you "
+        "must not author schema.guaranteed_fields from sample headers: patch_source_options with schema.mode "
+        "'flexible' and non-optional 'fields' to enforce the required columns per row ('fixed' only for a required "
+        "closed schema), or retain observed mode and request_interpretation_review(kind='source_data_contract', "
+        "affected_node_id='source' or 'source:<name>', user_term='source_data_contract'), omitting llm_draft, and "
+        "let the user acknowledge the server-computed field promise. This review requires the intended source "
+        "and demanding consumers to be saved already; it cannot review a rejected candidate or a scaffold "
+        "without those consumers. For a rejected full replacement, prefer an explicit runtime contract. "
+        "Composer-authored source content receives "
+        "its complete verified guarantee through source binding. Only "
+        "without 'contract' facts: get_pipeline_state on the sink, then reconcile its required fields upstream.",
+    ),
+    (
+        r"schema_contract_violation|Schema contract violation:",
+        "A downstream node requires fields that its upstream producer does not guarantee. An observed-mode source "
+        "guarantees only its declared guaranteed_fields (text and llm sources add their own output fields); a plugin-free "
+        "gate only passes through what its upstream guarantees. The rejection's 'contract' facts, when present, name the "
+        "edge in YOUR rejected candidate: 'producer' ('source', 'source:<name>', or a node id — transform, aggregation, "
+        "collector, queue, row_union, or coalesce), 'consumer' (the requiring node's id), and 'missing_fields' — the "
+        "names the consumer requires (explicitly, via a fixed/flexible schema's non-optional fields, or via an option "
+        "naming an input column) that the producer does not guarantee. A queue or row_union guarantees only the "
+        "INTERSECTION of its arms; a union coalesce the intersection of its participating branches, or their UNION under "
+        "policy require_all. A nested coalesce guarantees only its branch NAMES, only under require_all, never their "
+        "inner fields.",
+        "Make 'producer' guarantee every 'missing_fields' name (patch_source_options for a source — source_name is the "
+        "part after 'source:', bare 'source' is the default; patch_node_options for a transform, aggregation or "
+        "collector). A queue, row_union, or non-require_all union coalesce is named only by its id: find its arms in your "
+        "candidate and add the field to EVERY arm (one for a require_all union). Nested coalesce with policy require_all: "
+        "repoint the requirement at a branch name; otherwise it guarantees nothing: switch it to merge: union, or set "
+        "policy: require_all AND repoint at a branch name. Where preview_pipeline is offered, re-preview until the error "
+        "is gone. For uploaded or path-bound sources, you must not author schema.guaranteed_fields from sample "
+        "headers. Use patch_source_options with schema.mode 'flexible' and non-optional 'fields' for a runtime "
+        "contract ('fixed' only for a required closed schema), or retain observed mode and "
+        "request_interpretation_review(kind='source_data_contract', affected_node_id='source' or 'source:<name>', "
+        "user_term='source_data_contract'), omitting llm_draft, and let the user acknowledge the server-computed "
+        "promise. This review requires the intended source and demanding consumers to be saved already; "
+        "it cannot review a rejected candidate or a scaffold without those consumers. For a rejected full "
+        "replacement, prefer an explicit runtime contract. Composer-authored source content receives its "
+        "verified guarantee through source binding. "
+        "Only without 'contract' facts: take 'from', 'to' and "
+        "'missing_fields' from preview_pipeline's unsatisfied edge_contracts row or errors.",
+    ),
+    # ── Closed structural node-shape codes ──────────────────────────────────
+    # The planner repair feedback strips validation messages; these codes are
+    # the only signal it carries, so each must be explainable here.
+    (
+        r"unknown[ _]node_type",
+        "The node_type is not one of the composer's node kinds: aggregation, coalesce, gate, queue, row_union, transform. There is no 'fork' node_type.",
+        "Keep your current pipeline shape and change ONLY the invalid node: forking is expressed with a GATE node — "
+        "node_type='gate', condition='True', routes={'true': 'fork', 'false': 'fork'}, "
+        "fork_to=['branch_a', 'branch_b']; each branch node reads one branch name as its input. "
+        "Use COALESCE (branches + policy + merge) for N-to-one field merging: a downstream node consumes the coalesce id. "
+        "Use row_union for require_all N-to-N reconvergence that releases every original branch row: branches maps fork aliases "
+        "to arriving connections, input repeats the first branch value, and on_success names downstream processing.",
+    ),
+    (
+        r"coalesce_on_success_must_be_sink|coalesce_on_success_unknown_sink|Coalesce on_success must point to a sink|Coalesce '(.+)' on_success references unknown sink",
+        "A coalesce node's on_success may only name an existing sink; merged rows otherwise flow to whichever node reads the coalesce id as its input. "
+        "For coalesce_on_success_unknown_sink the rejection's 'connectivity' facts, when present, carry the offending value ('dangling_on_success') and the candidate's sink names ('declared_sinks').",
+        "Either set the coalesce on_success to a sink name from outputs[] (the connectivity facts' declared_sinks) exactly, or leave on_success null and give the downstream node input='<coalesce node id>'.",
+    ),
+    (
+        r"coalesce_missing_branches|Coalesce '(.+)' is missing required field 'branches'",
+        "A coalesce node must name the branch connections it rejoins.",
+        "Set branches to a mapping of fork branch name -> the connection ARRIVING at the coalesce: the branch's last transform "
+        "on_success (e.g. branches={'branch_a': 'a_done', 'branch_b': 'b_done'}), or the fork branch name itself only when that "
+        "branch has no transforms. Add policy='require_all' and merge='union'.",
+    ),
+    (
+        r"transform_missing_on_success|Transform '(.+)' is missing required field 'on_success'",
+        "Every transform must route its successful rows somewhere.",
+        "Set the transform's on_success to the next connection or sink name; preserve its separately chosen on_error policy. "
+        "A transform on a fork branch that rejoins at a coalesce must publish the connection named by that "
+        "coalesce's branches value for its branch — not a sink.",
+    ),
+    (
+        r"transform_missing_on_error|Transform '(.+)' is missing required field 'on_error'",
+        "Every transform must declare where failed rows go.",
+        "Set the transform's on_error explicitly. 'discard' costs the failed row's CONTENT, not the record of it — the "
+        "audit trail keeps the drop's terminal outcome, but nothing reaches a sink to inspect later. Route to a declared "
+        "quarantine sink name instead when failed rows must stay inspectable.",
+    ),
+    (
+        r"gate_missing_condition|Gate '(.+)' is missing required field 'condition'",
+        "A gate node needs a boolean row expression to route on.",
+        "Set condition to a row expression (call get_expression_grammar for syntax); a pure fan-out gate uses condition='True'.",
+    ),
+    (
+        r"gate_missing_routes|Gate '(.+)' is missing required field 'routes'",
+        "A gate node needs a routes mapping for its condition outcomes.",
+        "Set routes={'true': <connection-or-'fork'>, 'false': <connection-or-'fork'>}; use 'fork' with fork_to=[...] to fan a row out to several branches.",
+    ),
+    (
+        r"fork_branch_no_destination|fork branch '(.+)' with no destination",
+        "Every gate fork_to branch name must match one downstream transform/gate input, an exact sink name, or a KEY in a "
+        "coalesce/row_union branches mapping. Pure fan-out to independent outputs does not require coalesce.",
+        "For independent branches, set each downstream transform/gate input to its gate fork_to name exactly, or use an "
+        "exact sink name. Rename a branch and its consumer input together if needed. Use a barrier only when reconvergence "
+        "is intended: key coalesce/row_union branches by the gate's fork branch names, with each value naming the connection "
+        "arriving after that branch's transforms (their on_success), or the fork name when there are no transforms. Choose "
+        "coalesce to merge branch fields into one row, or row_union to release every original branch row; row_union input "
+        "repeats the first branches value and on_success names downstream processing.",
+    ),
+    (
+        r"coalesce_policy_invalid|coalesce_merge_invalid|coalesce_policy_quorum_unsupported|coalesce_merge_select_unsupported|coalesce_best_effort_requires_timeout",
+        "Coalesce policy and merge use the engine's closed vocabularies, narrowed to what the composer can make runnable.",
+        "Set policy to one of: require_all, best_effort (requires timeout_seconds), first — and merge to one of: union, nested. The engine's quorum (needs quorum_count) and select (needs select_branch) cannot be authored here. For an A/B rejoin that combines branch fields into one row: policy='require_all', merge='union'.",
+    ),
+    (
+        r"pipeline_decision_unregistered",
+        "A pipeline_decision interpretation review may only use one of the registered decision kinds — novel decision terms can never be reviewed or resolved.",
+        "Remove the pipeline_decision entry from the node's interpretation_requirements (record the rationale in metadata.description instead), or use an llm_prompt_template review for prompt-shaped decisions. Registered kinds: drop_raw_html_fields, web_scrape_http_identity, prompt_injection_shield_recommendation.",
+    ),
+    (
+        r"interpretation_requirements_invalid",
+        "A node's interpretation_requirements entry is malformed. interpretation_requirements is a list of review entry objects, each carrying string fields kind, user_term, and draft; the server-owned id and status fields are filled automatically.",
+        'Simplest fix: omit interpretation_requirements entirely — the required LLM reviews (prompt template, model choice) are auto-staged by the server, and the prompt-injection-shield recommendation is advisory. If you must stage a review, re-emit each entry as an object {kind, user_term, draft} with non-empty string values and optional display_title (a human-readable name of 1-200 characters) — e.g. {"kind": "pipeline_decision", "user_term": "prompt_injection_shield_recommendation", "draft": "<recommendation text>"} — and never author id, status, or resolved review metadata.',
+    ),
+    (
+        r"plugin_options_invalid",
+        "One of the component's options failed its plugin schema. This code alone does not identify WHICH option: the rejection's 'detail' field carries the validator's own message naming the exact option and requirement — read it before hypothesising a cause.",
+        "Preserve the user's explicit names, values, types and interface requirements when applying the validator's repair. "
+        "A schema-valid spelling does not authorize changing those requirements. If the plugin cannot express them, report "
+        "the concrete capability gap and supported alternatives instead of silently changing the request. Use 'detail' "
+        "to identify the offending options. Only if detail is absent: call get_plugin_schema(<plugin_type>, <plugin_name>) "
+        "for exact option shapes and allowed values, fix only the offending options, and re-emit. Common traps: an llm node "
+        "must declare the row fields its template reads; [] is for intentional whole-row or computed-key reads and a "
+        "field-scoped shield cannot credit it. Observed source schemas report lexical types; created fields use output "
+        "declarations or derived types. Declarations use carried field names; template filters and tests must exist; "
+        "the llm profile must be one of the enum aliases from get_plugin_schema.",
+    ),
+    (
+        r"transform_on_success_dangling|aggregation_on_success_dangling|source_on_success_dangling|is neither a sink nor a known connection",
+        "An on_success destination must be an existing sink name or a connection another node reads as its input. "
+        "The rejection's 'connectivity' facts, when present, name the exact mismatch in YOUR rejected candidate: "
+        "'dangling_on_success' is the value that matched nothing; 'declared_sinks' and 'consumable_connections' are the only valid destinations.",
+        "Re-emit with on_success set to one of the connectivity facts' declared_sinks or consumable_connections, copied exactly — "
+        "for a straight source-to-sink pipeline the source's on_success must equal the outputs[].sink_name byte-for-byte. "
+        "Change nothing else. Only without connectivity facts: call get_pipeline_state to list the CURRENT saved state's sink names "
+        "and node input connections (note it shows the saved state, not a rejected candidate).",
+    ),
+    (
+        r"gate_on_error_unknown_sink",
+        "A gate's node-level on_error policy may name 'discard', an existing sink, or an eligible enclosing "
+        "bound-region closer. Arbitrary processing destinations are forbidden. The rejection's "
+        "'connectivity' facts carry the offending value as 'dangling_on_error' and the candidate's sink names as "
+        "'declared_sinks'.",
+        "Use upsert_node to set the gate's on_error='discard', or copy one of the connectivity facts' declared_sinks "
+        "exactly. If the intended destination is an eligible enclosing closer, correct that binding instead. "
+        "Preserve the user's retention choices and required-control coverage. Gate evaluation-error routing "
+        "is configured on the gate node; do not add an on_error edge.",
+    ),
+    (
+        r"transform_on_error_unknown_sink|references unknown sink",
+        "An on_error destination ordinarily names 'discard' or an existing sink. A transform or gate inside a valid "
+        "bound region may instead name its enclosing closer; aggregations cannot. Required-control coverage still applies. "
+        "The rejection's 'connectivity' facts, when present, "
+        "carry the offending value as 'dangling_on_error' and the candidate's sink names as 'declared_sinks'.",
+        "Set on_error='discard', or point it at one of the connectivity facts' declared_sinks (outputs[].sink_name) exactly. "
+        "For a transform or gate whose intended destination is an eligible enclosing closer, correct that binding instead. "
+        "Preserve the user's retention choices and required-control coverage.",
+    ),
+    (
+        r"gate_route_labels_mismatch|route labels don't match",
+        'A boolean gate condition routes on exactly the labels "true" and "false" — both must be present even when they share a destination.',
+        'Use routes={"true": <destination>, "false": <destination>}. For a pure fan-out gate: condition=\'True\', routes={"true": "fork", "false": "fork"}, fork_to=[<branch connections>]. Only string-returning conditions may use custom route labels.',
+    ),
+    (
+        r"gate_condition_ignores_stated_threshold",
+        "Historical planner heuristic: request prose appeared to state a routing comparison while every authored gate "
+        "had a constant condition. That one-nudge check is retired; this stored code does not establish the request's "
+        "meaning or prove that the graph is wrong.",
+        "Compare the actual request with the authored condition and route destinations. If conditional routing was "
+        "intended, ask the planner to author that rule; if fan-out was intended, retain it. A constant fan-out sends "
+        "every row to every branch. This historical diagnostic no longer triggers an automatic second authoring attempt.",
+    ),
+    (
+        r"review_reconciliation_failed|Authoritative interpretation-review reconciliation failed",
+        "The submitted interpretation-review payload could not be reconciled. This can be an unknown reference "
+        "or duplicate review identity in a NEW candidate, or incoherent evidence for an existing resolved review; "
+        "the code alone does not establish prior approval. Read the rejection message or structured review_reference facts for the specific invariant. "
+        "An unknown prompt reference must match a requirement ID in that same candidate, not a review in the saved graph.",
+        "For an unknown reference, repair the rejected candidate using the exact valid requirement IDs named in the "
+        "message or review_reference.valid_requirement_ids. If that list is empty, add the intended authorable requirement shell first. "
+        "Node requirement IDs are user_term.strip() + ':' + node_id: preserve internal spaces, case and punctuation. "
+        "Keep the intended new node and its requirement shells, then re-emit the corrected candidate. "
+        "Only if the message identifies existing resolved-review evidence, call get_pipeline_state with "
+        'component="set_pipeline_arguments" and preserve that authoritative material while applying the intended change. '
+        "Never author server-owned fields inside interpretation_requirements (id, status, event_id, accepted_value, "
+        "resolved_prompt_template_hash); each shell carries only {kind, user_term, draft} plus optional display_title.",
+    ),
+    (
+        r"vague_term_unwired|Pending vague_term review is not wired for resolution",
+        "The pipeline stages a pending vague_term interpretation requirement that nothing can resolve: no "
+        "prompt_template_parts interpretation_ref references the requirement's id. A legacy "
+        "{{interpretation:...}} placeholder does NOT count once a requirement row is staged — the staged row "
+        "disables the legacy fallback, so the mixed form is unresolvable by construction. Committed, it would "
+        "produce a review the operator can approve but never resolve, and the execution gate would block Run "
+        "on it forever with no card offered.",
+        "Wire the requirement into the node's prompt: author prompt_template_parts as an ordered list of parts "
+        'where exactly one entry is {"kind": "interpretation_ref", "requirement_id": "<the requirement id named '
+        'in the rejection>"} and the surrounding text lives in {"kind": "text", "text": ...} parts. '
+        "Alternatively drop the interpretation_requirements row and keep exactly one legacy "
+        "{{interpretation:<user_term>}} placeholder. Do not restage the review; the repair is wiring.",
+    ),
+    (
+        r"interpretation_review_draft_malformed|cleanup review draft is malformed",
+        "Historical cleanup-draft diagnostic: an earlier implementation rejected review drafts that did not contain specific phrases. "
+        "That prose predicate is retired; this stored code does not establish a defect in the current review or mapping.",
+        "Keep the registered pipeline_decision user_term and describe the intended cleanup in the draft. "
+        "Check the actual field_mapper mapping against the declared web_scrape raw fields. Preserve review provenance "
+        "and artifact binding when repairing a candidate.",
+    ),
+    (
+        r"interpretation_review_contract_unsatisfied|drops web-scrape raw field",
+        "A cleanup node that drops web-scrape raw fields (field_mapper with select_only=true) must stage an interpretation review recording that decision before the pipeline is accepted. "
+        "The structured pipeline_decision kind and registered user_term identify the review; the actual mapping and declared producer fields determine its effects.",
+        "On the cleanup field_mapper node, add options.interpretation_requirements — a SIBLING of mapping, never inside it. "
+        f"Use kind 'pipeline_decision' and user_term {RAW_HTML_CLEANUP_USER_TERM!r} exactly. "
+        "Write the draft in your own words to describe the fields being dropped. Example review row: "
+        f'{{"kind": "pipeline_decision", "user_term": "{RAW_HTML_CLEANUP_USER_TERM}", "draft": "{RAW_HTML_CLEANUP_REVIEW_DRAFT}"}}. '
+        "Then re-emit the FULL set_pipeline call with that requirement in place; rejected set_pipeline calls do not persist partial nodes.",
+    ),
+    (
+        r"file_sink_write_policy_invalid|must set collision_policy explicitly|must set mode explicitly",
+        "File sinks require an explicit write policy: options.mode and options.collision_policy must both be present and consistent.",
+        "Set options.mode='write' with collision_policy='auto_increment' (or 'fail_if_exists'), or options.mode='append' with collision_policy='append_or_create', on every file-based outputs[] entry.",
+    ),
+    (
+        r"no_source_configured|No source configured",
+        "The pipeline has no source; every pipeline reads rows from exactly one configured source (or named sources). "
+        "set_pipeline is a full replacement, so source: null never means 'keep the existing source'.",
+        "Include a source block in the set_pipeline call — plugin, on_success connection, and options with a schema. "
+        "Rebuilding an already-sourced pipeline: re-supply the existing source by copying its blob_id (from "
+        "get_pipeline_state or list_blobs) into source.blob_id, or resend inline_blob.",
+    ),
+    (
+        r"no_sinks_configured|No sinks configured",
+        "The pipeline has no outputs; rows must land in at least one sink.",
+        "Include at least one outputs[] entry — sink_name, plugin, and options (file-based sinks need a path under outputs/).",
+    ),
+    (
+        r"source_name_invalid",
+        "A named source uses an invalid name.",
+        "Source names must be short lowercase identifiers; rename the source key and re-emit.",
+    ),
+    (
+        r"reserved_node_id|Reserved node id|reserved source producer namespace",
+        "The id 'source' and the 'source:<name>' namespace are reserved for pipeline sources; no node or queue may use them.",
+        "Rename the node to a descriptive id (e.g. 'clean_rows') and update every routing field that referenced the old id.",
+    ),
+    (
+        r"duplicate_node_id|Duplicate node ID",
+        "Two nodes share the same id; node ids must be unique.",
+        "Rename one of the nodes and update the routing fields that reference it.",
+    ),
+    (
+        r"duplicate_output_name|Duplicate output name",
+        "Two outputs share the same sink name; sink names must be unique.",
+        "Rename one of the outputs and update any on_success/on_error/route that targets it.",
+    ),
+    (
+        r"duplicate_edge_id|Duplicate edge ID",
+        "Two edges share the same id.",
+        "Edges are UI-only; drop the duplicate edge entry (runtime routing uses the connection fields, not edges).",
+    ),
+    (
+        r"edge_unknown_node|references unknown node",
+        "An edge names a from_node or to_node that does not exist in the pipeline.",
+        "Edges are UI-only; drop the stale edge or fix its node reference — runtime routing uses the connection fields.",
+    ),
+    (
+        r"duplicate_connection_producer|Duplicate producer for connection",
+        "Two different components publish rows to the same connection name; every connection has exactly one producer.",
+        "Rename one producer's on_success (or route/fork_to target) to a distinct connection name and point the intended "
+        "consumer's input at it. To merge branches, use a coalesce node — not a shared connection name.",
+    ),
+    (
+        r"duplicate_connection_consumer|Duplicate consumer for connection",
+        "Two different nodes read the same connection as their input; every connection has exactly one consumer.",
+        "Give each consumer its own input connection (fan out with a gate fork_to if both need the same rows).",
+    ),
+    (
+        r"connection_sink_name_overlap|Connection names overlap with sink names|collides with a sink of the same name",
+        "A connection name and a sink name are identical; connection and sink names must be disjoint so routing is unambiguous.",
+        "Rename the connection (the node id or on_success value) so it no longer matches any outputs[].sink_name.",
+    ),
+    (
+        r"gate_condition_invalid",
+        "A gate's condition expression failed to parse or uses disallowed syntax.",
+        "Set condition to a valid row expression (call get_expression_grammar for the syntax); a pure fan-out gate uses condition='True'.",
+    ),
+    (
+        r"aggregation_missing_on_error|Aggregation '(.+)' is missing required field 'on_error'",
+        "Every aggregation must declare where failed rows go.",
+        "Set the aggregation's on_error explicitly. 'discard' costs the failed batch's rows' CONTENT, not the record of "
+        "them — the audit trail keeps each row's terminal outcome and failure reason, but nothing reaches a sink to "
+        "inspect later. Route to a declared quarantine sink name instead when failed rows must stay inspectable.",
+    ),
+    (
+        r"aggregation_output_mode_invalid",
+        "An aggregation's output_mode is not one of the allowed values.",
+        "Set output_mode to 'transform' (the default). Use 'passthrough' only for a batch plugin whose catalogue aggregation_output_modes includes it, meaning one flushed row per buffered row.",
+    ),
+    (
+        r"batch_transform_misplaced",
+        "A batch-aware plugin sits in a node kind it cannot run in. Three placements carry this code: a batch-only "
+        "plugin as node_type='transform' (it processes a whole batch, never one row); a plugin that reads the "
+        "aggregation flush window (report_assemble) as a collector, whose end-of-group flush has no window; and "
+        "a batch plugin under passthrough whose flush does not emit one row per buffered row (such as batch_stats, batch_replicate, or an annotator that skips rows).",
+        "Choose the correction for the rejected candidate's node_type and output_mode. A transform: re-emit the node with "
+        "node_type='aggregation' and a trigger (e.g. trigger={'count': N}), or pick a row-level transform plugin. "
+        "A collector: keep the collector, close the scope with a batch-aware plugin that reads no flush window "
+        "(list_transforms, then get_plugin_schema), and if the refused plugin is still wanted, run it as an aggregation "
+        "downstream of the collector. Turning the collector itself into an aggregation leaves the scope without a "
+        "closer. For a non-1:1 batch plugin use output_mode: 'transform' (the default), or choose a plugin whose catalogue aggregation_output_modes includes passthrough.",
+    ),
+    (
+        r"batch_required_fields_invalid",
+        "A batch-aware plugin cannot enforce the row-mode required_input_fields option; batch input requirements use its schema contract.",
+        "Remove required_input_fields from the rejected node's options. Declare batch input requirements with "
+        "schema.required_fields using the plugin's documented schema shape; call get_plugin_schema for the "
+        "transform plugin to inspect that contract, then re-emit the corrected node.",
+    ),
+    (
+        r"batch_value_field_not_numeric",
+        "batch_distribution_profile.value_field must reference a numeric (int/float) field, but the upstream schema declares a non-numeric type.",
+        "Point value_field at a numeric field, or use batch_top_k for categorical distributions.",
+    ),
+    (
+        r"queue_config_invalid",
+        "A queue node's shape is invalid — a queue's id must equal its input, with no plugin, routing, or options beyond a description.",
+        "Re-emit the queue with id == input and only a description in options, or remove the queue node.",
+    ),
+    (
+        r"structural_node_plugin_forbidden",
+        "A gate or coalesce node carries a plugin; those are built-in node_types that take no plugin.",
+        "Re-emit the node with plugin=null. If you meant a plugin-driven step, use node_type='transform' or 'aggregation' with that plugin instead.",
+    ),
+    (
+        r"queue_no_consumer",
+        "A queue has no downstream consumer; a queue must feed exactly one ordinary node.",
+        "Give one downstream node input='<queue id>', or remove the queue.",
+    ),
+    (
+        r"queue_name_collision|collides with a source of the same name",
+        "A queue's id collides with a source name; source and queue names must be globally unique.",
+        "Rename the queue node (its id and the consumer's input) so it no longer matches any source name.",
+    ),
+    (
+        r"aggregation_trigger_invalid|trigger is invalid",
+        "An aggregation's trigger failed to parse.",
+        "Set trigger to a valid shape, e.g. trigger={'count': N} to aggregate every N rows, or omit it to aggregate at end of source.",
+    ),
+    (
+        r"web_scrape_http_identity_invalid",
+        "web_scrape.http identity fields (abuse_contact, scraping_reason) carry a placeholder or undeliverable value; these ship "
+        "as HTTP headers to the scraped host and must be real operator-supplied identity.",
+        "Ask the operator for the deployment's abuse contact email and scraping reason, or leave the http block for the operator "
+        "to fill — never invent an email or domain.",
+    ),
+    (
+        r"prompt_template_unbound_variables|prompt render context does not define",
+        "A prompt_template interpolates bare variable names the render context does not define — templates see row data only "
+        "as 'row.<field>' and lookup data as 'lookup.<key>', so rendering raises 'Undefined variable' at runtime and none of "
+        "the row's data reaches the model.",
+        "Rewrite each bare name as '{{ row.<field> }}' using a field the upstream schema provides (e.g. '{{ text }}' becomes "
+        "'{{ row.text }}'), or '{{ lookup.<key> }}' for lookup data, or remove the reference.",
+    ),
+    (
+        r"query_template_unbound_row_fields|input_fields binds only",
+        "A multi-query LLM template references 'row.<variable>' names the query never binds — each query renders with 'row' "
+        "holding exactly its input_fields variables plus 'source_row', so an unbound reference raises 'Undefined variable' "
+        "at runtime and that query fails for every row.",
+        "Bind each missing name in that query's input_fields (template variable → row column), rename the reference to a "
+        "variable the query already binds, or use '{{ row.source_row.<column> }}' for a source column also declared in the node's required_input_fields.",
+    ),
+    # Ordered AFTER the two unbound-name entries deliberately: this code's
+    # headline is "reads ... under 'row'", which neither of their patterns
+    # matches, and matching runs in LIST ORDER against raw text. Serves the
+    # state.py constants rather than a copy — the tool-call surface returns
+    # the message and never this catalogue, the planner's repair turn gets
+    # this catalogue and never the message, so a second copy drifts silently
+    # (elspeth-920bd88299).
+    (
+        r"prompt_template_undeclared_row_fields|required_input_fields does not declare",
+        _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION,
+        _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX,
+    ),
+    # Plugin-unavailability family. Exact-code patterns only (``re.escape``, no
+    # alternation): these codes are short and generic, and a loose pattern here
+    # would shadow an unrelated entry above. They sit LAST so every message-shaped
+    # pattern above still wins on a full validation message.
+    *(
+        (
+            re.escape(reason.value),
+            f"The pipeline names a plugin that cannot be used in this deployment: {_PLUGIN_UNAVAILABLE_EXPLANATIONS[reason]}.",
+            _PLUGIN_UNAVAILABLE_FIXES[reason],
+        )
+        for reason in _LEGACY_PLUGIN_UNAVAILABLE_REASONS
+    ),
+)
+
+
+# The closed validation codes the planner's redacted repair feedback can carry
+# (see ``pipeline_planner._allowlisted_candidate_feedback``). Every entry MUST
+# resolve through :func:`explain_validation_code` — the explain tool's fallback
+# advertises this list and its fuzzy route scans for these substrings, so a
+# dead entry would route the model to a code that then explains nothing
+# (test_closed_code_catalogue_is_fully_explainable pins the invariant).
+_LEGACY_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
+    "unknown_node_type",
+    "coalesce_on_success_must_be_sink",
+    "coalesce_missing_branches",
+    "coalesce_config_invalid",
+    "coalesce_policy_invalid",
+    "coalesce_merge_invalid",
+    # Branch ALIASES must be gate fork_to names — the coalesce twin of
+    # row_union_branch_alias_unreachable, and the code that co-fires whenever
+    # an identity branch is coalesce_branch_unreachable.
+    "coalesce_branch_alias_unreachable",
+    "row_union_config_invalid",
+    "row_union_name_invalid",
+    "row_union_branches_invalid",
+    "row_union_branch_invalid",
+    "row_union_input_mismatch",
+    "row_union_on_success_invalid",
+    "row_union_timeout_invalid",
+    "row_union_branch_alias_unreachable",
+    "row_union_branch_unreachable",
+    "row_union_branch_not_downstream",
+    "row_union_branch_aggregation_invalid",
+    "row_union_nested_fork_invalid",
+    "row_union_downstream_group_invalid",
+    "row_union_schema_incompatible",
+    "row_union_on_success_must_be_connection",
+    "row_union_on_success_dangling",
+    # Cross-node barrier topology: mirrors the engine's "each fork branch can
+    # only join at one barrier" rule for coalesce/coalesce, coalesce/row_union
+    # and row_union/row_union claims.
+    "fork_branch_multiple_barriers",
+    # Whole-roster fork closure (spec §7 rule 2 / ruling 23): a fork is fully
+    # bound (every branch reaches its one closer, rosters equal) or fully
+    # unbound (pure fan-out) — never a mix, and never split across closers.
+    "fork_mixed_closure_invalid",
+    "fork_multiple_closers_invalid",
+    "fork_roster_mismatch",
+    # Bound-region SESE walk (spec §7 rule 4): the sink-inside-region limb
+    # only — the backward walk and no-path limb are Stage-1 abstentions.
+    "bound_region_sink_inside",
+    # Spec §7 rule 6 (ruling 25): aggregators banned inside coalesce-bound
+    # branches — the row_union twin (row_union_branch_aggregation_invalid,
+    # above) stays for its narrower transform-mode-only shape.
+    "bound_region_aggregation_invalid",
+    "gate_duplicate_fork_branch",
+    "transform_missing_on_success",
+    "transform_missing_on_error",
+    "transform_on_success_dangling",
+    "transform_on_error_unknown_sink",
+    "gate_on_error_unknown_sink",
+    "aggregation_on_success_dangling",
+    "source_on_success_dangling",
+    "gate_missing_condition",
+    "gate_missing_routes",
+    "gate_route_labels_mismatch",
+    "fork_branch_no_destination",
+    "pipeline_decision_unregistered",
+    "interpretation_requirements_invalid",
+    "plugin_options_invalid",
+    # ── Schema-contract family (2026-07-22 codeless-rejection closure) ──────
+    # Edge-level members carry SchemaContractDetail facts; coalesce mode
+    # conflicts carry the coalesce id and branch groups in the validation row.
+    "schema_contract_violation",
+    "sink_contract_violation",
+    "locked_input_extras",
+    "sink_locked_extras",
+    "transform_contract_violation",
+    "transform_declared_output_not_guaranteed",
+    "semantic_contract_violation",
+    "contract_config_invalid",
+    "coalesce_schema_mode_mixed",
+    "coalesce_union_type_incompatible",
+    # ── Structural rejections (same closure sweep) ──────────────────────────
+    "no_source_configured",
+    "no_sinks_configured",
+    "source_name_invalid",
+    "reserved_node_id",
+    "duplicate_node_id",
+    "duplicate_output_name",
+    "duplicate_edge_id",
+    "edge_unknown_node",
+    "duplicate_connection_producer",
+    "duplicate_connection_consumer",
+    "connection_sink_name_overlap",
+    "gate_condition_invalid",
+    "aggregation_missing_plugin",
+    "aggregation_missing_on_error",
+    "aggregation_output_mode_invalid",
+    "batch_transform_misplaced",
+    "batch_required_fields_invalid",
+    "batch_value_field_not_numeric",
+    "queue_config_invalid",
+    # ── Collector node kind (barrier-scopes spec §3, Task 12) ──────────────
+    # Intrinsic collector/scope-binding shape plus the cross-collector scope
+    # checks and the decidable half of §7 rule 8 (escalate with provably no
+    # enclosing bound group — full membership stays with Stage 2).
+    "collector_missing_scope",
+    "collector_scope_policy_invalid",
+    "scope_opener_unknown",
+    "scope_opener_not_multi_row",
+    "collector_has_trigger_invalid",
+    "collector_has_on_error_invalid",
+    "collector_missing_plugin",
+    "collector_plugin_not_batch_aware",
+    "collector_config_invalid",
+    "collector_on_success_dangling",
+    "scope_name_duplicate",
+    "scope_opener_duplicate",
+    "scope_name_invalid",
+    "node_scope_fields_unsupported",
+    "structural_node_plugin_forbidden",
+    "queue_no_consumer",
+    "queue_name_collision",
+    "coalesce_branch_unreachable",
+    "node_input_not_reachable",
+    "coalesce_on_success_unknown_sink",
+    "aggregation_trigger_invalid",
+    "web_scrape_http_identity_invalid",
+    # ── Prompt-context binding guard (R2-F17 compounding; elspeth-bea314a89b) ─
+    # A prompt_template interpolating names outside {row, lookup} crashes at
+    # render under StrictUndefined and sends no row data to the model.
+    "prompt_template_unbound_variables",
+    # ── Multi-query row-binding guard (elspeth-bea314a89b follow-up) ───────
+    # A multi-query template referencing row.<name> outside that query's
+    # input_fields + {source_row} fails that query at render for every row.
+    "query_template_unbound_row_fields",
+    # ── Single-prompt declaration guard (elspeth-a9ba80cb0b) ──────────────
+    # A single-prompt template reading row.<field> outside a declared,
+    # non-empty required_input_fields: the reference escapes the node's
+    # input contract, so nothing obliges a producer to supply the field.
+    "prompt_template_undeclared_row_fields",
+    # ── Pre-application semantic rejections (tutorial op 1152d7e3 closure) ──
+    # Previously codeless _failure_result sites: the planner saw only the
+    # 'validation_error' placeholder while the actionable message was redacted.
+    "interpretation_review_contract_unsatisfied",
+    "interpretation_review_draft_malformed",
+    # ── Unwired vague_term guard (session 4c42a794, 2026-09-01) ────────────
+    # set_pipeline committed a pending vague_term with no resolvable prompt
+    # wiring; the review was approvable but never resolvable and the execution
+    # gate blocked Run forever. The staging tool's guard now also runs at the
+    # node-authoring doors, and its rejection carries this code.
+    "vague_term_unwired",
+    # ── Authoritative review reconciliation (session f33fa7c3, 2026-09-01) ─
+    # Ten invariants inside reconcile_authoritative_reviews shared one opaque
+    # message and no code, so explain_validation_error fell through to its
+    # no-match branch and the planner blind-repeated an identical payload.
+    "review_reconciliation_failed",
+    "file_sink_write_policy_invalid",
+    # ── Nodeless-revision guard (same closure; proposal 3cb6532e) ──────────
+    # A revision candidate netting zero transform nodes drew one coded nudge
+    # instead of silently shipping a passthrough with aspirational metadata.
+    # ── Historical stated-threshold heuristic (R2-F17, retired) ──────────
+    # Retain the stored code and legacy match order. The prose-derived
+    # planner rejection is retired; constant fan-out remains structurally legal.
+    "gate_condition_ignores_stated_threshold",
+    # ── Plugin-unavailability family (same sweep) ──────────────────────────
+    # Historical expansion only. New policy members get direct records from
+    # their owner's explanation and fix mappings, never new legacy regexes.
+    *(reason.value for reason in _LEGACY_PLUGIN_UNAVAILABLE_REASONS),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class DirectValidationGuidance:
+    """Owned machine-code guidance, independent of legacy prose matching."""
+
+    code: str
+    explanation: str
+    suggested_fix: str
+
+
+def _direct_plugin_policy_guidance() -> tuple[DirectValidationGuidance, ...]:
+    """New policy reasons require their owner's explanation and repair text."""
+    return tuple(
+        DirectValidationGuidance(
+            reason.value,
+            f"The pipeline names a plugin that cannot be used in this deployment: {_PLUGIN_UNAVAILABLE_EXPLANATIONS[reason]}.",
+            _PLUGIN_UNAVAILABLE_FIXES[reason],
+        )
+        for reason in PluginUnavailableReason
+        if reason not in _LEGACY_PLUGIN_UNAVAILABLE_REASONS
+    )
+
+
+_DIRECT_VALIDATION_GUIDANCE: Final = (
+    DirectValidationGuidance(
+        "edge_not_found",
+        "The requested edge is not present in the saved composition. No removal was applied.",
+        "Inspect the current edges and retry the intended exact edge ID. Preserve unrelated nodes, routes and edges; do not remove a different edge to silence this refusal.",
+    ),
+    DirectValidationGuidance(
+        "edge_not_lowerable",
+        "The proposed producer kind, edge type and destination kind do not express a supported runtime route.",
+        "Inspect the producer, destination and route kind, then choose the supported route that preserves the intended pipeline behavior. Edges between processing nodes are advisory; they do not replace scalar input or output connections. Preserve intentional gate and coalesce policies.",
+    ),
+    DirectValidationGuidance(
+        "edge_route_conflict",
+        "Another edge already expresses the same sink-routing slot. The new competing edge was not applied.",
+        "Inspect the current routing edges and update the existing intended slot edge instead of adding a competing edge ID. Preserve unrelated edges and the user's route choices; different fork destinations may occupy distinct slots.",
+    ),
+    DirectValidationGuidance(
+        "edge_field_type_incompatible",
+        "A consumer's required or optional field type cannot be satisfied by the producer's declared type. An int satisfies float, and an LLM number binds float; other types do not widen automatically.",
+        "Match the actual producer type or convert upstream on a field every arriving row carries. A type_coerce input declares the old arriving type; its conversion determines the output type consumed downstream. A declaration alone does not convert a value.",
+    ),
+    DirectValidationGuidance(
+        "quarantine_unknown_output",
+        "The source on_validation_failure names an output that is not declared.",
+        "Declare the intended quarantine output and reference its name in on_validation_failure, "
+        "or choose 'discard' only if discarding invalid source rows is intended.",
+    ),
+    # elspeth-d2e3f29d10: the aggregation error edge is wired, so a ghost
+    # aggregation on_error sink is refused by the DAG builder too.
+    DirectValidationGuidance(
+        "aggregation_on_error_unknown_sink",
+        "An aggregation's on_error names where every input row of a FAILED batch goes, and may only be 'discard' or "
+        "an existing sink name. The rejection's 'connectivity' facts carry the offending value as 'dangling_on_error' "
+        "and the candidate's sink names as 'declared_sinks'.",
+        "Set the aggregation's on_error='discard', or copy one of the connectivity facts' declared_sinks exactly. It "
+        "cannot name a coalesce, row_union or collector: an aggregation never sits inside a bound region.",
+    ),
+    DirectValidationGuidance(
+        "failure_route_required",
+        "This ordinary component has no explicit non-empty failure choice. Composer does not choose a route for it.",
+        "Supply the component's failure field with 'discard' or an eligible named route. Existing sink and required-control "
+        "restrictions still apply. Null/empty is invalid. Omit the field only when updating the same component to preserve "
+        "its existing choice; full replacement and new components require an explicit choice.",
+    ),
+    DirectValidationGuidance(
+        "aggregation_expected_output_count_mode_invalid",
+        "expected_output_count is only applicable to aggregation output_mode='transform'.",
+        "For passthrough, omit expected_output_count. If transformed output is intended, choose "
+        "output_mode='transform' and specify the expected count. These modes have different row semantics; "
+        "choose according to the intended pipeline behavior.",
+    ),
+    # Multi-query declaration guard (elspeth-a10d15055b): serves the state.py
+    # constants, whose FIX is the plugin layer's remedy, rather than a copy.
+    DirectValidationGuidance(
+        "query_input_columns_undeclared",
+        _QUERY_INPUT_COLUMNS_UNDECLARED_EXPLANATION,
+        _QUERY_INPUT_COLUMNS_UNDECLARED_FIX,
+    ),
+    DirectValidationGuidance(
+        "query_generated_fields_required",
+        _QUERY_GENERATED_FIELDS_REQUIRED_EXPLANATION,
+        _QUERY_GENERATED_FIELDS_REQUIRED_FIX,
+    ),
+    # Gate analogue of coalesce_config_invalid: GateSettings has no options
+    # field, so lowering drops every non-metadata gate option.
+    DirectValidationGuidance(
+        "gate_config_invalid",
+        "A gate is a built-in structural node; it has no runtime options contract, so authored options other than "
+        "review metadata cannot be preserved and would silently disappear before the pipeline runs.",
+        "Remove the named keys from the gate's options. Express the routing decision in the gate's condition and "
+        "routes (plus fork_to and on_error where needed), not in options.",
+    ),
+    DirectValidationGuidance(
+        "node_not_found",
+        "The requested saved node is not present in this composition.",
+        "Inspect the current pipeline and select the intended existing node ID. If a new node is intended, author it explicitly with upsert_node before referring to it.",
+    ),
+    DirectValidationGuidance(
+        "node_routing_patch_invalid",
+        "The options patch contains node routing fields, which are not plugin options.",
+        "Use upsert_node to edit input, on_success, on_error, routes or fork_to while retaining the intended node options. Preserve the user's failure choice; gates use on_error only for their supported error route.",
+    ),
+    DirectValidationGuidance(
+        "splice_ids_not_distinct",
+        "A splice needs distinct predecessor, successor and inserted-node IDs.",
+        "Inspect the intended path and name its existing predecessor and successor separately. Choose a distinct inserted-node ID without replacing either endpoint.",
+    ),
+    DirectValidationGuidance(
+        "splice_topology_unsupported",
+        "The requested splice is not an unambiguous direct source-or-transform to transform path, or its replay topology is not canonical.",
+        "Inspect the current nodes, scalar routes and visual edges. Select an existing direct linear path supported by splice_transform, preserving intentional branches and error routes; do not delete unrelated graph objects to force a splice.",
+    ),
+    DirectValidationGuidance(
+        "splice_replay_conflict",
+        "The inserted-node ID already names a different splice definition. Only an identical splice can be replayed without advancing the version.",
+        "Inspect the existing inserted node and retry its identical definition if replay is intended. For a different transform, choose an intentional distinct ID and path; do not overwrite the existing splice implicitly.",
+    ),
+    DirectValidationGuidance(
+        "splice_derivation_conflict",
+        "The splice cannot derive a bounded nonconflicting connection or visual edge identifier for the proposed inserted node.",
+        "Inspect the existing graph and choose an intentional nonconflicting inserted-node ID, then retry the same intended path. Preserve existing nodes, connections and edges.",
+    ),
+    # Leading entry of a splice_transform rejection; the planner's redacted
+    # repair feedback resolves it by code like every other entry.
+    DirectValidationGuidance(
+        "splice_validation_failed",
+        "The inserted transform passed its own option checks, but the pipeline that results from inserting it fails "
+        "context-aware validation. The rejected_mutation entries that follow this one name each new error, attributed "
+        "to the component it concerns in rejected_component. Nothing was mutated.",
+        "Repair the inserted node's options against the entries that follow (for a schema_contract_violation, remove "
+        "or satisfy the fields it names), or splice at a position whose producer supplies them, then retry "
+        "splice_transform.",
+    ),
+    DirectValidationGuidance(
+        "batch_dependency_refused",
+        "This call needs a new component or connection that an earlier refused call in the same batch did not create. "
+        "The saved pipeline is unchanged by this dependent call; independent calls may still succeed.",
+        "Inspect the saved pipeline, repair the refused prerequisite in a new turn, then retry the dependent change. "
+        "Use splice_transform only for its supported direct-transform-edge topology.",
+    ),
+    # Prompt-role presence (session 60ab6a67): a composer-authored llm node
+    # carries BOTH roles. Serves the state.py constants rather than a copy —
+    # the rejection message ends with the same FIX, and the planner's redacted
+    # repair turn sees only this record.
+    DirectValidationGuidance(
+        "llm_system_prompt_missing",
+        _LLM_SYSTEM_PROMPT_MISSING_EXPLANATION,
+        _LLM_SYSTEM_PROMPT_MISSING_FIX,
+    ),
+    DirectValidationGuidance(
+        "llm_user_prompt_missing",
+        _LLM_USER_PROMPT_MISSING_EXPLANATION,
+        _LLM_USER_PROMPT_MISSING_FIX,
+    ),
+    # Field-name spelling rule (operator ruling 2026-09-25). A code after the
+    # historical closure, so it gets a direct record, never a legacy regex.
+    # Stage 1 (Rule S) emits the code with SchemaContractDetail facts.
+    DirectValidationGuidance(
+        "field_name_header_spelling",
+        "A declaration names a field by the HEADER spelling of a field its producer carries. Sources normalize every "
+        "external header to a lowercase identifier (spaces and punctuation to '_', a leading digit prefixed with '_', a "
+        "Python keyword suffixed with '_': 'Name' -> 'name', 'First Name' -> 'first_name'), and rows are keyed by that "
+        "normalized name. A row LOOKUP (row['Name'] in an expression or template, a field_mapper mapping source) resolves "
+        "either spelling, but a DECLARATION — a schema field, required_input_fields, a column option such as url_field, "
+        "query_field, blob_ref_field or a type_coerce conversions[].field, a sink's custom headers key, or a created name "
+        "such as a value_transform target — is compared as written, so the header spelling never meets the field. The "
+        "rejection's 'contract' facts, when present, name the upstream node ('producer') and the rejected node "
+        "('consumer') and list the header-spelled names in 'missing_fields'.",
+        "Rewrite each name in 'missing_fields' as the carried name the refusal gives: the normalized header, the source field_mapping target ({name: b} means declare b), or the headerless column as written. Patch the rejected consumer (patch_node_options for a "
+        "transform, aggregation or collector; patch_output_options for 'output:<sink name>'). For a created target, the "
+        "carried name OVERWRITES the arriving field; if you meant a new field, choose a name that does not normalize "
+        "to an arriving field. Never add a field_mapper to restore the header spelling to satisfy this — declare the "
+        "carried name instead.",
+    ),
+    DirectValidationGuidance(
+        "field_name_lookup_unreachable",
+        "A template reads a declared field by a spelling other than its declared name (row['Score_Text'] under "
+        "required_input_fields [score_text], a multi-query input_fields column, a RAG query_template read). Such a "
+        "lookup resolves only when the arriving row records that spelling as the field's original source header, and "
+        "no row reaching this node can: on every path the field comes from a headerless source (columns recorded as "
+        "written), a source field_mapping or a rename (the target records the name it was renamed from), a node that "
+        "creates it, or a statistics-style aggregation or collector (every field it emits records its own name), or a "
+        "transform renames the field that header names away. The template fails every row.",
+        "Rewrite the lookup to the declared name the message names (row['score_text'] or row.score_text) with "
+        "patch_node_options on the rejected node. Do not rename the field back or add a field_mapper to recreate the "
+        "header spelling.",
+    ),
+    DirectValidationGuidance(
+        "source_data_contract_required",
+        "An uploaded or path-bound source header is sample evidence. An observed-mode guaranteed_fields "
+        "stamp is the user's recorded data promise and cannot be authored by the planner. The rejected "
+        "proposal was not applied; the saved graph remains unchanged.",
+        "Remove the newly authored schema.guaranteed_fields from the rejected proposal, or echo the stored "
+        "acknowledged stamp unchanged. Either declare a runtime-enforced schema with mode 'flexible' or "
+        "'fixed' and non-optional fields using the source's runtime field names, then retry the proposal; "
+        "or retain observed mode and request_interpretation_review(kind='source_data_contract', "
+        "affected_node_id='source' or 'source:<name>', user_term='source_data_contract'), omitting llm_draft, "
+        "only when the intended source and demanding consumers are already saved and have a pending "
+        "source data-contract review site. The review reads the current saved graph, never the rejected "
+        "candidate; if that graph is still a scaffold, repair the full candidate with an explicit runtime "
+        "contract instead. Ask the user to acknowledge the server-computed field promise. The server writes the stamp "
+        "on acknowledgement. A rejected replacement is not the current saved graph: retain the requested "
+        "input binding and evaluation transforms when repairing it.",
+    ),
+    DirectValidationGuidance(
+        "output_not_found",
+        "The requested output is not in the current saved graph. The requested change was not applied.",
+        "Inspect the current outputs and use the intended existing name. Create an output with set_output only "
+        "when that is the user's intended change; do not create or remove a different destination to silence this refusal.",
+    ),
+    DirectValidationGuidance(
+        "source_binding_ambiguous",
+        "The candidate supplies competing source bindings. No replacement was applied.",
+        "Keep the intended input and supply exactly one source or named sources map. For a blob-backed source, choose "
+        "either an existing blob_id or new inline_blob content, never both.",
+    ),
+    DirectValidationGuidance(
+        "source_binding_locked",
+        "The requested option patch would change a server-owned source blob binding. The saved source was retained.",
+        "Rebind the intended artifact through set_source_from_blob or set_source_from_blobs as appropriate. "
+        "Preserve its content and review provenance; do not clear the source merely to silence this refusal.",
+    ),
+    DirectValidationGuidance(
+        "source_not_found",
+        "The requested source is not in the current saved graph. The requested change was not applied.",
+        "Inspect the current named sources and select the intended existing name. Create or rebind a source only "
+        "when that is the user's intended operation; do not replace a different input to silence this refusal.",
+    ),
+    DirectValidationGuidance(
+        "source_path_policy_invalid",
+        "The source path is outside this session's permitted input locations. The candidate was not applied.",
+        "Keep the intended input artifact and use its canonical authenticated blob binding, or preserve an approved "
+        "existing source binding. Do not invent an absolute host directory or replace the input with empty data.",
+    ),
+    DirectValidationGuidance(
+        "sink_path_policy_invalid",
+        "The sink destination is outside this session's permitted output locations. The candidate was not applied.",
+        "Use a relative destination under outputs/ for the current session. Preserve the sink's purpose, output format "
+        "and explicit failure policy; do not guess a server filesystem root.",
+    ),
+    DirectValidationGuidance(
+        "provider_config_path_policy_invalid",
+        "A transform's local provider path is outside this session's permitted storage locations.",
+        "Use a session-local relative path under outputs/ for the provider's local store, or the supported authenticated "
+        "blob binding where applicable. Keep the transform's purpose and do not guess an absolute server directory.",
+    ),
+    DirectValidationGuidance(
+        "aws_s3_endpoint_url_not_allowed",
+        "The Web Composer does not permit an authored AWS S3 endpoint override.",
+        "Remove endpoint_url from the source or sink options and retain the intended authorized S3 location. Use the "
+        "deployment's served profile or supported AWS binding rather than supplying a replacement endpoint.",
+    ),
+    DirectValidationGuidance(
+        "llm_authored_inline_blob_content",
+        "LLM-authored blob content cannot replace the reviewable text or model selection of an LLM node.",
+        "Author the reviewable prompt text or served model/profile binding through its declared options and review "
+        "requirements. Use user-uploaded content only through a supported inline-reference surface; do not change blob provenance.",
+    ),
+    DirectValidationGuidance(
+        "llm_retry_budget_policy",
+        "A sequential multi-query LLM transform must use a bounded local capacity-retry budget allowed by Web policy.",
+        "Keep the intended queries and set max_capacity_retry_seconds to a positive value no greater than 30 seconds, "
+        "or use pool_size > 1 for pooled retry handling. Operator-profiled nodes use the profile's supplied retry configuration. Do not change "
+        "planner repair budgets or invent additional attempts to bypass this policy.",
+    ),
+    DirectValidationGuidance(
+        "source_binding_context_unavailable",
+        "The source binding requires session or storage context that this operation did not receive. No candidate was saved.",
+        "Retain the intended candidate and source artifact. Report the missing session/storage context and retry only "
+        "through a surface that supplies it; do not replace the source with invented empty data.",
+    ),
+    DirectValidationGuidance(
+        "inline_source_csv_inspection_failed",
+        "The inline CSV could not be inspected within the bounded CSV grammar and size limits. No uploaded-file conflict was established.",
+        "Keep the intended input content. Correct malformed CSV or use the supported uploaded-file binding for input "
+        "that exceeds inline inspection limits; do not silently truncate rows or assume that matching uploaded data exists.",
+    ),
+    DirectValidationGuidance(
+        "inline_source_comparison_incomplete",
+        "The ready uploaded CSV candidate scan exceeded its fixed limit, so the inline-source comparison did not finish.",
+        "Identify the intended input through list_blobs and bind its exact source.blob_id or use set_source_from_blob. "
+        "Keep the intended artifact; an incomplete comparison does not prove a matching upload or a content conflict.",
+    ),
+    DirectValidationGuidance(
+        "inline_source_content_conflict",
+        "The inline source contains only headers and a larger ready uploaded CSV has matching headers. Its data rows were not verified by this check.",
+        "Inspect the intended complete input artifact and bind its ready uploaded blob when appropriate, or re-supply "
+        "all intended literal rows. Do not replace the intended data with column names or infer verified rows from this header comparison.",
+    ),
+    DirectValidationGuidance(
+        "credential_literal_forbidden",
+        "Candidate options contain literal credential material. The literal values were not stored.",
+        "Discover an authorized secret reference and replace each named credential field with its inline secret_ref "
+        "marker in the rejected call. Do not echo credential values or rebuild unrelated pipeline components.",
+    ),
+    DirectValidationGuidance(
+        "BLOB_QUOTA_EXCEEDED",
+        "The inline source could not acquire blob storage within this session's quota. The replacement was not applied.",
+        "Retain the intended source data. Reuse an appropriate ready artifact or resolve the session storage limit before "
+        "retrying; do not silently drop rows to make the artifact smaller.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_identity_invalid",
+        "The source binding does not name a valid canonical blob identifier.",
+        "Use the exact blob_id returned by authenticated blob discovery for the intended source artifact; do not invent "
+        "or reconstruct an identifier from a filename or storage path.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_unavailable",
+        "The source artifact is missing, not ready, or has unavailable stored bytes.",
+        "Inspect the intended artifact's current readiness through authenticated blob discovery. Keep the requested "
+        "binding and resolve its availability before retrying; do not fabricate a replacement or assume an empty input.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_duplicate",
+        "The plural binding repeats a blob identity or canonical document content. No source replacement was applied.",
+        "Remove the duplicate entries while preserving every distinct intended input and its order. Use authenticated "
+        "blob discovery to select the intended artifacts; do not invent identities or change their content.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_review_required",
+        "The plural binding contains LLM-authored content whose interpretation review is not established by this flow.",
+        "Use a supported set_source_from_blob flow to stage the intended artifact's review where its content is "
+        "representable. Otherwise preserve the artifact and report the limitation; never relabel provenance or drop review.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_plugin_required",
+        "The artifact's MIME type does not determine a supported source plugin.",
+        "Choose an explicit source plugin from the served catalog whose input format matches the intended artifact, "
+        "then retry the same binding with that plugin and its declared options.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_changed",
+        "The artifact changed while its source binding was being checked. The attempted binding was not applied.",
+        "Re-read the intended artifact's current metadata and content evidence, then retry the binding against that "
+        "version. Do not keep a stale hash or change unrelated graph structure.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_encoding_invalid",
+        "The selected source artifact is not valid UTF-8 text for this binding.",
+        "Use an artifact with the source plugin's supported encoding and format, preserving the intended data. Do not "
+        "silently coerce bytes or discard undecodable content.",
+    ),
+    DirectValidationGuidance(
+        "secret_context_unavailable",
+        "Required authenticated secret-service context is unavailable for this request. The saved graph was retained.",
+        "Retain the intended graph and reference. Report the missing secret-service or user context and retry only "
+        "through a surface that supplies it. Rewriting the graph or inventing a secret cannot supply this context.",
+    ),
+    DirectValidationGuidance(
+        "secret_target_required",
+        "The secret wiring operation did not select one existing destination.",
+        "Inspect the saved graph and supply its intended exact target_id: the node ID or output name, or the source "
+        "name when multiple sources are configured. Preserve unrelated components and the intended reference.",
+    ),
+    DirectValidationGuidance(
+        "secret_target_unsupported",
+        "The selected node cannot receive plugin credential options.",
+        "Select the intended existing source, transform/aggregation/collector plugin node, or output. Do not change "
+        "a structural node's kind or replace unrelated components merely to make a credential destination.",
+    ),
+    DirectValidationGuidance(
+        "missing_secret_ref",
+        "The intended secret reference does not currently resolve for this authenticated request. This does not "
+        "establish that the reference is absent.",
+        "Use list_secret_refs and validate_secret_ref to inspect the intended reference's current availability and "
+        "reported reason where present. Use the existing secret-management workflow for user-owned references when "
+        "appropriate, or ask the operator to resolve deployment prerequisites when needed. Do not invent names, literal "
+        "credentials or environment interpolation, or assume availability grants destination authorization.",
+    ),
+    DirectValidationGuidance(
+        "unauthorized_secret_ref",
+        "The deployment has not authorized this exact secret/component/plugin/option destination.",
+        "Preserve the intended graph and explain the destination refusal. An operator must authorize the exact "
+        "destination through the server-authored secret wiring policy if it is required. Availability checks and "
+        "repeated wiring attempts cannot grant that authority; do not silently remove or substitute the reference.",
+    ),
+    DirectValidationGuidance(
+        "disallowed_secret_ref",
+        "An option does not permit secret_ref markers under the credential-placement policy.",
+        "Use the intended credential-bearing option allowed by the existing placement policy, still subject to exact "
+        "destination authorization. Do not paste a literal credential into a noncredential field or rewrite unrelated "
+        "components to silence the refusal.",
+    ),
+    *_direct_plugin_policy_guidance(),
+)
+
+
+def _build_validation_guidance_index(
+    patterns: tuple[tuple[str, str, str], ...],
+    legacy_codes: tuple[str, ...],
+    direct_records: tuple[DirectValidationGuidance, ...],
+) -> Mapping[str, tuple[str, str, str] | DirectValidationGuidance]:
+    index: dict[str, tuple[str, str, str] | DirectValidationGuidance] = {}
+    for code in legacy_codes:
+        if code in index:
+            raise AssertionError(f"duplicate legacy validation code: {code}")
+        for record in patterns:
+            if re.search(record[0], code):
+                index[code] = record
+                break
+        else:
+            raise AssertionError(f"unresolved legacy validation code: {code}")
+    for direct in direct_records:
+        if direct.code in index:
+            kind = "duplicate" if isinstance(index[direct.code], DirectValidationGuidance) else "collision"
+            raise AssertionError(f"{kind} validation code: {direct.code}")
+        index[direct.code] = direct
+    return MappingProxyType(index)
+
+
+_VALIDATION_GUIDANCE_BY_CODE: Final = _build_validation_guidance_index(
+    _VALIDATION_ERROR_PATTERNS,
+    # Historical public alias: runtime also emits corresponding prose.
+    (
+        *_LEGACY_VALIDATION_ERROR_CODES,
+        "on_error_closer_out_of_region",
+        "diff_baseline_unavailable",
+        "coalesce_policy_quorum_unsupported",
+        "coalesce_best_effort_requires_timeout",
+        "coalesce_merge_select_unsupported",
+    ),
+    _DIRECT_VALIDATION_GUIDANCE,
+)
+_CLOSED_VALIDATION_ERROR_CODES: Final = tuple(_VALIDATION_GUIDANCE_BY_CODE)
+
+
+def validation_guidance_items() -> Iterable[tuple[str, tuple[str, str]]]:
+    """Read the unified catalogue without depending on regex spellings."""
+    for code, record in _VALIDATION_GUIDANCE_BY_CODE.items():
+        if isinstance(record, DirectValidationGuidance):
+            yield code, (record.explanation, record.suggested_fix)
+        else:
+            yield code, (record[1], record[2])
+
+
+def _extract_validator_expected_hint(error_text: str) -> str | None:
+    """Pull the ``Expected ...`` span out of a validator error string.
+
+    Pydantic and our schema-spec validators frequently emit errors like
+    ``"Field spec at index 0 is a dict with 2 keys. Expected single-key
+    dict like {'field_name': 'type'} or a string like 'field_name: type'."``.
+    The static catalogue fix below the substring discards that hint, so
+    the model only sees ``"Use get_pipeline_state ... patch_source_options"``
+    — which doesn't tell it what shape to actually emit. Returning the
+    ``Expected ...`` span verbatim lets the caller append it to
+    ``suggested_fix`` so the model can copy the shape directly.
+
+    The hint terminates at the next sentence boundary (``.`` followed by
+    whitespace or end-of-string) so a trailing ``"Got X. Other noise."``
+    doesn't get swept up.
+    """
+    idx = error_text.find("Expected ")
+    if idx == -1:
+        return None
+    rest = error_text[idx:]
+    end = len(rest)
+    for i, ch in enumerate(rest):
+        if ch == "." and (i + 1 == len(rest) or rest[i + 1].isspace()):
+            end = i + 1
+            break
+    return rest[:end].strip()
+
+
+def _augment_with_expected_hint(fix: str, error_text: str) -> str:
+    """Append the validator ``Expected ...`` hint to ``fix`` when present."""
+    hint = _extract_validator_expected_hint(error_text)
+    if hint is None:
+        return fix
+    return f"{fix} {hint}"
+
+
+def explain_validation_code(code: str) -> tuple[str, str] | None:
+    """Resolve a closed validation ``error_code`` to ``(explanation, suggested_fix)``.
+
+    The one-shot pipeline planner's repair feedback strips raw validation
+    messages before returning a rejection to the model — a redaction boundary,
+    since a raw message can quote plugin names, option values, or row content
+    (see ``pipeline_planner._allowlisted_candidate_feedback``). The closed
+    ``error_code`` selects an exact catalogue record. Legacy codes retain their
+    original first-match record; new codes carry direct guidance. Prose belongs
+    to the public ``explain_validation_error`` tool, not this boundary.
+
+    Returns ``None`` when no exact code exists, so callers attach nothing rather
+    than a misleading generic. The ``_augment_with_expected_hint`` span is
+    intentionally NOT applied: there is no error_text to mine an ``Expected …``
+    hint from — only the bare code.
+    """
+    if type(code) is not str or not code:
+        return None
+    record = _VALIDATION_GUIDANCE_BY_CODE.get(code)
+    if record is None:
+        return None
+    if isinstance(record, DirectValidationGuidance):
+        return record.explanation, record.suggested_fix
+    return record[1], record[2]
+
+
+# Static usage line, never per-request data. Live planners called
+# explain_validation_error with junk ({"error_text": "ValidationError"})
+# because nothing said the exact code string is the lookup key. Kept
+# deliberately free of topology hints — mid-repair suggestions have derailed
+# otherwise-converging repairs.
+#
+# Public because BOTH repair surfaces advertise the tool with these exact
+# bytes: the planner's redacted feedback (pipeline_planner) and the freeform
+# tool envelope (tools._dispatch). Two copies would drift, and the parity
+# suite pins the string.
+EXPLAIN_VALIDATION_ERROR_GUIDANCE: Final[str] = "To expand any code, call explain_validation_error with the exact code string."
+"""Planner-surface pointer: there the catalogue text rides inline on each entry, so no container is named."""
+
+EXPLAIN_TOOL_GUIDANCE: Final[str] = (
+    "An entry whose error_code has no entry under 'validation_guidance.codes' — or that has no error_code "
+    "at all — can be expanded by calling explain_validation_error with the entry's error_code, or with its "
+    "full message when it has none."
+)
+"""Freeform-envelope pointer (``validation_guidance.explain_tool``): names the container the codes live in,
+so the model knows which codes the call can still add something for (elspeth-e405ad7cd2)."""
+
+
+def build_validation_guidance(codes: Iterable[str | None]) -> ValidationGuidance | None:
+    """Resolve a failed envelope's error codes to inline catalogue guidance.
+
+    The freeform twin of the planner's ``_allowlisted_candidate_feedback``
+    enrichment: the two surfaces read the SAME closed catalogue, so a model
+    on either one gets the repair text without spending a turn on
+    ``explain_validation_error``. Same rationale as the ``plugin_schemas``
+    augmentation that already rides these envelopes.
+
+    Every value is STATIC catalogue text — a public constant, never
+    per-request data. :func:`_augment_with_expected_hint` is deliberately NOT
+    applied, for the reason :func:`explain_validation_code` gives: there is
+    no ``error_text`` here to mine an ``Expected …`` hint from, only the bare
+    code. The mapping is also keyed BY code, so one entry serves every error
+    sharing it; splicing a per-entry message span into a per-code entry would
+    make N colliding entries whose text depended on which one was visited
+    last. Static text keeps all callers reading identical catalogue bytes.
+
+    Custody: this rides ``ToolResult.validation_guidance``, declared
+    ``_SafeResponseEnvelope`` in the redaction manifest, so the audit
+    projection collapses it to ``<redacted-response-mapping>`` exactly as it
+    collapses ``validation.errors[].message``. The provider sees the full
+    text; persistence sees a placeholder.
+
+    ``explain_tool`` is advertised only while some code arrived WITHOUT inline
+    guidance, which is exactly when the call can still add something: for an
+    already-enriched code the tool returns byte-equivalent text and the turn
+    is wasted (elspeth-41b406c9fc). An unresolved code is still worth the
+    call on this surface — the tool also matches on the full validator
+    message, which this envelope carries and the code lookup cannot use.
+
+    Returns ``None`` for an envelope with no error entries at all, so a
+    success carries no key.
+    """
+    resolved: dict[str, ValidationCodeGuidance] = {}
+    saw_entry = False
+    any_unresolved = False
+    for code in codes:
+        saw_entry = True
+        if code is None:
+            any_unresolved = True
+            continue
+        guidance = explain_validation_code(code)
+        if guidance is None:
+            any_unresolved = True
+            continue
+        explanation, suggested_fix = guidance
+        resolved[code] = ValidationCodeGuidance(explanation=explanation, suggested_fix=suggested_fix)
+    if not saw_entry:
+        return None
+    payload = ValidationGuidance(codes=resolved)
+    if any_unresolved:
+        payload["explain_tool"] = EXPLAIN_TOOL_GUIDANCE
+    return payload
+
+
+# Static text, never per-request data — the same public-constant posture as
+# every catalogue entry above, so it cannot re-open the message boundary the
+# planner's allowlist protects.
+_WITHHELD_VALIDATION_GUIDANCE: Final[tuple[str, str]] = (
+    "This error is on a component whose configuration is bound server-side for this surface. "
+    "Its true component id and validator detail are deliberately withheld: the message could "
+    "quote reviewed private values that are redacted from this conversation.",
+    "Do not guess at the withheld configuration — you cannot see or edit it. Re-verify only the "
+    "components you authored yourself: call get_plugin_schema(<plugin_type>, <plugin_name>) for "
+    "the exact option shapes and allowed values, and change only fields the other errors name. "
+    "If visible rejection classifiers repeat, compare the fields you changed: matching classifiers alone do not "
+    "prove the cause is unchanged or that repair is impossible. When necessary facts remain withheld, explain that "
+    "limitation and ask for the smallest actionable input rather than guessing.",
+)
+
+
+def explain_withheld_validation_code(code: str) -> tuple[str, str] | None:
+    """Blind-mode ``(explanation, suggested_fix)`` for a withheld rejection entry.
+
+    The planner's repair feedback withholds a rejection entry's component id
+    and validator detail when the entry is about a finalizer-owned component
+    (such as auto-wired controls). The ordinary catalogue guidance is
+    dishonest in that mode: ``plugin_options_invalid``'s fix opens with
+    "Apply exactly what 'detail' names" when no detail is present, which
+    sent live planners chasing a field that does not exist and burned the
+    repair budget on re-emissions. This accessor returns guidance that is
+    honest about the blindness for EVERY code — unlike
+    :func:`explain_validation_code` it never returns ``None`` for a
+    well-formed code, because naming the withholding is precisely the point.
+    """
+    if type(code) is not str or not code:
+        return None
+    if code in {reason.value for reason in PluginUnavailableReason}:
+        guidance = explain_validation_code(code)
+        assert guidance is not None
+        # Availability remedies use only the closed code, not private validator
+        # detail. Keep that diagnosis while explicitly withholding the binding.
+        return (
+            f"{_WITHHELD_VALIDATION_GUIDANCE[0]} {guidance[0]}",
+            f"Do not guess at or edit the withheld configuration. {guidance[1]}",
+        )
+    return _WITHHELD_VALIDATION_GUIDANCE
+
+
+def _execute_explain_validation_error(
+    args: dict[str, Any],
+    state: CompositionState,
+    context: ToolContext,
+) -> ToolResult:
+    validated = _validate_mutation_arguments(ExplainValidationErrorArgumentsModel, args, "explain_validation_error arguments")
+    """Explain a validation error with human-readable diagnosis and fix."""
+    validation = context.catalog.validate_composition_state(state).validation
+    error_text = validated.error_text
+    # Runtime merge reasons are not validation error codes. Keep this exact
+    # reason separate from the closed build-time code registry.
+    if error_text == "union_field_collision":
+        return ToolResult(
+            success=True,
+            updated_state=state,
+            validation=validation,
+            affected_nodes=(),
+            data={
+                "error_text": error_text,
+                "explanation": "A union merge encountered more than one value for the same field and its runtime collision policy failed that merge group.",
+                "suggested_fix": "Inspect the contributing branches in run diagnostics and give independent results distinct field names. The collision policy is external runtime configuration; Composer cannot author it.",
+            },
+        )
+    exact = explain_validation_code(error_text)
+    if exact is not None:
+        explanation, fix = exact
+        return ToolResult(
+            success=True,
+            updated_state=state,
+            validation=validation,
+            affected_nodes=(),
+            data={"error_text": error_text, "error_code": error_text, "explanation": explanation, "suggested_fix": fix},
+        )
+    for record in _VALIDATION_ERROR_PATTERNS:
+        pattern, explanation, fix = record
+        if re.search(pattern, error_text):
+            # A legacy regex owns only the codes bound to this exact record by
+            # the catalogue. Shared prose is not identity, and another code in
+            # the input must not override the first matching regex's diagnosis.
+            codes = [code for code, guidance in _VALIDATION_GUIDANCE_BY_CODE.items() if guidance is record]
+            matched_code = next(
+                (code for code in codes if code.lower() in error_text.lower()),
+                codes[0] if len(codes) == 1 else None,
+            )
+            return ToolResult(
+                success=True,
+                updated_state=state,
+                validation=validation,
+                affected_nodes=(),
+                data={
+                    "error_text": error_text,
+                    **({"error_code": matched_code} if matched_code is not None else {}),
+                    "explanation": explanation,
+                    "suggested_fix": _augment_with_expected_hint(fix, error_text),
+                },
+            )
+    # Fuzzy route: live planners pass junk like "ValidationError" or
+    # "node:X ValidationError validation_error" instead of the message or the
+    # bare code. A closed code buried in noise (any case) still resolves —
+    # the direct pattern pass above is case-sensitive, so this catches e.g.
+    # an upper-cased code echoed from a log line.
+    lowered = error_text.lower()
+    for code in _CLOSED_VALIDATION_ERROR_CODES:
+        if code.lower() in lowered:
+            guidance = explain_validation_code(code)
+            if guidance is None:  # pragma: no cover — catalogue invariant is test-pinned
+                continue
+            explanation, fix = guidance
+            return ToolResult(
+                success=True,
+                updated_state=state,
+                validation=validation,
+                affected_nodes=(),
+                data={
+                    "error_text": error_text,
+                    "error_code": code,
+                    "explanation": explanation,
+                    "suggested_fix": _augment_with_expected_hint(fix, error_text),
+                },
+            )
+    # No match at all — teach usage instead of an unhelpful generic. The codes
+    # are a public static catalogue, so listing them leaks nothing — but ONLY
+    # inside ``suggested_fix``: a ``known_codes`` array here (117 entries)
+    # exceeds RESPONSE_PROJECTION_MAX_CONTAINER_WIDTH (64) and collapses the
+    # whole persisted audit row to a ``response_projection_limit`` stub
+    # (elspeth-3e28029d2f). The planner reads the same codes from the string.
+    return ToolResult(
+        success=True,
+        updated_state=state,
+        validation=validation,
+        affected_nodes=(),
+        data={
+            "error_text": error_text,
+            "explanation": "The text does not match any known validation message or closed error_code.",
+            "suggested_fix": _augment_with_expected_hint(
+                "Call explain_validation_error with the exact error_code string from the rejection "
+                "feedback's validation.errors[].error_code. Closed codes: " + ", ".join(_CLOSED_VALIDATION_ERROR_CODES) + ".",
+                error_text,
+            ),
+        },
+    )
+
+
+_EXPLAIN_VALIDATION_ERROR_DECLARATION = ToolDeclaration(
+    name="explain_validation_error",
+    response_contract=EXPLAIN_VALIDATION_ERROR_RESPONSE_CONTRACT,
+    handler=_execute_explain_validation_error,
+    kind=ToolKind.DISCOVERY,
+    description="Get a human-readable explanation of a validation error "
+    "with suggested fixes. Pass the entry's `message`, or its `error_code` when "
+    "that is all you have. Returns the `error_text` echoed, an `explanation`, a "
+    "`suggested_fix`, and — when the text matched a closed code — the `error_code`.",
+    json_schema={
+        "type": "object",
+        "properties": {
+            "error_text": {
+                "type": "string",
+                "description": "The validation error message to explain.",
+            },
+        },
+        "required": ["error_text"],
+        "additionalProperties": False,
+    },
+    cacheable=True,
+)
+
+
+def _serialize_plugin_assistance_example(
+    example: Any,
+) -> dict[str, Any]:
+    """Serialize a PluginAssistanceExample for LLM consumption.
+
+    Mirrors the serialize-at-the-boundary pattern used by
+    ``_semantic_edge_contract_to_payload`` (composer_mcp/server.py) and
+    ``serialize_semantic_contracts`` (web/execution/_semantic_helpers.py):
+    L0 contract types intentionally have no ``.to_dict()``; the rendering
+    site owns the JSON shape so contracts stay free of encoding concerns.
+    """
+    return {
+        "title": example.title,
+        "before": deep_thaw(example.before) if example.before is not None else None,
+        "after": deep_thaw(example.after) if example.after is not None else None,
+    }
+
+
+def _execute_get_plugin_assistance(
+    args: dict[str, Any],
+    state: CompositionState,
+    context: ToolContext,
+) -> ToolResult:
+    """Return plugin-owned guidance for a source, transform, or sink.
+
+    Dual-use by ``issue_code``:
+
+    * ``issue_code is None`` (or absent) — discovery-time guidance. The
+      plugin returns a one-line ``summary`` and ``composer_hints``
+      (same surface that list_* and get_plugin_schema already carry).
+      ``examples`` may also be populated here — it is plugin-defined,
+      not exclusive to failure mode (e.g. ``llm`` publishes a worked
+      ``queries`` exemplar in discovery mode).
+    * ``issue_code is not None`` — failure-time guidance. The
+      semantic validator emits ``requirement_code`` values like
+      ``line_explode.source_field.line_framed_text``; the agent echoes
+      that code in to retrieve ``suggested_fixes`` + example
+      before/after configs.
+
+    When the plugin has no assistance to publish, returns success with
+    a "no assistance published" payload (summary=None, empty lists)
+    rather than failing — the absence is itself a useful signal.
+
+    Unavailable selections return the policy owner's refusal. Invalid
+    arguments belong to the owned argument model; admitted catalog or
+    manager inconsistencies propagate through their fault owners.
+    """
+    validated = _validate_mutation_arguments(GetPluginAssistanceArgumentsModel, args, "get_plugin_assistance arguments")
+    plugin_type = validated.plugin_type
+    plugin_name = validated.plugin_name
+    issue_code = validated.issue_code
+
+    policy_error = _plugin_selection_violation(context, plugin_type, plugin_name)
+    if policy_error is not None:
+        return _saved_graph_plugin_policy_failure(state, policy_error, component=None, rejected_component=None)
+    context.catalog.get_schema(plugin_type, plugin_name)
+
+    manager = get_shared_plugin_manager()
+    if plugin_type == "source":
+        plugin_cls: Any = manager.get_source_by_name(plugin_name)
+    elif plugin_type == "transform":
+        plugin_cls = manager.get_transform_by_name(plugin_name)
+    else:
+        plugin_cls = manager.get_sink_by_name(plugin_name)
+
+    assistance = plugin_cls.get_agent_assistance(issue_code=issue_code)
+    if assistance is not None:
+        assistance = context.catalog.project_agent_assistance(plugin_type, plugin_name, assistance)
+
+    if assistance is None:
+        payload: dict[str, Any] = {
+            "plugin_type": plugin_type,
+            "plugin_name": plugin_name,
+            "issue_code": issue_code,
+            "summary": None,
+            "suggested_fixes": [],
+            "examples": [],
+            "composer_hints": [],
+        }
+        return _discovery_result(state, payload)
+
+    payload = {
+        "plugin_type": plugin_type,
+        "plugin_name": assistance.plugin_name,
+        "issue_code": assistance.issue_code,
+        "summary": assistance.summary,
+        "suggested_fixes": list(assistance.suggested_fixes),
+        "examples": [_serialize_plugin_assistance_example(ex) for ex in assistance.examples],
+        "composer_hints": list(assistance.composer_hints),
+    }
+    return _discovery_result(state, payload)
+
+
+_GET_PLUGIN_ASSISTANCE_DECLARATION = ToolDeclaration(
+    name="get_plugin_assistance",
+    response_contract=PLUGIN_ASSISTANCE_RESPONSE_CONTRACT,
+    handler=_execute_get_plugin_assistance,
+    kind=ToolKind.DISCOVERY,
+    description=(
+        "Retrieve plugin-owned guidance for a source, transform, or sink. "
+        "Two modes by ``issue_code``:\n"
+        "  * Omit ``issue_code`` (or pass null) to get discovery-time guidance "
+        "    — a `summary` of the plugin and its `composer_hints`. (The same hints "
+        "    are also carried on list_sources / list_transforms / list_sinks / "
+        "    get_plugin_schema responses; this tool is the explicit path.) `examples` "
+        "    may also be populated in this mode — it is plugin-defined, not exclusive "
+        "    to failure mode.\n"
+        "  * Pass an ``issue_code`` (validators emit these as requirement_code "
+        "    on semantic_contracts entries) to get failure-time guidance — "
+        "    `summary`, `suggested_fixes`, and `examples` — each a `title` with the "
+        "    `before` and `after` configurations it contrasts.\n"
+        "Every result names the `plugin_name` and `plugin_type` it describes; a plugin with no published "
+        "guidance returns `summary` null and empty lists."
+    ),
+    json_schema={
+        "type": "object",
+        "properties": {
+            "plugin_type": {
+                "type": "string",
+                "enum": ["source", "transform", "sink"],
+                "description": "Plugin family. 'source', 'transform', or 'sink'.",
+            },
+            "plugin_name": {
+                "type": "string",
+                "description": "Plugin name (e.g. 'csv', 'web_scrape', 'database').",
+            },
+            "issue_code": {
+                "type": ["string", "null"],
+                "description": (
+                    "Optional. Stable issue identifier owned by the plugin "
+                    "for failure-time guidance. Omit or pass null for "
+                    "discovery-time guidance."
+                ),
+            },
+        },
+        "required": ["plugin_type", "plugin_name"],
+        "additionalProperties": False,
+    },
+    cacheable=True,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AuditInfoResponse:
+    enabled: Literal[True]
+    composer_modifiable: Literal[False]
+    summary: str
+    audit_export_summary: str
+
+
+def _admit_audit_info(value: object) -> AuditInfoResponse:
+    if type(value) is AuditInfoResponse:
+        enabled = value.enabled
+        modifiable = value.composer_modifiable
+        summary = value.summary
+        export = value.audit_export_summary
+    elif isinstance(value, Mapping) and value.keys() == {"enabled", "composer_modifiable", "summary", "audit_export_summary"}:
+        enabled = value["enabled"]
+        modifiable = value["composer_modifiable"]
+        summary = value["summary"]
+        export = value["audit_export_summary"]
+    else:
+        raise FrameworkBugError("Malformed audit information response")
+    if enabled is not True or modifiable is not False or type(summary) is not str or type(export) is not str:
+        raise FrameworkBugError("Malformed audit information response")
+    return AuditInfoResponse(enabled, modifiable, summary, export)
+
+
+def _encode_audit_info(value: AuditInfoResponse) -> JsonValue:
+    return {
+        "enabled": value.enabled,
+        "composer_modifiable": value.composer_modifiable,
+        "summary": value.summary,
+        "audit_export_summary": value.audit_export_summary,
+    }
+
+
+AUDIT_INFO_RESPONSE_CONTRACT = SelectedResponseContract(_admit_audit_info, _encode_audit_info)
+
+
+def _execute_get_audit_info(
+    args: dict[str, Any],
+    state: CompositionState,
+    context: ToolContext,
+) -> ToolResult:
+    _validate_mutation_arguments(EmptyToolArgumentsModel, args, "get_audit_info arguments")
+    """Return constant facts about the Landscape audit trail.
+
+    Audit is mandatory (`LandscapeSettings` rejects `enabled=false` at
+    config validation time) and the backend URL is operator-managed via
+    `WebSettings.get_landscape_url()` — security fix S1, see
+    `web/composer/yaml_generator.py:179`. Letting the composer set the
+    audit backend would let a user prompt redirect the audit trail to an
+    attacker DB, disable encryption, or split audit across stores.
+
+    The returned payload is a constant — no `WebSettings` access — so
+    operator-internal config (URL, backend type, encryption-key env var)
+    never reaches the LLM context. The model paraphrases `summary`; it
+    does not need the URL itself.
+    """
+    del context  # unused; signature uniformity with the other handlers.
+    payload = {
+        "enabled": True,
+        "composer_modifiable": False,
+        "summary": (
+            "Landscape audit is mandatory and always on for every pipeline run. "
+            "The audit backend (database type, location, encryption) is configured "
+            "by the operator at deploy time and is intentionally NOT addressable "
+            "from the composer — letting the composer set it would be a security "
+            "regression (audit-DSN injection, encryption bypass, audit split-brain). "
+            "When a user asks for 'audit logging', 'SQLite audit', or similar: "
+            "acknowledge that audit is already enabled for every run, do NOT add a "
+            "sink shape for it, and do NOT silently remove an audit-shaped node by "
+            "treating it as 'unconnected'. To inspect past runs, point the user at "
+            "the Landscape MCP forensic tools."
+        ),
+        "audit_export_summary": (
+            "A separate optional feature ('landscape.export') can copy each run's "
+            "audit data to an additional sink for offline review. This is also "
+            "operator-configured and is not currently composer-controllable. If a "
+            "user asks for 'export the audit data to a file', explain that this is "
+            "an operator-side configuration and is not part of the pipeline the "
+            "composer is building."
+        ),
+    }
+    return _discovery_result(state, payload)
+
+
+_GET_AUDIT_INFO_DECLARATION = ToolDeclaration(
+    response_contract=AUDIT_INFO_RESPONSE_CONTRACT,
+    name="get_audit_info",
+    handler=_execute_get_audit_info,
+    kind=ToolKind.DISCOVERY,
+    description=(
+        "Return facts about ELSPETH's Landscape audit trail. Call this BEFORE "
+        "answering any user question that mentions audit logging, audit "
+        "database, SQLite/Postgres audit, audit backend, audit export, "
+        "Landscape, or 'how do I record what the pipeline did'. Audit is "
+        "mandatory and operator-managed; the composer cannot configure the "
+        "backend (security boundary — see yaml_generator.py:179, fix S1). "
+        "Returns `enabled`, the `composer_modifiable` flag, a canonical "
+        "`summary` to paraphrase, and `audit_export_summary` (the optional "
+        "operator-configured export feature, also not composer-controllable). "
+        "Does NOT return the audit URL/path/DSN — "
+        "that is operator-internal and intentionally not surfaced to the LLM."
+    ),
+    json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+    cacheable=True,
+)
+
+
+def _execute_list_models(
+    args: dict[str, Any],
+    state: CompositionState,
+    context: ToolContext,
+) -> ToolResult:
+    """List available LLM model identifiers.
+
+    Without a provider filter, returns provider names and model counts
+    to avoid dumping hundreds of entries. With a provider filter,
+    returns matching model IDs capped at ``limit``.
+
+    For ``provider="openrouter/"`` the slugs are read from the live
+    OpenRouter catalog primed at boot (or the bundled litellm fallback
+    when the primer hasn't run / is offline) via
+    :func:`get_catalog_values` against :data:`MODEL_CATALOG_OPENROUTER` —
+    the same catalog accessor the value-source compliance walker
+    consults at preflight. Sharing one source of truth between the
+    composer's discovery surface and the validator closes the
+    "composer recommended a model the validator then rejects" loop
+    that previously surfaced as ``ValueSourceValidationError`` on
+    tutorial runs. Non-OpenRouter providers continue to be served from
+    the bundled litellm list because no per-provider live primer exists
+    yet.
+    """
+    del context  # unused; signature uniformity with the other handlers.
+    all_models: list[str] = list(read_litellm_model_list())
+
+    # ``args`` is LLM tool-call arguments (Tier 3). Both ``provider`` and
+    # ``limit`` are optional (json_schema ``required: []``). ``provider``
+    # absence is recorded honestly as ``None`` (membership form). ``limit``
+    # absence resolves to the documented default of 50 (the json_schema
+    # description states "default 50") — a meaning-preserving substitution, not
+    # fabrication. The scalar type checks use ``type() is`` so a bool ``limit``
+    # (``isinstance(True, int)`` is True) is correctly rejected at the boundary.
+    validated = _validate_mutation_arguments(ListModelsArgumentsModel, args, "list_models arguments")
+    provider = validated.provider
+    limit = validated.limit
+
+    if provider is not None and type(provider) is str:
+        normalised = provider.rstrip("/")
+        if normalised == OPENROUTER_LITELLM_PREFIX.rstrip("/"):
+            # Live-catalog read returns un-prefixed slugs already (e.g.
+            # ``anthropic/claude-sonnet-4.5``) — exactly the form the
+            # OpenRouterLLMProvider config field ``model`` expects and
+            # the value-source walker compares against. No prefix strip
+            # needed; the litellm fallback path inside
+            # ``get_catalog_values`` already strips ``openrouter/`` from
+            # its bundled list.
+            filtered = sorted(get_catalog_values(MODEL_CATALOG_OPENROUTER))
+        elif provider == "":
+            # Empty string means "models without a provider prefix"
+            filtered = [m for m in all_models if "/" not in m]
+        else:
+            filtered = [m for m in all_models if m.startswith(provider)]
+        truncated = len(filtered) > limit
+        data: dict[str, Any] = {
+            "models": filtered[:limit],
+            "count": len(filtered),
+            "truncated": truncated,
+        }
+    else:
+        # Group by provider prefix to avoid token waste. ``providers`` is our
+        # own freshly-constructed accumulator dict, not a Tier-3 boundary, so
+        # the offensive-programming rule rejects ``providers.get(prefix, 0)``
+        # as a defensive read on data we wrote. Initialize the slot
+        # explicitly before increment instead.
+        providers: dict[str, int] = {}
+        for m in all_models:
+            prefix = m.split("/", 1)[0] if "/" in m else ""
+            if prefix not in providers:
+                providers[prefix] = 0
+            providers[prefix] += 1
+        # Replace the bundled-litellm openrouter count with the live
+        # catalog size so the unfiltered summary advertises the same
+        # numbers a follow-up ``provider="openrouter/"`` filter will
+        # return. The litellm bundled list and the live OpenRouter
+        # catalog drift apart as Anthropic / OpenAI rotate model slugs;
+        # advertising the bundled count would invite the composer to
+        # request a "known" model that the validator then rejects.
+        openrouter_key = OPENROUTER_LITELLM_PREFIX.rstrip("/")
+        live_openrouter = get_catalog_values(MODEL_CATALOG_OPENROUTER)
+        if openrouter_key in providers:
+            bundled = providers[openrouter_key]
+            providers[openrouter_key] = len(live_openrouter)
+            total_models = len(all_models) - bundled + len(live_openrouter)
+        else:
+            providers[openrouter_key] = len(live_openrouter)
+            total_models = len(all_models) + len(live_openrouter)
+        data = {
+            "providers": providers,
+            "total_models": total_models,
+            "hint": "Use provider parameter to list models for a specific provider. An empty string key means models without a provider prefix.",
+        }
+
+    return _discovery_result(state, data)
+
+
+_LIST_MODELS_DECLARATION = ToolDeclaration(
+    name="list_models",
+    response_contract=LIST_MODELS_RESPONSE_CONTRACT,
+    handler=_execute_list_models,
+    kind=ToolKind.DISCOVERY,
+    description="List available LLM model identifiers. Without a provider "
+    "filter, returns provider names and counts. With a provider filter, "
+    "returns matching model IDs (capped at limit). For provider='openrouter/' "
+    "the returned slugs are normalised to OpenRouter's HTTP API form "
+    "(without the litellm-internal 'openrouter/' routing prefix) — these "
+    "are the values to put directly in `model:`. Result `data` carries "
+    "`providers` (provider name → model count) with `total_models` and a "
+    "`hint` on narrowing the query when no filter is given, or `models` with "
+    "`count` (matches found) and `truncated` (true when the limit cut the "
+    "list) with a filter.",
+    json_schema={
+        "type": "object",
+        "properties": {
+            "provider": {
+                "type": "string",
+                "description": "Provider prefix to filter by (e.g. 'openrouter/', 'azure/'). "
+                "Omit to get a provider summary instead of individual models.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 50,
+                "description": "Max models to return (default 50).",
+            },
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+    cacheable=True,
+)
+
+
+_BLOCKING_DIAGNOSTIC_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "aggregation_numeric_value_field_type_mismatch_against_source_schema",
+        "csv_duplicate_headers",
+        "csv_fixed_schema_omits_observed_columns",
+        "csv_source_blob_header_mismatch",
+        "csv_source_field_resolution_error",
+        "gate_expression_preview_memory_exhaustion",
+        "gate_expression_type_mismatch_against_source_schema",
+        "declared_input_type_mismatch_against_source_schema",
+        "gate_expression_unbounded_string_amplification",
+        "text_source_url_without_web_scrape",
+        "source_inspection_failed",
+        "source_blob_unavailable",
+    }
+)
+_MAX_PROOF_BLOB_SOURCES: Final[int] = 256
+_MAX_DECLARED_INPUT_TYPE_PROOF_CHECKS: Final[int] = 256
+_MAX_DECLARED_INPUT_TYPE_DIAGNOSTICS: Final[int] = 16
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedProofBlob:
+    """One custody-resolved blob with verified bounded content."""
+
+    metadata: BlobToolRecord
+    verified_prefix: bytes
+    verified_content_hash: str
+    total_size_bytes: int
+
+    def __post_init__(self) -> None:
+        if type(self.verified_prefix) is not bytes or len(self.verified_prefix) > 8 * 1024:
+            raise TypeError("verified proof prefix must be exact bytes bounded to 8192 bytes")
+        if type(self.verified_content_hash) is not str:
+            raise TypeError("verified proof content hash must be an exact string")
+        if type(self.total_size_bytes) is not int or self.total_size_bytes < len(self.verified_prefix):
+            raise TypeError("verified proof total size must be an exact int no smaller than the prefix")
+        stored_hash = self.metadata["content_hash"]
+        if stored_hash is None:
+            raise AuditIntegrityError("ready proof blob has null content_hash")
+        if not hmac.compare_digest(stored_hash, self.verified_content_hash):
+            raise BlobIntegrityError(
+                self.metadata["id"],
+                expected=stored_hash,
+                actual=self.verified_content_hash,
+            )
+        if self.metadata["size_bytes"] != self.total_size_bytes:
+            raise AuditIntegrityError("verified proof blob size differs from its custody metadata")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class UnresolvedClaimedProofBlob:
+    """Nominal marker that a reviewed sentinel's custody claim failed.
+
+    ``@final`` is load-bearing, not decoration: ``_compute_proof_diagnostics_for_source``
+    discriminates the closed ``ResolvedProofBlob | UnresolvedClaimedProofBlob | None``
+    resolver union with the house ``type(x) is C`` idiom, which only narrows the
+    negative branch to ``ResolvedProofBlob`` because this marker cannot be subclassed.
+    """
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ComposerProofContext:
+    """Complete dependencies for proof through the existing fenced blob reader.
+
+    This carrier grants no authority; the reader still verifies the operation
+    against the store under its normal custody lock.
+    """
+
+    session_engine: Engine
+    session_id: str
+    data_dir: str
+    operation: SessionOperationContext
+    authority: SessionOperationAuthority
+
+    def __post_init__(self) -> None:
+        if type(self.operation) is not SessionOperationContext or self.authority is None:
+            raise AuditIntegrityError("Source proof requires the actual session operation context and authority")
+        if self.operation.fence.session_id != self.session_id:
+            raise AuditIntegrityError("Source proof context does not match the requested store")
+        if not isinstance(self.session_engine, Engine):
+            raise TypeError("Source proof requires a session Engine")
+        if type(self.data_dir) is not str or not self.data_dir:
+            raise TypeError("Source proof requires a storage root")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _AuthoritativeProofContext:
+    """Resolver captured by the execution owner's exact custody factory."""
+
+    resolve: Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None]
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ProofNotApplicable:
+    """No source claims scalar blob content; no proof was performed."""
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ProofEvaluated:
+    """Bounded proof diagnostics were evaluated, including configuration faults."""
+
+    diagnostics: tuple[Mapping[str, Any], ...]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "diagnostics")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ProofUnavailable:
+    """At least one claimed source could not supply verified ready evidence."""
+
+    diagnostics: tuple[Mapping[str, Any], ...]
+
+    def __post_init__(self) -> None:
+        if not any(d["code"] == "source_blob_unavailable" and d["severity"] == "blocking" for d in self.diagnostics):
+            raise AuditIntegrityError("Unavailable source proof requires a blocking availability diagnostic")
+        freeze_fields(self, "diagnostics")
+
+
+class MalformedSourceProofClaim(ValueError):
+    """A present scalar claim is invalid; raw authored values are never retained."""
+
+    def __init__(self, source_name: str, reason: str) -> None:
+        self.source_name = source_name
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _admit_source_proof_claims(state: CompositionState) -> tuple[tuple[str, SourceSpec, str], ...]:
+    """Admit every present scalar identity before any metadata or byte read."""
+    claims: list[tuple[str, SourceSpec, str]] = []
+    for name, source in state.sources.items():
+        if "blob_ref" not in source.options:
+            continue
+        raw = source.options["blob_ref"]
+        if type(raw) is not str:
+            raise MalformedSourceProofClaim(name, "The source blob claim must be an exact canonical UUID string.")
+        try:
+            parsed = UUID(raw)
+        except ValueError:
+            raise MalformedSourceProofClaim(name, "The source blob claim must be a canonical UUID string.") from None
+        if str(parsed) != raw:
+            raise MalformedSourceProofClaim(name, "The source blob claim must use canonical UUID spelling.")
+        claims.append((name, source, raw))
+    return tuple(claims)
+
+
+class _BlockingDiagnosticPayload(TypedDict):
+    code: str
+    severity: Literal["blocking"]
+    message: str
+    suggested_repair: str
+    evidence_locator: Mapping[str, Any]
+
+
+def _blocking_diagnostic(
+    *,
+    code: str,
+    message: str,
+    suggested_repair: str,
+    evidence_locator: Mapping[str, Any],
+) -> _BlockingDiagnosticPayload:
+    """Construct a blocking diagnostic dict and assert the code is registered.
+
+    Offensive: a contributor who adds a new blocker without registering it in
+    ``_BLOCKING_DIAGNOSTIC_CODES`` (and the matching skill-markdown vocabulary)
+    crashes immediately rather than shipping an unrecognised code into the
+    audit trail and the LLM's repair-message context.
+    """
+    if code not in _BLOCKING_DIAGNOSTIC_CODES:
+        raise AssertionError(
+            f"blocking diagnostic code {code!r} is not registered in "
+            f"_BLOCKING_DIAGNOSTIC_CODES. Add it there (and to the skill-"
+            f"markdown vocabulary the composer LLM consumes) before emitting "
+            f"a blocking diagnostic with this code."
+        )
+    return {
+        "code": code,
+        "severity": "blocking",
+        "message": message,
+        "suggested_repair": suggested_repair,
+        "evidence_locator": evidence_locator,
+    }
+
+
+def _csv_source_field_resolution_error_diagnostic(
+    *,
+    blob_id: object,
+    facts: SourceInspectionFacts,
+    exc: ValueError,
+) -> _BlockingDiagnosticPayload:
+    return _blocking_diagnostic(
+        code="csv_source_field_resolution_error",
+        message=(
+            "CSV source header resolution failed before proof diagnostics could compare "
+            "declared fields to observed headers. CSVSource would reject this shape at "
+            "runtime, so preview_pipeline is blocking it for repair. The raw resolver "
+            "error text and observed header values are withheld: header-resolution "
+            "failure means a headerless or malformed CSV can make the first data row "
+            "look like headers, so those values are treated as potential row content."
+        ),
+        suggested_repair=(
+            "Rename colliding or invalid CSV headers, correct field_mapping keys and "
+            "values to match normalized source headers, or declare explicit `columns` "
+            "for headerless input, then re-run preview_pipeline."
+        ),
+        evidence_locator={
+            "source": "blob",
+            "blob_id": str(blob_id),
+            "error_class": type(exc).__name__,
+            "observed_header_count": len(facts.observed_headers or ()),
+            "observed_headers_redacted": True,
+        },
+    )
+
+
+def _csv_source_schema_config_error_diagnostic(
+    *,
+    blob_id: object,
+    facts: SourceInspectionFacts,
+    exc: ValueError,
+) -> _BlockingDiagnosticPayload:
+    """Distinct repair guidance for a ``schema.*``-block parse failure.
+
+    Shares the registered ``csv_source_field_resolution_error`` code (the
+    composer LLM's repair vocabulary and the skill markdown are keyed on that
+    code; adding a new code would silently half-wire the LLM contract), but the
+    repair text points at the ``schema.*`` knob rather than at header /
+    field_mapping / columns resolution. A failure from ``get_raw_schema_config``
+    is a malformed *schema declaration* (bad ``schema.mode``, a malformed field
+    spec, a non-bool required flag), NOT a header-resolution problem — so the
+    generic field-resolution repair text would misdirect the operator and the
+    LLM. The raw ``{exc}`` is NOT interpolated: it can quote observed header /
+    field values that, under a failed header resolution, may be row content; the
+    exception class is surfaced structurally instead and the repair text points
+    at the ``schema.*`` knob.
+    """
+    return _blocking_diagnostic(
+        code="csv_source_field_resolution_error",
+        message=(
+            "CSV source schema declaration failed to parse before proof diagnostics "
+            "could compare declared fields to observed headers. CSVSource would reject "
+            "this schema at runtime, so preview_pipeline is blocking it for repair. The "
+            "raw parser error text and observed header values are withheld (they may "
+            "carry row content for a headerless or malformed CSV)."
+        ),
+        suggested_repair=(
+            "Correct the source `schema` block: `schema.mode` must be one of "
+            "'fixed'/'flexible'/'observed', each entry in `schema.fields` must be a "
+            "valid field spec (a 'name: type' string or a mapping with a str name and a "
+            "bool required flag), then re-run preview_pipeline."
+        ),
+        evidence_locator={
+            "source": "blob",
+            "blob_id": str(blob_id),
+            "error_class": type(exc).__name__,
+            "observed_header_count": len(facts.observed_headers or ()),
+            "observed_headers_redacted": True,
+        },
+    )
+
+
+@observation_boundary(
+    tier=3,
+    source="The `schema` block inside a persisted SourceSpec options mapping — composer/operator-authored values re-read from session state",
+    source_param="source",
+    suppresses=("R5",),
+    invariant=(
+        "Observes the declared schema mode: returns options['schema']['mode'] lowercased only when "
+        "that block is a mapping carrying a str mode, and None for every other shape. Never raises on "
+        "any options content."
+    ),
+)
+def _source_schema_mode(source: SourceSpec) -> str | None:
+    # ``source.options`` is composer/user-authored config re-read from persisted
+    # session state — Tier-3 origin (we authored the container, they authored the
+    # values), so absence is recorded as ``None`` and shape is validated, never
+    # coerced. Membership form (not ``.get``) makes the honest absence→None
+    # explicit at the boundary.
+    schema = source.options["schema"] if "schema" in source.options else None
+    if not isinstance(schema, Mapping):
+        return None
+    mode = schema["mode"] if "mode" in schema else None
+    if type(mode) is not str:
+        return None
+    return mode.strip().lower()
+
+
+def _sample_csv_rows(content: bytes, *, filename: str, max_rows: int = 100) -> tuple[dict[str, str], ...]:
+    text = content[: 8 * 1024].decode("utf-8", errors="replace")
+    delimiter = "\t" if filename.lower().endswith(".tsv") else ","
+    reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
+    rows: list[dict[str, str]] = []
+    for index, row in enumerate(reader):
+        if index >= max_rows:
+            break
+        rows.append({key: value for key, value in row.items() if type(key) is str and value is not None})
+    return tuple(rows)
+
+
+def _row_fields_referenced_by_condition(condition: str) -> tuple[str, ...]:
+    tree = ast.parse(condition, mode="eval")
+    fields: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "row"
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, str)
+        ):
+            fields.append(node.slice.value)
+            continue
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "row"
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            fields.append(node.args[0].value)
+    return tuple(dict.fromkeys(fields))
+
+
+def _gate_expression_type_diagnostics_for_observed_csv(
+    state: CompositionState,
+    source_name: str,
+    source: SourceSpec,
+    *,
+    blob_id: str,
+    filename: str,
+    content: bytes,
+) -> list[Mapping[str, Any]]:
+    """Evaluate provably field-preserving source-fed gates against sampled rows.
+
+    Observed CSV sources emit raw strings because there are no declared field
+    types to coerce against. A gate such as ``row['amount'] >= 1000`` is
+    syntactically valid but fails at runtime when the evaluator compares
+    ``str`` with ``int``. This preview proof step uses the same expression
+    evaluator against bounded raw rows and reports the type mismatch without
+    surfacing row values.
+    """
+    if _source_schema_mode(source) != "observed":
+        return []
+
+    rows = _sample_csv_rows(content, filename=filename)
+    if not rows:
+        return []
+
+    diagnostics: list[Mapping[str, Any]] = []
+    gate_nodes = (node for node in state.nodes if node.node_type == "gate" and node.condition is not None)
+    for node in gate_nodes:
+        condition = node.condition
+        if condition is None:
+            continue
+        if _validate_gate_expression(condition) is not None:
+            continue
+        fields = _row_fields_referenced_by_condition(condition)
+        if not fields or not all(
+            _source_field_reaches_connection_without_type_change(
+                state,
+                node.input,
+                source_name=source_name,
+                field_name=field_name,
+            )
+            for field_name in fields
+        ):
+            continue
+        parser = ExpressionParser(condition)
+        field = fields[0] if fields else None
+        if parser.has_string_amplification_risk():
+            # THREAT-001: str repetition / printf-formatting over observed
+            # (string-typed) fields allocates output linear in the literal,
+            # per sampled row, inside the web process. Diagnose IN PLACE OF
+            # evaluating — never evaluate, never silently skip.
+            diagnostics.append(
+                _blocking_diagnostic(
+                    code="gate_expression_unbounded_string_amplification",
+                    message=(
+                        f"Gate '{node.id}' condition {condition!r} multiplies or %-formats a field that is "
+                        "string-typed under this observed CSV source. String repetition and formatting "
+                        "allocate output proportional to their inputs, so this expression is not evaluated "
+                        "at preview. If the field is meant to be numeric, declare it in the source schema; "
+                        "if string repetition/formatting is intended, it is not a routable gate condition."
+                    ),
+                    suggested_repair=(
+                        "Patch the source schema to declare the field with an explicit numeric type, for "
+                        "example schema.mode='fixed' or 'flexible' with schema.fields including "
+                        f"{field + ': int' if field is not None else '<field>: int'}, then re-run preview_pipeline."
+                    ),
+                    evidence_locator={
+                        "source": "blob",
+                        "blob_id": str(blob_id),
+                        "node_id": node.id,
+                        "field": field,
+                        "fields": list(fields),
+                        "source_schema_mode": "observed",
+                    },
+                )
+            )
+            continue
+        for row_index, row in enumerate(rows):
+            try:
+                parser.evaluate(row)
+            except ExpressionEvaluationError:
+                diagnostics.append(
+                    _blocking_diagnostic(
+                        code="gate_expression_type_mismatch_against_source_schema",
+                        message=(
+                            f"Gate '{node.id}' condition {condition!r} fails against sampled observed CSV "
+                            "rows before runtime. Observed CSV source values are strings unless the "
+                            "source schema declares explicit field types. (The raw evaluation error is "
+                            "withheld: it can quote sampled row values and the observed field/key set.)"
+                        ),
+                        suggested_repair=(
+                            "Patch the source schema to declare the compared field with an explicit numeric "
+                            "type, for example schema.mode='fixed' or 'flexible' with schema.fields including "
+                            f"{field + ': int' if field is not None else '<field>: int'}, then re-run preview_pipeline."
+                        ),
+                        evidence_locator={
+                            "source": "blob",
+                            "blob_id": str(blob_id),
+                            "node_id": node.id,
+                            "field": field,
+                            "fields": list(fields),
+                            "sample_row_index": row_index,
+                            "source_schema_mode": "observed",
+                        },
+                    )
+                )
+                break
+            except MemoryError:
+                # Belt-and-braces behind the amplification predicate: a
+                # resource event must not receive the schema-typing repair.
+                # By the time this fires the process is already degraded, so
+                # the diagnostic is best-effort — the predicate above is the
+                # actual bound.
+                diagnostics.append(
+                    _blocking_diagnostic(
+                        code="gate_expression_preview_memory_exhaustion",
+                        message=(
+                            f"Gate '{node.id}' condition {condition!r} exhausted memory while being "
+                            "evaluated against sampled observed CSV rows at preview. This is a resource "
+                            "failure, not a field-typing mismatch."
+                        ),
+                        suggested_repair=(
+                            "Simplify the gate condition so it does not build large intermediate values, then re-run preview_pipeline."
+                        ),
+                        evidence_locator={
+                            "source": "blob",
+                            "blob_id": str(blob_id),
+                            "node_id": node.id,
+                            "field": field,
+                            "fields": list(fields),
+                            "sample_row_index": row_index,
+                            "source_schema_mode": "observed",
+                        },
+                    )
+                )
+                break
+    return diagnostics
+
+
+_NUMERIC_VALUE_FIELD_AGGREGATION_PLUGINS: Final[frozenset[str]] = frozenset(
+    {
+        "batch_distribution_profile",
+        "batch_outlier_annotator",
+        "batch_rank",
+        "batch_stats",
+        "batch_threshold_summary",
+    }
+)
+
+
+def _pass_through_transform_plugin_names() -> frozenset[str]:
+    """Names of registered transforms declaring ``passes_through_input=True``.
+
+    Re-derived per call from the live registry (the ``_known_pass_through_plugins``
+    discipline in state.py): a plugin registered after module import must be
+    visible, and the read is a bounded scan over class attributes — no
+    instantiation. ``cls.passes_through_input`` is read directly; a missing
+    attribute is a framework bug and must crash loudly.
+    """
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    transforms = get_shared_plugin_manager().get_transforms()
+    return frozenset(cls.name for cls in transforms if cls.passes_through_input)
+
+
+def _probe_transform_output_declared_field_names(plugin: str, options: Mapping[str, Any]) -> frozenset[str] | None:
+    """Field names a transform's own output schema config declares, or None.
+
+    ``None`` means the probe could not construct the plugin from these options
+    (draft/malformed config — the contract-config validation rules own
+    reporting that) — callers must ABSTAIN. An empty frozenset means the
+    plugin constructed but declares no output fields; per the engine's
+    declaration discipline (``resolve_guaranteed_field_type``), a pass-through
+    transform that declares nothing has opted out of stating what it emits,
+    so callers must abstain on that too rather than treating silence as
+    type-preservation (the observed-mode ``type_coerce`` trap,
+    elspeth-85e8afa2f5 panel review).
+
+    Declarations are read from BOTH channels: typed ``fields`` (type_coerce
+    re-declares its whole input with conversion targets retyped) and
+    ``guaranteed_fields`` (an observed-schema llm names its ADDED fields
+    there with ``fields=None`` — the two channels are decoupled by design,
+    see ``validate_typed_producer_guaranteed_extras``).
+    """
+    try:
+        transform = get_shared_plugin_manager().create_transform(
+            plugin,
+            prepare_validation_probe_options(options, plugin=plugin),
+        )
+    except Exception as exc:
+        if not _is_config_probe_exception(exc):
+            raise
+        return None
+    try:
+        config = transform._output_schema_config
+        if config is None:
+            return frozenset()
+        declared: set[str] = set()
+        if config.fields:
+            declared.update(field_def.name for field_def in config.fields)
+        if config.guaranteed_fields:
+            declared.update(config.guaranteed_fields)
+        return frozenset(declared)
+    finally:
+        transform.close()
+
+
+@trust_boundary(
+    tier=3,
+    source="value_transform NodeSpec options (composer/user-authored config re-read from persisted session state)",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns False (the field-preservation proof abstains) for absent, non-sequence, or "
+        "non-mapping operations shapes and for any operation targeting the field; never raises "
+        "on malformed node options"
+    ),
+    non_raising=True,
+)
+def _value_transform_preserves_field(node: NodeSpec, field_name: str) -> bool:
+    # ``node.options`` is composer/user-authored config re-read from persisted
+    # session state — Tier-3 origin. Membership form (not ``.get``) records the
+    # honest absence→None at the boundary; the subtype guards below remain
+    # because frozen config arrives as MappingProxyType/tuple subtypes.
+    operations = node.options["operations"] if "operations" in node.options else None
+    if not isinstance(operations, (list, tuple)):
+        return False
+    for operation in operations:
+        if not isinstance(operation, Mapping):
+            return False
+        target = operation["target"] if "target" in operation else None
+        if target == field_name:
+            return False
+    return True
+
+
+def _field_preservation_walker(
+    state: CompositionState,
+    *,
+    source_name: str,
+    field_name: str,
+) -> tuple[ProducerResolver, Callable[..., bool], Callable[..., bool]]:
+    """Build the shared field-preservation walk over one composition.
+
+    Returns ``(resolver, producer_preserves, connection_preserves)`` — the
+    closures the connection-form and sink-form entry points below both drive.
+
+    The walk intentionally recognises only field-preserving nodes. Declared
+    queues traverse their predecessor set source-by-source; unrelated fan-in
+    never stands in for the target source. Unknown transforms may coerce,
+    overwrite, delete, or synthesize the field, so the proof step abstains
+    instead of emitting a false positive.
+    """
+    resolver = ProducerResolver.build(
+        source=None,
+        sources=state.sources,
+        nodes=state.nodes,
+        sink_names=frozenset(output.name for output in state.outputs),
+    )
+    target_source_id = source_producer_id(source_name)
+    # One producer has one field-preservation answer for this walker (the
+    # source and field are fixed above).  Queue fan-in can make the same
+    # upstream producer reachable through many paths, so retain completed
+    # answers instead of expanding that shared subgraph once per path.
+    producer_results: dict[str, bool] = {}
+
+    def _producer_preserves_field(
+        producer: ProducerEntry,
+        *,
+        visiting: frozenset[str],
+    ) -> bool:
+        if is_source_producer_id(producer.producer_id):
+            return producer.producer_id == target_source_id
+        if producer.producer_id in visiting:
+            return False
+        if producer.producer_id in producer_results:
+            return producer_results[producer.producer_id]
+        node = resolver.get_node(producer.producer_id)
+        if node is None:
+            return False
+        next_visiting = visiting | {producer.producer_id}
+        if node.node_type == "queue":
+            result = any(
+                _producer_preserves_field(predecessor, visiting=next_visiting) for predecessor in resolver.queue_predecessors(node.id)
+            )
+        elif node.node_type == "gate":
+            result = _connection_preserves_field(node.input, visiting=next_visiting)
+        elif node.node_type in ("coalesce", "row_union"):
+            # A merged/released row's field value comes from exactly one branch
+            # payload, so the field is provably preserved only when EVERY
+            # branch delivers it from the target source unchanged (unanimity —
+            # the true path is always among those considered, so an extra
+            # branch can only force abstention, never a wrong positive). A
+            # nested-merge coalesce rewrites the top level to branch names, so
+            # no top-level source field survives it.
+            if node.node_type == "coalesce" and node.merge == "nested":
+                result = False
+            else:
+                branch_connections = _coalesce_branch_connections(node.branches)
+                result = bool(branch_connections) and all(
+                    _connection_preserves_field(connection, visiting=next_visiting) for connection in branch_connections
+                )
+        elif node.plugin == "passthrough" or (node.plugin == "value_transform" and _value_transform_preserves_field(node, field_name)):
+            result = _connection_preserves_field(node.input, visiting=next_visiting)
+        elif node.node_type == "transform" and node.plugin is not None and node.plugin in _pass_through_transform_plugin_names():
+            # Engine declaration discipline (``resolve_guaranteed_field_type``):
+            # a pass-through transform forwards the whole input row, and one
+            # that rewrites a field in place declares it in its OUTPUT schema
+            # config (type_coerce declares conversion targets, value_transform
+            # its operation targets). Recurse only past a transform that
+            # declares SOMETHING and does not declare this field; a transform
+            # declaring nothing has opted out of that discipline (observed-mode
+            # type_coerce) and the walk abstains rather than guessing.
+            declared_output_fields = _probe_transform_output_declared_field_names(node.plugin, node.options)
+            if declared_output_fields and field_name not in declared_output_fields:
+                result = _connection_preserves_field(node.input, visiting=next_visiting)
+            else:
+                result = False
+        else:
+            result = False
+        producer_results[producer.producer_id] = result
+        return result
+
+    def _connection_preserves_field(
+        current: str,
+        *,
+        visiting: frozenset[str],
+    ) -> bool:
+        producer = resolver.find_producer_for(current)
+        if producer is None:
+            return False
+        return _producer_preserves_field(producer, visiting=visiting)
+
+    return resolver, _producer_preserves_field, _connection_preserves_field
+
+
+def _source_field_reaches_connection_without_type_change(
+    state: CompositionState,
+    connection_name: str,
+    *,
+    source_name: str,
+    field_name: str,
+) -> bool:
+    """Return True when a source field flows to a connection unchanged."""
+    _resolver, _producer_preserves, connection_preserves = _field_preservation_walker(
+        state,
+        source_name=source_name,
+        field_name=field_name,
+    )
+    return connection_preserves(connection_name, visiting=frozenset())
+
+
+def _source_field_reaches_sink_without_type_change(
+    state: CompositionState,
+    sink_name: str,
+    *,
+    source_name: str,
+    field_name: str,
+) -> bool:
+    """Return True when a source field flows to a sink's input unchanged.
+
+    Sink-targeted edges never enter the resolver's connection map (a sink is
+    terminal), so this walks the sink's direct producers instead. A sink can
+    have fan-in: rows arrive from EVERY producer, so the field is provably
+    str-typed on arrival only when every producer preserves it — one abstaining
+    producer collapses the answer to abstention, mirroring the queue/coalesce
+    unanimity posture.
+    """
+    resolver, producer_preserves, _connection_preserves = _field_preservation_walker(
+        state,
+        source_name=source_name,
+        field_name=field_name,
+    )
+    producers = resolver.sink_producers(sink_name)
+    if not producers:
+        return False
+    # Two route labels from one gate onto one sink are two registration-order
+    # entries for the same producer; dedupe on producer_id before the vote.
+    unique_producers = {producer.producer_id: producer for producer in producers}
+    return all(producer_preserves(producer, visiting=frozenset()) for producer in unique_producers.values())
+
+
+def _numeric_aggregation_diagnostics_for_observed_csv(
+    state: CompositionState,
+    source_name: str,
+    source: SourceSpec,
+    *,
+    blob_id: str,
+    inferred_types: Mapping[str, str] | None,
+    observed_headers: tuple[str, ...] | None,
+) -> list[Mapping[str, Any]]:
+    """Block observed CSV strings before numeric batch-plugin runtime failures.
+
+    Keyed on the PLUGIN alone. There used to be a `node.node_type ==
+    "aggregation"` gate here, which silently dropped the whole diagnostic for
+    the identical plugin wired as a collector (archived issue elspeth-1016a47e8f).
+    It was removed rather than widened to `{"aggregation", "collector"}`,
+    because the composer has no canonical set of "batch-barrier node kinds" to
+    derive such a tuple from, and hand-writing one would be a fifth inline copy
+    of a kind literal on an axis sibling elspeth-b3117ec3ac is canonicalizing.
+
+    The gate was redundant, not load-bearing:
+      * every member of ``_NUMERIC_VALUE_FIELD_AGGREGATION_PLUGINS`` has
+        ``supports_row_mode_when_batch_aware=False``, so it is in
+        ``_known_batch_aware_transform_plugins_requiring_aggregation()`` and
+        ``_batch_aware_placement_error`` — the composer's own placement
+        authority — already refuses ``node_type="transform"`` for it;
+      * plugin-free kinds (gate/coalesce/row_union/queue) have
+        ``node.plugin is None`` and can never match the set.
+    So plugin membership already implies a batch-barrier kind for any
+    composition that validates, and the check now derives from the plugin
+    rather than restating a kind list beside it.
+
+    Two consequences, both deliberate and both erring toward OVER-firing a
+    blocking diagnostic rather than under-firing — the correct direction for a
+    validation control:
+      * on an INVALID draft that misplaces one of these plugins as a
+        ``transform``, this now fires alongside the placement error. The
+        statement is still true (the field really does arrive as ``str``) and
+        the draft is already blocked, so the planner simply gets better repair
+        context;
+      * a plugin-bearing node kind added in future inherits the diagnostic
+        automatically instead of silently losing it, which is how this defect
+        arose in the first place.
+    """
+    if _source_schema_mode(source) != "observed" or observed_headers is None:
+        return []
+
+    observed_header_set = set(observed_headers)
+    diagnostics: list[Mapping[str, Any]] = []
+    for node in state.nodes:
+        if node.plugin not in _NUMERIC_VALUE_FIELD_AGGREGATION_PLUGINS:
+            continue
+        options, _owner = get_aggregation_contract_options(node.options, owner=f"node:{node.id}")
+        # ``options`` is the external-origin (composer/user-authored) node
+        # options Mapping returned by the contract helper — Tier-3. Membership
+        # form records honest absence→None; the following ``type() is`` check is
+        # the boundary validation of the scalar value.
+        value_field = options["value_field"] if "value_field" in options else None
+        if type(value_field) is not str or not value_field.strip():
+            continue
+        value_field = value_field.strip()
+        if value_field not in observed_header_set:
+            continue
+        if not _source_field_reaches_connection_without_type_change(
+            state,
+            node.input,
+            source_name=source_name,
+            field_name=value_field,
+        ):
+            continue
+
+        # ``inferred_types`` is our own Tier-2 derived inspection output. When
+        # present it is built by ``_inspect_csv`` as ``{h: ... for h in
+        # headers}`` against the SAME ``headers`` tuple it returns as
+        # ``observed_headers`` — i.e. it carries exactly one entry per observed
+        # header, never omitting one (``_merge_types`` always yields a type).
+        # The whole map can legitimately be absent (None) for an empty/parse-
+        # error blob, so that absence is handled explicitly. But ``value_field``
+        # was already confirmed present in ``observed_header_set`` above, so a
+        # non-None map is GUARANTEED to contain it: a missing key would be a
+        # Tier-2 invariant break in our own inspection output, which must crash
+        # (subscript), not be silently coerced to None by ``.get()``.
+        inferred_type = inferred_types[value_field] if inferred_types is not None else None
+        # The node kind is read off the node, never mapped from the code or the
+        # plugin name: a collector told to fix its pipeline "before aggregation"
+        # is being given an instruction about a node it does not have. Both
+        # placements named below were verified to validate clean AND to clear
+        # this diagnostic (elspeth-1016a47e8f).
+        node_kind = node.node_type
+        scope_clause = (
+            f" This {node_kind} closes an EXPAND scope, so the type_coerce node may sit either INSIDE the scope "
+            f"(between the scope opener and the {node_kind}) or upstream of the scope opener — both are valid."
+            if node_kind == "collector"
+            else ""
+        )
+        diagnostics.append(
+            _blocking_diagnostic(
+                code="aggregation_numeric_value_field_type_mismatch_against_source_schema",
+                message=(
+                    f"{node_kind.capitalize()} '{node.id}' ({node.plugin}) uses numeric value_field '{value_field}', "
+                    "but it is flowing from an observed CSV source. Observed CSV source values are strings "
+                    "unless the source schema declares explicit field types or an upstream type_coerce node "
+                    f"converts the field before it reaches the {node_kind}."
+                ),
+                suggested_repair=(
+                    "Patch the source schema to declare the batched field with an explicit numeric type "
+                    f"(for example {value_field}: float), or insert a type_coerce node upstream of the {node_kind} "
+                    f"with a conversions entry targeting the numeric type.{scope_clause} At that type_coerce node, "
+                    f"a schema declaration for the consumed field {value_field} must match its arriving str value; "
+                    "the conversions entry determines the output type. A value_transform may declare the output "
+                    "type of a created target, or derive it from a provable expression. Declaring the post-coercion "
+                    "type for the consumed field as its arriving type is rejected at the edge. If the "
+                    "field is categorical and you want counts/frequencies, use batch_top_k instead of a numeric "
+                    "batch plugin."
+                ),
+                evidence_locator={
+                    "source": "blob",
+                    "blob_id": str(blob_id),
+                    "node_id": node.id,
+                    # The detector knows the node's kind; carrying it here is what
+                    # lets the preflight label the blocker correctly instead of
+                    # guessing the kind back out of the diagnostic code
+                    # (_proof_component_type, web/execution/service.py).
+                    "node_type": node_kind,
+                    "plugin": node.plugin,
+                    "field": value_field,
+                    "observed_type": "str",
+                    "inferred_sample_type": inferred_type or "unknown",
+                    "source_runtime_type": "str",
+                    "source_schema_mode": "observed",
+                },
+            )
+        )
+
+    return diagnostics
+
+
+@dataclass(frozen=True, slots=True)
+class _DeclaredConcreteFields:
+    """One component's concretely-typed declared input fields, or an abstention.
+
+    ``schema_unparseable`` carries the Tier-3 parse outcome STRUCTURALLY rather
+    than collapsing it into an empty ``fields`` tuple: "this component declares
+    no concretely-typed field" and "this component's schema block could not be
+    parsed at all" are different facts, and only the first is evidence about
+    the pipeline. Conflating them would make the detector's abstention
+    invisible to its own tests.
+    """
+
+    fields: tuple[FieldDefinition, ...]
+    schema_unparseable: bool
+
+    @property
+    def abstains(self) -> bool:
+        return self.schema_unparseable or not self.fields
+
+
+@dataclass(slots=True)
+class _DeclaredInputTypeProofBudget:
+    """Request-wide bounds for the observed-CSV declared-input proof arm."""
+
+    checks_remaining: int = _MAX_DECLARED_INPUT_TYPE_PROOF_CHECKS
+    diagnostics_remaining: int = _MAX_DECLARED_INPUT_TYPE_DIAGNOSTICS
+    exhausted: bool = False
+
+
+def _declared_input_type_diagnostics_for_observed_csv(
+    state: CompositionState,
+    source_name: str,
+    source: SourceSpec,
+    *,
+    blob_id: str,
+    inferred_types: Mapping[str, str] | None,
+    observed_headers: tuple[str, ...] | None,
+    budget: _DeclaredInputTypeProofBudget,
+) -> list[Mapping[str, Any]]:
+    """Block concretely-typed input declarations fed observed CSV strings.
+
+    The incident class (elspeth-e6e552ce34): a downstream transform (or output)
+    declares an input field with a concrete non-str type (``id: int``) while
+    the field flows unchanged from an observed CSV source — whose values are
+    strings by construction. Authoring validation and the engine's edge
+    validation both bypass observed producers, so without this arm the mismatch
+    first fires as a per-row contract violation at run time, quarantining
+    every row.
+
+    Fires only on a provably field-preserving path (the
+    ``_field_preservation_walker`` entry points) — unknown transforms may
+    coerce the field, so the proof step abstains there rather than emitting a
+    false positive.
+    """
+    if _source_schema_mode(source) != "observed" or observed_headers is None:
+        return []
+
+    observed_header_set = set(observed_headers)
+    diagnostics: list[Mapping[str, Any]] = []
+
+    def _declared_concrete_fields(options: Mapping[str, Any], *, owner: str) -> _DeclaredConcreteFields:
+        # ``options`` is composer/user-authored config re-read from persisted
+        # session state — Tier-3 origin. A malformed schema block is
+        # recoverable external input owned by the contract-config validation
+        # rules, so this proof arm abstains rather than double-reporting — and
+        # records that abstention in the returned value instead of returning a
+        # bare empty tuple that reads identically to "nothing declared".
+        try:
+            schema_config = get_raw_schema_config(options, owner=owner)
+        except ValueError:
+            return _DeclaredConcreteFields(fields=(), schema_unparseable=True)
+        if schema_config is None or not schema_config.fields:
+            return _DeclaredConcreteFields(fields=(), schema_unparseable=False)
+        return _DeclaredConcreteFields(
+            fields=tuple(
+                field_def
+                for field_def in schema_config.fields
+                if field_def.field_type not in ("str", "any") and field_def.name in observed_header_set
+            ),
+            schema_unparseable=False,
+        )
+
+    def _mismatch_diagnostic(
+        *,
+        component_kind: str,
+        component_id: str,
+        plugin: str | None,
+        field_def: FieldDefinition,
+        extra_evidence: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        # ``inferred_types`` is our own Tier-2 derived inspection output —
+        # same invariant the aggregation arm documents: a non-None map is
+        # guaranteed to carry every observed header, so a missing key must
+        # crash (subscript), never coerce to None.
+        inferred_type = inferred_types[field_def.name] if inferred_types is not None else None
+        return _blocking_diagnostic(
+            code="declared_input_type_mismatch_against_source_schema",
+            message=(
+                f"{component_kind} '{component_id}' ({plugin}) declares input field "
+                f"'{field_def.name}' as {field_def.field_type}, but the field flows "
+                "unchanged from an observed CSV source. Observed CSV source values are "
+                "strings unless the source schema declares explicit field types, so "
+                f"'{field_def.name}' arrives as str and every row would fail this "
+                "consumer's input validation at runtime."
+            ),
+            suggested_repair=(
+                "Patch the SOURCE schema to declare the field with the intended type "
+                f"(for example schema.mode='flexible' with schema.fields including "
+                f"{field_def.name}: {field_def.field_type} — the source coerces values at "
+                "ingestion), or insert a type_coerce node upstream with a conversions "
+                f"entry converting {field_def.name} to {field_def.field_type}, or declare "
+                f"the field as {field_def.name}: str on this consumer if string values are "
+                "acceptable. The consumed field's schema declaration must admit its arriving value; "
+                "a type_coerce conversion determines its output type. A newly created value_transform target "
+                "can separately have an authored or provable output type."
+            ),
+            evidence_locator={
+                "source": "blob",
+                "blob_id": str(blob_id),
+                "plugin": plugin,
+                "field": field_def.name,
+                "declared_type": field_def.field_type,
+                "observed_type": "str",
+                "inferred_sample_type": inferred_type or "unknown",
+                "source_runtime_type": "str",
+                "source_schema_mode": "observed",
+                **extra_evidence,
+            },
+        )
+
+    for node in state.nodes:
+        if node.node_type != "transform":
+            continue
+        declared = _declared_concrete_fields(node.options, owner=f"node:{node.id}")
+        if declared.abstains:
+            continue
+        for field_def in declared.fields:
+            if budget.checks_remaining == 0:
+                budget.exhausted = True
+                return diagnostics
+            budget.checks_remaining -= 1
+            if not _source_field_reaches_connection_without_type_change(
+                state,
+                node.input,
+                source_name=source_name,
+                field_name=field_def.name,
+            ):
+                continue
+            if budget.diagnostics_remaining == 0:
+                budget.exhausted = True
+                return diagnostics
+            budget.diagnostics_remaining -= 1
+            diagnostics.append(
+                _mismatch_diagnostic(
+                    component_kind="Transform",
+                    component_id=node.id,
+                    plugin=node.plugin,
+                    field_def=field_def,
+                    extra_evidence={"node_id": node.id},
+                )
+            )
+
+    for output in state.outputs:
+        declared = _declared_concrete_fields(output.options, owner=f"output:{output.name}")
+        if declared.abstains:
+            continue
+        for field_def in declared.fields:
+            if budget.checks_remaining == 0:
+                budget.exhausted = True
+                return diagnostics
+            budget.checks_remaining -= 1
+            if not _source_field_reaches_sink_without_type_change(
+                state,
+                output.name,
+                source_name=source_name,
+                field_name=field_def.name,
+            ):
+                continue
+            if budget.diagnostics_remaining == 0:
+                budget.exhausted = True
+                return diagnostics
+            budget.diagnostics_remaining -= 1
+            diagnostics.append(
+                _mismatch_diagnostic(
+                    component_kind="Output",
+                    component_id=output.name,
+                    plugin=output.plugin,
+                    field_def=field_def,
+                    extra_evidence={"output_name": output.name},
+                )
+            )
+
+    return diagnostics
+
+
+def _compute_proof_diagnostics_for_source(
+    state: CompositionState,
+    *,
+    source_name: str,
+    source: SourceSpec,
+    blob_id: str,
+    blob_resolver: Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None],
+    declared_input_type_budget: _DeclaredInputTypeProofBudget,
+) -> list[Mapping[str, Any]]:
+    """Compute machine-readable proof diagnostics for one blob-backed source.
+
+    Promotes ``preview_pipeline`` from a "state validates" check into a
+    "state is plausibly runnable against observed input" proof. Returns a
+    machine-readable list of diagnostics — each entry has::
+
+        {
+            "code": "csv_fixed_schema_omits_observed_columns",
+            "severity": "blocking" | "warning" | "info",
+            "message": "human-readable description",
+            "suggested_repair": "tool/options the LLM should call",
+            "evidence_locator": {"source": "...", "node_id": "...", ...},
+        }
+
+    Diagnostics surfaced:
+
+      * ``csv_fixed_schema_omits_observed_columns`` — fixed CSV schema +
+        on_validation_failure=discard + at least one observed column
+        absent from declared fields. The combination silently discards
+        every row, which is the #1 historical convergence-failure mode.
+      * ``csv_source_blob_header_mismatch`` — CSV source with required
+        declared fields but no overlap with the parsed blob header. This
+        catches headerless CSV/list inputs before the first row is consumed
+        as a header and every data row is discarded.
+      * ``csv_source_field_resolution_error`` — CSVSource-style header
+        normalization or field_mapping resolution failed before schema
+        comparison could proceed.
+      * ``text_source_url_without_web_scrape`` — text source whose blob
+        content is a single URL but no compatible HTTP-fetch transform is
+        downstream. The URL string itself reaches sinks instead of the URL's
+        content. The stable historical code is retained for API compatibility.
+      * ``gate_expression_type_mismatch_against_source_schema`` — observed
+        CSV source values are still strings, and a gate reached through a
+        provably field-preserving path fails against sampled rows before runtime.
+      * ``aggregation_numeric_value_field_type_mismatch_against_source_schema`` —
+        observed CSV strings flow unchanged into a numeric aggregation
+        ``value_field`` before runtime can reject the batch.
+      * ``declared_input_type_mismatch_against_source_schema`` —
+        a transform or output declares a concretely-typed input field
+        (``id: int``) that flows unchanged from an observed CSV source,
+        whose values are strings by construction — every row would fail
+        that consumer's input validation at runtime (elspeth-e6e552ce34).
+      * ``source_inspection_warning`` — advisory inspection warnings are
+        mirrored here at ``info`` severity. Definite CSV normalization
+        failures and duplicate headers instead produce blocking diagnostics.
+
+    Bounded I/O: exactly one attempted blob resolution per call, bounded by
+    ``inspect_blob_content``'s 8 KiB / 100 row caps.
+    """
+    diagnostics: list[Mapping[str, Any]] = []
+
+    resolved_blob = blob_resolver(blob_id)
+    if resolved_blob is None or type(resolved_blob) is UnresolvedClaimedProofBlob:
+        return [
+            _blocking_diagnostic(
+                code="source_blob_unavailable",
+                message="The claimed source content could not be verified as ready for this request.",
+                suggested_repair=(
+                    "Inspect the intended artifact through authenticated blob discovery and resolve its availability before retrying. "
+                    "Retain the intended binding; do not fabricate or assume empty source content."
+                ),
+                evidence_locator={"source": "blob", "blob_id": blob_id},
+            )
+        ]
+    if type(resolved_blob) is not ResolvedProofBlob:
+        raise TypeError("Source proof resolver returned an unowned evidence type")
+    blob = resolved_blob.metadata
+    # ``blob`` is a BlobToolRecord (TypedDict produced by
+    # ``_blob_row_to_tool_dict`` from a validated blobs row). Direct
+    # subscript access is mandatory — a missing key is a Tier-1
+    # contract violation in our own dict shape, not external data.
+    if blob["status"] != "ready":
+        raise AuditIntegrityError("Resolved source proof evidence is not ready")
+    content = resolved_blob.verified_prefix
+    total_size_bytes = resolved_blob.total_size_bytes
+
+    facts = inspect_blob_content(
+        content=content,
+        filename=blob["filename"],
+        mime_type=blob["mime_type"],
+        content_hash=blob["content_hash"],
+        total_size_bytes=total_size_bytes,
+    )
+    json_inspection: ConfiguredJsonInspection | None = None
+    if source.plugin == "csv":
+        # ``source.options`` is composer/user-authored config re-read from
+        # persisted session state — Tier-3 origin (see the long note on the
+        # ``get_raw_schema_config`` catch below). ``_csv_source_delimiter`` /
+        # ``_csv_source_skip_rows`` / ``_csv_source_columns`` each re-validate a
+        # persisted external-origin option and raise a raw ``ValueError`` on a
+        # malformed value (non-single-char delimiter, non-int/negative skip_rows,
+        # non-sequence/non-str columns). ``compute_proof_diagnostics`` is called
+        # UNWRAPPED from ``_execute_preview_pipeline`` and the forced-repair gate,
+        # and the tool dispatcher only catches ``ToolArgumentError`` — so an
+        # unhandled ``ValueError`` here would escape and crash the preview_pipeline
+        # tool over recoverable bad external input. Wrap the whole inspect call,
+        # turn the failure into a per-blob blocking diagnostic (quarantine-
+        # equivalent), and early-return: every downstream diagnostic section
+        # (schema-mismatch, gate/aggregation type checks, text-URL, inspection
+        # warnings) depends on ``facts``, which we could not compute, so there is
+        # no independent diagnostic left to produce for this blob. The early
+        # return also makes the later ``columns`` use safe-by-construction —
+        # reaching it means ``columns`` already parsed here, so it is parsed
+        # once and reused rather than re-parsed outside this guard.
+        try:
+            columns = _csv_source_columns(source.options)
+            facts = inspect_csv_source_content(
+                content=content,
+                filename=blob["filename"],
+                mime_type=blob["mime_type"],
+                delimiter=_csv_source_delimiter(source.options),
+                skip_rows=_csv_source_skip_rows(source.options),
+                columns=columns,
+                content_hash=blob["content_hash"],
+                total_size_bytes=total_size_bytes,
+                encoding=source.options["encoding"] if "encoding" in source.options else "utf-8",
+            )
+        except ValueError as exc:
+            diagnostics.append(
+                _csv_source_field_resolution_error_diagnostic(
+                    blob_id=blob_id,
+                    facts=facts,
+                    exc=exc,
+                )
+            )
+            return diagnostics
+
+    elif source.plugin == "json":
+        try:
+            json_config = JSONSourceConfig.from_dict(
+                {
+                    **deep_thaw(_source_options_for_prevalidation(source.options)),
+                    "on_validation_failure": source.on_validation_failure,
+                }
+            )
+            json_inspection = inspect_json_source_content(
+                content=content,
+                filename=blob["filename"],
+                mime_type=blob["mime_type"],
+                config=json_config,
+                total_size_bytes=total_size_bytes,
+                content_hash=blob["content_hash"],
+            )
+            facts = json_inspection.facts
+        except (PluginConfigError, ValueError) as exc:
+            diagnostics.append(
+                _blocking_diagnostic(
+                    code="source_inspection_failed",
+                    message="Configured JSON source inspection failed; source options cannot support runtime record selection and field resolution.",
+                    suggested_repair="Correct JSON format, data_key, encoding, field_mapping and schema options using get_plugin_schema, then preview again.",
+                    evidence_locator={"blob_id": str(blob_id), "source_plugin": source.plugin, "error_class": type(exc).__name__},
+                )
+            )
+            return diagnostics
+
+    # 1. Fixed CSV schema omits observed columns + discard => silent all-row drop.
+    if facts.source_kind in {"csv", "json", "jsonl"}:
+        # ``source.options`` is composer/user-authored configuration re-read
+        # from persisted session state — Tier-3 origin, not Tier-1. We authored
+        # the container (``SourceSpec`` / the options Mapping) and the schema
+        # that validated it at load time, but the *values* were authored by the
+        # operator or the composer LLM. Persistence does not promote that to
+        # Tier-1: the store is mutable (hand-edits, stale restore) and the
+        # validating contract can drift between write and read, so re-reading it
+        # here is a FRESH Tier-3 boundary, not a Tier-1 invariant check. A
+        # ``ValueError`` from ``get_raw_schema_config`` is therefore recoverable
+        # bad external-origin input — exactly like a malformed source row — and
+        # is caught and turned into a per-blob blocking diagnostic
+        # (quarantine-equivalent: record what we found, skip the dependent
+        # schema-mismatch analysis for this blob) rather than being allowed to
+        # escape and crash the preview_pipeline tool. This mirrors the
+        # ``_csv_source_field_mapping`` try/except below. The typed
+        # ``SchemaConfig`` it returns replaces the prior raw-dict probing of
+        # mode/fields; declared field specs are bridged back into the spec form
+        # ``derive_*_risk`` consumes via ``to_dict()`` so the typed field
+        # names/required flags flow through unchanged.
+        try:
+            schema_config = get_raw_schema_config(source.options, owner=f"source:{source.plugin}")
+        except ValueError as exc:
+            diagnostics.append(
+                _csv_source_schema_config_error_diagnostic(
+                    blob_id=blob_id,
+                    facts=facts,
+                    exc=exc,
+                )
+            )
+            # Parse failed and the diagnostic is the record. Fall through with a
+            # ``None`` schema_config so the existing ``is not None`` guard skips
+            # the schema-mismatch analysis for this blob, mirroring how
+            # ``field_resolution_failed`` short-circuits dependent work below.
+            schema_config = None
+        if schema_config is not None and schema_config.mode in {"fixed", "flexible"}:
+            declared: tuple[Mapping[str, Any], ...] = tuple(schema_config.to_dict()["fields"] or ())
+            field_mapping: dict[str, str] | None = None
+            field_resolution_failed = False
+            if source.plugin == "csv":
+                try:
+                    field_mapping = _csv_source_field_mapping(source.options)
+                except ValueError as exc:
+                    diagnostics.append(
+                        _csv_source_field_resolution_error_diagnostic(
+                            blob_id=blob_id,
+                            facts=facts,
+                            exc=exc,
+                        )
+                    )
+                    field_resolution_failed = True
+
+            missing_declared: tuple[str, ...] = ()
+            if not field_resolution_failed and facts.source_kind == "csv":
+                try:
+                    missing_declared = derive_required_header_mismatch_risk(
+                        facts,
+                        declared,
+                        field_mapping=field_mapping,
+                    )
+                except ValueError as exc:
+                    diagnostics.append(
+                        _csv_source_field_resolution_error_diagnostic(
+                            blob_id=blob_id,
+                            facts=facts,
+                            exc=exc,
+                        )
+                    )
+                    field_resolution_failed = True
+            if missing_declared and source.on_validation_failure == "discard":
+                observed_header_count = len(facts.observed_headers or ())
+                diagnostics.append(
+                    _blocking_diagnostic(
+                        code="csv_source_blob_header_mismatch",
+                        message=(
+                            f"CSV source declares required field(s) {list(missing_declared)} "
+                            f"but the bound blob's parsed header has {observed_header_count} column(s) "
+                            "missing these required field names. Header values are redacted because "
+                            "headerless CSV input can make the first data row look like headers. "
+                            "Every row will fail validation; "
+                            "with on_validation_failure='discard', the run will terminate empty. "
+                            "Either prepend a header row containing the declared field names or set "
+                            "source options.columns to those names for headerless CSV input."
+                        ),
+                        suggested_repair=(
+                            "For headered CSV, update the blob so line 1 contains the declared "
+                            "schema field names. For headerless CSV, patch_source_options with "
+                            "`columns` set to the declared field names, then re-run preview_pipeline. "
+                            "Use the source schema's carried names, then preview the same pipeline."
+                        ),
+                        evidence_locator={
+                            "source": "blob",
+                            "blob_id": str(blob_id),
+                            "declared_required_fields": list(missing_declared),
+                            "observed_header_count": observed_header_count,
+                            "observed_headers_redacted": True,
+                            "source_plugin": source.plugin,
+                        },
+                    )
+                )
+            elif schema_config.mode == "fixed" and not field_resolution_failed:
+                missing: tuple[str, ...] = ()
+                if source.plugin == "csv":
+                    try:
+                        missing = derive_extra_column_risk(
+                            facts,
+                            declared,
+                            field_mapping=field_mapping,
+                        )
+                    except ValueError as exc:
+                        diagnostics.append(
+                            _csv_source_field_resolution_error_diagnostic(
+                                blob_id=blob_id,
+                                facts=facts,
+                                exc=exc,
+                            )
+                        )
+                    if missing and source.on_validation_failure == "discard":
+                        diagnostics.append(
+                            _blocking_diagnostic(
+                                code="csv_fixed_schema_omits_observed_columns",
+                                message=(
+                                    f"Source schema is mode=fixed but {len(missing)} observed column(s) "
+                                    "are not declared in schema.fields. Combined with "
+                                    "on_validation_failure='discard', every row will be dropped because "
+                                    "each contains an undeclared column. (Observed and missing column "
+                                    "values are withheld: an observed-mode or headerless CSV can make a "
+                                    "data row look like column headers.)"
+                                ),
+                                suggested_repair=(
+                                    "patch_source_options with schema.mode='flexible' to accept extra "
+                                    "columns, OR add the missing columns to schema.fields, OR set "
+                                    "on_validation_failure to a configured output for inspection."
+                                ),
+                                evidence_locator={
+                                    "source": "blob",
+                                    "blob_id": str(blob_id),
+                                    "missing_column_count": len(missing),
+                                    "observed_column_count": len(facts.observed_headers or ()),
+                                    "observed_columns_redacted": True,
+                                },
+                            )
+                        )
+                elif json_inspection is not None:
+                    declared_names = {field.name for field in schema_config.fields or ()}
+                    extra_rows = [fields for fields in json_inspection.row_fields if fields is not None and set(fields) - declared_names]
+                    if extra_rows and source.on_validation_failure == "discard":
+                        universal = json_inspection.all_rows_inspected and len(extra_rows) == len(json_inspection.row_fields)
+                        diagnostics.append(
+                            _blocking_diagnostic(
+                                code="csv_fixed_schema_omits_observed_columns",
+                                message=(
+                                    "Every selected JSON record contains undeclared fields; mode=fixed with "
+                                    "on_validation_failure='discard' will drop every row. All selected records were inspected."
+                                ),
+                                suggested_repair="Declare the carried JSON fields or use schema.mode='flexible', then preview again.",
+                                evidence_locator={
+                                    "blob_id": str(blob_id),
+                                    "selected_record_count": len(extra_rows),
+                                    "all_rows_inspected": True,
+                                },
+                            )
+                            if universal
+                            else {
+                                "code": "json_fixed_schema_sample_omits_fields",
+                                "severity": "warning",
+                                "message": "Some sampled JSON records contain undeclared fields and will be discarded; the sample does not prove every row will be lost.",
+                                "suggested_repair": "Inspect the configured record selection and declare its carried fields or use schema.mode='flexible'.",
+                                "evidence_locator": {
+                                    "blob_id": str(blob_id),
+                                    "sample_extra_record_count": len(extra_rows),
+                                    "all_rows_inspected": json_inspection.all_rows_inspected,
+                                },
+                            }
+                        )
+
+    # 2. Observed CSV + numeric gate predicate => preview/runtime agreement gap.
+    if facts.source_kind == "csv":
+        diagnostics.extend(
+            _gate_expression_type_diagnostics_for_observed_csv(
+                state,
+                source_name,
+                source,
+                blob_id=str(blob_id),
+                filename=blob["filename"],
+                content=content,
+            )
+        )
+        diagnostics.extend(
+            _numeric_aggregation_diagnostics_for_observed_csv(
+                state,
+                source_name,
+                source,
+                blob_id=str(blob_id),
+                inferred_types=facts.inferred_types,
+                observed_headers=facts.observed_headers,
+            )
+        )
+        diagnostics.extend(
+            _declared_input_type_diagnostics_for_observed_csv(
+                state,
+                source_name,
+                source,
+                blob_id=str(blob_id),
+                inferred_types=facts.inferred_types,
+                observed_headers=facts.observed_headers,
+                budget=declared_input_type_budget,
+            )
+        )
+
+    # 3. Text source containing a single URL but no compatible HTTP fetcher
+    #    reachable from this source. An unrelated fetch branch does not count.
+    if facts.source_kind == "text" and facts.url_candidates:
+        fetch_transform_names = http_fetch_transform_names()
+        downstream_nodes = _runtime_nodes_downstream_of_connection(source.on_success, state.nodes)
+        if not any(node.plugin in fetch_transform_names for node in downstream_nodes):
+            diagnostics.append(
+                _blocking_diagnostic(
+                    code="text_source_url_without_web_scrape",
+                    message=(
+                        f"Source blob contains URL(s) {list(facts.url_candidates)} but no "
+                        "compatible HTTP fetch transform is wired downstream from this source. "
+                        "The URL string itself will flow to sinks, not the URL's content."
+                    ),
+                    suggested_repair=(
+                        "Discover an available compatible HTTP fetch transform, wire its input to "
+                        "this source's on_success connection, configure its URL field, and route "
+                        "the source through it."
+                    ),
+                    evidence_locator={
+                        "source": "blob",
+                        "blob_id": str(blob_id),
+                        "url_candidates": list(facts.url_candidates),
+                    },
+                )
+            )
+
+    # 4. Surface inspection warnings as info-severity diagnostics so the model
+    #    sees them in the same array as blocking issues. These are *advisory*
+    #    only — the model can ignore them if the operator's intent justifies.
+    #
+    #    Definite normalization failures and ``csv_duplicate_headers`` are
+    #    promoted to blocking. Duplicate
+    #    headers cause silent column collapse in csv.DictReader (last-write-
+    #    wins) and similar libraries, fabricating a single column from multiple
+    #    source columns. That is a Tier-1 audit-integrity violation — the
+    #    audit trail would silently contain data that "looks single-column"
+    #    when the source had two — and must force the repair loop, not pass
+    #    through as advisory. A genuine header row must be corrected and
+    #    re-uploaded. Explicit unique ``columns`` are a valid alternative only
+    #    when the repeated first row is data from a genuinely headerless file.
+    for warning in facts.warnings:
+        if warning.startswith("csv_duplicate_headers:"):
+            # Do not relay the warning verbatim. ``facts`` comes from bounded
+            # source bytes, and a malformed/headerless CSV can make its first
+            # data row look like headers. Recompute only structural facts at
+            # this final model-visible boundary so even a future inspection-
+            # warning regression cannot expose raw header/cell values here.
+            observed_headers = facts.observed_headers or ()
+            header_counts = Counter(observed_headers)
+            duplicate_values = {name for name, count in header_counts.items() if count > 1}
+            duplicate_positions = [index for index, name in enumerate(observed_headers, start=1) if name in duplicate_values]
+            diagnostics.append(
+                _blocking_diagnostic(
+                    code="csv_duplicate_headers",
+                    message=(
+                        f"CSV source has {len(duplicate_values)} duplicate header value "
+                        f"class(es) across {len(duplicate_positions)} duplicate column "
+                        f"position(s) out of {len(observed_headers)} total columns. Header "
+                        "values are redacted because malformed or headerless CSV input can "
+                        "make row content look like headers. Downstream consumers may "
+                        "silently collapse these columns."
+                    ),
+                    suggested_repair=(
+                        "For a genuine header row, correct the source file so every "
+                        "physical header is unique, then re-upload and re-bind the "
+                        "replacement blob. If the file is genuinely headerless and "
+                        "the repeated first row is data rather than headers, declare "
+                        "explicit unique `columns` in the source options, then re-run "
+                        "preview_pipeline."
+                    ),
+                    evidence_locator={
+                        "source": "blob",
+                        "blob_id": str(blob_id),
+                        "observed_header_count": len(observed_headers),
+                        "duplicate_header_class_count": len(duplicate_values),
+                        "duplicate_header_column_count": len(duplicate_positions),
+                        "duplicate_header_positions": duplicate_positions,
+                        "header_values_redacted": True,
+                    },
+                )
+            )
+            continue
+        if source.plugin == "csv" and warning.startswith("csv_field_normalization_failed:"):
+            diagnostics.append(
+                _blocking_diagnostic(
+                    code="csv_source_field_resolution_error",
+                    message=(
+                        "CSV source headers cannot produce unique, nonempty runtime field names. "
+                        "CSVSource would reject this header before processing data rows, so "
+                        "preview_pipeline is blocking it for repair. Observed header values "
+                        "and inspection warning details are withheld because malformed or "
+                        "headerless CSV can make row content look like headers."
+                    ),
+                    suggested_repair=(
+                        "Correct the source file so every physical header normalizes to a "
+                        "unique, nonempty field name, then re-upload and re-bind the replacement "
+                        "blob. For genuinely headerless input, declare explicit unique `columns`, "
+                        "then re-run preview_pipeline."
+                    ),
+                    evidence_locator={
+                        "source": "blob",
+                        "blob_id": str(blob_id),
+                        "observed_header_count": len(facts.observed_headers or ()),
+                        "observed_headers_redacted": True,
+                    },
+                )
+            )
+            continue
+        diagnostics.append(
+            {
+                "code": "source_inspection_warning",
+                "severity": "info",
+                "message": warning,
+                "suggested_repair": None,
+                "evidence_locator": {"source": "blob", "blob_id": str(blob_id)},
+            }
+        )
+
+    return diagnostics
+
+
+def _attribute_proof_diagnostic_to_source(
+    diagnostic: Mapping[str, Any],
+    *,
+    source_name: str,
+) -> Mapping[str, Any]:
+    """Attach the authored source identity to one detector-owned diagnostic."""
+    # ``diagnostic`` is detector-owned Tier-1 data (every producer builds
+    # ``evidence_locator`` as a mapping literal); the ``{**evidence}`` splat
+    # crashes with TypeError on corruption, so no defensive shape re-check.
+    evidence = diagnostic["evidence_locator"]
+    return {
+        **diagnostic,
+        "evidence_locator": {**evidence, "source_name": source_name},
+    }
+
+
+def compute_proof_diagnostics(
+    state: CompositionState,
+    *,
+    context: ComposerProofContext | _AuthoritativeProofContext | None,
+) -> ProofNotApplicable | ProofEvaluated | ProofUnavailable:
+    """Inspect every blob-backed source within the authored-source proof cap.
+
+    Each source gets an independent custody resolution and bounded 8 KiB
+    inspection. Pipelines above the explicit cap block deterministically rather
+    than silently marking a partially inspected topology as proof-passed.
+    Composer supplies its complete fenced reader context; execution supplies
+    the nominal context captured by its authoritative BlobService factory.
+    """
+    if context is not None and type(context) not in (ComposerProofContext, _AuthoritativeProofContext):
+        raise TypeError("Source proof requires an owned proof context or explicit absence")
+    blob_sources = _admit_source_proof_claims(state)
+    if not blob_sources:
+        return ProofNotApplicable()
+
+    if len(blob_sources) > _MAX_PROOF_BLOB_SOURCES:
+        return ProofEvaluated(
+            (
+                _blocking_diagnostic(
+                    code="source_inspection_failed",
+                    message=(
+                        f"Pipeline has {len(blob_sources)} blob-backed sources, exceeding the bounded proof "
+                        f"limit of {_MAX_PROOF_BLOB_SOURCES}; no partial proof was admitted."
+                    ),
+                    suggested_repair=(
+                        f"Reduce the pipeline to at most {_MAX_PROOF_BLOB_SOURCES} blob-backed sources or partition "
+                        "it into separately validated pipelines, then re-run preview_pipeline."
+                    ),
+                    evidence_locator={
+                        "source": "pipeline",
+                        "blob_source_count": len(blob_sources),
+                        "max_blob_sources": _MAX_PROOF_BLOB_SOURCES,
+                    },
+                ),
+            )
+        )
+    if context is None:
+        return ProofUnavailable(
+            tuple(
+                _attribute_proof_diagnostic_to_source(
+                    _blocking_diagnostic(
+                        code="source_blob_unavailable",
+                        message="Authenticated source-proof context is unavailable for this request; source content was not verified.",
+                        suggested_repair=(
+                            "Restore the authenticated session and storage context before retrying. "
+                            "Retain the intended source binding; do not rewrite the graph to supply missing infrastructure."
+                        ),
+                        evidence_locator={"source": "blob", "blob_id": blob_id},
+                    ),
+                    source_name=source_name,
+                )
+                for source_name, _source, blob_id in blob_sources
+            )
+        )
+    effective_resolver: Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None]
+    if type(context) is ComposerProofContext:
+
+        def _resolve_from_composer_store(resolved_blob_id: str) -> ResolvedProofBlob | None:
+            # Row + bytes observed as ONE version under the session custody
+            # lock — an unlocked read racing update_blob's in-transaction
+            # file swap would escalate a false BlobIntegrityError
+            # (elspeth-3d1d1fcb6c).
+            metadata, content = _locked_read_ready_blob(
+                context.session_engine,
+                context.session_id,
+                resolved_blob_id,
+                data_dir=context.data_dir,
+                session_operation_context=context.operation,
+                session_operation_authority=context.authority,
+            )
+            if metadata is None or content is None:
+                return None
+            stored_hash = metadata["content_hash"]
+            if stored_hash is None:
+                raise AuditIntegrityError("ready proof blob has null content_hash")
+            return ResolvedProofBlob(
+                metadata=metadata,
+                verified_prefix=content[: 8 * 1024],
+                verified_content_hash=stored_hash,
+                total_size_bytes=len(content),
+            )
+
+        effective_resolver = _resolve_from_composer_store
+    else:
+        effective_resolver = context.resolve
+
+    uncached_resolver = effective_resolver
+    resolved_by_blob_id: dict[str, ResolvedProofBlob | UnresolvedClaimedProofBlob | None] = {}
+
+    def _memoized_resolver(resolved_blob_id: str) -> ResolvedProofBlob | UnresolvedClaimedProofBlob | None:
+        if resolved_blob_id not in resolved_by_blob_id:
+            resolved_by_blob_id[resolved_blob_id] = uncached_resolver(resolved_blob_id)
+        return resolved_by_blob_id[resolved_blob_id]
+
+    diagnostics: list[Mapping[str, Any]] = []
+    declared_input_type_budget = _DeclaredInputTypeProofBudget()
+    for source_name, source, blob_id in blob_sources:
+        source_diagnostics = _compute_proof_diagnostics_for_source(
+            state,
+            source_name=source_name,
+            source=source,
+            blob_id=blob_id,
+            blob_resolver=_memoized_resolver,
+            declared_input_type_budget=declared_input_type_budget,
+        )
+        diagnostics.extend(_attribute_proof_diagnostic_to_source(diagnostic, source_name=source_name) for diagnostic in source_diagnostics)
+        if declared_input_type_budget.exhausted:
+            diagnostics.append(
+                _blocking_diagnostic(
+                    code="source_inspection_failed",
+                    message=("Declared-input type proof exceeded its bounded request budget; no partial proof was admitted."),
+                    suggested_repair=(
+                        "Reduce the number of observed CSV sources or concretely typed consumer fields, "
+                        "partition the pipeline, then re-run preview_pipeline."
+                    ),
+                    evidence_locator={
+                        "source": "pipeline",
+                        "max_declared_input_type_checks": _MAX_DECLARED_INPUT_TYPE_PROOF_CHECKS,
+                        "max_declared_input_type_diagnostics": _MAX_DECLARED_INPUT_TYPE_DIAGNOSTICS,
+                    },
+                )
+            )
+            break
+    if any(d["code"] == "source_blob_unavailable" and d["severity"] == "blocking" for d in diagnostics):
+        return ProofUnavailable(tuple(diagnostics))
+    return ProofEvaluated(tuple(diagnostics))
+
+
+def _runtime_preflight_not_run_error() -> ValidationEntryDict:
+    """Build the marker naming an un-run Stage 2 in a preview's error channel.
+
+    A fresh dict per call: the entry is handed to the caller inside
+    ``data["preview_errors"]``, so a shared module constant would let one
+    consumer's mutation leak into every later preview.
+
+    Deliberately NOT registered in ``_CLOSED_VALIDATION_ERROR_CODES`` — that
+    tuple is a claim about the codes the planner's redacted repair feedback
+    can carry, and this marker is not on that path. Its own message therefore
+    has to carry the repair.
+    """
+    return ValidationEntryDict(
+        component="pipeline",
+        message=(
+            "The runtime preflight stage did not run for this preview, so this pipeline has not been "
+            "checked against the real engine at all (path allowlist, plugin instantiation, graph "
+            "structure, schema compatibility, secret refs, policy gates). preview_is_valid is false because "
+            "no verdict on those checks exists, not because one of them failed. This is a server wiring "
+            "omission, not a defect in the pipeline: do not rewrite the pipeline to try to clear it — "
+            "report that preview_pipeline returned runtime_preflight_not_run."
+        ),
+        severity="high",
+        error_code="runtime_preflight_not_run",
+    )
+
+
+class _StructuralPreviewCheckDict(TypedDict):
+    """One failing tolerant-preflight check projected into the preview block."""
+
+    name: str
+    detail: str
+    outcome_code: str | None
+    affected_nodes: list[str]
+
+
+class _StructuralPreviewBlockDict(TypedDict):
+    """The additive ``data["structural_preview"]`` payload (elspeth-229e9e8195)."""
+
+    is_valid: bool
+    confidence: Literal["equivalent", "provisional"]
+    masking_applied: bool
+    failing_checks: list[_StructuralPreviewCheckDict]
+    errors: list[dict[str, Any]]
+    note: str
+
+
+def _structural_preview_block(state: CompositionState, tolerant_result: ValidationResult) -> _StructuralPreviewBlockDict:
+    """Project the interpretation-tolerant preflight into an advisory block.
+
+    While an interpretation review is pending, the strict Stage-2 ledger
+    fails at ``review_interpretations`` and stamps every later stage —
+    graph structure included — ``SKIPPED_AFTER_FAILURE``, so a mid-loop
+    preview shows authoring-green plus a review-pending note while an
+    edge-contract violation stays invisible until completion
+    (elspeth-229e9e8195). This block surfaces the tolerant re-validation's
+    findings during authoring, while the defect is still cheap to fix.
+
+    A bounded PROJECTION, never a second full ``ValidationResult`` dump:
+    the preview result rides the append-only planner conversation against
+    the hard request-bytes cap, so only the failing checks and errors are
+    carried. ``SKIPPED_AFTER_FAILURE`` stamps are derived noise (the stage
+    that failed is already in the projection) and are dropped.
+
+    ``masking_applied`` is the soundness discriminator: tolerant masking
+    substitutes placeholder text for pending interpretation sites, which
+    can produce findings in BOTH directions (a false red at plugin
+    instantiation, a false green past it). ``materialize_state_for_authoring``
+    returns the IDENTICAL state object when substitution was a no-op, and
+    in that case the findings were computed against the exact authored
+    bytes — as reliable as a strict run.
+    """
+    masking_applied = materialize_state_for_authoring(state) is not state
+    failing_checks = [
+        _StructuralPreviewCheckDict(
+            name=check.name,
+            detail=check.detail,
+            outcome_code=check.outcome_code,
+            affected_nodes=list(check.affected_nodes),
+        )
+        for check in tolerant_result.checks
+        if not check.passed and check.outcome_code != CHECK_OUTCOME_SKIPPED_AFTER_FAILURE
+    ]
+    errors = [error.model_dump() for error in tolerant_result.errors]
+    confidence: Literal["equivalent", "provisional"]
+    if masking_applied:
+        confidence = "provisional"
+        note = (
+            "These findings were computed with pending interpretation reviews masked by "
+            "placeholder-substituted text, so a finding may be an artifact of the placeholder "
+            "rather than of the authored pipeline. Report these findings instead of blindly "
+            "repairing against them; re-check after the pending reviews resolve."
+        )
+    else:
+        confidence = "equivalent"
+        note = (
+            "The pending interpretation review required no placeholder substitution, so these "
+            "findings were computed against the exact authored pipeline and are as reliable as "
+            "a strict preflight. Repair any finding below before completing."
+        )
+    return _StructuralPreviewBlockDict(
+        is_valid=tolerant_result.is_valid,
+        confidence=confidence,
+        masking_applied=masking_applied,
+        failing_checks=failing_checks,
+        errors=errors,
+        note=note,
+    )
+
+
+def _execute_preview_pipeline(
+    args: dict[str, Any],
+    state: CompositionState,
+    context: ToolContext,
+) -> ToolResult:
+    _validate_mutation_arguments(EmptyToolArgumentsModel, args, "preview_pipeline arguments")
+    """Preview pipeline configuration — dry-run validation with source summary.
+
+    Three checks, each on its own surface: the authoring check rides on the
+    envelope's own ``validation``; the runtime preflight (the caller-supplied
+    callback) on the envelope's ``runtime_preflight``; the operator-input-aware
+    proof against the observed source blob under ``data["proof_diagnostics"]``.
+    ``data["preview_is_valid"]`` is their conjunct — any blocking
+    ``proof_diagnostics`` entry makes it false even when authoring + runtime
+    pass.
+
+    ``data`` carries only what the preview stage itself produces: the
+    conjunct, ``preview_errors`` (entries the preview stage mints — never a
+    copy of the authoring errors, which the envelope already carries),
+    ``edge_contracts`` (the one authoring fact the envelope does not carry),
+    the proof diagnostics, and a read-only overview. Hoisting the authoring
+    verdict here again put byte-twins of ``validation`` on the wire under a
+    second name and made ``is_valid`` a homonym (elspeth-e405ad7cd2 R4).
+
+    An un-run stage never rides the success side: with no runtime callback
+    wired, ``preview_is_valid`` is false and ``preview_errors`` carries an
+    explicit ``runtime_preflight_not_run`` entry naming the stage that did
+    not run.
+    """
+    operation = context.session_operation_context
+    if operation is not None:
+        if type(operation) is not SessionOperationContext:
+            raise AuditIntegrityError("Source proof requires the actual session operation context")
+        if context.session_id is not None and operation.fence.session_id != context.session_id:
+            raise AuditIntegrityError("Source proof context does not match the requested store")
+    proof_context = (
+        ComposerProofContext(
+            context.session_engine,
+            context.session_id,
+            context.data_dir,
+            operation,
+            context.session_operation_authority,
+        )
+        if context.session_engine is not None
+        and context.session_id is not None
+        and context.data_dir is not None
+        and operation is not None
+        and context.session_operation_authority is not None
+        else None
+    )
+    try:
+        _admit_source_proof_claims(state)
+    except MalformedSourceProofClaim as exc:
+        return _saved_graph_rejection_result(
+            state,
+            exc.reason,
+            error_code="source_blob_identity_invalid",
+            rejected_component=source_producer_id(exc.source_name),
+        )
+    validation = context.catalog.validate_composition_state(state).validation
+    _AUTHORING_VALIDATION_COUNTER.add(
+        1,
+        {"outcome": "valid" if validation.is_valid else "invalid"},
+    )
+    runtime_result = context.runtime_preflight(state) if context.runtime_preflight is not None else None
+    # Wired only when the caller's strict Stage-2 verdict is handoff-shaped
+    # (elspeth-229e9e8195). Additive advisory block: it never joins the
+    # ``preview_is_valid`` conjunct below — folding tolerant findings into the
+    # strict verdict would misreport a review-pending state as a validator
+    # objection.
+    structural_preview = (
+        _structural_preview_block(state, context.structural_preflight(state)) if context.structural_preflight is not None else None
+    )
+
+    proof = compute_proof_diagnostics(state, context=proof_context)
+    proof_diagnostics = () if type(proof) is ProofNotApplicable else proof.diagnostics
+    has_blocking_proof = any(d["severity"] == "blocking" for d in proof_diagnostics)
+
+    preview_is_valid = validation.is_valid
+    preview_errors: list[ValidationEntryDict] = []
+    if runtime_result is not None:
+        preview_is_valid = preview_is_valid and runtime_result.is_valid
+    else:
+        # Three live callers wire Stage 2 for preview: the operator channel
+        # precomputes it per call (tool_batch.py), the stdio MCP server wires
+        # it at construction (d53fbee91), and the planner precomputes it per
+        # request (service._planner_preview_preflight, elspeth-2ed41f0a4a).
+        # The planner is the one caller that can legitimately leave it unwired
+        # — it declines on a structurally empty pipeline (nothing to dry-run)
+        # and on a preflight that itself failed (a planner request must not die
+        # because Stage 2 broke) — so this branch is both that deliberate
+        # decline and a wiring-omission tripwire for the other two. Either way
+        # an un-run stage must not ride the success side of the conjunct: fail
+        # closed and name the stage, because ``runtime_preflight: null`` alone
+        # cannot tell a caller "not computed" apart from "nothing to report".
+        preview_is_valid = False
+        preview_errors.append(_runtime_preflight_not_run_error())
+    if has_blocking_proof:
+        preview_is_valid = False
+
+    summary: dict[str, Any] = {
+        "preview_is_valid": preview_is_valid,
+        "preview_errors": preview_errors,
+        "edge_contracts": [ec.to_dict() for ec in validation.edge_contracts],
+        # No nested ``runtime_preflight`` copy: the same value rides on the
+        # envelope's own ``runtime_preflight`` field (set below), and a
+        # byte-identical twin under ``data`` was two keys the model had to be
+        # taught were one (elspeth-e405ad7cd2, F9).
+        "proof_diagnostics": proof_diagnostics,
+        "sources": {
+            name: {
+                "plugin": source.plugin,
+                "on_success": source.on_success,
+                "has_schema_config": _source_options_have_schema(source.options),
+            }
+            for name, source in state.sources.items()
+        },
+        "node_count": len(state.nodes),
+        "output_count": len(state.outputs),
+        "nodes": [{"id": n.id, "node_type": n.node_type, "plugin": n.plugin} for n in state.nodes],
+        "outputs": [{"name": o.name, "plugin": o.plugin} for o in state.outputs],
+    }
+    if structural_preview is not None:
+        summary["structural_preview"] = structural_preview
+
+    return ToolResult(
+        success=True,
+        updated_state=state,
+        validation=validation,
+        affected_nodes=(),
+        data=summary,
+        runtime_preflight=runtime_result,
+    )
+
+
+_PREVIEW_PIPELINE_DECLARATION = ToolDeclaration(
+    name="preview_pipeline",
+    response_contract=PREVIEW_PIPELINE_RESPONSE_CONTRACT,
+    handler=_execute_preview_pipeline,
+    kind=ToolKind.DISCOVERY,
+    description="Preview the current pipeline without executing it. The "
+    "envelope's `validation` is the authoring check and `runtime_preflight` "
+    "(top-level, when a runtime check ran) is the dry-run. `data` carries "
+    "`preview_is_valid` (true only when the authoring check, the runtime "
+    "check and the source proof all pass), `preview_errors` (entries only "
+    "the preview stage produces, such as `runtime_preflight_not_run`), "
+    "`edge_contracts` (one entry per producer->consumer pair that was "
+    "checked, and a pair is checked only where the consumer REQUIRES "
+    "fields — through `required_fields`, through a fixed/flexible schema's "
+    "declared fields, or, "
+    "for a sink, through an option naming the field it writes from — so an "
+    "edge requiring none has no entry and an empty "
+    "list is not proof of a satisfied contract: `from`, `to` which is "
+    "`output:<name>` for a sink, the `producer_guarantees` and "
+    "`consumer_requires` field names, the `missing_fields` between them, "
+    "and `satisfied`), `proof_diagnostics`, "
+    "`structural_preview` when present (an advisory re-check whose "
+    "`is_valid` is not the verdict), and a read-only overview: `sources` "
+    "(keyed by source name, each with `plugin`, `on_success` and "
+    "`has_schema_config`), `nodes` (each with `id`, `node_type`, `plugin`), "
+    "`outputs` (each with `name`, `plugin`), `node_count`, "
+    "`output_count`.",
+    json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+    cacheable=False,
+)
+
+
+def _execute_diff_pipeline(
+    args: dict[str, Any],
+    state: CompositionState,
+    context: ToolContext,
+) -> ToolResult:
+    _validate_mutation_arguments(EmptyToolArgumentsModel, args, "diff_pipeline arguments")
+    """Compute a diff/change summary against a baseline state.
+
+    The baseline is passed explicitly by the MCP server or web composer
+    via ``context.baseline``. If no baseline is available, returns a
+    notice instead.
+
+    Pre-computed current-state validation is threaded through
+    ``context.current_validation`` so this handler avoids redundant
+    recomputation when the caller already has the live ValidationSummary
+    in hand.
+    """
+    baseline = context.baseline
+    current_validation = context.current_validation
+    if baseline is None:
+        # A failure, not a success carrying an ``error`` key: ``error`` is a
+        # failure-only key on every surface (elspeth-e405ad7cd2 D5). The
+        # current version already rides the envelope's ``version``.
+        return _saved_graph_rejection_result(
+            state,
+            "No baseline available. Load or create a session first.",
+            error_code="diff_baseline_unavailable",
+            rejected_component=None,
+        )
+
+    baseline_validation = context.catalog.validate_composition_state(baseline).validation
+    changes = diff_states(
+        baseline,
+        state,
+        baseline_validation=baseline_validation,
+        current_validation=current_validation,
+    )
+    return _discovery_result(state, changes)
+
+
+_DIFF_PIPELINE_DECLARATION = ToolDeclaration(
+    name="diff_pipeline",
+    response_contract=DIFF_PIPELINE_RESPONSE_CONTRACT,
+    handler=_execute_diff_pipeline,
+    kind=ToolKind.DISCOVERY,
+    description="Compare the current pipeline with the baseline supplied by this surface, which may be the request-start state. "
+    "On success `data` carries `from_version` (the baseline; the version it "
+    "changed TO is the envelope's own `version`), `sources_changed`, "
+    "`metadata_changed`, `total_changes`, `warnings_introduced`, "
+    "`warnings_resolved`, and per-collection `added` / `removed` / `modified` "
+    "lists under `nodes`, `edges`, `outputs`, and — only when `sources_changed` — `sources`. Without a "
+    "baseline it fails with `error` and "
+    "`error_code` only.",
+    json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+    cacheable=False,
+)
+
+
+TOOLS_IN_MODULE: tuple[ToolDeclaration, ...] = (
+    _GET_PLUGIN_SCHEMA_DECLARATION,
+    _GET_EXPRESSION_GRAMMAR_DECLARATION,
+    _EXPLAIN_VALIDATION_ERROR_DECLARATION,
+    _GET_PLUGIN_ASSISTANCE_DECLARATION,
+    _GET_AUDIT_INFO_DECLARATION,
+    _LIST_MODELS_DECLARATION,
+    _PREVIEW_PIPELINE_DECLARATION,
+    _DIFF_PIPELINE_DECLARATION,
+)
+"""Every tool declared in this module, in stable order.
+
+``_dispatch.py`` aggregates this tuple alongside every other plane's
+TOOLS_IN_MODULE to build the registered-tool universe."""

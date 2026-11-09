@@ -1,0 +1,29 @@
+usage: elspeth-lints check [-h] [--rules RULES] [--rule-set {static,full}]
+                           [--format {text,json,sarif,github}] [--root ROOT]
+                           [--repo-root REPO_ROOT]
+                           [--allowlist-dir ALLOWLIST_DIR] [--fail-on-inert]
+                           [--files [FILES ...]]
+
+options:
+  -h, --help            show this help message and exit
+  --rules RULES         Rule selection, required: 'all' for every registered
+                        rule, a comma-separated list of rule ids, or 'nothing'
+                        for the empty skeleton run
+  --rule-set {static,full}
+  --format {text,json,sarif,github}
+  --root ROOT
+  --repo-root REPO_ROOT
+                        Repository working tree root for rules that resolve
+                        repository-relative evidence paths. When omitted,
+                        rules derive it from --root using their documented
+                        fallback; when supplied, this explicit value wins.
+  --allowlist-dir ALLOWLIST_DIR
+                        Override every rule's per-rule allowlist directory
+                        with this one. Useful for shadow runs and cross-branch
+                        comparisons. When unset, each rule resolves its own
+                        per-rule default directory.
+  --fail-on-inert       Fail when a selected incremental rule matches no non-
+                        fixture Python files. Use for full-corpus gates;
+                        partial --files selections may legitimately reach only
+                        a subset of selected rules.
+  --files [FILES ...]

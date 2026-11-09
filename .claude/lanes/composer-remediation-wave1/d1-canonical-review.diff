@@ -1,0 +1,1516 @@
+diff --git a/src/elspeth/web/composer/pipeline_commit.py b/src/elspeth/web/composer/pipeline_commit.py
+index cd0389e42..acb0325b4 100644
+--- a/src/elspeth/web/composer/pipeline_commit.py
++++ b/src/elspeth/web/composer/pipeline_commit.py
+@@ -44,6 +44,7 @@ from elspeth.web.composer.pipeline_proposal import (
+     owned_composition_state_execution_arguments_from_restored,
+     restore_owned_composition_state_authority,
+ )
++from elspeth.web.composer.protocol import ToolArgumentError
+ from elspeth.web.composer.redaction import normalize_set_pipeline_redacted_arguments, semantic_redacted_pipeline_arguments_hash
+ from elspeth.web.composer.reviewed_source_authority import (
+     resolve_owned_composition_source_authority,
+@@ -528,12 +529,15 @@ async def prepare_pipeline_proposal_commit(
+         _interpretation_requirements_are_internal=True,
+     )
+ 
+-    candidate = await bounded(
+-        build_set_pipeline_candidate,
+-        execution_arguments,
+-        current_state,
+-        context,
+-    )
++    try:
++        candidate = await bounded(
++            build_set_pipeline_candidate,
++            execution_arguments,
++            current_state,
++            context,
++        )
++    except ToolArgumentError as exc:
++        raise PipelineCommitError(exc.safe_message, code="ARGUMENT_ERROR", dispatch=recovery_dispatch) from exc
+     if not candidate.acceptable or candidate.prepared_inline_blob is not None:
+         raise PipelineCommitError("pipeline proposal failed current candidate validation", code="VALIDATION_FAILED")
+     candidate_hash = composition_content_hash(candidate.result.updated_state)
+@@ -546,6 +550,12 @@ async def prepare_pipeline_proposal_commit(
+         assert recovery_executor_content_hash is not None
+         if candidate_hash != recovery_executor_content_hash:
+             raise PipelineCommitMismatchError(None, recovery_dispatch)
++
++    if candidate_hash == composition_content_hash(current_state):
++        raise PipelineCommitError("pipeline proposal does not change the current composition", code="NO_CHANGE", dispatch=recovery_dispatch)
++
++    if recovery_dispatch is not None:
++        assert recovery_executor_content_hash is not None
+         return RecoveredPipelineCommit(
+             result=candidate.result,
+             candidate_content_hash=candidate_hash,
+@@ -597,16 +607,20 @@ async def prepare_pipeline_proposal_commit(
+             ),
+         )
+ 
+-    outcome = await dispatch_with_audit(
+-        recorder=recorder,
+-        audit=audit,
+-        do_dispatch=execute_exact,
+-        version_after_provider=lambda result: result.updated_state.version,
+-        arg_error_payload_factory=lambda exc: {
+-            "error_class": type(exc).__name__,
+-            "error_code": exc.category.value,
+-        },
+-    )
++    try:
++        outcome = await dispatch_with_audit(
++            recorder=recorder,
++            audit=audit,
++            do_dispatch=execute_exact,
++            version_after_provider=lambda result: result.updated_state.version,
++            arg_error_payload_factory=lambda exc: {
++                "error_class": type(exc).__name__,
++                "error_code": exc.category.value,
++            },
++        )
++    except ToolArgumentError as exc:
++        # ARG_ERROR remains buffered evidence, never a SUCCESS-only binding.
++        raise PipelineCommitError(exc.safe_message, code="ARGUMENT_ERROR") from exc
+     result = outcome.result
+     if type(result) is not ToolResult:
+         raise AuditIntegrityError("pipeline executor returned a non-ToolResult")
+diff --git a/src/elspeth/web/composer/planning_application.py b/src/elspeth/web/composer/planning_application.py
+index 4dc3377d1..79b68195c 100644
+--- a/src/elspeth/web/composer/planning_application.py
++++ b/src/elspeth/web/composer/planning_application.py
+@@ -659,6 +659,12 @@ class PlanningApplication:
+             required_work=required_work,
+             visible_tool_events=visible_tool_events,
+         )
++        if plan.candidate_state is not None and composition_content_hash(plan.candidate_state) == composition_content_hash(state):
++            return ComposerResult(
++                message="The pipeline is unchanged; the finalized proposal already matches the current composition.",
++                state=state,
++                raw_assistant_content="",
++            )
+         arguments = cast(dict[str, Any], deep_thaw(plan.proposal.pipeline))
+         redacted_arguments = redact_tool_call_arguments(
+             "set_pipeline",
+diff --git a/src/elspeth/web/composer/tool_batch.py b/src/elspeth/web/composer/tool_batch.py
+index 05a5b93db..69ed45bff 100644
+--- a/src/elspeth/web/composer/tool_batch.py
++++ b/src/elspeth/web/composer/tool_batch.py
+@@ -1819,6 +1819,26 @@ async def run_tool_batch(
+                         semantic=True,
+                     )
+                     interpretation_requirements_are_internal = True
++                if (
++                    candidate.acceptable
++                    and candidate.prepared_inline_blob is None
++                    and composition_content_hash(candidate.result.updated_state) == composition_content_hash(state)
++                ):
++                    finalized_candidate_result = finalize_tool_result(
++                        candidate.result,
++                        tool_name=tool_name,
++                        catalog=ctx.policy_catalog,
++                        context=candidate_context,
++                        prior_validation=candidate_prior_validation,
++                    )
++                    if composition_content_hash(finalized_candidate_result.updated_state) == composition_content_hash(state):
++                        unapplied_admission = _unapplied_admission(
++                            finalized_candidate_result,
++                            "no_change",
++                            state=state,
++                            validation=candidate_prior_validation,
++                            runtime_preflight=last_runtime_preflight,
++                        )
+             except BaseException as exc:
+                 # Re-raise exactly once from inside dispatch_with_audit so the
+                 # established ARG_ERROR / PLUGIN_CRASH authority records the
+diff --git a/src/elspeth/web/sessions/proposal_authority.py b/src/elspeth/web/sessions/proposal_authority.py
+index 78909faf9..16c942b21 100644
+--- a/src/elspeth/web/sessions/proposal_authority.py
++++ b/src/elspeth/web/sessions/proposal_authority.py
+@@ -99,6 +99,7 @@ _PIPELINE_REJECTION_REASONS = frozenset(
+         "operator_rejected",
+         "candidate_executor_mismatch",
+         "validation_failed",
++        "no_change",
+         "policy_changed",
+         "base_conflict",
+         "request_cancelled",
+diff --git a/src/elspeth/web/sessions/protocol.py b/src/elspeth/web/sessions/protocol.py
+index 21f6eb7c0..e9d109440 100644
+--- a/src/elspeth/web/sessions/protocol.py
++++ b/src/elspeth/web/sessions/protocol.py
+@@ -126,6 +126,7 @@ PipelineProposalRejectionReason = Literal[
+     "operator_rejected",
+     "candidate_executor_mismatch",
+     "validation_failed",
++    "no_change",
+     "policy_changed",
+     "base_conflict",
+     "request_cancelled",
+diff --git a/src/elspeth/web/sessions/routes/composer/pipeline_settlement.py b/src/elspeth/web/sessions/routes/composer/pipeline_settlement.py
+index 003460fed..a25cddac8 100644
+--- a/src/elspeth/web/sessions/routes/composer/pipeline_settlement.py
++++ b/src/elspeth/web/sessions/routes/composer/pipeline_settlement.py
+@@ -492,6 +492,8 @@ async def _settle_pipeline_proposal_under_compose_lock(
+             reason_by_code: dict[str, PipelineProposalRejectionReason] = {
+                 "CANDIDATE_EXECUTOR_MISMATCH": "candidate_executor_mismatch",
+                 "VALIDATION_FAILED": "validation_failed",
++                "ARGUMENT_ERROR": "validation_failed",
++                "NO_CHANGE": "no_change",
+                 "BASE_CONFLICT": "base_conflict",
+             }
+             if exc.code in reason_by_code:
+@@ -523,6 +525,20 @@ async def _settle_pipeline_proposal_under_compose_lock(
+                 status_code=504,
+                 detail="Pipeline preparation timed out. Please retry this proposal.",
+             )
++        elif exc.code in {"NO_CHANGE", "ARGUMENT_ERROR"}:
++            diagnosis = (
++                "The composer's proposed change does not change the current composition. "
++                if exc.code == "NO_CHANGE"
++                else f"The composer's proposed change has invalid arguments: {exc} "
++            )
++            public_error = HTTPException(
++                status_code=422,
++                detail={
++                    "detail": diagnosis + "The proposal has been automatically rejected. Ask the composer to revise and resubmit.",
++                    "error_type": "proposal_no_change" if exc.code == "NO_CHANGE" else "proposal_argument_invalid",
++                    "tool_name": "set_pipeline",
++                },
++            )
+         else:
+             status_code = 409 if exc.code in {"BASE_CONFLICT", "NOT_PENDING"} else 422
+             public_error = HTTPException(status_code=status_code, detail=str(exc))
+diff --git a/tests/integration/web/composer/test_freeform_proposal_prevalidation.py b/tests/integration/web/composer/test_freeform_proposal_prevalidation.py
+index d5283f426..21b5c69fc 100644
+--- a/tests/integration/web/composer/test_freeform_proposal_prevalidation.py
++++ b/tests/integration/web/composer/test_freeform_proposal_prevalidation.py
+@@ -1685,8 +1685,14 @@ async def test_proposal_cap_counts_only_admitted_changes(tmp_path: Path, call_ki
+ 
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize("named_sources", (False, True), ids=("singleton-source", "named-source"))
+-async def test_identical_canonical_candidate_returns_unchanged_without_proposal(tmp_path: Path, named_sources: bool) -> None:
++@pytest.mark.parametrize("trust_mode", ("explicit_approve", "auto_commit"))
++async def test_identical_canonical_candidate_returns_unchanged_without_proposal(
++    tmp_path: Path, named_sources: bool, trust_mode: str
++) -> None:
+     harness = _harness(tmp_path)
++    await harness.sessions.update_composer_preferences(
++        UUID(harness.session_id), trust_mode=trust_mode, density_default="high", actor="user:proposal-prevalidation-user"
++    )
+     arguments = _valid_pipeline_args(tmp_path)
+     if named_sources:
+         arguments["sources"] = {"orders": arguments.pop("source")}
+@@ -1702,8 +1708,16 @@ async def test_identical_canonical_candidate_returns_unchanged_without_proposal(
+         _tool_turn("call_identical", "set_pipeline", arguments),
+         _fake_llm_response(content="The pipeline is unchanged."),
+     )
++    progress_events = []
++
++    async def record_progress(event: Any) -> None:
++        progress_events.append(event)
++
+     with (
+         patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
++        patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as executor,
++        patch.object(AntiAnchorTracker, "record_failure", autospec=True) as record_failure,
++        patch.object(AntiAnchorTracker, "record_success", autospec=True) as record_success,
+         _record_phase3_outcomes(harness.service) as batches,
+     ):
+         result = await harness.service.compose(
+@@ -1713,19 +1727,76 @@ async def test_identical_canonical_candidate_returns_unchanged_without_proposal(
+             session_id=harness.session_id,
+             user_id="proposal-prevalidation-user",
+             user_message_id=harness.user_message_id,
++            progress=record_progress,
+         )
+     assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
+     assert result.state is state
++    assert result.state.version == 7
++    assert len(llm.message_snapshots) == 2
++    executor.assert_not_called()
++    record_failure.assert_not_called()
++    record_success.assert_not_called()
+     assert len(result.tool_invocations) == 1
+     outcome = batches[0][0]
+     assert outcome.response.success is True
+     assert outcome.response.updated_state is state
+     assert outcome.response.affected_nodes == ()
+     assert outcome.response.prior_validation is None
++    assert "validation_delta" not in outcome.response.to_dict()
++    assert any("unchanged" in event.headline for event in progress_events)
++    assert not any("has updated the pipeline" in event.headline for event in progress_events)
++    assert json.loads(_persisted_tool_content(harness, "call_identical"))["version"] == 7
+     assert "PREVALIDATION_REJECTED" not in canonical_json(outcome.response.to_dict())
+     assert _count_rows(harness.engine, blobs_table) == 0
+ 
+ 
++@pytest.mark.asyncio
++async def test_auto_equal_shaped_candidate_with_profile_objection_retains_validation_precedence(tmp_path: Path) -> None:
++    harness = _harness(tmp_path)
++    await harness.sessions.update_composer_preferences(
++        UUID(harness.session_id),
++        trust_mode="auto_commit",
++        density_default="high",
++        actor="user:proposal-prevalidation-user",
++    )
++    arguments = _valid_pipeline_args(tmp_path, metadata_name="final-profile-reject")
++    state = CompositionState.from_dict(
++        {
++            **arguments,
++            "version": 7,
++            "metadata": {"description": "", **arguments["metadata"]},
++            "outputs": [{"name": output["sink_name"], **output} for output in arguments["outputs"]],
++        }
++    )
++    snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.catalog)
++    catalog = _FinalRejectingCatalog.for_trained_operator(harness.catalog, snapshot)
++    llm = _ScriptedLLM(
++        _tool_turn("call_profile_equal", "set_pipeline", arguments), _fake_llm_response(content="Current policy still objects.")
++    )
++    with (
++        patch.object(harness.service._policy_context, "build", return_value=(snapshot, catalog)),
++        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
++        patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as executor,
++        _record_phase3_outcomes(harness.service) as batches,
++    ):
++        result = await harness.service.compose(
++            "Keep this pipeline.",
++            [],
++            state,
++            session_id=harness.session_id,
++            user_id="proposal-prevalidation-user",
++            user_message_id=harness.user_message_id,
++        )
++    executor.assert_called_once()
++    assert len(result.tool_invocations) == 1
++    response = batches[0][0].response
++    assert response.success
++    assert not response.validation.is_valid
++    assert any(entry.error_code == "profile_complete_state_rejected" for entry in response.validation.errors)
++    assert not any("unchanged" in hint for hint in response.post_call_hints)
++    assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
++
++
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize(
+     ("family", "changed", "patch_kind"),
+@@ -2258,6 +2329,227 @@ async def test_blob_admission_refuses_known_ineligible_effect_once_without_propo
+     assert Path(blob.storage_path).read_bytes() == b"original bytes"
+ 
+ 
++@pytest.mark.asyncio
++async def test_complete_auto_raw_equality_still_applies_required_control_and_review_finalization(tmp_path: Path) -> None:
++    from elspeth.web.composer.pipeline_proposal import composition_content_hash
++    from elspeth.web.composer.required_controls import wire_required_controls
++    from elspeth.web.composer.tools._common import _serialize_set_pipeline_arguments
++    from tests.integration.web.composer.test_freeform_required_controls import (
++        _assert_required_control_disclosures,
++        _incremental_textract_state,
++        _required_textract_policy,
++    )
++
++    harness = _harness(tmp_path)
++    view, snapshot = _required_textract_policy(tmp_path)
++    incomplete, output = await _incremental_textract_state(tmp_path, harness=harness, view=view, snapshot=snapshot)
++    completed = real_execute_tool(
++        "set_output",
++        output,
++        incomplete,
++        view,
++        plugin_snapshot=snapshot,
++        data_dir=str(tmp_path),
++        session_engine=harness.engine,
++        session_id=harness.session_id,
++        user_id="proposal-prevalidation-user",
++        validate_arguments=True,
++        require_data_dir_for_paths=True,
++        raise_schema_argument_errors=True,
++    )
++    assert completed.success and completed.validation.is_valid
++    current = completed.updated_state
++    assert current.sources and current.outputs
++    assert not any(node.plugin.startswith("aws_bedrock_") for node in current.nodes)
++    arguments, error = _serialize_set_pipeline_arguments(current)
++    assert error is None and arguments is not None
++    authored = deepcopy(arguments)
++    await harness.sessions.update_composer_preferences(
++        UUID(harness.session_id),
++        trust_mode="auto_commit",
++        density_default="high",
++        actor="user:proposal-prevalidation-user",
++    )
++    candidates = []
++
++    def observe_candidate(*args: Any, **kwargs: Any) -> Any:
++        candidate = real_build_set_pipeline_candidate(*args, **kwargs)
++        candidates.append(candidate)
++        return candidate
++
++    llm = _ScriptedLLM(_tool_turn("call_complete_equal_controls", "set_pipeline", arguments))
++    with (
++        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
++        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
++        patch("elspeth.web.composer.tool_batch.build_set_pipeline_candidate", side_effect=observe_candidate),
++        patch("elspeth.web.composer.tool_batch.wire_required_controls", wraps=wire_required_controls) as finalizer,
++        patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as executor,
++        _record_phase3_outcomes(harness.service) as batches,
++    ):
++        result = await harness.service.compose(
++            "Keep this complete pipeline and apply current required controls.",
++            [],
++            current,
++            session_id=harness.session_id,
++            user_id="proposal-prevalidation-user",
++            user_message_id=harness.user_message_id,
++        )
++    assert candidates[0].acceptable
++    assert composition_content_hash(candidates[0].result.updated_state) == composition_content_hash(current)
++    assert composition_content_hash(candidates[-1].result.updated_state) != composition_content_hash(current)
++    finalizer.assert_called_once()
++    executor.assert_called_once()
++    assert result.state.version == current.version + 1
++    assert composition_content_hash(result.state) != composition_content_hash(current)
++    _assert_required_control_disclosures(result.state.to_dict())
++    assert {node.plugin for node in result.state.nodes} >= {"aws_bedrock_prompt_shield", "aws_bedrock_content_safety"}
++    assert len(result.tool_invocations) == 1
++    invocation = result.tool_invocations[0]
++    assert invocation.status is ComposerToolStatus.SUCCESS
++    _assert_required_control_disclosures(json.loads(invocation.arguments_canonical))
++    response = batches[0][0].response
++    assert response.updated_state is result.state
++    assert response.affected_nodes
++    assert not any("unchanged" in hint for hint in response.post_call_hints)
++    feedback = json.loads(_persisted_tool_content(harness, invocation.tool_call_id))
++    assert feedback["version"] == current.version + 1
++    assert not any("unchanged" in hint for hint in feedback.get("post_call_hints", ()))
++    assert _count_rows(harness.engine, composition_states_table) == 1
++    assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
++    assert arguments == authored
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("replacement", ["inline", "existing-blob"], ids=["same-inline-bytes-new-custody", "only-blob-identity-changed"])
++async def test_complete_auto_same_bytes_new_source_authority_is_published(tmp_path: Path, replacement: str) -> None:
++    from elspeth.web.composer.pipeline_proposal import composition_content_hash
++    from tests.helpers.session_fences import fenced_operation_context
++
++    harness = _harness(tmp_path)
++    arguments = _inline_pipeline_args(tmp_path)
++    inline = arguments["source"]["inline_blob"]
++    content = inline["content"].encode("utf-8")
++    await harness.sessions.update_composer_preferences(
++        UUID(harness.session_id),
++        trust_mode="auto_commit",
++        density_default="high",
++        actor="user:proposal-prevalidation-user",
++    )
++    current_state_id = None
++    if replacement == "inline":
++        seed_llm = _ScriptedLLM(_tool_turn("call_seed_inline_authority", "set_pipeline", arguments))
++        with patch.object(harness.service._provider_gateway, "_call_llm", new=seed_llm):
++            seed_result = await harness.service.compose(
++                "Prepare the first inline artifact.",
++                [],
++                _incremental_base_state(tmp_path),
++                session_id=harness.session_id,
++                user_id="proposal-prevalidation-user",
++                user_message_id=harness.user_message_id,
++            )
++        current = seed_result.state
++        assert len(seed_result.tool_invocations) == 1
++        saved = await harness.sessions.get_current_state(UUID(harness.session_id))
++        assert saved is not None
++        current_state_id = str(saved.id)
++        with harness.engine.connect() as conn:
++            original = conn.execute(select(blobs_table)).one()
++    else:
++        del arguments["source"]["inline_blob"]
++        with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as context:
++            original = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
++                UUID(harness.session_id),
++                inline["filename"],
++                content,
++                inline["mime_type"],
++                session_operation_context=context,
++            )
++            replacement_blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
++                UUID(harness.session_id),
++                inline["filename"],
++                content,
++                inline["mime_type"],
++                session_operation_context=context,
++            )
++        arguments["source"]["blob_id"] = str(original.id)
++        snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.catalog)
++        view = PolicyCatalogView.for_trained_operator(harness.catalog, snapshot)
++        with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.COMPOSE) as context:
++            seeded = real_execute_tool(
++                "set_pipeline",
++                arguments,
++                _incremental_base_state(tmp_path),
++                view,
++                plugin_snapshot=snapshot,
++                data_dir=str(tmp_path),
++                session_engine=harness.engine,
++                session_id=harness.session_id,
++                session_operation_context=context,
++                session_operation_authority=harness.sessions.session_operation_authority,
++                user_id="proposal-prevalidation-user",
++                validate_arguments=True,
++                require_data_dir_for_paths=True,
++                raise_schema_argument_errors=True,
++            )
++        assert seeded.success and seeded.validation.is_valid
++        current = seeded.updated_state
++        arguments["source"]["blob_id"] = str(replacement_blob.id)
++    assert current.sources and current.outputs
++    assert current.sources["source"].options["blob_ref"] == str(original.id)
++    llm = _ScriptedLLM(_tool_turn("call_complete_new_authority", "set_pipeline", arguments))
++    with (
++        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
++        patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as executor,
++        _record_phase3_outcomes(harness.service) as batches,
++    ):
++        result = await harness.service.compose(
++            "Use a new source artifact with the same bytes.",
++            [],
++            current,
++            current_state_id=current_state_id,
++            session_id=harness.session_id,
++            user_id="proposal-prevalidation-user",
++            user_message_id=harness.user_message_id,
++        )
++    executor.assert_called_once()
++    assert result.state.version == current.version + 1
++    assert composition_content_hash(result.state) != composition_content_hash(current)
++    source = result.state.sources["source"]
++    assert source.options["blob_ref"] != str(original.id)
++    assert {key: value for key, value in source.options.items() if key not in {"path", "blob_ref"}} == {
++        key: value for key, value in current.sources["source"].options.items() if key not in {"path", "blob_ref"}
++    }
++    if replacement == "existing-blob":
++        assert source.options["blob_ref"] == str(replacement_blob.id)
++    else:
++        assert source.options[INTERPRETATION_REQUIREMENTS_KEY][0]["kind"] == "invented_source"
++    assert result.state.nodes == current.nodes
++    assert result.state.edges == current.edges
++    assert result.state.outputs == current.outputs
++    assert result.state.metadata == current.metadata
++    assert len(result.tool_invocations) == 1
++    invocation = result.tool_invocations[0]
++    assert invocation.status is ComposerToolStatus.SUCCESS
++    response = batches[0][0].response
++    assert response.updated_state is result.state
++    assert not any("unchanged" in hint for hint in response.post_call_hints)
++    feedback = json.loads(_persisted_tool_content(harness, invocation.tool_call_id))
++    assert feedback["version"] == current.version + 1
++    assert not any("unchanged" in hint for hint in feedback.get("post_call_hints", ()))
++    with harness.engine.connect() as conn:
++        blobs = conn.execute(select(blobs_table)).all()
++    assert len(blobs) == 2
++    assert all(blob.status == "ready" and blob.content_hash == original.content_hash for blob in blobs)
++    assert all(Path(blob.storage_path).read_bytes() == content for blob in blobs)
++    assert _count_rows(harness.engine, composition_states_table) == (2 if replacement == "inline" else 1)
++    published = await harness.sessions.get_current_state(UUID(harness.session_id))
++    assert published is not None
++    assert published.sources["source"]["options"]["blob_ref"] == source.options["blob_ref"]
++    assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
++    if replacement == "existing-blob":
++        assert len(llm.message_snapshots) == 2
++
++
+ @pytest.mark.asyncio
+ async def test_inline_same_text_with_new_blob_authority_is_a_real_change(tmp_path: Path) -> None:
+     harness = _harness(tmp_path)
+diff --git a/tests/integration/web/composer/test_pipeline_proposal_lifecycle.py b/tests/integration/web/composer/test_pipeline_proposal_lifecycle.py
+index da95a8024..e19c58e32 100644
+--- a/tests/integration/web/composer/test_pipeline_proposal_lifecycle.py
++++ b/tests/integration/web/composer/test_pipeline_proposal_lifecycle.py
+@@ -1235,7 +1235,8 @@ async def test_rejection_rejects_duplicate_successful_dispatch_evidence(service:
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_pipeline_rejection_uses_closed_versioned_reason_and_is_exactly_idempotent(service: SessionServiceImpl) -> None:
++@pytest.mark.parametrize("reason", ["operator_rejected", "no_change"])
++async def test_pipeline_rejection_uses_closed_versioned_reason_and_is_exactly_idempotent(service: SessionServiceImpl, reason: str) -> None:
+     session_id = uuid4()
+     _insert_session(service, session_id)
+     plan = _plan()
+@@ -1245,7 +1246,7 @@ async def test_pipeline_rejection_uses_closed_versioned_reason_and_is_exactly_id
+         session_id=session_id,
+         proposal_id=row.id,
+         draft_hash=plan.proposal.draft_hash,
+-        reason="operator_rejected",
++        reason=reason,
+         dispatch=None,
+         actor="user:alice",
+     )
+@@ -1253,7 +1254,7 @@ async def test_pipeline_rejection_uses_closed_versioned_reason_and_is_exactly_id
+         session_id=session_id,
+         proposal_id=row.id,
+         draft_hash=plan.proposal.draft_hash,
+-        reason="operator_rejected",
++        reason=reason,
+         dispatch=None,
+         actor="user:alice",
+     )
+@@ -1266,11 +1267,13 @@ async def test_pipeline_rejection_uses_closed_versioned_reason_and_is_exactly_id
+         "tool_call_id": plan.tool_call_id,
+         "tool_name": "set_pipeline",
+         "status": "rejected",
+-        "outcome": "rejected",
+-        "reason_code": "operator_rejected",
++        "outcome": "rejected" if reason == "operator_rejected" else "failed",
++        "reason_code": reason,
+         "draft_hash": plan.proposal.draft_hash,
+         "dispatch": None,
+     }
++    reloaded = await service.get_authoritative_pipeline_proposal(session_id=session_id, proposal_id=row.id)
++    assert reloaded.row.status == "rejected"
+     with pytest.raises((TypeError, ValueError, AuditIntegrityError)):
+         await service.reject_pipeline_composition_proposal(
+             session_id=session_id,
+diff --git a/tests/unit/web/composer/test_audit_cohort_settlement.py b/tests/unit/web/composer/test_audit_cohort_settlement.py
+index 87ee7ac05..b272263ae 100644
+--- a/tests/unit/web/composer/test_audit_cohort_settlement.py
++++ b/tests/unit/web/composer/test_audit_cohort_settlement.py
+@@ -399,9 +399,16 @@ def _green_preflight() -> ValidationResult:
+     )
+ 
+ 
+-def _plan() -> PipelinePlanResult:
++def _plan(*, equal: bool = False) -> PipelinePlanResult:
++    metadata = PipelineMetadata() if equal else PipelineMetadata(name="Changed pipeline", description="")
+     proposal = PipelineProposal.create(
+-        pipeline={"sources": {}, "nodes": [], "edges": [], "outputs": []},
++        pipeline={
++            "sources": {},
++            "nodes": [],
++            "edges": [],
++            "outputs": [],
++            "metadata": {"name": metadata.name, "description": metadata.description},
++        },
+         base=AbsentBase(),
+         repair_count=0,
+         skill_hash=stable_hash("planner-skill"),
+@@ -413,7 +420,7 @@ def _plan() -> PipelinePlanResult:
+         model_identifier="planner-model",
+         model_version="planner-model-v1",
+         provider="test",
+-        candidate_state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
++        candidate_state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=metadata, version=2),
+     )
+ 
+ 
+@@ -424,11 +431,13 @@ class _FakePreferences:
+ 
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize("fail_at", [None, 0, 1, 2, 3, 4, 5], ids=["control", "index0", "index1", "index2", "index3", "index4", "index5"])
++@pytest.mark.parametrize("equal", [False, True], ids=["changed", "equal"])
+ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index(
+     composer_service_with_real_sessions: ComposerServiceImpl,
+     result_session_id: str,
+     monkeypatch: pytest.MonkeyPatch,
+     fail_at: int | None,
++    equal: bool,
+ ) -> None:
+     """``_stage_pipeline_plan``: a failure at any cohort row leaves zero rows AND no proposal."""
+     service = composer_service_with_real_sessions
+@@ -442,7 +451,7 @@ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_inde
+         async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
+             return await service._planning_application._stage_pipeline_plan(
+                 session_operation_context=compose_context,
+-                plan=_plan(),
++                plan=_plan(equal=equal),
+                 state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+                 session_id=UUID(result_session_id),
+                 current_state_id=None,
+@@ -464,8 +473,29 @@ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_inde
+             assert result.message
+             rows = _chat_rows(sessions_service, result_session_id)
+             assert _invocation_occurrences(rows) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
+-            assert _proposal_count(sessions_service, result_session_id) == 1
++            assert _proposal_count(sessions_service, result_session_id) == (0 if equal else 1)
+             assert injector.calls == 2 * len(_PLANNER_COHORT)
++            if equal:
++                preflight.assert_not_awaited()
++                assert result.state.version == 1
++                assert result.raw_assistant_content == ""
++                assert result.runtime_preflight is None and result.pipeline_commit_intent is None
++                assert result.tool_invocations == () and result.llm_calls == ()
++                from elspeth.web.sessions.routes._helpers import _composer_history_content, composer_turn_end_assistant_row
++
++                draft = composer_turn_end_assistant_row(result)
++                assert draft.content == result.message and draft.raw_content == ""
++                async with acquire_compose_context(sessions_service, result_session_id) as context:
++                    stored = await sessions_service.add_message(
++                        UUID(result_session_id),
++                        "assistant",
++                        draft.content,
++                        raw_content=draft.raw_content,
++                        writer_principal="compose_loop",
++                        session_operation_context=context,
++                    )
++                assert stored.content == result.message and stored.raw_content == ""
++                assert _composer_history_content(stored) == ""
+             return
+ 
+         with pytest.raises(AuditIntegrityError, match="pipeline planner audit persistence failed before proposal creation"):
+@@ -659,10 +689,12 @@ async def test_cancel_then_mid_cohort_failure_lands_nothing_and_keeps_the_cancel
+ 
+ 
+ @pytest.mark.asyncio
++@pytest.mark.parametrize("equal", [False, True], ids=["changed", "equal"])
+ async def test_planner_cohort_cancelled_mid_settlement_lands_whole_and_creates_no_proposal(
+     composer_service_with_real_sessions: ComposerServiceImpl,
+     result_session_id: str,
+     monkeypatch: pytest.MonkeyPatch,
++    equal: bool,
+ ) -> None:
+     """End-to-end on the planner success path: evidence lands whole, cancel wins, no proposal follows."""
+     service = composer_service_with_real_sessions
+@@ -676,7 +708,7 @@ async def test_planner_cohort_cancelled_mid_settlement_lands_whole_and_creates_n
+         async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
+             return await service._planning_application._stage_pipeline_plan(
+                 session_operation_context=compose_context,
+-                plan=_plan(),
++                plan=_plan(equal=equal),
+                 state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+                 session_id=UUID(result_session_id),
+                 current_state_id=None,
+diff --git a/tests/unit/web/composer/test_pipeline_commit_operation_authority.py b/tests/unit/web/composer/test_pipeline_commit_operation_authority.py
+index 97244d130..0e809a4b0 100644
+--- a/tests/unit/web/composer/test_pipeline_commit_operation_authority.py
++++ b/tests/unit/web/composer/test_pipeline_commit_operation_authority.py
+@@ -24,7 +24,12 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
+ from elspeth.web.composer import pipeline_commit
+ from elspeth.web.composer.audit import BufferingRecorder
+ from elspeth.web.composer.authority_hashing import composer_authority_hash
+-from elspeth.web.composer.pipeline_commit import PipelineCommitConfig, PreparedPipelineCommit, prepare_pipeline_proposal_commit
++from elspeth.web.composer.pipeline_commit import (
++    PipelineCommitConfig,
++    PipelineCommitError,
++    PreparedPipelineCommit,
++    prepare_pipeline_proposal_commit,
++)
+ from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+ from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
+ from elspeth.web.composer.protocol import ToolArgumentError
+@@ -34,6 +39,7 @@ from elspeth.web.composer.state import CompositionState, PipelineMetadata
+ from elspeth.web.coordination.contracts import SessionOperationFenceLost
+ from elspeth.web.dependencies import create_catalog_service
+ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
++from elspeth.web.plugin_policy.validation import ProfileAwareValidationResult
+ from elspeth.web.sessions.engine import create_session_engine
+ from elspeth.web.sessions.protocol import AuthoritativePipelineProposal
+ from elspeth.web.sessions.schema import initialize_session_schema
+@@ -171,10 +177,15 @@ async def _prepare(
+     context: SessionOperationContext,
+     *,
+     recorder: BufferingRecorder | None = None,
++    current_state: CompositionState | None = None,
++    recovery_dispatch: pipeline_commit.PipelineDispatchAuditBinding | None = None,
++    recovery_executor_content_hash: str | None = None,
+ ) -> PreparedPipelineCommit:
+     result = await prepare_pipeline_proposal_commit(
+         authority=proposal.authority,
+-        current_state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
++        current_state=current_state
++        if current_state is not None
++        else CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+         current_state_id=None,
+         policy_catalog=proposal.policy,
+         plugin_snapshot=proposal.snapshot,
+@@ -192,11 +203,49 @@ async def _prepare(
+         ),
+         recorder=recorder if recorder is not None else BufferingRecorder(),
+         actor="user:alice",
++        recovery_dispatch=recovery_dispatch,
++        recovery_executor_content_hash=recovery_executor_content_hash,
+     )
+     assert isinstance(result, PreparedPipelineCommit)
+     return result
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize("recovery", ["fresh", "matching", "mismatch", "missing_pair"])
++async def test_equal_candidate_only_rejects_after_recovery_integrity(proposal: _Proposal, recovery: str) -> None:
++    operations = proposal.service.session_operation_authority
++    context = operations.acquire(
++        session_id=proposal.authority.row.session_id,
++        operation_kind=SessionOperationKind.PROPOSAL,
++        owner_instance_id=proposal.service.session_operation_owner_instance_id,
++        lease_seconds=300,
++    )
++    try:
++        prepared = await _prepare(proposal, context)
++        current = replace(prepared.result.updated_state, version=19)
++        recorder = BufferingRecorder()
++        binding = prepared.dispatch if recovery != "fresh" else None
++        executor_hash = prepared.executor_content_hash if recovery == "matching" else "0" * 64 if recovery == "mismatch" else None
++        expected_error = AuditIntegrityError if recovery == "missing_pair" else PipelineCommitError
++        with pytest.raises(expected_error) as caught:
++            await _prepare(
++                proposal,
++                context,
++                recorder=recorder,
++                current_state=current,
++                recovery_dispatch=binding,
++                recovery_executor_content_hash=executor_hash,
++            )
++        if isinstance(caught.value, PipelineCommitError):
++            assert caught.value.code == ("CANDIDATE_EXECUTOR_MISMATCH" if recovery == "mismatch" else "NO_CHANGE")
++            assert caught.value.dispatch is binding
++            assert caught.value.invocation is None
++        assert recorder.invocations == ()
++        assert current.version == 19
++    finally:
++        operations.release(context)
++
++
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize("operation_kind", [SessionOperationKind.PROPOSAL, SessionOperationKind.COMPOSE])
+ async def test_candidate_and_executor_keep_the_exact_live_operation(
+@@ -354,8 +403,12 @@ async def test_executor_argument_error_persists_its_category_as_the_error_code(
+     )
+     recorder = BufferingRecorder()
+     try:
+-        with pytest.raises(ToolArgumentError):
++        with pytest.raises(PipelineCommitError) as caught:
+             await _prepare(proposal, context, recorder=recorder)
++        assert caught.value.code == "ARGUMENT_ERROR"
++        assert caught.value.invocation is None
++        assert caught.value.dispatch is None
++        assert str(caught.value) == reject_schema_error_message()
+     finally:
+         operations.release(context)
+ 
+@@ -365,3 +418,114 @@ async def test_executor_argument_error_persists_its_category_as_the_error_code(
+     assert (invocation.error_class, invocation.error_category) == ("ToolArgumentError", ToolArgumentErrorCategory.SCHEMA_SHAPE)
+     assert invocation.result_canonical is not None
+     assert json.loads(invocation.result_canonical) == {"error_class": "ToolArgumentError", "error_code": "schema_shape"}
++
++
++def reject_schema_error_message() -> str:
++    return ToolArgumentError(
++        argument="set_pipeline arguments",
++        expected="object conforming to SetPipelineArgumentsModel (arguments contains unsupported properties)",
++        actual_type="invalid_schema",
++        code="SCHEMA_VALIDATION",
++        category=ToolArgumentErrorCategory.SCHEMA_SHAPE,
++    ).safe_message
++
++
++@pytest.mark.asyncio
++async def test_candidate_argument_error_has_no_executor_or_success_binding(proposal: _Proposal, monkeypatch: pytest.MonkeyPatch) -> None:
++    original = ToolArgumentError(argument="source", expected="an object", actual_type="str")
++
++    def invalid_candidate(*_args: Any, **_kwargs: Any) -> Any:
++        raise original
++
++    monkeypatch.setattr(pipeline_commit, "build_set_pipeline_candidate", invalid_candidate)
++    operations = proposal.service.session_operation_authority
++    context = operations.acquire(
++        session_id=proposal.authority.row.session_id,
++        operation_kind=SessionOperationKind.PROPOSAL,
++        owner_instance_id=proposal.service.session_operation_owner_instance_id,
++        lease_seconds=300,
++    )
++    recorder = BufferingRecorder()
++    try:
++        with pytest.raises(PipelineCommitError) as caught:
++            await _prepare(proposal, context, recorder=recorder)
++        assert caught.value.code == "ARGUMENT_ERROR"
++        assert str(caught.value) == original.safe_message
++        assert caught.value.__cause__ is original
++        assert caught.value.invocation is None and caught.value.dispatch is None
++        assert recorder.invocations == ()
++    finally:
++        operations.release(context)
++
++
++class _RejectCompletePolicy(PolicyCatalogView):
++    def validate_composition_state(self, state: CompositionState) -> ProfileAwareValidationResult:
++        from elspeth.web.composer.state import ValidationEntry, ValidationSummary
++
++        validation = state.validate()
++        if state.sources:
++            validation = ValidationSummary(
++                is_valid=False,
++                errors=(
++                    ValidationEntry(
++                        component="policy:final",
++                        message="Current policy refuses this complete composition.",
++                        severity="high",
++                        error_code="profile_complete_state_rejected",
++                    ),
++                ),
++            )
++        return ProfileAwareValidationResult(authored_state=state, executable_state=state, policy_findings=(), validation=validation)
++
++
++@pytest.mark.asyncio
++async def test_equal_content_with_failed_authored_validation_remains_validation_failure(proposal: _Proposal) -> None:
++    operations = proposal.service.session_operation_authority
++    context = operations.acquire(
++        session_id=proposal.authority.row.session_id,
++        operation_kind=SessionOperationKind.PROPOSAL,
++        owner_instance_id=proposal.service.session_operation_owner_instance_id,
++        lease_seconds=300,
++    )
++    try:
++        accepted = await _prepare(proposal, context)
++        refusing_policy = _RejectCompletePolicy.for_trained_operator(create_catalog_service(), proposal.snapshot)
++        recorder = BufferingRecorder()
++        with pytest.raises(PipelineCommitError) as caught:
++            await _prepare(
++                replace(proposal, policy=refusing_policy), context, current_state=accepted.result.updated_state, recorder=recorder
++            )
++        assert caught.value.code == "VALIDATION_FAILED"
++        assert recorder.invocations == ()
++    finally:
++        operations.release(context)
++
++
++@pytest.mark.asyncio
++async def test_real_candidate_malformed_arguments_are_safe_argument_failure(proposal: _Proposal) -> None:
++    from elspeth.contracts.freeze import deep_thaw
++
++    arguments = deep_thaw(proposal.authority.proposal.pipeline)
++    arguments["source"] = "PRIVATE-INVALID-SOURCE"
++    authority = replace(
++        proposal.authority,
++        row=replace(proposal.authority.row, tool_arguments_hash=composer_authority_hash(arguments)),
++        proposal=PipelineProposal.create(pipeline=arguments, base=AbsentBase(), repair_count=0, skill_hash=stable_hash("test-skill")),
++    )
++    operations = proposal.service.session_operation_authority
++    context = operations.acquire(
++        session_id=proposal.authority.row.session_id,
++        operation_kind=SessionOperationKind.PROPOSAL,
++        owner_instance_id=proposal.service.session_operation_owner_instance_id,
++        lease_seconds=300,
++    )
++    try:
++        recorder = BufferingRecorder()
++        with pytest.raises(PipelineCommitError) as caught:
++            await _prepare(replace(proposal, authority=authority), context, recorder=recorder)
++        assert caught.value.code == "ARGUMENT_ERROR"
++        assert type(caught.value.__cause__) is ToolArgumentError
++        assert "PRIVATE" not in str(caught.value)
++        assert recorder.invocations == ()
++    finally:
++        operations.release(context)
+diff --git a/tests/unit/web/composer/test_pipeline_planner.py b/tests/unit/web/composer/test_pipeline_planner.py
+index a60744433..b3f11b648 100644
+--- a/tests/unit/web/composer/test_pipeline_planner.py
++++ b/tests/unit/web/composer/test_pipeline_planner.py
+@@ -1020,15 +1020,21 @@ async def test_retained_operation_context_reaches_selected_planner_wire(tmp_path
+ 
+ 
+ @pytest.mark.asyncio
++@pytest.mark.parametrize("equal_current", [False, True], ids=["new", "already-current"])
+ async def test_happy_path_returns_proposal_and_audits_exact_marked_wire_payload(
+     tmp_path: Path,
+     tool_context: ToolContext,
++    equal_current: bool,
+ ) -> None:
+     pipeline = _pipeline(tmp_path)
+     completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": pipeline})))
+     recorder = BufferingRecorder()
+     lifecycle_events: list[str] = []
+     policy = _budget()
++    context, _, _ = _candidate_context(tmp_path, _TEST_SESSION_ID)
++    candidate = build_set_pipeline_candidate(pipeline, _empty_state(), context)
++    assert candidate.acceptable
++    current = candidate.result.updated_state if equal_current else _empty_state()
+ 
+     proposal = await _plan(
+         tmp_path=tmp_path,
+@@ -1037,11 +1043,20 @@ async def test_happy_path_returns_proposal_and_audits_exact_marked_wire_payload(
+         recorder=recorder,
+         budget=policy,
+         lifecycle=_lifecycle(lifecycle_events),
++        current_state=current,
+     )
+ 
+     assert deep_thaw(proposal.proposal.pipeline) == pipeline
+     assert proposal.proposal.base == AbsentBase()
+     assert proposal.proposal.repair_count == 0
++    if equal_current:
++        from elspeth.web.composer.pipeline_proposal import composition_content_hash
++
++        assert proposal.candidate_state is not None
++        assert composition_content_hash(proposal.candidate_state) == composition_content_hash(current)
++        # Terminal authoring is represented by the accepted DONE attempt;
++        # it must not manufacture an executor dispatch to prove equality.
++        assert recorder.invocations == ()
+     assert lifecycle_events == ["before", "scope-enter", "scope-exit", "settled:complete"]
+     assert len(completion.requests) == 1
+     sent = completion.requests[0]
+diff --git a/tests/unit/web/composer/test_planner_stage_runtime_preflight.py b/tests/unit/web/composer/test_planner_stage_runtime_preflight.py
+index 5f349c2db..667a9266a 100644
+--- a/tests/unit/web/composer/test_planner_stage_runtime_preflight.py
++++ b/tests/unit/web/composer/test_planner_stage_runtime_preflight.py
+@@ -29,7 +29,7 @@ so the UI reads the findings structurally rather than from prose.
+ from __future__ import annotations
+ 
+ import asyncio
+-from dataclasses import dataclass
++from dataclasses import dataclass, replace
+ from typing import Any
+ from unittest.mock import AsyncMock, MagicMock, patch
+ from uuid import UUID, uuid4
+@@ -40,7 +40,7 @@ from elspeth.core.canonical import stable_hash
+ from elspeth.web.catalog.protocol import CatalogService
+ from elspeth.web.composer.audit import BufferingRecorder
+ from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+-from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
++from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, owned_composition_state_execution_arguments_from_restored
+ from elspeth.web.composer.protocol import (
+     PIPELINE_STAGED_AUTO_COMMIT_MESSAGE,
+     PIPELINE_STAGED_REVIEW_FINDINGS_MESSAGE,
+@@ -178,7 +178,9 @@ class _FakeSessionsService:
+ 
+ def _plan(candidate_state: CompositionState | None) -> PipelinePlanResult:
+     proposal = PipelineProposal.create(
+-        pipeline={"sources": {}, "nodes": [], "edges": [], "outputs": []},
++        pipeline=owned_composition_state_execution_arguments_from_restored(candidate_state)
++        if candidate_state is not None
++        else {"sources": {}, "nodes": [], "edges": [], "outputs": []},
+         base=AbsentBase(),
+         repair_count=0,
+         skill_hash=stable_hash("planner-skill"),
+@@ -208,11 +210,13 @@ async def _stage(
+     trust_mode: str,
+     preflight: ValidationResult | BaseException | None,
+     candidate_state: CompositionState | None,
++    live_trust_mode: str | None = None,
++    state: CompositionState | None = None,
+ ) -> tuple[Any, _FakeSessionsService]:
+     """Run ``_stage_pipeline_plan`` with a scripted Stage-2 outcome."""
+     service = _service()
+-    sessions = _FakeSessionsService(trust_mode)
+-    state = _empty_state()
++    sessions = _FakeSessionsService(live_trust_mode or trust_mode)
++    state = state if state is not None else _empty_state()
+ 
+     if isinstance(preflight, BaseException):
+         preflight_mock = AsyncMock(spec=service._preflight.cached_runtime_preflight, side_effect=preflight)
+@@ -221,7 +225,7 @@ async def _stage(
+ 
+     with (
+         patch.object(service._planning_application, "_sessions_service_optional", sessions),
+-        patch.object(service._planning_application, "_persist_pipeline_planner_audit", new_callable=AsyncMock),
++        patch.object(service._planning_application, "_persist_pipeline_planner_audit", new_callable=AsyncMock) as audit,
+         patch.object(service._preflight, "cached_runtime_preflight", preflight_mock),
+     ):
+         staged_session_id = uuid4()
+@@ -242,9 +246,52 @@ async def _stage(
+             planner_withheld_replies=(),
+             plugin_snapshot=None,
+         )
++        audit.assert_awaited_once()
++        if candidate_state is not None and candidate_state.metadata == state.metadata:
++            preflight_mock.assert_not_awaited()
+     return result, sessions
+ 
+ 
++def _changed_state() -> CompositionState:
++    state = _empty_state()
++    return replace(state, metadata=replace(state.metadata, name="Changed pipeline"))
++
++
++@pytest.mark.parametrize(
++    "snapshot,live", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve")]
++)
++async def test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged(snapshot: str, live: str) -> None:
++    state = replace(_empty_state(), version=7)
++    result, sessions = await _stage(
++        trust_mode=snapshot,
++        live_trust_mode=live,
++        preflight=AssertionError("no new runtime claim"),
++        candidate_state=replace(state, version=8),
++        state=state,
++    )
++    assert result.state is state
++    assert result.state.version == 7
++    assert sessions.created_proposals == []
++    assert result.pipeline_commit_intent is None
++    assert result.runtime_preflight is None
++    assert result.raw_assistant_content == ""
++    assert result.tool_invocations == () and result.llm_calls == ()
++    assert "unchanged" in result.message.lower()
++
++
++async def test_changed_plan_downgrade_retains_review_and_green_preflight() -> None:
++    result, sessions = await _stage(
++        trust_mode="auto_commit",
++        live_trust_mode="explicit_approve",
++        preflight=_green_result(),
++        candidate_state=_changed_state(),
++    )
++    assert len(sessions.created_proposals) == 1
++    assert result.pipeline_commit_intent is None
++    assert result.message == PIPELINE_STAGED_REVIEW_MESSAGE
++    assert result.runtime_preflight is not None and result.runtime_preflight.is_valid
++
++
+ # ---------------------------------------------------------------------------
+ # GREEN — the only arm allowed to say "validated"
+ # ---------------------------------------------------------------------------
+@@ -254,7 +301,7 @@ async def test_green_preflight_keeps_auto_commit_and_validated_wording() -> None
+     result, _ = await _stage(
+         trust_mode="auto_commit",
+         preflight=_green_result(),
+-        candidate_state=_empty_state(),
++        candidate_state=_changed_state(),
+     )
+ 
+     assert result.message == PIPELINE_STAGED_AUTO_COMMIT_MESSAGE
+@@ -268,7 +315,7 @@ async def test_green_preflight_under_explicit_approve_uses_validated_review_word
+     result, _ = await _stage(
+         trust_mode="explicit_approve",
+         preflight=_green_result(),
+-        candidate_state=_empty_state(),
++        candidate_state=_changed_state(),
+     )
+ 
+     assert result.message == PIPELINE_STAGED_REVIEW_MESSAGE
+@@ -286,7 +333,7 @@ async def test_red_preflight_downgrades_auto_commit_to_review() -> None:
+     result, sessions = await _stage(
+         trust_mode="auto_commit",
+         preflight=_red_result(),
+-        candidate_state=_empty_state(),
++        candidate_state=_changed_state(),
+     )
+ 
+     # Downgraded, NOT hard-failed: the proposal still staged for a human.
+@@ -303,7 +350,7 @@ async def test_red_preflight_on_review_arm_is_truthful() -> None:
+     result, _ = await _stage(
+         trust_mode="explicit_approve",
+         preflight=_red_result(),
+-        candidate_state=_empty_state(),
++        candidate_state=_changed_state(),
+     )
+ 
+     assert result.message == PIPELINE_STAGED_REVIEW_FINDINGS_MESSAGE
+@@ -320,7 +367,7 @@ async def test_pending_interpretation_review_blocks_auto_commit() -> None:
+     result, _ = await _stage(
+         trust_mode="auto_commit",
+         preflight=_pending_review_result(),
+-        candidate_state=_empty_state(),
++        candidate_state=_changed_state(),
+     )
+ 
+     assert result.pipeline_commit_intent is None
+@@ -338,7 +385,7 @@ async def test_pending_interpretation_review_is_not_reported_as_findings() -> No
+     result, _ = await _stage(
+         trust_mode="auto_commit",
+         preflight=_pending_review_result(),
+-        candidate_state=_empty_state(),
++        candidate_state=_changed_state(),
+     )
+ 
+     assert result.message == PIPELINE_STAGED_REVIEW_PENDING_INTERPRETATION_MESSAGE
+@@ -359,7 +406,7 @@ async def test_preflight_failure_is_not_run_and_blocks_auto_commit() -> None:
+             original_exc=RuntimeError("preflight exploded"),
+             partial_state=None,
+         ),
+-        candidate_state=_empty_state(),
++        candidate_state=_changed_state(),
+     )
+ 
+     assert len(sessions.created_proposals) == 1
+@@ -385,7 +432,7 @@ async def test_preflight_timeout_is_not_run() -> None:
+             original_exc=TimeoutError("deadline expired"),
+             partial_state=None,
+         ),
+-        candidate_state=_empty_state(),
++        candidate_state=_changed_state(),
+     )
+ 
+     assert result.pipeline_commit_intent is None
+@@ -403,7 +450,7 @@ async def test_cancellation_is_not_swallowed_into_a_staged_proposal() -> None:
+         await _stage(
+             trust_mode="auto_commit",
+             preflight=asyncio.CancelledError(),
+-            candidate_state=_empty_state(),
++            candidate_state=_changed_state(),
+         )
+ 
+ 
+diff --git a/tests/unit/web/sessions/test_pipeline_rejection_callers.py b/tests/unit/web/sessions/test_pipeline_rejection_callers.py
+index bdfbabd05..dd1ae6feb 100644
+--- a/tests/unit/web/sessions/test_pipeline_rejection_callers.py
++++ b/tests/unit/web/sessions/test_pipeline_rejection_callers.py
+@@ -47,6 +47,223 @@ from tests.unit.web.sessions.test_pipeline_rejection_required import prepared_re
+ pytest_plugins = ("tests.unit.web.coordination.test_composer_operation_authority",)
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize("owned", [False, True], ids=["public", "owned"])
++@pytest.mark.parametrize(
++    "recovered,argument_site",
++    [(False, None), (True, None), (False, "build"), (False, "executor")],
++    ids=["fresh", "persisted-success", "build-argument", "executor-argument"],
++)
++async def test_real_canonical_terminal_refusal_http_rejects_once_without_state_publication(
++    operation_store, tmp_path, monkeypatch, owned, recovered, argument_site
++):
++    from dataclasses import replace
++
++    from sqlalchemy import func
++
++    from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
++    from elspeth.core.canonical import stable_hash
++    from elspeth.web.catalog.policy_view import PolicyCatalogView
++    from elspeth.web.composer.audit import begin_dispatch, dispatch_with_audit
++    from elspeth.web.composer.pipeline_commit import _bind_executor_content_hash
++    from elspeth.web.composer.pipeline_proposal import (
++        PipelineProposal,
++        PresentBase,
++        composition_content_hash,
++        owned_composition_state_authority,
++        owned_composition_state_review_arguments,
++    )
++    from elspeth.web.composer.protocol import ToolArgumentError
++    from elspeth.web.composer.redaction import redact_tool_call_arguments
++    from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
++    from elspeth.web.composer.tools import ToolContext, build_set_pipeline_candidate, execute_tool
++    from elspeth.web.dependencies import create_catalog_service
++    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
++    from elspeth.web.sessions.models import chat_messages_table, composition_states_table
++    from elspeth.web.sessions.protocol import CompositionStateData
++    from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
++    from tests.integration.web.composer.test_pipeline_proposal_lifecycle import _runnable_pipeline
++    from tests.unit.web.coordination.test_composer_operation_authority import start
++
++    engine, repository, _authority, service, sid = operation_store
++    record, running = start(operation_store)
++    context = running.session_operation_context
++    from uuid import UUID
++
++    user = await service.add_message_with_transcript(
++        sid,
++        "user",
++        "Keep the current pipeline",
++        operation_id=UUID(record.operation_id),
++        requested_state_id=None,
++        writer_principal="route_user_message",
++        session_operation_context=context,
++        running=running,
++    )
++    catalog = create_catalog_service()
++    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
++    policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
++    public = _runnable_pipeline(tmp_path, sid)
++    empty = _initial_composition_state()
++    candidate = build_set_pipeline_candidate(
++        public,
++        empty,
++        ToolContext(
++            catalog=policy,
++            plugin_snapshot=snapshot,
++            data_dir=str(tmp_path),
++            session_id=str(sid),
++            session_engine=engine,
++            session_operation_context=context,
++            session_operation_authority=service.session_operation_authority,
++            user_id="alice",
++            require_data_dir_for_paths=True,
++        ),
++    )
++    assert candidate.acceptable
++    state = replace(candidate.result.updated_state, version=7)
++    payload = state.to_dict()
++    saved = await service.save_composition_state(
++        sid,
++        CompositionStateData(
++            sources=payload["sources"],
++            nodes=payload["nodes"],
++            edges=payload["edges"],
++            outputs=payload["outputs"],
++            metadata_=payload["metadata"],
++        ),
++        provenance="tool_call",
++        session_operation_context=context,
++    )
++    proposed = state
++    if argument_site == "executor":
++        proposed = replace(state, metadata=replace(state.metadata, name="Changed candidate"))
++        public["metadata"] = {"name": proposed.metadata.name, "description": proposed.metadata.description}
++    arguments = owned_composition_state_authority(proposed) if owned else public
++    plan = PipelinePlanResult(
++        proposal=PipelineProposal.create(
++            pipeline=arguments, base=PresentBase(saved.id, composition_content_hash(state)), repair_count=0, skill_hash=stable_hash("skill")
++        ),
++        tool_call_id="equal-terminal",
++        custody_result="not_required",
++        model_identifier="model",
++        model_version="v1",
++        provider="test",
++    )
++    row = await service.create_pipeline_composition_proposal(
++        session_id=sid,
++        plan=plan,
++        summary="Keep pipeline",
++        rationale="Requested",
++        affects=("graph",),
++        actor="composer-web:user:alice",
++        arguments_redacted_json=redact_tool_call_arguments(
++            "set_pipeline", owned_composition_state_review_arguments(arguments) if owned else arguments, telemetry=NoopRedactionTelemetry()
++        ),
++        composer_model_identifier="model",
++        composer_model_version="v1",
++        composer_provider="test",
++        session_operation_context=context,
++        user_message_id=user.message.id,
++    )
++    binding = None
++    if recovered:
++        recorder = BufferingRecorder()
++
++        async def dispatch():
++            return execute_tool(
++                "set_pipeline",
++                public,
++                state,
++                policy,
++                plugin_snapshot=snapshot,
++                data_dir=str(tmp_path),
++                session_id=str(sid),
++                session_engine=engine,
++                session_operation_context=context,
++                session_operation_authority=service.session_operation_authority,
++                user_id="alice",
++            )
++
++        outcome = await dispatch_with_audit(
++            recorder=recorder,
++            audit=begin_dispatch(row.tool_call_id, "set_pipeline", arguments, version_before=state.version, actor="user:alice"),
++            do_dispatch=dispatch,
++            version_after_provider=lambda result: result.updated_state.version,
++            arg_error_payload_factory=lambda exc: {"error_class": "ToolArgumentError", "error_code": exc.category.value},
++        )
++        assert outcome.result.success
++        invocation = _bind_executor_content_hash(
++            recorder.invocations[0], executor_content_hash=composition_content_hash(outcome.result.updated_state)
++        )
++        bindings = await _persist_tool_invocations(
++            service, sid, (invocation,), None, plugin_crash_pending=False, session_operation_context=context
++        )
++        (binding,) = bindings
++    repository.release(context)
++    app = mounted_app(operation_store, tmp_path)
++    import elspeth.web.composer.pipeline_commit as commit
++
++    def forbid_execution(*args, **kwargs):
++        pytest.fail("equal pending acceptance dispatched the executor")
++
++    argument_error = ToolArgumentError(
++        argument="set_pipeline arguments",
++        expected="object conforming to SetPipelineArgumentsModel",
++        actual_type="invalid_schema",
++        code="SCHEMA_VALIDATION",
++        category=ToolArgumentErrorCategory.SCHEMA_SHAPE,
++    )
++
++    def refuse_argument(*args, **kwargs):
++        raise argument_error
++
++    monkeypatch.setattr(commit, "execute_tool", refuse_argument if argument_site == "executor" else forbid_execution)
++    if argument_site == "build":
++        monkeypatch.setattr(commit, "build_set_pipeline_candidate", refuse_argument)
++    with engine.connect() as conn:
++        before = conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one()
++    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
++        url = f"/api/sessions/{sid}/proposals/{row.id}/accept"
++        response = await client.post(url, json={"draft_hash": plan.proposal.draft_hash})
++        assert response.status_code == 422, response.text
++        assert response.json()["detail"]["error_type"] == ("proposal_argument_invalid" if argument_site else "proposal_no_change")
++        diagnosis = (
++            f"The composer's proposed change has invalid arguments: {argument_error.safe_message} "
++            if argument_site
++            else "The composer's proposed change does not change the current composition. "
++        )
++        assert response.json()["detail"]["detail"] == (
++            diagnosis + "The proposal has been automatically rejected. Ask the composer to revise and resubmit."
++        )
++        repeat = await client.post(url, json={"draft_hash": plan.proposal.draft_hash})
++        assert repeat.status_code == 409
++    reloaded = await service.get_authoritative_pipeline_proposal(session_id=sid, proposal_id=row.id)
++    assert reloaded.row.status == "rejected"
++    assert reloaded.row.committed_state_id is None
++    assert (await service.get_current_state(sid)).id == saved.id
++    events = proposal_events(engine, row.id)
++    assert len(events) == 1
++    assert events[0].actor == "system:pipeline_commit:user:alice"
++    assert events[0].payload["reason_code"] == ("validation_failed" if argument_site else "no_change")
++    assert events[0].payload["dispatch"] == (binding.to_dict() if binding is not None else None)
++    with engine.connect() as conn:
++        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 1
++        if argument_site != "executor":
++            assert conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one() == before
++        else:
++            audit_rows = conn.execute(select(chat_messages_table.c.tool_calls).where(chat_messages_table.c.role == "audit")).scalars().all()
++            invocations = [
++                item["invocation"]
++                for calls in audit_rows
++                if calls
++                for item in calls
++                if item["_kind"] == "audit" and item["invocation"]["tool_call_id"] == row.tool_call_id
++            ]
++            assert len(invocations) == 1
++            assert invocations[0]["status"] == "arg_error"
++
++
+ @pytest.mark.asyncio
+ @pytest.mark.timeout(30, method="thread")
+ @pytest.mark.parametrize("rejection_outcome", ["returned", "raised", "unknown"])
+@@ -235,11 +452,16 @@ def proposal_events(engine, proposal_id):
+ 
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize("manual", [False, True])
+-async def test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body(operation_store, tmp_path, monkeypatch, manual):
++@pytest.mark.parametrize(
++    "code,reason", [("VALIDATION_FAILED", "validation_failed"), ("NO_CHANGE", "no_change"), ("ARGUMENT_ERROR", "validation_failed")]
++)
++async def test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body(
++    operation_store, tmp_path, monkeypatch, manual, code, reason
++):
+     engine, repository, _authority, _service, sid = operation_store
+     expected, running = await prepared_rejection(operation_store)
+     app = mounted_app(operation_store, tmp_path)
+-    body = PipelineCommitError("actual controlled validation failure", code="VALIDATION_FAILED")
++    body = PipelineCommitError("actual controlled validation failure", code=code)
+ 
+     async def fail_candidate(**kwargs):
+         raise body
+@@ -263,6 +485,12 @@ async def test_actual_canonical_failure_rejects_under_registered_child_and_keeps
+                 json={"draft_hash": expected.authority.proposal.draft_hash},
+             )
+         assert response.status_code == 422
++        if code in {"NO_CHANGE", "ARGUMENT_ERROR"}:
++            payload = response.json()["detail"]
++            assert "error_type" in payload, payload
++            assert payload["error_type"] == ("proposal_no_change" if code == "NO_CHANGE" else "proposal_argument_invalid")
++            assert payload["tool_name"] == "set_pipeline"
++            assert "automatically rejected" in payload["detail"]
+         assert len(bound) == 1
+         bound[0].assert_completed()
+         receipts = bound[0].failure_receipts()
+@@ -305,7 +533,111 @@ async def test_actual_canonical_failure_rejects_under_registered_child_and_keeps
+     events = proposal_events(engine, expected.authority.row.id)
+     assert len(events) == 1
+     assert events[0].actor == "system:pipeline_commit:user:alice"
+-    assert events[0].payload["reason_code"] == "validation_failed"
++    assert events[0].payload["reason_code"] == reason
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("boundary", ["before_sql", "after_sql"])
++async def test_no_change_required_rejection_keeps_exact_cancellations_and_projects_actual_sql(
++    operation_store, tmp_path, monkeypatch, boundary
++):
++    from elspeth.web.sessions.service import SessionServiceImpl
++
++    engine, repository, _authority, _service, _sid = operation_store
++    expected, running = await prepared_rejection(operation_store)
++    app = mounted_app(operation_store, tmp_path)
++    body = PipelineCommitError("pipeline proposal does not change the current composition", code="NO_CHANGE")
++
++    async def no_change(**kwargs):
++        raise body
++
++    monkeypatch.setattr(pipeline_settlement, "prepare_pipeline_proposal_commit", no_change)
++    parent = RequiredWorkCoordinator(
++        RequiredWorkAuthority(
++            RequiredAuthorityKind.DURABLE_COMPOSE,
++            running.session_operation_context,
++            running.claim.operation_id,
++            running.claim.attempt,
++        )
++    )
++    binding = RequiredWorkBinding(parent, 9, 13, RequiredWorkRole.TURN, running)
++    entered, release = threading.Event(), threading.Event()
++    handoffs = []
++    after_sql_cancel = asyncio.CancelledError("exact owned postSQL cancellation")
++    if boundary == "after_sql":
++        from elspeth.web.sessions import service as service_module
++
++        class CancelledCounter:
++            def add(self, amount, attributes):
++                raise after_sql_cancel
++
++        monkeypatch.setattr(service_module, "_PIPELINE_SETTLEMENT_COUNTER", CancelledCounter())
++
++    def park_sql(_conn, _cursor, statement, _parameters, _context, _many):
++        if boundary == "before_sql" and statement.startswith("UPDATE composition_proposals"):
++            entered.set()
++            assert release.wait(5)
++
++    actual_finish = SessionServiceImpl.reject_pipeline_composition_proposal_finish_once
++
++    async def observe_return(self, **kwargs):
++        handoff = await actual_finish(self, **kwargs)
++        handoffs.append(handoff)
++        return handoff
++
++    monkeypatch.setattr(SessionServiceImpl, "reject_pipeline_composition_proposal_finish_once", observe_return)
++    event.listen(engine, "before_cursor_execute", park_sql)
++    task = asyncio.create_task(
++        pipeline_settlement.settle_pipeline_proposal_under_compose_lock(
++            services=composer_app_services(app),
++            user_id="alice",
++            authority=expected.authority,
++            draft_hash=expected.authority.proposal.draft_hash,
++            session_operation_context=running.session_operation_context,
++            commit_timeout_seconds=5,
++            running=running,
++            required_work=parent,
++            required_binding=binding,
++        )
++    )
++    try:
++        if boundary == "before_sql":
++            async with asyncio.timeout(5):
++                while not entered.is_set():
++                    await asyncio.sleep(0.01)
++            for index in range(2):
++                task.cancel(f"no-change-{boundary}-{index}")
++                await asyncio.sleep(0.03)
++                assert not task.done()
++        release.set()
++        with pytest.raises(BaseExceptionGroup) as caught:
++            await task
++        leaves = originals(caught.value)
++        assert any(leaf is body for leaf in leaves)
++        assert len(handoffs) == 1
++        originals_delivered = handoffs[0].sql_outcome.deferred_cancellations if boundary == "before_sql" else handoffs[0].post_sql_failures
++        assert len(originals_delivered) == (2 if boundary == "before_sql" else 1)
++        if boundary == "after_sql":
++            assert originals_delivered[0] is after_sql_cancel
++        assert all(any(leaf is delivery for leaf in leaves) for delivery in originals_delivered)
++        parent.assert_completed()
++        producer = next(ticket for ticket in parent.tickets if ticket.key.source is RequiredWorkSource.REQUIRED_CONTINUATION_PRODUCER)
++        child = parent._child_registrations[producer]
++        sql = next(ticket for ticket in child.tickets if ticket.key.source is RequiredWorkSource.PROPOSAL_REJECTION_SQL)
++        projection = next(ticket for ticket in child.tickets if ticket.key.source is RequiredWorkSource.PROPOSAL_REJECTION_PROJECTION)
++        assert sql.complete and projection.complete and projection._projection_started
++        assert sql._finish_once_handoff is not None
++        assert producer.key.transition_ordinal == 9 and producer.key.semantic_ordinal == 13
++        events = proposal_events(engine, expected.authority.row.id)
++        assert len(events) == 1
++        assert events[0].actor == "system:pipeline_commit:user:alice"
++        assert events[0].payload["reason_code"] == "no_change"
++        assert events[0].payload["dispatch"] is not None
++    finally:
++        release.set()
++        await asyncio.gather(task, return_exceptions=True)
++        event.remove(engine, "before_cursor_execute", park_sql)
++        repository.release(running.session_operation_context)
+ 
+ 
+ @pytest.mark.asyncio

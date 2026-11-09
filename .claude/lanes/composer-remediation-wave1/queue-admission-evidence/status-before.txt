@@ -1,0 +1,6 @@
+ M src/elspeth/web/composer/tools/transforms.py
+ M tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py
+?? .claude/queue-admission-pytest/
+?? tests/unit/composer_mcp/test_queue_scope_admission.py
+?? tests/unit/web/composer/test_queue_scope_admission.py
+?? tests/unit/web/composer/test_queue_scope_approval.py

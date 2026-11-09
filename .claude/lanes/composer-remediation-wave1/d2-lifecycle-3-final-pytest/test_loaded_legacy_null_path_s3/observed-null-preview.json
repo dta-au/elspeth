@@ -1,0 +1,222 @@
+{
+  "component": "output",
+  "key": "file",
+  "escape_link": false,
+  "root": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-final-pytest/test_loaded_legacy_null_path_s3/data",
+  "outside": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-final-pytest/test_loaded_legacy_null_path_s3/outside.csv",
+  "reached": [],
+  "preflight": {
+    "is_valid": false,
+    "checks": [
+      {
+        "name": "plugin_enablement",
+        "passed": true,
+        "detail": "plugin_enablement passed.",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "operator_profile_options",
+        "passed": true,
+        "detail": "operator_profile_options passed.",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "required_control_availability",
+        "passed": true,
+        "detail": "required_control_availability passed.",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "required_control_coverage",
+        "passed": true,
+        "detail": "required_control_coverage passed.",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "path_allowlist",
+        "passed": false,
+        "detail": "Sink 'result' file must be a string path; got NoneType",
+        "affected_nodes": [],
+        "outcome_code": null
+      },
+      {
+        "name": "web_scrape_network_policy",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "web_fetch_resource_policy",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "secret_refs",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "semantic_contracts",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "batch_transform_options",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "interpretation_review",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "blob_inline_refs",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "llm_retry_budget_policy",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "llm_base_url_policy",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "llm_tracing_policy",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "aws_s3_endpoint_url_policy",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "aws_s3_source_policy",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "settings_load",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "plugin_instantiation",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "value_source_compliance",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "graph_structure",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "route_target_resolution",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "schema_compatibility",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "state_exists",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "advisor_signoff",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      },
+      {
+        "name": "proof_diagnostics",
+        "passed": false,
+        "detail": "Skipped: path_allowlist failed",
+        "affected_nodes": [],
+        "outcome_code": "validation.skipped_after_failure"
+      }
+    ],
+    "errors": [
+      {
+        "component_id": "result",
+        "component_type": "sink",
+        "message": "Sink 'result' file must be a string path; got NoneType",
+        "suggestion": "Set file to a nonempty string path without NUL within the configured data root.",
+        "error_code": null
+      }
+    ],
+    "warnings": [],
+    "readiness": {
+      "authoring_valid": false,
+      "execution_ready": false,
+      "completion_ready": false,
+      "blockers": [
+        {
+          "code": "path_allowlist",
+          "component_id": "result",
+          "component_type": "sink",
+          "detail": "Sink 'result' file must be a string path; got NoneType",
+          "suggestion": null,
+          "note": null
+        }
+      ]
+    },
+    "semantic_contracts": []
+  },
+  "outside_bytes_unchanged": true
+}

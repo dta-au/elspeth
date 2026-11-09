@@ -1,0 +1,141 @@
+{
+  "head": "8c35a2e2a9092260f15e88525cbe343df5410d4e",
+  "original_sha256": "fa0297dbf92d5faeb6a80099d28b216daa7fb282b1c1eaa25b66e1a19c629949",
+  "complete_diff_matches_live": true,
+  "fix_diff_matches_snapshot_delta": true,
+  "fix_paths": [
+    "src/elspeth/composer_mcp/portable_supervisor.py",
+    "tests/helpers/composer_stdio_ownership_probe.py",
+    "tests/unit/composer_mcp/test_standalone_lifecycle.py"
+  ],
+  "artifact_checks": [
+    {
+      "artifact": "d2-lifecycle-3-fix1.diff",
+      "bytes": 7918,
+      "sha256": "0cbb975bcd23d7b74d84e624bdfd23e7e4f7def3d6ba601f4334fab4111aa1bb",
+      "reverse_whitespace_exit": 0
+    },
+    {
+      "artifact": "d2-lifecycle-3-fix1-full.diff",
+      "bytes": 87824,
+      "sha256": "530cd979f8bb0d647623d0390205cb3f12da42aa2df068443c96fb1b426053d9",
+      "reverse_whitespace_exit": 0
+    }
+  ],
+  "cohort_before_after_equal": true,
+  "final_before_after_handoff_live_equal": true,
+  "interphase_delta": [
+    "tests/helpers/composer_stdio_ownership_probe.py"
+  ],
+  "live_inputs": 6222,
+  "live_manifest_sha256": "4c5e043b97da9c0821c125efb68eef781c0e9fdeeaf9e44edbb2f5cf90e70f89",
+  "junit": [
+    {
+      "artifact": "d2-lifecycle-3-fix1.xml",
+      "suites": [
+        {
+          "name": "pytest",
+          "errors": "0",
+          "failures": "0",
+          "skipped": "0",
+          "tests": "85",
+          "time": "89.691",
+          "timestamp": "2026-11-09T20:27:51.587066+00:00",
+          "hostname": "af0377a21211"
+        }
+      ]
+    },
+    {
+      "artifact": "d2-lifecycle-3-fix1-final.xml",
+      "suites": [
+        {
+          "name": "pytest",
+          "errors": "0",
+          "failures": "0",
+          "skipped": "0",
+          "tests": "1",
+          "time": "3.186",
+          "timestamp": "2026-11-09T20:30:37.950703+00:00",
+          "hostname": "af0377a21211"
+        }
+      ]
+    }
+  ],
+  "receipt_exit_checks": [
+    {
+      "phase": "bounded",
+      "name": "imports",
+      "exit": 0
+    },
+    {
+      "phase": "bounded",
+      "name": "before",
+      "exit": 0
+    },
+    {
+      "phase": "bounded",
+      "name": "pytest",
+      "exit": 0
+    },
+    {
+      "phase": "bounded",
+      "name": "ruff",
+      "exit": 1
+    },
+    {
+      "phase": "bounded",
+      "name": "format",
+      "exit": 0
+    },
+    {
+      "phase": "bounded",
+      "name": "mypy",
+      "exit": 0
+    },
+    {
+      "phase": "bounded",
+      "name": "contracts",
+      "exit": 0
+    },
+    {
+      "phase": "bounded",
+      "name": "whitespace",
+      "exit": 0
+    },
+    {
+      "phase": "bounded",
+      "name": "after",
+      "exit": 0
+    },
+    {
+      "phase": "final-",
+      "name": "before",
+      "exit": 0
+    },
+    {
+      "phase": "final-",
+      "name": "pytest",
+      "exit": 0
+    },
+    {
+      "phase": "final-",
+      "name": "ruff",
+      "exit": 0
+    },
+    {
+      "phase": "final-",
+      "name": "format",
+      "exit": 0
+    },
+    {
+      "phase": "final-",
+      "name": "whitespace",
+      "exit": 0
+    },
+    {
+      "phase": "final-",
+      "name": "after",
+      "exit": 0
+    }
+  ]
+}

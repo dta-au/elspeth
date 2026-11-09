@@ -1,0 +1,61 @@
+{
+  "before_count": 5436,
+  "after_count": 5446,
+  "before_warnings": 118,
+  "after_warnings": 118,
+  "added": [
+    {
+      "path": "composer_mcp/portable_bootstrap.py",
+      "rule": "R6",
+      "message": "Exception swallowed without re-raise or explicit error: except BlockingIOError:",
+      "occurrences": 2
+    },
+    {
+      "path": "composer_mcp/portable_bootstrap.py",
+      "rule": "R9",
+      "message": "dict.pop() with default hides missing keys: nonce = os.environ.pop(NONCE_ENV, None)",
+      "occurrences": 1
+    },
+    {
+      "path": "composer_mcp/portable_bootstrap.py",
+      "rule": "R9",
+      "message": "dict.pop() with default hides missing keys: port_text = os.environ.pop(PORT_ENV, None)",
+      "occurrences": 1
+    },
+    {
+      "path": "composer_mcp/portable_supervisor.py",
+      "rule": "R5",
+      "message": "isinstance() used: assert isinstance(peer, socket.socket)",
+      "occurrences": 1
+    },
+    {
+      "path": "composer_mcp/portable_supervisor.py",
+      "rule": "R6",
+      "message": "Exception swallowed without re-raise or explicit error: except (OSError, WatchdogProtocolError):",
+      "occurrences": 2
+    },
+    {
+      "path": "composer_mcp/portable_supervisor.py",
+      "rule": "R6",
+      "message": "Exception swallowed without re-raise or explicit error: except BlockingIOError:",
+      "occurrences": 3
+    },
+    {
+      "path": "contracts/process_watchdog_wire.py",
+      "rule": "R5",
+      "message": "isinstance() used: if not isinstance(value, dict):",
+      "occurrences": 1
+    }
+  ],
+  "removed": [
+    {
+      "path": "web/process_watchdog_codec.py",
+      "rule": "R5",
+      "message": "isinstance() used: if not isinstance(value, dict):",
+      "occurrences": 1
+    }
+  ],
+  "unparsed": 0,
+  "controls": "passed path/rule/full-message/multiplicity positive, location-only and warning negative, malformed rejection",
+  "limits": "Text capture lacks severity/suggestion/fingerprint. Compares complete diagnostic messages with only embedded line offsets and checkout prefixes normalized. Before is identity patch on1bc; after is05bc plus park test-only additions during capture."
+}

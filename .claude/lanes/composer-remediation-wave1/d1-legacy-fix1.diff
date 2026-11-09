@@ -1,0 +1,164 @@
+diff --git a/tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py b/tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py
+--- a/tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py
++++ b/tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py
+@@ -12,14 +12,21 @@
+ from httpx import ASGITransport, AsyncClient
+ from sqlalchemy import func, select
+ from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
++from tests.unit.web.composer.test_planner_authoring_aids import _empty_state, _guardrail_profile_view
++from tests.unit.web.composer.test_required_control_autowire import _bare_llm_candidate
+ from tests.unit.web.sessions.routes.composer.test_proposal_accept_preflight_failure import _set_pipeline_arguments
+ from tests.unit.web.sessions.test_blob_proposal_accept import _save_composition_state
+-from tests.unit.web.sessions.test_routes import _create_test_composition_proposal, _make_app
++from tests.unit.web.sessions.test_routes import _compose_session_operation_context, _create_test_composition_proposal, _make_app
+ 
+ from elspeth.contracts.errors import AuditIntegrityError
+ from elspeth.contracts.hashing import stable_hash
++from elspeth.web.async_workers import run_sync_in_worker
+ from elspeth.web.blobs.service import BlobServiceImpl
++from elspeth.web.composer.pipeline_proposal import composition_content_hash
+ from elspeth.web.coordination.lifecycle import SessionOperationLease
++from elspeth.web.interpretation_state import REQUIRED_CONTROL_AUTO_WIRED_USER_TERM, pipeline_decision_artifact_hash
++from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
++from elspeth.web.sessions.converters import state_from_record
+ from elspeth.web.sessions.models import composition_states_table
+ from elspeth.web.sessions.protocol import CompositionStateData
+ from elspeth.web.sessions.routes.composer import proposals as routes
+@@ -125,6 +132,137 @@
+     assert listed.json() == []
+ 
+ 
++@pytest.mark.parametrize("patch", [{}, {"name": "Assess tickets"}], ids=["empty-patch", "same-value"])
++def test_legacy_accept_compares_content_after_required_control_finalization(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, patch: dict[str, Any]
++) -> None:
++    from elspeth.web.sessions.routes import _helpers
++
++    app, service = _make_app(tmp_path)
++    view, snapshot = _guardrail_profile_view(tmp_path)
++    assert view._profiles is not None
++    app.state.catalog_service = view._full
++    app.state.operator_profile_registry = view._profiles
++    # Preserve the compiled control modes when projecting this policy to the
++    # route principal; the general static factory omits those modes.
++    route_snapshot = PluginAvailabilitySnapshot.create(
++        policy_hash=snapshot.policy_hash,
++        principal_scope="local:alice",
++        available=snapshot.available,
++        unavailable=snapshot.unavailable,
++        selected=snapshot.selected,
++        usable_profile_aliases=snapshot.usable_profile_aliases,
++        selected_profile_aliases=snapshot.selected_profile_aliases,
++        binding_generation_fingerprint=snapshot.binding_generation_fingerprint,
++        control_modes=snapshot.control_modes,
++    )
++    app.state.plugin_snapshot_factory = lambda _user: route_snapshot
++    client = TestClient(app)
++    session_id = UUID(client.post("/api/sessions", json={"title": "Required controls"}).json()["id"])
++    (tmp_path / "outputs").mkdir()
++    arguments = _bare_llm_candidate()
++    message = asyncio.run(
++        service.add_message(session_id, "user", arguments["source"]["inline_blob"]["content"], writer_principal="route_user_message")
++    )
++
++    async def build_bare_graph() -> Any:
++        async with _compose_session_operation_context(service, session_id) as context:
++            return await run_sync_in_worker(
++                routes.execute_tool,
++                "set_pipeline",
++                arguments,
++                _empty_state(),
++                view,
++                plugin_snapshot=snapshot,
++                data_dir=str(tmp_path),
++                session_engine=service._engine,
++                session_id=str(session_id),
++                session_operation_context=context,
++                session_operation_authority=service.session_operation_authority,
++                user_message_id=str(message.id),
++                user_message_content=message.content,
++                validate_arguments=True,
++            )
++
++    built = asyncio.run(build_bare_graph())
++    assert built.success, built.validation.errors
++    bare = built.updated_state
++    assert [node.id for node in bare.nodes] == ["assess_ticket"]
++    # A previously persisted graph can predate the deployment's required
++    # controls. Seed the real builder's authored state under a real authority.
++    bare_data = bare.to_dict()
++    before = asyncio.run(
++        _save_composition_state(
++            service,
++            session_id,
++            CompositionStateData(
++                sources=bare_data["sources"],
++                nodes=bare_data["nodes"],
++                edges=bare_data["edges"],
++                outputs=bare_data["outputs"],
++                metadata_=bare_data["metadata"],
++            ),
++            provenance="session_seed",
++        )
++    )
++    current = state_from_record(before)
++    proposal = _proposal(service, session_id, "set_metadata", {"patch": patch}, before.id)
++    dispatch_results = []
++    preflight_states = []
++    real_dispatch = routes.execute_tool
++    real_preflight = _helpers._runtime_preflight_for_state
++
++    def observe_dispatch(*args: Any, **kwargs: Any) -> Any:
++        result = real_dispatch(*args, **kwargs)
++        dispatch_results.append(result)
++        return result
++
++    async def observe_preflight(state: Any, **kwargs: Any) -> Any:
++        preflight_states.append(state)
++        return await real_preflight(state, **kwargs)
++
++    monkeypatch.setattr(routes, "execute_tool", observe_dispatch)
++    monkeypatch.setattr(_helpers, "_runtime_preflight_for_state", observe_preflight)
++    response = client.post(f"/api/sessions/{session_id}/proposals/{proposal.id}/accept")
++
++    assert len(dispatch_results) == 1
++    dispatched = dispatch_results[0]
++    assert dispatched.success
++    assert dispatched.validation.is_valid, dispatched.validation.errors
++    assert dispatched.updated_state.version == current.version + 1
++    assert composition_content_hash(dispatched.updated_state) == composition_content_hash(current)
++    assert [node.id for node in dispatched.updated_state.nodes] == ["assess_ticket"]
++    assert response.status_code == 200, response.text
++    assert response.json()["status"] == "committed"
++    assert len(preflight_states) == 1, "the finalized graph must reach real runtime preflight"
++    after = asyncio.run(service.get_current_state(session_id))
++    assert after is not None and after.id != before.id
++    assert response.json()["committed_state_id"] == str(after.id)
++    finalized = state_from_record(after)
++    assert composition_content_hash(finalized) == composition_content_hash(preflight_states[0])
++    assert composition_content_hash(finalized) != composition_content_hash(current)
++    nodes = {node.id: node for node in finalized.nodes}
++    assert set(nodes) == {"assess_ticket", "prompt_shield_auto_1", "content_safety_auto_1"}
++    assert nodes["prompt_shield_auto_1"].options["profile"] == "prompt-approved"
++    assert nodes["content_safety_auto_1"].options["profile"] == "content-approved"
++    for node_id in ("prompt_shield_auto_1", "content_safety_auto_1"):
++        requirements = nodes[node_id].options["interpretation_requirements"]
++        assert len(requirements) == 1
++        assert requirements[0]["user_term"] == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
++        assert requirements[0]["kind"] == "pipeline_decision"
++        assert requirements[0]["id"]
++        assert requirements[0]["status"] == "pending"
++        assert requirements[0]["accepted_artifact_hash"] is None
++        assert len(pipeline_decision_artifact_hash(nodes[node_id], finalized.nodes, user_term=REQUIRED_CONTROL_AUTO_WIRED_USER_TERM)) == 64
++    coverage = [finding for finding in view.validate_authored_state(finalized).findings if finding.stage == "required_control_coverage"]
++    assert coverage == []
++    with service._engine.connect() as conn:
++        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 2
++    events = [event for event in asyncio.run(service.list_proposal_events(session_id)) if event.proposal_id == proposal.id]
++    assert [event.event_type for event in events] == ["proposal.created", "proposal.accepted"]
++    assert events[-1].actor == "user:alice"
++
++
+ def test_real_malformed_handler_arguments_terminalize_without_leaking_cause(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+     app, service = _make_app(tmp_path)
+     client = TestClient(app)

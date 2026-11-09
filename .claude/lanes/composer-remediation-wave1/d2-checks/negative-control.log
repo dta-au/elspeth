@@ -1,0 +1,113 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-d2
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 147 items / 136 deselected / 11 selected
+
+tests/unit/composer_mcp/test_configured_root_admission.py .....F....F    [100%]
+
+=================================== FAILURES ===================================
+_ test_mcp_execution_and_compiled_identity_resolve_the_same_private_paths[None] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/negative-control-tmp/test_mcp_execution_and_compile1')
+provider_path = None
+
+    @pytest.mark.parametrize("provider_path", ["indexes/docs", None])
+    def test_mcp_execution_and_compiled_identity_resolve_the_same_private_paths(tmp_path: Path, provider_path: str | None) -> None:
+        """Dropping authority at either materializer must expose a path disagreement."""
+        payload = _seed_state().to_dict()
+        payload["nodes"][1]["options"]["provider_config"]["persist_directory"] = provider_path
+        state = CompositionState.from_dict(payload)
+        authority = McpConfiguredRootAuthority(tmp_path / "data")
+        generator = yaml_generator
+        report = materialize_validation_yaml(
+            _interpretation(state),
+            yaml_generator=generator,
+            data_dir=authority.root,
+            session_id=None,
+            blob_get_metadata=None,
+            load_yaml=yaml.safe_load,
+            mcp_root_authority=authority,
+        )
+        assert isinstance(report, PhaseReport)
+        execution = yaml.safe_load(report.artifact.pipeline_yaml)
+        identity = _compiled_identity_settings(
+            state,
+            yaml_generator=generator,
+            data_dir=authority.root,
+            session_id=None,
+            mcp_root_authority=authority,
+        ).audit_safe_settings()
+        for document in (execution, identity):
+            assert document["sources"]["source"]["options"]["path"] == str(authority.root / "input.csv")
+            assert document["sinks"]["result"]["options"]["path"] == str(authority.root / "outputs/report.csv")
+>           assert document["transforms"][1]["options"]["provider_config"]["persist_directory"] == (
+                str(authority.root / "indexes/docs") if provider_path is not None else None
+            )
+E           AssertionError: assert '/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/negative-control-tmp/test_mcp_execution_and_compile1/data/None' == None
+
+tests/unit/composer_mcp/test_configured_root_admission.py:544: AssertionError
+___ test_shared_coordinator_distinguishes_authority_mode_and_canonical_root ____
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/negative-control-tmp/test_shared_coordinator_distin0')
+
+    @pytest.mark.asyncio
+    async def test_shared_coordinator_distinguishes_authority_mode_and_canonical_root(tmp_path: Path) -> None:
+        """Equal caller settings hashes cannot let one filesystem mode borrow another's verdict."""
+        coordinator = RuntimePreflightCoordinator()
+        release = asyncio.Event()
+        started: list[str] = []
+        servers = []
+        first_root = tmp_path / "a"
+        first_root.mkdir()
+        alias = tmp_path / "alias"
+        alias.symlink_to(first_root, target_is_directory=True)
+        roots = [first_root, alias, tmp_path / "b", None]
+        for index, root in enumerate(roots):
+    
+            async def preflight(state: CompositionState, label: str = str(index)) -> ValidationResult:
+                started.append(label)
+                await release.wait()
+                return ValidationResult(
+                    is_valid=True,
+                    checks=[],
+                    errors=[],
+                    warnings=[],
+                    readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+                )
+    
+            scratch = tmp_path / str(index)
+            scratch.mkdir()
+            servers.append(
+                _LiveMcp(
+                    create_server(
+                        create_catalog_service(),
+                        scratch,
+                        runtime_preflight=preflight,
+                        runtime_preflight_settings_hash="same-settings",
+                        runtime_preflight_coordinator=coordinator,
+                        session_scope_provider=lambda: "same-scope",
+                        mcp_root_authority=McpConfiguredRootAuthority(root) if root is not None else None,
+                    ),
+                    scratch,
+                    "unused",
+                )
+            )
+        calls = [asyncio.create_task(live.call("preview_pipeline", {})) for live in servers]
+        try:
+            for _ in range(100):
+                if len(started) >= 3:
+                    break
+                await asyncio.sleep(0.001)
+>           assert len(started) == 3
+E           AssertionError: assert 1 == 3
+E            +  where 1 = len(['0'])
+
+tests/unit/composer_mcp/test_configured_root_admission.py:672: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_mcp_execution_and_compiled_identity_resolve_the_same_private_paths[None]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_shared_coordinator_distinguishes_authority_mode_and_canonical_root
+================= 2 failed, 9 passed, 136 deselected in 8.71s ==================

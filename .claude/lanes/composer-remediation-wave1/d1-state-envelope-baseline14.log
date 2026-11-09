@@ -1,0 +1,948 @@
+Exact baseline failure selection:
+tests/unit/web/composer/test_tool_result_envelope_gate.py::test_every_shipped_envelope_key_is_taught_or_fenced
+tests/unit/web/composer/test_tool_result_envelope_gate.py::test_no_nested_key_is_a_homonym_of_an_envelope_key
+tests/unit/web/composer/test_tool_result_envelope_gate.py::test_fence_entries_are_live_untaught_keys
+tests/unit/web/composer/test_tool_result_envelope_gate.py::test_review_blocked_payload_and_preflight_are_censused
+tests/unit/web/composer/test_tool_result_envelope_gate.py::test_review_blocked_census_rejects_an_untaught_payload_key
+tests/unit/web/composer/test_tool_result_envelope_gate.py::test_review_blocked_census_rejects_unadmitted_preflight
+tests/unit/web/composer/test_tool_result_envelope_gate.py::test_credential_builder_census_rejects_an_untaught_payload_key
+tests/unit/web/composer/test_tool_result_envelope_gate.py::test_credential_builder_owner_classification_is_required
+tests/unit/web/composer/test_tool_result_envelope_gate.py::test_every_registered_container_path_has_one_witnessed_producer
+tests/unit/web/composer/test_tool_result_envelope_gate.py::test_second_container_producer_refuses_even_with_existing_coverage[data.edge_contracts]
+tests/unit/web/composer/test_tool_result_envelope_gate.py::test_second_container_producer_refuses_even_with_existing_coverage[validation.errors]
+tests/unit/web/composer/test_tool_result_envelope_gate.py::test_second_container_producer_refuses_even_with_existing_coverage[validation.suggestions]
+tests/unit/web/composer/test_tool_result_envelope_gate.py::test_second_container_producer_refuses_even_with_existing_coverage[validation.warnings]
+tests/unit/web/composer/test_tool_result_envelope_gate.py::test_every_result_constructor_site_is_attributed
+elspeth: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src/elspeth/__init__.py
+elspeth_lints: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src/elspeth_lints/__init__.py
+Admission module replaced in memory with exact base 66739807c9acbdae6f2d7d9f1de858b8e69c9793
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+Tool-batch AST reads also use immutable base; every other path remains current/unchanged
+collected 14 items
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py FFFFFFFFFFFFFF [100%]
+
+=================================== FAILURES ===================================
+_____________ test_every_shipped_envelope_key_is_taught_or_fenced ______________
+
+    def test_every_shipped_envelope_key_is_taught_or_fenced() -> None:
+        fenced = {(e.surface, e.tool, e.key) for e in load_fence()}
+>       unexplained = {k: v for k, v in untaught_keys().items() if k not in fenced}
+                                        ^^^^^^^^^^^^^^^
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2413: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2370: in untaught_keys
+    blocks = _teaching_blocks()
+             ^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2350: in _teaching_blocks
+    validate_teaching_scopes(blocks, frozenset((row.surface, row.tool, row.key) for row in shipped_keys()))
+                                                                                           ^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2289: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2235: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2086: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fb62377b510>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fb623a20680>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+______________ test_no_nested_key_is_a_homonym_of_an_envelope_key ______________
+
+    def test_no_nested_key_is_a_homonym_of_an_envelope_key() -> None:
+        """No key nested under an envelope field may have one of the ENVELOPE's own key names as its leaf.
+    
+        Before the ownership reader, ``is_taught`` matched a quoted leaf ANYWHERE
+        in the taught corpus, which quotes every envelope key, so a payload key named
+        after one is "taught" by the sentence describing a different field. Not
+        hypothetical: ``data["success"] = "false"`` added to
+        ``_common._failure_result`` — the shared recoverable-rejection builder, 261
+        producers behind it — was ENUMERATED by the census (342 rows, the new row
+        named at its site) and then admitted, with the whole gate file green
+        (red-team RED2-2, mutant A3). The two payloads that already carry exact-key
+        pins refuse ``success`` by hand (F1); this refuses the class, on every
+        payload, for every envelope key, and takes the forbidden names from the
+        registry rather than from a list of the four that happen to be quoted today.
+    
+        This structural backstop remains depth-blind, not scoped to ``data.``:
+        the historical mechanism cared neither how deep the key sat
+        nor which surface carries it. The dotted test is what separates a nested
+        key from the envelope's own eleven rows, which are the only dotless ones
+        (measured). Measured before landing, so the rule costs no churn — zero of
+        the shipped rows collide (341 when the rule landed, 344 once the subscript
+        walker started reporting nested values). A future collision is an
+        adjudication (rename
+        the nested key, or split the envelope's), not something to route around
+        here: the reader cannot tell the two apart, whatever the gate does. A
+        depth-blind rule is worth only the walk beneath it: this stayed green
+        against a ``version`` planted inside ``data.sources`` until
+        ``_nested_value_keys`` stopped declining comprehension-valued payloads.
+        RE-MEASURED at that new size rather than assumed to still be free: 401
+        rows, 390 of them dotted, against the registry's 11 envelope keys — zero
+        collide. The set is derived live from every dotted row below, so no count
+        of the newly-walked rows is carried here: one more figure to keep true
+        across every census move, and the derivation already covers them all.
+    
+        NOT closed by this: a leaf admitted because some OTHER tool's description
+        quotes it. That is the same ``is_taught`` mechanism one step out, it needs
+        either a data-payload-scoped corpus match or a per-tool ruling, and it is
+        recorded on elspeth-e405ad7cd2 rather than fenced here.
+    
+        The DERIVATION is asserted, not only its consequence. Coming from the
+        registry rather than from the four names that happen to be quoted today is
+        one of the three ways this rule was generalised, and it was free to lose:
+        narrowing ``envelope`` back to ``{success, validation, version,
+        affected_nodes}`` left the whole gate file green, because no shipped row
+        collides with any of the other seven either (measured, red-team RED5-4).
+        So the set is re-derived here from the two registry constants
+        ``tool_result_keys`` is built out of — a different expression from the one
+        under test, which is the point: a hand-list substituted for either reds.
+        """
+        envelope = set(env.tool_result_keys(data=True))
+        assert envelope == set(env.TOOL_RESULT_REQUIRED_KEYS) | set(env.TOOL_RESULT_OPTIONAL_KEYS), (
+            "the forbidden names must be the registry's whole envelope, not a hand-list of the ones a shipped row happens to collide with today"
+        )
+        collisions = sorted(
+>           {(shipped.key, shipped.site) for shipped in shipped_keys() if "." in shipped.key and leaf_of(shipped.key) in envelope}
+                                                        ^^^^^^^^^^^^^^
+        )
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2476: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2289: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2235: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2086: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fb622d69b90>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fb631006d40>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+__________________ test_fence_entries_are_live_untaught_keys ___________________
+
+    def test_fence_entries_are_live_untaught_keys() -> None:
+        """A fence must not outlive what it fences: a taught or no-longer-shipped key leaves the fixture."""
+>       untaught = untaught_keys()
+                   ^^^^^^^^^^^^^^^
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2487: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2370: in untaught_keys
+    blocks = _teaching_blocks()
+             ^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2350: in _teaching_blocks
+    validate_teaching_scopes(blocks, frozenset((row.surface, row.tool, row.key) for row in shipped_keys()))
+                                                                                           ^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2289: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2235: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2086: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fb622e81150>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fb622fdccc0>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+____________ test_review_blocked_payload_and_preflight_are_censused ____________
+
+    def test_review_blocked_payload_and_preflight_are_censused() -> None:
+>       rows = [row for row in shipped_keys() if row.site.startswith(f"{_display(SESSION_TOOL)}:")]
+                               ^^^^^^^^^^^^^^
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2597: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2289: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2235: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2086: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fb6231d5450>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fb642cede40>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+__________ test_review_blocked_census_rejects_an_untaught_payload_key __________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fb62391a960>
+
+    def test_review_blocked_census_rejects_an_untaught_payload_key(monkeypatch: pytest.MonkeyPatch) -> None:
+>       test_review_blocked_payload_and_preflight_are_censused()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2607: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2597: in test_review_blocked_payload_and_preflight_are_censused
+    rows = [row for row in shipped_keys() if row.site.startswith(f"{_display(SESSION_TOOL)}:")]
+                           ^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2289: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2235: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2086: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fb622edb390>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fb623a77e20>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+___________ test_review_blocked_census_rejects_unadmitted_preflight ____________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fb623919c10>
+
+    def test_review_blocked_census_rejects_unadmitted_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+>       test_review_blocked_payload_and_preflight_are_censused()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2632: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2597: in test_review_blocked_payload_and_preflight_are_censused
+    rows = [row for row in shipped_keys() if row.site.startswith(f"{_display(SESSION_TOOL)}:")]
+                           ^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2289: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2235: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2086: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fb623b0d490>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fb631006d40>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+________ test_credential_builder_census_rejects_an_untaught_payload_key ________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fb62391acc0>
+
+    def test_credential_builder_census_rejects_an_untaught_payload_key(monkeypatch: pytest.MonkeyPatch) -> None:
+        test_credential_builder_payload_is_censused_at_its_actual_owner()
+        original = _parse
+    
+        def with_extra_key(path: Path) -> ast.Module:
+            tree = original(path)
+            if path == COMMON:
+                payload = _credential_builder_payload(tree)
+                payload.keys.append(ast.Constant(value="unexplained_credential_probe"))
+                payload.values.append(ast.Constant(value=True))
+            return tree
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "_parse", with_extra_key)
+        assert any(row.key == "data.unexplained_credential_probe" for row in _failure_data_sites())
+        with pytest.raises(AssertionError, match="unexplained_credential_probe"):
+>           test_every_shipped_envelope_key_is_taught_or_fenced()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2693: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2413: in test_every_shipped_envelope_key_is_taught_or_fenced
+    unexplained = {k: v for k, v in untaught_keys().items() if k not in fenced}
+                                    ^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2370: in untaught_keys
+    blocks = _teaching_blocks()
+             ^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2350: in _teaching_blocks
+    validate_teaching_scopes(blocks, frozenset((row.surface, row.tool, row.key) for row in shipped_keys()))
+                                                                                           ^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2289: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2235: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2086: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fb6236422d0>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fb642cede40>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fb62391acc0>
+
+    def test_credential_builder_census_rejects_an_untaught_payload_key(monkeypatch: pytest.MonkeyPatch) -> None:
+        test_credential_builder_payload_is_censused_at_its_actual_owner()
+        original = _parse
+    
+        def with_extra_key(path: Path) -> ast.Module:
+            tree = original(path)
+            if path == COMMON:
+                payload = _credential_builder_payload(tree)
+                payload.keys.append(ast.Constant(value="unexplained_credential_probe"))
+                payload.values.append(ast.Constant(value=True))
+            return tree
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "_parse", with_extra_key)
+        assert any(row.key == "data.unexplained_credential_probe" for row in _failure_data_sites())
+>       with pytest.raises(AssertionError, match="unexplained_credential_probe"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'unexplained_credential_probe'
+E         Actual message: "src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2692: AssertionError
+___________ test_credential_builder_owner_classification_is_required ___________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fb623cb4740>
+
+    def test_credential_builder_owner_classification_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
+>       test_every_result_constructor_site_is_attributed()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2720: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3163: in test_every_result_constructor_site_is_attributed
+    list(_tool_data_sites())
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2235: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2086: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fb622e5e8d0>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fb622c38900>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+_______ test_every_registered_container_path_has_one_witnessed_producer ________
+
+    def test_every_registered_container_path_has_one_witnessed_producer() -> None:
+>       _assert_unique_container_producers()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2760: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2754: in _assert_unique_container_producers
+    shipped_keys()
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2289: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2235: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2086: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fb6239148d0>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fb631006d40>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+_ test_second_container_producer_refuses_even_with_existing_coverage[data.edge_contracts] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fb62391fbc0>
+path = 'data.edge_contracts'
+
+    @pytest.mark.parametrize("path", sorted(_CONTAINER_ELEMENT_PAYLOADS))
+    def test_second_container_producer_refuses_even_with_existing_coverage(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+        census = shipped_keys
+    
+        def with_second_producer() -> list[ShippedKey]:
+            rows = census()
+            list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "second-producer", {}, element_of=path))
+            return rows
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", with_second_producer)
+        test_every_deferred_container_element_is_censused_by_its_named_derivation()
+        with pytest.raises(AssertionError, match="multiple producers"):
+>           _assert_unique_container_producers()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3078: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2754: in _assert_unique_container_producers
+    shipped_keys()
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3071: in with_second_producer
+    rows = census()
+           ^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2289: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2235: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2086: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fb622f441d0>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fb622f5f420>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fb62391fbc0>
+path = 'data.edge_contracts'
+
+    @pytest.mark.parametrize("path", sorted(_CONTAINER_ELEMENT_PAYLOADS))
+    def test_second_container_producer_refuses_even_with_existing_coverage(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+        census = shipped_keys
+    
+        def with_second_producer() -> list[ShippedKey]:
+            rows = census()
+            list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "second-producer", {}, element_of=path))
+            return rows
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", with_second_producer)
+        test_every_deferred_container_element_is_censused_by_its_named_derivation()
+>       with pytest.raises(AssertionError, match="multiple producers"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'multiple producers'
+E         Actual message: "src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3077: AssertionError
+_ test_second_container_producer_refuses_even_with_existing_coverage[validation.errors] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fb62391c380>
+path = 'validation.errors'
+
+    @pytest.mark.parametrize("path", sorted(_CONTAINER_ELEMENT_PAYLOADS))
+    def test_second_container_producer_refuses_even_with_existing_coverage(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+        census = shipped_keys
+    
+        def with_second_producer() -> list[ShippedKey]:
+            rows = census()
+            list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "second-producer", {}, element_of=path))
+            return rows
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", with_second_producer)
+        test_every_deferred_container_element_is_censused_by_its_named_derivation()
+        with pytest.raises(AssertionError, match="multiple producers"):
+>           _assert_unique_container_producers()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3078: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2754: in _assert_unique_container_producers
+    shipped_keys()
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3071: in with_second_producer
+    rows = census()
+           ^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2289: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2235: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2086: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fb622d43390>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fb642cede40>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fb62391c380>
+path = 'validation.errors'
+
+    @pytest.mark.parametrize("path", sorted(_CONTAINER_ELEMENT_PAYLOADS))
+    def test_second_container_producer_refuses_even_with_existing_coverage(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+        census = shipped_keys
+    
+        def with_second_producer() -> list[ShippedKey]:
+            rows = census()
+            list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "second-producer", {}, element_of=path))
+            return rows
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", with_second_producer)
+        test_every_deferred_container_element_is_censused_by_its_named_derivation()
+>       with pytest.raises(AssertionError, match="multiple producers"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'multiple producers'
+E         Actual message: "src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3077: AssertionError
+_ test_second_container_producer_refuses_even_with_existing_coverage[validation.suggestions] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fb62391fec0>
+path = 'validation.suggestions'
+
+    @pytest.mark.parametrize("path", sorted(_CONTAINER_ELEMENT_PAYLOADS))
+    def test_second_container_producer_refuses_even_with_existing_coverage(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+        census = shipped_keys
+    
+        def with_second_producer() -> list[ShippedKey]:
+            rows = census()
+            list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "second-producer", {}, element_of=path))
+            return rows
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", with_second_producer)
+        test_every_deferred_container_element_is_censused_by_its_named_derivation()
+        with pytest.raises(AssertionError, match="multiple producers"):
+>           _assert_unique_container_producers()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3078: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2754: in _assert_unique_container_producers
+    shipped_keys()
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3071: in with_second_producer
+    rows = census()
+           ^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2289: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2235: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2086: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fb62321dd50>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fb623a77e20>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fb62391fec0>
+path = 'validation.suggestions'
+
+    @pytest.mark.parametrize("path", sorted(_CONTAINER_ELEMENT_PAYLOADS))
+    def test_second_container_producer_refuses_even_with_existing_coverage(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+        census = shipped_keys
+    
+        def with_second_producer() -> list[ShippedKey]:
+            rows = census()
+            list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "second-producer", {}, element_of=path))
+            return rows
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", with_second_producer)
+        test_every_deferred_container_element_is_censused_by_its_named_derivation()
+>       with pytest.raises(AssertionError, match="multiple producers"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'multiple producers'
+E         Actual message: "src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3077: AssertionError
+_ test_second_container_producer_refuses_even_with_existing_coverage[validation.warnings] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fb623c77470>
+path = 'validation.warnings'
+
+    @pytest.mark.parametrize("path", sorted(_CONTAINER_ELEMENT_PAYLOADS))
+    def test_second_container_producer_refuses_even_with_existing_coverage(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+        census = shipped_keys
+    
+        def with_second_producer() -> list[ShippedKey]:
+            rows = census()
+            list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "second-producer", {}, element_of=path))
+            return rows
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", with_second_producer)
+        test_every_deferred_container_element_is_censused_by_its_named_derivation()
+        with pytest.raises(AssertionError, match="multiple producers"):
+>           _assert_unique_container_producers()
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3078: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2754: in _assert_unique_container_producers
+    shipped_keys()
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3071: in with_second_producer
+    rows = census()
+           ^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2289: in shipped_keys
+    return [
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2235: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2086: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fb6231b3010>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fb623a77e20>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fb623c77470>
+path = 'validation.warnings'
+
+    @pytest.mark.parametrize("path", sorted(_CONTAINER_ELEMENT_PAYLOADS))
+    def test_second_container_producer_refuses_even_with_existing_coverage(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+        census = shipped_keys
+    
+        def with_second_producer() -> list[ShippedKey]:
+            rows = census()
+            list(_nested_value_keys(ast.parse("item.to_dict()", mode="eval").body, path + "[]", "second-producer", {}, element_of=path))
+            return rows
+    
+        monkeypatch.setattr(importlib.import_module(__name__), "shipped_keys", with_second_producer)
+        test_every_deferred_container_element_is_censused_by_its_named_derivation()
+>       with pytest.raises(AssertionError, match="multiple producers"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'multiple producers'
+E         Actual message: "src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS"
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3077: AssertionError
+_______________ test_every_result_constructor_site_is_attributed _______________
+
+    def test_every_result_constructor_site_is_attributed() -> None:
+        """Every ``data=`` result-constructor site in web/composer is walked or classified, and nothing is skipped.
+    
+        Two claims, and before this the test made only half of the first: it ran
+        the tool-data walker, which raises on an unattributed site — but only over
+        a HAND-LIST of seven files, so a producer outside them was invisible rather
+        than refused, and three real ones were (systems seat SYS-R3-2). The site set
+        is now derived from the package, and a site that is neither walked as tool
+        data nor named in one of the two classification registries fails here.
+    
+        The registries are checked in both directions: a stale row (its site gone or
+        renamed) fails too, so a classification cannot outlive what it classifies.
+    
+        ``_all_data_sites`` walks the package recursively while ``_TOOL_DATA_FILES``
+        names files under ``tools/``, so a base name does NOT identify a module. Two
+        distinct escapes can come from keying on one:
+    
+        * another ``sources.py`` shipping a ``data=`` payload can count itself as
+          walked while ``_tool_data_sites`` parses only ``tools/sources.py``;
+        * another ``outputs.py`` can do the same with no collision to notice if
+          ``tools/outputs.py`` ships no ``data=`` site.
+    
+        Hence ``walked`` is keyed on the MODULE,
+        which is what the tool-data walker actually parses, plus an injectivity
+        refusal for each bare name this file still attributes by, each with its own
+        killing mutant:
+    
+        * the FILE name, because the two classification registries key on it and a
+          row cannot say which of two modules it classifies;
+        * the FUNCTION name, because ``_attribute_tool`` keys on it alone — a second
+          ``_execute_delete_blob_locked`` in another walked file had its keys
+          censused, taught and manifest-checked against ``delete_blob``, silently,
+          34 passed exit 0, whenever the keys it ships are ones that tool already
+          teaches.
+        """
+>       list(_tool_data_sites())
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:3163: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2235: in _tool_data_sites
+    for key in _expr_keys(data, fn=fn, tree=tree, path=path, prefix="data.", site=site):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/unit/web/composer/test_tool_result_envelope_gate.py:2086: in _expr_keys
+    yield from _dict_literal_keys(expr, prefix, site, constants, resolve_local)
+tests/unit/web/composer/test_tool_result_envelope_gate.py:540: in _dict_literal_keys
+    for key in _splat_keys(value, site, resolve_name):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+node = <ast.IfExp object at 0x7fb622e43650>
+site = 'src/elspeth/web/composer/tools/generation.py:2215'
+resolve_name = <function _expr_keys.<locals>.resolve_local at 0x7fb623a77e20>
+
+    def _splat_keys(node: ast.AST, site: str, resolve_name: _NameResolver | None) -> Iterator[str]:
+        """Keys a ``**`` splat re-carries: nothing for a result's own ``.data`` (already counted at its
+        producer), the attributed keys for a name in ``_SPLAT_KEYS``, the attributed payload of a
+        called helper, or — inside a handler — whatever the local resolves to. Anything else is a
+        refusal."""
+        if _is_own_data(node):
+            return iter(())
+        if isinstance(node, ast.Name) and node.id in _SPLAT_KEYS:
+            return iter(_SPLAT_KEYS[node.id])
+        if isinstance(node, ast.Name) and resolve_name is not None:
+            return resolve_name(node)
+        if isinstance(node, ast.Call):
+            return _attributed_call_keys(node, prefix="", site=site, depth=0, where="** splat")
+>       raise AssertionError(f"{site}: ** splat of {ast.dump(node)[:60]} inside a shipped dict literal — attribute it in _SPLAT_KEYS")
+E       AssertionError: src/elspeth/web/composer/tools/generation.py:2215: ** splat of IfExp(test=Compare(left=Name(id='matched_code', ctx=Load()), inside a shipped dict literal — attribute it in _SPLAT_KEYS
+
+tests/unit/web/composer/test_tool_result_envelope_gate.py:417: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_every_shipped_envelope_key_is_taught_or_fenced
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_no_nested_key_is_a_homonym_of_an_envelope_key
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_fence_entries_are_live_untaught_keys
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_review_blocked_payload_and_preflight_are_censused
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_review_blocked_census_rejects_an_untaught_payload_key
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_review_blocked_census_rejects_unadmitted_preflight
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_credential_builder_census_rejects_an_untaught_payload_key
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_credential_builder_owner_classification_is_required
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_every_registered_container_path_has_one_witnessed_producer
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_second_container_producer_refuses_even_with_existing_coverage[data.edge_contracts]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_second_container_producer_refuses_even_with_existing_coverage[validation.errors]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_second_container_producer_refuses_even_with_existing_coverage[validation.suggestions]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_second_container_producer_refuses_even_with_existing_coverage[validation.warnings]
+FAILED tests/unit/web/composer/test_tool_result_envelope_gate.py::test_every_result_constructor_site_is_attributed
+============================= 14 failed in 11.43s ==============================

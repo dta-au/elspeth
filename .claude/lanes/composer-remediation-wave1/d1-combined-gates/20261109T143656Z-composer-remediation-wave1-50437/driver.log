@@ -1,0 +1,34 @@
+tree        : /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+HEAD        : 14fef5e5342ccbd79b4fdd69b276c20f77d66dc1  ()
+stages      : ruff,mypy,contracts,lints,pytest,testcontainer
+log dir     : /workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-combined-gates
+provenance  : elspeth -> /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src/elspeth/__init__.py
+              elspeth_lints -> /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src/elspeth_lints/__init__.py
+siblings    : 0 pytest process(es) already on this box -> workers=12
+docker      : reachable
+tree state  : 14fef5e5342ccbd79b4fdd69b276c20f77d66dc1 01ba4719c80b6fe9  (HEAD + sha256 of status+diff; must match after the run)
+
+commands (PYTHONPATH=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src:/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src exported for every stage):
+  [ruff] /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/ruff check src/ tests/ scripts/ examples/ elspeth-lints/src/ && /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/ruff format --check src/ tests/ scripts/ examples/ elspeth-lints/src/
+  [mypy] /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/mypy src/ elspeth-lints/src/
+  [contracts] /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/python scripts/check_contracts.py && /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/python scripts/cicd/generate_skill_inventory.py --check
+  [lints] ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/python -m elspeth_lints.core.cli check --rules all --root src/elspeth
+  [pytest] /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/python -m pytest tests/ -n 12 -o 'pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src' -v --junitxml=<run-dir>/pytest-junit.xml 
+  [testcontainer] /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/bin/python -m pytest tests/ -m testcontainer -n 0 -o 'pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/elspeth-lints/src' -v --junitxml=<run-dir>/testcontainer-junit.xml
+
+run_dir=/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-combined-gates/20261109T143656Z-composer-remediation-wave1-50437
+tree=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1 head=14fef5e5342ccbd79b4fdd69b276c20f77d66dc1 before=14fef5e5342ccbd79b4fdd69b276c20f77d66dc1 01ba4719c80b6fe9
+>>> [ruff] 14:36:56Z  log: /workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-combined-gates/20261109T143656Z-composer-remediation-wave1-50437/ruff.log
+stage=ruff exit=0 seconds=3 fatal=1
+freeze_monitor stage=ruff status=healthy watcher_exit=0
+>>> [mypy] 14:37:01Z  log: /workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-combined-gates/20261109T143656Z-composer-remediation-wave1-50437/mypy.log
+stage=mypy exit=0 seconds=35 fatal=1
+freeze_monitor stage=mypy status=healthy watcher_exit=0
+>>> [contracts] 14:37:37Z  log: /workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-combined-gates/20261109T143656Z-composer-remediation-wave1-50437/contracts.log
+stage=contracts exit=0 seconds=36 fatal=1
+freeze_monitor stage=contracts status=healthy watcher_exit=0
+>>> [lints] 14:38:17Z  log: /workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-combined-gates/20261109T143656Z-composer-remediation-wave1-50437/lints.log
+stage=lints exit=1 seconds=260 fatal=0 findings=5429
+freeze_monitor stage=lints status=healthy watcher_exit=0
+>>> [pytest] 14:42:39Z  log: /workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-combined-gates/20261109T143656Z-composer-remediation-wave1-50437/pytest.log
+Terminated

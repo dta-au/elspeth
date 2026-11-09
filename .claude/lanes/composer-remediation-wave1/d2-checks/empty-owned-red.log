@@ -1,0 +1,80 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-d2
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 145 items / 142 deselected / 3 selected
+
+tests/unit/composer_mcp/test_configured_root_admission.py FFF            [100%]
+
+=================================== FAILURES ===================================
+_ test_empty_validation_cannot_hide_an_invalid_owned_path_context[wrong-type] __
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/empty-owned-red-tmp/test_empty_validation_cannot_h0')
+case = 'wrong-type'
+
+    @pytest.mark.parametrize("case", ["wrong-type", "web-session", "different-root"])
+    def test_empty_validation_cannot_hide_an_invalid_owned_path_context(tmp_path: Path, case: str) -> None:
+        """Owned configuration errors must precede even the empty-composition shortcut."""
+        catalog = create_catalog_service()
+        authority: Any = McpConfiguredRootAuthority(tmp_path)
+        data_dir = tmp_path / "other" if case == "different-root" else tmp_path
+        session_id = "web-session" if case == "web-session" else None
+        if case == "wrong-type":
+            authority = tmp_path
+        payload = _preview_state().to_dict()
+        payload["sources"], payload["outputs"] = {}, []
+>       with pytest.raises(TypeError if case == "wrong-type" else ValueError):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'TypeError'>
+
+tests/unit/composer_mcp/test_configured_root_admission.py:553: Failed
+_ test_empty_validation_cannot_hide_an_invalid_owned_path_context[web-session] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/empty-owned-red-tmp/test_empty_validation_cannot_h1')
+case = 'web-session'
+
+    @pytest.mark.parametrize("case", ["wrong-type", "web-session", "different-root"])
+    def test_empty_validation_cannot_hide_an_invalid_owned_path_context(tmp_path: Path, case: str) -> None:
+        """Owned configuration errors must precede even the empty-composition shortcut."""
+        catalog = create_catalog_service()
+        authority: Any = McpConfiguredRootAuthority(tmp_path)
+        data_dir = tmp_path / "other" if case == "different-root" else tmp_path
+        session_id = "web-session" if case == "web-session" else None
+        if case == "wrong-type":
+            authority = tmp_path
+        payload = _preview_state().to_dict()
+        payload["sources"], payload["outputs"] = {}, []
+>       with pytest.raises(TypeError if case == "wrong-type" else ValueError):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'ValueError'>
+
+tests/unit/composer_mcp/test_configured_root_admission.py:553: Failed
+_ test_empty_validation_cannot_hide_an_invalid_owned_path_context[different-root] _
+
+tmp_path = PosixPath('/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/empty-owned-red-tmp/test_empty_validation_cannot_h2')
+case = 'different-root'
+
+    @pytest.mark.parametrize("case", ["wrong-type", "web-session", "different-root"])
+    def test_empty_validation_cannot_hide_an_invalid_owned_path_context(tmp_path: Path, case: str) -> None:
+        """Owned configuration errors must precede even the empty-composition shortcut."""
+        catalog = create_catalog_service()
+        authority: Any = McpConfiguredRootAuthority(tmp_path)
+        data_dir = tmp_path / "other" if case == "different-root" else tmp_path
+        session_id = "web-session" if case == "web-session" else None
+        if case == "wrong-type":
+            authority = tmp_path
+        payload = _preview_state().to_dict()
+        payload["sources"], payload["outputs"] = {}, []
+>       with pytest.raises(TypeError if case == "wrong-type" else ValueError):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'ValueError'>
+
+tests/unit/composer_mcp/test_configured_root_admission.py:553: Failed
+=========================== short test summary info ============================
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_empty_validation_cannot_hide_an_invalid_owned_path_context[wrong-type]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_empty_validation_cannot_hide_an_invalid_owned_path_context[web-session]
+FAILED tests/unit/composer_mcp/test_configured_root_admission.py::test_empty_validation_cannot_hide_an_invalid_owned_path_context[different-root]
+====================== 3 failed, 142 deselected in 4.94s =======================

@@ -1,0 +1,3798 @@
+"""SQLAlchemy Core table definitions for the session database.
+
+Tables include session content plus epoch-44 web coordination authority,
+run-start, transient handoff, rate-limit, and cleanup state.
+
+Current schema bootstrap lives in ``sessions/schema.py``. Pre-release
+session databases are created from this metadata. Incompatible runtime DBs
+are preserved and refused; bootstrap does not migrate or recreate them.
+
+All tables live in a dedicated session database, separate from the
+Landscape audit database.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Literal, cast
+
+from sqlalchemy import (
+    DDL,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Column,
+    DateTime,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    LargeBinary,
+    MetaData,
+    PrimaryKeyConstraint,
+    String,
+    Table,
+    Text,
+    UniqueConstraint,
+    event,
+    text,
+)
+from sqlalchemy.sql.expression import false as sa_false
+from sqlalchemy.types import JSON
+
+from elspeth.core.schema_identity import create_schema_identity_table
+from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_JSON_MAX_LENGTH
+
+# ``SESSION_SCHEMA_EPOCH`` — schema version sentinel. Bump this constant
+# whenever a table or persisted semantic contract is changed in a way that
+# makes existing session stores incompatible. The startup
+# validator (``schema._assert_schema_sentinels``) reads ``PRAGMA user_version``
+# and crashes if it does not match, producing an actionable
+# "Preserve this store unchanged" message rather than a cryptic
+# SQLAlchemy error the first time a new code path touches the stale DB.
+#
+# Pattern mirrors ``SQLITE_SCHEMA_EPOCH`` in ``core/landscape/schema.py``
+# but is independent: the Landscape and session DBs are separate files
+# with separate lifecycles and separate epochs.
+#
+# Epoch 74 adds graph recovery parks and checkpoint operation ownership.
+# Epoch 75 adds durable auth families and derived-token revocation bindings.
+# Epoch 76 makes committed terminal graph-review facts authoritative over
+# immutable snapshots. Older readers ignore these private facts, so sharing
+# or rolling back across this semantic format boundary is unsupported.
+# Epoch 77 retains those graph-review semantics, separates container token caps
+# from optional storage ceilings, and enforces a single active container policy
+# across all granting actors. Both predecessor epoch-76 contracts are incompatible.
+# There is no migration path; preserve incompatible stores and prior access.
+# Epoch 78 binds settled provider attempts to the exact ledger custody tuple,
+# rejects negative token measures, records shared rate bucket policy, and
+# reserves local run output storage before writing physical bytes.
+SESSION_SCHEMA_EPOCH = 78
+
+_SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
+_POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
+# Hand-written on purpose, and pinned against ``AuthProviderType`` by
+# ``tests/unit/web/auth/test_provider_type_contract.py``.  Deriving the SQL
+# from the Literal would let a contract edit change what the database admits
+# with no epoch bump; pinning it means the drift is caught instead.
+_AUTH_PROVIDER_TYPE_CHECK = "auth_provider_type IN ('local', 'oidc', 'entra', 'vanguard', 'google')"
+
+
+def _sql_non_blank_text(column_name: str, *, dialect: Literal["sqlite", "postgresql"]) -> str:
+    if dialect == "sqlite":
+        return f"length(trim({column_name}, {_SQLITE_ASCII_WHITESPACE})) > 0"
+    return f"length(btrim({column_name}, {_POSTGRESQL_ASCII_WHITESPACE})) > 0"
+
+
+def _non_blank_text_constraints(
+    column_name: str,
+    *,
+    name: str,
+    nullable: bool = False,
+) -> tuple[CheckConstraint, CheckConstraint]:
+    def expression(dialect: Literal["sqlite", "postgresql"]) -> str:
+        non_blank = _sql_non_blank_text(column_name, dialect=dialect)
+        return f"{column_name} IS NULL OR {non_blank}" if nullable else non_blank
+
+    return (
+        CheckConstraint(expression("sqlite"), name=name).ddl_if(dialect="sqlite"),
+        CheckConstraint(expression("postgresql"), name=name).ddl_if(dialect="postgresql"),
+    )
+
+
+def _lower_sha256_check(column_name: str, *, dialect: Literal["sqlite", "postgresql"]) -> str:
+    base = f"length({column_name}) = 64"
+    if dialect == "sqlite":
+        return f"{base} AND {column_name} NOT GLOB '*[^a-f0-9]*'"
+    return f"{base} AND {column_name} ~ '^[a-f0-9]+$'"
+
+
+def _lower_sha256_constraints(
+    column_name: str,
+    *,
+    name: str,
+    nullable: bool = False,
+) -> tuple[CheckConstraint, CheckConstraint]:
+    def expression(dialect: Literal["sqlite", "postgresql"]) -> str:
+        shape = _lower_sha256_check(column_name, dialect=dialect)
+        return f"{column_name} IS NULL OR ({shape})" if nullable else shape
+
+    return (
+        CheckConstraint(expression("sqlite"), name=name).ddl_if(dialect="sqlite"),
+        CheckConstraint(expression("postgresql"), name=name).ddl_if(dialect="postgresql"),
+    )
+
+
+def _prefixed_sha256_constraints(column_name: str, *, name: str, nullable: bool = False) -> tuple[CheckConstraint, CheckConstraint]:
+    """CHECK a ``sha256:<64 lowercase hex>`` reference, the shape ``review_payload_digest`` emits."""
+
+    def expression(dialect: Literal["sqlite", "postgresql"]) -> str:
+        if dialect == "sqlite":
+            shape = (
+                f"length({column_name}) = 71 AND substr({column_name}, 1, 7) = 'sha256:' "
+                f"AND substr({column_name}, 8) NOT GLOB '*[^a-f0-9]*'"
+            )
+        else:
+            shape = f"{column_name} ~ '^sha256:[a-f0-9]{{64}}$'"
+        return f"{column_name} IS NULL OR ({shape})" if nullable else shape
+
+    return (
+        CheckConstraint(expression("sqlite"), name=name).ddl_if(dialect="sqlite"),
+        CheckConstraint(expression("postgresql"), name=name).ddl_if(dialect="postgresql"),
+    )
+
+
+def _composition_proposals_composer_provenance_check(*, dialect: Literal["sqlite", "postgresql"]) -> str:
+    return (
+        "((composer_model_identifier IS NULL AND composer_model_version IS NULL AND "
+        "composer_provider IS NULL AND composer_skill_hash IS NULL AND tool_arguments_hash IS NULL) OR "
+        "(composer_model_identifier IS NOT NULL AND composer_model_version IS NOT NULL AND "
+        "composer_provider IS NOT NULL AND composer_skill_hash IS NOT NULL AND tool_arguments_hash IS NOT NULL AND "
+        f"{_sql_non_blank_text('composer_model_identifier', dialect=dialect)} AND "
+        f"{_sql_non_blank_text('composer_model_version', dialect=dialect)} AND "
+        f"{_sql_non_blank_text('composer_provider', dialect=dialect)} AND "
+        f"{_sql_non_blank_text('composer_skill_hash', dialect=dialect)} AND "
+        f"{_sql_non_blank_text('tool_arguments_hash', dialect=dialect)}))"
+    )
+
+
+def _blobs_creating_llm_provenance_check(*, dialect: Literal["sqlite", "postgresql"]) -> str:
+    return (
+        "((creation_modality IN ('llm_generated', 'disambiguated', 'llm_generated_then_amended')) AND "
+        "created_from_message_id IS NOT NULL AND "
+        f"{_sql_non_blank_text('created_from_message_id', dialect=dialect)} AND "
+        "creating_model_identifier IS NOT NULL AND creating_model_version IS NOT NULL AND "
+        "creating_provider IS NOT NULL AND creating_composer_skill_hash IS NOT NULL AND "
+        "creating_arguments_hash IS NOT NULL AND "
+        f"{_sql_non_blank_text('creating_model_identifier', dialect=dialect)} AND "
+        f"{_sql_non_blank_text('creating_model_version', dialect=dialect)} AND "
+        f"{_sql_non_blank_text('creating_provider', dialect=dialect)} AND "
+        f"{_sql_non_blank_text('creating_composer_skill_hash', dialect=dialect)} AND "
+        f"{_sql_non_blank_text('creating_arguments_hash', dialect=dialect)}) OR "
+        "(creation_modality = 'verbatim' AND "
+        "creating_model_identifier IS NULL AND creating_model_version IS NULL AND "
+        "creating_provider IS NULL AND creating_composer_skill_hash IS NULL AND "
+        "creating_arguments_hash IS NULL)"
+    )
+
+
+# ``SESSION_DB_APPLICATION_ID`` — project-unique SQLite ``application_id``.
+# Stored in ``PRAGMA application_id`` so forensics tooling can confirm a
+# given SQLite file is in fact an ELSPETH session DB rather than some
+# other SQLite file that happens to live at the configured path.
+#
+# Hex 0x454C5350 spells "ELSP" (E=0x45, L=0x4C, S=0x53, P=0x50). Magic
+# numbers in SQLite's ``application_id`` slot are conventionally chosen
+# so a hexdump of the first 100 bytes of the file makes the project
+# identifiable to a human auditor.
+SESSION_DB_APPLICATION_ID = 0x454C5350
+
+metadata = MetaData()
+schema_identity_table = create_schema_identity_table(metadata)
+
+sessions_table = Table(
+    "sessions",
+    metadata,
+    Column("id", String, primary_key=True),
+    # The historical column name is retained; values are canonical identity IDs.
+    Column("user_id", String, ForeignKey("identities.identity_id", ondelete="RESTRICT"), nullable=False, index=True),
+    Column("auth_provider_type", String, nullable=False, default="local"),
+    Column("title", String, nullable=False),
+    # Default trust_mode is auto_commit, not explicit_approve.
+    #
+    # The explicit_approve flow (commit 1d2abca8e, 2026-05-14) intercepts
+    # mutation tool calls *before* the validator runs and turns them into
+    # pending proposals. The LLM gets back ``success=True`` /
+    # ``status=APPROVAL_REQUIRED`` and stops iterating; the validator
+    # only fires later at accept time, with no path back to the LLM for
+    # self-correction. With a small composer model (gpt-5.4-mini), the
+    # LLM's normal retry-on-validation-error loop is the load-bearing
+    # mechanism for converging on a valid pipeline. Intercepting before
+    # validation silently removes it, producing consistent stuck-proposal
+    # dead-ends across multi-plugin pipelines (observed empirically
+    # 2026-05-15 across multiple session retries with the exact prompt
+    # that ran reliably 2026-05-14 under the pre-intercept default).
+    #
+    # explicit_approve remains a supported value via
+    # ``PATCH /sessions/{id}/composer/preferences`` for operators who
+    # want a hard human-approval gate on every mutation. Setting it as
+    # the *default* is the regression; restoring auto_commit as the
+    # default restores convergence. The proper fix to make
+    # explicit_approve viable as a default is to dry-run the tool before
+    # creating the proposal (so the LLM sees validation errors and can
+    # retry within the same compose turn) — out of scope for the
+    # default-revert; tracked as a follow-up.
+    # ``default="auto_commit"`` is the Python-side INSERT default —
+    # SQLAlchemy supplies it on inserts that omit ``trust_mode``. The
+    # ``server_default`` is the DDL default baked into the table at
+    # CREATE TABLE time and is preserved here for symmetry, but the
+    # live staging DB was created when the DDL default was
+    # "explicit_approve" — SQLite does not retroactively change column
+    # defaults on existing tables. The Python-side ``default`` is what
+    # actually takes effect for newly-inserted rows in already-deployed
+    # databases. Per the project DB policy ("DB migration = delete the
+    # old DB"), changing the DDL alone is insufficient.
+    Column("trust_mode", String, nullable=False, default="auto_commit", server_default="auto_commit"),
+    Column("density_default", String, nullable=False, server_default="high"),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    # Historical provenance only. This deliberately is not a live
+    # ForeignKey("sessions.id") so no-durable-history archive can physically
+    # delete a parent session while preserving child fork provenance.
+    Column(
+        "forked_from_session_id",
+        String,
+        nullable=True,
+    ),
+    Column("forked_from_message_id", String, nullable=True),
+    ForeignKeyConstraint(
+        ["forked_from_message_id"],
+        ["chat_messages.id"],
+        name="fk_sessions_forked_from_message",
+        ondelete="SET NULL",
+    ),
+    # ``interpretation_review_disabled`` — per-session "stop asking" toggle for
+    # LLM-surfaced interpretation review. Fast-path read by the compose loop;
+    # the authoritative audit record is the ``opted_out``
+    # row in ``interpretation_events_table``.
+    #
+    # Two-source-of-truth tension (F-35): the opted-out state is represented
+    # both by this boolean column (fast-path read by the compose loop) and by
+    # the existence of a row in ``interpretation_events`` with
+    # ``choice='opted_out'`` (authoritative audit record). They MUST remain
+    # consistent. The service's write path sets both atomically within a
+    # single transaction (``_session_write_lock`` held throughout).
+    #
+    # If a future audit finds the boolean ``true`` but no ``opted_out`` row
+    # exists, that is a bug in the service's write path — crash on read
+    # (offensive programming). The boolean is a read-cache; the
+    # ``interpretation_events`` row is the source of truth.
+    #
+    # F-35 follow-up: consider enforcing this constraint with a trigger or
+    # computed column in a future schema revision. Deferred because SQLite
+    # does not support CHECK constraints that cross tables.
+    Column(
+        "interpretation_review_disabled",
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+    ),
+    Column("archived_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint(
+        "trust_mode IN ('explicit_approve', 'auto_commit')",
+        name="ck_sessions_trust_mode",
+    ),
+    CheckConstraint(
+        "density_default IN ('high', 'medium', 'low')",
+        name="ck_sessions_density_default",
+    ),
+    CheckConstraint(
+        _AUTH_PROVIDER_TYPE_CHECK,
+        name="ck_sessions_auth_provider_type",
+    ),
+)
+
+# One membership row per live web process. SQLite deployments do not use this
+# distributed membership surface, but the table remains part of the recreated
+# schema so both supported database modes share one exact metadata contract.
+web_instances_table = Table(
+    "web_instances",
+    metadata,
+    Column("instance_id", String, primary_key=True),
+    Column("deployment_target", String, nullable=False),
+    Column("deployment_generation", String, nullable=False),
+    Column("session_epoch", Integer, nullable=False),
+    Column("landscape_epoch", Integer, nullable=False),
+    Column("coordination_protocol", Integer, nullable=False),
+    Column("image_digest", String, nullable=False),
+    Column("revision_label", String, nullable=False),
+    Column("state", String, nullable=False),
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("last_heartbeat_at", DateTime(timezone=True), nullable=False),
+    Column("lease_expires_at", DateTime(timezone=True), nullable=False, index=True),
+    *_non_blank_text_constraints("instance_id", name="ck_web_instances_instance_id_nonblank"),
+    *_non_blank_text_constraints("deployment_target", name="ck_web_instances_target_nonblank"),
+    *_non_blank_text_constraints("deployment_generation", name="ck_web_instances_generation_nonblank"),
+    *_non_blank_text_constraints("image_digest", name="ck_web_instances_image_digest_nonblank"),
+    *_non_blank_text_constraints("revision_label", name="ck_web_instances_revision_label_nonblank"),
+    CheckConstraint(
+        "session_epoch > 0 AND landscape_epoch > 0 AND coordination_protocol > 0",
+        name="ck_web_instances_positive_compatibility",
+    ),
+    CheckConstraint("state IN ('active', 'draining', 'stopped')", name="ck_web_instances_state"),
+)
+Index(
+    "ix_web_instances_compatibility",
+    web_instances_table.c.deployment_generation,
+    web_instances_table.c.session_epoch,
+    web_instances_table.c.landscape_epoch,
+    web_instances_table.c.coordination_protocol,
+)
+
+# Exactly one persistent operation-fence row belongs to each retained session.
+# Release never nulls forensic authority; released_at alone discriminates an
+# inactive row. lease_token is random fencing authority and must not collapse
+# into the diagnostic owner identity.
+session_operation_fences_table = Table(
+    "session_operation_fences",
+    metadata,
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("operation_id", String, nullable=False),
+    Column("lease_token", String, nullable=False),
+    Column("operation_kind", String, nullable=False),
+    Column("owner_instance_id", String, nullable=False),
+    Column("operation_epoch", Integer, nullable=False),
+    Column("lease_expires_at", DateTime(timezone=True), nullable=False, index=True),
+    Column("released_at", DateTime(timezone=True), nullable=True),
+    *_non_blank_text_constraints("session_id", name="ck_session_operation_fences_session_id_nonblank"),
+    *_non_blank_text_constraints("operation_id", name="ck_session_operation_fences_operation_id_nonblank"),
+    *_non_blank_text_constraints("lease_token", name="ck_session_operation_fences_lease_token_nonblank"),
+    *_non_blank_text_constraints("owner_instance_id", name="ck_session_operation_fences_owner_nonblank"),
+    CheckConstraint("lease_token <> owner_instance_id", name="ck_session_operation_fences_token_not_owner"),
+    CheckConstraint("operation_epoch > 0", name="ck_session_operation_fences_positive_epoch"),
+    CheckConstraint(
+        "operation_kind IN ('create', 'compose', 'proposal', 'execute', 'archive', 'progress', 'blob_read', 'session_fork')",
+        name="ck_session_operation_fences_kind",
+    ),
+)
+
+# One row per live shareable BLOB_READ admission (epoch 53, elspeth-f98e0ae8b2).
+# A read admission takes no fence row, so without this record a released or
+# expired read context was indistinguishable from a live one. Every read
+# proof selects its row by (session_id, operation_id): row absent means the
+# admission was RELEASED (release deletes the row), a token mismatch is a
+# forged or foreign context, and ``expires_at <= database now`` is
+# LEASE_EXPIRED. ``operation_epoch`` records the fence epoch the read was
+# admitted under and is never compared — a writer advancing the fence must
+# not invalidate a shareable read. Session deletion cascades the rows away.
+session_read_admissions_table = Table(
+    "session_read_admissions",
+    metadata,
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("operation_id", String, primary_key=True),
+    Column("lease_token", String, nullable=False),
+    Column("owner_instance_id", String, nullable=False),
+    Column("operation_epoch", Integer, nullable=False),
+    Column("admitted_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    *_non_blank_text_constraints("session_id", name="ck_session_read_admissions_session_id_nonblank"),
+    *_non_blank_text_constraints("operation_id", name="ck_session_read_admissions_operation_id_nonblank"),
+    *_non_blank_text_constraints("lease_token", name="ck_session_read_admissions_lease_token_nonblank"),
+    *_non_blank_text_constraints("owner_instance_id", name="ck_session_read_admissions_owner_nonblank"),
+    CheckConstraint("lease_token <> owner_instance_id", name="ck_session_read_admissions_token_not_owner"),
+    CheckConstraint("operation_epoch > 0", name="ck_session_read_admissions_positive_epoch"),
+    CheckConstraint("expires_at > admitted_at", name="ck_session_read_admissions_expiry_after_admission"),
+)
+
+chat_messages_table = Table(
+    "chat_messages",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column("role", String, nullable=False),
+    Column("content", Text, nullable=False),
+    Column("raw_content", Text, nullable=True),
+    Column("tool_calls", JSON, nullable=True),
+    Column("tool_call_id", String, nullable=True),
+    Column("sequence_no", Integer, nullable=False),
+    Column("writer_principal", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    # Composite FK forces same-session ownership: a message in session B
+    # cannot reference a composition state owned by session A. When
+    # composition_state_id is NULL, standard SQL partial-null semantics
+    # skip FK enforcement, which is the intended behavior.
+    Column("composition_state_id", String, nullable=True),
+    Column("parent_assistant_id", String, nullable=True),
+    ForeignKeyConstraint(
+        ["composition_state_id", "session_id"],
+        ["composition_states.id", "composition_states.session_id"],
+        name="fk_chat_messages_composition_state_session",
+    ),
+    # Composite same-session FK on parent_assistant_id closes the
+    # cross-session lineage hole: a tool row in session B cannot
+    # reference an assistant row in session A. ON DELETE CASCADE
+    # removes child tool rows when the assistant is deleted, preventing
+    # orphan tool rows from accumulating in the audit DB. The schema
+    # cannot mechanically enforce that the referenced row has
+    # role='assistant'; _assert_parent_assistant_message guard
+    # adds that check at the helper-call boundary.
+    ForeignKeyConstraint(
+        ["parent_assistant_id", "session_id"],
+        ["chat_messages.id", "chat_messages.session_id"],
+        name="fk_chat_messages_parent_assistant_session",
+        ondelete="CASCADE",
+    ),
+    UniqueConstraint(
+        "id",
+        "session_id",
+        name="uq_chat_messages_id_session",
+    ),
+    CheckConstraint(
+        "role IN ('user', 'assistant', 'system', 'tool', 'audit')",
+        name="ck_chat_messages_role",
+    ),
+    CheckConstraint(
+        "(role = 'tool') = (tool_call_id IS NOT NULL)",
+        name="ck_chat_messages_tool_call_id_role",
+    ),
+    CheckConstraint(
+        "(role = 'tool') = (parent_assistant_id IS NOT NULL)",
+        name="ck_chat_messages_parent_role",
+    ),
+    CheckConstraint(
+        "writer_principal IN ('compose_loop', 'route_user_message', 'route_system_message', 'admin_tool', 'session_fork', 'run_diagnostics')",
+        name="ck_chat_messages_writer_principal",
+    ),
+    Index(
+        "ix_chat_messages_session_sequence",
+        "session_id",
+        "sequence_no",
+        unique=True,
+    ),
+    Index(
+        "ix_chat_messages_session_tool_call_id",
+        "session_id",
+        "tool_call_id",
+    ),
+)
+
+message_ingress_receipts_table = Table(
+    "message_ingress_receipts",
+    metadata,
+    Column("session_id", String, ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True),
+    Column("operation_id", String, primary_key=True),
+    Column("user_message_id", String, nullable=False),
+    Column("requested_state_id", String, nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    ForeignKeyConstraint(
+        ["user_message_id", "session_id"],
+        ["chat_messages.id", "chat_messages.session_id"],
+        name="fk_message_ingress_receipts_user_message_session",
+        ondelete="CASCADE",
+    ),
+    ForeignKeyConstraint(
+        ["requested_state_id", "session_id"],
+        ["composition_states.id", "composition_states.session_id"],
+        name="fk_message_ingress_receipts_requested_state_session",
+        ondelete="CASCADE",
+    ),
+    UniqueConstraint("user_message_id", name="uq_message_ingress_receipts_user_message"),
+    *_non_blank_text_constraints("session_id", name="ck_message_ingress_receipts_session_id_nonblank"),
+    *_non_blank_text_constraints("operation_id", name="ck_message_ingress_receipts_operation_id_nonblank"),
+    *_non_blank_text_constraints("user_message_id", name="ck_message_ingress_receipts_user_message_id_nonblank"),
+)
+
+# Partial unique index: tool_call_id must be unique within
+# (session_id, role='tool') scope. Two tool rows in the same session
+# cannot share a provider tool_call_id (would conflate distinct LLM
+# tool calls), but the same tool_call_id may legally appear in two
+# different sessions, and non-tool rows (NULL tool_call_id) must not
+# collide on NULL with each other. The same predicate is supplied to
+# both ``sqlite_where`` (SQLite 3.8.0+) and ``postgresql_where``
+# (PostgreSQL >= 9.5) so the index is equivalent across dialects.
+# Mirrors the project pattern at ``uq_runs_one_active_per_session``
+# below.
+Index(
+    "uq_chat_messages_tool_call_id",
+    chat_messages_table.c.session_id,
+    chat_messages_table.c.tool_call_id,
+    unique=True,
+    sqlite_where=chat_messages_table.c.role == "tool",
+    postgresql_where=chat_messages_table.c.role == "tool",
+)
+
+composition_states_table = Table(
+    "composition_states",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column("version", Integer, nullable=False),
+    Column("source", JSON, nullable=True),
+    Column("sources", JSON, nullable=True),
+    Column("nodes", JSON, nullable=True),
+    Column("edges", JSON, nullable=True),
+    Column("outputs", JSON, nullable=True),
+    Column("metadata_", JSON, nullable=True),
+    Column("is_valid", Boolean, nullable=False, default=False),
+    Column("validation_errors", JSON, nullable=True),
+    # Operational/audit metadata produced by the composer pipeline that
+    # describes *how this state was reached* (distinct from ``metadata_``,
+    # which carries the user-facing PipelineMetadata name/description).
+    # Surfaced keys: ``repair_turns_used``, and ``validation_lane``
+    # (elspeth-67c6fa691d) — which predicate produced this row's
+    # ``is_valid``: "authoring_only" (mid-turn compose writer: Stage-1
+    # ``validate()`` narrowed by pending interpretation-review sites; no
+    # plugin config instantiation, no runtime preflight) or "strict"
+    # (turn-end writer: authoring + runtime preflight via
+    # ``_composer_persisted_validation``). Two writers share the
+    # ``is_valid`` column, so rows with byte-identical content can differ
+    # in validity across lanes; the marker makes that transition legible
+    # to an auditor. Absence (NULL composer_meta or missing key) is honest
+    # for writer paths that predate the marker or copy an existing row
+    # (revert and fork).
+    Column("composer_meta", JSON, nullable=True),
+    Column("creator_operation_id", String, nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column(
+        "derived_from_state_id",
+        String,
+        ForeignKey("composition_states.id"),
+        nullable=True,
+    ),
+    # ``provenance`` records WHY this state row was written. The CHECK
+    # below is a closed enum — extending it requires design review and
+    # a corresponding spec §4.1.2 amendment, not a silent value
+    # addition. The Python Literal counterpart lives at
+    # ``web/sessions/protocol.py::CompositionStateProvenance``; the two
+    # are paired contracts (extending one without the other lets the
+    # writer pass while the DB rejects the row, or vice versa). Schedule
+    # 1A treats this as a DB-only audit column: it is NOT surfaced on
+    # ``CompositionStateRecord`` / ``CompositionStateResponse``.
+    # Read-side hydration is deferred to Schedule 1B+ per plan §1053-1061.
+    Column("provenance", String, nullable=False),
+    UniqueConstraint("session_id", "version", name="uq_composition_state_version"),
+    # Composite uniqueness target for composite FKs on chat_messages /
+    # runs. The primary key already makes `id` unique on its own; this
+    # constraint exists solely so SQL engines (including Postgres) will
+    # accept (id, session_id) as an FK reference.
+    UniqueConstraint("id", "session_id", name="uq_composition_state_id_session"),
+    # Closed enum: every value corresponds to a documented writer path
+    # in spec §4.1.2 (``session_fork`` is the cross-session fork-copy
+    # value).
+    # Adding a value here without amending the spec creates an
+    # untraceable writer category in the audit DB.
+    #
+    # The original persist-path values were actively written as of
+    # elspeth-obs-f217c634aa (closed by the same commit that retired the
+    # dormant-value friction block here). The previous block warned that
+    # three values (``convergence_persist``, ``plugin_crash_persist``,
+    # ``preflight_persist``) had no writer; verification revealed the
+    # call sites already existed in ``web/sessions/routes.py`` but were
+    # passing through ``save_composition_state``'s hardcoded
+    # ``"session_seed"`` label. The fix threads ``provenance`` through
+    # the public API as a required keyword argument so all four writer
+    # categories (session_seed, convergence_persist,
+    # plugin_crash_persist, preflight_persist) are distinguishable in
+    # the audit DB. Active writer map:
+    #
+    #   - ``tool_call``               — service.py compose-loop atomic write
+    #   - ``convergence_persist``     — routes.py _handle_convergence_error
+    #   - ``plugin_crash_persist``    — routes.py _handle_plugin_crash
+    #   - ``preflight_persist``       — routes.py _handle_runtime_preflight_failure
+    #   - ``tutorial_normalization``  — DORMANT (no live writer). Formerly
+    #                                    written by tutorial_service.py's
+    #                                    pre-execution template normalizer
+    #                                    (Phase 4 hello-world tutorial), which
+    #                                    rewrote bare ``{{ field }}`` placeholders
+    #                                    to the ``row.field`` namespace before the
+    #                                    live pass. Removed for tutorial-vs-regular
+    #                                    backend parity (the composer already emits
+    #                                    ``row.field`` templates; a 10-run live
+    #                                    battery showed the rewrite firing 0/10).
+    #                                    The value is retained in this CHECK so
+    #                                    historical audit rows remain representable;
+    #                                    re-activation is a governance action per
+    #                                    the NO SILENT EXTENSION block below.
+    #   - ``post_compose``            — routes/messages.py send_message and
+    #                                    routes/composer.py recompose successful
+    #                                    LLM-driven state advances, including the
+    #                                    transition_consumed metadata-only row.
+    #   - ``session_seed``            — route-driven seed/import writes and
+    #                                    service.py state reverts
+    #   - ``session_fork``            — service.py fork_session_at_message and
+    #                                    routes/sessions.py fork blob-reference
+    #                                    rewrite, which is part of the same fork
+    #                                    writer path.
+    #   - ``interpretation_resolve``  — routes.py /resolve handler:
+    #                                    a composition-state row written when the
+    #                                    user resolves an LLM-surfaced interpretation
+    #                                    (accept_as_drafted / amend) so the patched
+    #                                    prompt template is committed alongside the
+    #                                    ``interpretation_events`` row.
+    #
+    # NO SILENT EXTENSION. Adding another value MUST include all three
+    # of: (a) a spec amendment documenting the writer path and the audit
+    # semantics that distinguish it from neighbouring values; (b) an
+    # integration test that drives the writer and asserts the row was
+    # committed with the new ``provenance`` value; (c) a GitHub issue
+    # linking the change back to this enum so the audit history shows the
+    # addition as a deliberate governance step rather than a drive-by
+    # edit. Mirror also goes into ``CompositionStateProvenance`` at
+    # ``protocol.py``. See the parallel ``audit_access_log_table`` "INERT
+    # IN PHASE 1A" block below for the same closed-list-of-permitted-
+    # writers posture.
+    CheckConstraint(
+        "provenance IN ('tool_call', 'convergence_persist', 'plugin_crash_persist', 'preflight_persist', 'tutorial_normalization', 'post_compose', 'session_seed', 'session_fork', 'interpretation_resolve', 'graph_recovery')",
+        name="ck_composition_states_provenance",
+    ),
+)
+
+composition_graph_parks_table = Table(
+    "composition_graph_parks",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("session_id", String, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True),
+    Column("state_id", String, nullable=False),
+    Column("operation_id", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    ForeignKeyConstraint(
+        ["state_id", "session_id"],
+        ["composition_states.id", "composition_states.session_id"],
+        name="fk_graph_park_state_session",
+    ),
+)
+
+composition_proposals_table = Table(
+    "composition_proposals",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column("tool_call_id", String, nullable=False),
+    # Originating user chat message for proposals created by the composer
+    # in explicit_approve mode. Nullable for legacy/imported proposals and
+    # future non-chat proposal sources. When present, the composite FK forces
+    # same-session ownership so accept/replay cannot bind blobs to another
+    # session's message.
+    Column("user_message_id", String, nullable=True),
+    # Composer provenance captured at proposal creation. Nullable for
+    # legacy/imported/manual proposals, but all-or-none when present. Accept
+    # replay uses these columns for inline/blob-backed source writes so a
+    # deferred proposal cannot silently downgrade composer-authored bytes to
+    # verbatim merely because the original compose-loop context is gone.
+    Column("composer_model_identifier", String, nullable=True),
+    Column("composer_model_version", String, nullable=True),
+    Column("composer_provider", String, nullable=True),
+    Column("composer_skill_hash", String, nullable=True),
+    Column("tool_arguments_hash", String, nullable=True),
+    Column("tool_name", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("summary", Text, nullable=False),
+    Column("rationale", Text, nullable=False),
+    Column("affects", JSON, nullable=False),
+    # Raw arguments are retained only for replay/execution. Normal
+    # API/UI surfaces must expose ``arguments_redacted_json`` instead.
+    Column("arguments_json", JSON, nullable=False),
+    Column("arguments_redacted_json", JSON, nullable=False),
+    Column("base_state_id", String, nullable=True),
+    Column("committed_state_id", String, nullable=True),
+    Column("audit_event_id", String, nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    ForeignKeyConstraint(
+        ["base_state_id", "session_id"],
+        ["composition_states.id", "composition_states.session_id"],
+        name="fk_composition_proposals_base_state_session",
+    ),
+    ForeignKeyConstraint(
+        ["committed_state_id", "session_id"],
+        ["composition_states.id", "composition_states.session_id"],
+        name="fk_composition_proposals_committed_state_session",
+    ),
+    ForeignKeyConstraint(
+        ["user_message_id", "session_id"],
+        ["chat_messages.id", "chat_messages.session_id"],
+        name="fk_composition_proposals_user_message_session",
+        ondelete="RESTRICT",
+    ),
+    UniqueConstraint(
+        "session_id",
+        "tool_call_id",
+        name="uq_composition_proposals_session_tool_call",
+    ),
+    # Composite proposal identity is retained for same-session custody checks.
+    UniqueConstraint("id", "session_id", name="uq_composition_proposals_id_session"),
+    CheckConstraint(
+        "status IN ('pending', 'committed', 'rejected')",
+        name="ck_composition_proposals_status",
+    ),
+    CheckConstraint(
+        "(status = 'committed') = (committed_state_id IS NOT NULL)",
+        name="ck_composition_proposals_committed_state",
+    ),
+    CheckConstraint(
+        _composition_proposals_composer_provenance_check(dialect="sqlite"),
+        name="ck_composition_proposals_composer_provenance_all_or_none",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _composition_proposals_composer_provenance_check(dialect="postgresql"),
+        name="ck_composition_proposals_composer_provenance_all_or_none",
+    ).ddl_if(dialect="postgresql"),
+    *_lower_sha256_constraints("composer_skill_hash", name="ck_composition_proposals_composer_skill_hash_format", nullable=True),
+    *_lower_sha256_constraints("tool_arguments_hash", name="ck_composition_proposals_tool_arguments_hash_format", nullable=True),
+)
+# Fork and state-revert requests own an immutable request digest. Only a live exact lease may advance the
+# receipt to a terminal response locator. No planner/proposal columns belong
+# in this table.
+session_operation_receipts_table = Table(
+    "session_operation_receipts",
+    metadata,
+    Column("session_id", String(128), nullable=False),
+    Column("operation_id", String(128), nullable=False),
+    Column("kind", String(32), nullable=False),
+    Column("status", String(16), nullable=False),
+    Column("request_hash", String(64), nullable=False),
+    Column("lease_token", String(256), nullable=True),
+    Column("lease_expires_at", DateTime(timezone=True), nullable=True),
+    Column("attempt", Integer, nullable=False),
+    Column("originating_message_id", String(128), nullable=True),
+    Column("result_state_id", String(128), nullable=True),
+    Column("result_session_id", String(128), nullable=True),
+    Column("response_hash", String(64), nullable=True),
+    Column("failure_code", String(128), nullable=True),
+    Column("failure_diagnostics", JSON(none_as_null=True), nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("settled_at", DateTime(timezone=True), nullable=True),
+    PrimaryKeyConstraint("session_id", "operation_id", name="pk_session_operation_receipts"),
+    UniqueConstraint("session_id", "operation_id", "request_hash", name="uq_session_operation_receipts_request_binding"),
+    ForeignKeyConstraint(["session_id"], ["sessions.id"], name="fk_session_operation_receipts_session", ondelete="CASCADE"),
+    ForeignKeyConstraint(
+        ["originating_message_id", "session_id"],
+        ["chat_messages.id", "chat_messages.session_id"],
+        name="fk_session_operation_receipts_originating_message_session",
+        ondelete="RESTRICT",
+    ),
+    ForeignKeyConstraint(
+        ["result_state_id", "session_id"],
+        ["composition_states.id", "composition_states.session_id"],
+        name="fk_session_operation_receipts_result_state_session",
+        ondelete="RESTRICT",
+    ),
+    ForeignKeyConstraint(["result_session_id"], ["sessions.id"], name="fk_session_operation_receipts_result_session", ondelete="RESTRICT"),
+    CheckConstraint("length(operation_id) >= 1 AND length(operation_id) <= 128", name="ck_session_operation_receipts_id_bounded"),
+    CheckConstraint("kind IN ('session_fork', 'state_revert')", name="ck_session_operation_receipts_kind"),
+    CheckConstraint("status IN ('in_progress', 'completed', 'failed')", name="ck_session_operation_receipts_status"),
+    CheckConstraint("attempt >= 1", name="ck_session_operation_receipts_attempt"),
+    CheckConstraint("updated_at >= created_at", name="ck_session_operation_receipts_updated_after_created"),
+    CheckConstraint("settled_at IS NULL OR settled_at >= created_at", name="ck_session_operation_receipts_settled_after_created"),
+    CheckConstraint(_lower_sha256_check("request_hash", dialect="sqlite"), name="ck_session_operation_receipts_request_hash").ddl_if(
+        dialect="sqlite"
+    ),
+    CheckConstraint(_lower_sha256_check("request_hash", dialect="postgresql"), name="ck_session_operation_receipts_request_hash").ddl_if(
+        dialect="postgresql"
+    ),
+    CheckConstraint(
+        "lease_token IS NULL OR (length(lease_token) >= 1 AND length(lease_token) <= 256)",
+        name="ck_session_operation_receipts_lease_token_bounded",
+    ),
+    CheckConstraint(
+        "failure_code IS NULL OR failure_code IN ('stale_conflict', 'integrity_error', 'custody_error', "
+        "'quota_exceeded', 'storage_accounting_unavailable', 'operation_failed', 'request_cancelled')",
+        name="ck_session_operation_receipts_failure_code",
+    ),
+    CheckConstraint(
+        "failure_diagnostics IS NULL OR (json_type(failure_diagnostics) = 'array' AND "
+        "json_array_length(failure_diagnostics) > 0 AND json_array_length(failure_diagnostics) <= 32)",
+        name="ck_session_operation_receipts_failure_diagnostics_shape",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        "failure_diagnostics IS NULL OR (json_typeof(failure_diagnostics) = 'array'::text AND "
+        "json_array_length(failure_diagnostics) > 0 AND json_array_length(failure_diagnostics) <= 32)",
+        name="ck_session_operation_receipts_failure_diagnostics_shape",
+    ).ddl_if(dialect="postgresql"),
+    CheckConstraint(
+        "(status = 'in_progress' AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL "
+        "AND settled_at IS NULL AND response_hash IS NULL AND failure_code IS NULL AND failure_diagnostics IS NULL) OR "
+        "(status = 'completed' AND lease_token IS NULL AND lease_expires_at IS NULL AND settled_at IS NOT NULL "
+        "AND response_hash IS NOT NULL AND failure_code IS NULL AND failure_diagnostics IS NULL) OR "
+        "(status = 'failed' AND lease_token IS NULL AND lease_expires_at IS NULL AND settled_at IS NOT NULL "
+        "AND result_state_id IS NULL AND result_session_id IS NULL AND response_hash IS NULL AND failure_code IS NOT NULL)",
+        name="ck_session_operation_receipts_status_bundle",
+    ),
+    CheckConstraint(
+        "(kind = 'session_fork' AND result_state_id IS NULL AND "
+        "(status <> 'completed' OR result_session_id IS NOT NULL)) OR "
+        "(kind = 'state_revert' AND result_session_id IS NULL AND originating_message_id IS NULL AND "
+        "(status <> 'completed' OR result_state_id IS NOT NULL))",
+        name="ck_session_operation_receipts_result_locator",
+    ),
+    CheckConstraint(
+        "response_hash IS NULL OR (length(response_hash) = 64 AND response_hash NOT GLOB '*[^a-f0-9]*')",
+        name="ck_session_operation_receipts_response_hash",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        "response_hash IS NULL OR (length(response_hash) = 64 AND response_hash ~ '^[a-f0-9]+$')",
+        name="ck_session_operation_receipts_response_hash",
+    ).ddl_if(dialect="postgresql"),
+)
+Index(
+    "ix_session_operation_receipts_status_lease",
+    session_operation_receipts_table.c.status,
+    session_operation_receipts_table.c.lease_expires_at,
+)
+
+session_operation_receipt_events_table = Table(
+    "session_operation_receipt_events",
+    metadata,
+    Column("session_id", String(128), nullable=False),
+    Column("operation_id", String(128), nullable=False),
+    Column("sequence", Integer, nullable=False),
+    Column("event_kind", String(16), nullable=False),
+    Column("actor", String(128), nullable=False),
+    Column("attempt", Integer, nullable=False),
+    Column("prior_attempt", Integer, nullable=True),
+    Column("lease_expires_at", DateTime(timezone=True), nullable=True),
+    Column("request_hash", String(64), nullable=False),
+    Column("terminal_hash", String(64), nullable=True),
+    Column("occurred_at", DateTime(timezone=True), nullable=False),
+    PrimaryKeyConstraint("session_id", "operation_id", "sequence", name="pk_session_operation_receipt_events"),
+    ForeignKeyConstraint(
+        ["session_id", "operation_id", "request_hash"],
+        ["session_operation_receipts.session_id", "session_operation_receipts.operation_id", "session_operation_receipts.request_hash"],
+        name="fk_session_operation_receipt_events_receipt",
+        ondelete="CASCADE",
+    ),
+    CheckConstraint("sequence >= 1", name="ck_session_operation_receipt_events_sequence"),
+    CheckConstraint(
+        "event_kind IN ('claimed', 'renewed', 'taken_over', 'completed', 'failed')", name="ck_session_operation_receipt_events_kind"
+    ),
+    CheckConstraint("length(actor) >= 1 AND length(actor) <= 128", name="ck_session_operation_receipt_events_actor_bounded"),
+    CheckConstraint("attempt >= 1", name="ck_session_operation_receipt_events_attempt"),
+    CheckConstraint(_lower_sha256_check("request_hash", dialect="sqlite"), name="ck_session_operation_receipt_events_request_hash").ddl_if(
+        dialect="sqlite"
+    ),
+    CheckConstraint(
+        _lower_sha256_check("request_hash", dialect="postgresql"), name="ck_session_operation_receipt_events_request_hash"
+    ).ddl_if(dialect="postgresql"),
+    CheckConstraint(
+        "terminal_hash IS NULL OR (length(terminal_hash) = 64 AND terminal_hash NOT GLOB '*[^a-f0-9]*')",
+        name="ck_session_operation_receipt_events_terminal_hash",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        "terminal_hash IS NULL OR (length(terminal_hash) = 64 AND terminal_hash ~ '^[a-f0-9]+$')",
+        name="ck_session_operation_receipt_events_terminal_hash",
+    ).ddl_if(dialect="postgresql"),
+    CheckConstraint(
+        "(event_kind IN ('claimed', 'renewed') AND prior_attempt IS NULL AND lease_expires_at IS NOT NULL AND terminal_hash IS NULL) OR "
+        "(event_kind = 'taken_over' AND prior_attempt IS NOT NULL AND prior_attempt = attempt - 1 "
+        "AND lease_expires_at IS NOT NULL AND terminal_hash IS NULL) OR "
+        "(event_kind IN ('completed', 'failed') AND prior_attempt IS NULL AND lease_expires_at IS NULL AND terminal_hash IS NOT NULL)",
+        name="ck_session_operation_receipt_events_bundle",
+    ),
+)
+
+# Per-event ``payload`` JSON contract (Tier-1 schema; see
+# docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model —
+# values written here are our own data and must satisfy the contract on read
+# or crash):
+#
+# Payload contract for event_type="trust_mode.changed":
+#   trust_mode: str — the new value the PATCH set
+#       (vocabulary: 'explicit_approve' | 'auto_commit' per the
+#       CHECK constraint on sessions_table.trust_mode; see
+#       models.py:150).
+#   prior_trust_mode: str — the value the PATCH overwrote
+#       (added Phase 8 B1; same vocabulary as trust_mode above;
+#       required for the per-session session-switched telemetry
+#       counter to satisfy the audit-primacy superset rule).
+#   density_default: str — the new density_default value
+#       (vocabulary per the column's CHECK constraint).
+# Adding a new key here is a Tier-1 schema-cohort change: pre-release, a
+# schema change gets no migration shim — the old DB is deleted (per
+# CONTRIBUTING.md §Code Standards). Document the key, its vocabulary, and
+# the owning phase at the same time.
+#
+# Payload contract for event_type="proposal.created":
+#   Generic tool proposals use the closed current
+#   {schema="tool_proposal_created.v1", tool_call_id, tool_name,
+#   status="pending"} shape. The old schema-less three-field payload is
+#   invalid and is never inferred or upgraded by readers.
+#   Canonical set_pipeline rows use the distinct closed
+#   schema="pipeline_proposal_created.v2" metadata. It binds the exact
+#   private arguments, manifest-redacted audit projection, provenance,
+#   tagged base, draft/skill hashes, repair count, and custody result.
+#   Readers must never reinterpret malformed metadata as another schema.
+#
+# Payload contract for event_type="proposal.accepted":
+#   Canonical pipeline rows use schema="pipeline_proposal_accepted.v1" and
+#   bind the draft, committed state id/content, final composer metadata, and
+#   the exact durable redacted dispatch envelope (including its canonical
+#   executor-content hash).
+#
+# Payload contract for event_type="proposal.rejected":
+#   Canonical pipeline rows use schema="pipeline_proposal_rejected.v1" with a
+#   closed reason_code and an optional durable dispatch binding; free-form
+#   request/provider/exception text is never persisted in the terminal event.
+proposal_events_table = Table(
+    "proposal_events",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column(
+        "proposal_id",
+        String,
+        ForeignKey(
+            "composition_proposals.id",
+            ondelete="CASCADE",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        nullable=True,
+    ),
+    Column("event_type", String, nullable=False),
+    Column("actor", String, nullable=False),
+    Column("payload", JSON, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "event_type IN ('proposal.created', 'proposal.accepted', 'proposal.rejected', 'trust_mode.changed', 'auto_commit.revoked')",
+        name="ck_proposal_events_type",
+    ),
+)
+Index(
+    "ix_proposal_events_session_created",
+    proposal_events_table.c.session_id,
+    proposal_events_table.c.created_at,
+)
+
+# One durable obligation per approved blob effect. The blob coordinator writes
+# this row in the same database transaction that changes/removes blob metadata;
+# ordinary proposal settlement then binds the receipt to its accepted event.
+# A receipt may remain unaccepted after process death, but it may never be
+# rejected or cause the tool to execute again.
+proposal_blob_effect_receipts_table = Table(
+    "proposal_blob_effect_receipts",
+    metadata,
+    Column("proposal_id", String, primary_key=True),
+    Column("session_id", String, nullable=False, index=True),
+    Column("tool_name", String, nullable=False),
+    Column("blob_id", String, nullable=False),
+    Column("arguments_hash", String, nullable=False),
+    Column("result_blob_snapshot", JSON, nullable=False),
+    Column("result_blob_snapshot_hash", String, nullable=False),
+    Column("accepted_event_id", String, ForeignKey("proposal_events.id"), nullable=True, unique=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("accepted_at", DateTime(timezone=True), nullable=True),
+    ForeignKeyConstraint(
+        ["proposal_id", "session_id"],
+        ["composition_proposals.id", "composition_proposals.session_id"],
+        name="fk_proposal_blob_effect_receipts_proposal_session",
+        ondelete="CASCADE",
+    ),
+    CheckConstraint("tool_name IN ('update_blob', 'delete_blob')", name="ck_proposal_blob_effect_receipts_tool"),
+    CheckConstraint(
+        "(accepted_event_id IS NULL) = (accepted_at IS NULL)",
+        name="ck_proposal_blob_effect_receipts_acceptance_bundle",
+    ),
+    *_non_blank_text_constraints("blob_id", name="ck_proposal_blob_effect_receipts_blob_id_nonblank"),
+    CheckConstraint(
+        _lower_sha256_check("arguments_hash", dialect="sqlite"),
+        name="ck_proposal_blob_effect_receipts_arguments_hash",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _lower_sha256_check("arguments_hash", dialect="postgresql"),
+        name="ck_proposal_blob_effect_receipts_arguments_hash",
+    ).ddl_if(dialect="postgresql"),
+    CheckConstraint(
+        _lower_sha256_check("result_blob_snapshot_hash", dialect="sqlite"),
+        name="ck_proposal_blob_effect_receipts_result_hash",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _lower_sha256_check("result_blob_snapshot_hash", dialect="postgresql"),
+        name="ck_proposal_blob_effect_receipts_result_hash",
+    ).ddl_if(dialect="postgresql"),
+)
+
+interpretation_events_table = Table(
+    "interpretation_events",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    # Composite FK forces same-session ownership: an interpretation event in
+    # session B cannot reference a composition state owned by session A.
+    # Mirrors the pattern at composition_proposals.
+    # F-1/F-12: nullable=True — NULL for session-level
+    # auto_interpreted_opt_out marker rows; populated for user_approved rows
+    # and surface-specific auto_interpreted_opt_out rows.
+    Column("composition_state_id", String, nullable=True),
+    # The LLM transform's node_id within composition_states.nodes that this
+    # interpretation binds into. Validated at the writer boundary to exist;
+    # NOT a foreign key because nodes live inside a JSON column, not a
+    # separate table.
+    # F-1/F-12: nullable=True — NULL for session-level
+    # auto_interpreted_opt_out marker rows; populated for user_approved rows
+    # and surface-specific auto_interpreted_opt_out rows.
+    Column("affected_node_id", String, nullable=True),
+    # The provider tool_call_id from the LLM call that surfaced this
+    # interpretation. NOT a foreign key to chat_messages because the tool
+    # call may still be in flight when this row is inserted.
+    # F-1/F-12: nullable=True — NULL for session-level
+    # auto_interpreted_opt_out marker rows; populated for user_approved rows
+    # and surface-specific auto_interpreted_opt_out rows.
+    Column("tool_call_id", String, nullable=True),
+    # Audit-mandatory fields (source-conditional: see CHECKs below):
+    # NULL for session-level auto_interpreted_opt_out marker rows (no LLM
+    # surfacing occurred); NOT NULL for user_approved rows and
+    # surface-specific auto_interpreted_opt_out rows; NULL for
+    # auto_interpreted_no_surfaces rows except kind, which records the
+    # rejected review class.
+    # F-1: all nullable=True — the CHECKs below enforce source-conditional
+    # presence.
+    Column("user_term", Text, nullable=True),
+    Column("kind", String, nullable=True),
+    Column("llm_draft", Text, nullable=True),
+    Column("accepted_value", Text, nullable=True),  # None until resolved
+    Column("choice", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("resolved_at", DateTime(timezone=True), nullable=True),
+    Column("actor", String, nullable=False),
+    # Audit provenance: snapshot of the composer LLM context at surfacing time.
+    # F-1: nullable=True for model_identifier, model_version, provider,
+    # composer_skill_hash — NULL for session-level auto_interpreted_opt_out
+    # marker rows (no LLM was consulted), populated for surface-specific
+    # auto_interpreted_opt_out rows.
+    Column("model_identifier", String, nullable=True),
+    Column("model_version", String, nullable=True),
+    Column("provider", String, nullable=True),
+    Column("composer_skill_hash", String, nullable=True),
+    # NULL until resolved. Session-level auto_interpreted_opt_out marker rows
+    # have no LLM-supplied content to hash; surface-specific opt-out rows are
+    # born resolved with accepted_value, arguments_hash, and
+    # hash_domain_version='v2'.
+    # F-12 (hash domain versioning): hash_domain_version records the field set
+    # used to compute arguments_hash. New writes use
+    # contracts/composer_interpretation.py:INTERPRETATION_HASH_DOMAIN_V2.
+    # NULL for rows without a hash (opt-out, pending). NOT NULL once resolved.
+    Column("arguments_hash", String, nullable=True),
+    Column("hash_domain_version", String, nullable=True),
+    # Structural source of this row. Closed enum — see governance block
+    # on ``composition_states.provenance`` above for the same posture.
+    Column("interpretation_source", String, nullable=False),
+    # F-19 (runtime model snapshot at resolve time): nullable columns
+    # populated when the user resolves the event, capturing what model the
+    # affected LLM transform will use at runtime (for audit drift detection).
+    Column("runtime_model_identifier_at_resolve", String, nullable=True),
+    Column("runtime_model_version_at_resolve", String, nullable=True),
+    # Cross-DB hash anchor (Option A — see §"Hash-anchored cross-DB linkage"
+    # in 18-phase-5b-surface-llm-interpretation.md). Populated by
+    # resolve_interpretation_event at the same time as accepted_value is
+    # committed. NULL until resolved; NULL for session-level
+    # auto_interpreted_opt_out marker rows and for non-prompt-template
+    # surface opt-out rows. For user_approved rows and surface-specific
+    # auto_interpreted_opt_out rows that resolve an llm_prompt_template or
+    # a vague term embedded in that template,
+    # this is the versioned approved prompt surface hash from
+    # core/prompt_artifact.py: system prompt plus ordered effective queries.
+    # NOT part of INTERPRETATION_HASH_DOMAIN_V2 — it covers a different
+    # input (the approved prompt artifact) and serves as a cross-DB anchor
+    # only. Pair to ``calls.approved_prompt_artifact_hash`` in the L1
+    # Landscape audit DB; equality across both DBs is the audit-tooling
+    # cross-anchor invariant.
+    Column("approved_prompt_artifact_hash", String(64), nullable=True),
+    # What raised the surface: the composer LLM, or a server route that
+    # consulted no LLM (state revert, YAML import, E2E seed). NULL exactly when
+    # the row has no surface: session-level opt-out markers and
+    # auto_interpreted_no_surfaces rows. The four LLM provenance columns follow
+    # it (ck_interpretation_events_surface_origin_provenance): before this
+    # column the server routes wrote their own name into all four, so
+    # composer_skill_hash held a label instead of a skill_markdown_history key.
+    Column("surface_origin", String, nullable=True),
+    ForeignKeyConstraint(
+        ["composition_state_id", "session_id"],
+        ["composition_states.id", "composition_states.session_id"],
+        name="fk_interpretation_events_state_session",
+    ),
+    UniqueConstraint(
+        "id",
+        "session_id",
+        name="uq_interpretation_events_id_session",
+    ),
+    # Closed enum on choice. Adding a value requires (a) amending this plan,
+    # (b) extending InterpretationChoice in contracts/composer_interpretation.py,
+    # (c) updating the closed-enum tests, and (d) a writer-path audit.
+    # NO SILENT EXTENSION. See composition_states governance block above.
+    CheckConstraint(
+        "choice IN ('pending', 'accepted_as_drafted', 'amended', 'opted_out', 'abandoned', 'superseded')",
+        name="ck_interpretation_events_choice",
+    ),
+    # Closed enum on interpretation_source. Adding a value requires the same
+    # four-step ceremony as choice. NO SILENT EXTENSION.
+    CheckConstraint(
+        "interpretation_source IN ('user_approved', 'auto_interpreted_opt_out', 'auto_interpreted_no_surfaces')",
+        name="ck_interpretation_events_source",
+    ),
+    # Closed enum on kind. Adding a value requires the same ceremony as the
+    # InterpretationKind contract enum: contract amendment, schema update,
+    # closed-enum tests, and writer-path audit.
+    CheckConstraint(
+        "kind IS NULL OR kind IN ('vague_term', 'invented_source', 'llm_prompt_template', 'pipeline_decision', 'llm_model_choice', "
+        "'source_data_contract')",
+        name="ck_interpretation_events_kind",
+    ),
+    # Auto-interpreted rows are born resolved by definition. They never
+    # represent a user acceptance/amendment or an abandoned pending surface.
+    CheckConstraint(
+        "(interpretation_source NOT IN ('auto_interpreted_opt_out', 'auto_interpreted_no_surfaces')) OR choice = 'opted_out'",
+        name="ck_interpretation_events_auto_source_choice",
+    ),
+    # Closed enum on surface_origin, mirroring InterpretationSurfaceOrigin.
+    # Same four-step ceremony as choice. NO SILENT EXTENSION.
+    CheckConstraint(
+        "surface_origin IS NULL OR surface_origin IN ('composer_llm', 'state_revert', 'yaml_import', 'e2e_seed')",
+        name="ck_interpretation_events_surface_origin",
+    ),
+    # The four LLM provenance columns describe one LLM call: all or none.
+    CheckConstraint(
+        "(model_identifier IS NULL) = (model_version IS NULL) AND "
+        "(model_version IS NULL) = (provider IS NULL) AND "
+        "(provider IS NULL) = (composer_skill_hash IS NULL)",
+        name="ck_interpretation_events_llm_provenance_all_or_none",
+    ),
+    # A surfaced row carries LLM provenance exactly when an LLM raised it.
+    # Rows with no surface are governed by their source-keyed shape below.
+    # Spelt as two arms rather than ``(origin = 'composer_llm') = (hash IS NOT
+    # NULL)``: PostgreSQL reflects a string comparison used as a boolean
+    # operand with ``::text`` casts the startup shape comparator cannot
+    # normalise, and every fresh PostgreSQL store then reads as stale.
+    CheckConstraint(
+        "surface_origin IS NULL OR "
+        "(surface_origin = 'composer_llm' AND composer_skill_hash IS NOT NULL) OR "
+        "(surface_origin != 'composer_llm' AND composer_skill_hash IS NULL)",
+        name="ck_interpretation_events_surface_origin_provenance",
+    ),
+    # F-1/F-12 (source-keyed opt-out shapes): session-level opt-out marker
+    # rows have no surface, no LLM context and no hash; surface-specific
+    # opt-out rows are born resolved with kind, surface fields, a surface
+    # origin, accepted_value, and a V2 arguments_hash.
+    CheckConstraint(
+        "(interpretation_source != 'auto_interpreted_opt_out') OR "
+        "((kind IS NULL AND composition_state_id IS NULL AND affected_node_id IS NULL AND "
+        "  tool_call_id IS NULL AND user_term IS NULL AND llm_draft IS NULL AND "
+        "  accepted_value IS NULL AND surface_origin IS NULL AND model_identifier IS NULL AND model_version IS NULL AND "
+        "  provider IS NULL AND composer_skill_hash IS NULL AND arguments_hash IS NULL AND "
+        "  hash_domain_version IS NULL) OR "
+        " (kind IS NOT NULL AND composition_state_id IS NOT NULL AND affected_node_id IS NOT NULL AND "
+        "  tool_call_id IS NOT NULL AND user_term IS NOT NULL AND llm_draft IS NOT NULL AND "
+        "  accepted_value IS NOT NULL AND surface_origin IS NOT NULL AND arguments_hash IS NOT NULL AND "
+        "  hash_domain_version = 'v2'))",
+        name="ck_interpretation_events_opt_out_shape",
+    ),
+    # user_approved rows must have kind, all surface fields and a surface
+    # origin populated; LLM provenance follows the origin (above).
+    CheckConstraint(
+        "(interpretation_source != 'user_approved') OR "
+        "(composition_state_id IS NOT NULL AND affected_node_id IS NOT NULL AND "
+        " tool_call_id IS NOT NULL AND user_term IS NOT NULL AND kind IS NOT NULL AND llm_draft IS NOT NULL AND "
+        " surface_origin IS NOT NULL)",
+        name="ck_interpretation_events_user_approved_required",
+    ),
+    # auto_interpreted_no_surfaces rows: the five surface fields
+    # (composition_state_id, affected_node_id, tool_call_id, user_term,
+    # llm_draft) and surface_origin must be NULL (no surfacing occurred); kind
+    # and the four LLM provenance fields must be NOT NULL (the LLM was
+    # consulted for the rate-cap fallback auto-interpretation). This is the
+    # middle shape between session opt-out marker rows and user_approved rows.
+    CheckConstraint(
+        "(interpretation_source != 'auto_interpreted_no_surfaces') OR "
+        "(composition_state_id IS NULL AND affected_node_id IS NULL AND "
+        " tool_call_id IS NULL AND user_term IS NULL AND kind IS NOT NULL AND llm_draft IS NULL AND "
+        " surface_origin IS NULL AND "
+        " model_identifier IS NOT NULL AND model_version IS NOT NULL AND "
+        " provider IS NOT NULL AND composer_skill_hash IS NOT NULL)",
+        name="ck_interpretation_events_no_surfaces_shape",
+    ),
+    # If choice is anything other than 'pending', resolved_at MUST be
+    # populated. For opted_out rows resolved_at records the opt-out
+    # timestamp.
+    CheckConstraint(
+        "(choice = 'pending') = (resolved_at IS NULL)",
+        name="ck_interpretation_events_resolved_at_status",
+    ),
+    # accepted_value is populated only for accepted_as_drafted/amended
+    # user-approved rows and surface-specific auto_interpreted_opt_out rows.
+    CheckConstraint(
+        "((choice IN ('accepted_as_drafted', 'amended')) OR "
+        " (interpretation_source = 'auto_interpreted_opt_out' AND kind IS NOT NULL)) "
+        "= (accepted_value IS NOT NULL)",
+        name="ck_interpretation_events_accepted_value_status",
+    ),
+    *_lower_sha256_constraints("composer_skill_hash", name="ck_interpretation_events_composer_skill_hash_format", nullable=True),
+    *_lower_sha256_constraints("arguments_hash", name="ck_interpretation_events_arguments_hash_format", nullable=True),
+    # The cross-store link to the Landscape ``calls`` row of the same name;
+    # both sides carry the identical shape rule.
+    *_lower_sha256_constraints(
+        "approved_prompt_artifact_hash",
+        name="ck_interpretation_events_approved_prompt_artifact_hash_format",
+        nullable=True,
+    ),
+)
+
+# Partial unique index: only one pending interpretation per
+# (session_id, tool_call_id). After resolution (choice != 'pending'), the
+# same tool_call_id is allowed to recur (which it won't in practice, but
+# the index does not need to over-constrain).
+# F-26: See web/sessions/schema.py:_validate_partial_index_dialect_symmetry
+# for the schema-validator gate that enforces both sqlite_where and
+# postgresql_where are set consistently.
+Index(
+    "uq_interpretation_events_pending_tool_call",
+    interpretation_events_table.c.session_id,
+    interpretation_events_table.c.tool_call_id,
+    unique=True,
+    sqlite_where=interpretation_events_table.c.choice == "pending",
+    postgresql_where=interpretation_events_table.c.choice == "pending",
+)
+
+Index(
+    "ix_interpretation_events_session_created",
+    interpretation_events_table.c.session_id,
+    interpretation_events_table.c.created_at,
+)
+
+# F-11: index on composition_state_id for the common lookup pattern
+# "all interpretation events for this composition state". Verify with
+# EXPLAIN QUERY PLAN; the test in
+# tests/unit/web/sessions/test_interpretation_events_table.py asserts
+# SEARCH USING INDEX.
+Index(
+    "ix_interpretation_events_composition_state",
+    interpretation_events_table.c.composition_state_id,
+)
+
+# ``composition_rejection_events_table`` (elspeth-3e28029d2f — durable
+# rejection reasons).
+#
+# One row per composer mutation-tool REJECTION within a compose turn. The
+# persisted ``tool`` chat row collapses every free-text diagnostic under the
+# closed redaction allowlist, so before this table the reason a payload was
+# refused reached the planner in full and the operator NOWHERE. Operator
+# ruling 2026-09-02: the reason lives in the SESSION as session data — it is
+# authoring-session history, not Landscape data (Landscape relates to the
+# pipeline and the data traversing it).
+#
+# ``planner_payload`` is the EXACT serialized tool response the planner saw —
+# text and reasoning, unredacted. That is deliberate and mirrors
+# ``chat_messages.raw_content`` (B2): the session store is the private
+# audit-attribution surface; redaction governs the public projections, not
+# this table. ``error_code`` / ``message`` are extracted columns for
+# queryability (first coded validation entry, else the failure class).
+#
+# ``composition_state_id`` is the state that was CURRENT when the tool was
+# refused — a rejection commits no state of its own, so the linkage names the
+# version the operator would inspect to reproduce. NULL when the session had
+# no committed state yet. Written only by ``persist_compose_turn`` inside the
+# same transaction as the turn's chat rows.
+composition_rejection_events_table = Table(
+    "composition_rejection_events",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    # Same-session ownership, mirroring interpretation_events: a rejection in
+    # session B cannot reference a composition state owned by session A.
+    Column("composition_state_id", String, nullable=True),
+    Column("tool_call_id", String, nullable=False),
+    Column("tool_name", String, nullable=False),
+    Column("error_code", String, nullable=True),
+    Column("message", Text, nullable=False),
+    Column("planner_payload", Text, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    ForeignKeyConstraint(
+        ["composition_state_id", "session_id"],
+        ["composition_states.id", "composition_states.session_id"],
+        name="fk_composition_rejection_events_state_session",
+    ),
+)
+Index(
+    "ix_composition_rejection_events_session_created",
+    composition_rejection_events_table.c.session_id,
+    composition_rejection_events_table.c.created_at,
+)
+
+# ``composer_completion_events_table`` (Phase 6A — completion gestures).
+#
+# One row per completion-gesture audit event. Two event types in v1:
+#
+#   * ``mark_ready_for_review`` — user signed a snapshot of a composition
+#     state for review-only sharing. ``payload_digest`` carries the
+#     content-address of the snapshot blob in the payload store;
+#     ``expires_at`` carries the lifetime stamped onto the signed token.
+#   * ``export_yaml`` — user exported the pipeline YAML for the named
+#     composition state. ``payload_digest`` and ``expires_at`` stay NULL.
+#
+# Mirrors the Phase 18 ``interpretation_events_table`` precedent of "one new
+# table per event family, closed-enum CHECK on event_type, nullable optional
+# columns for event-type-specific data" rather than splitting into two tables
+# or extending ``proposal_events_table`` / ``audit_access_log_table`` whose
+# closed CHECKs are governance boundaries (see plan 19a §"Audit-event
+# recording" for the adjudication).
+#
+# CLOSED LIST on ``event_type``. Adding a third value requires (a) amending
+# 19a (or its successor), (b) the same four-step ceremony as the other
+# closed enums in this file, and (c) a schema-change cohort with epoch bump.
+# NO SILENT EXTENSION.
+composer_completion_events_table = Table(
+    "composer_completion_events",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column(
+        "composition_state_id",
+        String,
+        ForeignKey("composition_states.id"),
+        nullable=True,
+    ),
+    Column("event_type", String, nullable=False),
+    Column("actor", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    # Content-address of the snapshot blob in the payload store.
+    # Populated for ``mark_ready_for_review`` events; NULL for ``export_yaml``.
+    Column("payload_digest", String, nullable=True),
+    # Token expiry stamped on the signed share token at issuance time.
+    # Populated for ``mark_ready_for_review`` events; NULL for ``export_yaml``.
+    Column("expires_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint(
+        "event_type IN ('mark_ready_for_review', 'export_yaml')",
+        name="ck_composer_completion_events_type",
+    ),
+    # Per-event-type partial NULL/NOT-NULL constraints.
+    #
+    # ``payload_digest`` and ``expires_at`` are nullable at the column
+    # level because ``export_yaml`` rows don't carry them — but they MUST
+    # be present for ``mark_ready_for_review`` rows (the audit row would
+    # otherwise be useless: no blob pointer, no token expiry). The
+    # ``(A) = (B IS NOT NULL)`` idiom asserts the iff relation:
+    #   1 = 1  (event=mark... and digest present): OK
+    #   0 = 0  (event=export and digest absent):   OK
+    #   1 = 0  (event=mark... and digest absent):  CHECK fails — bug
+    #   0 = 1  (event=export and digest present):  CHECK fails — bug
+    #
+    # ``composition_state_id`` is the audit-anchor for both event types
+    # (the state being marked / the state being exported). Both writers
+    # populate it; the constraint pins that contract at the DB level so
+    # a future writer cannot silently drop it.
+    CheckConstraint(
+        "(event_type = 'mark_ready_for_review') = (payload_digest IS NOT NULL)",
+        name="ck_composer_completion_events_digest_iff_mark_ready",
+    ),
+    CheckConstraint(
+        "(event_type = 'mark_ready_for_review') = (expires_at IS NOT NULL)",
+        name="ck_composer_completion_events_expires_iff_mark_ready",
+    ),
+    CheckConstraint(
+        "composition_state_id IS NOT NULL",
+        name="ck_composer_completion_events_composition_state_id_required",
+    ),
+    ForeignKeyConstraint(
+        ["composition_state_id", "session_id"],
+        ["composition_states.id", "composition_states.session_id"],
+        name="fk_composer_completion_events_state_session",
+    ),
+    *_prefixed_sha256_constraints("payload_digest", name="ck_composer_completion_events_payload_digest_format", nullable=True),
+)
+
+Index(
+    "ix_composer_completion_events_session_created",
+    composer_completion_events_table.c.session_id,
+    composer_completion_events_table.c.created_at,
+)
+
+# ``skill_markdown_history`` (F-5c) — content-addressed archive of every
+# distinct ``pipeline_composer.md`` version seen at runtime.
+#
+# One row per SHA-256 hash. The compose loop upserts
+# (INSERT OR IGNORE) on first use of a hash, capturing the exact text that
+# was in memory when the LLM was prompted. This makes every
+# ``composer_skill_hash`` on ``interpretation_events`` rows forensically
+# traceable: an auditor can retrieve the exact skill prompt from this
+# table.
+#
+# Storage cost is negligible — one row per distinct deploy of the skill
+# markdown. Content is TEXT (not BLOB) because the skill file is UTF-8
+# Markdown.
+skill_markdown_history_table = Table(
+    "skill_markdown_history",
+    metadata,
+    Column("hash", String, primary_key=True),  # SHA-256 hex, 64 chars
+    Column("filename", String, nullable=False),
+    Column("content", Text, nullable=False),
+    Column("first_seen_at", DateTime(timezone=True), nullable=False),
+    *_lower_sha256_constraints("hash", name="ck_skill_markdown_history_hash_format"),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresqlAuditDDL:
+    """One immutable PostgreSQL audit-trigger installation unit."""
+
+    table: Table
+    trigger_name: str
+    function_name: str
+    function_sql: str
+    trigger_sql: str
+
+
+# This tuple is the sole authority for the PostgreSQL audit DDL installed by
+# both fresh metadata bootstrap and the release-0.7.1 one-shot migration.  Use
+# CREATE FUNCTION rather than CREATE OR REPLACE: both supported callers prove
+# the functions absent before installation, so replacement would only hide an
+# unrecognized mixed state.
+POSTGRESQL_AUDIT_DDL_COHORT: tuple[PostgresqlAuditDDL, ...] = (
+    PostgresqlAuditDDL(
+        table=interpretation_events_table,
+        trigger_name="trg_interpretation_events_immutable_resolved",
+        function_name="elspeth_interpretation_events_immutable_resolved",
+        function_sql="""
+        CREATE FUNCTION elspeth_interpretation_events_immutable_resolved()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          IF OLD.resolved_at IS NOT NULL AND (
+            NEW.accepted_value IS DISTINCT FROM OLD.accepted_value OR
+            NEW.resolved_at IS DISTINCT FROM OLD.resolved_at OR
+            NEW.actor IS DISTINCT FROM OLD.actor OR
+            NEW.choice IS DISTINCT FROM OLD.choice
+          ) THEN
+            RAISE EXCEPTION 'interpretation_events: resolved rows are immutable'
+              USING ERRCODE = '23000';
+          END IF;
+          RETURN NEW;
+        END;
+        $$
+        """,
+        trigger_sql=(
+            "CREATE TRIGGER trg_interpretation_events_immutable_resolved "
+            "BEFORE UPDATE ON interpretation_events "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_interpretation_events_immutable_resolved()"
+        ),
+    ),
+    PostgresqlAuditDDL(
+        table=interpretation_events_table,
+        trigger_name="trg_interpretation_events_no_delete_resolved",
+        function_name="elspeth_interpretation_events_no_delete_resolved",
+        function_sql="""
+        CREATE FUNCTION elspeth_interpretation_events_no_delete_resolved()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          IF OLD.resolved_at IS NOT NULL
+             AND EXISTS (SELECT 1 FROM sessions WHERE sessions.id = OLD.session_id) THEN
+            RAISE EXCEPTION 'interpretation_events: resolved rows are append-only'
+              USING ERRCODE = '23000';
+          END IF;
+          RETURN OLD;
+        END;
+        $$
+        """,
+        trigger_sql=(
+            "CREATE TRIGGER trg_interpretation_events_no_delete_resolved "
+            "BEFORE DELETE ON interpretation_events "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_interpretation_events_no_delete_resolved()"
+        ),
+    ),
+    PostgresqlAuditDDL(
+        table=composer_completion_events_table,
+        trigger_name="trg_composer_completion_events_no_update",
+        function_name="elspeth_composer_completion_events_no_update",
+        function_sql="""
+        CREATE FUNCTION elspeth_composer_completion_events_no_update()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          RAISE EXCEPTION 'composer_completion_events is append-only; UPDATE is forbidden'
+            USING ERRCODE = '23000';
+        END;
+        $$
+        """,
+        trigger_sql=(
+            "CREATE TRIGGER trg_composer_completion_events_no_update "
+            "BEFORE UPDATE ON composer_completion_events "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_composer_completion_events_no_update()"
+        ),
+    ),
+    PostgresqlAuditDDL(
+        table=composer_completion_events_table,
+        trigger_name="trg_composer_completion_events_no_delete",
+        function_name="elspeth_composer_completion_events_no_delete",
+        function_sql="""
+        CREATE FUNCTION elspeth_composer_completion_events_no_delete()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          RAISE EXCEPTION 'composer_completion_events is append-only; DELETE is forbidden'
+            USING ERRCODE = '23000';
+        END;
+        $$
+        """,
+        trigger_sql=(
+            "CREATE TRIGGER trg_composer_completion_events_no_delete "
+            "BEFORE DELETE ON composer_completion_events "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_composer_completion_events_no_delete()"
+        ),
+    ),
+    PostgresqlAuditDDL(
+        table=chat_messages_table,
+        trigger_name="trg_chat_messages_immutable_content",
+        function_name="elspeth_chat_messages_immutable_content",
+        function_sql="""
+        CREATE FUNCTION elspeth_chat_messages_immutable_content()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          RAISE EXCEPTION 'chat_messages.content is append-only'
+            USING ERRCODE = '23000';
+        END;
+        $$
+        """,
+        trigger_sql=(
+            "CREATE TRIGGER trg_chat_messages_immutable_content "
+            "BEFORE UPDATE OF content ON chat_messages "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_chat_messages_immutable_content()"
+        ),
+    ),
+    PostgresqlAuditDDL(
+        table=chat_messages_table,
+        trigger_name="trg_chat_messages_no_delete",
+        function_name="elspeth_chat_messages_no_delete",
+        function_sql="""
+        CREATE FUNCTION elspeth_chat_messages_no_delete()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id) THEN
+            RAISE EXCEPTION 'chat_messages rows are append-only'
+              USING ERRCODE = '23000';
+          END IF;
+          RETURN OLD;
+        END;
+        $$
+        """,
+        trigger_sql=(
+            "CREATE TRIGGER trg_chat_messages_no_delete "
+            "BEFORE DELETE ON chat_messages "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_chat_messages_no_delete()"
+        ),
+    ),
+    PostgresqlAuditDDL(
+        table=message_ingress_receipts_table,
+        trigger_name="trg_message_ingress_receipts_no_update",
+        function_name="elspeth_message_ingress_receipts_no_update",
+        function_sql="""
+        CREATE FUNCTION elspeth_message_ingress_receipts_no_update()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'message_ingress_receipts is append-only; UPDATE is forbidden'
+            USING ERRCODE = '23000';
+        END;
+        $$
+        """,
+        trigger_sql=(
+            "CREATE TRIGGER trg_message_ingress_receipts_no_update "
+            "BEFORE UPDATE ON message_ingress_receipts "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_message_ingress_receipts_no_update()"
+        ),
+    ),
+    PostgresqlAuditDDL(
+        table=message_ingress_receipts_table,
+        trigger_name="trg_message_ingress_receipts_no_delete",
+        function_name="elspeth_message_ingress_receipts_no_delete",
+        function_sql="""
+        CREATE FUNCTION elspeth_message_ingress_receipts_no_delete()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id) THEN
+            RAISE EXCEPTION 'message_ingress_receipts is append-only; DELETE is forbidden'
+              USING ERRCODE = '23000';
+          END IF;
+          RETURN OLD;
+        END;
+        $$
+        """,
+        trigger_sql=(
+            "CREATE TRIGGER trg_message_ingress_receipts_no_delete "
+            "BEFORE DELETE ON message_ingress_receipts "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_message_ingress_receipts_no_delete()"
+        ),
+    ),
+    PostgresqlAuditDDL(
+        table=session_operation_receipts_table,
+        trigger_name="trg_session_operation_receipts_terminal_immutable",
+        function_name="elspeth_session_operation_receipts_terminal_immutable",
+        function_sql="""
+        CREATE FUNCTION elspeth_session_operation_receipts_terminal_immutable()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF OLD.status IN ('completed', 'failed') THEN
+            RAISE EXCEPTION 'session_operation_receipts terminal rows are immutable'
+              USING ERRCODE = '23000';
+          END IF;
+          RETURN NEW;
+        END;
+        $$
+        """,
+        trigger_sql=(
+            "CREATE TRIGGER trg_session_operation_receipts_terminal_immutable "
+            "BEFORE UPDATE ON session_operation_receipts "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_session_operation_receipts_terminal_immutable()"
+        ),
+    ),
+    PostgresqlAuditDDL(
+        table=session_operation_receipt_events_table,
+        trigger_name="trg_session_operation_receipt_events_no_update",
+        function_name="elspeth_session_operation_receipt_events_no_update",
+        function_sql="""
+        CREATE FUNCTION elspeth_session_operation_receipt_events_no_update()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'session_operation_receipt_events is append-only; UPDATE is forbidden'
+            USING ERRCODE = '23000';
+        END;
+        $$
+        """,
+        trigger_sql=(
+            "CREATE TRIGGER trg_session_operation_receipt_events_no_update "
+            "BEFORE UPDATE ON session_operation_receipt_events "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_session_operation_receipt_events_no_update()"
+        ),
+    ),
+    PostgresqlAuditDDL(
+        table=session_operation_receipt_events_table,
+        trigger_name="trg_session_operation_receipt_events_no_delete",
+        function_name="elspeth_session_operation_receipt_events_no_delete",
+        function_sql="""
+        CREATE FUNCTION elspeth_session_operation_receipt_events_no_delete()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id) THEN
+            RAISE EXCEPTION 'session_operation_receipt_events is append-only; DELETE is forbidden'
+              USING ERRCODE = '23000';
+          END IF;
+          RETURN OLD;
+        END;
+        $$
+        """,
+        trigger_sql=(
+            "CREATE TRIGGER trg_session_operation_receipt_events_no_delete "
+            "BEFORE DELETE ON session_operation_receipt_events "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_session_operation_receipt_events_no_delete()"
+        ),
+    ),
+)
+
+# F-4 / F-23 — append-only triggers.
+#
+# ``trg_interpretation_events_immutable_resolved`` protects the audit
+# integrity of resolved rows: once ``resolved_at`` is non-NULL, the four
+# settled fields (``accepted_value``, ``resolved_at``, ``actor``,
+# ``choice``) cannot change. Updates to non-settled columns on resolved
+# rows are still permitted (e.g. backfilling provenance), but flipping the
+# decision is not.
+#
+# ``trg_interpretation_events_no_delete_resolved`` extends that resolved-row
+# protection to direct DELETE while deliberately leaving unresolved PENDING
+# rows deletable for orphan recovery. Whole-session archival remains allowed:
+# SQLite foreign-key cascades execute the child BEFORE DELETE trigger after
+# the parent ``sessions`` row is gone from the trigger's view, so the trigger
+# uses parent-row existence to distinguish direct child deletion from the
+# schema-owned archive cascade.
+#
+# ``trg_chat_messages_immutable_content`` enforces append-only semantics
+# for ``chat_messages.content`` — once a message is written, its body
+# cannot be edited. ``chat_messages`` is an audit anchor via
+# ``blobs.created_from_message_id``; without this trigger, post-hoc
+# editing would invalidate the lineage audit.
+#
+# ``trg_chat_messages_no_delete`` protects the same anchor against row
+# deletion. A missing chat row makes blob lineage unverifiable even if the
+# blob FK never existed, so the trigger is unconditional.
+#
+# ``IF NOT EXISTS`` makes the SQLite DDL idempotent across repeated
+# ``metadata.create_all`` calls. ``event.listen`` is **table-scoped**, not
+# metadata-scoped, so the trigger DDL fires only when this specific table
+# is created (not on every metadata.create_all() call for tables that
+# already exist). Each invariant has dialect-specific DDL below. SQLite uses
+# ``RAISE(ABORT)``; PostgreSQL uses PL/pgSQL functions that raise SQLSTATE
+# 23000 so SQLAlchemy classifies the refusal as an integrity error. Trigger
+# names are identical across dialects because sessions.schema validates the
+# live catalogue by those stable names.
+event.listen(
+    interpretation_events_table,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE TRIGGER IF NOT EXISTS trg_interpretation_events_immutable_resolved "
+        "BEFORE UPDATE ON interpretation_events "
+        "FOR EACH ROW BEGIN "
+        "  SELECT CASE "
+        "    WHEN OLD.resolved_at IS NOT NULL AND ("
+        "      NEW.accepted_value IS NOT OLD.accepted_value OR "
+        "      NEW.resolved_at IS NOT OLD.resolved_at OR "
+        "      NEW.actor IS NOT OLD.actor OR "
+        "      NEW.choice IS NOT OLD.choice"
+        "    ) THEN RAISE(ABORT, 'interpretation_events: resolved rows are immutable') "
+        "  END; "
+        "END;"
+    ).execute_if(dialect="sqlite"),
+)
+
+event.listen(
+    interpretation_events_table,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE TRIGGER IF NOT EXISTS trg_interpretation_events_no_delete_resolved "
+        "BEFORE DELETE ON interpretation_events "
+        "FOR EACH ROW "
+        "WHEN OLD.resolved_at IS NOT NULL "
+        "AND EXISTS (SELECT 1 FROM sessions WHERE sessions.id = OLD.session_id) "
+        "BEGIN "
+        "  SELECT RAISE(ABORT, 'interpretation_events: resolved rows are append-only'); "
+        "END;"
+    ).execute_if(dialect="sqlite"),
+)
+
+# Phase 6A — completion-event triggers.
+#
+# Unlike ``interpretation_events`` (which permits DELETE on PENDING rows for
+# orphan recovery) completion events have no recovery path. Both triggers
+# are **unconditional ABORT**: every recorded mark-ready-for-review or YAML
+# export is a permanent audit fact.
+#
+# Both triggers ship from day 1 — completion events have no recovery
+# path, unlike the ``interpretation_events`` PENDING-row carve-out where a
+# follow-up landed the DELETE trigger after the original cohort.
+event.listen(
+    composer_completion_events_table,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE TRIGGER IF NOT EXISTS trg_composer_completion_events_no_update "
+        "BEFORE UPDATE ON composer_completion_events "
+        "BEGIN "
+        "  SELECT RAISE(ABORT, 'composer_completion_events is append-only; UPDATE is forbidden'); "
+        "END;"
+    ).execute_if(dialect="sqlite"),
+)
+
+event.listen(
+    composer_completion_events_table,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE TRIGGER IF NOT EXISTS trg_composer_completion_events_no_delete "
+        "BEFORE DELETE ON composer_completion_events "
+        "BEGIN "
+        "  SELECT RAISE(ABORT, 'composer_completion_events is append-only; DELETE is forbidden'); "
+        "END;"
+    ).execute_if(dialect="sqlite"),
+)
+
+event.listen(
+    chat_messages_table,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE TRIGGER IF NOT EXISTS trg_chat_messages_immutable_content "
+        "BEFORE UPDATE OF content ON chat_messages "
+        "BEGIN "
+        "  SELECT RAISE(ABORT, 'chat_messages.content is append-only'); "
+        "END;"
+    ).execute_if(dialect="sqlite"),
+)
+
+event.listen(
+    chat_messages_table,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE TRIGGER IF NOT EXISTS trg_chat_messages_no_delete "
+        "BEFORE DELETE ON chat_messages "
+        "FOR EACH ROW "
+        "WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id) "
+        "BEGIN "
+        "  SELECT RAISE(ABORT, 'chat_messages rows are append-only'); "
+        "END;"
+    ).execute_if(dialect="sqlite"),
+)
+
+event.listen(
+    message_ingress_receipts_table,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE TRIGGER IF NOT EXISTS trg_message_ingress_receipts_no_update "
+        "BEFORE UPDATE ON message_ingress_receipts "
+        "BEGIN "
+        "  SELECT RAISE(ABORT, 'message_ingress_receipts is append-only; UPDATE is forbidden'); "
+        "END;"
+    ).execute_if(dialect="sqlite"),
+)
+
+event.listen(
+    message_ingress_receipts_table,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE TRIGGER IF NOT EXISTS trg_message_ingress_receipts_no_delete "
+        "BEFORE DELETE ON message_ingress_receipts "
+        "FOR EACH ROW "
+        "WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id) "
+        "BEGIN "
+        "  SELECT RAISE(ABORT, 'message_ingress_receipts is append-only; DELETE is forbidden'); "
+        "END;"
+    ).execute_if(dialect="sqlite"),
+)
+
+event.listen(
+    session_operation_receipts_table,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE TRIGGER IF NOT EXISTS trg_session_operation_receipts_terminal_immutable "
+        "BEFORE UPDATE ON session_operation_receipts "
+        "FOR EACH ROW WHEN OLD.status IN ('completed', 'failed') "
+        "BEGIN SELECT RAISE(ABORT, 'session_operation_receipts terminal rows are immutable'); END;"
+    ).execute_if(dialect="sqlite"),
+)
+
+event.listen(
+    session_operation_receipt_events_table,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE TRIGGER IF NOT EXISTS trg_session_operation_receipt_events_no_update "
+        "BEFORE UPDATE ON session_operation_receipt_events "
+        "BEGIN SELECT RAISE(ABORT, 'session_operation_receipt_events is append-only; UPDATE is forbidden'); END;"
+    ).execute_if(dialect="sqlite"),
+)
+
+event.listen(
+    session_operation_receipt_events_table,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE TRIGGER IF NOT EXISTS trg_session_operation_receipt_events_no_delete "
+        "BEFORE DELETE ON session_operation_receipt_events "
+        "FOR EACH ROW WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id) "
+        "BEGIN SELECT RAISE(ABORT, 'session_operation_receipt_events is append-only; DELETE is forbidden'); END;"
+    ).execute_if(dialect="sqlite"),
+)
+
+for postgresql_audit_ddl in POSTGRESQL_AUDIT_DDL_COHORT:
+    event.listen(
+        postgresql_audit_ddl.table,
+        "after_create",
+        DDL(postgresql_audit_ddl.function_sql).execute_if(dialect="postgresql"),  # type: ignore[no-untyped-call]
+    )
+    event.listen(
+        postgresql_audit_ddl.table,
+        "after_create",
+        DDL(postgresql_audit_ddl.trigger_sql).execute_if(dialect="postgresql"),  # type: ignore[no-untyped-call]
+    )
+
+
+def _runs_ownership_all_or_none_check(*, dialect: Literal["sqlite", "postgresql"]) -> str:
+    return (
+        "((owner_instance_id IS NULL AND owner_epoch IS NULL AND owner_lease_expires_at IS NULL) OR "
+        "(owner_instance_id IS NOT NULL AND "
+        f"{_sql_non_blank_text('owner_instance_id', dialect=dialect)} AND "
+        "owner_epoch IS NOT NULL AND owner_epoch > 0 AND owner_lease_expires_at IS NOT NULL))"
+    )
+
+
+runs_table = Table(
+    "runs",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    # Composite FK forces same-session ownership: a run in session B
+    # cannot reference a composition state owned by session A. state_id
+    # is NOT NULL so no partial-null concerns.
+    Column("state_id", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("finished_at", DateTime(timezone=True), nullable=True),
+    Column("rows_processed", Integer, nullable=False, default=0),
+    Column("rows_succeeded", Integer, nullable=False, default=0),
+    Column("rows_failed", Integer, nullable=False, default=0),
+    Column("rows_routed_success", Integer, nullable=False, default=0),
+    Column("rows_routed_failure", Integer, nullable=False, default=0),
+    Column("rows_quarantined", Integer, nullable=False, default=0),
+    Column("error", Text, nullable=True),
+    Column("landscape_run_id", String, nullable=True),
+    Column("pipeline_yaml", Text, nullable=True),
+    # Epoch-37 durable run ownership and cross-database saga projection.
+    # Runtime acquisition is wired in later tasks; until then the ownership
+    # tuple is either wholly absent or wholly populated.
+    Column("owner_instance_id", String, nullable=True),
+    Column("owner_epoch", Integer, nullable=True),
+    Column("owner_lease_expires_at", DateTime(timezone=True), nullable=True, index=True),
+    Column("cancel_requested_at", DateTime(timezone=True), nullable=True),
+    Column("cancellation_source", String, nullable=True),
+    Column("saga_state", String, nullable=False, server_default="draft", index=True),
+    Column("recovery_required_reason", String, nullable=True),
+    ForeignKeyConstraint(
+        ["state_id", "session_id"],
+        ["composition_states.id", "composition_states.session_id"],
+        name="fk_runs_state_session",
+    ),
+    UniqueConstraint("id", "session_id", name="uq_runs_id_session"),
+    # The constraint mirrors SessionRunStatus in web/sessions/protocol.py;
+    # adding a value to the Literal without updating this CheckConstraint
+    # would let the dataclass validator pass while the DB rejects the row,
+    # so widen both in lockstep.
+    CheckConstraint(
+        "status IN ('pending', 'running', 'completed', 'completed_with_failures', 'failed', 'empty', 'cancelled')",
+        name="ck_runs_status",
+    ),
+    *_non_blank_text_constraints("id", name="ck_runs_id_nonblank"),
+    *_non_blank_text_constraints("session_id", name="ck_runs_session_id_nonblank"),
+    CheckConstraint(
+        _runs_ownership_all_or_none_check(dialect="sqlite"),
+        name="ck_runs_ownership_all_or_none",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _runs_ownership_all_or_none_check(dialect="postgresql"),
+        name="ck_runs_ownership_all_or_none",
+    ).ddl_if(dialect="postgresql"),
+    CheckConstraint(
+        "cancellation_source IS NULL OR cancellation_source IN ('user', 'operator', 'shutdown', 'reconciler')",
+        name="ck_runs_cancellation_source",
+    ),
+    CheckConstraint(
+        "saga_state IN ('draft', 'start_intent', 'start_permit_issued', 'baseline_checkpointed', "
+        "'running', 'recovery_required', 'cancel_pending', 'terminal', 'terminal_cancelled', 'admission_refusal_pending')",
+        name="ck_runs_saga_state",
+    ),
+    CheckConstraint(
+        "recovery_required_reason IS NULL OR recovery_required_reason IN "
+        "('implementation_drift', 'generation_drift', 'compatibility_mismatch', 'missing_baseline', "
+        "'incomplete_source', 'secret_version_unavailable', 'unsafe_effect', 'authority_lost', 'unknown')",
+        name="ck_runs_recovery_required_reason",
+    ),
+)
+
+# Partial unique index: at most one active (pending/running) run per session.
+# Enforces the one-active-run invariant at the database level, eliminating
+# the TOCTOU race in the service-level check-and-insert.
+#
+# BOTH ``sqlite_where=`` AND ``postgresql_where=`` must be set to the same
+# predicate. Without ``postgresql_where=`` SQLAlchemy emits a non-partial
+# unique index on ``session_id`` alone on Postgres, which silently
+# over-restricts the invariant from "at most one ACTIVE run per session"
+# to "at most one run per session ever" — a real audit-integrity defect
+# (the second run in a session would fail to insert with a unique-violation
+# unrelated to its actual status). Mirrors the project pattern at
+# ``uq_chat_messages_tool_call_id`` above where both keys are set.
+#
+# The shared schema-shape collector validates the live index's name, ordered
+# columns, uniqueness, and dialect-specific WHERE predicate.  The session
+# validator additionally enforces model-side sqlite/postgresql predicate
+# symmetry before inspecting either runtime dialect.
+Index(
+    "uq_runs_one_active_per_session",
+    runs_table.c.session_id,
+    unique=True,
+    sqlite_where=runs_table.c.status.in_(["pending", "running"]),
+    postgresql_where=runs_table.c.status.in_(["pending", "running"]),
+)
+
+# Sessions-side start-versus-cancel linearization. Pending and
+# cancelled-before-permit rows contain no permit authority; start_permitted
+# rows retain the exact immutable non-secret fence identities and subject.
+_RUN_START_PERMIT_SUBJECT_IS_NULL = (
+    "permit_id IS NULL AND permit_epoch IS NULL AND session_operation_id IS NULL AND "
+    "session_operation_epoch IS NULL AND run_owner_instance_id IS NULL AND run_owner_epoch IS NULL AND "
+    "envelope_hash IS NULL AND topology_hash IS NULL AND source_manifest_hash IS NULL AND "
+    "checkpoint_subject_hash IS NULL AND deployment_generation IS NULL AND session_epoch IS NULL AND "
+    "landscape_epoch IS NULL AND coordination_protocol IS NULL AND permit_subject_hash IS NULL AND issued_at IS NULL"
+)
+
+
+def _run_start_permits_state_fields_check(*, dialect: Literal["sqlite", "postgresql"]) -> str:
+    return (
+        f"((start_state = 'pending' AND {_RUN_START_PERMIT_SUBJECT_IS_NULL} AND cancelled_at IS NULL AND admission_decision IS NULL AND admission_decision_hash IS NULL AND decided_at IS NULL) OR "
+        f"(start_state = 'cancelled_before_permit' AND {_RUN_START_PERMIT_SUBJECT_IS_NULL} AND cancelled_at IS NOT NULL AND admission_decision IS NULL AND admission_decision_hash IS NULL AND decided_at IS NULL) OR "
+        f"(start_state = 'refused' AND {_RUN_START_PERMIT_SUBJECT_IS_NULL} AND cancelled_at IS NULL AND admission_decision IS NOT NULL AND admission_decision_hash IS NOT NULL AND decided_at IS NOT NULL) OR "
+        "(start_state = 'start_permitted' AND permit_id IS NOT NULL AND "
+        f"{_sql_non_blank_text('permit_id', dialect=dialect)} AND "
+        "permit_epoch IS NOT NULL AND permit_epoch > 0 AND session_operation_id IS NOT NULL AND "
+        f"{_sql_non_blank_text('session_operation_id', dialect=dialect)} AND "
+        "session_operation_epoch IS NOT NULL AND session_operation_epoch > 0 AND run_owner_instance_id IS NOT NULL AND "
+        f"{_sql_non_blank_text('run_owner_instance_id', dialect=dialect)} AND "
+        "run_owner_epoch IS NOT NULL AND run_owner_epoch > 0 AND envelope_hash IS NOT NULL AND "
+        f"{_lower_sha256_check('envelope_hash', dialect=dialect)} AND topology_hash IS NOT NULL AND "
+        f"{_lower_sha256_check('topology_hash', dialect=dialect)} AND source_manifest_hash IS NOT NULL AND "
+        f"{_lower_sha256_check('source_manifest_hash', dialect=dialect)} AND checkpoint_subject_hash IS NOT NULL AND "
+        f"{_lower_sha256_check('checkpoint_subject_hash', dialect=dialect)} AND deployment_generation IS NOT NULL AND "
+        f"{_sql_non_blank_text('deployment_generation', dialect=dialect)} AND "
+        "session_epoch IS NOT NULL AND session_epoch > 0 AND landscape_epoch IS NOT NULL AND landscape_epoch > 0 AND "
+        "coordination_protocol IS NOT NULL AND coordination_protocol > 0 AND permit_subject_hash IS NOT NULL AND "
+        f"{_lower_sha256_check('permit_subject_hash', dialect=dialect)} AND "
+        "issued_at IS NOT NULL AND cancelled_at IS NULL AND admission_decision IS NOT NULL AND admission_decision_hash IS NOT NULL AND decided_at IS NOT NULL))"
+    )
+
+
+run_start_permits_table = Table(
+    "run_start_permits",
+    metadata,
+    Column("run_id", String, ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True),
+    Column("start_state", String, nullable=False, server_default="pending"),
+    Column("permit_id", String, nullable=True, unique=True),
+    Column("permit_epoch", Integer, nullable=True),
+    Column("session_operation_id", String, nullable=True),
+    Column("session_operation_epoch", Integer, nullable=True),
+    Column("run_owner_instance_id", String, nullable=True),
+    Column("run_owner_epoch", Integer, nullable=True),
+    Column("envelope_hash", String, nullable=True),
+    Column("topology_hash", String, nullable=True),
+    Column("source_manifest_hash", String, nullable=True),
+    Column("checkpoint_subject_hash", String, nullable=True),
+    Column("deployment_generation", String, nullable=True),
+    Column("session_epoch", Integer, nullable=True),
+    Column("landscape_epoch", Integer, nullable=True),
+    Column("coordination_protocol", Integer, nullable=True),
+    Column("permit_subject_hash", String, nullable=True),
+    Column("issued_at", DateTime(timezone=True), nullable=True),
+    Column("cancelled_at", DateTime(timezone=True), nullable=True),
+    Column("admission_decision", JSON(none_as_null=True), nullable=True),
+    Column("admission_decision_hash", String, nullable=True),
+    Column("decided_at", DateTime(timezone=True), nullable=True),
+    Column("execution_refusal", JSON(none_as_null=True), nullable=True),
+    Column("retention_expires_at", DateTime(timezone=True), nullable=True, index=True),
+    CheckConstraint(
+        "start_state IN ('pending', 'start_permitted', 'cancelled_before_permit', 'refused')", name="ck_run_start_permits_state"
+    ),
+    CheckConstraint("execution_refusal IS NULL OR start_state = 'start_permitted'", name="ck_run_start_permits_recovery_refusal"),
+    CheckConstraint(
+        f"admission_decision_hash IS NULL OR ({_lower_sha256_check('admission_decision_hash', dialect='sqlite')})",
+        name="ck_run_start_permits_admission_hash",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        f"admission_decision_hash IS NULL OR ({_lower_sha256_check('admission_decision_hash', dialect='postgresql')})",
+        name="ck_run_start_permits_admission_hash",
+    ).ddl_if(dialect="postgresql"),
+    *_non_blank_text_constraints("run_id", name="ck_run_start_permits_run_id_nonblank"),
+    CheckConstraint(
+        _run_start_permits_state_fields_check(dialect="sqlite"),
+        name="ck_run_start_permits_state_fields",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _run_start_permits_state_fields_check(dialect="postgresql"),
+        name="ck_run_start_permits_state_fields",
+    ).ddl_if(dialect="postgresql"),
+)
+
+# Immutable, secret-reference-only envelope substrate. Task 8 owns the public
+# serialization and resolver carrier; epoch 44 reserves and constrains its
+# durable shape now so deployment compatibility cannot drift underneath it.
+_RUN_EXECUTION_IDENTITY_COLUMNS = (
+    "canonical_input_digest",
+    "topology_digest",
+    "source_manifest_digest",
+    "application_fingerprint",
+    "plugin_registry_fingerprint",
+    "configuration_fingerprint",
+    "graph_fingerprint",
+    "runtime_fingerprint",
+    "implementation_fingerprint",
+)
+
+
+def _run_execution_inputs_identity_check(*, dialect: Literal["sqlite", "postgresql"]) -> str:
+    return " AND ".join(f"({_lower_sha256_check(column_name, dialect=dialect)})" for column_name in _RUN_EXECUTION_IDENTITY_COLUMNS)
+
+
+run_execution_inputs_table = Table(
+    "run_execution_inputs",
+    metadata,
+    Column("run_id", String, ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True),
+    Column("schema_version", Integer, nullable=False),
+    Column("envelope", JSON, nullable=False),
+    Column("canonical_input_digest", String, nullable=False),
+    Column("topology_digest", String, nullable=False),
+    Column("source_manifest_digest", String, nullable=False),
+    Column("application_fingerprint", String, nullable=False),
+    Column("plugin_registry_fingerprint", String, nullable=False),
+    Column("configuration_fingerprint", String, nullable=False),
+    Column("graph_fingerprint", String, nullable=False),
+    Column("runtime_fingerprint", String, nullable=False),
+    Column("implementation_fingerprint", String, nullable=False),
+    Column("deployment_generation", String, nullable=False),
+    Column("session_epoch", Integer, nullable=False),
+    Column("landscape_epoch", Integer, nullable=False),
+    Column("coordination_protocol", Integer, nullable=False),
+    Column("automatic_recovery_eligible", Boolean, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    *_non_blank_text_constraints("run_id", name="ck_run_execution_inputs_run_id_nonblank"),
+    *_non_blank_text_constraints(
+        "deployment_generation",
+        name="ck_run_execution_inputs_deployment_generation_nonblank",
+    ),
+    CheckConstraint(
+        _run_execution_inputs_identity_check(dialect="sqlite"),
+        name="ck_run_execution_inputs_sha256_identities",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _run_execution_inputs_identity_check(dialect="postgresql"),
+        name="ck_run_execution_inputs_sha256_identities",
+    ).ddl_if(dialect="postgresql"),
+    CheckConstraint("schema_version > 0", name="ck_run_execution_inputs_positive_schema_version"),
+    CheckConstraint(
+        "session_epoch > 0 AND landscape_epoch > 0 AND coordination_protocol > 0",
+        name="ck_run_execution_inputs_positive_compatibility",
+    ),
+)
+
+auth_session_families_table = Table(
+    "auth_session_families",
+    metadata,
+    Column("family_id", String, primary_key=True),
+    Column("identity_id", String, ForeignKey("identities.identity_id", ondelete="CASCADE"), nullable=False, index=True),
+    Column("provider", String, nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    Column("revoked_at", DateTime(timezone=True), nullable=True),
+    *_non_blank_text_constraints("family_id", name="ck_auth_session_families_id_nonblank"),
+    CheckConstraint(_AUTH_PROVIDER_TYPE_CHECK.replace("auth_provider_type", "provider"), name="ck_auth_session_families_provider"),
+)
+
+websocket_tickets_table = Table(
+    "websocket_tickets",
+    metadata,
+    Column("ticket_digest", String, primary_key=True),
+    Column("run_id", String, ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, index=True),
+    Column("user_id", String, nullable=False),
+    Column("auth_provider_type", String, nullable=False),
+    Column("session_family_id", String, nullable=False),
+    Column("credential_generation", Integer, nullable=False),
+    Column("token_expires_at", Integer, nullable=False),
+    Column("issued_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    Column("consumed_at", DateTime(timezone=True), nullable=True),
+    *_lower_sha256_constraints("ticket_digest", name="ck_websocket_tickets_digest_sha256"),
+    *_non_blank_text_constraints("run_id", name="ck_websocket_tickets_run_id_nonblank"),
+    *_non_blank_text_constraints("user_id", name="ck_websocket_tickets_user_id_nonblank"),
+    CheckConstraint(_AUTH_PROVIDER_TYPE_CHECK, name="ck_websocket_tickets_auth_provider_type"),
+    CheckConstraint("credential_generation >= 0 AND token_expires_at > 0", name="ck_websocket_tickets_token_binding"),
+    *_non_blank_text_constraints("session_family_id", name="ck_websocket_tickets_family_nonblank"),
+)
+
+composer_inflight_requests_table = Table(
+    "composer_inflight_requests",
+    metadata,
+    Column("request_token", String(36), primary_key=True),
+    Column("session_id", String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False),
+    Column("identity_id", String(36), ForeignKey("identities.identity_id", ondelete="CASCADE"), nullable=False),
+    Column("owner_instance_id", String(128), nullable=False),
+    Column("begun_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    *_non_blank_text_constraints("request_token", name="ck_composer_inflight_token_nonblank"),
+    *_non_blank_text_constraints("owner_instance_id", name="ck_composer_inflight_owner_nonblank"),
+    CheckConstraint("expires_at > begun_at", name="ck_composer_inflight_time_order"),
+    Index("ix_composer_inflight_session_expiry", "session_id", "expires_at"),
+)
+
+composer_progress_snapshots_table = Table(
+    "composer_progress_snapshots",
+    metadata,
+    Column("session_id", String(36), ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True),
+    Column("identity_id", String(36), ForeignKey("identities.identity_id", ondelete="CASCADE"), nullable=False),
+    Column("generation", String(36), nullable=False),
+    Column("request_token", String(36), nullable=True),
+    Column("request_id", String(256), nullable=True),
+    Column("snapshot_json", Text, nullable=True),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    *_non_blank_text_constraints("generation", name="ck_composer_progress_generation_nonblank"),
+    CheckConstraint("expires_at > updated_at", name="ck_composer_progress_time_order"),
+    CheckConstraint("snapshot_json IS NULL OR length(snapshot_json) <= 16384", name="ck_composer_progress_bounded"),
+)
+
+rate_limit_buckets_table = Table(
+    "rate_limit_buckets",
+    metadata,
+    Column("subject_digest", String, primary_key=True),
+    Column("window_seconds", Integer, nullable=False),
+    Column("request_limit", BigInteger, nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    *_lower_sha256_constraints("subject_digest", name="ck_rate_limit_buckets_digest_sha256"),
+    CheckConstraint("window_seconds > 0", name="ck_rate_limit_buckets_positive_window"),
+    CheckConstraint("request_limit > 0", name="ck_rate_limit_buckets_positive_limit"),
+)
+
+rate_limit_events_table = Table(
+    "rate_limit_events",
+    metadata,
+    Column("event_id", String, primary_key=True),
+    Column(
+        "subject_digest",
+        String,
+        ForeignKey("rate_limit_buckets.subject_digest", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("occurred_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    *_non_blank_text_constraints("event_id", name="ck_rate_limit_events_event_id_nonblank"),
+    *_lower_sha256_constraints("subject_digest", name="ck_rate_limit_events_digest_sha256"),
+)
+Index("ix_rate_limit_events_subject_occurred", rate_limit_events_table.c.subject_digest, rate_limit_events_table.c.occurred_at)
+
+sessions_cleanup_claims_table = Table(
+    "sessions_cleanup_claims",
+    metadata,
+    Column("claim_name", String, primary_key=True),
+    Column("claim_token", String, nullable=False),
+    Column("owner_instance_id", String, nullable=False),
+    Column("claim_epoch", Integer, nullable=False),
+    Column("lease_expires_at", DateTime(timezone=True), nullable=False, index=True),
+    Column("renewal_count", Integer, nullable=False),
+    Column("batch_count", Integer, nullable=False),
+    Column("max_renewals", Integer, nullable=False),
+    Column("max_batches", Integer, nullable=False),
+    Column("acquired_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    *_non_blank_text_constraints("claim_name", name="ck_sessions_cleanup_claims_name_nonblank"),
+    *_non_blank_text_constraints("claim_token", name="ck_sessions_cleanup_claims_token_nonblank"),
+    *_non_blank_text_constraints("owner_instance_id", name="ck_sessions_cleanup_claims_owner_nonblank"),
+    CheckConstraint("claim_token <> owner_instance_id", name="ck_sessions_cleanup_claims_token_not_owner"),
+    CheckConstraint("claim_epoch > 0", name="ck_sessions_cleanup_claims_positive_epoch"),
+    CheckConstraint(
+        "renewal_count >= 0 AND batch_count >= 0 AND max_renewals > 0 AND max_batches > 0 "
+        "AND renewal_count <= max_renewals AND batch_count <= max_batches",
+        name="ck_sessions_cleanup_claims_bounded_counts",
+    ),
+)
+
+blobs_table = Table(
+    "blobs",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column("filename", String, nullable=False),
+    Column("mime_type", String, nullable=False),
+    Column("size_bytes", Integer, nullable=False),
+    Column("content_hash", String, nullable=True),
+    Column("storage_path", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("created_by", String, nullable=False),
+    Column("source_description", String, nullable=True),
+    Column("status", String, nullable=False, server_default="ready"),
+    # --- Inline-blob provenance ---
+    # creation_modality: closed enum — how this blob's content was produced.
+    # Non-nullable with default "verbatim" so blobs created before these
+    # columns existed retain a valid value when the DB is rebuilt (we have no
+    # users yet; the operator deletes-and-recreates per
+    # project_db_migration_policy).
+    #
+    # Tier 1 crash-on-anomaly applies to reads: the read path
+    # (_row_to_blob_record / _blob_row_to_tool_dict) asserts the value is a
+    # valid CreationModality member; the SQL CHECK below mirrors the
+    # closed enum at the DB layer.
+    #
+    # CLOSED LIST — do not extend without design review.  Three locations
+    # must change together: the CreationModality StrEnum at
+    # contracts/enums.py, this column's CHECK, and the catalog-side
+    # tier-3 plumbing on the read/write paths (tools.py).  No fourth
+    # location.
+    Column("creation_modality", Text, nullable=False, server_default="verbatim"),
+    # created_from_message_id: FK to chat_messages.id of the user message
+    # that triggered the set_pipeline / create_blob call.  The composite
+    # FK (created_from_message_id, session_id) → (chat_messages.id,
+    # chat_messages.session_id) closes the cross-session lineage hole the
+    # same way fk_chat_messages_parent_assistant_session does for tool
+    # rows.  Nullable to admit (a) the migration-window default insert
+    # path before the route layer is wired, and (b) future programmatic
+    # blob creation paths that have no originating user message
+    # (e.g. pipeline-emitted blobs whose audit anchor is the run record).
+    # LLM-authored modalities narrow this column-level nullability through
+    # ck_blobs_creating_llm_provenance_nullability: they MUST carry a
+    # non-blank originating message anchor.
+    Column("created_from_message_id", Text, nullable=True),
+    # LLM-provenance columns: populated for the three LLM-authored
+    # modalities (llm_generated, disambiguated,
+    # llm_generated_then_amended); NULL for verbatim.  Required together —
+    # a blob cannot claim LLM authorship without naming the model,
+    # version, provider, the composer-skill prompt hash, and the
+    # tool-call arguments hash.  The all-or-nothing invariant is enforced
+    # by the ck_blobs_creating_llm_provenance_nullability CHECK below;
+    # the L0 _LLM_AUTHORED_CREATION_MODALITIES frozenset is the Python
+    # mirror used by the write path's pre-insert guard.
+    Column("creating_model_identifier", String, nullable=True),
+    Column("creating_model_version", String, nullable=True),
+    Column("creating_provider", String, nullable=True),
+    Column("creating_composer_skill_hash", String, nullable=True),
+    Column("creating_arguments_hash", String, nullable=True),
+    # Transient exact owner of a standalone-create reservation. The complete
+    # operation identity is cleared when the row becomes ready; a later
+    # current creator may retire only the exact abandoned pending obligation.
+    Column("custody_operation_id", String, nullable=True),
+    Column("custody_operation_epoch", Integer, nullable=True),
+    Column("custody_operation_kind", String, nullable=True),
+    # Composite FK: (created_from_message_id, session_id) must reference an
+    # existing (chat_messages.id, chat_messages.session_id) pair.  Mirrors
+    # fk_chat_messages_parent_assistant_session above.  ON DELETE RESTRICT
+    # (NOT CASCADE) because the blob is the audit anchor — deleting its
+    # originating message would silently truncate the lineage walk and
+    # leave the audit trail confidently asserting "this blob came from
+    # message X" while X no longer exists.  An operator who genuinely
+    # wants to delete a message must first delete or re-anchor every blob
+    # bound to it; the RESTRICT failure surfaces that explicitly.
+    ForeignKeyConstraint(
+        ["created_from_message_id", "session_id"],
+        ["chat_messages.id", "chat_messages.session_id"],
+        name="fk_blobs_created_from_message_session",
+        ondelete="RESTRICT",
+    ),
+    CheckConstraint(
+        "(custody_operation_id IS NULL) = (custody_operation_epoch IS NULL) "
+        "AND (custody_operation_id IS NULL) = (custody_operation_kind IS NULL)",
+        name="ck_blobs_custody_operation_identity",
+    ),
+    *_non_blank_text_constraints(
+        "custody_operation_id",
+        name="ck_blobs_custody_operation_id_nonblank",
+        nullable=True,
+    ),
+    CheckConstraint(
+        "custody_operation_epoch IS NULL OR custody_operation_epoch > 0",
+        name="ck_blobs_custody_operation_positive_epoch",
+    ),
+    CheckConstraint(
+        "custody_operation_kind IS NULL OR custody_operation_kind IN ('create', 'compose', 'proposal', 'execute')",
+        name="ck_blobs_custody_operation_kind",
+    ),
+    CheckConstraint(
+        "(status = 'pending') OR custody_operation_id IS NULL",
+        name="ck_blobs_custody_pending_only",
+    ),
+    CheckConstraint(
+        "creation_modality IN ('verbatim', 'llm_generated', 'disambiguated', 'llm_generated_then_amended')",
+        name="ck_blobs_creation_modality",
+    ),
+    # LLM-provenance nullability invariant: the three LLM-authored
+    # modalities MUST carry a non-blank created_from_message_id plus all
+    # five creating_* fields; verbatim MUST carry no creating_* fields and
+    # may carry or omit the triggering message anchor. Keep the verbatim
+    # branch explicit: a biconditional over the LLM-populated predicate
+    # lets partial/whitespace creating_* values on verbatim rows pass as
+    # "not fully populated", which weakens the audit nullability contract.
+    CheckConstraint(
+        _blobs_creating_llm_provenance_check(dialect="sqlite"),
+        name="ck_blobs_creating_llm_provenance_nullability",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _blobs_creating_llm_provenance_check(dialect="postgresql"),
+        name="ck_blobs_creating_llm_provenance_nullability",
+    ).ddl_if(dialect="postgresql"),
+    CheckConstraint(
+        "created_by IN ('user', 'assistant', 'pipeline')",
+        name="ck_blobs_created_by",
+    ),
+    CheckConstraint(
+        "status IN ('ready', 'pending', 'error')",
+        name="ck_blobs_status",
+    ),
+    # Integrity invariant: a blob that claims to be ready MUST carry a
+    # SHA-256 hex content_hash (exactly 64 lowercase hex characters).
+    # Without this, a defective finalization path — or a direct SQL
+    # write — could persist a "ready" row whose hash either is NULL
+    # (no integrity check possible) or is a malformed string like
+    # "abc123" (will never match any real bytes, so every download
+    # raises BlobIntegrityError).  Either failure mode leaves the
+    # audit trail asserting "this blob is ready" while the bytes are
+    # unverifiable in practice (AD-5/AD-7 in
+    # docs/plans/rc4.2-ux-remediation/2026-03-30-02-blob-manager-subplan.md).
+    #
+    # The shape rule mirrors ``_validate_finalize_hash`` at the write
+    # side (``re.compile(r"^[a-f0-9]{64}$")``).
+    #
+    # Two dialect-conditional expressions enforce the same invariant:
+    # SQLite uses ``NOT GLOB '*[^a-f0-9]*'`` (Postgres has no GLOB
+    # operator); PostgreSQL uses POSIX regex ``~ '^[a-f0-9]+$'`` (SQLite
+    # has no built-in POSIX regex). Both reject the same set of
+    # malformed content_hash values on rows with status='ready':
+    # NULL, length≠64, or any non-lowercase-hex character. The
+    # ``length(...) = 64`` clause anchors the length check on both sides,
+    # and the character-class checks anchor the alphabet — together they
+    # are equivalent to ``re.compile(r"^[a-f0-9]{64}$")`` on the write
+    # side.
+    #
+    # The shared name ``ck_blobs_ready_hash`` lets the schema validator
+    # (sessions/schema.py:_validate_named_checks) pair the live constraint
+    # with the dialect-active metadata constraint. The SQL text is still
+    # compared after the ``ddl_if(dialect=...)`` filter, so a same-named
+    # stale CHECK with weaker semantics is rejected at startup.
+    #
+    # If a third dialect is introduced, add its V0 check expression here
+    # with a matching ``ddl_if(dialect=...)`` instead of adding a
+    # migration path.
+    CheckConstraint(
+        "status != 'ready' OR (content_hash IS NOT NULL AND length(content_hash) = 64 AND content_hash NOT GLOB '*[^a-f0-9]*')",
+        name="ck_blobs_ready_hash",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        "status != 'ready' OR (content_hash IS NOT NULL AND length(content_hash) = 64 AND content_hash ~ '^[a-f0-9]+$')",
+        name="ck_blobs_ready_hash",
+    ).ddl_if(dialect="postgresql"),
+    *_lower_sha256_constraints("creating_composer_skill_hash", name="ck_blobs_creating_composer_skill_hash_format", nullable=True),
+    *_lower_sha256_constraints("creating_arguments_hash", name="ck_blobs_creating_arguments_hash_format", nullable=True),
+)
+
+# A blob delete spans database and filesystem durability domains. Persist the
+# exact intent before staging bytes, advance it to ``staged`` after rename+fsync,
+# and atomically pair metadata deletion with ``purge_pending``. The row does not
+# reference ``blobs.id`` because it must survive that metadata deletion for
+# cleanup-only retry. Session archival owns the whole blob directory, so its
+# cascade may retire cleanup rows after moving that directory into quarantine.
+blob_deletion_cleanups_table = Table(
+    "blob_deletion_cleanups",
+    metadata,
+    Column("blob_id", String, primary_key=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column("storage_path", String, nullable=False),
+    Column("tombstone_path", String, nullable=True),
+    Column("operation_id", String, nullable=True),
+    Column("operation_epoch", Integer, nullable=True),
+    Column("operation_kind", String, nullable=True),
+    Column("phase", String, nullable=True),
+    Column("blob_snapshot_hash", String, nullable=True),
+    Column("expected_file_present", Boolean, nullable=True),
+    Column("expected_file_size", Integer, nullable=True),
+    Column("expected_file_hash", String, nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("operation_epoch > 0", name="ck_blob_deletion_cleanups_positive_epoch"),
+    CheckConstraint(
+        "operation_kind IN ('archive', 'compose', 'proposal', 'session_fork')",
+        name="ck_blob_deletion_cleanups_kind",
+    ),
+    CheckConstraint("phase IN ('intent', 'staged', 'purge_pending')", name="ck_blob_deletion_cleanups_phase"),
+    *_non_blank_text_constraints("storage_path", name="ck_blob_deletion_cleanups_storage_path_nonblank"),
+    *_non_blank_text_constraints("tombstone_path", name="ck_blob_deletion_cleanups_tombstone_path_nonblank"),
+    *_non_blank_text_constraints("operation_id", name="ck_blob_deletion_cleanups_operation_id_nonblank"),
+    CheckConstraint(
+        "expected_file_present IN (0, 1)",
+        name="ck_blob_deletion_cleanups_expected_file_present",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint("storage_path <> tombstone_path", name="ck_blob_deletion_cleanups_paths_differ"),
+    CheckConstraint(
+        "expected_file_present = (expected_file_size IS NOT NULL) AND expected_file_present = (expected_file_hash IS NOT NULL)",
+        name="ck_blob_deletion_cleanups_expected_file_evidence",
+    ),
+    CheckConstraint("expected_file_size IS NULL OR expected_file_size >= 0", name="ck_blob_deletion_cleanups_nonnegative_size"),
+    CheckConstraint("updated_at >= created_at", name="ck_blob_deletion_cleanups_monotonic_timestamps"),
+    CheckConstraint("length(blob_snapshot_hash) = 64", name="ck_blob_deletion_cleanups_snapshot_hash_length"),
+    CheckConstraint("expected_file_hash IS NULL OR length(expected_file_hash) = 64", name="ck_blob_deletion_cleanups_file_hash_length"),
+    CheckConstraint(
+        "blob_snapshot_hash NOT GLOB '*[^a-f0-9]*'",
+        name="ck_blob_deletion_cleanups_snapshot_hash_lowercase",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        "blob_snapshot_hash ~ '^[a-f0-9]+$'",
+        name="ck_blob_deletion_cleanups_snapshot_hash_lowercase",
+    ).ddl_if(dialect="postgresql"),
+    CheckConstraint(
+        "expected_file_hash IS NULL OR expected_file_hash NOT GLOB '*[^a-f0-9]*'",
+        name="ck_blob_deletion_cleanups_file_hash_lowercase",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        "expected_file_hash IS NULL OR expected_file_hash ~ '^[a-f0-9]+$'",
+        name="ck_blob_deletion_cleanups_file_hash_lowercase",
+    ).ddl_if(dialect="postgresql"),
+)
+
+# A blob replacement crosses the same database/filesystem durability seam as a
+# delete, but its recovery evidence is intentionally separate: the live blob
+# row survives, and commit atomically changes its exact metadata while advancing
+# this obligation to ``purge_pending``. ``blob_id`` therefore has no FK to
+# ``blobs.id``; the session FK alone owns lifecycle cleanup.
+blob_replacement_cleanups_table = Table(
+    "blob_replacement_cleanups",
+    metadata,
+    Column("blob_id", String, primary_key=True),
+    Column("replacement_id", String, nullable=False, unique=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column("storage_path", String, nullable=False),
+    Column("staging_path", String, nullable=False),
+    Column("backup_path", String, nullable=False),
+    Column("operation_id", String, nullable=False),
+    Column("operation_epoch", Integer, nullable=False),
+    Column("operation_kind", String, nullable=False),
+    Column("lease_token", String, nullable=False),
+    Column("owner_instance_id", String, nullable=False),
+    Column("phase", String, nullable=False),
+    Column("old_blob_snapshot", JSON, nullable=False),
+    Column("replacement_blob_snapshot", JSON, nullable=False),
+    Column("old_blob_snapshot_hash", String, nullable=False),
+    Column("replacement_blob_snapshot_hash", String, nullable=False),
+    Column("old_size_bytes", Integer, nullable=False),
+    Column("old_content_hash", String, nullable=False),
+    Column("replacement_size_bytes", Integer, nullable=False),
+    Column("replacement_content_hash", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("operation_epoch > 0", name="ck_blob_replacement_cleanups_positive_epoch"),
+    CheckConstraint("operation_kind IN ('compose', 'proposal')", name="ck_blob_replacement_cleanups_kind"),
+    CheckConstraint("phase IN ('intent', 'swap_pending', 'purge_pending')", name="ck_blob_replacement_cleanups_phase"),
+    *_non_blank_text_constraints("replacement_id", name="ck_blob_replacement_cleanups_replacement_id_nonblank"),
+    *_non_blank_text_constraints("storage_path", name="ck_blob_replacement_cleanups_storage_path_nonblank"),
+    *_non_blank_text_constraints("staging_path", name="ck_blob_replacement_cleanups_staging_path_nonblank"),
+    *_non_blank_text_constraints("backup_path", name="ck_blob_replacement_cleanups_backup_path_nonblank"),
+    *_non_blank_text_constraints("operation_id", name="ck_blob_replacement_cleanups_operation_id_nonblank"),
+    *_non_blank_text_constraints("lease_token", name="ck_blob_replacement_cleanups_lease_token_nonblank"),
+    *_non_blank_text_constraints("owner_instance_id", name="ck_blob_replacement_cleanups_owner_nonblank"),
+    CheckConstraint(
+        "storage_path <> staging_path AND storage_path <> backup_path AND staging_path <> backup_path",
+        name="ck_blob_replacement_cleanups_paths_distinct",
+    ),
+    CheckConstraint("old_size_bytes >= 0", name="ck_blob_replacement_cleanups_old_size_nonnegative"),
+    CheckConstraint("replacement_size_bytes >= 0", name="ck_blob_replacement_cleanups_replacement_size_nonnegative"),
+    CheckConstraint("updated_at >= created_at", name="ck_blob_replacement_cleanups_monotonic_timestamps"),
+    *_lower_sha256_constraints("old_blob_snapshot_hash", name="ck_blob_replacement_cleanups_old_snapshot_hash_format"),
+    *_lower_sha256_constraints(
+        "replacement_blob_snapshot_hash",
+        name="ck_blob_replacement_cleanups_replacement_snapshot_hash_format",
+    ),
+    *_lower_sha256_constraints("old_content_hash", name="ck_blob_replacement_cleanups_old_content_hash_format"),
+    *_lower_sha256_constraints(
+        "replacement_content_hash",
+        name="ck_blob_replacement_cleanups_replacement_content_hash_format",
+    ),
+)
+
+# Index for the reverse-lookup path: "given a chat message, which inline
+# blobs were created from it?"  Backs the inline-blob lineage walk —
+# chat_messages.id → blobs.created_from_message_id → blobs.id — without
+# triggering a full table scan when an auditor opens the lineage drawer
+# on a session with thousands of blobs.
+Index(
+    "ix_blobs_created_from_message_id",
+    blobs_table.c.created_from_message_id,
+)
+
+blob_run_links_table = Table(
+    "blob_run_links",
+    metadata,
+    Column(
+        "blob_id",
+        String,
+        ForeignKey("blobs.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "run_id",
+        String,
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("direction", String, nullable=False),
+    UniqueConstraint("blob_id", "run_id", "direction", name="uq_blob_run_link"),
+    CheckConstraint(
+        "direction IN ('input', 'output')",
+        name="ck_blob_run_links_direction",
+    ),
+)
+Index("ix_blob_run_links_blob_id", blob_run_links_table.c.blob_id)
+Index("ix_blob_run_links_run_id", blob_run_links_table.c.run_id)
+
+blob_inline_resolutions_table = Table(
+    "blob_inline_resolutions",
+    metadata,
+    Column(
+        "run_id",
+        String,
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("attempt", Integer, nullable=False, server_default="1"),
+    Column("field_path", String, nullable=False),
+    Column("blob_id", String, nullable=False),
+    Column("content_hash", String, nullable=False),
+    Column("byte_length", Integer, nullable=False),
+    Column("mime_type", String, nullable=False),
+    Column("encoding", String, nullable=False),
+    Column("resolved_at", DateTime(timezone=True), nullable=False),
+    PrimaryKeyConstraint(
+        "run_id",
+        "field_path",
+        "blob_id",
+        "attempt",
+        name="pk_blob_inline_resolutions",
+    ),
+    *_lower_sha256_constraints("content_hash", name="ck_blob_inline_resolutions_hash_format"),
+    CheckConstraint(
+        "encoding IN ('utf-8', 'utf-8-sig', 'utf-16', 'latin-1')",
+        name="ck_blob_inline_resolutions_encoding",
+    ),
+    CheckConstraint(
+        "field_path LIKE 'source.options.%' OR field_path LIKE 'node:%.options.%' OR field_path LIKE 'output:%.options.%'",
+        name="ck_blob_inline_resolutions_field_path",
+    ),
+    CheckConstraint(
+        "byte_length >= 0",
+        name="ck_blob_inline_resolutions_byte_length",
+    ),
+)
+Index("ix_blob_inline_resolutions_blob_id", blob_inline_resolutions_table.c.blob_id)
+Index("ix_blob_inline_resolutions_run_id", blob_inline_resolutions_table.c.run_id)
+
+run_events_table = Table(
+    "run_events",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "run_id",
+        String,
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column("sequence", Integer, nullable=False),
+    Column("timestamp", DateTime(timezone=True), nullable=False),
+    Column("event_type", String, nullable=False),
+    Column("data", JSON, nullable=False),
+    UniqueConstraint("run_id", "sequence", name="uq_run_events_run_sequence"),
+    CheckConstraint("sequence >= 1", name="ck_run_events_positive_sequence"),
+    CheckConstraint(
+        "event_type IN ('progress', 'error', 'completed', 'cancelled', 'failed')",
+        name="ck_run_events_type",
+    ),
+)
+
+user_secrets_table = Table(
+    "user_secrets",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("name", String, nullable=False),
+    Column("user_id", String, ForeignKey("identities.identity_id", ondelete="RESTRICT"), nullable=False),
+    Column("auth_provider_type", String, nullable=False),
+    Column("encrypted_value", LargeBinary, nullable=False),
+    Column("salt", LargeBinary, nullable=False),
+    Column("version", Integer, nullable=False, server_default="1"),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint("name", "user_id", "auth_provider_type", name="uq_user_secret_name_user_provider"),
+    CheckConstraint(
+        _AUTH_PROVIDER_TYPE_CHECK,
+        name="ck_user_secrets_auth_provider_type",
+    ),
+    *_non_blank_text_constraints("id", name="ck_user_secrets_id_nonblank"),
+    CheckConstraint("version > 0", name="ck_user_secrets_positive_version"),
+)
+Index("ix_user_secrets_user_provider", user_secrets_table.c.user_id, user_secrets_table.c.auth_provider_type)
+
+# ``user_preferences`` — per-user composer settings.
+#
+# One row per user holding (a) the user's chosen default composer mode for
+# NEW sessions, (b) the dismissal timestamp for the one-time "we changed
+# the default" banner, and (c) the completed-at timestamp for the first-run
+# hello-world tutorial. Per-session mode toggles live in chat panel state
+# and do NOT touch this row; this is exclusively account-level preference
+# state.
+#
+# ``user_id`` holds an ``identities.identity_id`` (the D6 ownership re-key;
+# ``routes.py`` writes ``user_id=identity.identity_id`` and the session token's
+# ``sub`` is that same id) and matches ``sessions_table.user_id``.
+#
+# The identity FK completes D6's ownership constraint (elspeth-2371269e07).
+# Retain the existing column name across all three owner tables; it describes
+# the same canonical identity ID, not a provider username. RESTRICT preserves
+# owned data when an identity is retired; retirement is not a cascading purge.
+#
+user_preferences_table = Table(
+    "user_preferences",
+    metadata,
+    Column("user_id", String, ForeignKey("identities.identity_id", ondelete="RESTRICT"), primary_key=True),
+    # NULL = freeform introduction visible; non-NULL = dismissed account-wide.
+    Column("freeform_intro_dismissed_at", DateTime(timezone=True), nullable=True),
+    # NULL = tutorial not completed/reset; non-NULL = completed-at timestamp.
+    Column("tutorial_completed_at", DateTime(timezone=True), nullable=True),
+    # First-run tutorial resume state (elspeth-918f4434b3). NULL = no
+    # in-progress tutorial (the Welcome bookend is never persisted — nothing
+    # has started). Non-NULL = the macro stage to resume at after a reload.
+    # The stage vocabulary mirrors the frontend TutorialStep union
+    # (tutorialMachine.ts) minus "welcome"; the CHECK constraint below plus
+    # the Tier-1 read guard in ``PreferencesService._row_to_prefs`` are the
+    # closed-list pair.
+    Column("tutorial_stage", String, nullable=True),
+    # The tutorial session the persisted stage belongs to, so resume
+    # re-attaches to the SAME session instead of abandoning it. run id +
+    # source-data hash are recorded once the tutorial run completes so the
+    # audit step can resume with zero re-execution (no silent LLM re-spend).
+    Column("tutorial_session_id", String, nullable=True),
+    Column("tutorial_run_id", String, nullable=True),
+    Column("tutorial_source_data_hash", String, nullable=True),
+    # Per-user detail level (elspeth-9c11df65f8). False = standard view;
+    # True = engineer/auditor detail (raw options JSON, validation stage
+    # list, advanced plugin knobs expanded). A plain boolean needs no CHECK
+    # constraint; ``server_default`` keeps pre-existing rows readable.
+    Column("show_advanced", Boolean, nullable=False, server_default=sa_false()),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "tutorial_stage IS NULL OR tutorial_stage IN ('build', 'run', 'audit', 'graduation')",
+        name="ck_user_preferences_tutorial_stage",
+    ),
+    # Empty-string user_id would silently key a "shared" preferences row
+    # that any unauthenticated principal could write to if upstream auth
+    # ever regressed. SQLite's PRIMARY KEY accepts '' as a distinct
+    # value, so the only defence at the schema layer is an explicit
+    # length check. Mirrors the empty-string guards on other
+    # principal-keyed tables.
+    CheckConstraint(
+        "length(user_id) > 0",
+        name="ck_user_preferences_user_id_non_empty",
+    ),
+)
+
+# ``audit_access_log`` — INERT IN PHASE 1A.
+#
+# This table records who viewed audit-grade message data through the
+# ``include_tool_rows=true`` surface. D27 reserves the workflow inspection
+# principal in the paired schema batch before its authorization path ships.
+#
+# DO NOT ADD A WRITER WITHOUT THE PRIVACY GATE. The table holds
+# privacy-sensitive request context (``requesting_principal``,
+# ``request_path``, ``query_args``, ``ip_address``). Before any later
+# schedule adds a writer, that schedule MUST:
+#
+# 1. Define and test an allowlist for ``query_args`` keys. The writer
+#    must never store request headers, request bodies, secrets,
+#    provider tokens, or arbitrary exception strings. The allowlist
+#    is a closed set, with every accepted key justified.
+# 2. Choose an explicit IP retention policy. ``ip_address`` is
+#    nullable for service-to-service calls and for retention
+#    truncation. The policy must be stated in writing
+#    (literal storage, /24 truncation, or keyed hash) and pinned by
+#    test before the writer ships.
+# 3. Prove via integration test that no out-of-allowlist payload can
+#    reach the writer call site, even via misconfigured routes or
+#    unhandled exception paths.
+#
+# CLOSED-LIST WRITER PRINCIPAL ENUM. D27 reserves ``workflow_inspect`` for
+# authenticated approver/reviewer reads. Reserving it does not authorize a
+# workflow read or relax the owner-only audit-grade view. Its future writer
+# still needs per-request live role/request authorization and the privacy
+# gate above. The paired identity residual schema window adds this value.
+audit_access_log_table = Table(
+    "audit_access_log",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("timestamp", DateTime(timezone=True), nullable=False),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("requesting_principal", String, nullable=False),
+    Column("request_path", String, nullable=False),
+    Column("query_args", JSON, nullable=False),
+    Column("ip_address", String, nullable=True),
+    Column("writer_principal", String, nullable=False),
+    CheckConstraint(
+        "writer_principal IN ('audit_grade_view', 'admin_tool', 'workflow_inspect')",
+        name="ck_audit_access_log_writer_principal",
+    ),
+    Index("ix_audit_access_log_session_timestamp", "session_id", "timestamp"),
+)
+
+
+# === Identity substrate (epoch 52, elspeth-07cd19ba73) ==================
+#
+# Spec: docs/specs/2026-09-02-pluggable-sso-design.md, §Data model.
+#
+# ``identities`` is CURRENT STATE. Nothing here is an audit log, and nothing
+# here may be read as one.
+#
+# This comment used to continue "the history of record is the per-login
+# profile snapshot in the Landscape ``auth_events.metadata_json``". That
+# snapshot is NOT WRITTEN (measured 2026-09-07): the SSO login row's
+# ``metadata_json`` holds request method/path and ``compartment_id``; it
+# still has no profile snapshot. ``routes.py``'s ``record_login`` closure
+# passes provider, user_id, username and identity_id;
+# ``record_login_success`` passes ``metadata=_request_metadata(request)``,
+# which supplies method/path; the recorder adds ``compartment_id``.
+# The identity_id, provider, username and request_id it named are top-level
+# COLUMNS on ``auth_events``, not metadata keys.
+#
+# So the "not an audit log" rule above is now the WHOLE of it, and it binds
+# harder than before rather than less: there is no profile history anywhere
+# to redirect a reader to, which makes reading these mutable rows as history
+# the tempting mistake rather than an obviously wrong one. Asked what a
+# person's display name or organisation was at a login last month, the
+# honest answer today is that nothing recorded it. The spec states the
+# requirement (§Data model, rev2.12); until something writes it, do not
+# repeat the claim here or anywhere else -- this comment agreeing with the
+# spec is exactly why the spec's error survived three reviews.
+#
+# The provider discriminator on ``identities`` is DELIBERATELY WIDER than
+# the one on ``sessions`` and ``user_secrets``: an identity may exist for a
+# ``service`` principal that authenticates with an operator-issued
+# credential and never completes an OIDC walk, while a session or a user
+# secret can only ever belong to something that logged in through a browser.
+# The narrow set is a subset of the wide one, which is what keeps the
+# ownership foreign keys sound in that direction.
+
+_IDENTITY_PROVIDER_TYPE_CHECK = "provider IN ('local', 'oidc', 'entra', 'vanguard', 'google', 'service')"
+_IDENTITY_KIND_CHECK = "kind IN ('human', 'service')"
+_IDENTITY_ACCESS_STATE_CHECK = "access_state IN ('pending', 'active', 'disabled')"
+_IDENTITY_ROLE_CHECK = "role IN ('admin', 'approver', 'reviewer', 'user', 'curator', 'auditor', 'oversight')"
+_RELATIONSHIP_TYPE_CHECK = "relationship_type IN ('approver')"
+
+
+def _identities_text_columns_non_blank_check(*, dialect: Literal["sqlite", "postgresql"]) -> str:
+    """``subject`` and ``username`` must both carry real text.
+
+    ``(provider, subject)`` is the identity key, so a blank subject would
+    collapse every identity from one provider onto a single row. ``username``
+    is what an admin reads in the pending queue, and a blank one makes the
+    activation decision unreadable; it defaults to the IdP subject until a
+    login supplies something better, so there is no path that legitimately
+    has nothing to write.
+    """
+    return f"{_sql_non_blank_text('subject', dialect=dialect)} AND {_sql_non_blank_text('username', dialect=dialect)}"
+
+
+identities_table = Table(
+    "identities",
+    metadata,
+    Column("identity_id", String, primary_key=True),
+    Column("provider", String, nullable=False),
+    # ``human`` or ``service``. A service identity may hold only ``admin`` or
+    # ``oversight`` and may never approve, attest, or publish. That rule reads
+    # two tables, so no dialect can express it as a CHECK; it is refused at
+    # the route layer in the same transaction as the role insert.
+    Column("kind", String, nullable=False, server_default="human"),
+    Column("subject", String, nullable=False),
+    Column("username", String, nullable=False),
+    Column("display_name", String, nullable=True),
+    Column("email", String, nullable=True),
+    # VANguard ABN; null for every other provider.
+    Column("organisation_id", String, nullable=True),
+    # Forensics only — never returned by any API. Taken at ACTIVATION, not at
+    # first sight, so the container does not accumulate profile PII belonging
+    # to people who merely tried to log in. Bounded at 16 KiB by the write
+    # boundary rather than a CHECK: the bound is in bytes, and the byte-length
+    # SQL differs per dialect in a way that would make the constraint a
+    # character count on one of them and silently admit more than intended.
+    Column("raw_claims_json", Text, nullable=True),
+    # D10 rebound detection: the verified email seen the first time this
+    # subject appeared, and the moment it was observed to have changed.
+    Column("subject_email_at_first_seen", String, nullable=True),
+    Column("rebound_at", DateTime(timezone=True), nullable=True),
+    Column("first_seen_at", DateTime(timezone=True), nullable=False),
+    # Nullable: a pre-provisioned identity nobody has used has no login to
+    # stamp, and inventing one would falsify the dormancy window R9 measures.
+    Column("last_login_at", DateTime(timezone=True), nullable=True),
+    # Read on EVERY request in get_current_user, so revocation latency is one
+    # request rather than the token lifetime.
+    Column("access_state", String, nullable=False, server_default="pending"),
+    # An admin may create the row ``active`` by (provider, subject) before the
+    # person's first login; that login then BINDS to this row instead of
+    # creating one. This is how a known cohort is onboarded without each
+    # person hitting the pending wall.
+    Column("pre_provisioned_at", DateTime(timezone=True), nullable=True),
+    Column("activated_at", DateTime(timezone=True), nullable=True),
+    # Nullable on purpose: the bootstrap seed and the operator recovery CLI
+    # both activate the FIRST admin with actor ``operator`` and no activating
+    # identity, because there is by definition no active admin to name.
+    Column(
+        "activated_by_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=True,
+    ),
+    Column("disabled_at", DateTime(timezone=True), nullable=True),
+    Column(
+        "disabled_by_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=True,
+    ),
+    Column("disable_reason", String, nullable=True),
+    CheckConstraint(_IDENTITY_PROVIDER_TYPE_CHECK, name="ck_identities_provider"),
+    CheckConstraint(_IDENTITY_KIND_CHECK, name="ck_identities_kind"),
+    CheckConstraint(_IDENTITY_ACCESS_STATE_CHECK, name="ck_identities_access_state"),
+    CheckConstraint(
+        _identities_text_columns_non_blank_check(dialect="sqlite"),
+        name="ck_identities_subject_and_username_non_blank",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        _identities_text_columns_non_blank_check(dialect="postgresql"),
+        name="ck_identities_subject_and_username_non_blank",
+    ).ddl_if(dialect="postgresql"),
+    UniqueConstraint("provider", "subject", name="uq_identities_provider_subject"),
+)
+Index("ix_identities_access_state", identities_table.c.access_state)
+
+
+# A role row is never deleted; it is revoked, so the grant remains readable.
+# "Active" therefore means ``revoked_at IS NULL`` and nothing else — a
+# partial-index predicate must be immutable, so it cannot consult the clock
+# and ``expires_at`` is not part of it. Expiry is evaluated at read time by
+# the code that answers "what roles does this identity hold now".
+identity_roles_table = Table(
+    "identity_roles",
+    metadata,
+    Column("role_id", String, primary_key=True),
+    Column(
+        "identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    ),
+    Column("role", String, nullable=False),
+    # JIT grants: the organisation console's role in a container is granted
+    # with an expiry by a CONTAINER admin. The compartment owner reads the
+    # console in, never the reverse.
+    Column("expires_at", DateTime(timezone=True), nullable=True),
+    # Activation is the most consequential act in the model and must carry a
+    # reason.
+    Column("note", Text, nullable=True),
+    # Reserved (library id, team id); NULL means deployment-wide.
+    Column("scope", String, nullable=True),
+    Column(
+        "granted_by_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("granted_at", DateTime(timezone=True), nullable=False),
+    Column("revoked_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint(_IDENTITY_ROLE_CHECK, name="ck_identity_roles_role"),
+)
+# TWO partial uniques, for the same reason quota_policies needs two: NULLs
+# are DISTINCT for uniqueness in both dialects, so an index over
+# ``(identity_id, role, scope)`` does not constrain the deployment-wide case
+# at all — ``scope IS NULL`` is every ordinary grant, and without the second
+# index one identity could hold two active ``admin`` rows. The first index
+# covers scoped grants; the second covers the unscoped ones.
+Index(
+    "uq_identity_roles_active_scoped",
+    identity_roles_table.c.identity_id,
+    identity_roles_table.c.role,
+    identity_roles_table.c.scope,
+    unique=True,
+    sqlite_where=identity_roles_table.c.revoked_at.is_(None),
+    postgresql_where=identity_roles_table.c.revoked_at.is_(None),
+)
+Index(
+    "uq_identity_roles_active_unscoped",
+    identity_roles_table.c.identity_id,
+    identity_roles_table.c.role,
+    unique=True,
+    sqlite_where=identity_roles_table.c.revoked_at.is_(None) & identity_roles_table.c.scope.is_(None),
+    postgresql_where=identity_roles_table.c.revoked_at.is_(None) & identity_roles_table.c.scope.is_(None),
+)
+
+
+# The org tree carries ONE job: who oversees whom, for the approver's audit
+# view. Approver eligibility and leave cover are role questions answered by
+# ``identity_roles``, not tree questions — which is why there is exactly one
+# relationship type and why widening this vocabulary is a design change
+# rather than a schema convenience.
+identity_relationships_table = Table(
+    "identity_relationships",
+    metadata,
+    Column("relationship_id", String, primary_key=True),
+    Column(
+        "from_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    ),
+    Column(
+        "to_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    ),
+    Column("relationship_type", String, nullable=False),
+    Column(
+        "asserted_by_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("asserted_at", DateTime(timezone=True), nullable=False),
+    # ANNOTATION ONLY. A partial-index predicate must be immutable, so
+    # "active" cannot consult this window and no check reads it. Leave cover
+    # is a second ``approver`` role grant, not an edge.
+    Column("effective_from", DateTime(timezone=True), nullable=True),
+    Column("effective_until", DateTime(timezone=True), nullable=True),
+    Column("revoked_at", DateTime(timezone=True), nullable=True),
+    Column(
+        "revoked_by_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=True,
+    ),
+    Column("note", Text, nullable=True),
+    CheckConstraint(_RELATIONSHIP_TYPE_CHECK, name="ck_identity_relationships_type"),
+    CheckConstraint("from_identity_id <> to_identity_id", name="ck_identity_relationships_not_self"),
+)
+# One active default approver per person. Cycles are a different problem and
+# are refused at write time by a bounded ancestor walk in the route layer —
+# no index can express reachability.
+Index(
+    "uq_identity_relationships_active_incoming",
+    identity_relationships_table.c.to_identity_id,
+    identity_relationships_table.c.relationship_type,
+    unique=True,
+    sqlite_where=identity_relationships_table.c.revoked_at.is_(None),
+    postgresql_where=identity_relationships_table.c.revoked_at.is_(None),
+)
+Index(
+    "uq_identity_relationships_active_edge",
+    identity_relationships_table.c.from_identity_id,
+    identity_relationships_table.c.to_identity_id,
+    identity_relationships_table.c.relationship_type,
+    unique=True,
+    sqlite_where=identity_relationships_table.c.revoked_at.is_(None),
+    postgresql_where=identity_relationships_table.c.revoked_at.is_(None),
+)
+
+
+# The browser-to-backend handoff after a completed SSO walk. The code itself
+# is ``secrets.token_urlsafe(32)`` and is NEVER stored: only its SHA-256 is,
+# so a reader of this table cannot mint a session. Consume is ONE statement
+# (conditional UPDATE ... RETURNING) against the DATABASE clock, never a
+# select-then-compare and never a replica clock.
+#
+# Rows are purged lazily — on consume, and on the next login by the same
+# identity — with a 15 minute TTL. No background task, and no audit row: the
+# login attempt's own record already exists, and a maintenance delete is not
+# an authority mutation.
+sso_handoffs_table = Table(
+    "sso_handoffs",
+    metadata,
+    Column("code_hash", String, primary_key=True),
+    Column(
+        "identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    ),
+    Column("issued_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("consumed_at", DateTime(timezone=True), nullable=True),
+    Column("request_id", String, nullable=False),
+    CheckConstraint(_lower_sha256_check("code_hash", dialect="sqlite"), name="ck_sso_handoffs_code_hash").ddl_if(dialect="sqlite"),
+    CheckConstraint(_lower_sha256_check("code_hash", dialect="postgresql"), name="ck_sso_handoffs_code_hash").ddl_if(dialect="postgresql"),
+)
+Index("ix_sso_handoffs_expires_at", sso_handoffs_table.c.expires_at)
+
+
+# === Workflow governance (epoch 52, elspeth-07cd19ba73) ================
+#
+# Spec: docs/specs/2026-09-02-pluggable-sso-design.md, §Workflow tables.
+# "For but not with": basic columns only, every table keyed on identity_id,
+# and every mutation writes its Landscape ``auth_events`` row before
+# responding. These may be fleshed out later WITHOUT a new epoch only by
+# adding nullable columns; anything needing a CHECK change is a deliberate
+# epoch bump, which is why the closed sets below are settled now.
+#
+# EVERY session foreign key here declares ``ondelete`` EXPLICITLY. Silence is
+# not neutral: SQLAlchemy emits NO ACTION, and with ``PRAGMA foreign_keys=ON``
+# enforced at startup that ships the RESTRICT branch by accident rather than
+# by decision. RESTRICT is the decision.
+#
+# Note bounds ("4 KiB") are enforced at the write boundary, not by a CHECK,
+# for the same reason ``identities.raw_claims_json`` is: the bound is in
+# bytes, and byte-length SQL differs per dialect in a way that would silently
+# make the constraint a character count on one of them.
+
+_APPROVAL_DECISION_CHECK = "decision IN ('approved', 'rejected', 'revoked', 'superseded')"
+_APPROVAL_DECISION_ROW_CHECK = "decision IN ('approved', 'rejected')"
+_REVIEW_VERDICT_CHECK = "verdict IN ('signed_off', 'changes_requested', 'withdrawn')"
+_QUOTA_SET_BY_ACTOR_CHECK = "set_by_actor IN ('identity', 'config', 'operator', 'system')"
+_TOKEN_USAGE_SOURCE_CHECK = "source IN ('composer', 'run', 'auto_title', 'system')"
+
+
+approvals_table = Table(
+    "approvals",
+    metadata,
+    Column("approval_id", String, primary_key=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    ),
+    Column("state_id", String, nullable=False),
+    # config_hash, canonical_version, runtime_val_manifest_sha256,
+    # openrouter_catalog_sha256, binding_generation_fingerprint, policy_hash.
+    # binding_generation_fingerprint is in because config_hash records profile
+    # ALIASES, not the buckets or credentials they resolve to: without it an
+    # approval survives an operator repointing an alias. snapshot_hash is
+    # deliberately OUT — it embeds the principal scope and would never match
+    # across approver and author.
+    Column("binding_json", JSON, nullable=False),
+    Column(
+        "requested_by_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "approver_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("requested_at", DateTime(timezone=True), nullable=False),
+    Column("decided_at", DateTime(timezone=True), nullable=True),
+    Column("decision", String, nullable=True),
+    Column("revoked_by_identity_id", String, ForeignKey("identities.identity_id", ondelete="RESTRICT"), nullable=True),
+    Column("revocation_actor_kind", String, nullable=True),
+    Column("revocation_event_id", String, nullable=True),
+    # Quorum 1 is what this delivery enforces; > 1 stays reserved. The count
+    # lives over ``approval_decisions`` rows, so raising it later is not a
+    # schema change.
+    Column("required_count", Integer, nullable=False, server_default=text("1")),
+    # The requester's message to the approver. The approver's reply travels in
+    # approval_decisions.note. Both are part of the audit record, both render
+    # as text and never as markup.
+    Column("request_note", Text, nullable=True),
+    # Set when the requester opens the decided request, so the badge can
+    # clear. A UI convenience, NEVER a control: nothing gates on it.
+    Column("decision_seen_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint(_APPROVAL_DECISION_CHECK, name="ck_approvals_decision"),
+    CheckConstraint(
+        "(decision IS NOT NULL AND decision = 'revoked' AND decided_at IS NOT NULL AND revocation_event_id IS NOT NULL "
+        "AND length(revocation_event_id) > 0 AND revocation_actor_kind IS NOT NULL "
+        "AND ((revocation_actor_kind = 'identity' AND revoked_by_identity_id IS NOT NULL) "
+        "OR (revocation_actor_kind IN ('system', 'operator') AND revoked_by_identity_id IS NULL))) "
+        "OR ((decision IS NULL OR decision <> 'revoked') AND revoked_by_identity_id IS NULL "
+        "AND revocation_actor_kind IS NULL AND revocation_event_id IS NULL)",
+        name="ck_approvals_revocation_provenance",
+    ),
+    CheckConstraint(
+        "requested_by_identity_id <> approver_identity_id",
+        name="ck_approvals_author_is_not_approver",
+    ),
+)
+# One OPEN request per (session_id, state_id). Predicated on ``decision IS
+# NULL`` rather than ``decided_at IS NULL``: ``superseded`` and ``revoked``
+# set a decision without being stated to stamp a decision time, and a
+# predicate over the timestamp would leave those rows looking open.
+Index(
+    "uq_approvals_open_per_state",
+    approvals_table.c.session_id,
+    approvals_table.c.state_id,
+    unique=True,
+    sqlite_where=approvals_table.c.decision.is_(None),
+    postgresql_where=approvals_table.c.decision.is_(None),
+)
+
+
+# One row per deciding identity, so ``required_count > 1`` becomes a count
+# over rows rather than a schema change.
+approval_decisions_table = Table(
+    "approval_decisions",
+    metadata,
+    Column("decision_id", String, primary_key=True),
+    Column(
+        "approval_id",
+        String,
+        ForeignKey("approvals.approval_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    ),
+    Column(
+        "decided_by_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("decided_at", DateTime(timezone=True), nullable=False),
+    Column("decision", String, nullable=False),
+    # Required non-blank on a rejection, refused at the route: the note is the
+    # requester's only channel for learning why, and an empty rejection turns
+    # the mailbox round trip into a dead end.
+    Column("note", Text, nullable=True),
+    CheckConstraint(_APPROVAL_DECISION_ROW_CHECK, name="ck_approval_decisions_decision"),
+)
+
+
+# The mailbox's Inbox promises "review requests addressed to me", and until
+# this table nothing recorded one: ``review_attestations`` is append-only with
+# a non-null reviewer and exists only once a review has HAPPENED. A sibling
+# table rather than nullable columns and a ``requested`` verdict on that
+# ledger, which would contradict its append-only "not a control" design and
+# fill the approver's audit view with requests nobody ever completed.
+review_requests_table = Table(
+    "review_requests",
+    metadata,
+    Column("request_id", String, primary_key=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    ),
+    Column("state_id", String, nullable=False),
+    Column(
+        "requested_by_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    # NULL means "any active reviewer", matching the role-based eligibility
+    # already ruled for approvals.
+    Column(
+        "reviewer_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    ),
+    Column("requested_at", DateTime(timezone=True), nullable=False),
+    Column("cancelled_at", DateTime(timezone=True), nullable=True),
+    Column("request_note", Text, nullable=True),
+)
+
+
+# Append-only. A LEDGER, not a control: nothing refuses on it. The phrase
+# "two-person rule" is reserved for something that refuses, and a UI must
+# never say "two-person rule satisfied" over an unenforced count.
+review_attestations_table = Table(
+    "review_attestations",
+    metadata,
+    Column("attestation_id", String, primary_key=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    ),
+    Column("state_id", String, nullable=False),
+    Column("payload_digest", String, nullable=False),
+    Column(
+        "reviewer_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    # An IMMUTABLE SNAPSHOT taken at attestation time, never a mirror of
+    # sessions.identity_id. A mirror would be a second source of truth that
+    # drifts when a session changes hands. With the snapshot on the row,
+    # "reviewer is not the author" is a single-row CHECK; without it, it is a
+    # cross-table invariant no dialect can express.
+    Column(
+        "author_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("attested_at", DateTime(timezone=True), nullable=False),
+    Column("verdict", String, nullable=False),
+    # Required non-blank when the verdict is changes_requested, at the route.
+    Column("note", Text, nullable=True),
+    CheckConstraint(_REVIEW_VERDICT_CHECK, name="ck_review_attestations_verdict"),
+    CheckConstraint(
+        "reviewer_identity_id <> author_identity_id",
+        name="ck_review_attestations_reviewer_is_not_author",
+    ),
+    *_prefixed_sha256_constraints("payload_digest", name="ck_review_attestations_payload_digest_format"),
+)
+
+
+# Frozen and content-addressed. An entry is the PUBLIC PROJECTION
+# (generate_public_yaml shape), never a session reference, and it is
+# config-only: publishing a pipeline that reads an uploaded blob is refused
+# with a named error_type, because blob custody proves same-principal on fork
+# and a cross-user fork of a blob-backed source cannot copy the blob without
+# becoming an intra-container exfiltration path.
+library_entries_table = Table(
+    "library_entries",
+    metadata,
+    # A PROVENANCE COLUMN, not a foreign key — exactly as
+    # ``forked_from_session_id`` already is — so a published entry outlives
+    # the staging session it came from.
+    Column("entry_id", String, primary_key=True),
+    Column("published_from_session_id", String, nullable=True),
+    Column("payload_digest", String, nullable=False),
+    Column("compartment_id", String, nullable=False),
+    Column("title", String, nullable=False),
+    Column("version", Integer, nullable=False),
+    Column(
+        "published_by_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "curated_by_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=True,
+    ),
+    Column("published_at", DateTime(timezone=True), nullable=False),
+    # Visible deployment-wide once a curator sets this.
+    Column("accepted_at", DateTime(timezone=True), nullable=True),
+    Column("rejected_at", DateTime(timezone=True), nullable=True),
+    Column("rejection_note", Text, nullable=True),
+    Column("deprecated_at", DateTime(timezone=True), nullable=True),
+    # Recall FLAGS, never deletes.
+    Column("recalled_at", DateTime(timezone=True), nullable=True),
+    Column("note", Text, nullable=True),
+    # Nullable until a curator acts, so the rule has to admit NULL rather than
+    # compare it.
+    CheckConstraint(
+        "curated_by_identity_id IS NULL OR curated_by_identity_id <> published_by_identity_id",
+        name="ck_library_entries_curator_is_not_publisher",
+    ),
+    # Bare hex, unlike the ``sha256:``-prefixed ``payload_digest`` on reviews
+    # and completion events: this one is the payload store's content address.
+    *_lower_sha256_constraints("payload_digest", name="ck_library_entries_payload_digest_format"),
+)
+Index("ix_library_entries_compartment", library_entries_table.c.compartment_id)
+
+
+# Per person, PLUS the container ceiling row (identity_id NULL) shipped now:
+# activation would otherwise grant unbounded spend on the container's shared
+# LLM credential. Every path that makes an identity active writes the
+# per-identity row from the container defaults.
+quota_policies_table = Table(
+    "quota_policies",
+    metadata,
+    Column("policy_id", String, primary_key=True),
+    # NULL identifies the container ceiling row.
+    Column(
+        "identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=True,
+    ),
+    Column("tokens_per_day", BigInteger, nullable=True),
+    # A standing LEVEL, not a daily rate. Usage is SUM(blobs.size_bytes)
+    # joined through sessions.identity_id over live rows, evaluated at each
+    # byte-admitting site. The bound is eventually consistent, not exact: the
+    # existing blob lock is keyed on session_id alone, so two sessions of one
+    # identity do not serialise against each other.
+    # Identity allowances always include storage. A container token ceiling
+    # need not activate a storage ceiling.
+    Column("storage_bytes", BigInteger, nullable=True),
+    # An ordinary checked column makes the partial singleton index reflectable
+    # on both supported dialects (SQLite omits expression indexes on reflection).
+    Column("container_slot", Integer, nullable=False, server_default="1"),
+    Column("dual_control_above_tokens", BigInteger, nullable=True),
+    # NULLABLE beside a closed actor vocabulary: the container ceiling row is
+    # derived from configuration and has no granting identity. A non-null FK
+    # with an invented placeholder identity would put a fake row in the very
+    # table R5 counts.
+    Column(
+        "set_by_identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=True,
+    ),
+    Column("set_by_actor", String, nullable=False),
+    Column("set_at", DateTime(timezone=True), nullable=False),
+    Column("revoked_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint(_QUOTA_SET_BY_ACTOR_CHECK, name="ck_quota_policies_set_by_actor"),
+    CheckConstraint("container_slot = 1", name="ck_quota_policies_container_slot"),
+    CheckConstraint("identity_id IS NULL OR storage_bytes IS NOT NULL", name="ck_quota_policies_identity_storage_required"),
+    CheckConstraint("identity_id IS NULL OR tokens_per_day IS NOT NULL", name="ck_quota_policies_identity_tokens_required"),
+    CheckConstraint("tokens_per_day IS NOT NULL OR storage_bytes IS NOT NULL", name="ck_quota_policies_has_limit"),
+    CheckConstraint(
+        "(set_by_actor = 'identity') = (set_by_identity_id IS NOT NULL)",
+        name="ck_quota_policies_identity_actor_names_an_identity",
+    ),
+)
+# TWO partial uniques: NULLs are distinct for uniqueness in Postgres, so a
+# single predicate does not cover both the per-identity rows and the one
+# container ceiling row.
+Index(
+    "uq_quota_policies_active_per_identity",
+    quota_policies_table.c.identity_id,
+    unique=True,
+    sqlite_where=quota_policies_table.c.revoked_at.is_(None),
+    postgresql_where=quota_policies_table.c.revoked_at.is_(None),
+)
+Index(
+    "uq_quota_policies_active_container_ceiling",
+    quota_policies_table.c.container_slot,
+    unique=True,
+    sqlite_where=quota_policies_table.c.revoked_at.is_(None) & quota_policies_table.c.identity_id.is_(None),
+    postgresql_where=quota_policies_table.c.revoked_at.is_(None) & quota_policies_table.c.identity_id.is_(None),
+)
+
+
+# An operational accounting INDEX, not audit truth — Landscape ``calls`` is.
+# Deliberately excluded from ``durable_history_exists``: its session_id is
+# nullable and an accounting row is not history worth refusing an archive
+# over.
+output_storage_reservations_table = Table(
+    "output_storage_reservations",
+    metadata,
+    Column("target_path", Text, primary_key=True),
+    Column("session_id", String, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True),
+    Column("run_id", String, nullable=False),
+    Column("size_bytes", BigInteger, nullable=False),
+    Column("custody_operation_id", String, nullable=False),
+    Column("custody_operation_epoch", BigInteger, nullable=False),
+    ForeignKeyConstraint(
+        ["run_id", "session_id"],
+        ["runs.id", "runs.session_id"],
+        name="fk_output_storage_reservations_run_session",
+        ondelete="CASCADE",
+    ),
+    CheckConstraint("size_bytes >= 0", name="ck_output_storage_reservations_size_nonnegative"),
+    CheckConstraint("custody_operation_epoch > 0", name="ck_output_storage_reservations_epoch_positive"),
+    *_non_blank_text_constraints("target_path", name="ck_output_storage_reservations_target_nonblank"),
+    *_non_blank_text_constraints("custody_operation_id", name="ck_output_storage_reservations_operation_nonblank"),
+)
+
+
+token_usage_ledger_table = Table(
+    "token_usage_ledger",
+    metadata,
+    Column("entry_id", String, primary_key=True),
+    # NULL for the boot probe, which spends on no identity's behalf.
+    Column(
+        "identity_id",
+        String,
+        ForeignKey("identities.identity_id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    ),
+    Column("source", String, nullable=False),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
+        nullable=True,
+    ),
+    Column("run_id", String, nullable=True),
+    Column("model", String, nullable=False),
+    Column("prompt_tokens", Integer, nullable=True),
+    Column("completion_tokens", Integer, nullable=True),
+    Column("cached_prompt_tokens", Integer, nullable=True),
+    Column("reasoning_tokens", Integer, nullable=True),
+    Column("recorded_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(_TOKEN_USAGE_SOURCE_CHECK, name="ck_token_usage_ledger_source"),
+    CheckConstraint("prompt_tokens IS NULL OR prompt_tokens >= 0", name="ck_token_usage_ledger_prompt_nonnegative"),
+    CheckConstraint("completion_tokens IS NULL OR completion_tokens >= 0", name="ck_token_usage_ledger_completion_nonnegative"),
+    CheckConstraint("cached_prompt_tokens IS NULL OR cached_prompt_tokens >= 0", name="ck_token_usage_ledger_cached_nonnegative"),
+    CheckConstraint("reasoning_tokens IS NULL OR reasoning_tokens >= 0", name="ck_token_usage_ledger_reasoning_nonnegative"),
+    CheckConstraint(
+        "(source = 'run' AND run_id IS NOT NULL) OR (source <> 'run' AND run_id IS NULL)",
+        name="ck_token_usage_ledger_run",
+    ),
+    UniqueConstraint("entry_id", "identity_id", "session_id", "source", name="uq_token_usage_ledger_custody"),
+    UniqueConstraint("entry_id", "run_id", name="uq_token_usage_ledger_run"),
+)
+
+quota_provider_attempts_table = Table(
+    "quota_provider_attempts",
+    metadata,
+    Column("attempt_id", String, primary_key=True),
+    Column("identity_id", String, ForeignKey("identities.identity_id", ondelete="RESTRICT"), nullable=False),
+    Column("session_id", String, ForeignKey("sessions.id", ondelete="RESTRICT"), nullable=False),
+    Column("source", String, nullable=False),
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("settled_at", DateTime(timezone=True), nullable=True),
+    Column("operation_id", String, nullable=False),
+    Column("operation_epoch", Integer, nullable=False),
+    Column("lease_token", String, nullable=False),
+    Column("run_id", String, nullable=True),
+    CheckConstraint("source IN ('composer', 'run', 'auto_title')", name="ck_quota_provider_attempts_source"),
+    Column("ledger_entry_id", String, nullable=True),
+    # The nullable link permits pending attempts. Settled links bind the exact
+    # owner/session/source; the separate run FK covers non-NULL run IDs. The
+    # ledger's source/run CHECK makes NULL safe for all non-run sources.
+    ForeignKeyConstraint(
+        ["ledger_entry_id", "identity_id", "session_id", "source"],
+        ["token_usage_ledger.entry_id", "token_usage_ledger.identity_id", "token_usage_ledger.session_id", "token_usage_ledger.source"],
+        name="fk_quota_provider_attempts_ledger_custody",
+        ondelete="RESTRICT",
+    ),
+    ForeignKeyConstraint(
+        ["ledger_entry_id", "run_id"],
+        ["token_usage_ledger.entry_id", "token_usage_ledger.run_id"],
+        name="fk_quota_provider_attempts_ledger_run",
+        ondelete="RESTRICT",
+    ),
+    UniqueConstraint("ledger_entry_id", name="uq_quota_provider_attempts_ledger_entry"),
+    CheckConstraint(
+        "(settled_at IS NULL AND ledger_entry_id IS NULL) OR (settled_at IS NOT NULL AND ledger_entry_id IS NOT NULL)",
+        name="ck_quota_provider_attempts_settlement",
+    ),
+    CheckConstraint(
+        "(source = 'run' AND run_id IS NOT NULL) OR (source <> 'run' AND run_id IS NULL)",
+        name="ck_quota_provider_attempts_run",
+    ),
+    CheckConstraint("operation_epoch > 0", name="ck_quota_provider_attempts_epoch"),
+)
+Index(
+    "ix_quota_provider_attempts_identity_started", quota_provider_attempts_table.c.identity_id, quota_provider_attempts_table.c.started_at
+)
+Index(
+    "ix_quota_provider_attempts_started_identity", quota_provider_attempts_table.c.started_at, quota_provider_attempts_table.c.identity_id
+)
+# The quota question is "how much has this identity spent in the current UTC
+# day", so the index carries both columns in that order.
+Index(
+    "ix_token_usage_ledger_identity_recorded",
+    token_usage_ledger_table.c.identity_id,
+    token_usage_ledger_table.c.recorded_at,
+)
+Index(
+    "ix_token_usage_ledger_recorded_identity",
+    token_usage_ledger_table.c.recorded_at,
+    token_usage_ledger_table.c.identity_id,
+)
+
+
+# Retained with its session, never durable-history archive admission. Job
+# liveness is the bound COMPOSE lease's liveness. Results are validated
+# server-authored DTOs and have no arbitrary text length limit.
+composer_async_operations_table = Table(
+    "composer_async_operations",
+    metadata,
+    Column("session_id", String(128), ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True),
+    Column("operation_id", String(36), primary_key=True),
+    Column("kind", String(32), nullable=False),
+    Column("status", String(16), nullable=False),
+    Column("request_hash", String(64), nullable=False),
+    Column("actor_user_id", String(128), ForeignKey("identities.identity_id", ondelete="RESTRICT"), nullable=False),
+    Column("request_id", String(128)),
+    Column("base_state_id", String(128)),
+    Column("request_json", Text),
+    Column("deadline_at", DateTime(timezone=True), nullable=False),
+    Column("claim_token", String(256)),
+    Column("claim_owner_instance_id", String(128)),
+    Column("claim_expires_at", DateTime(timezone=True)),
+    Column("attempt", Integer, nullable=False, server_default="0"),
+    Column("session_operation_id", String(128)),
+    Column("session_operation_lease_token", String(256)),
+    Column("session_operation_epoch", Integer),
+    Column("user_message_id", String(128)),
+    Column("cancel_requested_at", DateTime(timezone=True)),
+    Column("failure_code", String(32)),
+    Column("settled_by", String(32)),
+    Column("result_schema", String(64)),
+    Column("result_json", Text),
+    Column("result_sha256", String(64)),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("started_at", DateTime(timezone=True)),
+    Column("settled_at", DateTime(timezone=True)),
+    ForeignKeyConstraint(
+        ["user_message_id", "session_id"],
+        ["chat_messages.id", "chat_messages.session_id"],
+        ondelete="NO ACTION",
+        name="fk_composer_operations_user_message_session",
+    ),
+    ForeignKeyConstraint(
+        ["base_state_id", "session_id"],
+        ["composition_states.id", "composition_states.session_id"],
+        ondelete="NO ACTION",
+        name="fk_composer_operations_base_state_session",
+    ),
+    UniqueConstraint("session_id", "operation_id", "user_message_id", name="uq_composer_operations_ingress_binding"),
+    CheckConstraint("kind IN ('compose_message', 'compose_recompose')", name="ck_composer_operations_kind"),
+    CheckConstraint("status IN ('queued', 'running', 'completed', 'failed')", name="ck_composer_operations_status"),
+    CheckConstraint(
+        "failure_code IN ('http_error', 'operation_failed', 'worker_lost', 'request_cancelled', 'deadline_expired')",
+        name="ck_composer_operations_failure",
+    ),
+    CheckConstraint(
+        "settled_by IN ('owner_terminal', 'settle_unstarted', 'request_cancel', 'settle_lost', 'settle_own_lapsed', 'settle_lost_inactive_session')",
+        name="ck_composer_operations_settler",
+    ),
+    CheckConstraint("length(operation_id) = 36 AND attempt >= 0", name="ck_composer_operations_identity"),
+    *_lower_sha256_constraints("request_hash", name="ck_composer_operations_request_hash"),
+    *_lower_sha256_constraints("result_sha256", name="ck_composer_operations_result_hash", nullable=True),
+    CheckConstraint("session_operation_epoch IS NULL OR session_operation_epoch > 0", name="ck_composer_operations_epoch"),
+    CheckConstraint(
+        "updated_at >= created_at AND deadline_at > created_at AND "
+        "(started_at IS NULL OR started_at >= created_at) AND "
+        "(settled_at IS NULL OR settled_at >= created_at) AND "
+        "(started_at IS NULL OR settled_at IS NULL OR settled_at >= started_at)",
+        name="ck_composer_operations_times",
+    ),
+)
+composer_async_operations_table.append_constraint(
+    CheckConstraint(
+        "(status = 'queued' AND request_json IS NOT NULL AND session_operation_id IS NULL AND session_operation_lease_token IS NULL AND session_operation_epoch IS NULL AND started_at IS NULL AND result_schema IS NULL AND result_json IS NULL AND result_sha256 IS NULL AND failure_code IS NULL AND settled_by IS NULL AND settled_at IS NULL AND user_message_id IS NULL AND ((claim_token IS NULL AND claim_owner_instance_id IS NULL AND claim_expires_at IS NULL) OR (claim_token IS NOT NULL AND claim_owner_instance_id IS NOT NULL AND claim_expires_at IS NOT NULL))) OR (status = 'running' AND request_json IS NOT NULL AND claim_token IS NOT NULL AND claim_owner_instance_id IS NOT NULL AND started_at IS NOT NULL AND session_operation_id IS NOT NULL AND session_operation_lease_token IS NOT NULL AND session_operation_epoch IS NOT NULL AND claim_expires_at IS NULL AND result_schema IS NULL AND result_json IS NULL AND result_sha256 IS NULL AND failure_code IS NULL AND settled_by IS NULL AND settled_at IS NULL) OR (status = 'completed' AND request_json IS NULL AND claim_token IS NULL AND claim_expires_at IS NULL AND cancel_requested_at IS NULL AND failure_code IS NULL AND claim_owner_instance_id IS NOT NULL AND started_at IS NOT NULL AND result_json IS NOT NULL AND result_sha256 IS NOT NULL AND settled_at IS NOT NULL AND settled_by IS NOT NULL AND session_operation_id IS NOT NULL AND session_operation_lease_token IS NOT NULL AND session_operation_epoch IS NOT NULL AND result_schema = 'message_with_state.v1') OR (status = 'failed' AND request_json IS NULL AND claim_token IS NULL AND claim_expires_at IS NULL AND result_json IS NOT NULL AND result_sha256 IS NOT NULL AND settled_at IS NOT NULL AND failure_code IS NOT NULL AND settled_by IS NOT NULL AND result_schema = 'composer_operation_error.v1' AND ((session_operation_id IS NULL AND session_operation_lease_token IS NULL AND session_operation_epoch IS NULL AND started_at IS NULL) OR (session_operation_id IS NOT NULL AND session_operation_lease_token IS NOT NULL AND session_operation_epoch IS NOT NULL AND started_at IS NOT NULL AND claim_owner_instance_id IS NOT NULL)))",
+        name="ck_composer_operations_status_bundle",
+    )
+)
+
+Index(
+    "uq_composer_async_operations_one_nonterminal_per_session",
+    composer_async_operations_table.c.session_id,
+    unique=True,
+    sqlite_where=composer_async_operations_table.c.status.in_(("queued", "running")),
+    postgresql_where=composer_async_operations_table.c.status.in_(("queued", "running")),
+)
+Index(
+    "ix_composer_async_operations_claimable",
+    composer_async_operations_table.c.status,
+    composer_async_operations_table.c.claim_expires_at,
+    composer_async_operations_table.c.created_at,
+    sqlite_where=composer_async_operations_table.c.status == "queued",
+    postgresql_where=composer_async_operations_table.c.status == "queued",
+)
+Index(
+    "uq_composer_async_operations_bound_fence",
+    composer_async_operations_table.c.session_id,
+    composer_async_operations_table.c.session_operation_epoch,
+    unique=True,
+    sqlite_where=composer_async_operations_table.c.session_operation_epoch.is_not(None),
+    postgresql_where=composer_async_operations_table.c.session_operation_epoch.is_not(None),
+)
+
+
+composer_async_operations_table.append_constraint(
+    CheckConstraint(
+        f"request_json IS NULL OR length(CAST(request_json AS BLOB)) <= {COMPOSER_OPERATION_REQUEST_JSON_MAX_LENGTH}",
+        name="ck_composer_operations_request_bytes",
+    ).ddl_if(dialect="sqlite")
+)
+composer_async_operations_table.append_constraint(
+    CheckConstraint(
+        f"request_json IS NULL OR octet_length(request_json) <= {COMPOSER_OPERATION_REQUEST_JSON_MAX_LENGTH}",
+        name="ck_composer_operations_request_bytes",
+    ).ddl_if(dialect="postgresql")
+)
+
+
+def _composer_operation_ddl(statement: str) -> DDL:
+    """Type the pinned SQLAlchemy DDL constructor's external string ABI."""
+    constructor = cast(Callable[[str], DDL], DDL)
+    return constructor(statement)
+
+
+event.listen(
+    composer_async_operations_table,
+    "after_create",
+    _composer_operation_ddl(
+        "CREATE TRIGGER trg_composer_async_operations_transition_guard BEFORE UPDATE ON composer_async_operations FOR EACH ROW WHEN (NEW.status IN ('queued', 'running') AND NEW.request_json IS NOT OLD.request_json) OR (OLD.status = 'queued' AND NEW.status = 'completed') OR (OLD.status = 'running' AND NEW.status = 'running' AND NEW.claim_token IS NOT OLD.claim_token) OR OLD.status IN ('completed', 'failed') OR (OLD.status = 'running' AND NEW.status = 'queued') OR NEW.session_id IS NOT OLD.session_id OR NEW.operation_id IS NOT OLD.operation_id OR NEW.kind IS NOT OLD.kind OR NEW.request_hash IS NOT OLD.request_hash OR NEW.actor_user_id IS NOT OLD.actor_user_id OR NEW.request_id IS NOT OLD.request_id OR NEW.base_state_id IS NOT OLD.base_state_id OR NEW.created_at IS NOT OLD.created_at OR NEW.deadline_at IS NOT OLD.deadline_at OR (OLD.status = 'running' AND (NEW.claim_owner_instance_id IS NOT OLD.claim_owner_instance_id OR NEW.session_operation_id IS NOT OLD.session_operation_id OR NEW.session_operation_lease_token IS NOT OLD.session_operation_lease_token OR NEW.session_operation_epoch IS NOT OLD.session_operation_epoch OR NEW.started_at IS NOT OLD.started_at OR NEW.attempt IS NOT OLD.attempt)) OR (OLD.cancel_requested_at IS NOT NULL AND (NEW.cancel_requested_at IS NOT OLD.cancel_requested_at)) OR (OLD.user_message_id IS NOT NULL AND (NEW.user_message_id IS NOT OLD.user_message_id)) BEGIN SELECT RAISE(ABORT, 'composer operation immutable transition'); END"
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    composer_async_operations_table,
+    "after_create",
+    _composer_operation_ddl(
+        "CREATE TRIGGER trg_composer_async_operations_no_delete_live BEFORE DELETE ON composer_async_operations FOR EACH ROW WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id) BEGIN SELECT RAISE(ABORT, 'composer operation retained with session'); END"
+    ).execute_if(dialect="sqlite"),
+)
+POSTGRESQL_COMPOSER_OPERATION_DDL: tuple[PostgresqlAuditDDL, ...] = (
+    PostgresqlAuditDDL(
+        table=composer_async_operations_table,
+        trigger_name="trg_composer_async_operations_transition_guard",
+        function_name="elspeth_composer_operations_guard",
+        function_sql="CREATE FUNCTION elspeth_composer_operations_guard() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF (NEW.status IN ('queued', 'running') AND (NEW.request_json IS DISTINCT FROM OLD.request_json)) OR (OLD.status = 'queued' AND NEW.status = 'completed') OR (OLD.status = 'running' AND NEW.status = 'running' AND NEW.claim_token IS DISTINCT FROM OLD.claim_token) OR OLD.status IN ('completed', 'failed') OR (OLD.status = 'running' AND NEW.status = 'queued') OR NEW.session_id IS DISTINCT FROM OLD.session_id OR NEW.operation_id IS DISTINCT FROM OLD.operation_id OR NEW.kind IS DISTINCT FROM OLD.kind OR NEW.request_hash IS DISTINCT FROM OLD.request_hash OR NEW.actor_user_id IS DISTINCT FROM OLD.actor_user_id OR NEW.request_id IS DISTINCT FROM OLD.request_id OR NEW.base_state_id IS DISTINCT FROM OLD.base_state_id OR NEW.created_at IS DISTINCT FROM OLD.created_at OR NEW.deadline_at IS DISTINCT FROM OLD.deadline_at OR (OLD.status = 'running' AND (NEW.claim_owner_instance_id IS DISTINCT FROM OLD.claim_owner_instance_id OR NEW.session_operation_id IS DISTINCT FROM OLD.session_operation_id OR NEW.session_operation_lease_token IS DISTINCT FROM OLD.session_operation_lease_token OR NEW.session_operation_epoch IS DISTINCT FROM OLD.session_operation_epoch OR NEW.started_at IS DISTINCT FROM OLD.started_at OR NEW.attempt IS DISTINCT FROM OLD.attempt)) OR (OLD.cancel_requested_at IS NOT NULL AND (NEW.cancel_requested_at IS DISTINCT FROM OLD.cancel_requested_at)) OR (OLD.user_message_id IS NOT NULL AND (NEW.user_message_id IS DISTINCT FROM OLD.user_message_id)) THEN RAISE EXCEPTION 'composer operation immutable transition' USING ERRCODE = '23514'; END IF; RETURN NEW; END $$",
+        trigger_sql="CREATE TRIGGER trg_composer_async_operations_transition_guard BEFORE UPDATE ON composer_async_operations FOR EACH ROW EXECUTE FUNCTION elspeth_composer_operations_guard()",
+    ),
+    PostgresqlAuditDDL(
+        table=composer_async_operations_table,
+        trigger_name="trg_composer_async_operations_no_delete_live",
+        function_name="elspeth_composer_operations_delete_guard",
+        function_sql="CREATE FUNCTION elspeth_composer_operations_delete_guard() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id) THEN RAISE EXCEPTION 'composer operation retained with session' USING ERRCODE = '23514'; END IF; RETURN OLD; END $$",
+        trigger_sql="CREATE TRIGGER trg_composer_async_operations_no_delete_live BEFORE DELETE ON composer_async_operations FOR EACH ROW EXECUTE FUNCTION elspeth_composer_operations_delete_guard()",
+    ),
+)
+POSTGRESQL_AUDIT_DDL_COHORT += POSTGRESQL_COMPOSER_OPERATION_DDL
+for composer_operation_ddl in POSTGRESQL_COMPOSER_OPERATION_DDL:
+    event.listen(
+        composer_async_operations_table,
+        "after_create",
+        _composer_operation_ddl(composer_operation_ddl.function_sql).execute_if(dialect="postgresql"),
+    )
+    event.listen(
+        composer_async_operations_table,
+        "after_create",
+        _composer_operation_ddl(composer_operation_ddl.trigger_sql).execute_if(dialect="postgresql"),
+    )
+
+message_ingress_receipts_table.append_constraint(
+    ForeignKeyConstraint(
+        ["session_id", "operation_id", "user_message_id"],
+        ["composer_async_operations.session_id", "composer_async_operations.operation_id", "composer_async_operations.user_message_id"],
+        name="fk_message_ingress_receipts_composer_operation",
+        ondelete="CASCADE",
+    )
+)
+
+composer_async_operations_table.append_constraint(
+    CheckConstraint("status = 'queued' OR status = 'failed' OR attempt > 0", name="ck_composer_operations_started_attempt")
+)
+composer_async_operations_table.append_constraint(
+    CheckConstraint("status <> 'completed' OR user_message_id IS NOT NULL", name="ck_composer_operations_completed_user")
+)
+composer_async_operations_table.append_constraint(
+    CheckConstraint("status = 'queued' OR status = 'running' OR result_schema IS NOT NULL", name="ck_composer_operations_terminal_schema")
+)

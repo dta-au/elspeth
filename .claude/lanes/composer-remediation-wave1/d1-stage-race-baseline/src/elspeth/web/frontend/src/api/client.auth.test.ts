@@ -1,0 +1,85 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { fetchAuthConfig, logoutSession, verifyEmail } from "./client";
+import { useAuthStore } from "@/stores/authStore";
+import { resetStore } from "@/test/store-helpers";
+
+describe("api/client auth helpers", () => {
+  beforeEach(() => {
+    globalThis.fetch = vi.fn();
+    localStorage.clear();
+    resetStore(useAuthStore);
+  });
+
+  it("posts the captured logout token after current credential custody changed", async () => {
+    localStorage.setItem("auth_token", "replacement-token");
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await logoutSession("original-token");
+    expect(globalThis.fetch).toHaveBeenCalledWith("/api/auth/logout", expect.objectContaining({
+      method: "POST",
+      headers: { Authorization: "Bearer original-token" },
+      signal: expect.any(AbortSignal),
+    }));
+    expect(localStorage.getItem("auth_token")).toBe("replacement-token");
+  });
+
+  it("reports logout rejection without clearing a replacement session", async () => {
+    localStorage.setItem("auth_token", "replacement-token");
+    useAuthStore.setState({ token: "replacement-token" });
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(new Response(
+      JSON.stringify({ detail: "Invalid token" }),
+      { status: 401, headers: { "content-type": "application/json" } },
+    ));
+    await expect(logoutSession("original-token")).rejects.toMatchObject({ status: 401 });
+    expect(useAuthStore.getState().token).toBe("replacement-token");
+    expect(localStorage.getItem("auth_token")).toBe("replacement-token");
+  });
+
+  it("does not log out an existing session when email verification returns 401", async () => {
+    const user = {
+      user_id: "alice",
+      username: "alice",
+      display_name: "Alice",
+      email: "alice@example.com",
+      groups: [],
+    };
+    localStorage.setItem("auth_token", "still-valid");
+    useAuthStore.setState({
+      token: "still-valid",
+      user,
+      loginError: null,
+      isLoading: false,
+    } as never);
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: "Email verification token expired" }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    await expect(verifyEmail("expired-token")).rejects.toMatchObject({
+      status: 401,
+    });
+    expect(useAuthStore.getState().token).toBe("still-valid");
+    expect(useAuthStore.getState().user).toEqual(user);
+    expect(localStorage.getItem("auth_token")).toBe("still-valid");
+  });
+
+  it("bypasses browser caches when fetching auth authority metadata", async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          provider: "oidc",
+          registration_mode: "closed",
+          sso_start_url: "https://elspeth.example.gov.au/api/auth/sso/start",
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    await fetchAuthConfig();
+
+    expect(globalThis.fetch).toHaveBeenCalledWith("/api/auth/config", {
+      cache: "no-store",
+    });
+  });
+});

@@ -1,0 +1,61 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 66 items / 43 deselected / 23 selected
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py . [  4%]
+...................F..                                                   [100%]
+
+=================================== FAILURES ===================================
+______ test_blob_marker_admission_checks_real_metadata_and_modality[llm] _______
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-46/test_blob_marker_admission_che2')
+blob_kind = 'llm'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("blob_kind", ("user", "missing", "llm"))
+    async def test_blob_marker_admission_checks_real_metadata_and_modality(tmp_path: Path, blob_kind: str) -> None:
+        from elspeth.web.composer.tools import blobs
+        from tests.helpers.session_fences import fenced_operation_context
+        from tests.unit.web.composer.test_blob_inline_tools import _inline_ref_state
+    
+        harness = _harness(tmp_path)
+        state = _inline_ref_state()
+        blob_id = uuid4()
+        if blob_kind == "user":
+            with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as operation:
+                blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+                    UUID(harness.session_id), "prompt.txt", b"A user supplied prompt", "text/plain",
+                    session_operation_context=operation,
+                )
+            blob_id = blob.id
+        elif blob_kind == "llm":
+            snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.catalog)
+            view = PolicyCatalogView.for_trained_operator(harness.catalog, snapshot)
+            with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.COMPOSE) as operation:
+                created = real_execute_tool(
+                    "create_blob", {"filename": "prompt.txt", "mime_type": "text/plain", "content": "Generated prompt content"},
+                    state, view, plugin_snapshot=snapshot, data_dir=str(tmp_path), session_engine=harness.engine,
+                    session_id=harness.session_id, session_operation_context=operation,
+                    session_operation_authority=harness.sessions.session_operation_authority,
+                    user_message_id=harness.user_message_id, user_message_content="Generate a prompt.",
+                    composer_model_identifier="test-model", composer_model_version="test-v1", composer_provider="test",
+                    composer_skill_hash="a" * 64, tool_arguments_hash="b" * 64,
+                )
+            assert created.success is True
+>           assert created.data["creation_modality"] == "llm_generated"
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           KeyError: 'creation_modality'
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1885: KeyError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:24:36 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:24:36 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:24:36 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+=========================== short test summary info ============================
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_blob_marker_admission_checks_real_metadata_and_modality[llm]
+================= 1 failed, 22 passed, 43 deselected in 18.50s =================

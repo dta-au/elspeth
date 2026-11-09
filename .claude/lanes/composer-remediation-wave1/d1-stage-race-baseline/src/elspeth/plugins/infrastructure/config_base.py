@@ -1,0 +1,785 @@
+"""Base classes for typed plugin configurations.
+
+This module provides base classes that plugins inherit from to get:
+- Strict validation (reject unknown fields)
+- Factory methods with clear error messages
+- Common validation patterns (path handling, etc.)
+
+Example usage:
+    class CSVSourceConfig(PathConfig):
+        delimiter: str = ","
+        encoding: str = "utf-8"
+
+    cfg = CSVSourceConfig.from_dict(config)
+    path = cfg.path  # Direct access, fails fast if missing
+"""
+
+import json
+from pathlib import Path
+from typing import Annotated, Any, ClassVar, Final, Literal, Self
+
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+
+from elspeth.contracts.emitted_option import (
+    EmittedToOutput,
+    emitted_option_values,
+    env_placeholders_in,
+)
+from elspeth.contracts.header_modes import HeaderMode, parse_header_mode
+from elspeth.contracts.schema import FIELD_TYPE_MAP, SchemaConfig
+
+OutputCollisionPolicy = Literal["fail_if_exists", "auto_increment", "append_or_create"]
+
+# The header-mode option, shared by every sink that writes a header row.
+#
+# Declared once as an annotated alias rather than spelled out per sink. The
+# three declaring models do NOT share a base — ``SinkPathConfig`` descends from
+# ``LocalFileSinkConfig`` while the S3 and Azure sink configs descend straight
+# from ``DataPluginConfig`` — so there is no inherited field to mark, and
+# marking each site by hand is the drift shape this alias exists to prevent.
+# A mixin would unify them but reorders fields in ``model_json_schema()``
+# (inherited fields sort first), which is wire-shape churn for no behavioural
+# gain; the alias changes no emitted schema at all.
+#
+# The CUSTOM mapping form's VALUES are written as the artifact's header row, so
+# a ``${VAR}`` here reaches output bytes as a host environment value
+# (elspeth-8f0a6b3391).
+HeaderModeOption = Annotated[
+    str | dict[str, str] | None,
+    EmittedToOutput("a sink writes these names as the artifact's header row, so the value reaches the output bytes"),
+]
+
+# Shared normalization options for every source/transform that turns external
+# tabular names into pipeline row keys. Several plugin config classes cannot
+# share ``TabularSourceDataConfig`` but do share the same wire fields; aliases
+# keep the output-emission fact attached across those independent declarations.
+NormalizedColumnsOption = Annotated[
+    list[str] | None,
+    EmittedToOutput("each configured column becomes an output row field name and a column in downstream artifacts"),
+]
+NormalizedFieldMappingOption = Annotated[
+    dict[str, str] | None,
+    EmittedToOutput("field-mapping values become normalized output row keys and columns in downstream artifacts"),
+]
+
+# --- Composer-surface help text -------------------------------------------
+#
+# ``Field(description=...)`` is the CLI/YAML truth and stays as-is: it
+# describes what the field means in a hand-authored settings file. The web
+# composer renders these fields as a bare form with no surrounding document,
+# and the web surface is *narrower* than YAML for paths. Those fields carry a
+# ``composer_description`` (and, where the value has internal structure, a
+# ``composer_placeholder``) in ``json_schema_extra``; the catalog's knob
+# lowering substitutes it for ``description`` on that surface only. See
+# ``elspeth.web.catalog.knob_schema._composer_description``.
+
+# The worked example rendered into COMPOSER_SCHEMA_DESCRIPTION. It is data, not
+# prose, so a test can feed this exact object through ``SchemaConfig.from_dict``
+# and prove the help text advertises a shape the parser actually accepts.
+COMPOSER_SCHEMA_EXAMPLE: Final[dict[str, Any]] = {
+    "mode": "fixed",
+    "fields": ["doc_id: str", "page_count: int", "note: str?"],
+}
+
+# The compact form used as the form-input placeholder.
+COMPOSER_SCHEMA_PLACEHOLDER: Final[str] = json.dumps({"mode": "fixed", "fields": ["doc_id: str", "note: str?"]})
+
+# Field types come from the authoritative grammar (FIELD_TYPE_MAP, which
+# FIELD_PATTERN's alternation mirrors) so a new legal type cannot appear in the
+# parser while the help text still lists the old five.
+COMPOSER_SCHEMA_DESCRIPTION: Final[str] = (
+    f"Enter one JSON object. Worked example: {json.dumps(COMPOSER_SCHEMA_EXAMPLE)}. "
+    f'Every entry in "fields" is the string "name: type", where type is one of '
+    f'{", ".join(FIELD_TYPE_MAP)}, and a trailing "?" marks the field optional '
+    f'("note: str?" is an optional string). Field names must be valid Python '
+    f'identifiers — write "doc_id", not "doc-id" or "doc.id". '
+    f'Modes: "fixed" accepts exactly these fields, "flexible" accepts these plus '
+    f'any extras the data carries, and "observed" infers every field from the '
+    f'data — with "observed" leave "fields" out entirely ({{"mode": "observed"}}).'
+)
+
+COMPOSER_PATH_DESCRIPTION: Final[str] = (
+    "On the web surface this field takes one of exactly two values: the sentinel "
+    '"blob:<uuid>" naming a file uploaded to this session — normally prefilled for '
+    "you, so leave it as it is — or a plain path that resolves inside this "
+    "session's own subtree (a source reads from <data_dir>/blobs/<session_id>/; an "
+    "output writes to <data_dir>/outputs/<session_id>/ or "
+    "<data_dir>/blobs/<session_id>/). Every other path is rejected, including "
+    "another session's subtree, a shared or deployment-level directory, and any "
+    "absolute path outside those trees. Hand-authored YAML runs are not confined "
+    "this way."
+)
+
+
+def _plugin_config_field_title(field_name: str, _field_info: Any) -> str:
+    """Generate stable human-facing titles for plugin configuration fields."""
+    words = field_name.removesuffix("_config").replace("_", " ").split()
+    acronyms = {"api", "csv", "http", "id", "json", "jsonl", "llm", "rag", "sql", "ssl", "url", "xml"}
+    return " ".join(word.upper() if word in acronyms else word.capitalize() for word in words)
+
+
+class PluginConfigError(Exception):
+    """Raised when plugin configuration is invalid.
+
+    Attributes:
+        cause: The underlying validation message without the class-name prefix.
+               Callers should read this instead of parsing str(exc).
+               None only when the raise site omits the keyword argument (legacy
+               or non-from_dict paths such as plugin __init__ guards).
+        plugin_class: The config class name (e.g. ``'CSVSourceConfig'``), or
+                      None when raised outside ``from_dict()``. Callers can use
+                      the suffix to infer component type without regex-parsing.
+        plugin_name: The runtime plugin name (e.g. ``'csv'``), as it appears
+                     in pipeline YAML. Set by ``from_dict()`` when provided by
+                     the caller. None when the caller doesn't know the name
+                     (direct ``from_dict()`` calls without context) or when
+                     raised outside ``from_dict()``.
+        component_type: The pipeline component type (``'source'``, ``'sink'``,
+                        ``'transform'``), or None when raised outside
+                        ``from_dict()`` or when the type is unknown.
+                        Set from the config class hierarchy's
+                        ``_plugin_component_type`` attribute.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        cause: str | None = None,
+        plugin_class: str | None = None,
+        plugin_name: str | None = None,
+        component_type: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.cause: str | None = cause
+        self.plugin_class: str | None = plugin_class
+        self.plugin_name: str | None = plugin_name
+        self.component_type: str | None = component_type
+
+
+def _format_validation_error_location(loc: tuple[Any, ...]) -> str:
+    """Render a Pydantic error location as a stable user-facing field path."""
+    if not loc:
+        return "config"
+
+    parts: list[str] = []
+    for item in loc:
+        match item:
+            case int() as index:
+                if parts:
+                    parts[-1] = f"{parts[-1]}[{index}]"
+                else:
+                    parts.append(f"[{index}]")
+            case _:
+                parts.append(str(item))
+    return ".".join(parts)
+
+
+_SCHEMA_REQUIRED_GUIDANCE = (
+    "Field required. "
+    "Use 'schema: {mode: observed}' to infer types from data, "
+    "or provide explicit field definitions with mode (fixed/flexible)."
+)
+
+
+def _format_validation_error_cause(exc: ValidationError) -> str:
+    """Build a class-name-free validation summary from structured Pydantic data.
+
+    For the schema-required-on-DataPluginConfig case (the most common LLM-composer
+    first-attempt failure shape — cf. elspeth-861b0c58f5), enrich the bare
+    Pydantic ``"Field required"`` message with the available mode options so
+    the LLM can self-repair on the next turn rather than echo the unhelpful
+    message back at the operator. All other Pydantic errors pass through
+    unchanged so multi-field failures (e.g. missing schema AND missing path)
+    still report every issue.
+    """
+    lines: list[str] = []
+    for error in exc.errors(include_input=False):
+        loc = tuple(error["loc"])
+        location = _format_validation_error_location(loc)
+        message = error["msg"]
+        if loc == ("schema",) and error["type"] == "missing":
+            message = _SCHEMA_REQUIRED_GUIDANCE
+        lines.append(f"{location}: {message}")
+    return "\n".join(lines)
+
+
+def _validate_schema_config(value: Any, *, require_dict: bool) -> SchemaConfig | None:
+    """Validate and parse schema config from dict or pass through SchemaConfig instance.
+
+    This validator enables Pydantic to accept schema dicts with string field specs
+    like "line: str" that need parsing via SchemaConfig.from_dict().
+
+    Args:
+        value: The schema config value to validate.
+        require_dict: If True, value must be a dict (rejects None and other types).
+            Used when 'schema' key was explicitly provided in the input.
+    """
+    if value is None:
+        if require_dict:
+            raise ValueError(
+                f"'schema' must be a dict, got {type(value).__name__}. "
+                f"Use 'schema: {{mode: observed}}' or provide explicit field definitions."
+            )
+        return None
+    if isinstance(value, SchemaConfig):
+        return value
+    if isinstance(value, dict):
+        return SchemaConfig.from_dict(value)
+    raise ValueError(
+        f"'schema' must be a dict, got {type(value).__name__}. Use 'schema: {{mode: observed}}' or provide explicit field definitions."
+    )
+
+
+class PluginConfig(BaseModel):
+    """Base class for typed plugin configurations.
+
+    Provides common validation patterns and helpful error messages.
+    All plugin configs should inherit from this class.
+
+    Schema is optional in the base class. Subclasses that process data
+    (DataPluginConfig) require schema to be specified.
+
+    The schema field is exposed as "schema" in JSON Schema (for LLM tools and YAML)
+    but stored internally as "schema_config" to avoid shadowing Python's built-in.
+    """
+
+    _plugin_component_type: ClassVar[str | None] = None
+
+    model_config = {
+        "extra": "forbid",
+        "frozen": True,
+        "populate_by_name": True,  # Allow both "schema" (alias) and "schema_config" (field name)
+        "field_title_generator": _plugin_config_field_title,
+    }
+
+    schema_config: SchemaConfig | None = Field(
+        default=None,
+        alias="schema",
+        description="Schema configuration for data validation.",
+    )
+
+    @field_validator("schema_config", mode="before")
+    @classmethod
+    def _parse_schema_config(cls, value: Any) -> SchemaConfig | None:
+        """Parse schema dict to SchemaConfig, handling string field specs.
+
+        Accepts:
+        - SchemaConfig instance (passthrough)
+        - dict (parsed via SchemaConfig.from_dict())
+        - None (allowed for PluginConfig, rejected by DataPluginConfig override)
+
+        Raises ValueError for other types (str, list, int, etc.)
+
+        Error messages use 'schema' to match the user-facing alias.
+        """
+        return _validate_schema_config(value, require_dict=False)
+
+    @model_validator(mode="after")
+    def _reject_env_placeholders_in_emitted_options(self) -> Self:
+        """Refuse a raw ``${VAR}`` in any field declared :class:`EmittedToOutput`.
+
+        DERIVED, not restated: the fields come from the model's own annotations,
+        so a plugin declares the fact once on the field and gets this check for
+        free. Nothing here lists a plugin or a field name.
+
+        This is the plugin-side half. It is BYPASSABLE on the CLI/YAML path,
+        where ``_expand_env_vars`` runs before plugin validation and hands this
+        validator an already-expanded host value that no longer matches. The
+        pre-expansion guard in the settings loader closes that window and reads
+        the same declarations. Neither is redundant; both derive from here.
+        """
+        for path, value, reason in emitted_option_values(type(self), self):
+            if env_placeholders_in(value):
+                raise ValueError(f"{path} must not contain environment-variable placeholders; {reason}")
+        return self
+
+    @classmethod
+    def from_dict(
+        cls,
+        config: object,
+        *,
+        plugin_name: str | None = None,
+    ) -> Self:
+        """Create config from dict with clear error on validation failure.
+
+        Args:
+            config: Configuration value — expected to be a dict but typed as
+                ``object`` because callers may pass unsanitized YAML output.
+                Non-dict values are rejected with PluginConfigError.
+                Accepts "schema" key (preferred, matches YAML format) or
+                "schema_config" for backwards compatibility.
+            plugin_name: Runtime plugin name (e.g. ``'csv'``). Threaded into
+                PluginConfigError so consumers get both the internal class name
+                and the user-facing plugin name without string parsing.
+
+        Returns:
+            Validated configuration instance.
+
+        Raises:
+            PluginConfigError: If configuration is invalid.
+        """
+        _err_fields: dict[str, Any] = {
+            "cause": "",
+            "plugin_class": cls.__name__,
+            "plugin_name": plugin_name,
+            "component_type": cls._plugin_component_type,
+        }
+
+        if not isinstance(config, dict):
+            _err_fields["cause"] = f"config must be a dict, got {type(config).__name__}."
+            raise PluginConfigError(
+                f"Invalid configuration for {cls.__name__}: {_err_fields['cause']}",
+                **_err_fields,
+            )
+
+        # Pre-validate: reject explicit non-dict schema values.
+        # Pydantic can't distinguish "key absent" from "key explicitly None",
+        # so we check here before passing to model_validate.
+        for key in ("schema", "schema_config"):
+            if key in config:
+                value = config[key]
+                if not isinstance(value, (dict, SchemaConfig)):
+                    _err_fields["cause"] = (
+                        f"'schema' must be a dict, got {type(value).__name__}. "
+                        f"Use 'schema: {{mode: observed}}' or provide explicit field definitions."
+                    )
+                    raise PluginConfigError(
+                        f"Invalid configuration for {cls.__name__}: {_err_fields['cause']}",
+                        **_err_fields,
+                    )
+
+        try:
+            # model_validate handles the schema alias and field_validator parses dicts
+            return cls.model_validate(config)
+        except ValidationError as e:
+            _err_fields["cause"] = _format_validation_error_cause(e)
+            raise PluginConfigError(
+                f"Invalid configuration for {cls.__name__}: {_err_fields['cause']}",
+                **_err_fields,
+            ) from e
+        except ValueError as e:
+            _err_fields["cause"] = str(e)
+            raise PluginConfigError(
+                f"Invalid configuration for {cls.__name__}: {e}",
+                **_err_fields,
+            ) from e
+
+
+_VALID_PLUGIN_COMPONENT_TYPES: tuple[str, ...] = ("source", "sink", "transform")
+"""Allowed values for ``_plugin_component_type`` on DataPluginConfig subclasses."""
+
+
+class DataPluginConfig(PluginConfig):
+    """Base class for data-processing plugin configurations.
+
+    Used by sources, transforms, and sinks that handle data rows.
+    Schema is REQUIRED to ensure auditable schema choices.
+
+    Use 'schema: {mode: observed}' to infer types from data, or provide
+    explicit field definitions with mode (fixed/flexible).
+
+    Type Safety:
+        This class overrides schema_config from Optional to required.
+        Pydantic validates this at construction time, and mypy sees the
+        narrowed type - no cast() needed in plugin implementations.
+
+    Component Type Enforcement:
+        All subclasses must set ``_plugin_component_type`` to ``'source'``,
+        ``'sink'``, or ``'transform'`` — either directly or by inheriting
+        from an intermediate base (SourceDataConfig, SinkPathConfig,
+        TransformDataConfig). Intermediate bases that intentionally leave
+        the type unset must declare ``_component_type_exempt = True`` in
+        their own class body; this exemption does not propagate to children.
+    """
+
+    _component_type_exempt: ClassVar[bool] = True
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        # Own-namespace check only (NOT inherited): the exemption must be
+        # re-declared per intermediate base and does not propagate to children.
+        # Membership-then-subscript on cls.__dict__ keeps that own-class scoping
+        # without a defensive default — the key is legitimately absent on most
+        # subclasses, so absence is the normal path, not an anomaly.
+        if "_component_type_exempt" in cls.__dict__ and cls.__dict__["_component_type_exempt"] is True:
+            return
+        if cls._plugin_component_type is None:
+            raise TypeError(
+                f"{cls.__qualname__} inherits from DataPluginConfig but does not "
+                f"set _plugin_component_type. Set it to 'source', 'sink', or "
+                f"'transform' (directly or via an intermediate base like "
+                f"SourceDataConfig, SinkPathConfig, or TransformDataConfig)."
+            )
+        if cls._plugin_component_type not in _VALID_PLUGIN_COMPONENT_TYPES:
+            # A non-None but invalid label would otherwise reach downstream
+            # validation and audit attribution (PluginConfigError.component_type)
+            # unchecked — reject it at class creation. (elspeth-d876f7b31b)
+            raise TypeError(
+                f"{cls.__qualname__} sets _plugin_component_type="
+                f"{cls._plugin_component_type!r}, which must be one of "
+                f"{', '.join(repr(t) for t in _VALID_PLUGIN_COMPONENT_TYPES)}."
+            )
+
+    # Override parent's Optional field with required field.
+    # This provides both runtime validation (Pydantic) and static typing (mypy).
+    # Alias matches parent - required for Pydantic to properly override.
+    # The parent's model_validator handles parsing; this just enforces required.
+    schema_config: SchemaConfig = Field(
+        ...,
+        alias="schema",
+        description=(
+            "Schema configuration for data validation. "
+            "Use 'schema: {mode: observed}' to infer types from data, or "
+            "provide explicit field definitions with mode (fixed/flexible)."
+        ),
+        json_schema_extra={
+            "composer_description": COMPOSER_SCHEMA_DESCRIPTION,
+            "composer_placeholder": COMPOSER_SCHEMA_PLACEHOLDER,
+        },
+    )
+
+
+class PathConfig(DataPluginConfig):
+    """Base for configs that include file paths.
+
+    Extends DataPluginConfig because file-based plugins process data rows
+    and therefore require schema configuration.
+
+    Provides path validation and resolution relative to a base directory.
+    """
+
+    _component_type_exempt: ClassVar[bool] = True
+
+    path: str = Field(
+        description="Filesystem path for the source input or sink output, resolved relative to the run data directory.",
+        json_schema_extra={"composer_description": COMPOSER_PATH_DESCRIPTION},
+    )
+
+    @field_validator("path")
+    @classmethod
+    def validate_path_not_empty(cls, v: str) -> str:
+        """Validate that path is not empty or whitespace-only."""
+        if not v or not v.strip():
+            raise ValueError("path cannot be empty")
+        return v
+
+    def resolved_path(self, base_dir: Path | None = None) -> Path:
+        """Resolve path relative to base directory if provided.
+
+        Args:
+            base_dir: Base directory for relative path resolution.
+                     If None, path is returned as-is.
+
+        Returns:
+            Resolved Path object.
+        """
+        p = Path(self.path)
+        if base_dir and not p.is_absolute():
+            return base_dir / p
+        return p
+
+
+class SourceDataConfig(PathConfig):
+    """Base config for source plugins with quarantine routing.
+
+    Extends PathConfig to add required on_validation_failure field.
+    All sources must specify where non-conformant rows go.
+
+    Note: on_success routing is defined at the settings level
+    (SourceSettings in core/config.py), not here. The bridge in
+    runtime_factory.py injects on_success after plugin construction.
+    """
+
+    _plugin_component_type: ClassVar[str | None] = "source"
+
+    on_validation_failure: str = Field(
+        ...,  # Required - no default
+        description="Sink name for non-conformant rows, or 'discard' for explicit drop",
+    )
+
+    @field_validator("on_validation_failure")
+    @classmethod
+    def validate_on_validation_failure(cls, v: str) -> str:
+        """Ensure on_validation_failure is not empty."""
+        if not v or not v.strip():
+            raise ValueError("on_validation_failure must be a sink name or 'discard'")
+        return v.strip()
+
+
+def declared_source_schema_field_names(schema_config: SchemaConfig | None) -> tuple[str, ...]:
+    """Names a source's schema config commits to producing on rows.
+
+    Declared field names (required and optional) plus guaranteed_fields and
+    required_fields entries — observed schemas carry the latter two without
+    declared fields. Deduplicated in first-declaration order so reachability
+    diagnostics report each name once, in the order the author wrote them.
+    """
+    if schema_config is None:
+        return ()
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for group in (
+        tuple(field.name for field in schema_config.fields) if schema_config.fields is not None else (),
+        schema_config.guaranteed_fields or (),
+        schema_config.required_fields or (),
+    ):
+        for name in group:
+            if name not in seen:
+                seen.add(name)
+                names.append(name)
+    return tuple(names)
+
+
+class TabularSourceDataConfig(SourceDataConfig):
+    """Config for sources that read tabular external data with headers.
+
+    Extends SourceDataConfig with field normalization options:
+    - columns: Explicit column names for headerless files
+    - field_mapping: Override specific normalized names
+
+    Field normalization is mandatory at all source boundaries. Raw headers
+    are always normalized to valid Python identifiers. The columns config
+    provides clean names for headerless files (mutually exclusive path).
+    """
+
+    columns: NormalizedColumnsOption = Field(
+        default=None,
+        description="Column names for headerless tabular input, in order, carried as written.",
+    )
+    field_mapping: NormalizedFieldMappingOption = Field(
+        default=None,
+        description="Optional mapping from normalized source names (or headerless columns as written) to the names rows carry downstream.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_normalization_options(self) -> Self:
+        """Validate field normalization option interactions."""
+        from elspeth.contracts.identifiers import validate_field_names
+
+        # Validate columns entries are valid identifiers and not keywords
+        if self.columns is not None:
+            validate_field_names(self.columns, "columns")
+
+        # Validate field_mapping values are valid identifiers and not keywords
+        if self.field_mapping is not None and self.field_mapping:
+            validate_field_names(list(self.field_mapping.values()), "field_mapping values")
+
+        # Reject declared schema names the header resolution can never produce
+        # (elspeth-3664e213c4): headers are normalized to lowercase identifiers
+        # at the source boundary while declared names are used verbatim, so an
+        # unreachable declaration silently discards every row (required fields)
+        # or crashes contract inference (optional fields). Function-local import
+        # keeps the infrastructure->sources dependency contained to this check.
+        declared = declared_source_schema_field_names(self.schema_config)
+        if declared:
+            from elspeth.plugins.sources.field_normalization import check_declared_fields_reachable
+
+            check_declared_fields_reachable(
+                declared,
+                columns=self.columns,
+                field_mapping=self.field_mapping,
+            )
+
+        return self
+
+
+def validate_headers_value(v: str | dict[str, str] | None) -> str | dict[str, str] | None:
+    """Validate a headers config value — shared by SinkPathConfig and AzureBlobSinkConfig.
+
+    Returns the validated value unchanged. Raises ValueError for invalid inputs.
+    """
+    if v is None:
+        return v
+    if isinstance(v, dict):
+        from elspeth.contracts.identifiers import validate_field_names
+
+        if not v:
+            raise ValueError("headers custom mapping must not be empty — use 'normalized' or 'original' for non-custom modes")
+        validate_field_names(list(v.keys()), "headers custom mapping keys")
+        for source_name, target_name in v.items():
+            if not target_name.strip():
+                raise ValueError(f"headers custom mapping value for {source_name!r} must not be empty or whitespace-only")
+        targets = list(v.values())
+        duplicates = [t for t in targets if targets.count(t) > 1]
+        if duplicates:
+            raise ValueError(f"Duplicate header mapping targets: {sorted(set(duplicates))}. Each output header must be unique.")
+        return v
+    if isinstance(v, str):
+        if v not in ("normalized", "original"):
+            raise ValueError(f"Invalid header mode '{v}'. Expected 'normalized', 'original', or mapping dict.")
+        return v
+    raise ValueError(f"headers must be 'normalized', 'original', or a dict mapping, got {type(v).__name__}")
+
+
+class LocalFileSinkConfig(PathConfig):
+    """Base for local file sinks with schema, path, and collision policy."""
+
+    _plugin_component_type: ClassVar[str | None] = "sink"
+
+    # Conditionally required, not optional. YAML may omit it (the runtime
+    # resolves a default), but the composer refuses a runnable file sink that
+    # does not choose explicitly — see
+    # ``validate_composer_file_sink_collision_policy``. The old "Optional …"
+    # text contradicted that on every surface, and the correct guidance existed
+    # only as an LLM-facing hint on the sink plugins, so a form user was told
+    # the knob was optional and then rejected for omitting it (R2-F2).
+    collision_policy: OutputCollisionPolicy | None = Field(
+        default=None,
+        description=(
+            "Required when mode='write': "
+            "'fail_if_exists' refuses an existing write target; "
+            "'auto_increment' picks a free sibling path; "
+            "'append_or_create' only with mode='append'."
+        ),
+        json_schema_extra={
+            "composer_description": (
+                "Required when mode is 'write'. 'auto_increment' is the safe default — it picks a free sibling path. "
+                "'fail_if_exists' refuses an existing write target. "
+                "'append_or_create' only with mode='append'."
+            ),
+            "composer_required_when": {"field": "mode", "equals": "write"},
+        },
+    )
+
+
+class SinkPathConfig(LocalFileSinkConfig):
+    """Base config for file-based sink plugins with header output mode.
+
+    Extends PathConfig to add header output configuration for output formatting.
+    Sinks own their output format - headers are resolved at sink level,
+    not carried through the pipeline.
+
+    Header Mode Options:
+        headers: Unified header mode setting. Can be:
+            - "normalized": Use Python identifier names (default)
+            - "original": Restore original source header names
+            - dict: Custom mapping from normalized to output names
+    """
+
+    _plugin_component_type: ClassVar[str | None] = "sink"
+
+    headers: HeaderModeOption = Field(
+        default=None,
+        description=("Header output mode: 'normalized', 'original', or {field: header} mapping"),
+    )
+
+    @field_validator("headers")
+    @classmethod
+    def _validate_headers(cls, v: str | dict[str, str] | None) -> str | dict[str, str] | None:
+        return validate_headers_value(v)
+
+    @property
+    def headers_mode(self) -> HeaderMode:
+        """Get resolved header mode.
+
+        Returns NORMALIZED when headers is not set.
+        """
+        if self.headers is not None:
+            return parse_header_mode(self.headers)
+        return HeaderMode.NORMALIZED
+
+    @property
+    def headers_mapping(self) -> dict[str, str] | None:
+        """Get custom header mapping if CUSTOM mode.
+
+        Returns the explicit header mapping dict if headers mode is CUSTOM,
+        otherwise None.
+        """
+        if isinstance(self.headers, dict):
+            return self.headers
+        return None
+
+
+class TransformDataConfig(DataPluginConfig):
+    """Base config for transform plugins.
+
+    Routing fields (on_success, on_error) are defined at the settings level
+    (TransformSettings in core/config.py), not here. This class provides
+    plugin-specific configuration like schema and required_input_fields.
+
+    Input Field Requirements:
+        Transforms can declare which fields they require in their input using
+        `required_input_fields`. This enables DAG validation to catch missing
+        field errors at configuration time rather than runtime.
+
+        For template-based transforms (like LLM transforms), use
+        `elspeth.core.templates.extract_jinja2_fields()` to discover which
+        fields your template references, then declare them explicitly.
+    """
+
+    _plugin_component_type: ClassVar[str | None] = "transform"
+
+    # Redeclared from DataPluginConfig to state DIRECTION. The inherited wording
+    # ("Schema configuration for data validation") is direction-neutral, and a
+    # transform sits between two contracts, so an author — including the LLM
+    # composer, which reads this exact string — reasonably reads it as "describe
+    # this node's data" and enumerates the node's own OUTPUTS here. That is the
+    # authoring mistake behind elspeth-d6eeb3a71d / elspeth-5955a9c421.
+    #
+    # Deliberately NOT saying "do not list fields this transform creates":
+    # declaring a created field is legal and automatically demoted to optional on
+    # input (BaseTransform.input_schema), and it is the ONLY route to a typed
+    # downstream guarantee — SchemaConfig requires every guaranteed_fields entry
+    # to be declared in `fields` AND marked required. Telling authors to omit
+    # them would forbid the supported path.
+    #
+    # Sources and sinks keep the inherited wording: each has one data contract,
+    # so there is no direction to disambiguate.
+    schema_config: SchemaConfig = Field(
+        ...,
+        alias="schema",
+        description=(
+            "This transform's schema declares arriving types for consumed fields and output types for fields it creates. "
+            "Use 'schema: {mode: observed}' to infer types from data, or "
+            "provide explicit field definitions with mode (fixed/flexible)."
+        ),
+        json_schema_extra={
+            "composer_description": COMPOSER_SCHEMA_DESCRIPTION,
+            "composer_placeholder": COMPOSER_SCHEMA_PLACEHOLDER,
+        },
+    )
+
+    required_input_fields: list[str] | None = Field(
+        default=None,
+        description=(
+            "Fields this transform requires in input, by the names rows carry. Used for DAG validation "
+            "to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage."
+        ),
+    )
+
+    @field_validator("required_input_fields")
+    @classmethod
+    def validate_required_input_fields(cls, v: list[str] | None) -> list[str] | None:
+        """Validate required_input_fields contains valid identifiers.
+
+        Important distinction for LLM transforms:
+        - None = not specified (triggers error if template has row references)
+        - [] = explicit opt-out (accepts runtime risk, no error)
+        - [fields...] = explicit declaration (DAG validates these)
+        """
+        if v is None:
+            return None
+
+        # Empty list is INTENTIONALLY preserved - it's an explicit opt-out
+        # for LLM templates that accept runtime risk of missing fields
+        if len(v) == 0:
+            return []
+
+        from elspeth.contracts.identifiers import validate_field_names
+
+        return list(validate_field_names(v, "required_input_fields", strip=True))
+
+    @property
+    def declared_input_fields(self) -> frozenset[str]:
+        """Normalized runtime view of ``required_input_fields``.
+
+        ``required_input_fields`` stays list-shaped in config models so JSON
+        schema and YAML remain natural. Runtime declaration contracts need an
+        immutable, order-insensitive set surface, so transforms normalize the
+        value through this property at construction time.
+        """
+        if self.required_input_fields is None:
+            return frozenset()
+        return frozenset(self.required_input_fields)

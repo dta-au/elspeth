@@ -1,0 +1,499 @@
+cls = <class 'elspeth.core.landscape.database.LandscapeDB'>
+url = 'sqlite:////tmp/pytest-of-agent/pytest-168/test_postgres_admission_waitin0/audit.db'
+
+    @classmethod
+    def admit_existing_sqlite_store(cls, url: str, *, passphrase: str | None = None) -> None:
+        """Admit a current store or pristine allocation without bootstrap writes."""
+        from sqlalchemy import inspect
+    
+        engine = (
+            cls._create_sqlcipher_engine(url, passphrase, read_only=True)
+            if passphrase is not None
+            else create_engine(cls._sqlite_read_only_url(url))
+        )
+        try:
+            cls._configure_sqlite(engine, read_only=True)
+            with engine.connect() as connection:
+                objects = connection.exec_driver_sql("SELECT name FROM sqlite_master").all()
+                application_id = connection.exec_driver_sql("PRAGMA application_id").scalar_one()
+                epoch = connection.exec_driver_sql("PRAGMA user_version").scalar_one()
+                if not objects:
+                    if application_id != 0 or epoch != 0:
+                        raise SchemaCompatibilityError(
+                            "Landscape creation requires an unstamped, object-free target. "
+                            "Preserve this store unchanged and configure an explicitly new Landscape database."
+                        )
+                    return
+                inspector = inspect(connection)
+                if inspector.get_view_names():
+                    raise SchemaCompatibilityError(
+                        "Landscape database contains unsupported views. Preserve this store unchanged "
+                        "and configure an explicitly new Landscape database."
+                    )
+            instance = cls._from_parts(url, engine, passphrase=passphrase, require_existing_schema=True, read_only=True)
+>           instance._validate_schema()
+
+src/elspeth/core/landscape/database.py:1977: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <elspeth.core.landscape.database.LandscapeDB object at 0x7f5c3ffa2d50>
+
+    def _validate_schema(self) -> None:
+        """Validate that existing database has the required schema.
+    
+        For non-SQLite backends, validates table existence when
+        _require_existing_schema is set (inspection callers like MCP/CLI).
+        For SQLite, performs full validation of columns, foreign keys,
+        check constraints, and indexes to catch stale local audit.db files.
+    
+        Raises:
+            SchemaCompatibilityError: If database is missing required schema
+                elements, or if an encrypted database is opened without the
+                correct passphrase.
+    
+        Pre-1.0 callers validate only the current schema. Older schema epochs
+        are recreate boundaries, not inputs to an in-place migration.
+        """
+        from sqlalchemy import inspect
+        from sqlalchemy.exc import OperationalError
+    
+        try:
+            inspector = inspect(self.engine)
+            existing_tables = set(inspector.get_table_names())
+        except OperationalError as e:
+            error_msg = str(e)
+            if self.connection_string.startswith("sqlite") and ("file is not a database" in error_msg or "file is encrypted" in error_msg):
+                raise SchemaCompatibilityError(
+                    "Cannot open Landscape database — file is encrypted or passphrase is incorrect.\n\n"
+                    "If this is an encrypted (SQLCipher) database, ensure:\n"
+                    "  1. The correct passphrase is set in the configured environment variable\n"
+                    "     (landscape.encryption_key_env in settings.yaml, default: ELSPETH_AUDIT_KEY)\n"
+                    "  2. backend: sqlcipher is set in settings.yaml\n\n"
+                    f"Database: {_safe_database_descriptor(self.connection_string)}"
+                ) from e
+            raise
+        validation_metadata = metadata
+        if not existing_tables and not database_target_is_empty(self.engine):
+            raise SchemaCompatibilityError(
+                "Landscape creation requires an unstamped, object-free target. Preserve this store unchanged "
+                "and configure an explicitly new Landscape database."
+            )
+        expected_tables = set(validation_metadata.tables.keys())
+        present_landscape_tables = existing_tables & expected_tables
+        schema_epoch = self._get_sqlite_schema_epoch() if self.connection_string.startswith("sqlite") else 0
+        identity_issue = (
+            _landscape_identity_issue(
+                self.engine,
+                inspector,
+                existing_tables,
+                schema_epoch=SQLITE_SCHEMA_EPOCH,
+                identity_required=SCHEMA_IDENTITY_TABLE_NAME in expected_tables,
+            )
+            if existing_tables
+            else None
+        )
+    
+        epoch_incompatible = self.connection_string.startswith("sqlite") and schema_epoch != (SQLITE_SCHEMA_EPOCH if existing_tables else 0)
+        if epoch_incompatible and not present_landscape_tables:
+            raise SchemaCompatibilityError(
+                "Landscape database schema is outdated.\n\n"
+                f"schema epoch is incompatible:\nDatabase epoch: {schema_epoch}\nCurrent epoch: {SQLITE_SCHEMA_EPOCH}\n\n"
+                f"Database: {_safe_database_descriptor(self.connection_string)}"
+            )
+    
+        foreign_tables = sorted(existing_tables - expected_tables)
+        if foreign_tables:
+            raise SchemaCompatibilityError(
+                "Landscape database contains foreign tables and cannot be opened as an ELSPETH audit database.\n\n"
+                f"Unexpected tables: {', '.join(foreign_tables)}\n\n"
+                f"Database: {_safe_database_descriptor(self.connection_string)}"
+            )
+    
+        # If this looks like an existing Landscape database, all known tables must exist.
+        # For brand-new DB files (no Landscape tables yet), creation happens in create_all().
+        #
+        # If _require_existing_schema is set (create_tables=False callers like MCP/CLI),
+        # we require at least some Landscape tables to be present. An empty/non-Landscape
+        # DB with create_tables=False would fail later with raw SQL errors — fail fast instead.
+        if self._require_existing_schema and not present_landscape_tables:
+            raise SchemaCompatibilityError(
+                "Database does not contain any Landscape tables.\n\n"
+                "This does not appear to be an ELSPETH audit database. "
+                "Verify the database path is correct.\n\n"
+                f"Database: {_safe_database_descriptor(self.connection_string)}"
+            )
+        missing_tables = sorted(expected_tables - existing_tables) if present_landscape_tables else []
+    
+        shape_issues = collect_metadata_shape_issues(
+            inspector,
+            validation_metadata,
+            dialect=self.engine.dialect,
+            present_tables=present_landscape_tables,
+        )
+    
+        # Full shape validation already covers every predecessor column. The
+        # named current-column guard is retained for ordinary current-schema
+        # validation, where it provides higher-signal diagnostics.
+        missing_columns = _collect_missing_required_columns(inspector)
+        token_outcomes_shape_errors = _collect_token_outcomes_shape_errors(
+            inspector,
+            engine=self.engine,
+            inspect_sqlite_indexes=self.connection_string.startswith("sqlite"),
+        )
+    
+        # Check for required foreign keys (Tier 1 audit integrity)
+        missing_fks: list[tuple[str, str, str]] = []
+    
+        for table_name, column_name, referenced_table in _REQUIRED_FOREIGN_KEYS:
+            # Check if table exists
+            if table_name not in existing_tables:
+                # Table will be created by create_all, skip
+                continue
+    
+            # Check if FK exists AND targets the correct referenced table
+            # SQLAlchemy inspector API guarantees constrained_columns and referred_table keys
+            fks = inspector.get_foreign_keys(table_name)
+            has_correct_fk = any(column_name in fk["constrained_columns"] and fk["referred_table"] == referenced_table for fk in fks)
+    
+            if not has_correct_fk:
+                missing_fks.append((table_name, column_name, referenced_table))
+    
+        # Check for required composite foreign keys (Tier 1 audit integrity)
+        missing_composite_fks: list[tuple[str, tuple[str, ...], str, tuple[str, ...]]] = []
+    
+        for table_name, constrained_columns, referenced_table, referenced_columns in _REQUIRED_COMPOSITE_FOREIGN_KEYS:
+            if table_name not in existing_tables:
+                continue
+    
+            fks = inspector.get_foreign_keys(table_name)
+            has_correct_fk = any(
+                tuple(fk["constrained_columns"]) == constrained_columns
+                and fk["referred_table"] == referenced_table
+                and tuple(fk["referred_columns"]) == referenced_columns
+                for fk in fks
+            )
+    
+            if not has_correct_fk:
+                missing_composite_fks.append((table_name, constrained_columns, referenced_table, referenced_columns))
+    
+        forbidden_fks: list[tuple[str, tuple[str, ...], str, tuple[str, ...], str]] = []
+    
+        for table_name, constrained_columns, referenced_table, referenced_columns, reason in _FORBIDDEN_FOREIGN_KEYS:
+            if table_name not in existing_tables:
+                continue
+    
+            fks = inspector.get_foreign_keys(table_name)
+            has_forbidden_fk = any(
+                tuple(fk["constrained_columns"]) == constrained_columns
+                and fk["referred_table"] == referenced_table
+                and tuple(fk["referred_columns"]) == referenced_columns
+                for fk in fks
+            )
+    
+            if has_forbidden_fk:
+                forbidden_fks.append((table_name, constrained_columns, referenced_table, referenced_columns, reason))
+    
+        # Check for required check constraints (Tier 1 audit integrity)
+        missing_checks: list[tuple[str, str]] = []
+    
+        for table_name, constraint_name in _REQUIRED_CHECK_CONSTRAINTS:
+            if table_name not in existing_tables:
+                continue
+    
+            checks = inspector.get_check_constraints(table_name)
+            has_constraint = any(c["name"] == constraint_name for c in checks)
+    
+            if not has_constraint:
+                missing_checks.append((table_name, constraint_name))
+    
+        # Check for required indexes (Tier 1 audit integrity)
+        missing_indexes: list[tuple[str, str]] = []
+    
+        for table_name, index_name in _REQUIRED_INDEXES:
+            if table_name not in existing_tables:
+                continue
+    
+            indexes = inspector.get_indexes(table_name)
+            has_index = any(idx["name"] == index_name for idx in indexes)
+    
+            if not has_index:
+                missing_indexes.append((table_name, index_name))
+    
+        # Triggers are physical integrity objects, not reflected as table
+        # indexes/checks by SQLAlchemy. Require their exact stable names on a
+        # current physical schema so an equivalent-looking table definition
+        # cannot silently omit the seal/immutability enforcement.
+        missing_triggers: list[str] = []
+        should_validate_triggers = (
+            bool(present_landscape_tables)
+            and "audit_export_snapshot_chunks" in expected_tables
+            and (self.engine.dialect.name != "sqlite" or schema_epoch == SQLITE_SCHEMA_EPOCH)
+        )
+        if should_validate_triggers:
+            with self.engine.connect() as connection:
+                if self.engine.dialect.name == "sqlite":
+                    trigger_names = set(connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type = 'trigger'").scalars())
+                else:
+                    # information_schema.triggers hides real triggers from
+                    # SELECT-only nonowners. Catalog inspection needs no write
+                    # privilege and binds each trigger to its actual relation,
+                    # function, event, and origin-enabled execution mode.
+                    trigger_rows = connection.exec_driver_sql(
+                        "SELECT trigger.tgname, relation.relname, function.proname, trigger.tgtype "
+                        "FROM pg_catalog.pg_trigger AS trigger "
+                        "JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger.tgrelid "
+                        "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace "
+                        "JOIN pg_catalog.pg_proc AS function ON function.oid = trigger.tgfoid "
+                        "WHERE namespace.nspname = pg_catalog.current_schema() "
+                        "AND function.pronamespace = namespace.oid "
+                        "AND NOT trigger.tgisinternal AND trigger.tgenabled IN ('O', 'A') "
+                        "AND trigger.tgqual IS NULL AND trigger.tgnargs = 0"
+                    )
+                    trigger_names = {
+                        row.tgname
+                        for row in trigger_rows
+                        if row.tgname in _REQUIRED_POSTGRES_TRIGGERS
+                        and (row.relname, row.proname, row.tgtype) == _REQUIRED_POSTGRES_TRIGGERS[row.tgname]
+                    }
+            missing_triggers = sorted(set(_REQUIRED_TRIGGERS) - trigger_names)
+    
+        epoch_incompatible = bool(present_landscape_tables) and epoch_incompatible
+    
+        # Raise errors for missing columns, FKs, check constraints, indexes, or stale ADR-019 shapes.
+        if (
+            missing_tables
+            or missing_columns
+            or token_outcomes_shape_errors
+            or missing_fks
+            or missing_composite_fks
+            or forbidden_fks
+            or missing_checks
+            or missing_indexes
+            or missing_triggers
+            or shape_issues
+            or epoch_incompatible
+            or identity_issue
+        ):
+            error_parts = []
+    
+            if epoch_incompatible:
+                error_parts.append(f"schema epoch is incompatible:\nDatabase epoch: {schema_epoch}\nCurrent epoch: {SQLITE_SCHEMA_EPOCH}")
+    
+            if identity_issue:
+                error_parts.append(
+                    f"schema identity is incompatible ({identity_issue}); expected application elspeth, "
+                    f"store landscape, epoch {SQLITE_SCHEMA_EPOCH}"
+                )
+    
+            if missing_tables:
+                missing_tables_str = ", ".join(missing_tables)
+                error_parts.append(f"Missing tables: {missing_tables_str}")
+    
+            if missing_columns:
+                missing_str = ", ".join(f"{t}.{c}" for t, c in missing_columns)
+                error_parts.append(f"Missing columns: {missing_str}")
+    
+            if token_outcomes_shape_errors:
+                error_parts.append("ADR-019 stale token_outcomes shape: " + "; ".join(token_outcomes_shape_errors))
+    
+            if missing_fks:
+                missing_fk_str = ", ".join(f"{t}.{c} → {ref}" for t, c, ref in missing_fks)
+                error_parts.append(f"Missing foreign keys: {missing_fk_str}")
+    
+            if missing_composite_fks:
+                missing_composite_fk_str = ", ".join(
+                    f"{table}({', '.join(columns)}) → {ref_table}({', '.join(ref_columns)})"
+                    for table, columns, ref_table, ref_columns in missing_composite_fks
+                )
+                error_parts.append(f"Missing composite foreign keys: {missing_composite_fk_str}")
+    
+            if forbidden_fks:
+                forbidden_fk_str = ", ".join(
+                    f"{table}({', '.join(columns)}) → {ref_table}({', '.join(ref_columns)}) [{reason}]"
+                    for table, columns, ref_table, ref_columns, reason in forbidden_fks
+                )
+                error_parts.append(f"Forbidden foreign keys: {forbidden_fk_str}")
+    
+            if missing_checks:
+                missing_checks_str = ", ".join(f"{t}.{name}" for t, name in missing_checks)
+                error_parts.append(f"Missing check constraints: {missing_checks_str}")
+    
+            if missing_indexes:
+                missing_indexes_str = ", ".join(f"{t}.{name}" for t, name in missing_indexes)
+                error_parts.append(f"Missing indexes: {missing_indexes_str}")
+    
+            if missing_triggers:
+                error_parts.append(f"Missing triggers: {', '.join(missing_triggers)}")
+    
+            if shape_issues:
+                shape_str = "; ".join(f"{issue.subject}: expected {issue.expected!r}, observed {issue.actual!r}" for issue in shape_issues)
+                error_parts.append(f"Full metadata shape mismatches: {shape_str}")
+    
+            if (
+                ("token_outcomes", "completed") in missing_columns
+                or ("token_outcomes", "path") in missing_columns
+                or token_outcomes_shape_errors
+            ):
+                error_parts.append(
+                    "ADR-019 changed token_outcomes from the old single-axis outcome/is_terminal to "
+                    "(TerminalOutcome, TerminalPath, completed). See "
+                    f"{ADR019_CUTOVER_GUIDE}. Preserve the stale audit.db unchanged and select "
+                    "an explicitly new database before starting this ELSPETH version."
+                )
+    
+>           raise SchemaCompatibilityError(
+                "Landscape database schema is outdated.\n\n" + "\n".join(error_parts) + "\n\n"
+                "Pre-1.0 schemas are not migrated in place. Preserve this store unchanged\n"
+                "and configure an explicitly new Landscape database.\n\n"
+                f"Database: {_safe_database_descriptor(self.connection_string)}"
+            )
+E           elspeth.core.landscape.database.SchemaCompatibilityError: Landscape database schema is outdated.
+E           
+E           Missing foreign keys: audit_export_snapshot_chunks.snapshot_id → audit_export_snapshots, sink_effect_export_snapshots.snapshot_id → audit_export_snapshots
+E           Missing composite foreign keys: sink_effects(sink_node_id, run_id) → nodes(node_id, run_id), sink_effect_members(token_id, row_id, run_id) → tokens(token_id, row_id, run_id), sink_effect_members(effect_id, input_kind) → sink_effects(effect_id, input_kind), sink_effect_members(primary_effect_id, run_id) → sink_effects(effect_id, run_id), audit_export_snapshots(source_run_id, source_status, source_completed_at) → runs(run_id, status, completed_at), sink_effect_export_snapshots(effect_id, input_kind) → sink_effects(effect_id, input_kind)
+E           Full metadata shape mismatches: audit_export_snapshot_chunks foreign-key mismatch: expected [((('snapshot_id',), None, 'audit_export_snapshots', ('snapshot_id',), None, None, True, 'DEFERRED', 'SIMPLE'), 1)], observed []; audit_export_snapshots foreign-key mismatch: expected [((('snapshot_id', 'terminal_chunk_ordinal', 'last_chunk_seal_hash', 'record_count', 'total_bytes'), None, 'audit_export_snapshot_chunks', ('snapshot_id', 'ordinal', 'chunk_seal_hash', 'cumulative_records', 'cumulative_bytes'), None, None, True, 'DEFERRED', 'SIMPLE'), 1), ((('source_run_id', 'source_status', 'source_completed_at'), None, 'runs', ('run_id', 'status', 'completed_at'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1)], observed []; sink_effect_export_snapshots foreign-key mismatch: expected [((('effect_id', 'input_kind'), None, 'sink_effects', ('effect_id', 'input_kind'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('snapshot_id',), None, 'audit_export_snapshots', ('snapshot_id',), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1)], observed []; sink_effect_members foreign-key mismatch: expected [((('effect_id', 'input_kind'), None, 'sink_effects', ('effect_id', 'input_kind'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('primary_effect_id', 'run_id'), None, 'sink_effects', ('effect_id', 'run_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('row_id', 'run_id'), None, 'rows', ('row_id', 'run_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('sink_node_id', 'run_id'), None, 'nodes', ('node_id', 'run_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('token_id', 'row_id', 'run_id'), None, 'tokens', ('token_id', 'row_id', 'run_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1)], observed []; sink_effect_streams foreign-key mismatch: expected [((('head_effect_id', 'stream_id'), None, 'sink_effects', ('effect_id', 'stream_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('run_id',), None, 'runs', ('run_id',), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('sink_node_id', 'run_id'), None, 'nodes', ('node_id', 'run_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('tail_effect_id', 'stream_id'), None, 'sink_effects', ('effect_id', 'stream_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1)], observed []; sink_effects foreign-key mismatch: expected [((('effect_id', 'input_kind', 'required_member_ordinal'), None, 'sink_effect_members', ('effect_id', 'input_kind', 'ordinal'), None, None, True, 'DEFERRED', 'SIMPLE'), 1), ((('effect_id', 'input_kind', 'required_snapshot_slot'), None, 'sink_effect_export_snapshots', ('effect_id', 'input_kind', 'slot'), None, None, True, 'DEFERRED', 'SIMPLE'), 1), ((('predecessor_effect_id', 'stream_id'), None, 'sink_effects', ('effect_id', 'stream_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('primary_effect_id',), None, 'sink_effects', ('effect_id',), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('run_id',), None, 'runs', ('run_id',), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('sink_node_id', 'run_id'), None, 'nodes', ('node_id', 'run_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('stream_id', 'run_id'), None, 'sink_effect_streams', ('stream_id', 'run_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1)], observed []
+E           
+E           Pre-1.0 schemas are not migrated in place. Preserve this store unchanged
+E           and configure an explicitly new Landscape database.
+E           
+E           Database: sqlite:////tmp/pytest-of-agent/pytest-168/test_postgres_admission_waitin0/audit.db
+
+src/elspeth/core/landscape/database.py:1804: SchemaCompatibilityError
+
+The above exception was the direct cause of the following exception:
+
+pg_fenced = FencedSession(engine=Engine(postgresql+psycopg://elspeth_admin_eeb1ca35714947f1be898b3ab74dd882:***@localhost:32909/qu...='nxsEKpJLNZ9k004yaYmNuiUNPofciOTi0Cjvp99M8KA', identity_id='alice', session_id='f2bb6f85-9a5c-4d2d-b4b0-b46d62d44e96')
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-168/test_postgres_admission_waitin0')
+
+    def test_postgres_admission_waiting_on_container_sees_committed_output_reservation(pg_fenced, tmp_path):
+        _repository, _service, record, context, recorder, url = _setup(pg_fenced, tmp_path)
+        from tests.fixtures.identities import ensure_test_identity
+    
+        from elspeth.web.sessions.models import composition_states_table, runs_table, sessions_table
+    
+        other_session, state_id, run_id = (str(uuid4()) for _ in range(3))
+        now = datetime.now(UTC)
+        with pg_fenced.engine.begin() as connection:
+            ensure_test_identity(connection, identity_id="bob")
+            connection.execute(
+                sessions_table.insert().values(
+                    id=other_session, user_id="bob", auth_provider_type="local", title="other owner", created_at=now, updated_at=now
+                )
+            )
+            connection.execute(
+                composition_states_table.insert().values(
+                    id=state_id, session_id=other_session, version=1, is_valid=True, provenance="session_seed", created_at=now
+                )
+            )
+            connection.execute(
+                runs_table.insert().values(id=run_id, session_id=other_session, state_id=state_id, status="completed", started_at=now)
+            )
+            connection.execute(
+                quota_policies_table.insert().values(
+                    policy_id="container-storage", identity_id=None, storage_bytes=8, set_by_actor="operator", set_at=now
+                )
+            )
+        contender_engine = create_session_engine(pg_fenced.engine.url.render_as_string(hide_password=False))
+        contender = PostgresSessionOperationRepository(contender_engine, quota_exceeded_recorder=recorder.record_quota_exceeded)
+        contender_context = replace(
+            context, session_engine=contender_engine, session_operation_authority=contender, user_message_content="larger"
+        )
+        pid, started = [], Event()
+    
+        def observe_waiter(connection, _cursor, statement, _parameters, _execution, _many):
+            if "quota_policies" in statement and "FOR UPDATE" in statement and not pid:
+                pid.append(connection.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
+                started.set()
+    
+        event.listen(contender_engine, "before_cursor_execute", observe_waiter)
+        try:
+            # A genuine accepting writer reserves six bytes for another identity
+            # while holding the shared container policy, before admission measures.
+            from elspeth.web.coordination.quota_authority import admit_storage_bytes_on_connection
+    
+            with ThreadPoolExecutor(max_workers=1) as workers, pg_fenced.engine.begin() as writer:
+                admit_storage_bytes_on_connection(
+                    writer, session_id=other_session, additional_bytes=5, operation="run_output_finalize", record=recorder.record_quota_exceeded
+                )
+                writer.execute(
+                    output_storage_reservations_table.insert().values(
+                        target_path=str(tmp_path / "other.csv"),
+                        session_id=other_session,
+                        run_id=run_id,
+                        size_bytes=5,
+                        custody_operation_id="execute-other",
+                        custody_operation_epoch=1,
+                    )
+                )
+                admission = workers.submit(
+                    admit_blob_mutation, "update_blob", {"blob_id": str(record.id), "content": "larger"}, _empty_state(), contender_context
+                )
+                assert started.wait(5)
+                _wait_for_database_lock(pg_fenced, pid[0])
+                writer.commit()
+                assert admission.result(timeout=5) is not None
+>           rows = _durable_rows(url)
+                   ^^^^^^^^^^^^^^^^^^
+
+tests/testcontainer/web/test_blob_mutation_admission_postgres.py:272: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/web/auth/test_audit.py:645: in _durable_rows
+    with LandscapeDB.from_url(landscape_url) as db, db.read_only_connection() as conn:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/core/landscape/database.py:2038: in from_url
+    cls._admit_sqlite_target(url, passphrase=passphrase)
+src/elspeth/core/landscape/database.py:1945: in _admit_sqlite_target
+    cls.admit_existing_sqlite_store(url, passphrase=passphrase)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+cls = <class 'elspeth.core.landscape.database.LandscapeDB'>
+url = 'sqlite:////tmp/pytest-of-agent/pytest-168/test_postgres_admission_waitin0/audit.db'
+
+    @classmethod
+    def admit_existing_sqlite_store(cls, url: str, *, passphrase: str | None = None) -> None:
+        """Admit a current store or pristine allocation without bootstrap writes."""
+        from sqlalchemy import inspect
+    
+        engine = (
+            cls._create_sqlcipher_engine(url, passphrase, read_only=True)
+            if passphrase is not None
+            else create_engine(cls._sqlite_read_only_url(url))
+        )
+        try:
+            cls._configure_sqlite(engine, read_only=True)
+            with engine.connect() as connection:
+                objects = connection.exec_driver_sql("SELECT name FROM sqlite_master").all()
+                application_id = connection.exec_driver_sql("PRAGMA application_id").scalar_one()
+                epoch = connection.exec_driver_sql("PRAGMA user_version").scalar_one()
+                if not objects:
+                    if application_id != 0 or epoch != 0:
+                        raise SchemaCompatibilityError(
+                            "Landscape creation requires an unstamped, object-free target. "
+                            "Preserve this store unchanged and configure an explicitly new Landscape database."
+                        )
+                    return
+                inspector = inspect(connection)
+                if inspector.get_view_names():
+                    raise SchemaCompatibilityError(
+                        "Landscape database contains unsupported views. Preserve this store unchanged "
+                        "and configure an explicitly new Landscape database."
+                    )
+            instance = cls._from_parts(url, engine, passphrase=passphrase, require_existing_schema=True, read_only=True)
+            instance._validate_schema()
+        except SchemaCompatibilityError as exc:
+>           raise SchemaCompatibilityError(
+                "Landscape database is unsupported. Preserve this store unchanged and configure an explicitly new "
+                f"Landscape database. Detail: {exc}"
+            ) from exc
+E           elspeth.core.landscape.database.SchemaCompatibilityError: Landscape database is unsupported. Preserve this store unchanged and configure an explicitly new Landscape database. Detail: Landscape database schema is outdated.
+E           
+E           Missing foreign keys: audit_export_snapshot_chunks.snapshot_id → audit_export_snapshots, sink_effect_export_snapshots.snapshot_id → audit_export_snapshots
+E           Missing composite foreign keys: sink_effects(sink_node_id, run_id) → nodes(node_id, run_id), sink_effect_members(token_id, row_id, run_id) → tokens(token_id, row_id, run_id), sink_effect_members(effect_id, input_kind) → sink_effects(effect_id, input_kind), sink_effect_members(primary_effect_id, run_id) → sink_effects(effect_id, run_id), audit_export_snapshots(source_run_id, source_status, source_completed_at) → runs(run_id, status, completed_at), sink_effect_export_snapshots(effect_id, input_kind) → sink_effects(effect_id, input_kind)
+E           Full metadata shape mismatches: audit_export_snapshot_chunks foreign-key mismatch: expected [((('snapshot_id',), None, 'audit_export_snapshots', ('snapshot_id',), None, None, True, 'DEFERRED', 'SIMPLE'), 1)], observed []; audit_export_snapshots foreign-key mismatch: expected [((('snapshot_id', 'terminal_chunk_ordinal', 'last_chunk_seal_hash', 'record_count', 'total_bytes'), None, 'audit_export_snapshot_chunks', ('snapshot_id', 'ordinal', 'chunk_seal_hash', 'cumulative_records', 'cumulative_bytes'), None, None, True, 'DEFERRED', 'SIMPLE'), 1), ((('source_run_id', 'source_status', 'source_completed_at'), None, 'runs', ('run_id', 'status', 'completed_at'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1)], observed []; sink_effect_export_snapshots foreign-key mismatch: expected [((('effect_id', 'input_kind'), None, 'sink_effects', ('effect_id', 'input_kind'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('snapshot_id',), None, 'audit_export_snapshots', ('snapshot_id',), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1)], observed []; sink_effect_members foreign-key mismatch: expected [((('effect_id', 'input_kind'), None, 'sink_effects', ('effect_id', 'input_kind'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('primary_effect_id', 'run_id'), None, 'sink_effects', ('effect_id', 'run_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('row_id', 'run_id'), None, 'rows', ('row_id', 'run_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('sink_node_id', 'run_id'), None, 'nodes', ('node_id', 'run_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('token_id', 'row_id', 'run_id'), None, 'tokens', ('token_id', 'row_id', 'run_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1)], observed []; sink_effect_streams foreign-key mismatch: expected [((('head_effect_id', 'stream_id'), None, 'sink_effects', ('effect_id', 'stream_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('run_id',), None, 'runs', ('run_id',), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('sink_node_id', 'run_id'), None, 'nodes', ('node_id', 'run_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('tail_effect_id', 'stream_id'), None, 'sink_effects', ('effect_id', 'stream_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1)], observed []; sink_effects foreign-key mismatch: expected [((('effect_id', 'input_kind', 'required_member_ordinal'), None, 'sink_effect_members', ('effect_id', 'input_kind', 'ordinal'), None, None, True, 'DEFERRED', 'SIMPLE'), 1), ((('effect_id', 'input_kind', 'required_snapshot_slot'), None, 'sink_effect_export_snapshots', ('effect_id', 'input_kind', 'slot'), None, None, True, 'DEFERRED', 'SIMPLE'), 1), ((('predecessor_effect_id', 'stream_id'), None, 'sink_effects', ('effect_id', 'stream_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('primary_effect_id',), None, 'sink_effects', ('effect_id',), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('run_id',), None, 'runs', ('run_id',), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('sink_node_id', 'run_id'), None, 'nodes', ('node_id', 'run_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1), ((('stream_id', 'run_id'), None, 'sink_effect_streams', ('stream_id', 'run_id'), None, None, False, 'IMMEDIATE', 'SIMPLE'), 1)], observed []
+E           
+E           Pre-1.0 schemas are not migrated in place. Preserve this store unchanged
+E           and configure an explicitly new Landscape database.
+E           
+E           Database: sqlite:////tmp/pytest-of-agent/pytest-168/test_postgres_admission_waitin0/audit.db
+
+src/elspeth/core/landscape/database.py:1979: SchemaCompatibilityError

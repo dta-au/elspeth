@@ -1,0 +1,1534 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 35 items / 17 deselected / 18 selected
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py . [  5%]
+FFFFFFFFFFFFFFFFF                                                        [100%]
+
+=================================== FAILURES ===================================
+___ test_incremental_explicit_approval_admits_only_valid_arguments[invalid] ____
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-41/test_incremental_explicit_appr1')
+arguments = {'patch': 'not-an-object'}, expected_proposals = 0
+expected_error_class = 'ToolArgumentError'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("arguments", "expected_proposals", "expected_error_class"),
+        [
+            ({"patch": {"name": "reviewed"}}, 1, None),
+            ({"patch": "not-an-object"}, 0, "ToolArgumentError"),
+        ],
+        ids=("valid", "invalid"),
+    )
+    async def test_incremental_explicit_approval_admits_only_valid_arguments(
+        tmp_path: Path,
+        arguments: dict[str, Any],
+        expected_proposals: int,
+        expected_error_class: str | None,
+    ) -> None:
+        harness = _harness(tmp_path)
+        state = _incremental_base_state(tmp_path)
+        llm = _ScriptedLLM(
+            _tool_turn("call_metadata", "set_metadata", arguments),
+            _fake_llm_response(content="Done."),
+        )
+    
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            _record_phase3_outcomes(harness.service) as outcome_batches,
+            patch("elspeth.web.composer.tool_batch.build_set_pipeline_candidate") as builder,
+        ):
+            result = await harness.service.compose(
+                "Update metadata under explicit approval.",
+                [],
+                state,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                user_message_id=harness.user_message_id,
+            )
+    
+        proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+>       assert len(proposals) == expected_proposals
+E       AssertionError: assert 1 == 0
+E        +  where 1 = len([CompositionProposalRecord(id=UUID('1c963bbc-23ce-47f0-a5a8-59f8f6d69151'), session_id=UUID('00000000-0000-4000-8000-0...one.utc), updated_at=datetime.datetime(2026, 11, 9, 11, 14, 14, tzinfo=datetime.timezone.utc), pipeline_metadata=None)])
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1536: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:14:14 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:14:14 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:14:14 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:14:14 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_unapplied_incremental_feedback_then_repair_stages_once[empty-noop-openai_strict] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-41/test_unapplied_incremental_fee0')
+dialect = <ToolContractDialect.OPENAI_STRICT: 'openai_strict'>
+tool_name = 'set_metadata', arguments = {'patch': {}}, expected_success = True
+expected_error = None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dialect", tuple(ToolContractDialect))
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments", "expected_success", "expected_error"),
+        [
+            ("set_metadata", {"patch": {}}, True, None),
+            ("set_metadata", {"patch": {"name": ""}}, True, None),
+            ("set_metadata", {"patch": "invalid"}, None, "ToolArgumentError"),
+            ("patch_node_options", {"node_id": "absent", "patch": {}}, False, None),
+        ],
+        ids=("empty-noop", "same-value-noop", "argument-error", "handler-refusal"),
+    )
+    async def test_unapplied_incremental_feedback_then_repair_stages_once(
+        tmp_path: Path,
+        dialect: ToolContractDialect,
+        tool_name: str,
+        arguments: dict[str, Any],
+        expected_success: bool | None,
+        expected_error: str | None,
+    ) -> None:
+        harness = _harness(tmp_path)
+        harness.service._planner_dialect = dialect
+        state = _incremental_base_state(tmp_path)
+        repair = {"patch": {"name": "local-repair"}}
+        llm = _ScriptedLLM(
+            _tool_turn("call_unapplied", tool_name, encode_semantic_arguments(tool_name, dialect, arguments)),
+            _tool_turn("call_repair", "set_metadata", encode_semantic_arguments("set_metadata", dialect, repair)),
+            _fake_llm_response(content="The repair awaits approval."),
+        )
+        progress = []
+        async def record_progress(event: Any) -> None:
+            progress.append(event)
+    
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Update the metadata.", [], state, session_id=harness.session_id,
+                user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                progress=record_progress,
+            )
+        proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+>       assert [proposal.tool_call_id for proposal in proposals] == ["call_repair"]
+E       AssertionError: assert ['call_unappl...'call_repair'] == ['call_repair']
+E         
+E         At index 0 diff: 'call_unapplied' != 'call_repair'
+E         Left contains one more item: 'call_repair'
+E         Use -v to get more diff
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1587: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:14:14 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:14:14 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:14:14 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:14:14 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_unapplied_incremental_feedback_then_repair_stages_once[empty-noop-none] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-41/test_unapplied_incremental_fee1')
+dialect = <ToolContractDialect.NONE: 'none'>, tool_name = 'set_metadata'
+arguments = {'patch': {}}, expected_success = True, expected_error = None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dialect", tuple(ToolContractDialect))
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments", "expected_success", "expected_error"),
+        [
+            ("set_metadata", {"patch": {}}, True, None),
+            ("set_metadata", {"patch": {"name": ""}}, True, None),
+            ("set_metadata", {"patch": "invalid"}, None, "ToolArgumentError"),
+            ("patch_node_options", {"node_id": "absent", "patch": {}}, False, None),
+        ],
+        ids=("empty-noop", "same-value-noop", "argument-error", "handler-refusal"),
+    )
+    async def test_unapplied_incremental_feedback_then_repair_stages_once(
+        tmp_path: Path,
+        dialect: ToolContractDialect,
+        tool_name: str,
+        arguments: dict[str, Any],
+        expected_success: bool | None,
+        expected_error: str | None,
+    ) -> None:
+        harness = _harness(tmp_path)
+        harness.service._planner_dialect = dialect
+        state = _incremental_base_state(tmp_path)
+        repair = {"patch": {"name": "local-repair"}}
+        llm = _ScriptedLLM(
+            _tool_turn("call_unapplied", tool_name, encode_semantic_arguments(tool_name, dialect, arguments)),
+            _tool_turn("call_repair", "set_metadata", encode_semantic_arguments("set_metadata", dialect, repair)),
+            _fake_llm_response(content="The repair awaits approval."),
+        )
+        progress = []
+        async def record_progress(event: Any) -> None:
+            progress.append(event)
+    
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Update the metadata.", [], state, session_id=harness.session_id,
+                user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                progress=record_progress,
+            )
+        proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+>       assert [proposal.tool_call_id for proposal in proposals] == ["call_repair"]
+E       AssertionError: assert ['call_unappl...'call_repair'] == ['call_repair']
+E         
+E         At index 0 diff: 'call_unapplied' != 'call_repair'
+E         Left contains one more item: 'call_repair'
+E         Use -v to get more diff
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1587: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:14:15 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:14:15 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:14:15 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:14:15 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_unapplied_incremental_feedback_then_repair_stages_once[same-value-noop-openai_strict] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-41/test_unapplied_incremental_fee2')
+dialect = <ToolContractDialect.OPENAI_STRICT: 'openai_strict'>
+tool_name = 'set_metadata', arguments = {'patch': {'name': ''}}
+expected_success = True, expected_error = None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dialect", tuple(ToolContractDialect))
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments", "expected_success", "expected_error"),
+        [
+            ("set_metadata", {"patch": {}}, True, None),
+            ("set_metadata", {"patch": {"name": ""}}, True, None),
+            ("set_metadata", {"patch": "invalid"}, None, "ToolArgumentError"),
+            ("patch_node_options", {"node_id": "absent", "patch": {}}, False, None),
+        ],
+        ids=("empty-noop", "same-value-noop", "argument-error", "handler-refusal"),
+    )
+    async def test_unapplied_incremental_feedback_then_repair_stages_once(
+        tmp_path: Path,
+        dialect: ToolContractDialect,
+        tool_name: str,
+        arguments: dict[str, Any],
+        expected_success: bool | None,
+        expected_error: str | None,
+    ) -> None:
+        harness = _harness(tmp_path)
+        harness.service._planner_dialect = dialect
+        state = _incremental_base_state(tmp_path)
+        repair = {"patch": {"name": "local-repair"}}
+        llm = _ScriptedLLM(
+            _tool_turn("call_unapplied", tool_name, encode_semantic_arguments(tool_name, dialect, arguments)),
+            _tool_turn("call_repair", "set_metadata", encode_semantic_arguments("set_metadata", dialect, repair)),
+            _fake_llm_response(content="The repair awaits approval."),
+        )
+        progress = []
+        async def record_progress(event: Any) -> None:
+            progress.append(event)
+    
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Update the metadata.", [], state, session_id=harness.session_id,
+                user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                progress=record_progress,
+            )
+        proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+>       assert [proposal.tool_call_id for proposal in proposals] == ["call_repair"]
+E       AssertionError: assert ['call_unappl...'call_repair'] == ['call_repair']
+E         
+E         At index 0 diff: 'call_unapplied' != 'call_repair'
+E         Left contains one more item: 'call_repair'
+E         Use -v to get more diff
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1587: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:14:16 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:14:16 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:14:16 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:14:16 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_unapplied_incremental_feedback_then_repair_stages_once[same-value-noop-none] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-41/test_unapplied_incremental_fee3')
+dialect = <ToolContractDialect.NONE: 'none'>, tool_name = 'set_metadata'
+arguments = {'patch': {'name': ''}}, expected_success = True
+expected_error = None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dialect", tuple(ToolContractDialect))
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments", "expected_success", "expected_error"),
+        [
+            ("set_metadata", {"patch": {}}, True, None),
+            ("set_metadata", {"patch": {"name": ""}}, True, None),
+            ("set_metadata", {"patch": "invalid"}, None, "ToolArgumentError"),
+            ("patch_node_options", {"node_id": "absent", "patch": {}}, False, None),
+        ],
+        ids=("empty-noop", "same-value-noop", "argument-error", "handler-refusal"),
+    )
+    async def test_unapplied_incremental_feedback_then_repair_stages_once(
+        tmp_path: Path,
+        dialect: ToolContractDialect,
+        tool_name: str,
+        arguments: dict[str, Any],
+        expected_success: bool | None,
+        expected_error: str | None,
+    ) -> None:
+        harness = _harness(tmp_path)
+        harness.service._planner_dialect = dialect
+        state = _incremental_base_state(tmp_path)
+        repair = {"patch": {"name": "local-repair"}}
+        llm = _ScriptedLLM(
+            _tool_turn("call_unapplied", tool_name, encode_semantic_arguments(tool_name, dialect, arguments)),
+            _tool_turn("call_repair", "set_metadata", encode_semantic_arguments("set_metadata", dialect, repair)),
+            _fake_llm_response(content="The repair awaits approval."),
+        )
+        progress = []
+        async def record_progress(event: Any) -> None:
+            progress.append(event)
+    
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Update the metadata.", [], state, session_id=harness.session_id,
+                user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                progress=record_progress,
+            )
+        proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+>       assert [proposal.tool_call_id for proposal in proposals] == ["call_repair"]
+E       AssertionError: assert ['call_unappl...'call_repair'] == ['call_repair']
+E         
+E         At index 0 diff: 'call_unapplied' != 'call_repair'
+E         Left contains one more item: 'call_repair'
+E         Use -v to get more diff
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1587: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:14:16 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:14:16 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:14:16 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:14:16 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_unapplied_incremental_feedback_then_repair_stages_once[argument-error-openai_strict] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-41/test_unapplied_incremental_fee4')
+dialect = <ToolContractDialect.OPENAI_STRICT: 'openai_strict'>
+tool_name = 'set_metadata', arguments = {'patch': 'invalid'}
+expected_success = None, expected_error = 'ToolArgumentError'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dialect", tuple(ToolContractDialect))
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments", "expected_success", "expected_error"),
+        [
+            ("set_metadata", {"patch": {}}, True, None),
+            ("set_metadata", {"patch": {"name": ""}}, True, None),
+            ("set_metadata", {"patch": "invalid"}, None, "ToolArgumentError"),
+            ("patch_node_options", {"node_id": "absent", "patch": {}}, False, None),
+        ],
+        ids=("empty-noop", "same-value-noop", "argument-error", "handler-refusal"),
+    )
+    async def test_unapplied_incremental_feedback_then_repair_stages_once(
+        tmp_path: Path,
+        dialect: ToolContractDialect,
+        tool_name: str,
+        arguments: dict[str, Any],
+        expected_success: bool | None,
+        expected_error: str | None,
+    ) -> None:
+        harness = _harness(tmp_path)
+        harness.service._planner_dialect = dialect
+        state = _incremental_base_state(tmp_path)
+        repair = {"patch": {"name": "local-repair"}}
+        llm = _ScriptedLLM(
+            _tool_turn("call_unapplied", tool_name, encode_semantic_arguments(tool_name, dialect, arguments)),
+            _tool_turn("call_repair", "set_metadata", encode_semantic_arguments("set_metadata", dialect, repair)),
+            _fake_llm_response(content="The repair awaits approval."),
+        )
+        progress = []
+        async def record_progress(event: Any) -> None:
+            progress.append(event)
+    
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Update the metadata.", [], state, session_id=harness.session_id,
+                user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                progress=record_progress,
+            )
+        proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+>       assert [proposal.tool_call_id for proposal in proposals] == ["call_repair"]
+E       AssertionError: assert ['call_unappl...'call_repair'] == ['call_repair']
+E         
+E         At index 0 diff: 'call_unapplied' != 'call_repair'
+E         Left contains one more item: 'call_repair'
+E         Use -v to get more diff
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1587: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:14:17 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:14:17 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:14:17 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:14:17 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_unapplied_incremental_feedback_then_repair_stages_once[argument-error-none] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-41/test_unapplied_incremental_fee5')
+dialect = <ToolContractDialect.NONE: 'none'>, tool_name = 'set_metadata'
+arguments = {'patch': 'invalid'}, expected_success = None
+expected_error = 'ToolArgumentError'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dialect", tuple(ToolContractDialect))
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments", "expected_success", "expected_error"),
+        [
+            ("set_metadata", {"patch": {}}, True, None),
+            ("set_metadata", {"patch": {"name": ""}}, True, None),
+            ("set_metadata", {"patch": "invalid"}, None, "ToolArgumentError"),
+            ("patch_node_options", {"node_id": "absent", "patch": {}}, False, None),
+        ],
+        ids=("empty-noop", "same-value-noop", "argument-error", "handler-refusal"),
+    )
+    async def test_unapplied_incremental_feedback_then_repair_stages_once(
+        tmp_path: Path,
+        dialect: ToolContractDialect,
+        tool_name: str,
+        arguments: dict[str, Any],
+        expected_success: bool | None,
+        expected_error: str | None,
+    ) -> None:
+        harness = _harness(tmp_path)
+        harness.service._planner_dialect = dialect
+        state = _incremental_base_state(tmp_path)
+        repair = {"patch": {"name": "local-repair"}}
+        llm = _ScriptedLLM(
+            _tool_turn("call_unapplied", tool_name, encode_semantic_arguments(tool_name, dialect, arguments)),
+            _tool_turn("call_repair", "set_metadata", encode_semantic_arguments("set_metadata", dialect, repair)),
+            _fake_llm_response(content="The repair awaits approval."),
+        )
+        progress = []
+        async def record_progress(event: Any) -> None:
+            progress.append(event)
+    
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Update the metadata.", [], state, session_id=harness.session_id,
+                user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                progress=record_progress,
+            )
+        proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+>       assert [proposal.tool_call_id for proposal in proposals] == ["call_repair"]
+E       AssertionError: assert ['call_unappl...'call_repair'] == ['call_repair']
+E         
+E         At index 0 diff: 'call_unapplied' != 'call_repair'
+E         Left contains one more item: 'call_repair'
+E         Use -v to get more diff
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1587: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:14:18 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:14:18 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:14:18 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:14:18 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_unapplied_incremental_feedback_then_repair_stages_once[handler-refusal-openai_strict] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-41/test_unapplied_incremental_fee6')
+dialect = <ToolContractDialect.OPENAI_STRICT: 'openai_strict'>
+tool_name = 'patch_node_options', arguments = {'node_id': 'absent', 'patch': {}}
+expected_success = False, expected_error = None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dialect", tuple(ToolContractDialect))
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments", "expected_success", "expected_error"),
+        [
+            ("set_metadata", {"patch": {}}, True, None),
+            ("set_metadata", {"patch": {"name": ""}}, True, None),
+            ("set_metadata", {"patch": "invalid"}, None, "ToolArgumentError"),
+            ("patch_node_options", {"node_id": "absent", "patch": {}}, False, None),
+        ],
+        ids=("empty-noop", "same-value-noop", "argument-error", "handler-refusal"),
+    )
+    async def test_unapplied_incremental_feedback_then_repair_stages_once(
+        tmp_path: Path,
+        dialect: ToolContractDialect,
+        tool_name: str,
+        arguments: dict[str, Any],
+        expected_success: bool | None,
+        expected_error: str | None,
+    ) -> None:
+        harness = _harness(tmp_path)
+        harness.service._planner_dialect = dialect
+        state = _incremental_base_state(tmp_path)
+        repair = {"patch": {"name": "local-repair"}}
+        llm = _ScriptedLLM(
+            _tool_turn("call_unapplied", tool_name, encode_semantic_arguments(tool_name, dialect, arguments)),
+            _tool_turn("call_repair", "set_metadata", encode_semantic_arguments("set_metadata", dialect, repair)),
+            _fake_llm_response(content="The repair awaits approval."),
+        )
+        progress = []
+        async def record_progress(event: Any) -> None:
+            progress.append(event)
+    
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Update the metadata.", [], state, session_id=harness.session_id,
+                user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                progress=record_progress,
+            )
+        proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+>       assert [proposal.tool_call_id for proposal in proposals] == ["call_repair"]
+E       AssertionError: assert ['call_unappl...'call_repair'] == ['call_repair']
+E         
+E         At index 0 diff: 'call_unapplied' != 'call_repair'
+E         Left contains one more item: 'call_repair'
+E         Use -v to get more diff
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1587: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:14:18 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:14:18 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:14:18 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:14:18 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_unapplied_incremental_feedback_then_repair_stages_once[handler-refusal-none] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-41/test_unapplied_incremental_fee7')
+dialect = <ToolContractDialect.NONE: 'none'>, tool_name = 'patch_node_options'
+arguments = {'node_id': 'absent', 'patch': {}}, expected_success = False
+expected_error = None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dialect", tuple(ToolContractDialect))
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments", "expected_success", "expected_error"),
+        [
+            ("set_metadata", {"patch": {}}, True, None),
+            ("set_metadata", {"patch": {"name": ""}}, True, None),
+            ("set_metadata", {"patch": "invalid"}, None, "ToolArgumentError"),
+            ("patch_node_options", {"node_id": "absent", "patch": {}}, False, None),
+        ],
+        ids=("empty-noop", "same-value-noop", "argument-error", "handler-refusal"),
+    )
+    async def test_unapplied_incremental_feedback_then_repair_stages_once(
+        tmp_path: Path,
+        dialect: ToolContractDialect,
+        tool_name: str,
+        arguments: dict[str, Any],
+        expected_success: bool | None,
+        expected_error: str | None,
+    ) -> None:
+        harness = _harness(tmp_path)
+        harness.service._planner_dialect = dialect
+        state = _incremental_base_state(tmp_path)
+        repair = {"patch": {"name": "local-repair"}}
+        llm = _ScriptedLLM(
+            _tool_turn("call_unapplied", tool_name, encode_semantic_arguments(tool_name, dialect, arguments)),
+            _tool_turn("call_repair", "set_metadata", encode_semantic_arguments("set_metadata", dialect, repair)),
+            _fake_llm_response(content="The repair awaits approval."),
+        )
+        progress = []
+        async def record_progress(event: Any) -> None:
+            progress.append(event)
+    
+        with (
+            patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+            _record_phase3_outcomes(harness.service) as batches,
+        ):
+            result = await harness.service.compose(
+                "Update the metadata.", [], state, session_id=harness.session_id,
+                user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                progress=record_progress,
+            )
+        proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+>       assert [proposal.tool_call_id for proposal in proposals] == ["call_repair"]
+E       AssertionError: assert ['call_unappl...'call_repair'] == ['call_repair']
+E         
+E         At index 0 diff: 'call_unapplied' != 'call_repair'
+E         Left contains one more item: 'call_repair'
+E         Use -v to get more diff
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1587: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:14:19 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:14:19 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:14:19 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:14:19 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_____________ test_proposal_cap_counts_only_admitted_changes[noop] _____________
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-41/test_proposal_cap_counts_only_0')
+call_kind = 'noop'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("call_kind", ("noop", "refusal", "at-cap-noop", "at-cap-refusal", "change", "inline"))
+    async def test_proposal_cap_counts_only_admitted_changes(tmp_path: Path, call_kind: str) -> None:
+        harness = _harness(tmp_path)
+        state = _incremental_base_state(tmp_path)
+        at_cap = call_kind.startswith("at-cap") or call_kind in {"change", "inline"}
+        calls = [
+            {"id": f"call_change_{i}", "name": "set_metadata", "arguments": {"patch": {"name": f"change-{i}"}}}
+            for i in range(10 if at_cap else 0)
+        ]
+        tool_name, arguments = (
+            ("patch_node_options", {"node_id": "absent", "patch": {}})
+            if "refusal" in call_kind else ("set_metadata", {"patch": {}})
+        )
+        if call_kind == "change":
+            tool_name, arguments = "set_metadata", {"patch": {"name": "excess"}}
+        if call_kind == "inline":
+            tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
+        calls.extend({"id": f"call_tail_{i}", "name": tool_name, "arguments": arguments} for i in range(1 if at_cap else 11))
+        llm = _ScriptedLLM(_fake_llm_response(tool_calls=tuple(calls)), _fake_llm_response(content="Done."))
+        with patch.object(harness.service._provider_gateway, "_call_llm", new=llm):
+            if call_kind in {"change", "inline"}:
+                with pytest.raises(ComposerConvergenceError) as raised:
+                    await harness.service.compose(
+                        "Review these edits.", [], state, session_id=harness.session_id,
+                        user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                    )
+                assert dict(raised.value.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
+                assert len(raised.value.tool_invocations) == 10
+            else:
+>               result = await harness.service.compose(
+                    "Review these edits.", [], state, session_id=harness.session_id,
+                    user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                )
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1640: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/helpers/composer_lease.py:165: in compose
+    return await _with_lease(self, session_id, kwargs, call, bind_provider_owner=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:108: in _with_lease
+    return await _with_provider_owner(self, forwarded, call, lease) if bind_provider_owner else await call(**forwarded)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:50: in _with_provider_owner
+    return await call(**forwarded)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:163: in call
+    return await real_compose(self, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:1274: in compose
+    return await self._compose_loop(
+src/elspeth/web/composer/service.py:2870: in _compose_loop
+    ) = await _await_tool_turn_with_deferred_cancellation(
+src/elspeth/web/composer/service.py:204: in _await_tool_turn_with_deferred_cancellation
+    return await asyncio.shield(task), deferred
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:2724: in _dispatch_and_persist_tool_turn
+    dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(
+src/elspeth/web/composer/service.py:1690: in _dispatch_tool_batch
+    return await run_tool_batch(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def run_tool_batch(
+        *,
+        call_model: _CallModelOutcome,
+        ctx: ToolBatchContext,
+        acc: BatchAccumulator,
+        llm_messages: list[dict[str, Any]],
+    ) -> tuple[_DispatchOutcome, int]:
+        """Execute one tool batch — extracted verbatim from
+        ``ComposerServiceImpl._dispatch_tool_batch``.
+    
+        See the module docstring and ``ToolBatchContext`` for the
+        behaviour-preservation contract. The body below is the former method
+        body with deployment facts and collaborators supplied through
+        ``ToolBatchContext`` and driver-owned locals supplied by the preamble.
+        """
+        # ------------------------------------------------------------------
+        # Alias preamble: reconstruct the original ``_dispatch_tool_batch``
+        # local namespace so the branch ordering below remains intact. Loop-invariant
+        # inputs come from ``ctx``; the four driver-owned loop-carried inputs come
+        # from ``acc``. Every other body init (``tool_outcomes = []``,
+        # ``turn_has_mutation = False``, ...) stays inline exactly as before, so
+        # the closures, the ``_append_tool_outcome`` default-arg capture, and
+        # every loop reassignment keep working against the same local names.
+        # Former service reads now use named collaborators and immutable batch facts.
+        # ------------------------------------------------------------------
+        recorder = ctx.recorder
+        anti_anchor = ctx.anti_anchor
+        discovery_cache = ctx.discovery_cache
+        runtime_preflight_cache = ctx.runtime_preflight_cache
+        session_id = ctx.session_id
+        user_id = ctx.user_id
+        user_message_id = ctx.user_message_id
+        user_message_content = ctx.user_message_content
+        current_state_id = ctx.current_state_id
+        actor = ctx.actor
+        initial_version = ctx.initial_version
+        deadline = ctx.deadline
+        progress = ctx.progress
+        session_scope = ctx.session_scope
+        turn_sessions_service = ctx.turn_sessions_service
+        turn_session_uuid = ctx.turn_session_uuid
+        turn_preferences = ctx.turn_preferences
+        state = acc.state
+        last_validation = acc.last_validation
+        last_runtime_preflight = acc.last_runtime_preflight
+        advisor_calls_used = acc.advisor_calls_used
+    
+        completion = call_model.completion
+        assistant_message = completion.message
+        raw_assistant_content = assistant_message.content
+        admitted_batch = completion.tool_batch
+        assistant_tool_calls = admitted_batch.calls
+        mixed_abandonment_batch = False
+        if len(assistant_tool_calls) > 1:
+            for candidate_call in assistant_tool_calls:
+                if candidate_call.function.name != "request_advisor_hint":
+                    continue
+                try:
+                    candidate_arguments = bounded_json_loads(candidate_call.function.arguments, label="advisor batch admission")
+                except (json.JSONDecodeError, JsonBoundaryError, TypeError, ValueError):
+                    continue
+                if (
+                    type(candidate_arguments) is dict
+                    and "trigger" in candidate_arguments
+                    and candidate_arguments["trigger"] == ADVISOR_TRIGGER_CANNOT_COMPLETE
+                ):
+                    mixed_abandonment_batch = True
+                    break
+        if ctx.turn_evidence is not None:
+            ctx.turn_evidence.invalidate_abandonment()
+        # Scan the complete response metadata before progress, history, audit,
+        # proposal, blob, or state effects. Internal adapters can supply an
+        # already-admitted completion without passing through ProviderGateway, so
+        # this common owner must cover prose, identifiers, reasoning, and mixed
+        # batches all-or-nothing as well.
+        require_no_credential_material_in_llm_metadata(
+            content=raw_assistant_content,
+            tool_calls=tuple((call.id, call.function.name) for call in assistant_tool_calls),
+            reasoning_content=completion.provider_metadata.reasoning_content,
+            reasoning_details=completion.provider_metadata.reasoning_details,
+            thinking_blocks=completion.provider_metadata.thinking_blocks,
+            model_returned=completion.provider_metadata.model_returned,
+            provider_request_id=completion.provider_metadata.provider_request_id,
+            finish_reason=completion.provider_metadata.finish_reason,
+            provider_served=completion.provider_metadata.provider_served,
+            surface="composer_tool_batch",
+        )
+        from elspeth.web.credential_guard import credential_state_for_tool_batch
+    
+        batch_credential_state = credential_state_for_tool_batch(state, tuple(call.function.name for call in assistant_tool_calls))
+        for tool_call in assistant_tool_calls:
+            require_no_credential_material_in_tool_wire(
+                tool_call.function.name,
+                tool_call.function.arguments,
+                surface="composer_tool_wire",
+                credential_state=batch_credential_state,
+            )
+        provider_model_version = completion.provider_metadata.model_returned or ctx.provenance.model_identifier
+        if (
+            turn_sessions_service is not None
+            and turn_session_uuid is not None
+            and turn_preferences is not None
+            and turn_preferences.trust_mode == "explicit_approve"
+        ):
+            approval_required_mutations = sum(
+                1
+                for tool_call in assistant_tool_calls
+                if is_mutation_tool(tool_call.function.name)
+                and (
+                    not is_blob_store_only_mutation_tool(tool_call.function.name)
+                    or is_approval_required_blob_store_only_mutation_tool(tool_call.function.name)
+                )
+            )
+            if approval_required_mutations > _MAX_PENDING_PROPOSALS_PER_TURN:
+>               raise _pending_proposal_cap_error(approval_required_mutations, ctx=ctx, state=state)
+E               elspeth.web.composer.protocol.ComposerConvergenceError: Composer did not converge within 0 turns (budget exhausted: composition). The LLM kept making tool calls without producing a final response.
+
+src/elspeth/web/composer/tool_batch.py:1054: ComposerConvergenceError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:14:20 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:14:20 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:14:20 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:14:20 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+___________ test_proposal_cap_counts_only_admitted_changes[refusal] ____________
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-41/test_proposal_cap_counts_only_1')
+call_kind = 'refusal'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("call_kind", ("noop", "refusal", "at-cap-noop", "at-cap-refusal", "change", "inline"))
+    async def test_proposal_cap_counts_only_admitted_changes(tmp_path: Path, call_kind: str) -> None:
+        harness = _harness(tmp_path)
+        state = _incremental_base_state(tmp_path)
+        at_cap = call_kind.startswith("at-cap") or call_kind in {"change", "inline"}
+        calls = [
+            {"id": f"call_change_{i}", "name": "set_metadata", "arguments": {"patch": {"name": f"change-{i}"}}}
+            for i in range(10 if at_cap else 0)
+        ]
+        tool_name, arguments = (
+            ("patch_node_options", {"node_id": "absent", "patch": {}})
+            if "refusal" in call_kind else ("set_metadata", {"patch": {}})
+        )
+        if call_kind == "change":
+            tool_name, arguments = "set_metadata", {"patch": {"name": "excess"}}
+        if call_kind == "inline":
+            tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
+        calls.extend({"id": f"call_tail_{i}", "name": tool_name, "arguments": arguments} for i in range(1 if at_cap else 11))
+        llm = _ScriptedLLM(_fake_llm_response(tool_calls=tuple(calls)), _fake_llm_response(content="Done."))
+        with patch.object(harness.service._provider_gateway, "_call_llm", new=llm):
+            if call_kind in {"change", "inline"}:
+                with pytest.raises(ComposerConvergenceError) as raised:
+                    await harness.service.compose(
+                        "Review these edits.", [], state, session_id=harness.session_id,
+                        user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                    )
+                assert dict(raised.value.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
+                assert len(raised.value.tool_invocations) == 10
+            else:
+>               result = await harness.service.compose(
+                    "Review these edits.", [], state, session_id=harness.session_id,
+                    user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                )
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1640: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/helpers/composer_lease.py:165: in compose
+    return await _with_lease(self, session_id, kwargs, call, bind_provider_owner=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:108: in _with_lease
+    return await _with_provider_owner(self, forwarded, call, lease) if bind_provider_owner else await call(**forwarded)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:50: in _with_provider_owner
+    return await call(**forwarded)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:163: in call
+    return await real_compose(self, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:1274: in compose
+    return await self._compose_loop(
+src/elspeth/web/composer/service.py:2870: in _compose_loop
+    ) = await _await_tool_turn_with_deferred_cancellation(
+src/elspeth/web/composer/service.py:204: in _await_tool_turn_with_deferred_cancellation
+    return await asyncio.shield(task), deferred
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:2724: in _dispatch_and_persist_tool_turn
+    dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(
+src/elspeth/web/composer/service.py:1690: in _dispatch_tool_batch
+    return await run_tool_batch(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def run_tool_batch(
+        *,
+        call_model: _CallModelOutcome,
+        ctx: ToolBatchContext,
+        acc: BatchAccumulator,
+        llm_messages: list[dict[str, Any]],
+    ) -> tuple[_DispatchOutcome, int]:
+        """Execute one tool batch — extracted verbatim from
+        ``ComposerServiceImpl._dispatch_tool_batch``.
+    
+        See the module docstring and ``ToolBatchContext`` for the
+        behaviour-preservation contract. The body below is the former method
+        body with deployment facts and collaborators supplied through
+        ``ToolBatchContext`` and driver-owned locals supplied by the preamble.
+        """
+        # ------------------------------------------------------------------
+        # Alias preamble: reconstruct the original ``_dispatch_tool_batch``
+        # local namespace so the branch ordering below remains intact. Loop-invariant
+        # inputs come from ``ctx``; the four driver-owned loop-carried inputs come
+        # from ``acc``. Every other body init (``tool_outcomes = []``,
+        # ``turn_has_mutation = False``, ...) stays inline exactly as before, so
+        # the closures, the ``_append_tool_outcome`` default-arg capture, and
+        # every loop reassignment keep working against the same local names.
+        # Former service reads now use named collaborators and immutable batch facts.
+        # ------------------------------------------------------------------
+        recorder = ctx.recorder
+        anti_anchor = ctx.anti_anchor
+        discovery_cache = ctx.discovery_cache
+        runtime_preflight_cache = ctx.runtime_preflight_cache
+        session_id = ctx.session_id
+        user_id = ctx.user_id
+        user_message_id = ctx.user_message_id
+        user_message_content = ctx.user_message_content
+        current_state_id = ctx.current_state_id
+        actor = ctx.actor
+        initial_version = ctx.initial_version
+        deadline = ctx.deadline
+        progress = ctx.progress
+        session_scope = ctx.session_scope
+        turn_sessions_service = ctx.turn_sessions_service
+        turn_session_uuid = ctx.turn_session_uuid
+        turn_preferences = ctx.turn_preferences
+        state = acc.state
+        last_validation = acc.last_validation
+        last_runtime_preflight = acc.last_runtime_preflight
+        advisor_calls_used = acc.advisor_calls_used
+    
+        completion = call_model.completion
+        assistant_message = completion.message
+        raw_assistant_content = assistant_message.content
+        admitted_batch = completion.tool_batch
+        assistant_tool_calls = admitted_batch.calls
+        mixed_abandonment_batch = False
+        if len(assistant_tool_calls) > 1:
+            for candidate_call in assistant_tool_calls:
+                if candidate_call.function.name != "request_advisor_hint":
+                    continue
+                try:
+                    candidate_arguments = bounded_json_loads(candidate_call.function.arguments, label="advisor batch admission")
+                except (json.JSONDecodeError, JsonBoundaryError, TypeError, ValueError):
+                    continue
+                if (
+                    type(candidate_arguments) is dict
+                    and "trigger" in candidate_arguments
+                    and candidate_arguments["trigger"] == ADVISOR_TRIGGER_CANNOT_COMPLETE
+                ):
+                    mixed_abandonment_batch = True
+                    break
+        if ctx.turn_evidence is not None:
+            ctx.turn_evidence.invalidate_abandonment()
+        # Scan the complete response metadata before progress, history, audit,
+        # proposal, blob, or state effects. Internal adapters can supply an
+        # already-admitted completion without passing through ProviderGateway, so
+        # this common owner must cover prose, identifiers, reasoning, and mixed
+        # batches all-or-nothing as well.
+        require_no_credential_material_in_llm_metadata(
+            content=raw_assistant_content,
+            tool_calls=tuple((call.id, call.function.name) for call in assistant_tool_calls),
+            reasoning_content=completion.provider_metadata.reasoning_content,
+            reasoning_details=completion.provider_metadata.reasoning_details,
+            thinking_blocks=completion.provider_metadata.thinking_blocks,
+            model_returned=completion.provider_metadata.model_returned,
+            provider_request_id=completion.provider_metadata.provider_request_id,
+            finish_reason=completion.provider_metadata.finish_reason,
+            provider_served=completion.provider_metadata.provider_served,
+            surface="composer_tool_batch",
+        )
+        from elspeth.web.credential_guard import credential_state_for_tool_batch
+    
+        batch_credential_state = credential_state_for_tool_batch(state, tuple(call.function.name for call in assistant_tool_calls))
+        for tool_call in assistant_tool_calls:
+            require_no_credential_material_in_tool_wire(
+                tool_call.function.name,
+                tool_call.function.arguments,
+                surface="composer_tool_wire",
+                credential_state=batch_credential_state,
+            )
+        provider_model_version = completion.provider_metadata.model_returned or ctx.provenance.model_identifier
+        if (
+            turn_sessions_service is not None
+            and turn_session_uuid is not None
+            and turn_preferences is not None
+            and turn_preferences.trust_mode == "explicit_approve"
+        ):
+            approval_required_mutations = sum(
+                1
+                for tool_call in assistant_tool_calls
+                if is_mutation_tool(tool_call.function.name)
+                and (
+                    not is_blob_store_only_mutation_tool(tool_call.function.name)
+                    or is_approval_required_blob_store_only_mutation_tool(tool_call.function.name)
+                )
+            )
+            if approval_required_mutations > _MAX_PENDING_PROPOSALS_PER_TURN:
+>               raise _pending_proposal_cap_error(approval_required_mutations, ctx=ctx, state=state)
+E               elspeth.web.composer.protocol.ComposerConvergenceError: Composer did not converge within 0 turns (budget exhausted: composition). The LLM kept making tool calls without producing a final response.
+
+src/elspeth/web/composer/tool_batch.py:1054: ComposerConvergenceError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:14:21 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:14:21 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:14:21 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:14:21 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_________ test_proposal_cap_counts_only_admitted_changes[at-cap-noop] __________
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-41/test_proposal_cap_counts_only_2')
+call_kind = 'at-cap-noop'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("call_kind", ("noop", "refusal", "at-cap-noop", "at-cap-refusal", "change", "inline"))
+    async def test_proposal_cap_counts_only_admitted_changes(tmp_path: Path, call_kind: str) -> None:
+        harness = _harness(tmp_path)
+        state = _incremental_base_state(tmp_path)
+        at_cap = call_kind.startswith("at-cap") or call_kind in {"change", "inline"}
+        calls = [
+            {"id": f"call_change_{i}", "name": "set_metadata", "arguments": {"patch": {"name": f"change-{i}"}}}
+            for i in range(10 if at_cap else 0)
+        ]
+        tool_name, arguments = (
+            ("patch_node_options", {"node_id": "absent", "patch": {}})
+            if "refusal" in call_kind else ("set_metadata", {"patch": {}})
+        )
+        if call_kind == "change":
+            tool_name, arguments = "set_metadata", {"patch": {"name": "excess"}}
+        if call_kind == "inline":
+            tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
+        calls.extend({"id": f"call_tail_{i}", "name": tool_name, "arguments": arguments} for i in range(1 if at_cap else 11))
+        llm = _ScriptedLLM(_fake_llm_response(tool_calls=tuple(calls)), _fake_llm_response(content="Done."))
+        with patch.object(harness.service._provider_gateway, "_call_llm", new=llm):
+            if call_kind in {"change", "inline"}:
+                with pytest.raises(ComposerConvergenceError) as raised:
+                    await harness.service.compose(
+                        "Review these edits.", [], state, session_id=harness.session_id,
+                        user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                    )
+                assert dict(raised.value.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
+                assert len(raised.value.tool_invocations) == 10
+            else:
+>               result = await harness.service.compose(
+                    "Review these edits.", [], state, session_id=harness.session_id,
+                    user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                )
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1640: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/helpers/composer_lease.py:165: in compose
+    return await _with_lease(self, session_id, kwargs, call, bind_provider_owner=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:108: in _with_lease
+    return await _with_provider_owner(self, forwarded, call, lease) if bind_provider_owner else await call(**forwarded)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:50: in _with_provider_owner
+    return await call(**forwarded)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:163: in call
+    return await real_compose(self, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:1274: in compose
+    return await self._compose_loop(
+src/elspeth/web/composer/service.py:2870: in _compose_loop
+    ) = await _await_tool_turn_with_deferred_cancellation(
+src/elspeth/web/composer/service.py:204: in _await_tool_turn_with_deferred_cancellation
+    return await asyncio.shield(task), deferred
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:2724: in _dispatch_and_persist_tool_turn
+    dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(
+src/elspeth/web/composer/service.py:1690: in _dispatch_tool_batch
+    return await run_tool_batch(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def run_tool_batch(
+        *,
+        call_model: _CallModelOutcome,
+        ctx: ToolBatchContext,
+        acc: BatchAccumulator,
+        llm_messages: list[dict[str, Any]],
+    ) -> tuple[_DispatchOutcome, int]:
+        """Execute one tool batch — extracted verbatim from
+        ``ComposerServiceImpl._dispatch_tool_batch``.
+    
+        See the module docstring and ``ToolBatchContext`` for the
+        behaviour-preservation contract. The body below is the former method
+        body with deployment facts and collaborators supplied through
+        ``ToolBatchContext`` and driver-owned locals supplied by the preamble.
+        """
+        # ------------------------------------------------------------------
+        # Alias preamble: reconstruct the original ``_dispatch_tool_batch``
+        # local namespace so the branch ordering below remains intact. Loop-invariant
+        # inputs come from ``ctx``; the four driver-owned loop-carried inputs come
+        # from ``acc``. Every other body init (``tool_outcomes = []``,
+        # ``turn_has_mutation = False``, ...) stays inline exactly as before, so
+        # the closures, the ``_append_tool_outcome`` default-arg capture, and
+        # every loop reassignment keep working against the same local names.
+        # Former service reads now use named collaborators and immutable batch facts.
+        # ------------------------------------------------------------------
+        recorder = ctx.recorder
+        anti_anchor = ctx.anti_anchor
+        discovery_cache = ctx.discovery_cache
+        runtime_preflight_cache = ctx.runtime_preflight_cache
+        session_id = ctx.session_id
+        user_id = ctx.user_id
+        user_message_id = ctx.user_message_id
+        user_message_content = ctx.user_message_content
+        current_state_id = ctx.current_state_id
+        actor = ctx.actor
+        initial_version = ctx.initial_version
+        deadline = ctx.deadline
+        progress = ctx.progress
+        session_scope = ctx.session_scope
+        turn_sessions_service = ctx.turn_sessions_service
+        turn_session_uuid = ctx.turn_session_uuid
+        turn_preferences = ctx.turn_preferences
+        state = acc.state
+        last_validation = acc.last_validation
+        last_runtime_preflight = acc.last_runtime_preflight
+        advisor_calls_used = acc.advisor_calls_used
+    
+        completion = call_model.completion
+        assistant_message = completion.message
+        raw_assistant_content = assistant_message.content
+        admitted_batch = completion.tool_batch
+        assistant_tool_calls = admitted_batch.calls
+        mixed_abandonment_batch = False
+        if len(assistant_tool_calls) > 1:
+            for candidate_call in assistant_tool_calls:
+                if candidate_call.function.name != "request_advisor_hint":
+                    continue
+                try:
+                    candidate_arguments = bounded_json_loads(candidate_call.function.arguments, label="advisor batch admission")
+                except (json.JSONDecodeError, JsonBoundaryError, TypeError, ValueError):
+                    continue
+                if (
+                    type(candidate_arguments) is dict
+                    and "trigger" in candidate_arguments
+                    and candidate_arguments["trigger"] == ADVISOR_TRIGGER_CANNOT_COMPLETE
+                ):
+                    mixed_abandonment_batch = True
+                    break
+        if ctx.turn_evidence is not None:
+            ctx.turn_evidence.invalidate_abandonment()
+        # Scan the complete response metadata before progress, history, audit,
+        # proposal, blob, or state effects. Internal adapters can supply an
+        # already-admitted completion without passing through ProviderGateway, so
+        # this common owner must cover prose, identifiers, reasoning, and mixed
+        # batches all-or-nothing as well.
+        require_no_credential_material_in_llm_metadata(
+            content=raw_assistant_content,
+            tool_calls=tuple((call.id, call.function.name) for call in assistant_tool_calls),
+            reasoning_content=completion.provider_metadata.reasoning_content,
+            reasoning_details=completion.provider_metadata.reasoning_details,
+            thinking_blocks=completion.provider_metadata.thinking_blocks,
+            model_returned=completion.provider_metadata.model_returned,
+            provider_request_id=completion.provider_metadata.provider_request_id,
+            finish_reason=completion.provider_metadata.finish_reason,
+            provider_served=completion.provider_metadata.provider_served,
+            surface="composer_tool_batch",
+        )
+        from elspeth.web.credential_guard import credential_state_for_tool_batch
+    
+        batch_credential_state = credential_state_for_tool_batch(state, tuple(call.function.name for call in assistant_tool_calls))
+        for tool_call in assistant_tool_calls:
+            require_no_credential_material_in_tool_wire(
+                tool_call.function.name,
+                tool_call.function.arguments,
+                surface="composer_tool_wire",
+                credential_state=batch_credential_state,
+            )
+        provider_model_version = completion.provider_metadata.model_returned or ctx.provenance.model_identifier
+        if (
+            turn_sessions_service is not None
+            and turn_session_uuid is not None
+            and turn_preferences is not None
+            and turn_preferences.trust_mode == "explicit_approve"
+        ):
+            approval_required_mutations = sum(
+                1
+                for tool_call in assistant_tool_calls
+                if is_mutation_tool(tool_call.function.name)
+                and (
+                    not is_blob_store_only_mutation_tool(tool_call.function.name)
+                    or is_approval_required_blob_store_only_mutation_tool(tool_call.function.name)
+                )
+            )
+            if approval_required_mutations > _MAX_PENDING_PROPOSALS_PER_TURN:
+>               raise _pending_proposal_cap_error(approval_required_mutations, ctx=ctx, state=state)
+E               elspeth.web.composer.protocol.ComposerConvergenceError: Composer did not converge within 0 turns (budget exhausted: composition). The LLM kept making tool calls without producing a final response.
+
+src/elspeth/web/composer/tool_batch.py:1054: ComposerConvergenceError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:14:21 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:14:21 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:14:21 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:14:21 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+________ test_proposal_cap_counts_only_admitted_changes[at-cap-refusal] ________
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-41/test_proposal_cap_counts_only_3')
+call_kind = 'at-cap-refusal'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("call_kind", ("noop", "refusal", "at-cap-noop", "at-cap-refusal", "change", "inline"))
+    async def test_proposal_cap_counts_only_admitted_changes(tmp_path: Path, call_kind: str) -> None:
+        harness = _harness(tmp_path)
+        state = _incremental_base_state(tmp_path)
+        at_cap = call_kind.startswith("at-cap") or call_kind in {"change", "inline"}
+        calls = [
+            {"id": f"call_change_{i}", "name": "set_metadata", "arguments": {"patch": {"name": f"change-{i}"}}}
+            for i in range(10 if at_cap else 0)
+        ]
+        tool_name, arguments = (
+            ("patch_node_options", {"node_id": "absent", "patch": {}})
+            if "refusal" in call_kind else ("set_metadata", {"patch": {}})
+        )
+        if call_kind == "change":
+            tool_name, arguments = "set_metadata", {"patch": {"name": "excess"}}
+        if call_kind == "inline":
+            tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
+        calls.extend({"id": f"call_tail_{i}", "name": tool_name, "arguments": arguments} for i in range(1 if at_cap else 11))
+        llm = _ScriptedLLM(_fake_llm_response(tool_calls=tuple(calls)), _fake_llm_response(content="Done."))
+        with patch.object(harness.service._provider_gateway, "_call_llm", new=llm):
+            if call_kind in {"change", "inline"}:
+                with pytest.raises(ComposerConvergenceError) as raised:
+                    await harness.service.compose(
+                        "Review these edits.", [], state, session_id=harness.session_id,
+                        user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                    )
+                assert dict(raised.value.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
+                assert len(raised.value.tool_invocations) == 10
+            else:
+>               result = await harness.service.compose(
+                    "Review these edits.", [], state, session_id=harness.session_id,
+                    user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                )
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1640: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/helpers/composer_lease.py:165: in compose
+    return await _with_lease(self, session_id, kwargs, call, bind_provider_owner=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:108: in _with_lease
+    return await _with_provider_owner(self, forwarded, call, lease) if bind_provider_owner else await call(**forwarded)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:50: in _with_provider_owner
+    return await call(**forwarded)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+tests/helpers/composer_lease.py:163: in call
+    return await real_compose(self, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:1274: in compose
+    return await self._compose_loop(
+src/elspeth/web/composer/service.py:2870: in _compose_loop
+    ) = await _await_tool_turn_with_deferred_cancellation(
+src/elspeth/web/composer/service.py:204: in _await_tool_turn_with_deferred_cancellation
+    return await asyncio.shield(task), deferred
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/service.py:2724: in _dispatch_and_persist_tool_turn
+    dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(
+src/elspeth/web/composer/service.py:1690: in _dispatch_tool_batch
+    return await run_tool_batch(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def run_tool_batch(
+        *,
+        call_model: _CallModelOutcome,
+        ctx: ToolBatchContext,
+        acc: BatchAccumulator,
+        llm_messages: list[dict[str, Any]],
+    ) -> tuple[_DispatchOutcome, int]:
+        """Execute one tool batch — extracted verbatim from
+        ``ComposerServiceImpl._dispatch_tool_batch``.
+    
+        See the module docstring and ``ToolBatchContext`` for the
+        behaviour-preservation contract. The body below is the former method
+        body with deployment facts and collaborators supplied through
+        ``ToolBatchContext`` and driver-owned locals supplied by the preamble.
+        """
+        # ------------------------------------------------------------------
+        # Alias preamble: reconstruct the original ``_dispatch_tool_batch``
+        # local namespace so the branch ordering below remains intact. Loop-invariant
+        # inputs come from ``ctx``; the four driver-owned loop-carried inputs come
+        # from ``acc``. Every other body init (``tool_outcomes = []``,
+        # ``turn_has_mutation = False``, ...) stays inline exactly as before, so
+        # the closures, the ``_append_tool_outcome`` default-arg capture, and
+        # every loop reassignment keep working against the same local names.
+        # Former service reads now use named collaborators and immutable batch facts.
+        # ------------------------------------------------------------------
+        recorder = ctx.recorder
+        anti_anchor = ctx.anti_anchor
+        discovery_cache = ctx.discovery_cache
+        runtime_preflight_cache = ctx.runtime_preflight_cache
+        session_id = ctx.session_id
+        user_id = ctx.user_id
+        user_message_id = ctx.user_message_id
+        user_message_content = ctx.user_message_content
+        current_state_id = ctx.current_state_id
+        actor = ctx.actor
+        initial_version = ctx.initial_version
+        deadline = ctx.deadline
+        progress = ctx.progress
+        session_scope = ctx.session_scope
+        turn_sessions_service = ctx.turn_sessions_service
+        turn_session_uuid = ctx.turn_session_uuid
+        turn_preferences = ctx.turn_preferences
+        state = acc.state
+        last_validation = acc.last_validation
+        last_runtime_preflight = acc.last_runtime_preflight
+        advisor_calls_used = acc.advisor_calls_used
+    
+        completion = call_model.completion
+        assistant_message = completion.message
+        raw_assistant_content = assistant_message.content
+        admitted_batch = completion.tool_batch
+        assistant_tool_calls = admitted_batch.calls
+        mixed_abandonment_batch = False
+        if len(assistant_tool_calls) > 1:
+            for candidate_call in assistant_tool_calls:
+                if candidate_call.function.name != "request_advisor_hint":
+                    continue
+                try:
+                    candidate_arguments = bounded_json_loads(candidate_call.function.arguments, label="advisor batch admission")
+                except (json.JSONDecodeError, JsonBoundaryError, TypeError, ValueError):
+                    continue
+                if (
+                    type(candidate_arguments) is dict
+                    and "trigger" in candidate_arguments
+                    and candidate_arguments["trigger"] == ADVISOR_TRIGGER_CANNOT_COMPLETE
+                ):
+                    mixed_abandonment_batch = True
+                    break
+        if ctx.turn_evidence is not None:
+            ctx.turn_evidence.invalidate_abandonment()
+        # Scan the complete response metadata before progress, history, audit,
+        # proposal, blob, or state effects. Internal adapters can supply an
+        # already-admitted completion without passing through ProviderGateway, so
+        # this common owner must cover prose, identifiers, reasoning, and mixed
+        # batches all-or-nothing as well.
+        require_no_credential_material_in_llm_metadata(
+            content=raw_assistant_content,
+            tool_calls=tuple((call.id, call.function.name) for call in assistant_tool_calls),
+            reasoning_content=completion.provider_metadata.reasoning_content,
+            reasoning_details=completion.provider_metadata.reasoning_details,
+            thinking_blocks=completion.provider_metadata.thinking_blocks,
+            model_returned=completion.provider_metadata.model_returned,
+            provider_request_id=completion.provider_metadata.provider_request_id,
+            finish_reason=completion.provider_metadata.finish_reason,
+            provider_served=completion.provider_metadata.provider_served,
+            surface="composer_tool_batch",
+        )
+        from elspeth.web.credential_guard import credential_state_for_tool_batch
+    
+        batch_credential_state = credential_state_for_tool_batch(state, tuple(call.function.name for call in assistant_tool_calls))
+        for tool_call in assistant_tool_calls:
+            require_no_credential_material_in_tool_wire(
+                tool_call.function.name,
+                tool_call.function.arguments,
+                surface="composer_tool_wire",
+                credential_state=batch_credential_state,
+            )
+        provider_model_version = completion.provider_metadata.model_returned or ctx.provenance.model_identifier
+        if (
+            turn_sessions_service is not None
+            and turn_session_uuid is not None
+            and turn_preferences is not None
+            and turn_preferences.trust_mode == "explicit_approve"
+        ):
+            approval_required_mutations = sum(
+                1
+                for tool_call in assistant_tool_calls
+                if is_mutation_tool(tool_call.function.name)
+                and (
+                    not is_blob_store_only_mutation_tool(tool_call.function.name)
+                    or is_approval_required_blob_store_only_mutation_tool(tool_call.function.name)
+                )
+            )
+            if approval_required_mutations > _MAX_PENDING_PROPOSALS_PER_TURN:
+>               raise _pending_proposal_cap_error(approval_required_mutations, ctx=ctx, state=state)
+E               elspeth.web.composer.protocol.ComposerConvergenceError: Composer did not converge within 0 turns (budget exhausted: composition). The LLM kept making tool calls without producing a final response.
+
+src/elspeth/web/composer/tool_batch.py:1054: ComposerConvergenceError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:14:22 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:14:22 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:14:22 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:14:22 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+____________ test_proposal_cap_counts_only_admitted_changes[change] ____________
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-41/test_proposal_cap_counts_only_4')
+call_kind = 'change'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("call_kind", ("noop", "refusal", "at-cap-noop", "at-cap-refusal", "change", "inline"))
+    async def test_proposal_cap_counts_only_admitted_changes(tmp_path: Path, call_kind: str) -> None:
+        harness = _harness(tmp_path)
+        state = _incremental_base_state(tmp_path)
+        at_cap = call_kind.startswith("at-cap") or call_kind in {"change", "inline"}
+        calls = [
+            {"id": f"call_change_{i}", "name": "set_metadata", "arguments": {"patch": {"name": f"change-{i}"}}}
+            for i in range(10 if at_cap else 0)
+        ]
+        tool_name, arguments = (
+            ("patch_node_options", {"node_id": "absent", "patch": {}})
+            if "refusal" in call_kind else ("set_metadata", {"patch": {}})
+        )
+        if call_kind == "change":
+            tool_name, arguments = "set_metadata", {"patch": {"name": "excess"}}
+        if call_kind == "inline":
+            tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
+        calls.extend({"id": f"call_tail_{i}", "name": tool_name, "arguments": arguments} for i in range(1 if at_cap else 11))
+        llm = _ScriptedLLM(_fake_llm_response(tool_calls=tuple(calls)), _fake_llm_response(content="Done."))
+        with patch.object(harness.service._provider_gateway, "_call_llm", new=llm):
+            if call_kind in {"change", "inline"}:
+                with pytest.raises(ComposerConvergenceError) as raised:
+                    await harness.service.compose(
+                        "Review these edits.", [], state, session_id=harness.session_id,
+                        user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                    )
+                assert dict(raised.value.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
+>               assert len(raised.value.tool_invocations) == 10
+E               AssertionError: assert 0 == 10
+E                +  where 0 = len(())
+E                +    where () = ComposerConvergenceError('Composer did not converge within 0 turns (budget exhausted: composition). The LLM kept making tool calls without producing a final response.').tool_invocations
+E                +      where ComposerConvergenceError('Composer did not converge within 0 turns (budget exhausted: composition). The LLM kept making tool calls without producing a final response.') = <ExceptionInfo ComposerConvergenceError('Composer did not converge within 0 turns (budget exhausted: composition). The LLM kept making tool calls without producing a final response.') tblen=11>.value
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1638: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:14:23 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:14:23 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:14:23 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:14:23 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+____________ test_proposal_cap_counts_only_admitted_changes[inline] ____________
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-41/test_proposal_cap_counts_only_5')
+call_kind = 'inline'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("call_kind", ("noop", "refusal", "at-cap-noop", "at-cap-refusal", "change", "inline"))
+    async def test_proposal_cap_counts_only_admitted_changes(tmp_path: Path, call_kind: str) -> None:
+        harness = _harness(tmp_path)
+        state = _incremental_base_state(tmp_path)
+        at_cap = call_kind.startswith("at-cap") or call_kind in {"change", "inline"}
+        calls = [
+            {"id": f"call_change_{i}", "name": "set_metadata", "arguments": {"patch": {"name": f"change-{i}"}}}
+            for i in range(10 if at_cap else 0)
+        ]
+        tool_name, arguments = (
+            ("patch_node_options", {"node_id": "absent", "patch": {}})
+            if "refusal" in call_kind else ("set_metadata", {"patch": {}})
+        )
+        if call_kind == "change":
+            tool_name, arguments = "set_metadata", {"patch": {"name": "excess"}}
+        if call_kind == "inline":
+            tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
+        calls.extend({"id": f"call_tail_{i}", "name": tool_name, "arguments": arguments} for i in range(1 if at_cap else 11))
+        llm = _ScriptedLLM(_fake_llm_response(tool_calls=tuple(calls)), _fake_llm_response(content="Done."))
+        with patch.object(harness.service._provider_gateway, "_call_llm", new=llm):
+            if call_kind in {"change", "inline"}:
+                with pytest.raises(ComposerConvergenceError) as raised:
+                    await harness.service.compose(
+                        "Review these edits.", [], state, session_id=harness.session_id,
+                        user_id="proposal-prevalidation-user", user_message_id=harness.user_message_id,
+                    )
+                assert dict(raised.value.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
+>               assert len(raised.value.tool_invocations) == 10
+E               AssertionError: assert 0 == 10
+E                +  where 0 = len(())
+E                +    where () = ComposerConvergenceError('Composer did not converge within 0 turns (budget exhausted: composition). The LLM kept making tool calls without producing a final response.').tool_invocations
+E                +      where ComposerConvergenceError('Composer did not converge within 0 turns (budget exhausted: composition). The LLM kept making tool calls without producing a final response.') = <ExceptionInfo ComposerConvergenceError('Composer did not converge within 0 turns (budget exhausted: composition). The LLM kept making tool calls without producing a final response.') tblen=11>.value
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1638: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:14:23 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:14:23 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:14:23 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+2026-11-09 11:14:23 [info     ] composer_authoring_surface_selected authoring_surface=compose_loop session_id=00000000-0000-4000-8000-000000000001 state_is_structurally_empty=False
+_ test_identical_canonical_candidate_returns_unchanged_without_proposal[public] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-41/test_identical_canonical_candi0')
+owned = False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owned", (False, True), ids=("public", "owned"))
+    async def test_identical_canonical_candidate_returns_unchanged_without_proposal(tmp_path: Path, owned: bool) -> None:
+        harness = _harness(tmp_path)
+        arguments = _valid_pipeline_args(tmp_path)
+>       state = CompositionState.from_dict({**arguments, "version": 7})
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1656: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/composer/state.py:8436: in from_dict
+    outputs=tuple(OutputSpec.from_dict(o) for o in d["outputs"]),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/state.py:8436: in <genexpr>
+    outputs=tuple(OutputSpec.from_dict(o) for o in d["outputs"]),
+                  ^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+cls = <class 'elspeth.web.composer.state.OutputSpec'>
+d = {'on_write_failure': 'discard', 'options': {'collision_policy': 'auto_increment', 'format': 'jsonl', 'mode': 'write', ...nonical_candi0/outputs/00000000-0000-4000-8000-000000000001/result.jsonl', ...}, 'plugin': 'json', 'sink_name': 'main'}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Self:
+        """Reconstruct from a plain dict (inverse of to_dict serialisation).
+    
+        ``description`` defaults to None when absent so sessions persisted
+        before the field existed deserialise unchanged.
+        """
+        return cls(
+>           name=d["name"],
+                 ^^^^^^^^^
+            plugin=d["plugin"],
+            options=d["options"],
+            on_write_failure=d["on_write_failure"],
+            description=d["description"] if "description" in d else None,
+        )
+E       KeyError: 'name'
+
+src/elspeth/web/composer/state.py:1351: KeyError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:14:24 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:14:24 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:14:24 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+_ test_identical_canonical_candidate_returns_unchanged_without_proposal[owned] _
+
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-41/test_identical_canonical_candi1')
+owned = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owned", (False, True), ids=("public", "owned"))
+    async def test_identical_canonical_candidate_returns_unchanged_without_proposal(tmp_path: Path, owned: bool) -> None:
+        harness = _harness(tmp_path)
+        arguments = _valid_pipeline_args(tmp_path)
+>       state = CompositionState.from_dict({**arguments, "version": 7})
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/integration/web/composer/test_freeform_proposal_prevalidation.py:1656: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/composer/state.py:8436: in from_dict
+    outputs=tuple(OutputSpec.from_dict(o) for o in d["outputs"]),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/elspeth/web/composer/state.py:8436: in <genexpr>
+    outputs=tuple(OutputSpec.from_dict(o) for o in d["outputs"]),
+                  ^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+cls = <class 'elspeth.web.composer.state.OutputSpec'>
+d = {'on_write_failure': 'discard', 'options': {'collision_policy': 'auto_increment', 'format': 'jsonl', 'mode': 'write', ...nonical_candi1/outputs/00000000-0000-4000-8000-000000000001/result.jsonl', ...}, 'plugin': 'json', 'sink_name': 'main'}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Self:
+        """Reconstruct from a plain dict (inverse of to_dict serialisation).
+    
+        ``description`` defaults to None when absent so sessions persisted
+        before the field existed deserialise unchanged.
+        """
+        return cls(
+>           name=d["name"],
+                 ^^^^^^^^^
+            plugin=d["plugin"],
+            options=d["options"],
+            on_write_failure=d["on_write_failure"],
+            description=d["description"] if "description" in d else None,
+        )
+E       KeyError: 'name'
+
+src/elspeth/web/composer/state.py:1351: KeyError
+----------------------------- Captured stdout call -----------------------------
+2026-11-09 11:14:25 [warning  ] composer_turn_budget_underfunded composer_timeout_seconds=85.0 configured_turns=25 fundable_turns_estimate=5 planning_seconds_per_turn=15.0
+2026-11-09 11:14:25 [info     ] composer_tool_contract_resolved hatch_diagnostic=None hatch_dialect=none hatch_transport=none loop_strict_tool_count=0 loop_tool_count=45 planner_diagnostic=None planner_dialect=none planner_transport=none setting=preferred
+2026-11-09 11:14:25 [warning  ] composer_prompt_guard_debug_mode mode=debug-when-unconfigured unconfigured_roles=('composer', 'advisor')
+=========================== short test summary info ============================
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_incremental_explicit_approval_admits_only_valid_arguments[invalid]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_unapplied_incremental_feedback_then_repair_stages_once[empty-noop-openai_strict]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_unapplied_incremental_feedback_then_repair_stages_once[empty-noop-none]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_unapplied_incremental_feedback_then_repair_stages_once[same-value-noop-openai_strict]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_unapplied_incremental_feedback_then_repair_stages_once[same-value-noop-none]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_unapplied_incremental_feedback_then_repair_stages_once[argument-error-openai_strict]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_unapplied_incremental_feedback_then_repair_stages_once[argument-error-none]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_unapplied_incremental_feedback_then_repair_stages_once[handler-refusal-openai_strict]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_unapplied_incremental_feedback_then_repair_stages_once[handler-refusal-none]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_proposal_cap_counts_only_admitted_changes[noop]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_proposal_cap_counts_only_admitted_changes[refusal]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_proposal_cap_counts_only_admitted_changes[at-cap-noop]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_proposal_cap_counts_only_admitted_changes[at-cap-refusal]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_proposal_cap_counts_only_admitted_changes[change]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_proposal_cap_counts_only_admitted_changes[inline]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_identical_canonical_candidate_returns_unchanged_without_proposal[public]
+FAILED tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_identical_canonical_candidate_returns_unchanged_without_proposal[owned]
+================= 17 failed, 1 passed, 17 deselected in 16.02s =================

@@ -1,0 +1,2372 @@
+diff --git a/src/elspeth/composer_mcp/server.py b/src/elspeth/composer_mcp/server.py
+index ddff6b7526ccad8f2cc2c36cfead21d26940668f..a31751374da0c04b1782ec00978180cb7505e510 100644
+--- a/src/elspeth/composer_mcp/server.py
++++ b/src/elspeth/composer_mcp/server.py
+@@ -42,6 +42,7 @@ from elspeth.contracts.composer_audit import (
+     ComposerToolStatus,
+     ToolArgumentErrorCategory,
+ )
++from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
+ from elspeth.contracts.freeze import deep_thaw
+ from elspeth.core.canonical import canonical_json, stable_hash
+ from elspeth.web.async_workers import run_sync_in_worker
+@@ -76,6 +77,7 @@ from elspeth.web.execution.runtime_preflight import (
+ )
+ from elspeth.web.execution.schemas import ValidationResult
+ from elspeth.web.execution.validation import validate_pipeline
++from elspeth.web.paths import require_mcp_root_context
+ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+ 
+ __all__ = ["create_server", "main"]
+@@ -370,6 +372,7 @@ def _dispatch_tool(
+     runtime_preflight: RuntimePreflight | None = None,
+     session_manager: SessionManager | None = None,
+     session_checkout_ref: list[SessionCheckout | None] | None = None,
++    mcp_root_authority: McpConfiguredRootAuthority | None = None,
+ ) -> dict[str, Any]:
+     """Dispatch a tool call and return a result dict.
+ 
+@@ -410,6 +413,7 @@ def _dispatch_tool(
+             runtime_preflight=runtime_preflight,
+             validate_arguments=True,
+             require_data_dir_for_paths=True,
++            mcp_root_authority=mcp_root_authority,
+             raise_schema_argument_errors=True,
+         )
+         response = result.to_dict()
+@@ -645,6 +649,7 @@ def create_server(
+     *,
+     runtime_preflight: McpRuntimePreflight | None,
+     runtime_preflight_settings_hash: str | None,
++    mcp_root_authority: McpConfiguredRootAuthority | None = None,
+     runtime_preflight_timeout_seconds: float = 5.0,
+     runtime_preflight_coordinator: RuntimePreflightCoordinator | None = None,
+     session_scope_provider: SessionScopeProvider | None = None,
+@@ -678,12 +683,21 @@ def create_server(
+         runtime_preflight_coordinator: Shared coordinator for in-flight deduplication.
+             When embedded in-process with the web server, pass the same coordinator
+             used by ComposerServiceImpl so HTTP and MCP share a single-flight lock.
++        mcp_root_authority: Operator-owned root for local file authoring and preview.
++            Omitting it refuses local path writes while retaining non-file tools.
+         session_scope_provider: Optional callable returning the current session scope
+             string. When None, scope is derived from scratch_dir and session_id.
+ 
+     Returns:
+         Configured MCP Server ready for stdio transport.
+     """
++    require_mcp_root_context(mcp_root_authority, data_dir=None, session_id=None)
++    path_policy_scope = (
++        f"mcp-configured-root:{mcp_root_authority.root}" if mcp_root_authority is not None else "mcp-no-local-path-authority"
++    )
++    preflight_settings_hash = (
++        f"{runtime_preflight_settings_hash}:{path_policy_scope}" if runtime_preflight_settings_hash is not None else None
++    )
+     server = Server("elspeth-composer")
+     session_manager = SessionManager(scratch_dir)
+     coordinator = runtime_preflight_coordinator or RuntimePreflightCoordinator()
+@@ -828,13 +842,13 @@ def create_server(
+ 
+             if name == "preview_pipeline" and runtime_preflight is not None:
+                 try:
+-                    if runtime_preflight_settings_hash is None:
++                    if preflight_settings_hash is None:
+                         raise ValueError("runtime_preflight_settings_hash is required when runtime_preflight is configured")
+                     preview_preflight = await _mcp_preview_runtime_preflight(
+                         state_ref[0],
+                         coordinator=coordinator,
+                         session_scope=current_session_scope(),
+-                        settings_hash=runtime_preflight_settings_hash,
++                        settings_hash=preflight_settings_hash,
+                         timeout_seconds=runtime_preflight_timeout_seconds,
+                         run_preflight=runtime_preflight,
+                     )
+@@ -865,6 +879,7 @@ def create_server(
+                     runtime_preflight=runtime_preflight_callback,
+                     session_manager=session_manager,
+                     session_checkout_ref=session_checkout_ref,
++                    mcp_root_authority=mcp_root_authority,
+                 )
+             except ToolArgumentError as exc:
+                 return _argument_error_result(exc, exc.category)
+@@ -1028,26 +1043,11 @@ def _build_stdio_server(catalog: CatalogService, scratch_dir: Path, data_dir: Pa
+     Factored out of ``run_server`` so the construction the shipped transport
+     uses is the construction under test.
+     """
+-    settings = _StdioValidationSettings(data_dir=data_dir)
++    authority = McpConfiguredRootAuthority(data_dir)
++    settings = _StdioValidationSettings(data_dir=authority.root)
+     plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+-    # A validation-internal path-scoping token, NOT an identity. Three
+-    # constraints make it necessary, and none of them are visible at the call
+-    # below:
+-    #
+-    # 1. ``allowed_sink_directories`` / ``allowed_source_directories``
+-    #    (web/paths.py) return ``()`` for ``session_id=None`` BY DESIGN — that
+-    #    is web tenancy, where a caller without a session owns no directory.
+-    #    Passing None here rejects every pipeline that reads or writes a local
+-    #    file, and publishes it as an honest-looking ``is_valid: false``.
+-    # 2. A single-user stdio process has no tenancy boundary to enforce and no
+-    #    session identity to borrow, so it scopes itself once per process.
+-    #    Threading the live MCP session id back in does NOT work: it is None
+-    #    for any unsaved composition, which is the common case.
+-    # 3. Nothing the user keeps carries it — ``generate_public_yaml`` takes no
+-    #    session_id and emits authored paths verbatim.
+-    #
+-    # Traversal out of ``data_dir`` is still rejected; this widens no boundary.
+-    session_id = uuid.uuid4().hex[:12]
++    # Filesystem authority comes only from operator configuration, never
++    # from the persistence session id or coordinator scope.
+ 
+     async def stdio_runtime_preflight(state: CompositionState) -> ValidationResult:
+         return await run_sync_in_worker(
+@@ -1059,17 +1059,18 @@ def _build_stdio_server(catalog: CatalogService, scratch_dir: Path, data_dir: Pa
+             profile_registry=None,
+             catalog=catalog,
+             secret_service=None,
+-            session_id=session_id,
++            mcp_root_authority=authority,
+         )
+ 
+     return create_server(
+         catalog,
+         scratch_dir,
+         runtime_preflight=stdio_runtime_preflight,
++        mcp_root_authority=authority,
+         # Both extras change the verdict for one data_dir, so both belong in
+         # the key: a coordinator shared with an in-process web server would
+         # otherwise serve its policy-filtered verdict for our snapshot.
+-        runtime_preflight_settings_hash=f"{runtime_preflight_settings_hash(settings)}:{plugin_snapshot.snapshot_hash}:{session_id}",
++        runtime_preflight_settings_hash=f"{runtime_preflight_settings_hash(settings)}:{plugin_snapshot.snapshot_hash}",
+     )
+ 
+ 
+@@ -1179,7 +1180,7 @@ def main() -> None:
+         type=Path,
+         default=Path("data"),
+         help=(
+-            "Root for runtime preflight path checks (default: data). preview_pipeline reports source and sink paths that resolve outside this directory as invalid."
++            "Configured root for local source, sink and provider authoring and preview checks (default: data). Paths escaping this directory are refused."
+         ),
+     )
+     args = parser.parse_args()
+diff --git a/src/elspeth/web/composer/tools/_common.py b/src/elspeth/web/composer/tools/_common.py
+index d0d52e2e7c36a48abe3ccb2cf20aa5f6663619bd..fc29a5da2f4f06c0dca3b2fe4e90407e31b1f63e 100644
+--- a/src/elspeth/web/composer/tools/_common.py
++++ b/src/elspeth/web/composer/tools/_common.py
+@@ -37,6 +37,7 @@ from sqlalchemy import Engine
+ from elspeth.contracts.blobs_inline import is_widened_blob_ref
+ from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+ from elspeth.contracts.composer_interpretation import InterpretationKind
++from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
+ from elspeth.contracts.emitted_option import emitted_option_values, env_placeholders_in
+ from elspeth.contracts.errors import AuditIntegrityError
+ from elspeth.contracts.freeze import deep_thaw, freeze_fields
+@@ -114,6 +115,8 @@ from elspeth.web.paths import (
+     SOURCE_LOCAL_PATH_OPTION_KEYS,
+     allowed_sink_directories,
+     allowed_source_directories,
++    is_local_path_value,
++    require_mcp_root_context,
+     resolve_data_path,
+     resolve_sink_data_path,
+ )
+@@ -2328,20 +2331,36 @@ def _validate_aggregation_trigger(trigger: Any) -> str | None:
+     return None
+ 
+ 
++def _path_policy_refusal_message(context: ToolContext, web_message: str) -> str:
++    """Keep file-authoring repair guidance specific to the owning route."""
++    if context.mcp_root_authority is not None or (context.data_dir is None and context.require_data_dir_for_paths):
++        return "Local file paths require configured data root authority and must remain within the configured data root (--data-dir)."
++    return web_message
++
++
+ def _validate_source_path(
+     options: Mapping[str, Any],
+     data_dir: str | None,
+     *,
+     session_id: str | None,
+     require_data_dir: bool = False,
++    mcp_root_authority: McpConfiguredRootAuthority | None = None,
+ ) -> str | None:
+-    """S2: Validate path/file options under the caller's blob subtree.
++    """Validate local sources under the owned MCP root or Web blob subtree.
+ 
+     Returns an error message if validation fails, None if OK.
+     Uses Path.resolve() + is_relative_to() to defeat ../ traversal.
+     """
++    require_mcp_root_context(mcp_root_authority, data_dir=data_dir, session_id=session_id)
+     for key in SOURCE_LOCAL_PATH_OPTION_KEYS:
+         if key in options:
++            if not is_local_path_value(options[key]):
++                return "Source local path must be a nonempty string without NUL"
++            if mcp_root_authority is not None:
++                resolved = resolve_data_path(options[key], str(mcp_root_authority.root))
++                if not resolved.is_relative_to(mcp_root_authority.root):
++                    return "Source local path is outside the configured data root"
++                continue
+             if data_dir is None:
+                 if not require_data_dir:
+                     return None
+@@ -2366,21 +2385,36 @@ def _validate_sink_path(
+     data_dir: str | None,
+     *,
+     session_id: str | None,
++    require_data_dir: bool = False,
++    mcp_root_authority: McpConfiguredRootAuthority | None = None,
+ ) -> str | None:
+     """Validate that sink path options are under allowed output directories.
+ 
+     Returns an error message if validation fails, None if OK.
+     Mirrors _validate_source_path but uses _allowed_sink_directories.
+-    Blob-directory writes are confined to the caller's own session subtree
+-    (elspeth-bdc17cfdb1); ``session_id=None`` fails closed to outputs only.
++    Web writes are confined to the caller's own session subtrees;
++    ``session_id=None`` grants no Web paths. MCP has separate root authority.
+     """
++    require_mcp_root_context(mcp_root_authority, data_dir=data_dir, session_id=session_id)
++    if mcp_root_authority is not None:
++        for key in SINK_LOCAL_PATH_OPTION_KEYS:
++            if key in options:
++                if not is_local_path_value(options[key]):
++                    return "Output local path must be a nonempty string without NUL"
++                if not resolve_data_path(options[key], str(mcp_root_authority.root)).is_relative_to(mcp_root_authority.root):
++                    return "Output local path is outside the configured data root"
++        return None
+     if data_dir is None:
++        if require_data_dir and any(key in options for key in SINK_LOCAL_PATH_OPTION_KEYS):
++            return "Output local paths require configured data root authority"
+         return None
+ 
+     allowed = allowed_sink_directories(data_dir, session_id=session_id)
+ 
+     for key in SINK_LOCAL_PATH_OPTION_KEYS:
+         if key in options:
++            if not is_local_path_value(options[key]):
++                return "Output local path must be a nonempty string without NUL"
+             resolved = resolve_sink_data_path(options[key], data_dir, session_id=session_id)
+             if not any(resolved.is_relative_to(d) for d in allowed):
+                 return (
+@@ -2397,6 +2431,8 @@ def _validate_transform_provider_config_path(
+     data_dir: str | None,
+     *,
+     session_id: str | None,
++    require_data_dir: bool = False,
++    mcp_root_authority: McpConfiguredRootAuthority | None = None,
+ ) -> str | None:
+     """Validate nested provider_config path options are under allowed dirs.
+ 
+@@ -2410,15 +2446,11 @@ def _validate_transform_provider_config_path(
+ 
+     Returns an error message if validation fails, None if OK.
+     """
+-    if data_dir is None:
+-        return None
+-
++    require_mcp_root_context(mcp_root_authority, data_dir=data_dir, session_id=session_id)
+     provider_config = options["provider_config"] if "provider_config" in options else None
+     if not isinstance(provider_config, Mapping):
+         return None
+ 
+-    allowed = allowed_sink_directories(data_dir, session_id=session_id)
+-
+     for key in NESTED_LOCAL_PATH_OPTION_KEYS:
+         if key not in provider_config:
+             continue
+@@ -2428,6 +2460,17 @@ def _validate_transform_provider_config_path(
+         # ``value is not None`` before resolving.
+         if value is None:
+             continue
++        if not is_local_path_value(value):
++            return "Provider local path must be a nonempty string without NUL"
++        if mcp_root_authority is not None:
++            if not resolve_data_path(value, str(mcp_root_authority.root)).is_relative_to(mcp_root_authority.root):
++                return "Provider local path is outside the configured data root"
++            continue
++        if data_dir is None:
++            if require_data_dir:
++                return "Provider local paths require configured data root authority"
++            continue
++        allowed = allowed_sink_directories(data_dir, session_id=session_id)
+         resolved = resolve_sink_data_path(value, data_dir, session_id=session_id)
+         if not any(resolved.is_relative_to(d) for d in allowed):
+             return (
+@@ -3786,6 +3829,7 @@ class ToolContext:
+     catalog: PolicyCatalogView
+     plugin_snapshot: PluginAvailabilitySnapshot
+     data_dir: str | None = None
++    mcp_root_authority: McpConfiguredRootAuthority | None = None
+     require_data_dir_for_paths: bool = False
+     session_engine: Engine | None = None
+     session_id: str | None = None
+@@ -3810,6 +3854,17 @@ class ToolContext:
+     executing_proposal_id: str | None = None
+     _interpretation_requirements_are_internal: bool = False
+ 
++    def __post_init__(self) -> None:
++        require_mcp_root_context(self.mcp_root_authority, data_dir=self.data_dir, session_id=self.session_id)
++        if self.mcp_root_authority is not None and (
++            self.data_dir is not None
++            or self.session_engine is not None
++            or self.session_operation_context is not None
++            or self.session_operation_authority is not None
++            or self.reviewed_source_authority is not None
++        ):
++            raise ValueError("MCP root authority cannot carry Web session custody")
++
+ 
+ ToolHandler = Callable[
+     [dict[str, Any], CompositionState, ToolContext],
+diff --git a/src/elspeth/web/composer/tools/_dispatch.py b/src/elspeth/web/composer/tools/_dispatch.py
+index 04cc44cabc029d82e9b69cfa96404f011a29c6c5..5a9f8e800b289960c67ca7e2abcc97f3cfe0a336 100644
+--- a/src/elspeth/web/composer/tools/_dispatch.py
++++ b/src/elspeth/web/composer/tools/_dispatch.py
+@@ -27,6 +27,7 @@ from jsonschema.exceptions import ValidationError
+ from sqlalchemy import Engine
+ 
+ from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
++from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
+ from elspeth.contracts.freeze import deep_freeze, deep_thaw
+ from elspeth.contracts.secrets import WebSecretResolver
+ from elspeth.contracts.session_operation import SessionOperationContext
+@@ -823,6 +824,7 @@ def execute_tool(
+     executing_proposal_id: str | None = None,
+     validate_arguments: bool = False,
+     require_data_dir_for_paths: bool = False,
++    mcp_root_authority: McpConfiguredRootAuthority | None = None,
+     raise_schema_argument_errors: bool = False,
+     _interpretation_requirements_are_internal: bool = False,
+ ) -> ToolResult:
+@@ -953,6 +955,7 @@ def execute_tool(
+         catalog=catalog,
+         plugin_snapshot=plugin_snapshot,
+         data_dir=data_dir,
++        mcp_root_authority=mcp_root_authority,
+         require_data_dir_for_paths=require_data_dir_for_paths,
+         session_engine=session_engine,
+         session_id=session_id,
+diff --git a/src/elspeth/web/composer/tools/outputs.py b/src/elspeth/web/composer/tools/outputs.py
+index 2334c093b97ef62a79c1159d56fb1ff0e71acc4d..2121c10b4cbeb4f782fa6164a6433f5558ef8d6b 100644
+--- a/src/elspeth/web/composer/tools/outputs.py
++++ b/src/elspeth/web/composer/tools/outputs.py
+@@ -27,6 +27,7 @@ from elspeth.web.composer.tools._common import (
+     _apply_merge_patch,
+     _attach_post_call_hints,
+     _mutation_result,
++    _path_policy_refusal_message,
+     _plugin_selection_violation,
+     _post_mutation_invariant_error,
+     _prevalidate_sink,
+@@ -178,12 +179,21 @@ def _execute_set_output(
+     )
+     if credential_error is not None:
+         return credential_error
+-    path_error = _validate_sink_path(sink_options, context.data_dir, session_id=context.session_id)
++    path_error = _validate_sink_path(
++        sink_options,
++        context.data_dir,
++        session_id=context.session_id,
++        require_data_dir=context.require_data_dir_for_paths,
++        mcp_root_authority=context.mcp_root_authority,
++    )
+     if path_error is not None:
+         return _saved_graph_rejection_result(
+             state,
+-            "Output path options (path, file or persist_directory) must use this session's permitted destinations. "
+-            "Use an authorized session-local output path.",
++            _path_policy_refusal_message(
++                context,
++                "Output path options (path, file or persist_directory) must use this session's permitted destinations. "
++                "Use an authorized session-local output path.",
++            ),
+             error_code="sink_path_policy_invalid",
+             rejected_component=f"output:{validated.sink_name}",
+         )
+@@ -298,12 +308,21 @@ def _execute_patch_output_options(
+         return credential_error
+ 
+     # S2: Validate patched sink paths against allowlist
+-    path_error = _validate_sink_path(new_options, context.data_dir, session_id=context.session_id)
++    path_error = _validate_sink_path(
++        new_options,
++        context.data_dir,
++        session_id=context.session_id,
++        require_data_dir=context.require_data_dir_for_paths,
++        mcp_root_authority=context.mcp_root_authority,
++    )
+     if path_error is not None:
+         return _saved_graph_rejection_result(
+             state,
+-            "Output path options (path, file or persist_directory) must use this session's permitted destinations. "
+-            "Use an authorized session-local output path.",
++            _path_policy_refusal_message(
++                context,
++                "Output path options (path, file or persist_directory) must use this session's permitted destinations. "
++                "Use an authorized session-local output path.",
++            ),
+             error_code="sink_path_policy_invalid",
+             rejected_component=f"output:{sink_name}",
+         )
+diff --git a/src/elspeth/web/composer/tools/sessions.py b/src/elspeth/web/composer/tools/sessions.py
+index dfa69465ae0cb6e6a95fea93f1868e30d6515e6a..bc791406ed94d96ef67d342fe1c139b532a56659 100644
+--- a/src/elspeth/web/composer/tools/sessions.py
++++ b/src/elspeth/web/composer/tools/sessions.py
+@@ -91,6 +91,7 @@ from elspeth.web.composer.tools._common import (
+     _normalize_echoed_interpretation_requirements,
+     _normalize_trusted_legacy_interpretation_requirements,
+     _options_with_default_llm_reviews,
++    _path_policy_refusal_message,
+     _post_mutation_invariant_error,
+     _prevalidate_sink,
+     _prevalidate_source_for_context,
+@@ -1235,11 +1236,20 @@ def build_set_pipeline_candidate(
+         if credential_error is not None:
+             return _candidate(credential_error)
+ 
+-        path_error = _validate_source_path(legacy_src_options, data_dir, session_id=session_id)
++        path_error = _validate_source_path(
++            legacy_src_options,
++            data_dir,
++            session_id=session_id,
++            require_data_dir=context.require_data_dir_for_paths,
++            mcp_root_authority=context.mcp_root_authority,
++        )
+         if path_error is not None:
+             return _failure_result(
+                 state,
+-                "Source file path options (path or file) must use this session's permitted source locations. Use the session's blob binding or an authorized source path.",
++                _path_policy_refusal_message(
++                    context,
++                    "Source file path options (path or file) must use this session's permitted source locations. Use the session's blob binding or an authorized source path.",
++                ),
+                 error_code="source_path_policy_invalid",
+                 rejected_component="source",
+             )
+@@ -1448,12 +1458,21 @@ def build_set_pipeline_candidate(
+             if credential_error is not None:
+                 _record_component_rejection(_candidate(credential_error))
+                 continue
+-            path_error = _validate_source_path(src_options, data_dir, session_id=session_id)
++            path_error = _validate_source_path(
++                src_options,
++                data_dir,
++                session_id=session_id,
++                require_data_dir=context.require_data_dir_for_paths,
++                mcp_root_authority=context.mcp_root_authority,
++            )
+             if path_error is not None:
+                 _record_component_rejection(
+                     _failure_result(
+                         state,
+-                        "Source file path options (path or file) must use this session's permitted source locations. Use the session's blob binding or an authorized source path.",
++                        _path_policy_refusal_message(
++                            context,
++                            "Source file path options (path or file) must use this session's permitted source locations. Use the session's blob binding or an authorized source path.",
++                        ),
+                         error_code="source_path_policy_invalid",
+                         rejected_component=source_ref,
+                     )
+@@ -1663,12 +1682,21 @@ def build_set_pipeline_candidate(
+             # retrieval). Parity with the per-output sink-path check below so
+             # a bulk set_pipeline cannot wave through an escaping transform
+             # path while rejecting an escaping sink path.
+-            provider_path_error = _validate_transform_provider_config_path(review_options, data_dir, session_id=session_id)
++            provider_path_error = _validate_transform_provider_config_path(
++                review_options,
++                data_dir,
++                session_id=session_id,
++                require_data_dir=context.require_data_dir_for_paths,
++                mcp_root_authority=context.mcp_root_authority,
++            )
+             if provider_path_error is not None:
+                 _record_component_rejection(
+                     _failure_result(
+                         state,
+-                        "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
++                        _path_policy_refusal_message(
++                            context,
++                            "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
++                        ),
+                         error_code="provider_config_path_policy_invalid",
+                         rejected_component=node_ref,
+                     )
+@@ -1808,12 +1836,21 @@ def build_set_pipeline_candidate(
+         if credential_error is not None:
+             _record_component_rejection(_candidate(credential_error))
+             continue
+-        out_path_error = _validate_sink_path(out_options, data_dir, session_id=session_id)
++        out_path_error = _validate_sink_path(
++            out_options,
++            data_dir,
++            session_id=session_id,
++            require_data_dir=context.require_data_dir_for_paths,
++            mcp_root_authority=context.mcp_root_authority,
++        )
+         if out_path_error is not None:
+             _record_component_rejection(
+                 _failure_result(
+                     state,
+-                    "Output path options (path, file or persist_directory) must use this session's permitted destinations. Use an authorized session-local output path.",
++                    _path_policy_refusal_message(
++                        context,
++                        "Output path options (path, file or persist_directory) must use this session's permitted destinations. Use an authorized session-local output path.",
++                    ),
+                     error_code="sink_path_policy_invalid",
+                     rejected_component=output_ref,
+                 )
+diff --git a/src/elspeth/web/composer/tools/sources.py b/src/elspeth/web/composer/tools/sources.py
+index 9ff079c8e33cb3476e6f1cbd7cf87e389a6851d8..fe6732ea18ccef09ddd7c6d30c19c7d8fc166272 100644
+--- a/src/elspeth/web/composer/tools/sources.py
++++ b/src/elspeth/web/composer/tools/sources.py
+@@ -68,6 +68,7 @@ from elspeth.web.composer.tools._common import (
+     _mutation_result,
+     _normalize_echoed_interpretation_requirements,
+     _options_with_pending_requirement,
++    _path_policy_refusal_message,
+     _pending_interpretation_requirement,
+     _plugin_selection_violation,
+     _prevalidate_source_for_context,
+@@ -1132,12 +1133,16 @@ def _execute_set_source(
+         context.data_dir,
+         session_id=context.session_id,
+         require_data_dir=context.require_data_dir_for_paths,
++        mcp_root_authority=context.mcp_root_authority,
+     )
+     if path_error is not None:
+         return _saved_graph_rejection_result(
+             state,
+-            "Source file path options (path or file) must use this session's permitted source locations. "
+-            "Use the session's blob binding or an authorized source path.",
++            _path_policy_refusal_message(
++                context,
++                "Source file path options (path or file) must use this session's permitted source locations. "
++                "Use the session's blob binding or an authorized source path.",
++            ),
+             error_code="source_path_policy_invalid",
+             rejected_component=_source_component_id(source_name),
+         )
+@@ -2197,12 +2202,16 @@ def _execute_patch_source_options(
+         context.data_dir,
+         session_id=context.session_id,
+         require_data_dir=context.require_data_dir_for_paths,
++        mcp_root_authority=context.mcp_root_authority,
+     )
+     if path_error is not None:
+         return _saved_graph_rejection_result(
+             state,
+-            "Source file path options (path or file) must use this session's permitted source locations. "
+-            "Use the session's blob binding or an authorized source path.",
++            _path_policy_refusal_message(
++                context,
++                "Source file path options (path or file) must use this session's permitted source locations. "
++                "Use the session's blob binding or an authorized source path.",
++            ),
+             error_code="source_path_policy_invalid",
+             rejected_component=_source_component_id(source_name),
+         )
+diff --git a/src/elspeth/web/composer/tools/transforms.py b/src/elspeth/web/composer/tools/transforms.py
+index 7684d079380ec4f0c4502a68311bb39a0ec108f9..6e86d62185df12bafc4301136f338bca0abfb290 100644
+--- a/src/elspeth/web/composer/tools/transforms.py
++++ b/src/elspeth/web/composer/tools/transforms.py
+@@ -56,6 +56,7 @@ from elspeth.web.composer.tools._common import (
+     _mutation_result,
+     _normalize_echoed_interpretation_requirements,
+     _options_with_default_llm_reviews,
++    _path_policy_refusal_message,
+     _plugin_selection_violation,
+     _post_mutation_invariant_error,
+     _prevalidate_transform_for_context,
+@@ -817,11 +818,20 @@ def _execute_upsert_node(
+                     state, f"Node '{node_id}': {provider_policy_error}", error_code="llm_retry_budget_policy", rejected_component=node_ref
+                 )
+ 
+-        provider_path_error = _validate_transform_provider_config_path(review_options, context.data_dir, session_id=context.session_id)
++        provider_path_error = _validate_transform_provider_config_path(
++            review_options,
++            context.data_dir,
++            session_id=context.session_id,
++            require_data_dir=context.require_data_dir_for_paths,
++            mcp_root_authority=context.mcp_root_authority,
++        )
+         if provider_path_error is not None:
+             return _saved_graph_rejection_result(
+                 state,
+-                "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
++                _path_policy_refusal_message(
++                    context,
++                    "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
++                ),
+                 error_code="provider_config_path_policy_invalid",
+                 rejected_component=node_ref,
+             )
+@@ -1927,11 +1937,20 @@ def _execute_patch_node_options(
+ 
+         # S2: confine nested provider_config persist_directory (RAG retrieval).
+         # A merge-patch can introduce an escaping path just as upsert_node can.
+-        provider_path_error = _validate_transform_provider_config_path(reconciled_options, context.data_dir, session_id=context.session_id)
++        provider_path_error = _validate_transform_provider_config_path(
++            reconciled_options,
++            context.data_dir,
++            session_id=context.session_id,
++            require_data_dir=context.require_data_dir_for_paths,
++            mcp_root_authority=context.mcp_root_authority,
++        )
+         if provider_path_error is not None:
+             return _saved_graph_rejection_result(
+                 state,
+-                "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
++                _path_policy_refusal_message(
++                    context,
++                    "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
++                ),
+                 error_code="provider_config_path_policy_invalid",
+                 rejected_component=node_ref,
+             )
+@@ -2145,11 +2164,20 @@ def _prepare_transform_candidate(
+             return _saved_graph_rejection_result(
+                 state, f"Node '{node_id}': {provider_policy_error}", error_code="llm_retry_budget_policy", rejected_component=node_ref
+             )
+-    provider_path_error = _validate_transform_provider_config_path(review_options, context.data_dir, session_id=context.session_id)
++    provider_path_error = _validate_transform_provider_config_path(
++        review_options,
++        context.data_dir,
++        session_id=context.session_id,
++        require_data_dir=context.require_data_dir_for_paths,
++        mcp_root_authority=context.mcp_root_authority,
++    )
+     if provider_path_error is not None:
+         return _saved_graph_rejection_result(
+             state,
+-            "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
++            _path_policy_refusal_message(
++                context,
++                "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
++            ),
+             error_code="provider_config_path_policy_invalid",
+             rejected_component=node_ref,
+         )
+diff --git a/src/elspeth/web/execution/_validation_authoring.py b/src/elspeth/web/execution/_validation_authoring.py
+index 6a13be63b0a2fca569c079dc4f41fcb5c807db79..303187dae605b4b7a5d2f2b5a5a87d0144b656d2 100644
+--- a/src/elspeth/web/execution/_validation_authoring.py
++++ b/src/elspeth/web/execution/_validation_authoring.py
+@@ -13,6 +13,7 @@ from pathlib import Path
+ from pydantic import TypeAdapter
+ from pydantic import ValidationError as PydanticValidationError
+ 
++from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
+ from elspeth.contracts.plugin_semantics import SemanticEdgeContract, SemanticOutcome, UnknownSemanticPolicy
+ from elspeth.contracts.secrets import SecretRefPlacementViolation, SecretScope, WebSecretResolver
+ from elspeth.contracts.trust_boundary import observation_boundary
+@@ -76,6 +77,7 @@ from elspeth.web.interpretation_state import (
+     materialize_state_for_authoring,
+     materialize_state_for_execution,
+ )
++from elspeth.web.paths import is_local_path_value, require_mcp_root_context
+ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+ from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+ from elspeth.web.plugin_policy.validation import PolicyValidationStage, validate_plugin_policy
+@@ -138,6 +140,7 @@ def _path_value_failure(
+     component_type: str,
+     option_name: str,
+     detail: str,
++    mcp_root_authority: McpConfiguredRootAuthority | None = None,
+ ) -> PhaseFailure:
+     """Return the canonical typed failure for one malformed authored path."""
+     return PhaseFailure(
+@@ -154,7 +157,9 @@ def _path_value_failure(
+                 component_id=component_id,
+                 component_type=component_type,
+                 message=detail,
+-                suggestion=f"Set {option_name} to a valid path within this session's allowed directories.",
++                suggestion=f"Set {option_name} to a nonempty string path without NUL within the configured data root."
++                if mcp_root_authority is not None
++                else f"Set {option_name} to a valid path within this session's allowed directories.",
+                 error_code=None,
+             ),
+         ),
+@@ -250,6 +255,7 @@ def validate_path_policy(
+     *,
+     data_dir: Path,
+     session_id: str | None,
++    mcp_root_authority: McpConfiguredRootAuthority | None = None,
+ ) -> PhaseReport[PolicyLoweredState] | PhaseFailure:
+     """Validate authored source, sink, and nested provider paths.
+ 
+@@ -272,24 +278,30 @@ def validate_path_policy(
+         resolve_sink_data_path,
+     )
+ 
++    require_mcp_root_context(mcp_root_authority, data_dir=data_dir, session_id=session_id)
+     state = policy.state
+     data_dir_text = str(data_dir)
+-    allowed_source_dirs = allowed_source_directories(data_dir_text, session_id=session_id)
+-    allowed_sink_dirs = allowed_sink_directories(data_dir_text, session_id=session_id)
++    allowed_source_dirs = (
++        (mcp_root_authority.root,) if mcp_root_authority is not None else allowed_source_directories(data_dir_text, session_id=session_id)
++    )
++    allowed_sink_dirs = (
++        (mcp_root_authority.root,) if mcp_root_authority is not None else allowed_sink_directories(data_dir_text, session_id=session_id)
++    )
+     path_checked = False
+ 
+     for source_name, source in state.sources.items():
+         source_options = dict(source.options)
+         source_component = _source_policy_component_id(source_name)
+         for key in SOURCE_LOCAL_PATH_OPTION_KEYS:
+-            value = source_options.get(key)
+-            if value is None:
++            if key not in source_options:
+                 continue
+-            if type(value) is not str:
++            value = source_options[key]
++            if not is_local_path_value(value):
+                 return _path_value_failure(
+                     component_id=source_component,
+                     component_type="source",
+                     option_name=key,
++                    mcp_root_authority=mcp_root_authority,
+                     detail=f"Source '{source_name}' {key} must be a string path; got {type(value).__name__}",
+                 )
+             path_checked = True
+@@ -300,6 +312,7 @@ def validate_path_policy(
+                     component_id=source_component,
+                     component_type="source",
+                     option_name=key,
++                    mcp_root_authority=mcp_root_authority,
+                     detail=f"Source '{source_name}' {key} is not a valid path",
+                 )
+             if not any(resolved.is_relative_to(directory) for directory in allowed_source_dirs):
+@@ -317,7 +330,9 @@ def validate_path_policy(
+                             component_id=source_component,
+                             component_type="source",
+                             message=f"Path traversal blocked: source '{source_name}' {key}='{value}' resolves outside allowed directories",
+-                            suggestion="Use a file within the blobs directory.",
++                            suggestion="Use a file within the configured data root."
++                            if mcp_root_authority is not None
++                            else "Use a file within the blobs directory.",
+                             error_code=None,
+                         ),
+                     ),
+@@ -331,24 +346,30 @@ def validate_path_policy(
+ 
+     for output in state.outputs:
+         for key in SINK_LOCAL_PATH_OPTION_KEYS:
+-            value = output.options[key] if key in output.options else None
+-            if value is None:
++            if key not in output.options:
+                 continue
+-            if type(value) is not str:
++            value = output.options[key]
++            if not is_local_path_value(value):
+                 return _path_value_failure(
+                     component_id=output.name,
+                     component_type="sink",
+                     option_name=key,
++                    mcp_root_authority=mcp_root_authority,
+                     detail=f"Sink '{output.name}' {key} must be a string path; got {type(value).__name__}",
+                 )
+             path_checked = True
+             try:
+-                resolved = resolve_sink_data_path(value, data_dir_text, session_id=session_id)
++                resolved = (
++                    resolve_data_path(value, data_dir_text)
++                    if mcp_root_authority is not None
++                    else resolve_sink_data_path(value, data_dir_text, session_id=session_id)
++                )
+             except (OSError, TypeError, ValueError):
+                 return _path_value_failure(
+                     component_id=output.name,
+                     component_type="sink",
+                     option_name=key,
++                    mcp_root_authority=mcp_root_authority,
+                     detail=f"Sink '{output.name}' {key} is not a valid path",
+                 )
+             if not any(resolved.is_relative_to(directory) for directory in allowed_sink_dirs):
+@@ -366,7 +387,9 @@ def validate_path_policy(
+                             component_id=output.name,
+                             component_type="sink",
+                             message=f"Path traversal blocked: sink '{output.name}' {key}='{value}' resolves outside allowed directories",
+-                            suggestion="Use a path within this session's output or blob subtree.",
++                            suggestion="Use a path within the configured data root."
++                            if mcp_root_authority is not None
++                            else "Use a path within this session's output or blob subtree.",
+                             error_code=None,
+                         ),
+                     ),
+@@ -407,21 +430,27 @@ def validate_path_policy(
+             value = provider_config.get(key)
+             if value is None:
+                 continue
+-            if type(value) is not str:
++            if not is_local_path_value(value):
+                 return _path_value_failure(
+                     component_id=node.id,
+                     component_type="transform",
+                     option_name=key,
++                    mcp_root_authority=mcp_root_authority,
+                     detail=f"{node.node_type.capitalize()} '{node.id}' {key} must be a string path; got {type(value).__name__}",
+                 )
+             path_checked = True
+             try:
+-                resolved = resolve_sink_data_path(value, data_dir_text, session_id=session_id)
++                resolved = (
++                    resolve_data_path(value, data_dir_text)
++                    if mcp_root_authority is not None
++                    else resolve_sink_data_path(value, data_dir_text, session_id=session_id)
++                )
+             except (OSError, TypeError, ValueError):
+                 return _path_value_failure(
+                     component_id=node.id,
+                     component_type="transform",
+                     option_name=key,
++                    mcp_root_authority=mcp_root_authority,
+                     detail=f"{node.node_type.capitalize()} '{node.id}' {key} is not a valid path",
+                 )
+             if not any(resolved.is_relative_to(directory) for directory in allowed_sink_dirs):
+@@ -439,7 +468,9 @@ def validate_path_policy(
+                             component_id=node.id,
+                             component_type="transform",
+                             message=f"Path traversal blocked: {node.node_type} '{node.id}' {key}='{value}' resolves outside allowed directories",
+-                            suggestion="Use a path within this session's output or blob subtree.",
++                            suggestion="Use a path within the configured data root."
++                            if mcp_root_authority is not None
++                            else "Use a path within this session's output or blob subtree.",
+                             error_code=None,
+                         ),
+                     ),
+diff --git a/src/elspeth/web/execution/_validation_materialization.py b/src/elspeth/web/execution/_validation_materialization.py
+index d30319f77e52732e053a3124a6fb16a95c916eac..dec84bb0335565daa1c09858dc9c30e7457fc08a 100644
+--- a/src/elspeth/web/execution/_validation_materialization.py
++++ b/src/elspeth/web/execution/_validation_materialization.py
+@@ -16,6 +16,7 @@ import yaml
+ 
+ from elspeth.contracts.blobs import AllowedMimeType, BlobNotFoundError, BlobRecord, BlobStateError
+ from elspeth.contracts.blobs_inline import BlobContentResolutionError, BlobInlineRef, BlobInlineValidationViolation
++from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
+ from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
+ from elspeth.contracts.errors import PipelineLoweringError
+ from elspeth.contracts.freeze import freeze_fields
+@@ -270,6 +271,7 @@ def materialize_validation_yaml(
+     yaml_generator: YamlGenerator,
+     data_dir: Path,
+     session_id: str | None,
++    mcp_root_authority: McpConfiguredRootAuthority | None = None,
+     blob_get_metadata: Callable[[UUID], BlobRecord | None] | None,
+     load_yaml: Callable[[str], object],
+     blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
+@@ -313,7 +315,7 @@ def materialize_validation_yaml(
+             readiness=_blocked_readiness(code="state_shape_materialization", detail=detail),
+             semantic_contracts=interpretation.authored.semantic_contracts,
+         )
+-    pipeline_yaml = resolve_runtime_yaml_paths(pipeline_yaml, str(data_dir), session_id=session_id)
++    pipeline_yaml = resolve_runtime_yaml_paths(pipeline_yaml, str(data_dir), session_id=session_id, mcp_root_authority=mcp_root_authority)
+ 
+     if "blob_ref" in pipeline_yaml and "inline_content" in pipeline_yaml:
+         loaded = load_yaml(pipeline_yaml)
+diff --git a/src/elspeth/web/execution/_validation_pipeline.py b/src/elspeth/web/execution/_validation_pipeline.py
+index 7399368b2ea1cb7d751d0a4740a2824216b9ae6e..f1484d3489bf4603606a7c609188057a3134beeb 100644
+--- a/src/elspeth/web/execution/_validation_pipeline.py
++++ b/src/elspeth/web/execution/_validation_pipeline.py
+@@ -8,6 +8,7 @@ from typing import Protocol
+ from uuid import UUID
+ 
+ from elspeth.contracts.blobs import BlobRecord
++from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
+ from elspeth.contracts.secrets import WebSecretResolver
+ from elspeth.web.catalog.protocol import CatalogService
+ from elspeth.web.composer.state import CompositionState
+@@ -46,6 +47,7 @@ class _ValidationRunImpl(Protocol):
+         blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
+         allow_pending_interpretation_placeholders: bool = False,
+         session_id: str | None = None,
++        mcp_root_authority: McpConfiguredRootAuthority | None = None,
+         dependencies: ValidationDependencies,
+     ) -> ValidationResult: ...
+ 
+@@ -90,6 +92,7 @@ class ValidationPipeline:
+         blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
+         allow_pending_interpretation_placeholders: bool = False,
+         session_id: str | None = None,
++        mcp_root_authority: McpConfiguredRootAuthority | None = None,
+     ) -> ValidationResult:
+         """Delegate to the injected implementation, converting terminations.
+ 
+@@ -116,6 +119,7 @@ class ValidationPipeline:
+                 blob_get_content=blob_get_content,
+                 allow_pending_interpretation_placeholders=allow_pending_interpretation_placeholders,
+                 session_id=session_id,
++                mcp_root_authority=mcp_root_authority,
+                 dependencies=self.dependencies,
+             )
+         except PhaseTermination as termination:
+diff --git a/src/elspeth/web/execution/preflight.py b/src/elspeth/web/execution/preflight.py
+index 8465539ad4f93637240e79bdd3e5d130d7ee0671..c4b97ca428084b11b0e3c6819dc2de1416c65278 100644
+--- a/src/elspeth/web/execution/preflight.py
++++ b/src/elspeth/web/execution/preflight.py
+@@ -17,6 +17,7 @@ from sqlalchemy.exc import ArgumentError
+ from elspeth.contracts import SinkProtocol
+ from elspeth.contracts.aws_s3 import S3_PROFILED_AUDIT_SAFE_OPTION_NAMES, S3ProfiledAuditIdentities
+ from elspeth.contracts.aws_textract import TEXTRACT_PROFILED_AUDIT_SAFE_OPTION_NAMES, TextractProfiledAuditIdentities
++from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
+ from elspeth.contracts.freeze import deep_thaw
+ from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
+ from elspeth.contracts.trust_boundary import trust_boundary
+@@ -41,6 +42,8 @@ from elspeth.web.paths import (
+     NESTED_LOCAL_PATH_OPTION_KEYS,
+     SINK_LOCAL_PATH_OPTION_KEYS,
+     SOURCE_LOCAL_PATH_OPTION_KEYS,
++    is_local_path_value,
++    require_mcp_root_context,
+     resolve_data_path,
+     resolve_sink_data_path,
+ )
+@@ -90,7 +93,13 @@ class RuntimeGraphBundle:
+     test_ref="tests/unit/web/execution/test_service.py::TestResolveYamlPaths::test_non_dict_yaml_raises_type_error",
+     test_fingerprint="0b6962a40eb0f2ab584fb2c1de368235d046257d81da266750c8f8011e651c36",
+ )
+-def resolve_runtime_yaml_paths(pipeline_yaml: str, data_dir: str, *, session_id: str | None = None) -> str:
++def resolve_runtime_yaml_paths(
++    pipeline_yaml: str,
++    data_dir: str,
++    *,
++    session_id: str | None = None,
++    mcp_root_authority: McpConfiguredRootAuthority | None = None,
++) -> str:
+     """Rewrite relative source/sink paths in pipeline YAML to absolute paths.
+ 
+     Plugins call PathConfig.resolved_path() with no base_dir, so relative
+@@ -99,6 +108,7 @@ def resolve_runtime_yaml_paths(pipeline_yaml: str, data_dir: str, *, session_id:
+     every source/sink path absolute before the YAML reaches the plugin
+     layer, so what is allowlisted is what is actually loaded.
+     """
++    require_mcp_root_context(mcp_root_authority, data_dir=data_dir, session_id=session_id)
+     if not isinstance(pipeline_yaml, str):
+         raise TypeError(f"YamlGenerator.generate_yaml() must return str; got {type(pipeline_yaml).__name__}")
+ 
+@@ -124,11 +134,16 @@ def resolve_runtime_yaml_paths(pipeline_yaml: str, data_dir: str, *, session_id:
+             raise TypeError(f"YAML generator produced non-dict '{component_path}.options' value (got {type(opts).__name__})")
+         path_options = cast(dict[str, Any], opts)
+         for key in path_option_keys:
+-            if key in path_options and not Path(str(path_options[key])).is_absolute():
+-                if sink_paths:
+-                    path_options[key] = str(resolve_sink_data_path(str(path_options[key]), data_dir, session_id=session_id))
++            if key not in path_options:
++                continue
++            value = path_options[key]
++            if not is_local_path_value(value):
++                raise ValueError(f"{component_path}.options.{key} must be a nonempty string path without NUL")
++            if not Path(value).is_absolute():
++                if sink_paths and mcp_root_authority is None:
++                    path_options[key] = str(resolve_sink_data_path(value, data_dir, session_id=session_id))
+                 else:
+-                    path_options[key] = str(resolve_data_path(str(path_options[key]), data_dir))
++                    path_options[key] = str(resolve_data_path(value, data_dir))
+ 
+     if "source" in config:
+         source = config["source"]
+@@ -227,8 +242,19 @@ def resolve_runtime_yaml_paths(pipeline_yaml: str, data_dir: str, *, session_id:
+             if not isinstance(provider_config, dict):
+                 continue
+             for key in NESTED_LOCAL_PATH_OPTION_KEYS:
+-                if key in provider_config and not Path(str(provider_config[key])).is_absolute():
+-                    provider_config[key] = str(resolve_sink_data_path(str(provider_config[key]), data_dir, session_id=session_id))
++                if key not in provider_config:
++                    continue
++                value = provider_config[key]
++                if value is None:
++                    continue
++                if not is_local_path_value(value):
++                    raise ValueError(f"transform.options.provider_config.{key} must be a nonempty string path without NUL")
++                if not Path(value).is_absolute():
++                    provider_config[key] = str(
++                        resolve_data_path(value, data_dir)
++                        if mcp_root_authority is not None
++                        else resolve_sink_data_path(value, data_dir, session_id=session_id)
++                    )
+ 
+     return yaml.dump(config, default_flow_style=False)
+ 
+diff --git a/src/elspeth/web/execution/validation.py b/src/elspeth/web/execution/validation.py
+index f6013f29373cb50c5c84e819fd4fcf5accb364fb..2fabb6b070dbd5a8c07473b81a33976c450e39a3 100644
+--- a/src/elspeth/web/execution/validation.py
++++ b/src/elspeth/web/execution/validation.py
+@@ -31,6 +31,7 @@ from uuid import UUID
+ 
+ from elspeth.config_loading import load_settings_from_config_dict, load_settings_from_yaml_string
+ from elspeth.contracts.blobs import BlobRecord
++from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
+ from elspeth.contracts.freeze import deep_thaw, freeze_fields
+ from elspeth.contracts.secrets import WebSecretResolver
+ from elspeth.contracts.trust_boundary import observation_boundary
+@@ -135,6 +136,7 @@ from elspeth.web.interpretation_state import (
+     materialize_state_for_authoring,
+     materialize_state_for_execution,
+ )
++from elspeth.web.paths import require_mcp_root_context
+ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginSnapshotAuthority
+ from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+ from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
+@@ -414,6 +416,7 @@ def _compiled_identity_settings(
+     yaml_generator: YamlGenerator,
+     data_dir: Path,
+     session_id: str | None,
++    mcp_root_authority: McpConfiguredRootAuthority | None = None,
+ ) -> _CompiledIdentityDocument:
+     """Mirror the execution service's audit-safe settings for node identity.
+ 
+@@ -435,7 +438,7 @@ def _compiled_identity_settings(
+     yaml-generator bug that must surface (W18), not a state to tolerate.
+     """
+     identity_yaml = yaml_generator.generate_yaml(_identity_state_for_compiled_ids(authored_state))
+-    identity_yaml = resolve_runtime_yaml_paths(identity_yaml, str(data_dir), session_id=session_id)
++    identity_yaml = resolve_runtime_yaml_paths(identity_yaml, str(data_dir), session_id=session_id, mcp_root_authority=mcp_root_authority)
+     loaded = load_bounded_pipeline_yaml(identity_yaml)
+     if type(loaded) is not dict:
+         raise TypeError(f"generate_yaml() produced non-dict YAML (got {type(loaded).__name__}) — this is a bug in the YAML generator")
+@@ -467,6 +470,7 @@ def validate_pipeline(
+     blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
+     allow_pending_interpretation_placeholders: bool = False,
+     session_id: str | None = None,
++    mcp_root_authority: McpConfiguredRootAuthority | None = None,
+ ) -> ValidationResult:
+     """Compatibility facade that captures patchable runtime dependencies per call."""
+     dependencies = ValidationDependencies(
+@@ -491,6 +495,7 @@ def validate_pipeline(
+         blob_get_content=blob_get_content,
+         allow_pending_interpretation_placeholders=allow_pending_interpretation_placeholders,
+         session_id=session_id,
++        mcp_root_authority=mcp_root_authority,
+     )
+ 
+ 
+@@ -509,6 +514,7 @@ def _validate_pipeline_impl(
+     blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
+     allow_pending_interpretation_placeholders: bool = False,
+     session_id: str | None = None,
++    mcp_root_authority: McpConfiguredRootAuthority | None = None,
+     dependencies: ValidationDependencies,
+ ) -> ValidationResult:
+     """Dry-run validation through the real engine code path.
+@@ -554,6 +560,7 @@ def _validate_pipeline_impl(
+         profile_registry: Frozen operator-profile resolver registry. Required
+             when the snapshot exposes operator-profiled plugin aliases.
+     """
++    require_mcp_root_context(mcp_root_authority, data_dir=settings.data_dir, session_id=session_id)
+     # Empty compositions have a deliberate legacy producer shape rather than
+     # entering the ordered core ledger: no authored phase can make them
+     # executable, and engine settings diagnostics would leak internal names.
+@@ -607,6 +614,7 @@ def _validate_pipeline_impl(
+             policy,
+             data_dir=settings.data_dir,
+             session_id=session_id,
++            mcp_root_authority=mcp_root_authority,
+         ),
+     )
+     network_validated = _apply_phase(
+@@ -648,6 +656,7 @@ def _validate_pipeline_impl(
+             yaml_generator=yaml_generator,
+             data_dir=settings.data_dir,
+             session_id=session_id,
++            mcp_root_authority=mcp_root_authority,
+             blob_get_metadata=blob_get_metadata,
+             blob_get_content=blob_get_content,
+             load_yaml=dependencies.load_yaml,
+@@ -719,6 +728,7 @@ def _validate_pipeline_impl(
+             yaml_generator=yaml_generator,
+             data_dir=settings.data_dir,
+             session_id=session_id,
++            mcp_root_authority=mcp_root_authority,
+         )
+ 
+         def _build_graph_under_authored_identity(settings: ElspethSettings, bundle: PluginBundle) -> ExecutionGraph:
+diff --git a/src/elspeth/web/paths.py b/src/elspeth/web/paths.py
+index 06cdf438fa6413dd7c20f911f6cd7f81e0cbede4..6b40477136a4a62b03ac9c3858b7c9881083b16f 100644
+--- a/src/elspeth/web/paths.py
++++ b/src/elspeth/web/paths.py
+@@ -10,6 +10,8 @@ from __future__ import annotations
+ from pathlib import Path
+ from uuid import UUID
+ 
++from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
++
+ SOURCE_LOCAL_PATH_OPTION_KEYS: tuple[str, ...] = ("path", "file")
+ SINK_LOCAL_PATH_OPTION_KEYS: tuple[str, ...] = ("path", "file", "persist_directory")
+ # Local filesystem keys to confine inside a transform's
+@@ -19,6 +21,28 @@ SINK_LOCAL_PATH_OPTION_KEYS: tuple[str, ...] = ("path", "file", "persist_directo
+ NESTED_LOCAL_PATH_OPTION_KEYS: tuple[str, ...] = ("persist_directory",)
+ 
+ 
++def require_mcp_root_context(
++    authority: McpConfiguredRootAuthority | None,
++    *,
++    data_dir: str | Path | None,
++    session_id: str | None,
++) -> None:
++    """Reject contradictory owned configuration before reading user paths."""
++    if authority is None:
++        return
++    if not isinstance(authority, McpConfiguredRootAuthority):
++        raise TypeError("MCP path authority must be McpConfiguredRootAuthority")
++    if session_id is not None:
++        raise ValueError("MCP root authority cannot carry Web session custody")
++    if data_dir is not None and Path(data_dir).resolve() != authority.root:
++        raise ValueError("MCP configured root contradicts data_dir")
++
++
++def is_local_path_value(value: object) -> bool:
++    """Admit the lexical shape before passing an external value to Path."""
++    return type(value) is str and bool(value) and "\x00" not in value
++
++
+ def resolve_data_path(value: str, data_dir: str) -> Path:
+     """Resolve a path value against data_dir (relative) or as-is (absolute).
+ 
+diff --git a/tests/unit/composer_mcp/test_server.py b/tests/unit/composer_mcp/test_server.py
+index e166f3b63ee724c3c9f9bcdc2db6ffbcd644cbe0..81e57ce03a3d3728584f19dca767a9894fbddcfc 100644
+--- a/tests/unit/composer_mcp/test_server.py
++++ b/tests/unit/composer_mcp/test_server.py
+@@ -542,7 +542,7 @@ class TestDispatchTool:
+         assert caught.value.surface == "composer_mcp_state"
+         assert candidate not in repr(caught.value.to_payload())
+ 
+-    def test_set_source_path_without_session_identity_fails_closed(self, scratch_dir: Path) -> None:
++    def test_set_source_path_without_configured_authority_fails_closed(self, scratch_dir: Path) -> None:
+         # set_source is promoted to a type-driven manifest entry
+         # (SetSourceArgumentsModel) with extra="forbid" — the LLM-supplied
+         # argument set MUST include all four required fields.  Prior to
+@@ -574,10 +574,8 @@ class TestDispatchTool:
+             "source_path_policy_invalid",
+             "source",
+         )
+-        assert entry["message"] == (
+-            "Source file path options (path or file) must use this session's permitted source locations. "
+-            "Use the session's blob binding or an authorized source path."
+-        )
++        assert "configured data root" in entry["message"]
++        assert "blob" not in entry["message"]
+         assert result["validation"]["errors"][1:] == [item.to_dict() for item in standing.errors]
+         assert result["validation"]["warnings"] == [item.to_dict() for item in standing.warnings]
+         assert result["validation"]["suggestions"] == [item.to_dict() for item in standing.suggestions]
+@@ -603,6 +601,8 @@ class TestDispatchTool:
+         assert result["state"] == _empty_state().to_dict()
+ 
+     def test_set_output_accepts_explicit_collision_policy(self, scratch_dir: Path) -> None:
++        from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
++
+         result = _dispatch_tool(
+             "set_output",
+             {
+@@ -619,6 +619,7 @@ class TestDispatchTool:
+             _empty_state(),
+             _mock_catalog(),
+             scratch_dir,
++            mcp_root_authority=McpConfiguredRootAuthority(scratch_dir / "data"),
+         )
+ 
+         assert result["success"] is True
+@@ -1398,32 +1399,30 @@ class TestStdioServerConstruction:
+         [("traversal", "outputs/../../evil.csv"), ("absolute", "/etc/elspeth-evil.csv")],
+     )
+     @pytest.mark.asyncio
+-    async def test_stdio_construction_publishes_runtime_rejection(
++    async def test_stdio_construction_refuses_escaping_output_at_admission(
+         self,
+         tmp_path: Path,
+         data_dir: Path,
+         label: str,
+         sink_path: str,
+     ) -> None:
+-        """Escaping data_dir must flip the published verdict — the security-not-weakened pin.
+-
+-        The synthetic session id scopes paths; it must not admit them. Both
+-        escape forms have to stay rejected under it.
+-        """
+-        # Stage 1 accepts these paths; only the runtime allowlist rejects them.
+-        envelope = await self._preview_with_sink_path(tmp_path, data_dir, label, sink_path)
++        """The shipped construction must refuse escaped paths before mutation."""
++        from elspeth.web.dependencies import create_catalog_service
+ 
+-        assert envelope["validation"]["is_valid"] is True
+-        preflight = envelope.get("runtime_preflight")
+-        assert preflight is not None
+-        assert preflight["is_valid"] is False
+-        # Named, because a sink path resolving outside data_dir is not
+-        # automatically a rejection — ``resolve_sink_data_path`` adopts a
+-        # non-UUID second segment under the caller's own outputs directory,
+-        # so ``outputs/deadbeef1234/x.csv`` validates TRUE. A verdict-only
+-        # assertion here would pass for the wrong reason.
+-        assert "path_allowlist" in {check["name"] for check in preflight["checks"] if not check["passed"]}
+-        assert envelope["data"]["preview_is_valid"] is False
++        scratch = tmp_path / f"scratch-{label}"
++        scratch.mkdir()
++        server = _build_stdio_server(create_catalog_service(), scratch, data_dir)
++        handlers = server.request_handlers
++        source = await _call_handler(handlers, "set_source", _STDIO_SOURCE_ARGS)
++        assert json.loads(source.root.content[0].text)["success"] is True
++        before = await _call_handler(handlers, "get_pipeline_state", {})
++        response = await _call_handler(handlers, "set_output", _stdio_output_args(sink_path))
++        envelope = json.loads(response.root.content[0].text)
++        assert envelope["success"] is False
++        assert envelope["validation"]["errors"][0]["error_code"] == "sink_path_policy_invalid"
++        assert envelope["affected_nodes"] == []
++        after = await _call_handler(handlers, "get_pipeline_state", {})
++        assert json.loads(after.root.content[0].text) == json.loads(before.root.content[0].text)
+ 
+     def test_create_server_requires_an_explicit_runtime_preflight(self, tmp_path: Path) -> None:
+         """Re-adding the silent default is itself the mutation being caught."""
+diff --git a/tests/unit/web/composer/test_set_pipeline_candidate.py b/tests/unit/web/composer/test_set_pipeline_candidate.py
+index e3a74b3b531907608162e70e2099c1cf72ac39cc..9697a429649cf3b7035b563b6f15ed64ca8850a6 100644
+--- a/tests/unit/web/composer/test_set_pipeline_candidate.py
++++ b/tests/unit/web/composer/test_set_pipeline_candidate.py
+@@ -2370,6 +2370,50 @@ def test_inline_blob_canonical_b_failure_precedes_blob_persistence(tmp_path: Pat
+     assert blob_files == ()
+ 
+ 
++@pytest.mark.parametrize("bad_component", ["output", "provider"])
++def test_later_path_refusal_does_not_persist_a_prepared_inline_source(tmp_path: Path, bad_component: str) -> None:
++    """A good inline source must not write bytes before all paths are admitted."""
++    engine, session_id, message_id = _session_with_user_message()
++    args = _linear_args(tmp_path)
++    args["source"]["options"] = {"schema": {"mode": "observed"}}
++    args["source"]["inline_blob"] = {"filename": "data.csv", "mime_type": "text/csv", "content": "name,score\nada,42\n"}
++    args["outputs"][0]["options"]["path"] = str(tmp_path / "outputs" / session_id / "result.jsonl")
++    if bad_component == "output":
++        args["outputs"][0]["options"]["path"] = str(tmp_path / "outside-session.jsonl")
++        expected = ("sink_path_policy_invalid", "output:main")
++    else:
++        args["nodes"][0]["plugin"] = "rag_retrieval"
++        args["nodes"][0]["options"] = {
++            "provider": "chroma",
++            "provider_config": {"collection": "docs", "persist_directory": str(tmp_path / "outside-session-index")},
++            "query_field": "name",
++            "output_prefix": "rag_",
++            "schema": {"mode": "observed"},
++        }
++        expected = ("provider_config_path_policy_invalid", "node:copy")
++    context = _trained_context(
++        data_dir=tmp_path,
++        session_engine=engine,
++        session_id=session_id,
++        user_message_id=message_id,
++        user_message_content="Use this CSV: name,score\nada,42\n",
++        composer_model_identifier="test-model",
++        composer_model_version="test-model-version",
++        composer_provider="test-provider",
++        composer_skill_hash="a" * 64,
++        tool_arguments_hash="b" * 64,
++    )
++    state = _empty_state()
++    result = _execute_set_pipeline(args, state, context)
++    assert result.success is False
++    assert result.updated_state is state
++    assert result.affected_nodes == ()
++    assert (result.validation.errors[0].error_code, result.validation.errors[0].rejected_component) == expected
++    with engine.begin() as conn:
++        assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
++    assert tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file()) == ()
++
++
+ def test_inline_blob_replacement_preserves_trusted_existing_source_requirement_id(tmp_path: Path) -> None:
+     engine, session_id, message_id = _session_with_user_message()
+     content = "name,score\nada,42\n"
+diff --git a/tests/unit/web/execution/test_preflight_side_effects.py b/tests/unit/web/execution/test_preflight_side_effects.py
+index dc986b0b89ae2fb1cb0cd71fbe260fcf8a5a04a8..baccfd26c4de8a1dfdb394e15e95a2c5d10db5dd 100644
+--- a/tests/unit/web/execution/test_preflight_side_effects.py
++++ b/tests/unit/web/execution/test_preflight_side_effects.py
+@@ -12,9 +12,11 @@ from typing import Any, cast
+ from unittest.mock import patch
+ 
+ import pytest
++import yaml
+ from pydantic import SecretBytes
+ 
+ from elspeth.config_loading import load_settings_from_yaml_string
++from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
+ from elspeth.contracts.enums import RunMode
+ from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml, resolve_config
+ from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode, plugin_preflight_mode_enabled
+@@ -52,6 +54,63 @@ def _forbid_socket_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+     monkeypatch.setattr(socket, "getaddrinfo", fail)
+ 
+ 
++_REWRITTEN_PATH_SITES = [
++    ("source", "path"),
++    ("source", "file"),
++    ("sources", "path"),
++    ("sources", "file"),
++    ("sinks", "path"),
++    ("sinks", "file"),
++    ("sinks", "persist_directory"),
++    ("provider", "persist_directory"),
++]
++
++
++@pytest.mark.parametrize(
++    ("component", "key", "value"),
++    [
++        (component, key, value)
++        for component, key in _REWRITTEN_PATH_SITES
++        for value in (None, 42, False, [], {}, "", "bad\x00path")
++        if not (component == "provider" and value is None)
++    ],
++)
++@pytest.mark.parametrize("mode", ["web", "mcp"])
++def test_runtime_yaml_refuses_invalid_values_before_path_coercion(
++    tmp_path: Path, component: str, key: str, value: object, mode: str
++) -> None:
++    """Resolver entry points cannot turn an invalid scalar/container into a filename."""
++    configured: dict[str, Any]
++    if component == "provider":
++        configured = {"transforms": [{"name": "lookup", "plugin": "rag_retrieval", "options": {"provider_config": {key: value}}}]}
++    else:
++        item = {"plugin": "csv", "options": {key: value}}
++        configured = {component: item if component == "source" else {"main": item}}
++    with pytest.raises(ValueError, match="nonempty string path"):
++        execution_preflight.resolve_runtime_yaml_paths(
++            yaml.safe_dump(configured),
++            str(tmp_path),
++            session_id="test-session" if mode == "web" else None,
++            mcp_root_authority=McpConfiguredRootAuthority(tmp_path) if mode == "mcp" else None,
++        )
++
++
++@pytest.mark.parametrize("mode", ["web", "mcp"])
++def test_runtime_yaml_keeps_absent_path_options_and_nullable_provider(tmp_path: Path, mode: str) -> None:
++    document = {
++        "sources": {"main": {"plugin": "null", "options": {}}},
++        "sinks": {"main": {"plugin": "csv", "options": {}}},
++        "transforms": [{"name": "lookup", "plugin": "rag_retrieval", "options": {"provider_config": {"persist_directory": None}}}],
++    }
++    result = execution_preflight.resolve_runtime_yaml_paths(
++        yaml.safe_dump(document),
++        str(tmp_path),
++        session_id="test-session" if mode == "web" else None,
++        mcp_root_authority=McpConfiguredRootAuthority(tmp_path) if mode == "mcp" else None,
++    )
++    assert yaml.safe_load(result) == document
++
++
+ def _web_settings(tmp_path: Path) -> WebSettings:
+     return WebSettings(
+         data_dir=tmp_path,
+diff --git a/tests/unit/web/execution/test_validation.py b/tests/unit/web/execution/test_validation.py
+index bbd0eb5c57584779f4fa4f02c76f1c004d1d43a6..d4bff9ac17209bfdb609af2c718ceddbd17a4e3c 100644
+--- a/tests/unit/web/execution/test_validation.py
++++ b/tests/unit/web/execution/test_validation.py
+@@ -1089,7 +1089,8 @@ def test_validate_pipeline_public_signature_is_stable_through_boundary_decorator
+         "secret_wiring_policy: 'SecretWiringPolicy | None' = None, user_id: 'str | None' = None, "
+         "blob_get_metadata: 'Callable[[UUID], BlobRecord | None] | None' = None, "
+         "blob_get_content: 'Callable[[UUID], tuple[BlobRecord, bytes]] | None' = None, "
+-        "allow_pending_interpretation_placeholders: 'bool' = False, session_id: 'str | None' = None) -> 'ValidationResult'"
++        "allow_pending_interpretation_placeholders: 'bool' = False, session_id: 'str | None' = None, "
++        "mcp_root_authority: 'McpConfiguredRootAuthority | None' = None) -> 'ValidationResult'"
+     )
+ 
+     # The single literal comparison IS the whole guarantee: inspect.signature
+diff --git a/tests/unit/web/execution/test_validation_authoring.py b/tests/unit/web/execution/test_validation_authoring.py
+index c82e7a55cd371a48d395dad61c45108fe8a6be62..491b3ed7de7fd59e1ab17a1b71c13634c04274b3 100644
+--- a/tests/unit/web/execution/test_validation_authoring.py
++++ b/tests/unit/web/execution/test_validation_authoring.py
+@@ -9,6 +9,7 @@ from typing import Any, cast
+ import pytest
+ 
+ from elspeth.contracts import Determinism
++from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
+ from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem, SecretScope
+ from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+ from elspeth.plugins.transforms.blob_fetch import BlobFetch
+@@ -235,6 +236,36 @@ def test_path_phase_returns_typed_failure_for_malformed_authored_paths(bad_path:
+     assert result.errors[0].component_id == "source"
+ 
+ 
++@pytest.mark.parametrize(
++    ("component", "key"), [("source", "path"), ("source", "file"), ("sink", "path"), ("sink", "file"), ("sink", "persist_directory")]
++)
++@pytest.mark.parametrize("mode", ["web", "mcp"])
++def test_path_phase_refuses_present_null_for_each_source_sink_alias(tmp_path: Path, component: str, key: str, mode: str) -> None:
++    state = _state(source=_source({key: None})) if component == "source" else _state(outputs=(_output({key: None}),))
++    result = validate_path_policy(
++        _policy(state),
++        data_dir=tmp_path,
++        session_id="test-session" if mode == "web" else None,
++        mcp_root_authority=McpConfiguredRootAuthority(tmp_path) if mode == "mcp" else None,
++    )
++    assert isinstance(result, PhaseFailure)
++    assert result.failed_check.name == "path_allowlist"
++    assert result.errors[0].component_type == component
++
++
++@pytest.mark.parametrize("mode", ["web", "mcp"])
++def test_path_phase_keeps_missing_keys_and_nullable_provider_distinct_from_null_source_sink(tmp_path: Path, mode: str) -> None:
++    state = _state(nodes=(_node(options={"provider_config": {"persist_directory": None}}),), outputs=(_output(),))
++    result = validate_path_policy(
++        _policy(state),
++        data_dir=tmp_path,
++        session_id="test-session" if mode == "web" else None,
++        mcp_root_authority=McpConfiguredRootAuthority(tmp_path) if mode == "mcp" else None,
++    )
++    assert isinstance(result, PhaseReport)
++    assert result.artifact.state.to_dict() == state.to_dict()
++
++
+ @pytest.mark.parametrize(
+     ("source_name", "component_id"),
+     [("source", "source"), ("orders", "source:orders"), ("7", "source:7"), (7, "source:<invalid>"), (None, "source:<invalid>")],
+diff --git a/tests/unit/web/execution/test_validation_materialization.py b/tests/unit/web/execution/test_validation_materialization.py
+index e764971efdab7462038f1f5f4fcb37dd3cb031ac..067f03012ea9d876be5e70d8e5b9f824127c645a 100644
+--- a/tests/unit/web/execution/test_validation_materialization.py
++++ b/tests/unit/web/execution/test_validation_materialization.py
+@@ -421,7 +421,7 @@ def test_materialization_does_not_catch_yaml_path_or_bounded_yaml_exceptions(
+     if stage == "path":
+         monkeypatch.setattr(
+             "elspeth.web.execution._validation_materialization.resolve_runtime_yaml_paths",
+-            lambda pipeline_yaml, data_dir, *, session_id: (_ for _ in ()).throw(ExpectedError("path")),
++            lambda pipeline_yaml, data_dir, *, session_id, mcp_root_authority: (_ for _ in ()).throw(ExpectedError("path")),
+         )
+ 
+     with pytest.raises(ExpectedError, match=stage):
+diff --git a/tests/unit/web/test_paths.py b/tests/unit/web/test_paths.py
+index 7941198281596def21c411cad1b73f0a22bddf7d..a7b98f417fe59647b94452e80ef8338a6d87c8cc 100644
+--- a/tests/unit/web/test_paths.py
++++ b/tests/unit/web/test_paths.py
+@@ -6,6 +6,11 @@ from pathlib import Path
+ 
+ import pytest
+ 
++from elspeth.web.composer.tools._common import (
++    _validate_sink_path,
++    _validate_source_path,
++    _validate_transform_provider_config_path,
++)
+ from elspeth.web.paths import (
+     allowed_sink_directories,
+     allowed_source_directories,
+@@ -14,6 +19,35 @@ from elspeth.web.paths import (
+ )
+ 
+ 
++@pytest.mark.parametrize("kind", ["source", "sink", "provider"])
++@pytest.mark.parametrize("location", ["own", "foreign", "shared", "traversal", "symlink", "no-session"])
++def test_web_admission_retains_real_session_confinement(tmp_path: Path, kind: str, location: str) -> None:
++    """MCP root admission must not make deployment storage Web authority."""
++    own = tmp_path / "blobs" / "sess-a"
++    foreign = tmp_path / "blobs" / "sess-b"
++    own.mkdir(parents=True)
++    foreign.mkdir(parents=True)
++    (own / "link").symlink_to(foreign, target_is_directory=True)
++    path = {
++        "own": str(own / "data.csv"),
++        "foreign": str(foreign / "data.csv"),
++        "shared": str(tmp_path / "data.csv"),
++        "traversal": "blobs/sess-a/../sess-b/data.csv",
++        "symlink": str(own / "link" / "data.csv"),
++        "no-session": str(own / "data.csv"),
++    }[location]
++    session_id = None if location == "no-session" else "sess-a"
++    if kind == "source":
++        error = _validate_source_path({"path": path}, str(tmp_path), session_id=session_id)
++    elif kind == "sink":
++        error = _validate_sink_path({"path": path}, str(tmp_path), session_id=session_id)
++    else:
++        error = _validate_transform_provider_config_path(
++            {"provider_config": {"persist_directory": path}}, str(tmp_path), session_id=session_id
++        )
++    assert (error is None) is (location == "own")
++
++
+ class TestResolveDataPath:
+     """Unit tests for resolve_data_path — the single resolution function
+     used by both validation and execution service."""
+diff --git a/src/elspeth/contracts/composer_paths.py b/src/elspeth/contracts/composer_paths.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..acb4774ee4e9b7e6b0c50f715e9eac1c198775ed
+--- /dev/null
++++ b/src/elspeth/contracts/composer_paths.py
+@@ -0,0 +1,25 @@
++"""Nominal operator authority for local Composer MCP paths."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from pathlib import Path
++
++
++@dataclass(frozen=True, slots=True)
++class McpConfiguredRootAuthority:
++    """Operator-issued root, independent of Web session or blob custody.
++
++    Resolve the configured root once so admission, runtime YAML and cache
++    identity share one location. Containment does not require it to exist.
++    """
++
++    root: Path
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.root, Path):
++            raise TypeError("MCP configured root must be a Path")
++        root = self.root.resolve()
++        if root.exists() and not root.is_dir():
++            raise ValueError("MCP configured root must be a directory")
++        object.__setattr__(self, "root", root)
+diff --git a/tests/unit/composer_mcp/test_configured_root_admission.py b/tests/unit/composer_mcp/test_configured_root_admission.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..90a7312cf38b5a5b91cf98de56c557b1ad3e2646
+--- /dev/null
++++ b/tests/unit/composer_mcp/test_configured_root_admission.py
+@@ -0,0 +1,856 @@
++"""Configured-root file authoring through the shipped MCP construction.
++
++These tests intentionally use real catalog admission and registered SDK
++handlers. Pytest supplies executor recovery for the isolated preview controls;
++they do not qualify the standalone process lifecycle.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++from copy import deepcopy
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++from unittest.mock import patch
++
++import pytest
++import yaml
++from mcp.server import Server
++from mcp.types import CallToolRequest, CallToolRequestParams, CallToolResult, TextContent
++
++from elspeth.composer_mcp.server import _build_stdio_server, _StdioValidationSettings, create_server
++from elspeth.composer_mcp.session import SessionManager
++from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
++from elspeth.web.catalog.policy_view import PolicyCatalogView
++from elspeth.web.composer import yaml_generator
++from elspeth.web.composer.pipeline_proposal import composition_content_hash
++from elspeth.web.composer.state import CompositionState
++from elspeth.web.composer.tools._common import ToolContext
++from elspeth.web.dependencies import create_catalog_service
++from elspeth.web.execution import validation as execution_validation
++from elspeth.web.execution._validation_materialization import materialize_validation_yaml
++from elspeth.web.execution._validation_model import PhaseReport
++from elspeth.web.execution.runtime_preflight import RuntimePreflightCoordinator
++from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
++from elspeth.web.execution.validation import _compiled_identity_settings, validate_pipeline
++from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
++from tests.unit.web.composer.test_splice_transform_tool import _state as _linear_state
++from tests.unit.web.execution.test_validation import (
++    _fake_pipeline_config,
++    _fake_settings,
++    _FakeRuntimeBundle,
++    _make_output,
++    _make_state,
++    _runtime_graph_mock,
++    _s3_source_profile_policy_context,
++)
++from tests.unit.web.execution.test_validation_materialization import _interpretation
++
++
++def _source(path: object = "input.csv") -> dict[str, Any]:
++    return {
++        "plugin": "csv",
++        "on_success": "rows",
++        "options": {"path": path, "schema": {"mode": "observed"}},
++        "on_validation_failure": "discard",
++    }
++
++
++def _output(path: object = "outputs/report.csv") -> dict[str, Any]:
++    return {
++        "sink_name": "result",
++        "plugin": "csv",
++        "options": {
++            "path": path,
++            "schema": {"mode": "observed"},
++            "mode": "write",
++            "collision_policy": "auto_increment",
++        },
++        "on_write_failure": "discard",
++    }
++
++
++def _provider_options(path: object) -> dict[str, Any]:
++    return {
++        "provider": "chroma",
++        "provider_config": {"collection": "docs", "persist_directory": path},
++        "schema": {"mode": "flexible", "fields": ["text: str"]},
++        "output_prefix": "rag_",
++        "query_field": "text",
++    }
++
++
++def _provider_node(path: object) -> dict[str, Any]:
++    return {
++        "id": "after",
++        "node_type": "transform",
++        "plugin": "rag_retrieval",
++        "input": "middle",
++        "on_success": "result",
++        "on_error": "discard",
++        "options": _provider_options(path),
++    }
++
++
++def _seed_state() -> CompositionState:
++    payload = _linear_state().to_dict()
++    payload["sources"]["source"]["options"]["path"] = "input.csv"
++    payload["nodes"][1].update(_provider_node("indexes/docs"))
++    payload["outputs"][0]["options"] = _output()["options"]
++    return CompositionState.from_dict(payload)
++
++
++# Literal expected diagnostics keep a refusal for an unrelated plugin/options
++# error from satisfying a path-security test. The bulk cases exercise every
++# existing source branch plus the provider and output gates independently.
++_WRITERS = [
++    pytest.param("set_source", "source_path_policy_invalid", "source", id="set-source"),
++    pytest.param("patch_source_options", "source_path_policy_invalid", "source", id="patch-source"),
++    pytest.param("set_output", "sink_path_policy_invalid", "output:result", id="set-output"),
++    pytest.param("patch_output_options", "sink_path_policy_invalid", "output:result", id="patch-output"),
++    pytest.param("upsert_node", "provider_config_path_policy_invalid", "node:after", id="upsert-provider"),
++    pytest.param("patch_node_options", "provider_config_path_policy_invalid", "node:after", id="patch-provider"),
++    pytest.param("splice_transform", "provider_config_path_policy_invalid", "node:inserted", id="splice-provider"),
++    pytest.param("bulk-source", "source_path_policy_invalid", "source", id="bulk-singular-source"),
++    pytest.param("bulk-sources", "source_path_policy_invalid", "source:orders", id="bulk-plural-source"),
++    pytest.param("bulk-output", "sink_path_policy_invalid", "output:result", id="bulk-output"),
++    pytest.param("bulk-provider", "provider_config_path_policy_invalid", "node:after", id="bulk-provider"),
++]
++
++
++def _mutation(writer: str, path: object) -> tuple[str, dict[str, Any]]:
++    if writer == "set_source":
++        return writer, _source(path)
++    if writer == "patch_source_options":
++        return writer, {"patch": {"path": path}}
++    if writer == "set_output":
++        return writer, _output(path)
++    if writer == "patch_output_options":
++        return writer, {"sink_name": "result", "patch": {"path": path}}
++    if writer == "upsert_node":
++        return writer, _provider_node(path)
++    if writer == "patch_node_options":
++        return writer, {"node_id": "after", "patch": {"provider_config": {"collection": "docs", "persist_directory": path}}}
++    if writer == "splice_transform":
++        return writer, {
++            "predecessor_id": "before",
++            "successor_id": "after",
++            "node": {
++                "id": "inserted",
++                "plugin": "rag_retrieval",
++                "on_error": "discard",
++                "options": {**_provider_options(path), "output_prefix": "lookup_"},
++            },
++        }
++    args = {
++        "source": _source(path)
++        if writer == "bulk-source"
++        else {"plugin": "null", "on_success": "rows", "options": {"schema": {"mode": "observed"}}, "on_validation_failure": "discard"},
++        "nodes": [_provider_node(path)] if writer == "bulk-provider" else [],
++        "edges": [],
++        "outputs": [_output(path)] if writer == "bulk-output" else [],
++    }
++    if writer == "bulk-provider":
++        args["nodes"][0]["input"] = "rows"
++    if writer == "bulk-sources":
++        args.pop("source")
++        args["sources"] = {
++            "control": {
++                "plugin": "null",
++                "on_success": "control_rows",
++                "options": {"schema": {"mode": "observed"}},
++                "on_validation_failure": "discard",
++            },
++            "orders": _source(path),
++        }
++    return "set_pipeline", args
++
++
++@dataclass
++class _LiveMcp:
++    server: Server
++    scratch: Path
++    session_id: str
++
++    async def raw_call(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
++        request = CallToolRequest(method="tools/call", params=CallToolRequestParams(name=name, arguments=arguments))
++        response = await self.server.request_handlers[CallToolRequest](request)
++        assert isinstance(response.root, CallToolResult)
++        return response.root
++
++    async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
++        response = await self.raw_call(name, arguments)
++        assert not response.isError, response
++        content = response.content[0]
++        assert isinstance(content, TextContent)
++        return json.loads(content.text)
++
++    @property
++    def private_state(self) -> CompositionState:
++        return SessionManager(self.scratch).load(self.session_id)
++
++    @property
++    def saved_bytes(self) -> bytes:
++        return (self.scratch / f"{self.session_id}.json").read_bytes()
++
++    @property
++    def last_audit(self) -> dict[str, Any]:
++        lines = (self.scratch / f"{self.session_id}.events.jsonl").read_text().splitlines()
++        return json.loads(lines[-1])
++
++
++async def _live_mcp(tmp_path: Path, root: Path, *, configured: bool = True, state: CompositionState | None = None) -> _LiveMcp:
++    scratch = tmp_path / "scratch"
++    scratch.mkdir()
++    manager = SessionManager(scratch)
++    session_id, _ = manager.new_session(name="Path admission")
++    manager.save_if_current(session_id, state if state is not None else _seed_state(), expected_token=None)
++    catalog = create_catalog_service()
++    server = (
++        _build_stdio_server(catalog, scratch, root)
++        if configured
++        else create_server(catalog, scratch, runtime_preflight=None, runtime_preflight_settings_hash=None)
++    )
++    live = _LiveMcp(server, scratch, session_id)
++    assert (await live.call("load_session", {"session_id": session_id}))["success"] is True
++    return live
++
++
++async def _assert_refused_unchanged(
++    live: _LiveMcp,
++    writer: str,
++    path: object,
++    code: str,
++    component: str,
++    *,
++    mutation: tuple[str, dict[str, Any]] | None = None,
++) -> dict[str, Any]:
++    before = live.private_state
++    saved = live.saved_bytes
++    public_before = await live.call("get_pipeline_state", {})
++    tool, arguments = _mutation(writer, path) if mutation is None else mutation
++    result = await live.call(tool, arguments)
++    assert live.last_audit["status"] == "success"
++    assert live.last_audit["version_before"] == before.version
++    assert live.last_audit["version_after"] == before.version
++    assert result["success"] is False, result
++    assert result["version"] == before.version
++    assert result["affected_nodes"] == []
++    errors = result["validation"]["errors"]
++    assert (errors[0]["error_code"], errors[0]["rejected_component"]) == (code, component), errors
++    public_after = await live.call("get_pipeline_state", {})
++    assert public_after["state"] == public_before["state"]
++    assert live.saved_bytes == saved
++    # Saving the live state detects private mutations hidden by response
++    # redaction; an idempotent save also preserves the exact durable bytes.
++    assert (await live.call("save_session", {"session_id": live.session_id}))["success"] is True
++    after = live.private_state
++    assert after.to_dict() == before.to_dict()
++    assert composition_content_hash(after) == composition_content_hash(before)
++    assert live.saved_bytes == saved
++    return result
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(("writer", "code", "component"), _WRITERS)
++@pytest.mark.parametrize("spelling", ["relative", "absolute"])
++async def test_configured_root_admits_file_authoring(tmp_path: Path, writer: str, code: str, component: str, spelling: str) -> None:
++    """Removing root authority from any writer must break its positive control."""
++    root = tmp_path / "data"
++    root.mkdir()
++    (root / "admitted.csv").write_text("text\nhello\n")
++    live = await _live_mcp(tmp_path, root)
++    path = "admitted.csv" if spelling == "relative" else str(root / "admitted.csv")
++    tool, arguments = _mutation(writer, path)
++    result = await live.call(tool, arguments)
++    assert result["success"] is True, result
++    assert (await live.call("save_session", {"session_id": live.session_id}))["success"] is True
++    assert live.private_state.version > _seed_state().version
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(("writer", "code", "component"), _WRITERS)
++@pytest.mark.parametrize("escape", ["absolute", "traversal", "symlink"])
++async def test_each_writer_refuses_escape_atomically(tmp_path: Path, writer: str, code: str, component: str, escape: str) -> None:
++    """Skipping any gate must expose both the exact reason and state mutation."""
++    root = tmp_path / "data"
++    root.mkdir()
++    outside = tmp_path / "private"
++    outside.mkdir()
++    (root / "link").symlink_to(outside, target_is_directory=True)
++    (root / "outputs").mkdir()
++    (root / "outputs" / "link").symlink_to(outside, target_is_directory=True)
++    path = {"absolute": str(outside / "data.csv"), "traversal": "../private/data.csv", "symlink": "link/data.csv"}[escape]
++    live = await _live_mcp(tmp_path, root)
++    if writer == "bulk-output" and escape == "traversal":
++        # Existing spelling canonicalization intentionally rejects '..'
++        # before the containment gate and keeps its option-error channel.
++        await _assert_refused_unchanged(live, writer, path, "plugin_options_invalid", component)
++        return
++    result = await _assert_refused_unchanged(live, writer, path, code, component)
++    message = result["validation"]["errors"][0]["message"]
++    assert "configured" in message.lower() and "root" in message.lower()
++    assert "blob" not in message.lower()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(("writer", "code", "component"), _WRITERS)
++async def test_embedded_mcp_without_root_refuses_every_local_writer(tmp_path: Path, writer: str, code: str, component: str) -> None:
++    live = await _live_mcp(tmp_path, tmp_path / "data", configured=False)
++    await _assert_refused_unchanged(live, writer, "input.csv", code, component)
++
++
++@pytest.mark.asyncio
++async def test_embedded_mcp_without_root_keeps_nonfile_source_authoring(tmp_path: Path) -> None:
++    live = await _live_mcp(tmp_path, tmp_path / "data", configured=False)
++    result = await live.call(
++        "set_source",
++        {
++            "plugin": "null",
++            "on_success": "rows",
++            "options": {"schema": {"mode": "observed"}},
++            "on_validation_failure": "discard",
++        },
++    )
++    assert result["success"] is True
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(("writer", "code", "component"), _WRITERS)
++@pytest.mark.parametrize("value", [42, ["input.csv"], None, "", "bad\x00path"])
++async def test_malformed_path_is_an_intentional_tool_refusal(tmp_path: Path, writer: str, code: str, component: str, value: object) -> None:
++    """Enabling root checks must not expose raw Path TypeError/ValueError."""
++    live = await _live_mcp(tmp_path, tmp_path / "not-created")
++    tool, arguments = _mutation(writer, value)
++    response = await live.raw_call(tool, arguments)
++    content = response.content[0]
++    assert isinstance(content, TextContent)
++    assert "Tool error: TypeError" not in content.text
++    assert "Tool error: ValueError" not in content.text
++    if writer in {"upsert_node", "patch_node_options", "splice_transform", "bulk-provider"} and value is None:
++        assert not response.isError
++        assert json.loads(content.text)["success"] is True
++    elif response.isError:
++        assert content.text.startswith("Tool error: ")
++        assert live.last_audit["status"] == "arg_error"
++        assert live.last_audit["error_class"] == "ToolArgumentError"
++    else:
++        assert json.loads(content.text)["success"] is False
++        assert live.last_audit["status"] == "success"
++
++
++@pytest.mark.asyncio
++async def test_missing_contained_files_and_root_are_not_missing_authority(tmp_path: Path) -> None:
++    root = tmp_path / "not-created"
++    live = await _live_mcp(tmp_path, root)
++    assert (await live.call("set_source", _source("missing.csv")))["success"] is True
++    assert (await live.call("set_output", _output("reports/new.csv")))["success"] is True
++    assert not root.exists()
++
++
++@pytest.mark.asyncio
++async def test_source_encoding_patch_validates_and_retains_the_admitted_path(tmp_path: Path) -> None:
++    live = await _live_mcp(tmp_path, tmp_path / "data")
++    assert (await live.call("set_source", _source()))["success"] is True
++    assert (await live.call("patch_source_options", {"patch": {"encoding": "utf-8-sig"}}))["success"] is True
++    await live.call("save_session", {"session_id": live.session_id})
++    assert live.private_state.sources["source"].options["path"] == "input.csv"
++    assert live.private_state.sources["source"].options["encoding"] == "utf-8-sig"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("writer", ["patch_source_options", "patch_output_options", "patch_node_options"])
++async def test_nonpath_patch_cannot_reauthorize_a_legacy_escape(tmp_path: Path, writer: str) -> None:
++    payload = _seed_state().to_dict()
++    code, component, arguments = "source_path_policy_invalid", "source", {"patch": {"encoding": "utf-8"}}
++    if writer == "patch_source_options":
++        payload["sources"]["source"]["options"]["path"] = "/legacy-private/input.csv"
++    elif writer == "patch_output_options":
++        payload["outputs"][0]["options"]["path"] = "/legacy-private/output.csv"
++        code, component = "sink_path_policy_invalid", "output:result"
++        arguments = {"sink_name": "result", "patch": {"encoding": "utf-8"}}
++    else:
++        payload["nodes"][1]["options"]["provider_config"]["persist_directory"] = "/legacy-private/index"
++        code, component = "provider_config_path_policy_invalid", "node:after"
++        arguments = {"node_id": "after", "patch": {"output_prefix": "retrieved_"}}
++    live = await _live_mcp(tmp_path, tmp_path / "data", state=CompositionState.from_dict(payload))
++    before, saved = live.private_state.to_dict(), live.saved_bytes
++    result = await live.call(writer, arguments)
++    assert result["success"] is False
++    assert (result["validation"]["errors"][0]["error_code"], result["validation"]["errors"][0]["rejected_component"]) == (code, component)
++    assert result["affected_nodes"] == []
++    await live.call("save_session", {"session_id": live.session_id})
++    assert live.private_state.to_dict() == before
++    assert live.saved_bytes == saved
++
++
++@pytest.mark.asyncio
++async def test_public_export_omits_private_paths_without_replacing_live_state(tmp_path: Path) -> None:
++    payload = _seed_state().to_dict()
++    payload["sources"]["source"]["options"]["path"] = str(tmp_path / "PRIVATE-SOURCE.csv")
++    payload["outputs"][0]["options"]["path"] = str(tmp_path / "PRIVATE-OUTPUT.csv")
++    payload["nodes"][1]["options"]["provider_config"]["persist_directory"] = str(tmp_path / "PRIVATE-PROVIDER")
++    live = await _live_mcp(tmp_path, tmp_path, state=CompositionState.from_dict(payload))
++    before = deepcopy(live.private_state.to_dict())
++    exported = await live.call("generate_yaml", {})
++    assert exported["success"] is True, exported
++    public_text = json.dumps(exported)
++    for canary in ("PRIVATE-SOURCE", "PRIVATE-OUTPUT", "PRIVATE-PROVIDER"):
++        assert canary not in public_text
++    await live.call("save_session", {"session_id": live.session_id})
++    assert live.private_state.to_dict() == before
++
++
++def _preview_state(path: str = "input.csv") -> CompositionState:
++    payload = _seed_state().to_dict()
++    payload["sources"]["source"].update(_source(path))
++    payload["sources"]["source"]["on_success"] = "result"
++    payload["nodes"] = []
++    payload["edges"] = []
++    return CompositionState.from_dict(payload)
++
++
++@pytest.mark.asyncio
++async def test_in_root_file_preview_reaches_actual_plugin_and_graph_checks(tmp_path: Path) -> None:
++    root = tmp_path / "data"
++    root.mkdir()
++    (root / "input.csv").write_text("text\nhello\n")
++    live = await _live_mcp(tmp_path, root, state=_preview_state())
++    assert (await live.call("set_source", {**_source(), "on_success": "result"}))["success"] is True
++    preview = await live.call("preview_pipeline", {})
++    preflight = preview["runtime_preflight"]
++    assert preflight["is_valid"] is True, preflight
++    assert {"path_allowlist", "plugin_instantiation", "graph_structure", "schema_compatibility"} <= {
++        check["name"] for check in preflight["checks"] if check["passed"]
++    }
++    assert preview["data"]["preview_is_valid"] is True
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("component", ["source", "output", "provider"])
++async def test_loaded_legacy_escape_is_preserved_and_refused_by_preview(tmp_path: Path, component: str) -> None:
++    root = tmp_path / "data"
++    root.mkdir()
++    payload = _preview_state().to_dict()
++    escaped = str(tmp_path / "PRIVATE-LEGACY-PATH")
++    if component == "source":
++        payload["sources"]["source"]["options"]["path"] = escaped
++    elif component == "output":
++        payload["outputs"][0]["options"]["path"] = escaped
++    else:
++        payload = _seed_state().to_dict()
++        payload["nodes"][1]["options"]["provider_config"]["persist_directory"] = escaped
++    live = await _live_mcp(tmp_path, root, state=CompositionState.from_dict(payload))
++    before, saved = live.private_state.to_dict(), live.saved_bytes
++    preview = await live.call("preview_pipeline", {})
++    preflight = preview["runtime_preflight"]
++    assert preflight["is_valid"] is False
++    assert "path_allowlist" in {check["name"] for check in preflight["checks"] if not check["passed"]}
++    assert preview["data"]["preview_is_valid"] is False
++    await live.call("save_session", {"session_id": live.session_id})
++    assert live.private_state.to_dict() == before
++    assert live.saved_bytes == saved
++
++
++_SOURCE_SINK_PATH_KEYS = [
++    pytest.param("source", "path", id="source-path"),
++    pytest.param("source", "file", id="source-file"),
++    pytest.param("output", "path", id="sink-path"),
++    pytest.param("output", "file", id="sink-file"),
++    pytest.param("output", "persist_directory", id="sink-persist-directory"),
++]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(("component", "key"), _SOURCE_SINK_PATH_KEYS)
++@pytest.mark.parametrize("escape_link", [False, True])
++async def test_loaded_legacy_null_path_stops_before_materialization_and_plugin_setup(
++    tmp_path: Path, component: str, key: str, escape_link: bool, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A present null must fail the path gate before any scalar-to-path rewrite."""
++    root = tmp_path / "data"
++    root.mkdir()
++    (root / "input.csv").write_text("text\ninside\n")
++    outside = tmp_path / "outside.csv"
++    outside.write_text("text\noutside\n")
++    if escape_link:
++        (root / "None").symlink_to(outside)
++    payload = _preview_state().to_dict()
++    options = payload["sources"]["source"]["options"] if component == "source" else payload["outputs"][0]["options"]
++    options[key] = None
++    live = await _live_mcp(tmp_path, root, state=CompositionState.from_dict(payload))
++    before, saved = live.private_state, live.saved_bytes
++    before_public = await live.call("get_pipeline_state", {})
++    outside_bytes = outside.read_bytes()
++    reached: list[dict[str, Any]] = []
++    materialize = execution_validation.materialize_validation_yaml
++    instantiate = execution_validation.instantiate_runtime_plugins
++
++    def observe_materialization(*args: Any, **kwargs: Any) -> Any:
++        result = materialize(*args, **kwargs)
++        reached.append({"phase": "materialization", "yaml": result.artifact.pipeline_yaml if isinstance(result, PhaseReport) else None})
++        return result
++
++    def observe_plugin_setup(*args: Any, **kwargs: Any) -> Any:
++        reached.append({"phase": "plugin_setup"})
++        return instantiate(*args, **kwargs)
++
++    monkeypatch.setattr(execution_validation, "materialize_validation_yaml", observe_materialization)
++    monkeypatch.setattr(execution_validation, "instantiate_runtime_plugins", observe_plugin_setup)
++    preview = await live.call("preview_pipeline", {})
++    preflight = preview["runtime_preflight"]
++    (tmp_path / "observed-null-preview.json").write_text(
++        json.dumps(
++            {
++                "component": component,
++                "key": key,
++                "escape_link": escape_link,
++                "root": str(root),
++                "outside": str(outside),
++                "reached": reached,
++                "preflight": preflight,
++                "outside_bytes_unchanged": outside.read_bytes() == outside_bytes,
++            },
++            indent=2,
++        )
++    )
++    path_checks = [check for check in preflight["checks"] if check["name"] == "path_allowlist"]
++    assert len(path_checks) == 1
++    assert path_checks[0]["passed"] is False, {"preflight": preflight, "reached": reached}
++    assert preflight["is_valid"] is False
++    assert preview["data"]["preview_is_valid"] is False
++    assert reached == []
++    assert outside.read_bytes() == outside_bytes
++    assert live.saved_bytes == saved
++    after_public = await live.call("get_pipeline_state", {})
++    assert after_public["state"] == before_public["state"]
++    assert (await live.call("save_session", {"session_id": live.session_id}))["success"] is True
++    after = live.private_state
++    assert after.to_dict() == before.to_dict()
++    assert after.version == before.version
++    assert composition_content_hash(after) == composition_content_hash(before)
++    assert live.saved_bytes == saved
++
++
++@pytest.mark.parametrize(("component", "key"), _SOURCE_SINK_PATH_KEYS)
++def test_null_path_cannot_be_materialized_into_execution_or_identity_yaml(tmp_path: Path, component: str, key: str) -> None:
++    """Calling either materializer directly must not invent a pathname from null."""
++    root = tmp_path / "data"
++    root.mkdir()
++    (root / "None").symlink_to(tmp_path / "outside.csv")
++    payload = _preview_state().to_dict()
++    options = payload["sources"]["source"]["options"] if component == "source" else payload["outputs"][0]["options"]
++    options[key] = None
++    state = CompositionState.from_dict(payload)
++    authority = McpConfiguredRootAuthority(root)
++    with pytest.raises(ValueError, match="nonempty string path"):
++        materialize_validation_yaml(
++            _interpretation(state),
++            yaml_generator=yaml_generator,
++            data_dir=root,
++            session_id=None,
++            blob_get_metadata=None,
++            load_yaml=yaml.safe_load,
++            mcp_root_authority=authority,
++        )
++    with pytest.raises(ValueError, match="nonempty string path"):
++        _compiled_identity_settings(state, yaml_generator=yaml_generator, data_dir=root, session_id=None, mcp_root_authority=authority)
++
++
++def test_missing_source_sink_keys_and_nullable_provider_survive_both_materializers(tmp_path: Path) -> None:
++    """Absent optional keys stay absent; only nested provider null is retained."""
++    payload = _seed_state().to_dict()
++    payload["sources"]["source"]["options"].pop("path")
++    payload["outputs"][0]["options"].pop("path")
++    payload["nodes"][1]["options"]["provider_config"]["persist_directory"] = None
++    state = CompositionState.from_dict(payload)
++    authority = McpConfiguredRootAuthority(tmp_path)
++    materialized = materialize_validation_yaml(
++        _interpretation(state),
++        yaml_generator=yaml_generator,
++        data_dir=tmp_path,
++        session_id=None,
++        blob_get_metadata=None,
++        load_yaml=yaml.safe_load,
++        mcp_root_authority=authority,
++    )
++    assert isinstance(materialized, PhaseReport)
++    execution = yaml.safe_load(materialized.artifact.pipeline_yaml)
++    identity = _compiled_identity_settings(
++        state,
++        yaml_generator=yaml_generator,
++        data_dir=tmp_path,
++        session_id=None,
++        mcp_root_authority=authority,
++    ).audit_safe_settings()
++    for document in (execution, identity):
++        assert not {"path", "file"}.intersection(document["sources"]["source"]["options"])
++        assert not {"path", "file", "persist_directory"}.intersection(document["sinks"]["result"]["options"])
++        assert document["transforms"][1]["options"]["provider_config"]["persist_directory"] is None
++
++
++@pytest.mark.asyncio
++async def test_canonical_root_and_contained_leaf_symlinks_allow_authoring(tmp_path: Path) -> None:
++    actual = tmp_path / "actual-data"
++    actual.mkdir()
++    (actual / "input.csv").write_text("text\nhello\n")
++    (actual / "alias.csv").symlink_to(actual / "input.csv")
++    root = tmp_path / "configured-data"
++    root.symlink_to(actual, target_is_directory=True)
++    live = await _live_mcp(tmp_path, root)
++    assert (await live.call("set_source", _source("alias.csv")))["success"] is True
++
++
++@pytest.mark.asyncio
++async def test_preview_rechecks_a_symlink_changed_since_admission(tmp_path: Path) -> None:
++    root = tmp_path / "data"
++    root.mkdir()
++    target = root / "input.csv"
++    target.write_text("text\nhello\n")
++    link = root / "alias.csv"
++    link.symlink_to(target)
++    live = await _live_mcp(tmp_path, root, state=_preview_state())
++    assert (await live.call("set_source", {**_source("alias.csv"), "on_success": "result"}))["success"] is True
++    # Admission was valid; a different later resolution must not inherit it.
++    link.unlink()
++    link.symlink_to(tmp_path / "private.csv")
++    preview = await live.call("preview_pipeline", {})
++    assert "path_allowlist" in {check["name"] for check in preview["runtime_preflight"]["checks"] if not check["passed"]}
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("component", ["source", "output", "provider"])
++@pytest.mark.parametrize("value", ["", 42, ["input.csv"], "bad\x00path"])
++async def test_malformed_legacy_path_preview_has_route_accurate_refusal(tmp_path: Path, component: str, value: object) -> None:
++    """Legacy lexical errors must refuse before Path and direct repair to MCP authority."""
++    payload = _seed_state().to_dict()
++    if component == "source":
++        payload["sources"]["source"]["options"]["path"] = value
++    elif component == "output":
++        payload["outputs"][0]["options"]["path"] = value
++    else:
++        payload["nodes"][1]["options"]["provider_config"]["persist_directory"] = value
++    live = await _live_mcp(tmp_path, tmp_path / "data", state=CompositionState.from_dict(payload))
++    preview = await live.call("preview_pipeline", {})
++    result = preview["runtime_preflight"]
++    assert result["is_valid"] is False
++    assert "path_allowlist" in {check["name"] for check in result["checks"] if not check["passed"]}
++    assert "configured data root" in result["errors"][0]["suggestion"]
++
++
++@pytest.mark.asyncio
++async def test_bulk_sink_spelling_is_canonicalized_without_an_mcp_session_segment(tmp_path: Path) -> None:
++    live = await _live_mcp(tmp_path, tmp_path / "data")
++    tool, arguments = _mutation("bulk-output", "report.csv")
++    assert (await live.call(tool, arguments))["success"] is True
++    await live.call("save_session", {"session_id": live.session_id})
++    assert live.private_state.outputs[0].options["path"] == "outputs/report.csv"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("source_form", ["source", "sources"])
++@pytest.mark.parametrize("late_component", ["output", "provider"])
++async def test_bulk_good_file_source_and_late_bad_path_are_atomic(tmp_path: Path, source_form: str, late_component: str) -> None:
++    """Neither source form may replace live state before a later component refuses."""
++    root = tmp_path / "data"
++    root.mkdir()
++    (root / "input.csv").write_text("text\nhello\n")
++    live = await _live_mcp(tmp_path, root)
++    arguments: dict[str, Any] = {"nodes": [], "edges": [], "outputs": [_output()]}
++    if source_form == "source":
++        arguments["source"] = _source()
++    else:
++        arguments["sources"] = {"orders": _source()}
++    if late_component == "output":
++        arguments["outputs"].append({**_output(str(tmp_path / "outside.csv")), "sink_name": "late"})
++        code, component = "sink_path_policy_invalid", "output:late"
++    else:
++        arguments["nodes"] = [
++            {
++                **_provider_node("indexes/good"),
++                "id": "early",
++                "input": "rows",
++                "on_success": "next",
++                "options": {**_provider_options("indexes/good"), "output_prefix": "early_"},
++            },
++            {**_provider_node(str(tmp_path / "outside-index")), "input": "next"},
++        ]
++        code, component = "provider_config_path_policy_invalid", "node:after"
++    await _assert_refused_unchanged(live, "bulk-source", "unused", code, component, mutation=("set_pipeline", arguments))
++
++
++@pytest.mark.parametrize("provider_path", ["indexes/docs", None])
++def test_mcp_execution_and_compiled_identity_resolve_the_same_private_paths(tmp_path: Path, provider_path: str | None) -> None:
++    """Dropping authority at either materializer must expose a path disagreement."""
++    payload = _seed_state().to_dict()
++    payload["nodes"][1]["options"]["provider_config"]["persist_directory"] = provider_path
++    state = CompositionState.from_dict(payload)
++    authority = McpConfiguredRootAuthority(tmp_path / "data")
++    generator = yaml_generator
++    report = materialize_validation_yaml(
++        _interpretation(state),
++        yaml_generator=generator,
++        data_dir=authority.root,
++        session_id=None,
++        blob_get_metadata=None,
++        load_yaml=yaml.safe_load,
++        mcp_root_authority=authority,
++    )
++    assert isinstance(report, PhaseReport)
++    execution = yaml.safe_load(report.artifact.pipeline_yaml)
++    identity = _compiled_identity_settings(
++        state,
++        yaml_generator=generator,
++        data_dir=authority.root,
++        session_id=None,
++        mcp_root_authority=authority,
++    ).audit_safe_settings()
++    for document in (execution, identity):
++        assert document["sources"]["source"]["options"]["path"] == str(authority.root / "input.csv")
++        assert document["sinks"]["result"]["options"]["path"] == str(authority.root / "outputs/report.csv")
++        assert document["transforms"][1]["options"]["provider_config"]["persist_directory"] == (
++            str(authority.root / "indexes/docs") if provider_path is not None else None
++        )
++
++
++def test_profiled_validation_passes_authority_to_real_compiled_identity(tmp_path: Path) -> None:
++    """The profiled caller must keep the same authority as executable materialization."""
++    profiles, snapshot = _s3_source_profile_policy_context()
++    authority = McpConfiguredRootAuthority(tmp_path)
++    state = _make_state(
++        source_plugin="aws_s3",
++        source_options={
++            "profile": "demo-input",
++            "key": "records/input.csv",
++            "format": "csv",
++            "schema": {"mode": "observed"},
++        },
++        outputs=(_make_output(options={"path": "outputs/report.csv", "schema": {"mode": "observed"}}),),
++    )
++    identities: list[dict[str, Any]] = []
++
++    def record_identity(*args: Any, **kwargs: Any) -> Any:
++        assert kwargs["mcp_root_authority"] is authority
++        document = _compiled_identity_settings(*args, **kwargs)
++        identities.append(document.audit_safe_settings())
++        return document
++
++    with (
++        patch("elspeth.web.execution.validation._compiled_identity_settings", record_identity),
++        patch("elspeth.web.execution.validation.load_settings_from_yaml_string", return_value=_fake_settings()),
++        patch("elspeth.web.execution.validation.instantiate_runtime_plugins", return_value=_FakeRuntimeBundle()),
++        patch("elspeth.web.execution.preflight.bind_profiled_s3_source_audit_identities"),
++        patch("elspeth.web.execution.validation.build_runtime_graph", return_value=_runtime_graph_mock()),
++        patch("elspeth.web.execution.validation.assemble_and_validate_pipeline_config", return_value=_fake_pipeline_config()),
++    ):
++        result = validate_pipeline(
++            state,
++            _StdioValidationSettings(data_dir=tmp_path),
++            yaml_generator,
++            plugin_snapshot=snapshot,
++            profile_registry=profiles,
++            catalog=create_catalog_service(),
++            mcp_root_authority=authority,
++        )
++    assert result.is_valid is True, result
++    assert len(identities) == 1
++    assert identities[0]["sinks"]["primary"]["options"]["path"] == str(tmp_path / "outputs/report.csv")
++
++
++def test_mcp_root_is_nominal_and_cannot_mix_with_web_custody(tmp_path: Path) -> None:
++    catalog = create_catalog_service()
++    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
++    view = PolicyCatalogView.for_trained_operator(catalog, snapshot)
++    invalid: Any = tmp_path
++    with pytest.raises(TypeError, match="McpConfiguredRootAuthority"):
++        ToolContext(catalog=view, plugin_snapshot=snapshot, mcp_root_authority=invalid)
++    for custody in ({"session_id": "web-session"}, {"data_dir": str(tmp_path)}):
++        with pytest.raises(ValueError, match="Web session custody"):
++            ToolContext(catalog=view, plugin_snapshot=snapshot, mcp_root_authority=McpConfiguredRootAuthority(tmp_path), **custody)
++    invalid_root: Any = str(tmp_path)
++    with pytest.raises(TypeError, match="must be a Path"):
++        McpConfiguredRootAuthority(invalid_root)
++    leaf = tmp_path / "file"
++    leaf.write_text("not a directory")
++    with pytest.raises(ValueError, match="must be a directory"):
++        McpConfiguredRootAuthority(leaf)
++
++
++@pytest.mark.parametrize("case", ["wrong-type", "web-session", "different-root"])
++def test_empty_validation_cannot_hide_an_invalid_owned_path_context(tmp_path: Path, case: str) -> None:
++    """Owned configuration errors must precede even the empty-composition shortcut."""
++    catalog = create_catalog_service()
++    authority: Any = McpConfiguredRootAuthority(tmp_path)
++    data_dir = tmp_path / "other" if case == "different-root" else tmp_path
++    session_id = "web-session" if case == "web-session" else None
++    if case == "wrong-type":
++        authority = tmp_path
++    payload = _preview_state().to_dict()
++    payload["sources"], payload["outputs"] = {}, []
++    with pytest.raises(TypeError if case == "wrong-type" else ValueError):
++        validate_pipeline(
++            CompositionState.from_dict(payload),
++            _StdioValidationSettings(data_dir=data_dir),
++            yaml_generator,
++            plugin_snapshot=PluginAvailabilitySnapshot.for_trained_operator(catalog),
++            profile_registry=None,
++            catalog=catalog,
++            session_id=session_id,
++            mcp_root_authority=authority,
++        )
++
++
++@pytest.mark.asyncio
++async def test_shared_coordinator_distinguishes_authority_mode_and_canonical_root(tmp_path: Path) -> None:
++    """Equal caller settings hashes cannot let one filesystem mode borrow another's verdict."""
++    coordinator = RuntimePreflightCoordinator()
++    release = asyncio.Event()
++    started: list[str] = []
++    servers = []
++    first_root = tmp_path / "a"
++    first_root.mkdir()
++    alias = tmp_path / "alias"
++    alias.symlink_to(first_root, target_is_directory=True)
++    roots = [first_root, alias, tmp_path / "b", None]
++    for index, root in enumerate(roots):
++
++        async def preflight(state: CompositionState, label: str = str(index)) -> ValidationResult:
++            started.append(label)
++            await release.wait()
++            return ValidationResult(
++                is_valid=True,
++                checks=[],
++                errors=[],
++                warnings=[],
++                readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
++            )
++
++        scratch = tmp_path / str(index)
++        scratch.mkdir()
++        servers.append(
++            _LiveMcp(
++                create_server(
++                    create_catalog_service(),
++                    scratch,
++                    runtime_preflight=preflight,
++                    runtime_preflight_settings_hash="same-settings",
++                    runtime_preflight_coordinator=coordinator,
++                    session_scope_provider=lambda: "same-scope",
++                    mcp_root_authority=McpConfiguredRootAuthority(root) if root is not None else None,
++                ),
++                scratch,
++                "unused",
++            )
++        )
++    calls = [asyncio.create_task(live.call("preview_pipeline", {})) for live in servers]
++    try:
++        for _ in range(100):
++            if len(started) >= 3:
++                break
++            await asyncio.sleep(0.001)
++        assert len(started) == 3
++    finally:
++        release.set()
++        await asyncio.gather(*calls)

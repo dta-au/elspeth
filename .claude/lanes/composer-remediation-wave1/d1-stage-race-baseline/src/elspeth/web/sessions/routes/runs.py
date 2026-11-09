@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Annotated
+
+from elspeth.web.execution.schemas import RunAccounting, RunAccountingCorruption
+
+from ._helpers import (
+    SESSION_TERMINAL_RUN_STATUS_VALUES,
+    UUID,
+    APIRouter,
+    AuditStoryIntegrityError,
+    AuditStoryService,
+    Depends,
+    HTTPException,
+    LandscapeDB,
+    PydanticValidationError,
+    Request,
+    RunAuditStoryResponse,
+    RunResponse,
+    SessionServiceProtocol,
+    UserIdentity,
+    _run_accounting_integrity_http,
+    _validate_run_status_accounting_for_list,
+    _verify_session_ownership,
+    load_run_accounting_for_settings,
+    require_pipeline_user,
+    run_sync_in_worker,
+)
+
+
+def register_run_routes(router: APIRouter) -> None:
+
+    @router.get(
+        "/{session_id}/runs",
+        response_model=list[RunResponse],
+    )
+    async def list_session_runs(
+        session_id: UUID,
+        request: Request,
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
+    ) -> list[RunResponse]:
+        """List all runs for a session, newest first."""
+        session = await _verify_session_ownership(session_id, user, request)
+        service: SessionServiceProtocol = request.app.state.session_service
+        runs = await service.list_runs_for_session(session.id)
+        from elspeth.web.execution.discard_summary import load_discard_summaries_for_settings
+
+        terminal_landscape_run_ids = tuple(
+            run.landscape_run_id for run in runs if run.status in SESSION_TERMINAL_RUN_STATUS_VALUES and run.landscape_run_id is not None
+        )
+        accounting_by_run_id: Mapping[str, RunAccounting] = {}
+        corruption_by_run_id: Mapping[str, RunAccountingCorruption] = {}
+        if terminal_landscape_run_ids:
+            try:
+                accounting_batch = await run_sync_in_worker(
+                    load_run_accounting_for_settings,
+                    request.app.state.settings,
+                    terminal_landscape_run_ids,
+                )
+            except ValueError as exc:
+                raise _run_accounting_integrity_http(
+                    "Session run accounting projection failed.",
+                    landscape_run_ids=terminal_landscape_run_ids,
+                    error=str(exc),
+                ) from exc
+            accounting_by_run_id = accounting_batch.accounting
+            # Per-run isolation (elspeth-d5578ccd98): corrupt runs render in
+            # the list with an explicit corruption marker instead of
+            # accounting; before this split one corrupt historical run made
+            # the whole session history 500, hiding every healthy run.
+            corruption_by_run_id = accounting_batch.corrupt
+        discard_summaries = {}
+        if terminal_landscape_run_ids:
+            discard_summaries = await run_sync_in_worker(
+                load_discard_summaries_for_settings,
+                request.app.state.settings,
+                terminal_landscape_run_ids,
+            )
+
+        # Resolve composition_version from each run's state_id.
+        # A missing state is Tier 1 data corruption — crash, don't hide.
+        # Scope the read to the current session: the current-schema
+        # composite FK prevents cross-session state refs at the schema
+        # layer. ``get_state_in_session`` raises
+        # ``AuditIntegrityError`` on session mismatch, surfacing Tier 1
+        # corruption rather than silently returning the wrong state's
+        # version number in another session's listing.
+        responses: list[RunResponse] = []
+        for run in runs:
+            state = await service.get_state_in_session(run.state_id, session.id)
+            version = state.version
+            discard_summary = None
+            if run.landscape_run_id is not None and run.landscape_run_id in discard_summaries:
+                discard_summary = discard_summaries[run.landscape_run_id]
+            accounting = None
+            accounting_corruption = None
+            if run.landscape_run_id is not None and run.landscape_run_id in accounting_by_run_id:
+                accounting = accounting_by_run_id[run.landscape_run_id]
+            if run.landscape_run_id is not None and run.landscape_run_id in corruption_by_run_id:
+                accounting_corruption = corruption_by_run_id[run.landscape_run_id]
+            if accounting_corruption is None:
+                # The status/accounting contract presumes trustworthy
+                # accounting; a corrupt run replaces it with the explicit
+                # corruption marker, which RunResponse's own validator pins
+                # as mutually exclusive with accounting.
+                _validate_run_status_accounting_for_list(run, accounting)
+            # RunResponse construction runs the accounting/discard-summary
+            # reconciliation validator (elspeth-43f52d69a4) — the list helper
+            # above never sees discard_summary, so a contradiction fires HERE
+            # and must route through the structured run_integrity_error
+            # envelope, not a bare 500.
+            try:
+                response = RunResponse(
+                    id=str(run.id),
+                    session_id=str(run.session_id),
+                    status=run.status,
+                    accounting=accounting,
+                    accounting_corruption=accounting_corruption,
+                    error=run.error,
+                    started_at=run.started_at,
+                    finished_at=run.finished_at,
+                    composition_version=version,
+                    discard_summary=discard_summary,
+                )
+            except PydanticValidationError as exc:
+                raise _run_accounting_integrity_http(
+                    "Session run failed internal accounting validation.",
+                    run_id=run.id,
+                    landscape_run_id=run.landscape_run_id,
+                    validation_errors=exc.errors(include_url=False, include_context=False, include_input=False),
+                ) from exc
+            responses.append(response)
+        return responses
+
+    @router.get(
+        "/{session_id}/runs/{run_id}/audit-story",
+        response_model=RunAuditStoryResponse,
+    )
+    async def get_run_audit_story(
+        session_id: UUID,
+        run_id: UUID,
+        request: Request,
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
+    ) -> RunAuditStoryResponse:
+        """Return the Landscape-backed audit story for a run."""
+        session = await _verify_session_ownership(session_id, user, request)
+        service: SessionServiceProtocol = request.app.state.session_service
+        try:
+            run = await service.get_run(run_id)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Run not found") from None
+        if run.session_id != session.id:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if run.landscape_run_id is None:
+            # Sessions-DB run row exists but was never linked to a Landscape
+            # run — same Tier-1 audit-DB invariant violation as the failure
+            # modes inside ``AuditStoryService``. Promoting to the named type
+            # routes both code paths through the single
+            # ``AuditStoryIntegrityError`` handler in ``app.py`` so the
+            # response carries the ``error_type`` discriminator that
+            # incident-response code switches on.
+            raise AuditStoryIntegrityError(f"Run {run_id} has no Landscape run id; audit story cannot be reconstructed")
+        landscape_run_id = run.landscape_run_id
+
+        settings = request.app.state.settings
+
+        def _load_story() -> RunAuditStoryResponse:
+            from elspeth.web.execution.discard_summary import _sqlite_database_file_missing
+
+            landscape_url = settings.get_landscape_url()
+            if _sqlite_database_file_missing(landscape_url):
+                # A run row carrying a non-None ``landscape_run_id`` with no
+                # audit database on disk is the same Tier-1 invariant breach
+                # as a missing run row inside ``AuditStoryService`` — surface
+                # it through the named error type instead of (as the previous
+                # bare ``LandscapeDB(...)`` writer constructor did) silently
+                # CREATING an empty audit database and then failing with
+                # "run not found".
+                raise AuditStoryIntegrityError(
+                    f"Landscape run {landscape_run_id} is recorded for run {run.id} but the audit database does not exist"
+                )
+            with LandscapeDB.from_url(
+                landscape_url,
+                passphrase=settings.landscape_passphrase,
+                create_tables=False,
+                read_only=True,
+            ) as db:
+                return AuditStoryService(db).get_run_audit_story(
+                    landscape_run_id,
+                    public_run_id=str(run.id),
+                    session_id=str(session.id),
+                )
+
+        # Let ``AuditStoryIntegrityError`` propagate unflattened — the FastAPI
+        # exception handler in ``app.py`` matches on the named type and
+        # returns a structured 500. Catching it here and re-raising as bare
+        # ``RuntimeError`` would route the failure to FastAPI's default
+        # handler and erase the discriminator.
+        return await run_sync_in_worker(_load_story)

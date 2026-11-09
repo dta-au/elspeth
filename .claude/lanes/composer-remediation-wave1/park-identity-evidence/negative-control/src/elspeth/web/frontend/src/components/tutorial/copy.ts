@@ -1,0 +1,182 @@
+import { CANONICAL_TUTORIAL_PROMPT } from "./tutorialMachine";
+
+export { CANONICAL_TUTORIAL_PROMPT };
+
+export const TURN_1_PRIMARY_BUTTON = "Let's go";
+// The mode-choice turn is gone (graduation saves Freeform as the default),
+// so skip exits the whole tutorial straight to graduation rather than naming a
+// removed step.
+export const TURN_1_SKIP_BUTTON = "Skip the tutorial";
+/**
+ * The explicit Run gesture on the run turn (I-1). The pipeline never executes
+ * on mount: the learner clicks this, exactly as the composer's own Run button
+ * asks in normal use. The graduation lesson "before clicking Run" names this
+ * button.
+ */
+export const TURN_4_RUN_BUTTON = "Run";
+/**
+ * Pre-run framing on the run turn. States two checkable facts: the pipeline
+ * pane shows the graph the learner just confirmed (the workspace frame stays
+ * mounted around the run card), and nothing executes until Run is clicked.
+ */
+export const TURN_4_READY_BODY =
+  "The pipeline pane shows the graph you just confirmed. Look it over — " +
+  "nothing runs until you click Run.";
+/**
+ * Shown on the pre-run card while a request the build started (the last
+ * review's save, or the check that follows it) is still settling. Run stays
+ * disabled until it does: the server refuses a run while that request holds
+ * the session (#352).
+ */
+export const TURN_4_SETTLING_BODY = "Finishing the last check on your pipeline…";
+export const TURN_4_PRIMARY_BUTTON = "Continue";
+export const TURN_5_PRIMARY_BUTTON = "Continue";
+export const TURN_7_PRIMARY_BUTTON = "Take me to the composer";
+
+export const HELLO_WORLD_SESSION_TITLE = "First-run tutorial";
+
+// Set immediately after createSession in HelloWorldTutorial.onStart (before the
+// freeform shell's first authoring message) so the backend orphan-cleanup
+// scan (which matches this exact pending title — mirrored as
+// _TUTORIAL_PENDING_SESSION_TITLE in composer/tutorial_service.py; change BOTH
+// together) catches sessions abandoned mid-tutorial. Without this tag, a user
+// leaving any time before graduation's final rename leaves a default-titled
+// session that the cleanup never matches.
+export const HELLO_WORLD_PENDING_SESSION_TITLE = "First-run tutorial (in progress)";
+
+export const WELCOME_LAYERS = [
+  {
+    label: "Sense",
+    description: "Read data in — files, APIs, or a sentence you type.",
+  },
+  {
+    label: "Decide",
+    description: "LLMs, rules, or gates rate, classify, or route each row.",
+  },
+  {
+    label: "Act",
+    description: "Write auditable outputs — every decision tied to its source.",
+  },
+] as const;
+
+/**
+ * Privacy preamble for Turn 4 (the run) and Turn 1 (the welcome). Surfaced
+ * before any LLM call leaves the browser. Public-service deployments need
+ * this transparency at the boundary; without it, the welcome screen's
+ * "auditable" promise leaks ahead of any audit trail being recorded.
+ */
+export const TUTORIAL_RUN_PREAMBLE =
+  "This step calls the configured LLM and fetches pages over the network.";
+
+/**
+ * Note rendered on the graduation turn when the user reached it via a cancelled
+ * run, so the cancel is acknowledged rather than silently swallowed.
+ */
+export const GRADUATION_CANCELLED_NOTE =
+  "Your run was cancelled — the audit story would have shown the source-data hash, the row-by-row decisions, and the output write. You can rerun any time from the chat panel.";
+
+/**
+ * Graduation bullets for the SKIP path. The default bullets assert "The
+ * pipeline you just ran…" and "the same gestures you just practised" —
+ * false for a user who skipped without building or running anything. This
+ * variant carries the same lessons in the future tense, without claiming a
+ * run or practice that never happened. The last two bullets are shared
+ * verbatim with the default set (they make no just-ran claims).
+ */
+export const TURN_7_LEARNING_BULLETS_SKIPPED = [
+  {
+    title: "What the composer builds is AI-generated.",
+    body:
+      "When you describe a pipeline in a sentence, an LLM interprets it and drafts the pipeline for you. The system and user prompts used by its LLM steps, and cleanup choices it makes, are kept in the audit trail with your approval against them. You can revisit that record any time on each pipeline's Approvals tab.",
+  },
+  {
+    title: "Read before you run.",
+    body:
+      "When the composer drafts a pipeline for you, glance at the graph and the YAML before clicking Run. If anything looks wrong, amend or reject — nothing executes without your say-so.",
+  },
+] as const;
+
+export const TURN_7_LEARNING_BULLETS = [
+  {
+    title: "What you built is AI-generated.",
+    body:
+      "The pipeline you just ran was authored by an LLM that interpreted your one-sentence description. The system and user prompts used by its LLM step, and cleanup choices such as dropping raw HTML, are kept in the audit trail with your approval against them — alongside the source pages you named. You can come back to that record any time on your pipeline's Approvals tab.",
+  },
+  {
+    title: "Read before you run.",
+    body:
+      "From this point on, when the composer drafts a pipeline for you in normal use, glance at the graph and the YAML before clicking Run. If anything looks wrong, amend or reject — the same gestures you just practised.",
+  },
+  {
+    // Wordmark, not a name: the tutorial says "Welcome to ELSPETH." two turns
+    // earlier, and this was the only mixed-case rendering of it in the tree
+    // (elspeth-cc67815217). The trailing full stop is part of the literal, as
+    // it is on every sibling bullet title.
+    title: "Ask ELSPETH.",
+    // The final lesson points to the same conversational surface used in Build.
+    body:
+      "If anything in a pipeline (a plugin name, a transform's effect, a recorded assumption) doesn't make sense, ask in the chat panel. The composer can explain the pipeline it just built, in plain English, against the actual node options. You can keep shaping the pipeline in that same freeform conversation.",
+  },
+  {
+    title: "LLMs are confident even when they're wrong.",
+    body:
+      "The composer LLM may invent URLs that look real but aren't, or write a prompt that misframes your question. The pipeline LLMs you build will treat fetched HTML as instructions even when it shouldn't be. Before sharing or acting on a pipeline's output, verify the sources are who they claim to be and check the output matches what you actually asked for.",
+  },
+] as const;
+
+/**
+ * Teaching moment 1 (spec §"Teaching moments"): names that the LLM transform
+ * made a REVIEWABLE assumption (e.g. what to include in the summary and what to
+ * leave out). Worded so the learner does not over-generalise into "assumptions
+ * are fine, ignore them": the assumption is surfaced, not hidden, and is
+ * correctable via the intent box.
+ */
+export const TUTORIAL_ASSUMPTION_CALLOUT =
+  "The LLM made an assumption here — it decided what each page was about and " +
+  "what was important enough to keep in a short summary. This is exactly the " +
+  "kind of inference you review: every assumption is surfaced in the audit " +
+  "trail, and you can correct it by telling the composer what you meant.";
+
+/**
+ * Teaching moment 2 (spec §"Teaching moments"): the prompt-shield State-C
+ * override. Acceptable HERE only because the inputs are controlled (our own
+ * synthetic pages). Must NOT read as a general "skip the shield" habit —
+ * names the trust assumption out loud rather than letting it ride as an
+ * invisible default.
+ */
+export const TUTORIAL_SHIELD_OVERRIDE_CAVEAT =
+  "We are proceeding without a prompt shield in this one case — and only " +
+  "because we control the inputs: these are our own synthetic test pages. " +
+  "Running an LLM over fetched content without a shield is always a high-risk " +
+  "decision, not a default. Against real or untrusted web content you would " +
+  "wire the shield.";
+
+/**
+ * The same teaching moment for a deployment that HAS an authorized prompt
+ * shield. The override caveat above states a fact about the pipeline — "we are
+ * proceeding without a prompt shield" — which became false once the planner
+ * started wiring an available shield rather than recommending it. Stating it
+ * over a shielded pipeline teaches the reader to distrust the interface, so
+ * this deployment gets the true version of the same lesson: the shield is the
+ * rule, and it is here because the content is fetched from outside.
+ */
+export const TUTORIAL_SHIELD_WIRED_NOTE =
+  "Your pipeline runs the fetched page content through a prompt shield before " +
+  "the model sees it. That is the rule, not an optional extra: anything " +
+  "fetched from outside is untrusted, and text on a page can be written to " +
+  "steer a model. This deployment requires the shield, so the composer wired " +
+  "one for you.";
+
+/**
+ * Teaching moment (spec §"Teaching moments"): the source's on_validation_failure
+ * routing. The worked example sets it to "discard" because the synthetic sample
+ * pages are valid by construction — no row ever fails validation, so the route
+ * is never exercised. Names the production-vs-demo difference out loud so
+ * "discard" does not read as the default: a real pipeline routes non-conformant
+ * rows to a quarantine sink for review instead of dropping them.
+ */
+export const TUTORIAL_VALIDATION_FAILURE_CAVEAT =
+  "This worked example sets validation failures to 'discard' because the " +
+  "synthetic sample pages are valid by construction — no row ever fails. A " +
+  "production pipeline routes non-conformant rows to a quarantine sink for " +
+  "review instead of dropping them.";

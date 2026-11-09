@@ -1,0 +1,196 @@
+diff --git a/src/elspeth/web/composer/tools/generation.py b/src/elspeth/web/composer/tools/generation.py
+index 06a93f4a1..c36c852c3 100644
+--- a/src/elspeth/web/composer/tools/generation.py
++++ b/src/elspeth/web/composer/tools/generation.py
+@@ -2199,10 +2199,19 @@ def _execute_explain_validation_error(
+             updated_state=state,
+             validation=validation,
+             affected_nodes=(),
+-            data={"error_text": error_text, "explanation": explanation, "suggested_fix": fix},
++            data={"error_text": error_text, "error_code": error_text, "explanation": explanation, "suggested_fix": fix},
+         )
+-    for pattern, explanation, fix in _VALIDATION_ERROR_PATTERNS:
++    for record in _VALIDATION_ERROR_PATTERNS:
++        pattern, explanation, fix = record
+         if re.search(pattern, error_text):
++            # A legacy regex owns only the codes bound to this exact record by
++            # the catalogue. Shared prose is not identity, and another code in
++            # the input must not override the first matching regex's diagnosis.
++            codes = [code for code, guidance in _VALIDATION_GUIDANCE_BY_CODE.items() if guidance is record]
++            matched_code = next(
++                (code for code in codes if code.lower() in error_text.lower()),
++                codes[0] if len(codes) == 1 else None,
++            )
+             return ToolResult(
+                 success=True,
+                 updated_state=state,
+@@ -2210,6 +2219,7 @@ def _execute_explain_validation_error(
+                 affected_nodes=(),
+                 data={
+                     "error_text": error_text,
++                    **({"error_code": matched_code} if matched_code is not None else {}),
+                     "explanation": explanation,
+                     "suggested_fix": _augment_with_expected_hint(fix, error_text),
+                 },
+diff --git a/tests/unit/web/composer/fixtures/generation_response_wire_4f206253.json b/tests/unit/web/composer/fixtures/generation_response_wire_4f206253.json
+index 72ff7ce20..0c63a98f7 100644
+--- a/tests/unit/web/composer/fixtures/generation_response_wire_4f206253.json
++++ b/tests/unit/web/composer/fixtures/generation_response_wire_4f206253.json
+@@ -11,7 +11,7 @@
+     },
+     "explain_exact": {
+       "success": true,
+-      "data": "{\"error_text\": \"unknown_node_type\", \"explanation\": \"The node_type is not one of the composer's node kinds: aggregation, coalesce, gate, queue, row_union, transform. There is no 'fork' node_type.\", \"suggested_fix\": \"Keep your current pipeline shape and change ONLY the invalid node: forking is expressed with a GATE node \\u2014 node_type='gate', condition='True', routes={'true': 'fork', 'false': 'fork'}, fork_to=['branch_a', 'branch_b']; each branch node reads one branch name as its input. Use COALESCE (branches + policy + merge) for N-to-one field merging: a downstream node consumes the coalesce id. Use row_union for require_all N-to-N reconvergence that releases every original branch row: branches maps fork aliases to arriving connections, input repeats the first branch value, and on_success names downstream processing.\"}"
++      "data": "{\"error_text\": \"unknown_node_type\", \"error_code\": \"unknown_node_type\", \"explanation\": \"The node_type is not one of the composer's node kinds: aggregation, coalesce, gate, queue, row_union, transform. There is no 'fork' node_type.\", \"suggested_fix\": \"Keep your current pipeline shape and change ONLY the invalid node: forking is expressed with a GATE node \\u2014 node_type='gate', condition='True', routes={'true': 'fork', 'false': 'fork'}, fork_to=['branch_a', 'branch_b']; each branch node reads one branch name as its input. Use COALESCE (branches + policy + merge) for N-to-one field merging: a downstream node consumes the coalesce id. Use row_union for require_all N-to-N reconvergence that releases every original branch row: branches maps fork aliases to arriving connections, input repeats the first branch value, and on_success names downstream processing.\"}"
+     },
+     "explain_noisy": {
+       "success": true,
+@@ -23,7 +23,7 @@
+     },
+     "explain_hint": {
+       "success": true,
+-      "data": "{\"error_text\": \"unknown node_type. Expected a gate.\", \"explanation\": \"The node_type is not one of the composer's node kinds: aggregation, coalesce, gate, queue, row_union, transform. There is no 'fork' node_type.\", \"suggested_fix\": \"Keep your current pipeline shape and change ONLY the invalid node: forking is expressed with a GATE node \\u2014 node_type='gate', condition='True', routes={'true': 'fork', 'false': 'fork'}, fork_to=['branch_a', 'branch_b']; each branch node reads one branch name as its input. Use COALESCE (branches + policy + merge) for N-to-one field merging: a downstream node consumes the coalesce id. Use row_union for require_all N-to-N reconvergence that releases every original branch row: branches maps fork aliases to arriving connections, input repeats the first branch value, and on_success names downstream processing. Expected a gate.\"}"
++      "data": "{\"error_text\": \"unknown node_type. Expected a gate.\", \"error_code\": \"unknown_node_type\", \"explanation\": \"The node_type is not one of the composer's node kinds: aggregation, coalesce, gate, queue, row_union, transform. There is no 'fork' node_type.\", \"suggested_fix\": \"Keep your current pipeline shape and change ONLY the invalid node: forking is expressed with a GATE node \\u2014 node_type='gate', condition='True', routes={'true': 'fork', 'false': 'fork'}, fork_to=['branch_a', 'branch_b']; each branch node reads one branch name as its input. Use COALESCE (branches + policy + merge) for N-to-one field merging: a downstream node consumes the coalesce id. Use row_union for require_all N-to-N reconvergence that releases every original branch row: branches maps fork aliases to arriving connections, input repeats the first branch value, and on_success names downstream processing. Expected a gate.\"}"
+     },
+     "assistance": {
+       "success": true,
+diff --git a/tests/unit/web/composer/test_generation_response_contracts.py b/tests/unit/web/composer/test_generation_response_contracts.py
+index ce2427c17..6fe0a74ce 100644
+--- a/tests/unit/web/composer/test_generation_response_contracts.py
++++ b/tests/unit/web/composer/test_generation_response_contracts.py
+@@ -216,9 +216,18 @@ def test_failed_diff_stays_validation_only():
+         admit_discovery_result("diff_pipeline", replace(result, data={"error_code": "diff_baseline_unavailable"}))
+ 
+ 
+-def test_successful_explanation_code_survives(producer_results):
+-    wire = responses.EXPLAIN_VALIDATION_ERROR_RESPONSE_CONTRACT.admit(producer_results["explain_noisy"].data).to_wire()
+-    assert wire["error_code"] == "quarantine_unknown_output"
++@pytest.mark.parametrize(
++    ("case", "code"),
++    [("explain_exact", "unknown_node_type"), ("explain_hint", "unknown_node_type"), ("explain_noisy", "quarantine_unknown_output")],
++)
++def test_successful_explanation_code_survives(producer_results, case, code):
++    wire = responses.EXPLAIN_VALIDATION_ERROR_RESPONSE_CONTRACT.admit(producer_results[case].data).to_wire()
++    assert wire["error_code"] == code
++
++
++def test_unknown_explanation_does_not_acquire_a_code(producer_results):
++    wire = responses.EXPLAIN_VALIDATION_ERROR_RESPONSE_CONTRACT.admit(producer_results["explain_none"].data).to_wire()
++    assert "error_code" not in wire
+ 
+ 
+ def test_assistance_reuses_owned_examples_and_closes_json_leaves(producer_results):
+diff --git a/tests/unit/web/composer/test_validation_guidance_catalogue.py b/tests/unit/web/composer/test_validation_guidance_catalogue.py
+index 8a9fc0384..189b3a646 100644
+--- a/tests/unit/web/composer/test_validation_guidance_catalogue.py
++++ b/tests/unit/web/composer/test_validation_guidance_catalogue.py
+@@ -21,6 +21,68 @@ def test_runtime_union_collision_reason_has_guidance_without_build_code() -> Non
+     result = execute_tool("explain_validation_error", {"error_text": "union_field_collision"}, _empty_state(), _mock_catalog())
+     assert result.success
+     assert "Composer cannot author" in result.data["suggested_fix"]
++    assert "error_code" not in result.data
++
++
++@pytest.mark.parametrize("code", generation._CLOSED_VALIDATION_ERROR_CODES)
++@pytest.mark.parametrize("form", ["exact", "lowercase_noise", "uppercase_noise"])
++def test_closed_code_is_canonical_on_every_match_branch(code: str, form: str) -> None:
++    text = code if form == "exact" else f"LOG {code.lower() if form == 'lowercase_noise' else code.upper()} END"
++    result = execute_tool("explain_validation_error", {"error_text": text}, _empty_state(), _mock_catalog())
++    assert result.success
++    assert result.data["error_code"] == code
++    assert (result.data["explanation"], result.data["suggested_fix"]) == generation.explain_validation_code(code)
++
++
++def test_identifiable_legacy_prose_returns_its_indexed_code() -> None:
++    result = execute_tool("explain_validation_error", {"error_text": "Invalid unknown node_type."}, _empty_state(), _mock_catalog())
++    assert result.data["error_code"] == "unknown_node_type"
++
++
++@pytest.mark.parametrize("text", ["ZZZ_UNRECOGNIZED_QQQ", "No source configured. LOG UNKNOWN_NODE_TYPE END"])
++def test_unowned_match_does_not_borrow_a_code_from_elsewhere(text: str) -> None:
++    result = execute_tool("explain_validation_error", {"error_text": text}, _empty_state(), _mock_catalog())
++    assert "error_code" not in result.data
++
++
++def test_matching_prose_text_is_not_record_ownership(monkeypatch: pytest.MonkeyPatch) -> None:
++    owned = generation._VALIDATION_GUIDANCE_BY_CODE["unknown_node_type"]
++    assert isinstance(owned, tuple)
++    unowned = ("unowned diagnostic", owned[1], owned[2])
++    monkeypatch.setattr(generation, "_VALIDATION_ERROR_PATTERNS", (unowned, *generation._VALIDATION_ERROR_PATTERNS))
++    result = execute_tool(
++        "explain_validation_error", {"error_text": "unowned diagnostic UNKNOWN_NODE_TYPE"}, _empty_state(), _mock_catalog()
++    )
++    assert result.data["explanation"] == owned[1]
++    assert "error_code" not in result.data
++
++
++@pytest.mark.parametrize(
++    "text",
++    ["Coalesce on_success must point to a sink", "Destination is neither a sink nor a known connection"],
++)
++def test_ambiguous_legacy_prose_does_not_invent_one_of_its_codes(text: str) -> None:
++    matching = next(row for row in generation._VALIDATION_ERROR_PATTERNS if re.search(row[0], text))
++    owners = [code for code, record in generation._VALIDATION_GUIDANCE_BY_CODE.items() if record is matching]
++    assert len(owners) > 1
++    result = execute_tool("explain_validation_error", {"error_text": text}, _empty_state(), _mock_catalog())
++    assert result.data["explanation"] == matching[1]
++    assert result.data["suggested_fix"] == matching[2]
++    assert "error_code" not in result.data
++
++
++@pytest.mark.parametrize(
++    ("first", "second"),
++    [
++        ("coalesce_on_success_must_be_sink", "coalesce_on_success_unknown_sink"),
++        ("coalesce_policy_invalid", "coalesce_merge_invalid"),
++        ("transform_on_success_dangling", "aggregation_on_success_dangling"),
++    ],
++)
++def test_multiple_explicit_codes_for_one_record_keep_index_precedence(first: str, second: str) -> None:
++    assert generation._VALIDATION_GUIDANCE_BY_CODE[first] is generation._VALIDATION_GUIDANCE_BY_CODE[second]
++    result = execute_tool("explain_validation_error", {"error_text": f"LOG {second} {first} END"}, _empty_state(), _mock_catalog())
++    assert result.data["error_code"] == first
+ 
+ 
+ def _historical_fixture():
+@@ -252,7 +314,8 @@ def test_new_policy_guidance_does_not_extend_legacy_patterns(monkeypatch: pytest
+ def test_direct_exact_and_noisy_lookup_and_help_derive_from_records() -> None:
+     for record in generation._DIRECT_VALIDATION_GUIDANCE:
+         exact = execute_tool("explain_validation_error", {"error_text": record.code}, _empty_state(), _mock_catalog())
+-        assert list(exact.data) == ["error_text", "explanation", "suggested_fix"]
++        assert list(exact.data) == ["error_text", "error_code", "explanation", "suggested_fix"]
++        assert exact.data["error_code"] == record.code
+         assert exact.data["explanation"] == record.explanation
+         assert exact.data["suggested_fix"] == record.suggested_fix
+         noisy = execute_tool("explain_validation_error", {"error_text": f"LOG {record.code.upper()} END"}, _empty_state(), _mock_catalog())
+@@ -284,6 +347,30 @@ def test_public_prose_retains_first_match_and_expected_hint() -> None:
+     result = execute_tool("explain_validation_error", {"error_text": text}, _empty_state(), _mock_catalog())
+     assert result.data["explanation"] == matching[0][1]
+     assert result.data["suggested_fix"] == matching[0][2] + " Expected a declared node kind."
++    assert result.data["error_code"] == "unknown_node_type"
++
++
++def test_first_regex_owns_code_even_when_later_code_occurs_first_in_text() -> None:
++    text = "coalesce_policy_invalid; unknown node_type. Expected a declared node kind."
++    result = execute_tool("explain_validation_error", {"error_text": text}, _empty_state(), _mock_catalog())
++    assert result.data["error_code"] == "unknown_node_type"
++    guidance = generation.explain_validation_code("unknown_node_type")
++    assert guidance is not None
++    assert result.data["explanation"] == guidance[0]
++    assert result.data["suggested_fix"] == guidance[1] + " Expected a declared node kind."
++
++
++def test_fuzzy_match_retains_expected_hint() -> None:
++    result = execute_tool(
++        "explain_validation_error",
++        {"error_text": "LOG UNKNOWN_NODE_TYPE END. Expected a declared node kind."},
++        _empty_state(),
++        _mock_catalog(),
++    )
++    guidance = generation.explain_validation_code("unknown_node_type")
++    assert guidance is not None
++    assert result.data["error_code"] == "unknown_node_type"
++    assert result.data["suggested_fix"] == guidance[1] + " Expected a declared node kind."
+ 
+ 
+ def test_public_noisy_code_preserves_legacy_seed_precedence() -> None:

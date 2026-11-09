@@ -1,0 +1,7 @@
+entries:
+- path: src/elspeth/x.py
+  qualname: f
+  kind: getattr
+  occurrences: 0
+  classification: unadjudicated
+  justification: bad

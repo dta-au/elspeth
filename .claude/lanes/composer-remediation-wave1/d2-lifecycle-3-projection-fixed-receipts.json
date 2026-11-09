@@ -1,0 +1,86 @@
+[
+  {
+    "name": "before",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/bin/python",
+      "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/freeze_tree.py",
+      "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-projection-fixed-before.json"
+    ],
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src:/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/elspeth-lints/src",
+    "returncode": 0,
+    "elapsed_seconds": 0.6160067639939371
+  },
+  {
+    "name": "pytest",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/bin/python",
+      "-m",
+      "pytest",
+      "tests/unit/composer_mcp/test_standalone_lifecycle.py::test_public_executable_real_preview_paths_and_eof",
+      "-n",
+      "0",
+      "-o",
+      "pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src /workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/elspeth-lints/src",
+      "--basetemp=/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-projection-fixed-pytest",
+      "--junitxml=/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-projection.xml"
+    ],
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src:/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/elspeth-lints/src",
+    "returncode": 0,
+    "elapsed_seconds": 11.812819359001878
+  },
+  {
+    "name": "ruff",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/bin/python",
+      "-m",
+      "ruff",
+      "check",
+      "tests/helpers/composer_stdio_probe.py"
+    ],
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src:/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/elspeth-lints/src",
+    "returncode": 0,
+    "elapsed_seconds": 0.03562574600073276
+  },
+  {
+    "name": "format",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/bin/python",
+      "-m",
+      "ruff",
+      "format",
+      "--check",
+      "tests/helpers/composer_stdio_probe.py"
+    ],
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src:/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/elspeth-lints/src",
+    "returncode": 0,
+    "elapsed_seconds": 0.03242337099800352
+  },
+  {
+    "name": "whitespace",
+    "command": [
+      "git",
+      "diff",
+      "--check"
+    ],
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src:/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/elspeth-lints/src",
+    "returncode": 0,
+    "elapsed_seconds": 0.016159824997885153
+  },
+  {
+    "name": "after",
+    "command": [
+      "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/.venv/bin/python",
+      "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-checks/freeze_tree.py",
+      "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-lifecycle-3-projection-fixed-after.json"
+    ],
+    "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle",
+    "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/src:/workspace/elspeth/.claude/worktrees/composer-remediation-mcp-lifecycle/elspeth-lints/src",
+    "returncode": 0,
+    "elapsed_seconds": 0.7192305310018128
+  }
+]

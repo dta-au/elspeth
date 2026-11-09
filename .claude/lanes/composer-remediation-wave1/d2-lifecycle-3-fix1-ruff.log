@@ -1,0 +1,17 @@
+SIM105 Use `contextlib.suppress(BrokenPipeError)` instead of `try`-`except`-`pass`
+   --> tests/helpers/composer_stdio_ownership_probe.py:112:13
+    |
+110 |               # Closing a buffered writer after the successful loss-of-reader
+111 |               # observation can itself report the same expected broken pipe.
+112 | /             try:
+113 | |                 process.stdin.close()
+114 | |             except BrokenPipeError:
+115 | |                 pass
+    | |____________________^
+116 |               status = process.wait(timeout=8)
+117 |               reader.join(timeout=2)
+    |
+help: Replace `try`-`except`-`pass` with `with contextlib.suppress(BrokenPipeError): ...`
+
+Found 1 error.
+No fixes available (1 hidden fix can be enabled with the `--unsafe-fixes` option).

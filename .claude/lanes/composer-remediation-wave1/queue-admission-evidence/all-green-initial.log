@@ -1,0 +1,688 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-queue-admission
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 122 items
+
+tests/unit/web/composer/test_queue_scope_admission.py ..FF..FF..FF..FF.. [ 14%]
+FF..FF..FF..FF..FF..FF..FF..FF..FF..FF..FF..FF.......................... [ 73%]
+..........                                                               [ 81%]
+tests/unit/web/composer/test_queue_scope_approval.py .....               [ 86%]
+tests/unit/composer_mcp/test_queue_scope_admission.py ............       [ 95%]
+tests/unit/web/sessions/routes/composer/test_proposal_accept_terminal_refusal.py . [ 96%]
+....                                                                     [100%]
+
+=================================== FAILURES ===================================
+_ test_scope_refusal_preserves_full_private_saved_state[override0-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': 'document_pages'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override0-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': 'document_pages'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override1-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_opener': 'expand_rows'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override1-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_opener': 'expand_rows'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override2-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override2-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override3-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override3-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override4-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override4-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override5-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override5-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override6-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override6-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override7-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_opener': 'expand_rows', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override7-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_opener': 'expand_rows', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override8-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_opener': 'expand_rows', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override8-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_opener': 'expand_rows', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override9-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override9-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows', 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override10-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override10-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_opener': 'expand_rows', 'scope_policy': 'best_effort'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override11-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_opener': None, 'scope_policy': None}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override11-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': 'document_pages', 'scope_opener': None, 'scope_policy': None}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override12-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': None, 'scope_opener': 'expand_rows', 'scope_policy': None}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override12-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': None, 'scope_opener': 'expand_rows', 'scope_policy': None}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override13-True-handler] _
+
+surface = 'handler', existing_queue = True
+override = {'scope_name': None, 'scope_opener': None, 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override13-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True
+override = {'scope_name': None, 'scope_opener': None, 'scope_policy': 'require_all'}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override14-True-handler] _
+
+surface = 'handler', existing_queue = True, override = {'scope_name': ''}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override14-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True, override = {'scope_name': ''}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override15-True-handler] _
+
+surface = 'handler', existing_queue = True, override = {'scope_opener': ''}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+_ test_scope_refusal_preserves_full_private_saved_state[override15-True-dispatch] _
+
+surface = 'dispatch', existing_queue = True, override = {'scope_opener': ''}
+
+    @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+    @pytest.mark.parametrize("existing_queue", [False, True])
+    @pytest.mark.parametrize("override", SCOPE_CASES)
+    def test_scope_refusal_preserves_full_private_saved_state(
+        surface: Literal["handler", "dispatch"],
+        existing_queue: bool,
+        override: dict[str, Any],
+    ) -> None:
+        state = _saved_state()
+        if existing_queue:
+>           state = replace(state, nodes=(*state.nodes, NodeSpec(**QUEUE, options={"description": "Keep this queue"})))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           TypeError: NodeSpec.__init__() missing 9 required positional arguments: 'plugin', 'on_success', 'on_error', 'condition', 'routes', 'fork_to', 'branches', 'policy', and 'merge'
+
+tests/unit/web/composer/test_queue_scope_admission.py:92: TypeError
+=========================== short test summary info ============================
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override0-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override0-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override1-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override1-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override2-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override2-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override3-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override3-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override4-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override4-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override5-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override5-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override6-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override6-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override7-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override7-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override8-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override8-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override9-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override9-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override10-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override10-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override11-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override11-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override12-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override12-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override13-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override13-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override14-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override14-True-dispatch]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override15-True-handler]
+FAILED tests/unit/web/composer/test_queue_scope_admission.py::test_scope_refusal_preserves_full_private_saved_state[override15-True-dispatch]
+======================== 32 failed, 90 passed in 30.92s ========================

@@ -1,0 +1,7 @@
+{
+  "supervisor_alive_before": true,
+  "supervisor_alive_after": true,
+  "stdout_eof_while_alive": true,
+  "stdin_reader_gone_while_alive": true,
+  "inherited_echo": "pong"
+}

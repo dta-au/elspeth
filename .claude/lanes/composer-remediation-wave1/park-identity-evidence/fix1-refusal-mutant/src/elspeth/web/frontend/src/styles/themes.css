@@ -1,0 +1,134 @@
+/* themes.css — High-contrast and forced-colors overrides.
+   Contains @media (prefers-contrast: more) and @media (forced-colors: active)
+   blocks that override .type-badge*, .status-badge*, .validation-banner-*,
+   .alert-banner, .tutorial-graph-*, .tutorial-progress-* etc.
+   MUST be imported LAST in styles/index.css — these rules override selectors
+   defined in every other file. */
+
+
+/* ---------------------------------------------------------------------------
+   High Contrast — respect OS-level contrast preferences
+   --------------------------------------------------------------------------- */
+@media (prefers-contrast: more) {
+  :root {
+    --color-text:           #ffffff;
+    --color-text-secondary: #b0d8d8;
+    --color-text-muted:     #96c0c0;
+    --color-border:         rgba(143, 200, 200, 0.30);
+    --color-border-strong:  rgba(143, 200, 200, 0.50);
+  }
+
+  [data-theme="light"] {
+    --color-text:           #000000;
+    --color-text-secondary: #1a3a44;
+    --color-text-muted:     #2a4a54;
+    --color-border:         rgba(15, 45, 53, 0.30);
+    --color-border-strong:  rgba(15, 45, 53, 0.50);
+  }
+
+  .type-badge {
+    border-width: 2px;
+  }
+
+  :focus-visible {
+    outline-width: 3px;
+  }
+}
+
+@media (forced-colors: active) {
+  .validation-banner-pass,
+  .validation-banner-fail,
+  .alert-banner {
+    border: 2px solid CanvasText;
+    forced-color-adjust: none;
+  }
+
+  .type-badge-source,
+  .type-badge-transform,
+  .type-badge-gate,
+  .type-badge-sink,
+  .type-badge-aggregation,
+  .type-badge-coalesce,
+  .type-badge-row_union,
+  .type-badge-queue {
+    border-width: 2px;
+    border-color: ButtonText;
+    background-color: Canvas;
+    color: ButtonText;
+  }
+
+  .react-flow__edge-path {
+    stroke: ButtonText;
+  }
+
+  /* Workspace pane toggles (collapse/restore, 2026-08-15 recut): bare-variant
+     icon buttons whose only chrome is a translucent border on a transparent
+     fill — exactly the shape that can wash out under a system palette.
+     Explicit system-color border/glyph for parity with every other stateful
+     control in this block. */
+  .workspace-pane-toggle {
+    border-color: ButtonText;
+    color: ButtonText;
+  }
+
+  :focus-visible {
+    outline: 2px solid Highlight;
+  }
+
+  .yaml-toolbar-btn[data-copied="true"] {
+    border: 2px solid Highlight;
+  }
+
+  /* First-run tutorial — high-contrast fallbacks. Without these the
+     graph nodes render borderless, the active progress dot is
+     indistinguishable from inactive dots, and the indeterminate
+     progress bar disappears into the surface. */
+  .tutorial-graph-node {
+    border: 1px solid CanvasText;
+    forced-color-adjust: none;
+  }
+
+  .tutorial-graph-chevron {
+    color: CanvasText;
+  }
+
+  .tutorial-progress-dot {
+    border: 1px solid CanvasText;
+  }
+
+  /* elspeth-44dc95153e: without this, completed and upcoming steps render
+     identically for the users with no colour cue — reintroducing the exact
+     defect the --complete class split was written to fix (tutorial.css:659).
+     Filled CanvasText (reached) vs Highlight (current) vs Canvas (upcoming)
+     gives three distinguishable states without colour.
+     Source order mirrors tutorial.css (--complete, then --active): the two
+     classes are mutually exclusive today (HelloWorldTutorial.tsx:386-392 is a
+     ternary), but they carry equal specificity, so if a dot ever gained both
+     the CURRENT step must keep Highlight rather than reading as completed. */
+  .tutorial-progress-dot--complete {
+    background: CanvasText;
+  }
+
+  .tutorial-progress-dot--active {
+    background: Highlight;
+  }
+
+  .tutorial-progress-bar {
+    border: 1px solid CanvasText;
+  }
+
+  .tutorial-progress-bar::after {
+    background: Highlight;
+  }
+
+
+  /* People & access tabs — forced-colors paints a transparent border, so
+     every tab would carry the selected tab's underline. */
+  .identity-admin-tab {
+    border-bottom-color: Canvas;
+  }
+
+  .identity-admin-tab[aria-selected="true"] {
+    border-bottom-color: Highlight;
+  }
+}

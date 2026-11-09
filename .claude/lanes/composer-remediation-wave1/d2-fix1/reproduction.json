@@ -1,0 +1,24 @@
+[
+  {
+    "component": "source",
+    "path_allowlist": [
+      true
+    ],
+    "resolved_path": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s5/outside.csv",
+    "outside": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s5/outside.csv",
+    "plugin_setup_reached": true,
+    "outside_bytes_unchanged": true,
+    "preflight_is_valid": true
+  },
+  {
+    "component": "output",
+    "path_allowlist": [
+      true
+    ],
+    "resolved_path": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s7/outside.csv",
+    "outside": "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d2-fix1/red-handlers-tmp/test_loaded_legacy_null_path_s7/outside.csv",
+    "plugin_setup_reached": true,
+    "outside_bytes_unchanged": true,
+    "preflight_is_valid": true
+  }
+]

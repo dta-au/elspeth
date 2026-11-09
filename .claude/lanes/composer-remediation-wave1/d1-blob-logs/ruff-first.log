@@ -1,0 +1,24 @@
+RUF059 Unpacked variable `service` is never used
+   --> tests/testcontainer/web/test_blob_mutation_admission_postgres.py:128:17
+    |
+126 | @pytest.mark.parametrize("race", ["expiry", "metadata"])
+127 | def test_postgres_admission_releases_sessions_during_file_io_and_rechecks(pg_fenced, tmp_path, monkeypatch, race):
+128 |     repository, service, record, context, recorder, _url = _setup(pg_fenced, tmp_path)
+    |                 ^^^^^^^
+129 |     entered, resume = Event(), Event()
+130 |     original = BlobReplacementCoordinator._read_bytes
+    |
+help: Prefix it with an underscore or any other dummy variable pattern
+
+RUF059 Unpacked variable `repository` is never used
+   --> tests/testcontainer/web/test_blob_mutation_admission_postgres.py:162:5
+    |
+161 | def test_postgres_admission_waiting_on_container_sees_committed_output_reservation(pg_fenced, tmp_path):
+162 |     repository, _service, record, context, recorder, url = _setup(pg_fenced, tmp_path)
+    |     ^^^^^^^^^^
+163 |     from tests.fixtures.identities import ensure_test_identity
+    |
+help: Prefix it with an underscore or any other dummy variable pattern
+
+Found 12 errors (10 fixed, 2 remaining).
+No fixes available (2 hidden fixes can be enabled with the `--unsafe-fixes` option).

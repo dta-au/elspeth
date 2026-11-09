@@ -1,0 +1,7 @@
+before 0
+pytest 0
+ruff 0
+format 0
+whitespace 0
+after 0
+{'frozen': True, 'changed_since_600': ['tests/helpers/composer_stdio_probe.py', 'tests/unit/composer_mcp/test_standalone_lifecycle.py'], 'production_unchanged': True}

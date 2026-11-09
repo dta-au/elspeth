@@ -1,0 +1,2540 @@
+[
+  {
+    "outcome": "NoneType",
+    "proposals": [
+      {
+        "id": "7b8fc95d-a057-4a90-a28b-eaec6e639447",
+        "status": "pending",
+        "tool_call_id": "call_valid_attempt_0",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "27e874a5-75a9-46be-8fa3-d4f1dae308a2",
+        "status": "pending",
+        "tool_call_id": "call_valid_attempt_1",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "86bbf300-c9f4-48ea-83ad-d00a4684a39e",
+        "status": "pending",
+        "tool_call_id": "call_valid_attempt_2",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "94f28d37-a65f-47e4-b2a7-a5cfc23acd2c",
+        "status": "pending",
+        "tool_call_id": "call_valid_attempt_3",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "1ac8ade9-8be1-44de-9a49-816860334092",
+        "status": "pending",
+        "tool_call_id": "call_valid_attempt_4",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "70e5fac8-ff73-4d3b-bdb0-bfeb18f9fe36",
+        "status": "pending",
+        "tool_call_id": "call_valid_attempt_5",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "3d821581-a30d-4c72-94a7-f7a8278b9b8f",
+        "status": "pending",
+        "tool_call_id": "call_valid_attempt_6",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "39447dbc-940c-404a-a3ab-3e23cba30068",
+        "status": "pending",
+        "tool_call_id": "call_valid_attempt_7",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "6f150232-0c1f-4760-b520-e15b9ebd56ce",
+        "status": "pending",
+        "tool_call_id": "call_valid_attempt_8",
+        "tool_name": "set_metadata"
+      }
+    ],
+    "provider_feedback": [
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "7b8fc95d-a057-4a90-a28b-eaec6e639447",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_0"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "27e874a5-75a9-46be-8fa3-d4f1dae308a2",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_1"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "86bbf300-c9f4-48ea-83ad-d00a4684a39e",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_2"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "94f28d37-a65f-47e4-b2a7-a5cfc23acd2c",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_3"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "1ac8ade9-8be1-44de-9a49-816860334092",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_4"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "70e5fac8-ff73-4d3b-bdb0-bfeb18f9fe36",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_5"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "3d821581-a30d-4c72-94a7-f7a8278b9b8f",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_6"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "39447dbc-940c-404a-a3ab-3e23cba30068",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_7"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "6f150232-0c1f-4760-b520-e15b9ebd56ce",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_8"
+      },
+      {
+        "payload": {
+          "error": "Tool 'set_metadata' missing required argument(s): patch"
+        },
+        "tool_call_id": "call_schema_invalid_attempt"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "applied": false,
+            "candidate_version": 2,
+            "message": "The candidate pipeline failed prevalidation, was not applied, and was not submitted for approval. Repair the reported validation errors and retry.",
+            "status": "PREVALIDATION_REJECTED"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              },
+              {
+                "component": "source",
+                "error_code": "source_on_success_dangling",
+                "message": "Source on_success 'rows' is neither a sink nor a known connection.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": [
+              {
+                "component": "source",
+                "message": "Source on_success 'rows' does not match any node input or output \u2014 data may not flow.",
+                "severity": "medium"
+              }
+            ]
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_semantic_invalid_attempt"
+      }
+    ],
+    "session_id": "b91f4b9e-a59c-4e91-8593-c7f303e56710",
+    "stored_feedback": [
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_0"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_1"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_2"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_3"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_4"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_5"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_6"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_7"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_valid_attempt_8"
+      },
+      {
+        "payload": {
+          "_redaction_status": "arg_error",
+          "error_category": "missing_required_path",
+          "error_class": "ToolArgumentError",
+          "error_message": "<redacted-arg-error-message>"
+        },
+        "tool_call_id": "call_schema_invalid_attempt"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": "<redacted-response-mapping>",
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "source_on_success_dangling",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": null,
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "medium"
+              }
+            ]
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_semantic_invalid_attempt"
+      }
+    ]
+  },
+  {
+    "outcome": "NoneType",
+    "proposals": [
+      {
+        "id": "6cf2c85a-cfe9-4b72-bd9c-131ec398359e",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_0",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "025fc5fe-5de6-476c-8279-003af24fa4af",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_1",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "c1e0f602-6a56-4bc7-a9a0-071c5fde0e7b",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_2",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "74557580-7733-425b-8a83-956b7e05f58f",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_3",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "d5d367c4-2d01-43df-9428-1b3190804048",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_4",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "1962c42f-9b5f-4b10-9e1f-d4b37ec11ccd",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_5",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "45f90856-7c04-4dab-a960-44ba0f05501d",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_6",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "ff3e5a06-fef2-4aa3-bf7a-d29512335e43",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_7",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "79111faf-a524-4726-8647-d061bcdd9527",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_8",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "83a56135-914a-413f-9367-18ce923e6eb6",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_9",
+        "tool_name": "set_metadata"
+      }
+    ],
+    "provider_feedback": [
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "6cf2c85a-cfe9-4b72-bd9c-131ec398359e",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_0"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "025fc5fe-5de6-476c-8279-003af24fa4af",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_1"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "c1e0f602-6a56-4bc7-a9a0-071c5fde0e7b",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_2"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "74557580-7733-425b-8a83-956b7e05f58f",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_3"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "d5d367c4-2d01-43df-9428-1b3190804048",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_4"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "1962c42f-9b5f-4b10-9e1f-d4b37ec11ccd",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_5"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "45f90856-7c04-4dab-a960-44ba0f05501d",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_6"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "ff3e5a06-fef2-4aa3-bf7a-d29512335e43",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_7"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "79111faf-a524-4726-8647-d061bcdd9527",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_8"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "83a56135-914a-413f-9367-18ce923e6eb6",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_9"
+      },
+      {
+        "payload": {
+          "error": "Tool 'delete_blob' missing required argument(s): blob_id"
+        },
+        "tool_call_id": "call_approval_required_blob_only"
+      }
+    ],
+    "session_id": "04bb2a9c-ea5e-4e01-bdbf-434ef3b95214",
+    "stored_feedback": [
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_0"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_1"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_2"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_3"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_4"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_5"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_6"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_7"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_8"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_9"
+      },
+      {
+        "payload": {
+          "_redaction_status": "arg_error",
+          "error_category": "missing_required_path",
+          "error_class": "ToolArgumentError",
+          "error_message": "<redacted-arg-error-message>"
+        },
+        "tool_call_id": "call_approval_required_blob_only"
+      }
+    ]
+  },
+  {
+    "outcome": "NoneType",
+    "proposals": [
+      {
+        "id": "9e2e3db7-b9aa-4401-93fc-8e0fa6808b8e",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_0",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "c960d543-92c0-43f3-bcea-8dc0de7bcbf2",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_1",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "5b0d6be7-83ee-4504-92cf-bed26d9cd93c",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_2",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "34034132-8ada-4fe7-9df7-add8509a2bb4",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_3",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "026e078d-2c26-41f9-8e49-8586ed9cfdd0",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_4",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "c5cad27c-c62b-4d9a-9a17-578bdcf2359f",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_5",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "ef2907b0-0b5f-41ff-a3fd-6e109735468f",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_6",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "fc55ece4-7210-476f-864f-b01284b01117",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_7",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "0a983c91-63df-4306-b361-531d5d764c6d",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_8",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "bed93816-db6a-4d9b-a33a-30f7a2428a9b",
+        "status": "pending",
+        "tool_call_id": "call_approval_required_blob_only",
+        "tool_name": "delete_blob"
+      }
+    ],
+    "provider_feedback": [
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "9e2e3db7-b9aa-4401-93fc-8e0fa6808b8e",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_0"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "c960d543-92c0-43f3-bcea-8dc0de7bcbf2",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_1"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "5b0d6be7-83ee-4504-92cf-bed26d9cd93c",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_2"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "34034132-8ada-4fe7-9df7-add8509a2bb4",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_3"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "026e078d-2c26-41f9-8e49-8586ed9cfdd0",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_4"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "c5cad27c-c62b-4d9a-9a17-578bdcf2359f",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_5"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "ef2907b0-0b5f-41ff-a3fd-6e109735468f",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_6"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "fc55ece4-7210-476f-864f-b01284b01117",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_7"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "0a983c91-63df-4306-b361-531d5d764c6d",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Apply composer tool set_metadata.",
+            "tool_name": "set_metadata"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_8"
+      },
+      {
+        "payload": {
+          "affected_nodes": [],
+          "data": {
+            "message": "The requested pipeline change is pending human approval and has not been applied.",
+            "proposal_id": "bed93816-db6a-4d9b-a33a-30f7a2428a9b",
+            "status": "APPROVAL_REQUIRED",
+            "summary": "Delete session file \"b781fe9d-6808-4461-ab01-bed1d86955ed\".",
+            "tool_name": "delete_blob"
+          },
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "component": "source",
+                "error_code": "no_source_configured",
+                "message": "No source configured.",
+                "severity": "high"
+              },
+              {
+                "component": "pipeline",
+                "error_code": "no_sinks_configured",
+                "message": "No sinks configured.",
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_approval_required_blob_only"
+      }
+    ],
+    "session_id": "5dbc7b1f-c35b-4f77-a975-9783c6d4c0de",
+    "stored_feedback": [
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_0"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_1"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_2"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_3"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_4"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_5"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_6"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_7"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_blob_boundary_proposal_8"
+      },
+      {
+        "payload": {
+          "_unknown_response": "<redacted-unknown-response-key>",
+          "affected_nodes": [],
+          "success": true,
+          "validation": {
+            "errors": [
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_source_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              },
+              {
+                "coalesce_union_type": null,
+                "component": "<redacted-response-text>",
+                "contract": null,
+                "error_code": "no_sinks_configured",
+                "message": "<redacted-response-text>",
+                "rejected_component": null,
+                "row_union_schema": null,
+                "severity": "high"
+              }
+            ],
+            "graph_repair_suggestions": [],
+            "is_valid": false,
+            "semantic_contracts": [],
+            "suggestions": [],
+            "warnings": []
+          },
+          "version": 1
+        },
+        "tool_call_id": "call_approval_required_blob_only"
+      }
+    ]
+  },
+  {
+    "outcome": "ComposerConvergenceError",
+    "proposals": [
+      {
+        "id": "ae266bfb-9916-43f3-8863-6be87a3da0db",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_0",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "221424d6-c178-4b1e-a9bd-af2be09ed704",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_1",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "f8b90254-7618-45b4-b56f-994fafdfe9df",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_2",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "8790d1e6-3cec-4c22-bff7-f992f1c28994",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_3",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "f3d11362-f21b-4e4e-bee9-120d725146be",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_4",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "f82a084e-6e7b-49b2-a7a7-812b2ac0a55a",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_5",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "9abb4f15-42c8-47b9-a7f1-92ab76d88ea3",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_6",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "63fe13b9-fef1-4605-a168-8a2f636235f4",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_7",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "7b26eeba-f626-455b-99bb-3d0d7139e6ee",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_8",
+        "tool_name": "set_metadata"
+      },
+      {
+        "id": "85b39506-1255-4901-98a9-2f8e53a4e2f7",
+        "status": "pending",
+        "tool_call_id": "call_blob_boundary_proposal_9",
+        "tool_name": "set_metadata"
+      }
+    ],
+    "provider_feedback": [],
+    "session_id": "f9b4d0ea-01fe-4e07-b3d7-a5370e366600",
+    "stored_feedback": []
+  }
+]

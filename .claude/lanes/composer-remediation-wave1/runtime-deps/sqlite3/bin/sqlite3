@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+sqlite_root="$(CDPATH= cd -- "$(dirname -- "$0")/../root" && pwd)"
+LD_LIBRARY_PATH="$sqlite_root/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$sqlite_root/usr/bin/sqlite3" "$@"

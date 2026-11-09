@@ -1,0 +1,90 @@
+mode=operation_kind; repository=/workspace/elspeth/.claude/worktrees/composer-remediation-wave1/src/elspeth/web/coordination/repository.py; no checkout edits
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.0.3, pluggy-1.6.0
+benchmark: 4.0.0 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /workspace/elspeth/.claude/worktrees/composer-remediation-wave1
+configfile: pyproject.toml
+plugins: anyio-4.14.2, elspeth-0.8.9, hypothesis-6.152.4, asyncio-1.3.0, benchmark-4.0.0, cov-7.1.0, dotenv-0.5.2, timeout-2.4.0, xdist-3.8.0, respx-0.23.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 1 item
+
+tests/unit/web/blobs/test_mutation_admission.py F                        [100%]
+
+=================================== FAILURES ===================================
+_ test_admission_requires_exact_live_mutation_authority_before_reading_files[execute-update_blob] _
+
+blob_service = <elspeth.web.blobs.service.BlobServiceImpl object at 0x7f6ec5c0bda0>
+db_engine = Engine(sqlite:///:memory:)
+session_id = UUID('a8997c96-b25e-4c25-b916-9ac439350d9c')
+compose_context = SessionOperationContext(fence=SessionOperationFence(session_id='a8997c96-b25e-4c25-b916-9ac439350d9c', operation_id='8...token='a3ba9e28f3e14cf691cdb8f748a359a8', operation_epoch=2), operation_kind=<SessionOperationKind.COMPOSE: 'compose'>)
+tmp_path = PosixPath('/tmp/pytest-of-agent/pytest-85/test_admission_requires_exact_0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f6ec5dbda00>
+tool_name = 'update_blob', fence = 'execute'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_name", ["update_blob", "delete_blob"])
+    @pytest.mark.parametrize("fence", ["create", "blob_read", "execute", "session_fork", "expired", "released", "forged", "foreign"])
+    async def test_admission_requires_exact_live_mutation_authority_before_reading_files(
+        blob_service, db_engine, session_id, compose_context, tmp_path, monkeypatch, tool_name, fence
+    ):
+        record = await blob_service.create_blob(session_id, "authority.csv", b"old", "text/csv", session_operation_context=compose_context)
+        authority = blob_service._session_operation_authority
+        operation = compose_context
+        if fence == "blob_read":
+            operation = authority.acquire(
+                session_id=session_id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="admission-reader", lease_seconds=60
+            )
+        elif fence in {"create", "execute", "session_fork"}:
+            operation = seed_live_operation_context(db_engine, session_id, operation_kind=SessionOperationKind(fence))
+        elif fence == "released":
+            authority.release(operation)
+        elif fence == "expired":
+            with db_engine.begin() as connection:
+                connection.execute(update(session_operation_fences_table).values(lease_expires_at=datetime.now(UTC) - timedelta(hours=1)))
+        elif fence == "forged":
+            operation = replace(operation, fence=replace(operation.fence, lease_token="forged-token"))
+        context = _context(blob_service, db_engine, operation, tmp_path)
+        if fence == "foreign":
+            context = replace(context, session_id=str(uuid4()))
+        before = _resources(db_engine, tmp_path)
+    
+        def forbidden_read(*args, **kwargs):
+            pytest.fail("invalid authority reached filesystem content")
+    
+        with monkeypatch.context() as guards:
+            guards.setattr(BlobReplacementCoordinator, "_read_bytes", forbidden_read)
+            guards.setattr(BlobServiceImpl, "_read_deletion_content", forbidden_read)
+            with pytest.raises(SessionOperationFenceLost if fence in {"expired", "released", "forged"} else AuditIntegrityError):
+>               blobs.admit_blob_mutation(
+                    tool_name,
+                    {"blob_id": str(record.id), **({"content": "new"} if tool_name == "update_blob" else {})},
+                    _empty_state(),
+                    context,
+                )
+
+tests/unit/web/blobs/test_mutation_admission.py:500: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/elspeth/web/composer/tools/blobs.py:1818: in admit_blob_mutation
+    driver._require_canonical_replacement_content(expected, directory_fd)
+src/elspeth/web/blobs/replacement.py:142: in _require_canonical_replacement_content
+    old_data = self._read_bytes(storage, directory_fd)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+args = (<elspeth.web.blobs.replacement.BlobReplacementCoordinator object at 0x7f6ec5bb7950>, PosixPath('/tmp/pytest-of-agent/...osixPath('/tmp/pytest-of-agent/pytest-85/test_admission_requires_exact_0/blobs/a8997c96-b25e-4c25-b916-9ac439350d9c')))
+kwargs = {}
+
+    def forbidden_read(*args, **kwargs):
+>       pytest.fail("invalid authority reached filesystem content")
+E       Failed: invalid authority reached filesystem content
+
+tests/unit/web/blobs/test_mutation_admission.py:494: Failed
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/_pytest/config/__init__.py:1309
+  /workspace/elspeth/.claude/worktrees/composer-remediation-wave1/.venv/lib/python3.12/site-packages/_pytest/config/__init__.py:1309: PytestAssertRewriteWarning: Module already imported so cannot be rewritten; anyio
+    self._mark_plugins_for_rewrite(hook, disable_autoload)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/unit/web/blobs/test_mutation_admission.py::test_admission_requires_exact_live_mutation_authority_before_reading_files[execute-update_blob]
+========================= 1 failed, 1 warning in 0.51s =========================

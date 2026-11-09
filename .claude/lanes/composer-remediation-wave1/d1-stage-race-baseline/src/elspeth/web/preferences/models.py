@@ -1,0 +1,141 @@
+"""Pydantic models for the composer-preferences API.
+
+``ComposerPreferences`` is the full response payload for GET; it is also the
+response for PATCH (the service returns the post-write state). The PATCH
+request body is ``UpdateComposerPreferencesRequest``, which is a partial
+form where each field is independently optional.
+
+``ComposerPreferences`` (response, server-built) uses
+``ConfigDict(strict=True, extra="forbid")``. ``strict=True`` is safe on
+the server side because the datetime fields are always real ``datetime``
+instances at construction.
+
+``UpdateComposerPreferencesRequest`` (request, JSON-bound) uses
+``ConfigDict(extra="forbid")`` only — same pattern as
+``blobs/schemas.py::CreateInlineBlobRequest``. ``strict=True`` on a
+request body with a ``datetime`` field would reject the standard JSON
+ISO-8601 string representation (Pydantic v2 strict mode rejects
+string→datetime coercion entirely), which is too aggressive for a
+Tier-3 boundary whose contract is "validate, coerce where the standard
+wire format permits, never fabricate".
+
+The Composer has one authoring surface, freeform, so preferences carry no
+mode selector. ``extra="forbid"`` rejects retired mode-setting requests.
+
+Separately from the permitted-VALUES covenant above, the FIELD SET of
+``ComposerPreferences`` is itself a closed cross-language contract. The
+decoder's ``KEYS`` tuple rejects a missing key and an unexpected key
+alike, so adding or removing a field here without editing ``KEYS``
+breaks every preferences GET at runtime while CI stays green. That axis
+is gated executably by
+``tests/unit/web/composer/test_preferences_decoder_parity.py`` rather
+than by this comment, so a field change fails pytest instead of failing
+at the user.
+"""
+
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, model_validator
+
+# First-run tutorial resume stage (elspeth-918f4434b3). Mirrors the frontend
+# ``TutorialStep`` union (tutorialMachine.ts) minus ``"welcome"`` — the
+# Welcome bookend is never persisted (nothing has started; ``None`` is the
+# no-in-progress-tutorial state). Extending this set requires updating the
+# Literal here, the ``ck_user_preferences_tutorial_stage`` CHECK in
+# ``sessions/models.py``, the Tier-1 read guard in
+# ``PreferencesService._row_to_prefs``, and the ``STAGES`` Record in the
+# frontend's ``api/preferencesDecoder.ts`` in lockstep — same rule, and the
+# same four sites. The decoder fails closed on an
+# unlisted stage, so adding a value here without it makes the frontend reject
+# a payload the server considers valid.
+TutorialStage = Literal["build", "run", "audit", "graduation"]
+
+
+class ComposerPreferences(BaseModel):
+    """The full preferences payload returned by GET and PATCH.
+
+    ``updated_at`` is nullable (Panel U1): when no DB row exists for the
+    user, the response payload represents the in-server *default* — there
+    has been no write event to associate a timestamp with, and fabricating
+    ``self._now()`` here would put a value in the audit-visible field that
+    the system never actually wrote: absence is evidence, and a fabricated
+    timestamp is indistinguishable from a recorded one. The no-row GET path
+    and the empty-PATCH-on-no-row path both return ``updated_at=None``;
+    every other response returns the real write time.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    freeform_intro_dismissed_at: datetime | None
+    tutorial_completed_at: datetime | None
+    # In-progress tutorial resume state. All four are NULL when no tutorial
+    # is in progress. ``tutorial_run_id`` / ``tutorial_source_data_hash``
+    # are recorded once the tutorial run completes so the audit step can
+    # resume without re-executing the pipeline.
+    tutorial_stage: TutorialStage | None
+    tutorial_session_id: str | None
+    tutorial_run_id: str | None
+    tutorial_source_data_hash: str | None
+    # Detail level (elspeth-9c11df65f8): True shows engineer/auditor detail
+    # the standard view keeps behind summaries.
+    show_advanced: bool
+    updated_at: datetime | None
+
+
+class UpdateComposerPreferencesRequest(BaseModel):
+    """Partial-update payload for PATCH.
+
+    Fields are optional except for the coupled completion intent;
+    the service writes only the
+    fields the caller actually set. An empty PATCH is a no-op (the
+    request succeeds; ``updated_at`` is bumped if any row already
+    exists; if no row exists, none is created — see PreferencesService
+    Panel C2 guard for the no-insert contract).
+
+    ``tutorial_completed_at`` semantics:
+
+      - Field absent from JSON → unchanged.
+      - JSON ``null`` → clear/reset the tutorial completion gate.
+      - ISO-8601 datetime string → set to that value; requires an explicit
+        ``tutorial_completed_via``.
+
+    This field uses ``model_fields_set`` in the service so the reset
+    affordance can distinguish "not mentioned" from "clear it".
+
+    Tutorial resume fields (``tutorial_stage`` / ``tutorial_session_id`` /
+    ``tutorial_run_id`` / ``tutorial_source_data_hash``) follow the same
+    absent-vs-explicit-null discrimination via ``model_fields_set``. They
+    interact with ``tutorial_completed_at`` through the service's
+    completion-clears-progress rule: a PATCH that sets OR clears
+    ``tutorial_completed_at`` clears resume state and rejects populated
+    resume fields in the same request, because completing (or resetting for a retake — the e2e
+    harness recipe) terminates any in-progress tutorial. See
+    ``PreferencesService.update_composer_preferences``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    freeform_intro_dismissed_at: datetime | None = None
+    tutorial_completed_at: datetime | None = None
+    tutorial_stage: TutorialStage | None = None
+    tutorial_session_id: str | None = None
+    tutorial_run_id: str | None = None
+    tutorial_source_data_hash: str | None = None
+    show_advanced: bool | None = None
+    # Request-only completion intent.
+    tutorial_completed_via: Literal["complete", "skip", "exit"] | None = None
+
+    @model_validator(mode="after")
+    def _via_requires_completion_write(self) -> "UpdateComposerPreferencesRequest":
+        if "tutorial_completed_at" in self.model_fields_set and any(
+            value is not None
+            for value in (self.tutorial_stage, self.tutorial_session_id, self.tutorial_run_id, self.tutorial_source_data_hash)
+        ):
+            raise ValueError("tutorial completion or reset cannot include populated progress fields")
+        if self.tutorial_completed_at is not None:
+            if self.tutorial_completed_via is None:
+                raise ValueError("tutorial_completed_at requires tutorial_completed_via")
+        elif "tutorial_completed_via" in self.model_fields_set:
+            raise ValueError("tutorial_completed_via requires a non-null tutorial_completed_at in the same PATCH")
+        return self

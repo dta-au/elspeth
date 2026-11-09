@@ -1,0 +1,562 @@
+"""Multi-query LLM support — query specifications and resolution.
+
+Provides QuerySpec (named variable mapping) and resolve_queries() for
+multi-query LLM transforms. Output field configuration (OutputFieldConfig,
+ResponseFormat) used by both single and multi-query modes.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import InitVar, dataclass, field
+from enum import StrEnum
+from types import MappingProxyType
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.plugins.infrastructure.config_base import PluginConfig
+from elspeth.plugins.infrastructure.templates import RowProjection, TemplateError, TemplateRow
+from elspeth.plugins.transforms.llm.templates import PromptTemplate
+
+
+class OutputFieldType(StrEnum):
+    """Supported types for structured output fields."""
+
+    STRING = "string"
+    INTEGER = "integer"
+    NUMBER = "number"
+    BOOLEAN = "boolean"
+    ENUM = "enum"
+
+
+class ResponseFormat(StrEnum):
+    """LLM response format modes.
+
+    - STANDARD: Uses {"type": "json_object"} - model outputs JSON but no schema enforcement
+    - STRUCTURED: Uses {"type": "json_schema", ...} - API enforces exact schema compliance
+    """
+
+    STANDARD = "standard"
+    STRUCTURED = "structured"
+
+
+class QueryInputMode(StrEnum):
+    """Whether explicit bindings can consume previously validated query outputs."""
+
+    UPSTREAM = "upstream"
+    ORDERED = "ordered"
+
+
+class OutputFieldConfig(PluginConfig):
+    """Configuration for a single output field in the LLM response.
+
+    Attributes:
+        suffix: Column suffix in output row (e.g., "score" -> "{prefix}_score")
+        type: Data type for schema enforcement, and the output column's row type
+            (integer -> int, number -> float, boolean -> bool, string/enum -> str)
+        values: Required for enum type - list of allowed values
+        nullable: Whether this required field also admits JSON null
+    """
+
+    # ``OutputFieldConfig`` inherits ``PluginConfig.schema_config`` (surfaced in
+    # JSON Schema under the ``schema`` alias). That inherited field is meaningless
+    # for a single structured-output field descriptor: a nested ``output_fields``
+    # entry describes one column (``suffix``/``type``/``values``), never a
+    # data-validation schema. Left as-is it lowers to a spurious editable
+    # ``schema`` knob per output field in the composer catalog discovery. Override
+    # the inherited field solely to mark it ``composer_hidden`` (mirroring
+    # ``LLMConfig.approved_prompt_artifact_hash``) so ``_lower_nested_model``
+    # skips it; the type/alias/default and the inherited ``_parse_schema_config``
+    # validator (bound by field name) are preserved unchanged.
+    schema_config: SchemaConfig | None = Field(
+        default=None,
+        alias="schema",
+        description="Schema configuration for data validation.",
+        json_schema_extra={"composer_hidden": True},
+    )
+    suffix: str = Field(..., description="Column suffix in output row")
+    type: OutputFieldType = Field(
+        ...,
+        description=(
+            "Data type for schema enforcement, and the output column's row type: integer -> int, number -> float, "
+            "boolean -> bool, string/enum -> str. A JSON number is parsed into it: 5.0 under integer arrives as 5 "
+            "(5.5 fails the row), 7 under number as 7.0."
+        ),
+    )
+    values: list[str] | None = Field(None, description="Allowed values (required for enum type)")
+    nullable: bool = Field(
+        default=False,
+        strict=True,
+        description="Allow JSON null in this required field; the key must still be present. Defaults to false.",
+    )
+
+    @model_validator(mode="after")
+    def validate_enum_has_values(self) -> OutputFieldConfig:
+        """Ensure enum type has values list."""
+        if self.type == OutputFieldType.ENUM:
+            if not self.values or len(self.values) == 0:
+                raise ValueError("enum type requires non-empty 'values' list")
+        elif self.values is not None:
+            raise ValueError(f"'values' is only valid for enum type, not {self.type.value}")
+        return self
+
+    def to_json_schema(self) -> dict[str, Any]:
+        """Convert to JSON Schema property definition.
+
+        Returns:
+            JSON Schema dict for this field
+        """
+        if self.type == OutputFieldType.ENUM:
+            # Enum uses 'enum' keyword with allowed values
+            if self.nullable:
+                return {"type": ["string", "null"], "enum": [*(self.values or ()), None]}
+            return {"type": "string", "enum": self.values}
+        else:
+            # Direct type mapping
+            if self.nullable:
+                return {"type": [self.type.value, "null"]}
+            return {"type": self.type.value}
+
+
+# Names a query's ``row`` (a plain ``dict`` of its variables plus ``source_row``)
+# never resolves to a variable: its own ``source_row`` entry, and every public
+# attribute of ``dict``, which ``row.<name>`` finds before the key.
+_QUERY_CONTEXT_RESERVED_NAMES: frozenset[str] = frozenset({"source_row"} | {name for name in dir(dict) if not name.startswith("_")})
+
+
+def _validate_structured_output_prefix(value: str | None) -> str | None:
+    """Preserve null and empty distinctly; refuse silently normalized stems."""
+    if value is not None and (not isinstance(value, str) or (value != "" and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", value) is None)):
+        raise ValueError("structured_output_prefix must be null, empty, or an ASCII identifier of at most 64 characters")
+    return value
+
+
+class QueryDefinition(BaseModel):
+    """Typed authoring model for a single multi-query LLM query.
+
+    This is the *public discovery* shape for one entry of ``LLMConfig.queries``.
+    It replaces the previous untyped ``dict[str, Any]`` so the catalog can
+    advertise the structured-output contract (``name``, ``input_fields``,
+    ``template``, ``response_format``, ``output_fields``) and so malformed
+    drafts fail closed with a safe ``PluginConfigError`` rather than a bare
+    ``ValueError`` escaping as a 500.
+
+    Both accepted authoring forms normalize to this model:
+
+    * **Mapping form** — ``queries: {query_name: {...}}``. The value carries no
+      ``name``; ``LLMConfig`` injects the mapping key as ``name`` before
+      validation (see ``LLMConfig._inject_mapping_query_names``).
+    * **List form** — ``queries: [{name: query_name, ...}]``. Each entry must
+      carry its own ``name``; ``resolve_queries`` rejects a list entry with a
+      missing name as a safe configuration error.
+
+    ``name`` is therefore ``str | None`` at the model level (the mapping value
+    legitimately omits it under ``extra=forbid``); the list-form requirement is
+    enforced downstream in ``resolve_queries``. The frozen runtime spec remains
+    :class:`QuerySpec`.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str | None = Field(
+        default=None,
+        description="Unique query identifier (used in output field prefixes). Omitted in mapping form, where the mapping key supplies it.",
+    )
+    input_fields: dict[str, str] = Field(
+        ...,
+        description="Mapping of template variable name to row column name.",
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.STANDARD,
+        description="LLM response format mode (standard JSON object vs. enforced json_schema).",
+    )
+    output_fields: list[OutputFieldConfig] | None = Field(
+        default=None,
+        description="Typed structured-output field definitions (None = unstructured response).",
+    )
+    structured_output_prefix: str | None = Field(
+        default=None,
+        strict=True,
+        max_length=64,
+        description=(
+            "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier "
+            "of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. "
+            "Any non-null override requires unique final generated names across all queries."
+        ),
+    )
+
+    @field_validator("structured_output_prefix")
+    @classmethod
+    def validate_structured_output_prefix(cls, value: str | None) -> str | None:
+        return _validate_structured_output_prefix(value)
+
+    template: str | None = Field(
+        default=None,
+        description="Per-query Jinja2 template override (None = use the config-level prompt_template).",
+    )
+
+    @field_validator("input_fields")
+    @classmethod
+    def validate_input_field_variables(cls, v: dict[str, str]) -> dict[str, str]:
+        """Refuse a variable name the query's ``row`` cannot read as that variable.
+
+        A query renders with ``row`` bound to a plain mapping of its variables
+        plus ``source_row`` (``build_template_context``). ``source_row`` is that
+        mapping's own entry, so a variable of that name is overwritten; and
+        attribute syntax on a mapping finds the mapping's method before its
+        key, so ``row.items`` for a variable named ``items`` renders the bound
+        method (with a memory address) on every row. Both are fixed by the
+        name alone, so configuration refuses them.
+        """
+        shadowed = sorted(name for name in v if name in _QUERY_CONTEXT_RESERVED_NAMES)
+        if shadowed:
+            names = ", ".join(f"'{name}'" for name in shadowed)
+            raise ValueError(
+                f"input_fields variable {names} cannot be read as that variable: a query's row is a mapping of its "
+                "input_fields variables plus 'source_row', so 'source_row' is taken and row.<name> for a mapping "
+                "method name (keys, items, values, get, ...) renders the method, not the value. Rename the variable, "
+                "e.g. 'items_text'."
+            )
+        return v
+
+    @field_validator("template")
+    @classmethod
+    def validate_template(cls, v: str | None) -> str | None:
+        """Compile-check per-query templates at config time (compose parity).
+
+        Pack pressure-suite run 4 (P4): ``options.prompt_template`` is
+        Jinja-compiled by ``LLMConfig.validate_prompt_template`` at config
+        time, but per-query overrides were compiled only at ENGINE BUILD
+        (``QueryExecutor.__post_init__``) — so a compose-accepted candidate
+        could crash the run at setup. Same gate, both template slots.
+
+        ``{{interpretation:...}}`` tokens get a targeted rejection: the
+        interpretation resolver rewrites only the node-level
+        ``prompt_template``/``prompt_template_parts`` — there is NO delivery
+        mechanism into per-query templates, so a token here survives review
+        resolution verbatim and dies as a Jinja syntax error at build.
+        """
+        if v is None:
+            return v
+        if "{{interpretation:" in v:
+            raise ValueError(
+                "queries.*.template cannot carry {{interpretation:...}} tokens: "
+                "interpretation review resolution rewrites only the node-level "
+                "prompt_template/prompt_template_parts. Put reviewed slots in the "
+                "node-level template and reference plain row variables here."
+            )
+        try:
+            PromptTemplate(v)
+        except TemplateError as exc:
+            raise ValueError(f"Invalid Jinja2 template in queries entry: {exc}") from exc
+        return v
+
+    max_tokens: int | None = Field(
+        default=None,
+        description="Per-query max_tokens override (None = use the config-level max_tokens).",
+    )
+
+    @field_validator("max_tokens", mode="before")
+    @classmethod
+    def reject_boolean_max_tokens(cls, value: object) -> object:
+        """Preserve boolean rejection at the authoring boundary, before coercion."""
+        if isinstance(value, bool):
+            raise ValueError("max_tokens must be an integer, not a boolean")
+        return value
+
+
+@dataclass(frozen=True, slots=True)
+class QuerySpec:
+    """Domain-agnostic query specification for multi-query transforms.
+
+    Uses named input_fields (dict mapping template variable name to row
+    column name) for flexible variable binding in templates.
+
+    Attributes:
+        name: Unique query identifier (used in output field prefixes)
+        input_fields: Mapping of template variable → row column name
+        response_format: LLM response format mode
+        output_fields: Typed output field definitions (None = unstructured)
+        template: Per-query template override (None = use config-level template)
+        max_tokens: Per-query max_tokens override (None = use config-level)
+        structured_output_prefix: Structured row-field stem (None = query name,
+            empty = bare suffix); raw response and operational names are unchanged.
+    """
+
+    name: str
+    input_fields: MappingProxyType[str, str]
+    response_format: ResponseFormat = ResponseFormat.STANDARD
+    output_fields: tuple[OutputFieldConfig, ...] | None = None
+    template: str | None = None
+    max_tokens: int | None = None
+    allow_empty_inputs: InitVar[bool] = False
+    structured_output_prefix: str | None = field(default=None, kw_only=True)
+
+    def __post_init__(self, allow_empty_inputs: bool) -> None:
+        if not self.name:
+            raise ValueError("name must be non-empty")
+        if not self.input_fields and not allow_empty_inputs:
+            raise ValueError("input_fields must be non-empty")
+        _validate_structured_output_prefix(self.structured_output_prefix)
+        if self.max_tokens is not None:
+            if isinstance(self.max_tokens, bool):
+                raise TypeError(f"max_tokens must be int, got bool ({self.max_tokens!r})")
+            if not isinstance(self.max_tokens, int):
+                raise TypeError(f"max_tokens must be int, got {type(self.max_tokens).__name__}")
+            if self.max_tokens <= 0:
+                raise ValueError(f"max_tokens must be > 0, got {self.max_tokens}")
+        object.__setattr__(self, "input_fields", MappingProxyType(dict(self.input_fields)))
+        if self.output_fields is not None:
+            object.__setattr__(self, "output_fields", tuple(self.output_fields))
+
+    @property
+    def structured_field_prefix(self) -> str:
+        """The sole publication prefix, including its optional separator."""
+        stem = self.name if self.structured_output_prefix is None else self.structured_output_prefix
+        return f"{stem}_" if stem else ""
+
+    def structured_field_name(self, suffix: str) -> str:
+        return f"{self.structured_field_prefix}{suffix}"
+
+    def build_template_context(
+        self, row: PipelineRow, projection: RowProjection, *, original_row: PipelineRow | None = None
+    ) -> dict[str, Any]:
+        """Build template context mapping named variables to row values.
+
+        Args:
+            row: The full row. Each ``input_fields`` value names a column the
+                query declares, read here in the parent process.
+            projection: The node's declaration (``declared_row_projection`` of
+                its ``required_input_fields``): ``source_row`` holds only those
+                fields (ADR-051).
+
+        Returns:
+            Context dict with named variables and the projected ``source_row``
+
+        Raises:
+            KeyError: If a required row column is missing
+        """
+        context: dict[str, Any] = {}
+        for template_var, row_column in self.input_fields.items():
+            context[template_var] = row[row_column]
+        context["source_row"] = TemplateRow.project(row if original_row is None else original_row, projection)
+        return context
+
+
+# Pattern for detecting legacy positional template variables {{ input_N }}
+_POSITIONAL_VAR_PATTERN = re.compile(r"\{\{\s*input_\d+\s*\}\}")
+
+
+def _query_spec_from_definition(name: str, definition: QueryDefinition, *, allow_empty_inputs: bool) -> QuerySpec:
+    """Build the frozen runtime :class:`QuerySpec` from a typed authoring model."""
+    output_fields = tuple(definition.output_fields) if definition.output_fields is not None else None
+    return QuerySpec(
+        name=name,
+        input_fields=MappingProxyType(dict(definition.input_fields)),
+        response_format=definition.response_format,
+        output_fields=output_fields,
+        template=definition.template,
+        max_tokens=definition.max_tokens,
+        structured_output_prefix=definition.structured_output_prefix,
+        allow_empty_inputs=allow_empty_inputs,
+    )
+
+
+def resolve_queries(
+    queries: list[QuerySpec] | list[QueryDefinition] | dict[str, QueryDefinition],
+    *,
+    allow_empty_inputs: bool = False,
+) -> list[QuerySpec]:
+    """Normalize typed query definitions into a list of QuerySpec.
+
+    Accepts:
+    - ``dict[str, QueryDefinition]``: mapping key becomes the query name
+      (the value carries no ``name``).
+    - ``list[QueryDefinition]``: each entry must carry its own ``name``.
+    - ``list[QuerySpec]``: already-resolved specs, passed through as-is.
+
+    Validates (cross-query rules that a per-field Pydantic model cannot express):
+    - Non-empty input
+    - List-form entries carry a ``name``
+    - No duplicate query names
+    - No legacy positional template variables (``{{ input_N }}``)
+    - No output field suffix collisions across queries, and no collision with a
+      reserved LLM suffix (``usage``/``model``/``error``)
+
+    Per-field shape (missing ``input_fields``, invalid ``output_fields``, enum
+    without ``values``, ...) is already enforced by ``QueryDefinition`` /
+    ``OutputFieldConfig`` at model-validation time, so those never reach here.
+
+    Args:
+        queries: Typed query definitions in any supported form.
+
+    Returns:
+        List of validated QuerySpec instances.
+
+    Raises:
+        ValueError: If queries is empty, a list entry omits ``name``, names
+            collide, positional variables are used, or output keys collide.
+    """
+    specs: list[QuerySpec] = []
+
+    if isinstance(queries, dict):
+        if not queries:
+            raise ValueError("no queries configured")
+        for name, definition in queries.items():
+            specs.append(_query_spec_from_definition(name, definition, allow_empty_inputs=allow_empty_inputs))
+    elif isinstance(queries, list):
+        if not queries:
+            raise ValueError("no queries configured")
+        for item in queries:
+            if isinstance(item, QuerySpec):
+                specs.append(item)
+            else:
+                if item.name is None:
+                    raise ValueError(
+                        "List-form query entries must include a 'name'. Add 'name' to each "
+                        "query, or author the queries as a mapping keyed by query name."
+                    )
+                specs.append(_query_spec_from_definition(item.name, item, allow_empty_inputs=allow_empty_inputs))
+    else:
+        raise TypeError(f"queries must be list or dict, got {type(queries).__name__}")
+
+    if not allow_empty_inputs and any(not spec.input_fields for spec in specs):
+        raise ValueError("input_fields must be non-empty")
+
+    # Validate: reject duplicate query names.
+    # Dict-form configs are naturally unique (Python dict keys), but list-form
+    # configs can have duplicate "name" fields. Duplicate names cause silent
+    # data loss: per-query output keys ({name}_response, {name}_metadata) collide,
+    # and dict.update() overwrites earlier query results.
+    seen_names: set[str] = set()
+    for spec in specs:
+        if spec.name in seen_names:
+            raise ValueError(f"Duplicate query name '{spec.name}'. Each query must have a unique name to prevent output field collisions.")
+        seen_names.add(spec.name)
+
+    # Validate: reject positional template variables
+    for spec in specs:
+        if spec.template and _POSITIONAL_VAR_PATTERN.search(spec.template):
+            raise ValueError(
+                f"Query '{spec.name}' template uses positional variables "
+                f"(e.g., {{{{ input_1 }}}}). Use named input_fields instead: "
+                f"map template variables to row columns via input_fields dict."
+            )
+
+    # Validate: check output field suffix collisions across queries
+    from elspeth.plugins.transforms.llm import MULTI_QUERY_GUARANTEED_SUFFIXES
+
+    reserved_suffixes = set()
+    for suffix in MULTI_QUERY_GUARANTEED_SUFFIXES:
+        if suffix:
+            reserved_suffixes.add(suffix.lstrip("_"))
+    # System-reserved suffixes used by multi-query error handling
+    reserved_suffixes.add("error")
+
+    seen_output_keys: dict[str, str] = {}  # full output key → first query name
+    for spec in specs:
+        if spec.output_fields:
+            for field in spec.output_fields:
+                # Warn on reserved suffixes
+                if field.suffix in reserved_suffixes:
+                    raise ValueError(
+                        f"Query '{spec.name}' output field suffix '{field.suffix}' collides with "
+                        f"reserved LLM suffix. Reserved suffixes: {sorted(reserved_suffixes)}. "
+                        f"Choose a different suffix to prevent silent data loss."
+                    )
+                # Check for cross-query output key collisions.
+                # Compare publication names, including explicit prefix overrides;
+                # different queries may share a suffix only when final keys differ.
+                output_key = spec.structured_field_name(field.suffix)
+                if output_key in seen_output_keys:
+                    raise ValueError(
+                        f"Output field key collision: key '{output_key}' "
+                        f"used by both query '{seen_output_keys[output_key]}' "
+                        f"and query '{spec.name}'"
+                    )
+                seen_output_keys[output_key] = spec.name
+
+    return specs
+
+
+@dataclass(frozen=True, slots=True)
+class OrderedQueryPlan:
+    """Compiled immutable publication and binding identities in authored list order."""
+
+    specs: tuple[QuerySpec, ...]
+    generated_by_query: tuple[frozenset[str], ...]
+    external_by_query: tuple[frozenset[str], ...]
+
+    @property
+    def generated_fields(self) -> frozenset[str]:
+        return frozenset().union(*self.generated_by_query)
+
+
+class OrderedQueryPlanError(ValueError):
+    """A compiler diagnostic containing structural field/query identities only."""
+
+
+def unique_query_generated_fields(specs: tuple[QuerySpec, ...], response_field: str) -> tuple[frozenset[str], ...]:
+    """Inventory all actual publications, refusing even within-query collisions.
+
+    Ordered mode always uses this strict contract. Upstream mode opts in when
+    any query explicitly overrides its structured publication stem.
+    """
+    from elspeth.plugins.transforms.llm import LLM_GUARANTEED_SUFFIXES
+
+    seen: set[str] = set()
+    generated: list[frozenset[str]] = []
+    for spec in specs:
+        prefix = f"{spec.name}_{response_field}"
+        names = [f"{prefix}{suffix}" for suffix in LLM_GUARANTEED_SUFFIXES]
+        names.extend(spec.structured_field_name(item.suffix) for item in spec.output_fields or ())
+        for name in names:
+            if name in seen:
+                raise OrderedQueryPlanError(f"Generated output field collision: '{name}' in query '{spec.name}'")
+            seen.add(name)
+        generated.append(frozenset(names))
+    return tuple(generated)
+
+
+def compile_ordered_query_plan(
+    specs: tuple[QuerySpec, ...],
+    response_field: str,
+    original_only_fields: frozenset[str] = frozenset(),
+    *,
+    list_form: bool = True,
+    pool_size: int = 1,
+) -> OrderedQueryPlan:
+    """Reject ambiguous producers and self/forward reads before provider execution.
+
+    Header aliases resolving to generated names are refused rather than assigned
+    dictionary precedence. Per-row admission additionally checks actual aliases.
+    """
+    from elspeth.plugins.sources.field_normalization import normalize_field_name
+
+    if not list_form:
+        raise OrderedQueryPlanError("ordered query_input_mode requires list-form queries")
+    if pool_size != 1:
+        raise OrderedQueryPlanError("ordered query_input_mode requires pool_size=1")
+    generated_by_query = unique_query_generated_fields(specs, response_field)
+    producers = {name: index for index, names in enumerate(generated_by_query) for name in names}
+    for name in original_only_fields:
+        canonical = normalize_field_name(name)
+        if name in producers or canonical in producers:
+            raise OrderedQueryPlanError(f"Field '{name}' is generated by this node and cannot be read from the original row")
+    external_by_query: list[frozenset[str]] = []
+    for index, spec in enumerate(specs):
+        external: set[str] = set()
+        for name in spec.input_fields.values():
+            canonical = normalize_field_name(name)
+            if name not in producers and canonical in producers:
+                raise OrderedQueryPlanError(f"Binding '{name}' ambiguously names a generated field; use its exact canonical name")
+            if name in producers:
+                if producers[name] >= index:
+                    raise OrderedQueryPlanError(f"Query '{spec.name}' binding '{name}' must refer to an earlier query")
+            else:
+                external.add(name)
+        external_by_query.append(frozenset(external))
+    return OrderedQueryPlan(specs, generated_by_query, tuple(external_by_query))

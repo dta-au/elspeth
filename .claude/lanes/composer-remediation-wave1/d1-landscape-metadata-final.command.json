@@ -1,0 +1,30 @@
+{
+  "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata",
+  "argv": [
+    "/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/.venv/bin/python",
+    "-m",
+    "pytest",
+    "-n",
+    "0",
+    "-m",
+    "testcontainer or not testcontainer",
+    "-o",
+    "pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/src /workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/elspeth-lints/src",
+    "tests/testcontainer/web/test_schema_probe_postgres.py::test_landscape_database_construction_stamps_postgres_identity",
+    "tests/testcontainer/web/test_schema_probe_postgres.py::test_postgres_landscape_creation_preserves_later_sqlite_schema",
+    "tests/testcontainer/web/test_blob_mutation_admission_postgres.py",
+    "tests/testcontainer/web/test_schema_probe_postgres.py::test_fresh_create_reaches_current",
+    "tests/testcontainer/web/test_schema_probe_postgres.py::test_postgres_schema_identity_drift_is_stale_and_not_repaired",
+    "tests/testcontainer/web/test_schema_probe_postgres.py::test_concurrent_initializers_serialize_to_one_create_all",
+    "tests/unit/core/landscape/test_database_metadata_creation.py",
+    "tests/unit/core/landscape/test_database_compatibility_guards.py",
+    "tests/unit/core/landscape/test_database_schema_probe.py",
+    "tests/unit/core/landscape/test_database_engine_lifecycle.py",
+    "tests/unit/core/landscape/test_database_pragma_probe.py",
+    "tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_new_landscape_stamp_requires_exact_locked_empty_target_sources",
+    "tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_new_landscape_stamp_refuses_incomplete_or_foreign_authority",
+    "tests/unit/architecture/test_session_db_mutation_authority.py::test_non_session_connection_manifest_is_bidirectional_and_exact",
+    "tests/unit/architecture/test_session_db_mutation_authority.py::test_writer_manifest_is_bidirectional_and_multiplicity_aware"
+  ],
+  "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/src:/workspace/elspeth/.claude/worktrees/composer-remediation-landscape-metadata/elspeth-lints/src"
+}

@@ -1,0 +1,18 @@
+{
+  "cwd": "/workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1",
+  "argv": [
+    "/workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1/.venv/bin/python",
+    "/workspace/elspeth/.claude/lanes/composer-remediation-wave1/d1-gate-fix1-verify.py",
+    "-n",
+    "0",
+    "-o",
+    "pythonpath=/workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1/src /workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1/elspeth-lints/src",
+    "tests/unit/web/composer/test_compose_loop_persistence.py",
+    "tests/unit/web/composer/test_proposal_cap_turn_counts.py",
+    "tests/unit/web/composer/test_tool_batch_rejection_llm_call_audit.py",
+    "tests/integration/web/composer/test_freeform_proposal_prevalidation.py::test_proposal_cap_counts_only_admitted_changes",
+    "tests/unit/test_mock_discipline_baseline.py"
+  ],
+  "PYTHONPATH": "/workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1:/workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1/src:/workspace/elspeth/.claude/worktrees/composer-remediation-d1-gates-fix1/elspeth-lints/src",
+  "head": "14fef5e5342ccbd79b4fdd69b276c20f77d66dc1"
+}

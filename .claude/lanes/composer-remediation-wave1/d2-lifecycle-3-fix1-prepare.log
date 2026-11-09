@@ -1,0 +1,24 @@
+patching file src/elspeth/composer_mcp/__init__.py
+patching file src/elspeth/composer_mcp/portable_supervisor.py
+patching file src/elspeth/composer_mcp/server.py
+patching file src/elspeth/web/async_workers.py
+patching file src/elspeth/web/required_executor.py
+patching file tests/conftest.py
+patching file tests/fixtures/required_executor.py
+patching file tests/unit/composer_mcp/test_server.py
+patching file docs/guides/composer-mcp-lifecycle.md
+patching file src/elspeth/composer_mcp/runner.py
+patching file src/elspeth/composer_mcp/standalone.py
+patching file tests/helpers/composer_lifecycle_probe.py
+patching file tests/helpers/composer_parent_death_probe.py
+patching file tests/helpers/composer_stdio_probe.py
+patching file tests/unit/composer_mcp/test_standalone_lifecycle.py
+patching file tests/unit/web/test_async_worker_settlement.py
+{"head": "8c35a2e2a9092260f15e88525cbe343df5410d4e", "inputs": 6222, "sha256": "e3e71ce63b705c414e1b5efb12b2fce03654a0628dd325209fdfcfbbce66d93f"}
+{
+  "original_sha256": "fa0297dbf92d5faeb6a80099d28b216daa7fb282b1c1eaa25b66e1a19c629949",
+  "baseline_delta": [
+    "tests/helpers/composer_stdio_ownership_probe.py",
+    "tests/unit/composer_mcp/test_standalone_lifecycle.py"
+  ]
+}
