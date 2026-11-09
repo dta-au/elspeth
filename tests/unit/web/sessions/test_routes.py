@@ -5575,7 +5575,13 @@ class TestMessageRoutes:
             assert next(message["status"] for message in sent if message["type"] == "http.response.start") == 202
             owner = asyncio.create_task(app.state.composer_async_worker.run_until_idle())
             try:
-                await asyncio.wait_for(composer.entered.wait(), timeout=5.0)
+                # Startup includes real SQL/worker setup; this is a hang guard
+                # (the same 30 s the Stop-race sibling below uses). A shorter
+                # wait fires on a co-loaded CI runner before the worker reaches
+                # compose; the resulting owner.cancel() lands in a pre-adoption
+                # _owned() join that drops it, and the job runs on to its
+                # 85 s deadline (reproduced on main; see dta-au/elspeth#355).
+                await asyncio.wait_for(composer.entered.wait(), timeout=30)
                 poll_path = f"/api/sessions/{session_id}/operations/{body['operation_id']}"
                 running = await http.get(poll_path)
                 assert running.json()["status"] == "running"
