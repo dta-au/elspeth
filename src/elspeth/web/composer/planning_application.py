@@ -116,6 +116,7 @@ from elspeth.web.sessions.pipeline_rejection_custody import (
     read_rejection_authority,
     reject_pipeline_with_required_custody,
 )
+from elspeth.web.sessions.proposal_blob_refs import PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE, ProposalResourceUnavailableError
 from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, RedactedPipelineArguments, SessionServiceProtocol
 
 slog = structlog.get_logger()
@@ -719,22 +720,25 @@ class PlanningApplication:
         preflight_green = runtime_result is not None and runtime_result.is_valid
 
         if required_work is None:
-            row, deferred = await _await_pipeline_staging_write_with_deferred_cancellation(
-                sessions.create_pipeline_composition_proposal(
-                    session_id=session_id,
-                    plan=plan,
-                    summary=summary.summary,
-                    rationale=summary.rationale,
-                    affects=summary.affects,
-                    arguments_redacted_json=summary.arguments_redacted_json,
-                    actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
-                    composer_model_identifier=plan.model_identifier,
-                    composer_model_version=plan.model_version,
-                    composer_provider=plan.provider,
-                    user_message_id=user_message_id,
-                    session_operation_context=session_operation_context,
+            try:
+                row, deferred = await _await_pipeline_staging_write_with_deferred_cancellation(
+                    sessions.create_pipeline_composition_proposal(
+                        session_id=session_id,
+                        plan=plan,
+                        summary=summary.summary,
+                        rationale=summary.rationale,
+                        affects=summary.affects,
+                        arguments_redacted_json=summary.arguments_redacted_json,
+                        actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
+                        composer_model_identifier=plan.model_identifier,
+                        composer_model_version=plan.model_version,
+                        composer_provider=plan.provider,
+                        user_message_id=user_message_id,
+                        session_operation_context=session_operation_context,
+                    )
                 )
-            )
+            except ProposalResourceUnavailableError:
+                return ComposerResult(message=PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE, state=state, raw_assistant_content="")
             if deferred is not None:
                 if auto_commit_authorized:
                     await _await_pipeline_staging_write_with_deferred_cancellation(
@@ -791,6 +795,12 @@ class PlanningApplication:
                 handoff,
             )
             if required_row is None:
+                if (
+                    len(creation_failures) == 1
+                    and type(creation_failures[0]) is ProposalResourceUnavailableError
+                    and not creation_cancellations
+                ):
+                    return ComposerResult(message=PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE, state=state, raw_assistant_content="")
                 raise original_outcome_group(
                     "Actual creation failure and original cancellation", *creation_failures, *creation_cancellations
                 )

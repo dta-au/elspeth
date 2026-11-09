@@ -12,7 +12,67 @@ from uuid import uuid4
 import pytest
 
 from elspeth.web.composer.pipeline_proposal import OWNED_COMPOSITION_STATE_AUTHORITY
-from elspeth.web.sessions.proposal_blob_refs import proposal_blob_reference_ids
+from elspeth.web.sessions.proposal_blob_refs import ProposalResourceUnavailableError, proposal_blob_reference_ids
+
+
+@pytest.mark.parametrize("availability", ["missing", "foreign", "pending", "error", "ready", "corrupt", "null"])
+def test_final_reference_check_distinguishes_resource_refusal_from_owned_corruption(availability: str) -> None:
+    from sqlalchemy import Column, MetaData, String, Table, create_engine
+
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.sessions import proposal_blob_refs
+
+    engine = create_engine("sqlite://")
+    metadata = MetaData()
+    blobs = Table("blobs", metadata, Column("id", String), Column("session_id", String), Column("status", String))
+    metadata.create_all(engine)
+    with engine.begin() as conn:
+        if availability != "missing":
+            conn.execute(
+                blobs.insert().values(
+                    id="private-resource",
+                    session_id="foreign" if availability == "foreign" else "owned",
+                    status=None if availability == "null" else "unknown" if availability == "corrupt" else availability,
+                )
+            )
+        if availability == "ready":
+            proposal_blob_refs.validate_proposal_blob_references(
+                conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"}
+            )
+        elif availability in {"corrupt", "null"}:
+            with pytest.raises(AuditIntegrityError):
+                proposal_blob_refs.validate_proposal_blob_references(
+                    conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"}
+                )
+        else:
+            with pytest.raises(ProposalResourceUnavailableError) as caught:
+                proposal_blob_refs.validate_proposal_blob_references(
+                    conn, session_id="owned", tool_name="delete_blob", arguments={"blob_id": "private-resource"}
+                )
+            assert type(caught.value) is ProposalResourceUnavailableError
+            assert "private-resource" not in str(caught.value)
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"source": {"options": {"blob_ref": 7}}},
+        {"source": {"options": {"path": "blob:malformed"}}},
+        {"authority_kind": OWNED_COMPOSITION_STATE_AUTHORITY, "sources": []},
+    ],
+)
+def test_malformed_authority_is_not_an_expected_resource_refusal(arguments: dict) -> None:
+    from sqlalchemy import create_engine
+
+    from elspeth.web.sessions.proposal_blob_refs import validate_proposal_blob_references
+
+    engine = create_engine("sqlite://")
+    # No table exists: a malformed authority must fail before any resource query.
+    with engine.connect() as conn, pytest.raises(ValueError) as caught:
+        validate_proposal_blob_references(conn, session_id="owned", tool_name="set_pipeline", arguments=arguments)
+    assert type(caught.value) is ValueError
+    engine.dispose()
 
 
 def _sha() -> str:

@@ -191,6 +191,7 @@ from elspeth.web.interpretation_state import (
     interpretation_sites,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.sessions.proposal_blob_refs import PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE, ProposalResourceUnavailableError
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -2227,74 +2228,90 @@ async def run_tool_batch(
                     arguments=proposal_summary_arguments,
                     redacted_arguments=proposal_redacted_arguments,
                 )
-                if proposal_tool_name == "set_pipeline":
-                    proposal_base = (
-                        PresentBase(
-                            state_id=UUID(current_state_id),
-                            composition_content_hash=composition_content_hash(state),
+                try:
+                    if proposal_tool_name == "set_pipeline":
+                        proposal_base = (
+                            PresentBase(
+                                state_id=UUID(current_state_id),
+                                composition_content_hash=composition_content_hash(state),
+                            )
+                            if current_state_id is not None
+                            else AbsentBase()
                         )
-                        if current_state_id is not None
-                        else AbsentBase()
-                    )
-                    pipeline_proposal = PipelineProposal.create(
-                        pipeline=proposal_arguments,
-                        base=proposal_base,
-                        repair_count=0,
-                        skill_hash=ctx.provenance.skill_hash,
-                    )
-                    if type(ctx.session_operation_context) is not SessionOperationContext:
-                        raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
-                    proposal = await _await_started_tool_stage(
-                        turn_sessions_service.create_pipeline_composition_proposal(
-                            session_id=turn_session_uuid,
-                            session_operation_context=ctx.session_operation_context,
-                            plan=PipelinePlanResult(
-                                proposal=pipeline_proposal,
-                                tool_call_id=tool_call.id,
-                                custody_result=pipeline_custody_result,
-                                model_identifier=ctx.provenance.model_identifier,
-                                model_version=provider_model_version,
-                                provider=ctx.provenance.provider or "unknown",
+                        pipeline_proposal = PipelineProposal.create(
+                            pipeline=proposal_arguments,
+                            base=proposal_base,
+                            repair_count=0,
+                            skill_hash=ctx.provenance.skill_hash,
+                        )
+                        if type(ctx.session_operation_context) is not SessionOperationContext:
+                            raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
+                        proposal = await _await_started_tool_stage(
+                            turn_sessions_service.create_pipeline_composition_proposal(
+                                session_id=turn_session_uuid,
+                                session_operation_context=ctx.session_operation_context,
+                                plan=PipelinePlanResult(
+                                    proposal=pipeline_proposal,
+                                    tool_call_id=tool_call.id,
+                                    custody_result=pipeline_custody_result,
+                                    model_identifier=ctx.provenance.model_identifier,
+                                    model_version=provider_model_version,
+                                    provider=ctx.provenance.provider or "unknown",
+                                ),
+                                summary=proposal_summary.summary,
+                                rationale=proposal_summary.rationale,
+                                affects=proposal_summary.affects,
+                                arguments_redacted_json=proposal_summary.arguments_redacted_json,
+                                actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
+                                user_message_id=UUID(user_message_id) if user_message_id is not None else None,
+                                composer_model_identifier=ctx.provenance.model_identifier,
+                                composer_model_version=provider_model_version,
+                                composer_provider=ctx.provenance.provider or "unknown",
                             ),
-                            summary=proposal_summary.summary,
-                            rationale=proposal_summary.rationale,
-                            affects=proposal_summary.affects,
-                            arguments_redacted_json=proposal_summary.arguments_redacted_json,
-                            actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
-                            user_message_id=UUID(user_message_id) if user_message_id is not None else None,
-                            composer_model_identifier=ctx.provenance.model_identifier,
-                            composer_model_version=provider_model_version,
-                            composer_provider=ctx.provenance.provider or "unknown",
+                            audit=audit,
+                            recorder=recorder,
+                        )
+                    else:
+                        if type(ctx.session_operation_context) is not SessionOperationContext:
+                            raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
+                        proposal = await _await_started_tool_stage(
+                            turn_sessions_service.create_composition_proposal(
+                                session_id=turn_session_uuid,
+                                session_operation_context=ctx.session_operation_context,
+                                tool_call_id=tool_call.id,
+                                tool_name=proposal_tool_name,
+                                summary=proposal_summary.summary,
+                                rationale=proposal_summary.rationale,
+                                affects=proposal_summary.affects,
+                                arguments_json=proposal_arguments,
+                                arguments_redacted_json=proposal_summary.arguments_redacted_json,
+                                base_state_id=UUID(current_state_id) if current_state_id is not None else None,
+                                actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
+                                user_message_id=UUID(user_message_id) if user_message_id is not None else None,
+                                composer_model_identifier=ctx.provenance.model_identifier,
+                                composer_model_version=provider_model_version,
+                                composer_provider=ctx.provenance.provider or "unknown",
+                                composer_skill_hash=ctx.provenance.skill_hash,
+                                tool_arguments_hash=audit.binding_arguments_hash,
+                            ),
+                            audit=audit,
+                            recorder=recorder,
+                        )
+                except ProposalResourceUnavailableError:
+                    unapplied_admission = _unapplied_admission(
+                        _saved_graph_rejection_result(
+                            state,
+                            PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE,
+                            error_code="proposal_resource_unavailable",
+                            rejected_component=None,
                         ),
-                        audit=audit,
-                        recorder=recorder,
+                        "refused",
+                        state=state,
+                        validation=last_validation if last_validation is not None else state.validate(),
+                        runtime_preflight=last_runtime_preflight,
                     )
-                else:
-                    if type(ctx.session_operation_context) is not SessionOperationContext:
-                        raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
-                    proposal = await _await_started_tool_stage(
-                        turn_sessions_service.create_composition_proposal(
-                            session_id=turn_session_uuid,
-                            session_operation_context=ctx.session_operation_context,
-                            tool_call_id=tool_call.id,
-                            tool_name=proposal_tool_name,
-                            summary=proposal_summary.summary,
-                            rationale=proposal_summary.rationale,
-                            affects=proposal_summary.affects,
-                            arguments_json=proposal_arguments,
-                            arguments_redacted_json=proposal_summary.arguments_redacted_json,
-                            base_state_id=UUID(current_state_id) if current_state_id is not None else None,
-                            actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
-                            user_message_id=UUID(user_message_id) if user_message_id is not None else None,
-                            composer_model_identifier=ctx.provenance.model_identifier,
-                            composer_model_version=provider_model_version,
-                            composer_provider=ctx.provenance.provider or "unknown",
-                            composer_skill_hash=ctx.provenance.skill_hash,
-                            tool_arguments_hash=audit.binding_arguments_hash,
-                        ),
-                        audit=audit,
-                        recorder=recorder,
-                    )
+                    proposal_redacted_arguments = None
+            if proposal_redacted_arguments is not None:
                 proposals_this_turn += 1
                 proposal_result = ToolResult(
                     success=True,

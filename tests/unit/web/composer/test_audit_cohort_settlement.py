@@ -707,3 +707,82 @@ async def test_planner_cohort_cancelled_mid_settlement_lands_whole_and_creates_n
     assert _proposal_count(sessions_service, result_session_id) == 0, (
         "evidence-without-proposal is the safe direction; a proposal must not follow a cancelled request"
     )
+
+
+@pytest.mark.asyncio
+async def test_resource_race_after_planner_admission_preserves_cohort_once_and_no_candidate_verdict(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    tmp_path,
+) -> None:
+    from dataclasses import replace
+
+    from sqlalchemy import update
+
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from elspeth.web.sessions.models import blobs_table, composition_states_table, proposal_events_table
+    from elspeth.web.sessions.proposal_blob_refs import validate_proposal_blob_references
+    from tests.integration.web.composer.test_freeform_proposal_prevalidation import _valid_pipeline_args
+
+    service = composer_service_with_real_sessions
+    sessions = service._sessions_service
+    user_message_id = await _seed_user_message(sessions, result_session_id)
+    state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+    async with acquire_compose_context(sessions, result_session_id) as context:
+        blob = await BlobServiceImpl(sessions._engine, tmp_path).create_blob(
+            UUID(result_session_id), "input.csv", b"value\n1\n", "text/csv", session_operation_context=context
+        )
+        arguments = _valid_pipeline_args(tmp_path)
+        arguments["source"]["blob_id"] = str(blob.id)
+        candidate = CompositionState.from_dict(
+            {
+                **arguments,
+                "version": 2,
+                "metadata": {**arguments["metadata"], "description": ""},
+                "outputs": [{**output, "name": output["sink_name"]} for output in arguments["outputs"]],
+            }
+        )
+        assert candidate.validate().is_valid
+        plan = replace(
+            _plan(),
+            proposal=PipelineProposal.create(
+                pipeline=arguments, base=AbsentBase(), repair_count=0, skill_hash=stable_hash("planner-skill")
+            ),
+            candidate_state=candidate,
+        )
+        with sessions._engine.connect() as conn:
+            validate_proposal_blob_references(conn, session_id=result_session_id, tool_name="set_pipeline", arguments=arguments)
+
+        async def preflight_then_change_resource(*args, **kwargs):
+            assert args[0] is candidate
+            with sessions._engine.begin() as conn:
+                conn.execute(update(blobs_table).where(blobs_table.c.id == str(blob.id)).values(status="error"))
+            return _green_preflight()
+
+        with patch.object(service._preflight, "cached_runtime_preflight", new=preflight_then_change_resource):
+            result = await service._planning_application._stage_pipeline_plan(
+                session_operation_context=context,
+                plan=plan,
+                state=state,
+                session_id=UUID(result_session_id),
+                current_state_id=None,
+                user_message_id=user_message_id,
+                user_id="phase3-test-user",
+                preferences=_FakePreferences(trust_mode="explicit_approve"),
+                recorder=BufferingRecorder(),
+                planner_llm_calls=(),
+                planner_private_candidates=(),
+                planner_attempts=(),
+                planner_invocations=_PLANNER_COHORT,
+                planner_withheld_replies=(),
+                plugin_snapshot=None,
+            )
+    assert result.state is state
+    assert result.runtime_preflight is None and result.pipeline_commit_intent is None
+    assert result.raw_assistant_content == ""
+    assert result.tool_invocations == () and result.llm_calls == ()
+    assert _invocation_occurrences(_chat_rows(sessions, result_session_id)) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
+    assert _proposal_count(sessions, result_session_id) == 0
+    with sessions._engine.connect() as conn:
+        assert conn.execute(select(composition_states_table.c.id)).all() == []
+        assert conn.execute(select(proposal_events_table.c.id)).all() == []
