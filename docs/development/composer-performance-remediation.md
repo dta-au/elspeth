@@ -66,7 +66,7 @@ verifying path), not by the type of the container.
 | 10 | Load `chat_messages.tool_calls` once per list, filter by id | Low–Med | Medium | Reviewed-writer recipe re-pin; sessions unit | open |
 | 11 | Memoize tool-definition credential scan by tools hash | Low | Low | Unit (provider_context) | open |
 | 12 | Cache `canonical_set_pipeline_schema()` per process | Low | Low | Unit (schema_contract, planner) | open |
-| 13 | Review-card publication: prepare once per candidate, batch fenced reads | Medium | Medium–High | Sessions + interpretation unit; recipe pins | open |
+| 13 | Review-card publication: prepare once per candidate, batch fenced reads | Medium | Medium–High | Sessions + interpretation unit; recipe pins | landed (settlement + import paths); surfacer path pending S-7; testcontainer suites owed |
 | 14 | Preserve state identity: single restore, no-op reconcile returns same object, hash once | Low–Med | Medium | Proposal/decoder/sessions unit | open |
 | 15 | Candidate build: drop the third full walk on the identical reconciled object | Low–Med | Low | Planner unit | open — commit rebuild stays |
 
@@ -97,8 +97,8 @@ the original list:
 | S-10/11 Accept re-checks own arguments; serialize-then-hash twice | A | Proposal accept re-verifies arguments it just produced (10–81 ms); same value serialized then hashed separately back-to-back | Fold into fix 6 |
 | S-12 Post-turn GET fan-out | F | Frontend fires 6–7 GETs after every turn, beyond fix 2's validate/readiness pair | Extend fix 2B's coordinator |
 
-Order: 1 ✓ → 10 ✓ → 6 ✓ → 7 ✓ → 9 ✓ → 14 ✓ → 15 ✓ → 11 ✓ → 12 ✓ → 2A ✓ → 3-T1 ✓ → 13 →
-2B (+S-12) → 4A → re-measure; other composer-side pending items slot in
+Order: 1 ✓ → 10 ✓ → 6 ✓ → 7 ✓ → 9 ✓ → 14 ✓ → 15 ✓ → 11 ✓ → 12 ✓ → 2A ✓ → 3-T1 ✓ → 13 ✓ →
+2B ✓ (+2C ✓; S-12 open) → 4A ✓ → re-measure; other composer-side pending items slot in
 once verified and, where marked, ruled on. Fix 13 sits after 3-T1 because it
 is the widest change to session-write transactions and benefits from fixes
 1, 14 and 15 having shrunk the per-card cost first. Engine-side fixes 7 and
@@ -1051,7 +1051,56 @@ SQLite vs PostgreSQL fence semantics — needs the Testcontainer job.
 add a statement-count assertion (N cards → one anchor/head read) and a
 quadratic-shape negative control with R terms at one node/kind.
 
-**Evidence.** _(fill in)_
+**Evidence (landed; lane report
+`.claude/lanes/perf-eval/fix13-implementation.md`).** Mechanism confirmed in
+the live source: each card re-prepared the shared context, re-read and
+decoded the anchor and head rows, and loaded surfacing graphs before term
+filtering; the pre-fix tree measured 3 / 10 / 21 full-row
+`composition_states` reads for R = 1 / 3 / 5 cards. Changes:
+`coordination/repository.py` keeps a transaction-local map `state_id →
+(decoded record, locked)`; a cached row is reused for a locking read only
+when this transaction already holds its lock, otherwise it is re-selected
+`FOR UPDATE` (rows are append-only, so a row read in this transaction cannot
+change before it ends). The head's identity is still probed and locked per
+card (`SELECT id … FOR UPDATE`); its full row is re-read only when a card
+moved it (a stale card costs 3 statements instead of 2 — accepted).
+Surfacing graphs load only for pending rows with the same term (the same
+`str`-and-`strip()` test the planner applies before it reads
+`surfacing_state`); every pending row is still read, locked and handed to
+the planner. **Proved (orchestrator ruling):** no consumer reads
+`surfacing_state` for an other-term row — the planner's stale arm reads only
+`user_term`/`id`, the main arm `continue`s on a term mismatch before its
+three `surfacing_state` reads, every other reader touches `site.event` or the
+anchor/live states, and the field type already admits `None`.
+`sessions/service.py`: `_PendingInterpretationPublication` holder bound to
+the exact candidate, fence and preparation binding; both cohort callers
+(settlement and import) prepare once and share one validator; per-card
+provenance and authorization checks unchanged. Measurements (pre-fix →
+after; statements / full-row state reads / preparation calls): R=1 27/3/1 →
+27/2/1; R=3 50/10/3 → 41/2/1; R=5 77/21/5 → 55/2/1; each card now costs
+exactly 7 statements. Timings noisy on the shared box (R=5 medians 27.8–29.2
+→ 23.2–25.4 ms, excluding the plugin-snapshot saving); counts are the
+reliable figure. Tests: new
+`tests/unit/web/sessions/test_interpretation_publication_shared_context.py`
+(7 tests, all fail on the pre-fix worktree; three mutants — surfacing loads,
+head advance, holder binding — each red; a mutant that never loads
+surfacing graphs makes 7 existing same-term tests fail, so the path is
+exercised). Scoped selection (sessions, coordination, blobs, shareable
+reviews, readiness, 13 composer files, 4 integration files) 5,685 passed, 1
+skipped, 2 failed — both `test_cli_quota_admission` and present on the
+pre-fix baseline; see the Test environment note on `.env`. Orchestrator
+confirmation of the interpretation/publication/pending/surfacing selection
+with the new file: 457 passed, exit 0. Re-pins with the gates' own tools and
+controls: `sessions/service.py` full-source guard; writer inventory 118
+`line=` values (125/125 rows match the live scan; the inventory test file
+alone: 298 passed, 1 xfailed, exit 0); writer recipes show no drift. ruff,
+format, mypy, `check_contracts` (census 2,615) clean. **Not run:**
+architecture suite and lint corpus (batch 2 gate); testcontainer suites
+(mandatory for this fix — it changes `FOR UPDATE` reads). **Follow-ups:**
+the surfacer path (one transaction per card) still prepares per card pending
+the S-7 ruling; found, not fixed, pre-existing: importing into an opted-out
+session fails from the second card when one prompt holds several vague
+terms.
 
 ---
 
@@ -1263,6 +1312,13 @@ Record raw output, not summaries, in each fix's Evidence line.
   while the run was in progress, so this run is frozen evidence for the
   batch 1 commits only, not for those two fixes; the batch 2 run covers
   them.
+- The repo-root `.env` used for this work is read by the CLI even under
+  `--no-dotenv`: `tests/unit/web/coordination/test_cli_quota_admission.py`
+  (2 cases) fails in this checkout with "an active human admin already
+  exists" because the CLI reaches the local PostgreSQL sessions database
+  where `pilot`/`demo` were bootstrapped, and passes with `.env` moved
+  aside (verified 2026-11-09). Environmental here; the `--no-dotenv` gap
+  is a latent defect worth a ticket, not part of this plan.
 - The doctor warns `composer_turn_budget_underfunded`: 240 s funds ~16 turns
   against 34 configured. Left as supplied; revisit if runs time out.
 - Network: this session was moved onto a personal environment allowing

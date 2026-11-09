@@ -956,10 +956,18 @@ class _RepositoryCompositionStateMutations:
 class _RepositoryInterpretationMutations:
     """Interpretation-event capability bound to one private operation transaction."""
 
-    __slots__ = ("__state",)
+    __slots__ = ("__state", "__verified_states")
 
     def __init__(self, state: _RepositoryMutationState) -> None:
         self.__state = state
+        # Transaction-local map ``state_id -> (decoded record, locked)``. A
+        # ``composition_states`` row is append-only, so a row this transaction
+        # has already read cannot change before it ends, and a row it read
+        # FOR UPDATE stays locked until then. Publishing R cards for one
+        # candidate therefore reads and decodes each anchor, head and
+        # surfacing row once, not once per card. The head's *identity* is
+        # still re-probed per card (it moves whenever a card appends a state).
+        self.__verified_states: dict[str, tuple[CompositionStateRecord, bool]] = {}
 
     def _require_compose(self) -> None:
         state = self.__state
@@ -1005,6 +1013,30 @@ class _RepositoryInterpretationMutations:
             derived_from_state_id=(UUID(row.derived_from_state_id) if row.derived_from_state_id is not None else None),
             composer_meta=cls._state_column(row.composer_meta),
         )
+
+    def _verified_state(self, state_id: str, *, lock: bool) -> CompositionStateRecord | None:
+        """Read one same-session state row once per transaction, decoded once.
+
+        A cached row is reused for a locking read only when this transaction
+        already took its row lock; otherwise it is re-selected FOR UPDATE.
+        """
+        state = self.__state
+        if state_id in self.__verified_states:
+            record, locked = self.__verified_states[state_id]
+            if locked or not lock:
+                return record
+        query = select(composition_states_table).where(
+            composition_states_table.c.id == state_id,
+            composition_states_table.c.session_id == state._session_id,
+        )
+        if lock:
+            query = query.with_for_update()
+        row = _resolve_mutation_connection(state._connection_token).execute(query).one_or_none()
+        if row is None:
+            return None
+        record = self._state_record(row)
+        self.__verified_states[state_id] = (record, lock)
+        return record
 
     @staticmethod
     def _event_record(row: Row[Any]) -> InterpretationEventRecord:
@@ -1070,25 +1102,21 @@ class _RepositoryInterpretationMutations:
         state = self.__state
         connection = _resolve_mutation_connection(state._connection_token)
         state_id = str(command.composition_state_id)
-        anchor_row = connection.execute(
-            select(composition_states_table)
-            .where(
-                composition_states_table.c.id == state_id,
-                composition_states_table.c.session_id == state._session_id,
-            )
-            .with_for_update()
-        ).one_or_none()
-        if anchor_row is None:
+        anchor_state = self._verified_state(state_id, lock=True)
+        if anchor_state is None:
             raise ValueError(
                 f"create_pending_interpretation_event: composition state {state_id!r} not found in session {state._session_id!r}"
             )
-        live_row = connection.execute(
-            select(composition_states_table)
+        live_state_id = connection.execute(
+            select(composition_states_table.c.id)
             .where(composition_states_table.c.session_id == state._session_id)
             .order_by(composition_states_table.c.version.desc())
             .limit(1)
             .with_for_update()
-        ).one()
+        ).scalar_one()
+        live_state = self._verified_state(live_state_id, lock=True)
+        if live_state is None:
+            raise AuditIntegrityError("create_pending_interpretation_event: locked session head row disappeared")
         pending_rows = connection.execute(
             select(interpretation_events_table)
             .where(
@@ -1102,19 +1130,22 @@ class _RepositoryInterpretationMutations:
             .with_for_update()
         ).all()
         pending_sites: list[SessionPendingInterpretationSiteSnapshot] = []
+        command_term = command.user_term.strip()
         for pending_row in pending_rows:
-            surfacing_row = None
-            if pending_row.composition_state_id is not None:
-                surfacing_row = connection.execute(
-                    select(composition_states_table).where(
-                        composition_states_table.c.id == pending_row.composition_state_id,
-                        composition_states_table.c.session_id == state._session_id,
-                    )
-                ).one_or_none()
+            # Every pending row at this (node, kind) is still read and locked,
+            # but only a same-term row's surfacing graph is ever compared: the
+            # planner skips other terms (and refuses a malformed term) before
+            # it reads ``surfacing_state``. Filtering here removes the
+            # R(R-1)/2 surfacing-state loads of R terms at one node and kind.
+            same_term = type(pending_row.user_term) is str and pending_row.user_term.strip() == command_term
             pending_sites.append(
                 SessionPendingInterpretationSiteSnapshot(
                     event=self._event_record(pending_row),
-                    surfacing_state=(self._state_record(surfacing_row) if surfacing_row is not None else None),
+                    surfacing_state=(
+                        self._verified_state(pending_row.composition_state_id, lock=False)
+                        if same_term and pending_row.composition_state_id is not None
+                        else None
+                    ),
                 )
             )
         superseded_rows = connection.execute(
@@ -1146,8 +1177,8 @@ class _RepositoryInterpretationMutations:
             is not None
         )
         snapshot = SessionPendingInterpretationSnapshot(
-            anchor_state=self._state_record(anchor_row),
-            live_state=self._state_record(live_row),
+            anchor_state=anchor_state,
+            live_state=live_state,
             pending_sites=tuple(pending_sites),
             review_disabled=review_disabled,
             opt_out_marker_exists=marker_exists,

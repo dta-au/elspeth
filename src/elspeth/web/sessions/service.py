@@ -18,7 +18,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast, final
 from uuid import UUID
 
 import structlog
@@ -733,6 +733,67 @@ def _validate_principal_snapshot(value: tuple[str | None, PluginAvailabilitySnap
 def _validate_inline_snapshot(value: SessionInlineBlobSnapshot | None) -> None:
     if value is not None and type(value) is not SessionInlineBlobSnapshot:
         raise AuditIntegrityError("preparation inline read returned an invalid owned snapshot")
+
+
+@final
+class _PendingInterpretationPublication:
+    """Shared candidate preparation for one cohort publication of review cards.
+
+    Settlement and import publish R cards for ONE proposed candidate. The
+    prepared validator's inputs (principal and plugin snapshot, inline
+    preflight config, blob snapshot, validation inputs) depend on that
+    candidate and the session, never on the card, so the first card prepares
+    them and later cards reuse the validator. All of it is still captured
+    before the single write transaction, so sharing is no less fresh than
+    preparing per card. The holder binds the exact candidate, fence and
+    preparation-binding objects and is refused for any other; every per-card
+    check (kind, fence, and the under-lock provenance checks) still runs.
+    """
+
+    __slots__ = ("_preparation_work", "_proposed_state", "_session_operation_context", "_validator")
+
+    def __init__(
+        self,
+        *,
+        proposed_state: CompositionStateData,
+        session_operation_context: SessionOperationContext,
+        preparation_work: RequiredWorkBinding | None,
+    ) -> None:
+        if type(proposed_state) is not CompositionStateData:
+            raise TypeError("pending interpretation publication requires an exact proposed candidate")
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("pending interpretation publication requires an exact SessionOperationContext")
+        if preparation_work is not None and type(preparation_work) is not RequiredWorkBinding:
+            raise TypeError("pending interpretation publication preparation binding must be exact")
+        self._proposed_state = proposed_state
+        self._session_operation_context = session_operation_context
+        self._preparation_work = preparation_work
+        self._validator: _SessionPendingInterpretationValidator | None = None
+
+    @property
+    def preparation_work(self) -> RequiredWorkBinding | None:
+        return self._preparation_work
+
+    def require_bound(
+        self,
+        *,
+        proposed_state: CompositionStateData | None,
+        session_operation_context: SessionOperationContext,
+        preparation_work: RequiredWorkBinding | None,
+    ) -> _SessionPendingInterpretationValidator | None:
+        """Return the retained validator, or ``None`` before the first card."""
+        if (
+            proposed_state is not self._proposed_state
+            or session_operation_context is not self._session_operation_context
+            or preparation_work is not self._preparation_work
+        ):
+            raise AuditIntegrityError("pending interpretation publication context belongs to another candidate")
+        return self._validator
+
+    def retain(self, validator: _SessionPendingInterpretationValidator) -> None:
+        if type(validator) is not _SessionPendingInterpretationValidator or self._validator is not None:
+            raise AuditIntegrityError("pending interpretation publication validator is prepared exactly once")
+        self._validator = validator
 
 
 class SessionServiceImpl:
@@ -3585,8 +3646,24 @@ class SessionServiceImpl:
             _refuse_required_sql(required_work, AuditIntegrityError("pipeline prepared cohort identities are duplicated"))
         candidate_state_id = str(uuid.uuid4())
         prepared_events: list[_PreparedPendingInterpretation] = []
+        publication: _PendingInterpretationPublication | None = None
         for draft in prepared_interpretations:
             try:
+                if publication is None:
+                    publication = _PendingInterpretationPublication(
+                        proposed_state=settled_state,
+                        session_operation_context=session_operation_context,
+                        preparation_work=(
+                            RequiredWorkBinding(
+                                finish_once_work.coordinator,
+                                finish_once_work.publication.key.transition_ordinal,
+                                finish_once_work.publication.key.semantic_ordinal,
+                                RequiredWorkRole.TURN,
+                            )
+                            if finish_once_work is not None
+                            else None
+                        ),
+                    )
                 prepared = await self._prepare_or_create_pending_interpretation_event(
                     session_id=session_id,
                     composition_state_id=UUID(candidate_state_id),
@@ -3604,16 +3681,8 @@ class SessionServiceImpl:
                     _event_id=draft.event_id,
                     _prepare_only=True,
                     proposed_state=settled_state,
-                    preparation_work=(
-                        RequiredWorkBinding(
-                            finish_once_work.coordinator,
-                            finish_once_work.publication.key.transition_ordinal,
-                            finish_once_work.publication.key.semantic_ordinal,
-                            RequiredWorkRole.TURN,
-                        )
-                        if finish_once_work is not None
-                        else None
-                    ),
+                    preparation_work=publication.preparation_work,
+                    _publication=publication,
                 )
             except BaseException as error:
                 _refuse_required_sql(required_work, error)
@@ -4947,6 +5016,7 @@ class SessionServiceImpl:
         _prepare_only: bool = False,
         proposed_state: CompositionStateData | None = None,
         preparation_work: RequiredWorkBinding | None = None,
+        _publication: _PendingInterpretationPublication | None = None,
     ) -> InterpretationEventRecord | _PreparedPendingInterpretation:
         """Insert a PENDING interpretation event.
 
@@ -4993,39 +5063,51 @@ class SessionServiceImpl:
         ):
             raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
         event_id = _event_id if _event_id is not None else uuid.uuid4()
-        principal_user_id, plugin_snapshot = await self._session_principal_context(sid, preparation_work=preparation_work)
-        expected_anchor: CompositionStateRecord | None = None
-        expected_live: CompositionStateRecord | None = None
-        if proposed_state is None:
-            expected_anchor, expected_live = await self._preflight_state_pair(session_id=session_id, anchor_id=composition_state_id)
-            snapshot_config = self._inline_preflight_config(expected_live) if expected_live is not None else None
-        else:
-            snapshot_config = self._inline_preflight_config(proposed_state)
-        inline_blob_snapshot = (
-            await self._prepare_inline_blob_snapshot(
-                snapshot_config,
-                session_id=session_id,
+        validator: _SessionPendingInterpretationValidator | None = None
+        if _publication is not None:
+            if type(_publication) is not _PendingInterpretationPublication:
+                raise TypeError("pending interpretation publication context must be exact")
+            validator = _publication.require_bound(
+                proposed_state=proposed_state,
                 session_operation_context=session_operation_context,
                 preparation_work=preparation_work,
             )
-            if snapshot_config is not None
-            else None
-        )
-        validation_inputs = build_interpretation_validation_inputs(
-            profile_aware=self._plugin_snapshot_factory is not None,
-            plugin_snapshot=plugin_snapshot,
-            profile_registry=self._operator_profile_registry,
-            catalog=self._catalog,
-        )
-        validator = _SessionPendingInterpretationValidator(
-            validation_inputs=validation_inputs,
-            runtime_preflight=self._runtime_preflight,
-            inline_blob_snapshot=inline_blob_snapshot,
-            expected_anchor=expected_anchor if inline_blob_snapshot is not None else None,
-            expected_live=expected_live if inline_blob_snapshot is not None else None,
-            session_id=sid,
-            user_id=principal_user_id,
-        )
+        if validator is None:
+            principal_user_id, plugin_snapshot = await self._session_principal_context(sid, preparation_work=preparation_work)
+            expected_anchor: CompositionStateRecord | None = None
+            expected_live: CompositionStateRecord | None = None
+            if proposed_state is None:
+                expected_anchor, expected_live = await self._preflight_state_pair(session_id=session_id, anchor_id=composition_state_id)
+                snapshot_config = self._inline_preflight_config(expected_live) if expected_live is not None else None
+            else:
+                snapshot_config = self._inline_preflight_config(proposed_state)
+            inline_blob_snapshot = (
+                await self._prepare_inline_blob_snapshot(
+                    snapshot_config,
+                    session_id=session_id,
+                    session_operation_context=session_operation_context,
+                    preparation_work=preparation_work,
+                )
+                if snapshot_config is not None
+                else None
+            )
+            validation_inputs = build_interpretation_validation_inputs(
+                profile_aware=self._plugin_snapshot_factory is not None,
+                plugin_snapshot=plugin_snapshot,
+                profile_registry=self._operator_profile_registry,
+                catalog=self._catalog,
+            )
+            validator = _SessionPendingInterpretationValidator(
+                validation_inputs=validation_inputs,
+                runtime_preflight=self._runtime_preflight,
+                inline_blob_snapshot=inline_blob_snapshot,
+                expected_anchor=expected_anchor if inline_blob_snapshot is not None else None,
+                expected_live=expected_live if inline_blob_snapshot is not None else None,
+                session_id=sid,
+                user_id=principal_user_id,
+            )
+            if _publication is not None:
+                _publication.retain(validator)
 
         command = SessionPendingInterpretationCommand(
             event_id=event_id,
@@ -6388,7 +6470,14 @@ class SessionServiceImpl:
         state_id = uuid.uuid4()
         now = self._now()
         prepared_events: list[_PreparedPendingInterpretation] = []
+        publication: _PendingInterpretationPublication | None = None
         for index, draft in enumerate(interpretations):
+            if publication is None:
+                publication = _PendingInterpretationPublication(
+                    proposed_state=state,
+                    session_operation_context=session_operation_context,
+                    preparation_work=None,
+                )
             prepared = await self._prepare_or_create_pending_interpretation_event(
                 session_id=session_id,
                 composition_state_id=state_id,
@@ -6410,6 +6499,7 @@ class SessionServiceImpl:
                 _event_id=draft.event_id,
                 _prepare_only=True,
                 proposed_state=state,
+                _publication=publication,
             )
             if type(prepared) is not _PreparedPendingInterpretation:
                 raise AuditIntegrityError("imported interpretation preparation did not return an exact package")
