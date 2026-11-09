@@ -34,7 +34,9 @@ provider call identity and fixes action to `restore_parked_graph`.
 `park_id` is not canonicalized at admission: an in-memory parser run accepted
 uppercase, brace-wrapped, whitespace-padded and non-UUID strings unchanged
 (restore_parked_graph-N3). The store then compares that raw string with the
-canonical lowercase identity it advertised.
+canonical lowercase identity it advertised. A probe run (§7.1) confirmed that
+uppercase, braced and padded spellings of an advertised park are refused as
+`target_unavailable`.
 
 Successful parsing creates an intent only. Session preparation looks up the
 park by both park ID and current session, reads and qualifies its exact graph,
@@ -132,10 +134,12 @@ from another session, unknown park, non-canonically spelled ID, malformed
 target or credential-bearing checkpoint is unavailable; nothing is
 reconstructed heuristically. Mixed batches reject before discovery or
 mutation effects, but the rejection ends the turn and the model gets no
-repair turn. The planner raises `MALFORMED_RESPONSE`. Freeform and
-malformed-head raise a bare `ValueError` that unwinds as an unknown
-first-party fault (restore_parked_graph-N5). Its attached provider calls are
-still drained and persisted
+repair turn. The planner settles as HTTP 502 `invalid_provider_response` /
+`MALFORMED_RESPONSE`. Freeform and malformed-head raise a bare `ValueError`
+that settles as HTTP 500 `operation_failed`. On the malformed-head route, a
+partner tool outside its recovery-only palette is refused first by the
+gateway, as HTTP 502 `composer_error` (restore_parked_graph-N5, measured in
+§7.1). The single provider call is still drained and persisted
 ([finally block](../../../../src/elspeth/web/sessions/composer_turn.py#L1876)).
 Credential material in `message` raises `CredentialMaterialRefused`, which is
 an admission refusal and not a `ValueError`, on every route. Provider
@@ -158,37 +162,55 @@ claim data loss or universal inability to restore. Model-directed selection of
 an unadvertised older park lacks a first-class discovery route. No >100-park
 interaction was executed during this assessment.
 
-**restore_parked_graph-N1, source-established, high confidence.** A
+**restore_parked_graph-N1, demonstrated (probe run at the session-service layer, §7.1).** A
 successful restore rejects every pending `set_pipeline` proposal as
 `superseded`
 ([L9117–9166](../../../../src/elspeth/web/sessions/service.py#L9117)). This
-happens even when the restored graph equals the head. The declaration,
-skills and receipt notice do not mention it. Only the refusal path is tested
+happens even when the restored graph equals the head. In the probe run, the
+pending pipeline proposal moved to `rejected` with a `proposal.rejected` event
+by `composer_graph_recovery`, for a park of an older state and for a park of
+the current head. A refused restore left it `pending`. The declaration and
+skills do not mention this, and neither does the receipt notice. The measured
+notice was "Restored saved draft … as a new editable version. Execution
+readiness and approvals require current checks. …", with no word about
+proposals. The repository suite still tests only the refusal path
 (`test_completed_restore_refusal_preserves_head_and_pending_proposal`). A grep
 for `superseded`, `proposal.rejected` and `composer_graph_recovery` found no
 success-path assertion in the six test files that call
 `prepare_graph_recovery` or cover turn recovery. The actor string is present in
 `service.py`, which confirms the grep can match.
 
-**restore_parked_graph-N2, source-established inconsistency.** Supersession
+**restore_parked_graph-N2, demonstrated inconsistency (session layer and full turn path, §7.1).** Supersession
 filters `tool_name == "set_pipeline"`
 ([L9124](../../../../src/elspeth/web/sessions/service.py#L9124)), so pending
-incremental proposals stay pending after a restore. They are published in the
-restore response. Accepting a graph-only one returns 409
-`proposal_base_state_changed`
+incremental proposals stay pending after a restore. In the probe run, a
+pending `set_metadata` proposal stayed `pending` while the `set_pipeline`
+proposal beside it was rejected. Through `POST /messages`, the completed
+restore response listed it under `proposals` as `pending`. Accepting it then
+returned 409 `proposal_base_state_changed`
 ([proposals L409–418](../../../../src/elspeth/web/sessions/routes/composer/proposals.py#L409)).
-That check exempts proposals whose blob effect was applied
-(`blob_effect_applied`); this review did not trace that branch. No unsafe
+The control accepted the same proposal without a restore turn and got 200
+`committed`. The base check exempts proposals whose blob effect was applied
+(`blob_effect_applied`). That branch was neither traced nor run. No unsafe
 approval was shown. The defect is a dead card with inconsistent disposition.
 
-**restore_parked_graph-N3, demonstrated (in-memory parser run) plus source-established lookup.**
+**restore_parked_graph-N3, demonstrated on SQLite (parser to store, and full turn path, §7.1).**
 `parse_recovery_tool_call` accepted `UPPER`, `{braced}`, `" padded "` and
 `park-one` IDs unchanged. Lookup is raw string equality on a `String` column
 ([L6777–6784](../../../../src/elspeth/web/sessions/service.py#L6777)), while
 advertised IDs are canonical lowercase
 ([`recovery_identity`](../../../../src/elspeth/web/sessions/graph_recovery.py#L33)).
-A recognisable spelling of an advertised park is therefore refused as
-unavailable. This is the same class as BOS-03.
+In the probe run, the admission context advertised the canonical lowercase ID.
+The parser passed each spelling through unchanged. The uppercase, braced and
+padded spellings each settled as `target_unavailable`, the canonical spelling
+restored the parked state, and an unknown UUID was also refused. A scripted
+model call with the uppercase ID through `POST /messages` completed as a
+refusal ("Graph recovery did not complete …"), and the head stayed unchanged.
+The canonical ID on the same path restored. The PostgreSQL leg was not run,
+because Docker is unavailable to this probe. The column is `String` on both
+backends, and default collations compare it case-sensitively on both. That
+part is reasoning, not a run. This is the same class as
+BOS-03.
 
 **restore_parked_graph-N4, source-established actionability gap.** All refusal
 causes share `failure_reason="target_unavailable"`
@@ -200,18 +222,32 @@ park list in the browser or REST surface. Not disclosing *content* is
 intended. Collapsing "no such park in this session" and "park exists but
 cannot be restored" is not needed for that and leaves the next turn guessing.
 
-**restore_parked_graph-N5, source-established route divergence; final failure code unverified.**
-A malformed restore control (129-character ID, extra field, blank text, mixed
-batch) gets three different failure shapes. The planner converts it to
-`MALFORMED_RESPONSE` with an audited planner-failure body
+**restore_parked_graph-N5, demonstrated route divergence (full `POST /messages` worker path, §7.1).**
+A malformed restore control gets different user-visible failures by route.
+The planner converts it to `MALFORMED_RESPONSE` with an audited
+planner-failure body
 ([L4361](../../../../src/elspeth/web/composer/pipeline_planner.py#L4361)).
 Freeform and malformed-head re-raise the `ValueError`
 ([L1094–1099](../../../../src/elspeth/web/composer/service.py#L1094),
 [L1078–1084](../../../../src/elspeth/web/composer/service.py#L1078)). No typed
-turn arm catches it, so the worker settles it as a generic failure. The
-palettes test confirms `compose()` raises `ValueError("…sole tool call…")`.
-Provider-call audit is retained by the drain. No route gives the model a repair
-opportunity, which differs from ordinary tool-argument rejection.
+turn arm catches it, so the worker settles it as a generic failure. These were
+the measured settlements:
+
+| Route | 129-character `park_id` | Mixed batch |
+|---|---|---|
+| Freeform | HTTP 500 `operation_failed` (Pydantic `string_too_long`) | HTTP 500 `operation_failed` (`[restore, set_metadata]`, "sole tool call") |
+| Malformed head | HTTP 500 `operation_failed` | `[restore, set_metadata]`: HTTP 502 `composer_error`, "Reply stage requires text or a terminal recovery control" (the gateway's recovery-only palette refuses it before the parser). `[restore, handoff_to_user]`: HTTP 500 `operation_failed` |
+| Planner | HTTP 502 `invalid_provider_response` / `MALFORMED_RESPONSE` | HTTP 502 `invalid_provider_response` / `MALFORMED_RESPONSE` |
+
+The 500 bodies carry only "The compose operation failed" and a diagnostic ID.
+Every run made exactly one provider call and persisted exactly one
+`llm_call_audit` row, so the drain claim holds. No route gave the model a
+repair round, although each double had more responses queued. The freeform
+head was unchanged. The control was a well-formed restore of an unknown UUID.
+On all three routes it completed as a trusted refusal ("The requested graph
+recovery did not complete"), so the failures above come from the malformed
+control and not from the refusal. Ordinary tool-argument rejection, by
+contrast, gives the model a repair opportunity.
 
 **restore_parked_graph-N6, source-established discovery limitation.** Each
 advertised park carries only `park_id`, `state_id` and `version`
@@ -230,11 +266,15 @@ An in-memory run of the context projection for a session with no parks gave
 palette protects the cache anchor and strict-dialect tests. The consequence is
 that any call in that state is a guaranteed refusal that ends the turn.
 
-**restore_parked_graph-N8, source-established no-op semantics (SG-03 class).**
+**restore_parked_graph-N8, demonstrated no-op semantics (SG-03 class, §7.1).**
 Every restore uses a fresh `state_id`
 ([L6849–6851](../../../../src/elspeth/web/sessions/service.py#L6849)), so a park
 of the current head still creates a version and supersedes `set_pipeline`
-proposals.
+proposals. In the probe run, restoring a park of head v2 wrote a new v3 with
+identical content, `is_valid=False`, derived from v2. It also rejected the
+pending `set_pipeline` proposal. The full-turn run gave the same result: a
+park of the seeded head produced v2 and left the incremental proposal stale
+(N2).
 
 **restore_parked_graph-N9, source-established audit labelling, low.** The
 planner attempt trail records a restore as phase `prose`, outcome `declined`,
@@ -252,9 +292,6 @@ null
 requested ID is kept in private diagnostic evidence (asserted by
 `test_refused_provider_recovery_retains_exact_private_control_and_physical_binding`),
 not in the public audit row.
-
-**Hypothesis, unverified:** the user-visible failure code for N5. It depends on
-the worker's `_failure_for` classification, which was not executed.
 
 No demonstrated integrity defect was found in the inspected local recovery
 paths. The current tests provide useful counterevidence to a hypothesis that a
@@ -405,10 +442,39 @@ proposal),
 (mixed batch raises `ValueError`; reply-stage and pending-review recovery), and
 [negative-only review retention](../../../../tests/unit/web/sessions/test_graph_review_facts.py#L737)
 (exercised with `reset_to_turn_start` on the shared settlement path). The
-sheet review ran no pytest. Its parser and context observations (N3, N7) come
-from in-memory calls to `parse_recovery_tool_call`, `recovery_context_message`
-and the two tool-list producers, with `elspeth.__file__` resolving into this
-checkout. They are not end-to-end service runs. Nothing has been implemented.
+sheet review itself ran no pytest. Its N7 context observation comes from
+in-memory calls to `recovery_context_message` and the two tool-list
+producers, with `elspeth.__file__` resolving into this checkout, and is not an
+end-to-end run. The later probe runs in §7.1 cover N1, N2, N3, N5 and N8.
+Nothing has been implemented.
+
+### 7.1 Probe runs (2026-11-09)
+
+Worktree `$WT` (production source at baseline `3b28d537b`), lane-private
+directory `$L`. `$PY` is the main checkout's `.venv/bin/python`. Every run used
+the network fail-closed prefix `HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 NO_PROXY= LITELLM_LOCAL_MODEL_COST_MAP=True ELSPETH_DISABLE_NETWORK=1`,
+plus `PYTHONDONTWRITEBYTECODE=1`, `PYTHONPATH=$WT:$WT/src:$WT/elspeth-lints/src`,
+`TMPDIR=$L/tmp` and `-n 0 -p no:cacheprovider --rootdir $WT -c $WT/pyproject.toml`
+with a matching whitespace-separated `-o pythonpath`. Ad-hoc files loaded
+`-p tests.conftest -p tests.unit.conftest`. The session-layer file also loaded
+`-p tests.unit.web.coordination.test_composer_operation_authority` for
+`operation_store`. Each file asserted two things: that `elspeth.__file__`
+resolves under `$WT/src/`, and that the autouse fixtures loaded. The shell
+unset `ELSPETH_ALLOW_RAW_SECRETS`, and the test saw `"true"`.
+A proxy control (`$L/proxy_control.py`) returned `ConnectError [Errno 111]`.
+The provider guard replaced `litellm.acompletion` with a scripted double that
+raises on any unscripted call, and made `litellm.completion` raise.
+`provider_gateway._litellm_acompletion` and the by-name
+`pipeline_planner._litellm_acompletion` raise unless that double is installed.
+Its positive control showed every unscripted entry point raising.
+
+| Probe | Finding | Outcome | Command (abridged) | Exit | Observed |
+|---|---|---|---|---|---|
+| P0 | baseline | ran, green | `$PY -m pytest tests/unit/web/sessions/test_graph_recovery_turn.py` | 0 | 5 passed |
+| P1 | N5 | **confirmed** | `$PY -m pytest $L/test_probe_n5.py …` | 0 (12 passed) | `POST /messages` through the detached worker with the real `ComposerServiceImpl`. Controls: a well-formed unknown-park restore completed as a trusted refusal on freeform, malformed-head and planner. Malformed controls: freeform 500 `operation_failed` for both shapes. Malformed head: 500 for a 129-character ID or a pair of recovery controls, 502 `composer_error` for `[restore, set_metadata]` (gateway palette check). Planner: 502 `invalid_provider_response`/`MALFORMED_RESPONSE` for both shapes. One provider call and one `llm_call_audit` row per run, no repair round, freeform head unchanged |
+| P2 | N1, N2, N8 | **confirmed** | `$PY -m pytest $L/test_probe_session.py …` (session layer) and `$PY -m pytest $L/test_probe_route.py …` (full turn) | 0 (5 passed), 0 (5 passed) | Session layer: one pending `set_pipeline` proposal and one pending `set_metadata` proposal on head B. Restoring park→A produced v3 "Parked draft A", `is_valid=False`; the pipeline proposal became `rejected` by `composer_graph_recovery`, the incremental stayed `pending`, and the receipt did not mention proposals. Park→B (current head) gave the same dispositions and a new v3 with identical content (N8). A refused restore left both pending. Limit: the session-layer admission context was loaded when the operation started, before the states and proposals existed. That does not affect the result, because supersession and park lookup are keyed on DB rows, and the full-turn run agrees. Full turn: the restore response listed the incremental proposal as `pending`, and accept returned 409 `proposal_base_state_changed`. Control: accept without a restore turn returned 200 `committed` |
+| P3 | N3 | **confirmed** (SQLite) | `test_probe_session.py::test_n3_spellings` and `test_probe_route.py::test_n3_end_to_end_spelling` | 0 | Advertised `[<canonical lowercase id>]`. The parser left every spelling unchanged. Canonical restored A. Uppercase, braced and padded spellings each gave `target_unavailable`, as did the unknown-UUID negative control. Full turn: uppercase completed as a refusal with the head unchanged, and canonical restored |
+| P3-PG | N3 | not runnable here | — (no file written; the N3 cases would need a testcontainer-marked copy) | — | Needs PostgreSQL/Docker, which this probe brief forbids |
 
 ## Runtime argument schema and measured exposure
 

@@ -177,7 +177,7 @@ can discover. The practical impact above 100 parks remains unexercised.
 
 New provisional findings (coordinator renumbers):
 
-- **N1 — source-established, undisclosed effect, untested.** Any settlement that
+- **N1 — demonstrated (probe N1, §7.1), undisclosed effect.** Any settlement that
   inserts a checkpoint rejects every pending `set_pipeline` proposal as
   `superseded` with actor `composer_graph_recovery`
   ([L9117–L9168](../../../../src/elspeth/web/sessions/service.py#L9117)),
@@ -185,9 +185,13 @@ New provisional findings (coordinator renumbers):
   ([L1797](../../../../src/elspeth/web/sessions/service.py#L1797)). This matches
   the user state-revert rule, so the behaviour is plausibly intended; the
   description, skill, receipt notice and this sheet did not disclose it, and no
-  test in the recovery suites exercises the branch. The interpretation-sweep
-  consequence for staged review cards is unverified.
-- **N2 — source-established semantics/guidance mismatch.** Safe-checkpoint
+  test in the recovery suites exercises the branch. The probe run showed a
+  `reset_to_turn_start` move a pending proposal from `pending` to `rejected`
+  with a `proposal.rejected` event by `composer_graph_recovery`. The only
+  receipt notice did not mention the proposal. A bookmark-only `park` (the
+  control) left the proposal pending. The interpretation-sweep consequence for
+  staged review cards is still unverified; the probe did not stage any.
+- **N2 — demonstrated at the session-service layer (probe N2, §7.1), semantics/guidance mismatch.** Safe-checkpoint
   selection ([L6787](../../../../src/elspeth/web/sessions/service.py#L6787))
   iterates every version, admitting this operation's own tool-call checkpoints
   ([foreign-only fence, L6730](../../../../src/elspeth/web/sessions/service.py#L6730);
@@ -195,13 +199,26 @@ New provisional findings (coordinator renumbers):
   The common freeform outcome is a duplicate of the current draft, stored
   `is_valid=False`, with pending proposals superseded (N1) — while the skill
   tells the model to use it to “abandon a broken draft”. Not an integrity defect.
-- **N3 — source-established fault-typing asymmetry.** Rejected recovery calls
+  The probe saved two different tool-call checkpoints in one operation.
+  Safe-checkpoint then targeted the newer one, and the restored version 3
+  carried the newer content with `is_valid=False`. The `reset_to_turn_start`
+  control discarded both checkpoints. The probe called the session service
+  directly; it did not drive the freeform per-round insert at L2094.
+- **N3 — demonstrated (probe N3, §7.1), fault-typing asymmetry.** Rejected recovery calls
   end the turn without repair. Freeform re-raises the `ValueError`
   ([L1097](../../../../src/elspeth/web/composer/service.py#L1097)); the turn
-  ladder has no arm for it, so the worker most likely projects the generic
-  500 `operation_failed` ([L246](../../../../src/elspeth/web/sessions/composer_operation_errors.py#L246))
-  — source-traced, not executed. The planner raises typed
+  ladder has no arm for it, so the worker projects the generic
+  500 `operation_failed` ([L246](../../../../src/elspeth/web/sessions/composer_operation_errors.py#L246)).
+  The planner raises typed
   `MALFORMED_RESPONSE` ([L4356](../../../../src/elspeth/web/composer/pipeline_planner.py#L4356)).
+  Measured through `POST /messages` and the detached worker with a scripted
+  `[handoff_to_user, set_metadata]` reply: freeform settled as HTTP 500,
+  `failure_code=operation_failed`, with a diagnostic id. The turn raised
+  `ValueError: Recovery controls must be the sole tool call in a response`.
+  The planner, given `[handoff_to_user, list_sources]`, settled as HTTP 502,
+  `http_error` / `composer_planner_failure` / `invalid_provider_response` /
+  `MALFORMED_RESPONSE`. Each route made exactly one provider call, so neither
+  ran a repair round.
   Provider-authored bad input therefore surfaces as an unknown first-party fault on one route.
 - **N4 — demonstrated audit labelling inconsistency, low impact.** The planner
   captures received arguments with `known_tools` that exclude recovery names
@@ -226,10 +243,13 @@ New provisional findings (coordinator renumbers):
 - **N7 — intended restriction, tested.** On refusal the provider message is
   replaced by [fixed trusted text](../../../../src/elspeth/web/composer/no_tool_policy.py#L102),
   so a clarifying question carried by a refused control never reaches the user.
-- **N8 — source-established wording mismatch, minor.** `reset_to_turn_start`
+- **N8 — demonstrated (incidentally, in the probe N1 run, §7.1), wording mismatch, minor.** `reset_to_turn_start`
   on a session that was empty at turn start sets `empty_fallback` and publishes
   “No eligible saved draft was available” ([L9211](../../../../src/elspeth/web/sessions/service.py#L9211)),
-  although the exact turn-start state was restored.
+  although the exact turn-start state was restored. The probe N1 reset and the
+  N2 turn-start control both reported `empty_fallback=True`. The N1 receipt
+  notice read “No eligible saved draft was available; an empty authoring
+  workspace was opened. …”.
 - **N9 — source-established resource limitation, unmeasured.** Preparation
   reads every version row without a limit ([L6723](../../../../src/elspeth/web/sessions/service.py#L6723))
   and safe-checkpoint may decode each version until one qualifies.
@@ -367,11 +387,10 @@ corrupt-park proofs. These prove local/scripted and SQLite behavior,
 not remote-provider compliance, PostgreSQL contention, browser rendering or
 deployment recovery. Existing browser decoder tests were located, not run.
 
-The sheet review read, but did not run, the freeform palette and
-mixed-batch tests in
-[`test_recovery_control_palettes.py`](../../../../tests/unit/web/composer/test_recovery_control_palettes.py);
-that file is not part of any recorded selection. The review's only execution
-was read-only introspection with both worktree source roots (`elspeth.__file__`
+The freeform palette and mixed-batch tests in
+[`test_recovery_control_palettes.py`](../../../../tests/unit/web/composer/test_recovery_control_palettes.py)
+were run in the probe pass: 22 passed, exit 0, recorded in §7.1. The sheet
+review itself executed only read-only introspection with both worktree source roots (`elspeth.__file__`
 resolved into the worktree): registry/canonical/MCP absence (controlled by
 `set_pipeline` present), loop and planner membership for both dialects,
 byte-identical parameter schemas across dialects, parser rejections (blank,
@@ -383,10 +402,36 @@ the known-name control).
 
 Confidence in the described source/local contracts is high; the >100 park
 experience is a source-established limitation needing a controlled boundary test.
-N3's user-visible failure code and N1's interpretation-review consequence are
-source-traced, not executed. Implementation risk is high if unification weakens fencing or receipt binding;
+N3's user-visible failure code and N1's proposal supersession are now measured
+(§7.1). N1's interpretation-review consequence remains source-traced, not executed.
+Implementation risk is high if unification weakens fencing or receipt binding;
 incremental descriptor adoption is reversible, persisted envelope changes need
 explicit compatibility handling.
+
+### 7.1 Probe runs (2026-11-09)
+
+Worktree `$WT` (production source at baseline `3b28d537b`), lane-private
+directory `$L`. `$PY` is the main checkout's `.venv/bin/python`. Every run used
+the network fail-closed prefix `HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 NO_PROXY= ELSPETH_DISABLE_NETWORK=1`
+with `PYTHONPATH=$WT:$WT/src:$WT/elspeth-lints/src` (P0: `$WT/src:$WT/elspeth-lints/src`),
+`TMPDIR=$L/tmp`, `-n 0 -p no:cacheprovider` and a matching whitespace-separated
+`-o pythonpath`. Every probe file printed `elspeth.__file__` and asserted that
+it resolved under `$WT/src/`. A proxy control (`$L/proxy_control.py`) returned
+`ConnectError [Errno 111] Connection refused` from the dead proxy. The N3 file
+also installed a provider guard: `litellm.acompletion` became a scripted double
+that raises on any unscripted call, `litellm.completion` raises, and both
+`provider_gateway._litellm_acompletion` and
+`pipeline_planner._litellm_acompletion` raise unless the double is installed.
+Its positive control showed every unscripted entry point raising.
+
+| Probe | Finding | Outcome | Command (abridged) | Exit | Observed |
+|---|---|---|---|---|---|
+| P0 | §7 caveat (palette file unrun) | ran, green | `$PY -m pytest tests/unit/web/composer/test_recovery_control_palettes.py tests/unit/web/coordination/test_graph_recovery_persistence.py` | 0 | 34 passed (22 + 12) |
+| N1 | N1 | **confirmed** | `$PY -m pytest $L/test_probe_n1_n2.py --rootdir $WT -c $WT/pyproject.toml -p tests.conftest -p tests.unit.web.conftest -p tests.unit.web.coordination.conftest -p tests.unit.web.coordination.test_composer_operation_authority` | 0 (5 passed) | The pending `set_pipeline` proposal was created bound to the running job. After `reset_to_turn_start` it was `rejected` with events `[proposal.created by composer-web:user:alice, proposal.rejected by composer_graph_recovery]`. The only receipt notice did not mention it. The control, a bookmark-only `park` (`state_id == expected_state_id`), left it `pending` with no rejection event |
+| N2 | N2 | **confirmed** (session-service layer) | same file and run as N1 | 0 | Two different same-operation `tool_call` checkpoints were saved. Safe-checkpoint targeted the newer one (`empty_fallback=False`). The restored v3 held the newer content, `is_valid=False`, derived from the newer checkpoint. The `reset_to_turn_start` control targeted `None` (`empty_fallback=True`) and discarded both |
+| N3 | N3 | **confirmed** | `$PY -m pytest $L/test_probe_n3.py --rootdir $WT -c $WT/pyproject.toml -p tests.conftest -p tests.unit.web.conftest` | 0 (5 passed) | Full `POST /messages` path through the detached worker. Control: a freeform singleton `park` completed. Freeform `[handoff_to_user, set_metadata]`: HTTP 500, `operation_failed`, with a diagnostic id; the raised chain was `ValueError: Recovery controls must be the sole tool call in a response`. Planner `[handoff_to_user, list_sources]`: HTTP 502, `http_error`, `composer_planner_failure` / `invalid_provider_response` / `MALFORMED_RESPONSE`. One provider call per route |
+
+N4 was already demonstrated in process (§7, above) and was not re-run.
 
 ## Runtime argument schema and measured exposure
 

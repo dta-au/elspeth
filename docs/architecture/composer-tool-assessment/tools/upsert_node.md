@@ -47,7 +47,7 @@ The handler returns an immutable candidate; it does not itself durably save the 
 | Proposal accept replay (REST) | `POST /{session_id}/proposals/{proposal_id}/accept` ([proposals.py:286](../../../../src/elspeth/web/sessions/routes/composer/proposals.py#L286)); `execute_tool` at [proposals.py:492](../../../../src/elspeth/web/sessions/routes/composer/proposals.py#L492) | session ownership, compose lock, operation lease; `validate_arguments=True`, `require_data_dir_for_paths=True` | Re-admits against the *current* state; required controls re-wired only if `success`, version advanced and `validation.is_valid` ([proposals.py:519](../../../../src/elspeth/web/sessions/routes/composer/proposals.py#L519)). Version-unchanged results get a distinguished 409 ([proposals.py:551](../../../../src/elspeth/web/sessions/routes/composer/proposals.py#L551)); an identical upsert_node replacement always advances version, so it never reaches that branch. |
 | Planner | not emitted | — | Measured absence: `grep -c upsert_node pipeline_planner.py` = 0 against a control of `set_pipeline` = 19. `inventory.md` records Planner default = no. |
 | Recovery controls | not referenced | — | `recovery_controls.py` does not name the tool. |
-| Composer MCP | `execute_tool` at [server.py:402](../../../../src/elspeth/composer_mcp/server.py#L402) | trained-operator snapshot; `validate_arguments=True`, `require_data_dir_for_paths=True`, `data_dir=None` | With `data_dir=None` the handler's `provider_config.persist_directory` check returns early ([_common.py:2393](../../../../src/elspeth/web/composer/tools/_common.py#L2393)); `require_data_dir_for_paths` covers source-local paths only. Whether that is intended for the local operator route is unverified. MCP responses carry no `graph_repair_suggestions` ([server.py:104](../../../../src/elspeth/composer_mcp/server.py#L104)). |
+| Composer MCP | `execute_tool` at [server.py:402](../../../../src/elspeth/composer_mcp/server.py#L402) | trained-operator snapshot; `validate_arguments=True`, `require_data_dir_for_paths=True`, `data_dir=None` | With `data_dir=None` the handler's `provider_config.persist_directory` check returns early ([_common.py:2393](../../../../src/elspeth/web/composer/tools/_common.py#L2393)); `require_data_dir_for_paths` covers source-local paths only. Measured (§7.1 probe 3): MCP `upsert_node` admits and stores `persist_directory="/etc/x"` (`success=True`); the shipped stdio construction's `preview_pipeline` runtime preflight then fails `path_allowlist` ("Path traversal blocked: transform 'rag' persist_directory='/etc/x' …"), and `generate_yaml` omits `persist_directory` from the export. This matches the MCP design that existing tests pin for sink paths (mutation admits, runtime preflight rejects). Whether mutation-time admission is the intended policy for the local operator route remains a maintainer question; no escape was observed. MCP responses carry no `graph_repair_suggestions` ([server.py:104](../../../../src/elspeth/composer_mcp/server.py#L104)). |
 | Pre-dispatch credential scan | [credential_guard.py:221](../../../../src/elspeth/web/credential_guard.py#L221) | all routes through `execute_tool` | `_credential_node_projection` of the whole argument object. |
 | Dependent-batch refusal | [batch_dependencies.py:39](../../../../src/elspeth/web/composer/batch_dependencies.py#L39), [batch_dependencies.py:68](../../../../src/elspeth/web/composer/batch_dependencies.py#L68), [batch_dependencies.py:106](../../../../src/elspeth/web/composer/batch_dependencies.py#L106) | freeform batches | `_node_produces` counts `on_success`, `routes`, `fork_to` as promised connections regardless of node_type — the same kind-blind reading as upsert_node-N1. This changes which dependents are refused (more aggressively after a failed call; `set_pipeline` subtracts promises from its own references); no defect is claimed for this consumer. |
 | Redaction / audit projection | [redaction.py:3852](../../../../src/elspeth/web/composer/redaction.py#L3852), [diagnostic_evidence.py:339](../../../../src/elspeth/web/composer/diagnostic_evidence.py#L339) | transcript/audit | Separate argument models; checked by CI schema-contract tests. |
@@ -59,7 +59,7 @@ The handler returns an immutable candidate; it does not itself durably save the 
 
 The handler normalises server metadata echoes, protects runtime-owned LLM fields, stages default model/prompt review, checks credential placement and policy/schema admission, batch-aware placement/required inputs, inline prompt surfaces, profile-aware config, retry budget and path policy. Gates validate expressions and Boolean labels; structural contracts reject before mutation. Candidate sink edges are reconciled against scalar routes, then global invariants and authoritative reviews are checked. Incomplete noncanonical graph readiness can be returned as validation after accepted mutation. Queue admission has a separate early path. Operator-profile public config and private runtime lowering differ deliberately. No plugin processing or provider call occurs in the handler.
 
-The queue early return at [transforms.py:740–746](../../../../src/elspeth/web/composer/tools/transforms.py#L740) bypasses everything after it: sink-mirror edge reconciliation, `_post_mutation_invariant_error`, `reconcile_authoritative_reviews` and `composition_review_contract_error`. The skipped edge reconciliation is demonstrated (upsert_node-N4); the review consequence is not.
+The queue early return at [transforms.py:740–746](../../../../src/elspeth/web/composer/tools/transforms.py#L740) bypasses everything after it: sink-mirror edge reconciliation, `_post_mutation_invariant_error`, `reconcile_authoritative_reviews` and `composition_review_contract_error`. The skipped edge reconciliation and the skipped review reconciliation are both demonstrated (upsert_node-N4).
 
 Refusal policy is uneven across required fields. A missing failure choice on a new transform/aggregation refuses atomically (`failure_route_required`), while a missing `plugin` on a new transform is persisted with `transform_missing_plugin` telemetry (measured). Both are documented as required.
 
@@ -67,7 +67,7 @@ Refusal policy is uneven across required fields. A missing failure choice on a n
 
 **SG-07 — demonstrated argument loss defeats the queue invariant; high confidence.** Public `execute_tool(..., validate_arguments=True)` accepts a queue with any of `scope_name`, `scope_opener` or `scope_policy`, then silently stores all three as `None`. The queue-specific builder at lines 612–631 omits those admitted fields before calling `queue_node_contract_error`, despite its docstring saying it constructs the node "from the validated arguments verbatim". That guard explicitly forbids all three at `state.py:1026–1032`, so a direct NodeSpec with the same values correctly fails, while this public route succeeds. Trigger: use `upsert_node(node_type='queue', id==input)` with a collector scope field. Consequence: a forbidden request is reported successful and changed meaning before invariant checking; an invalid-input rejection contract is inconsistent across entry paths. The bulk route does not share the defect: `set_pipeline` with the same queue plus `scope_name` refuses with `queue_config_invalid` (in-memory dispatch run, this review). Workaround: omit all collector scope fields on queues. This does not claim queues execute as collectors or that stored invalid queues bypass runtime validation. SG-07 is one cell of the broader matrix in upsert_node-N2.
 
-**upsert_node-N1 — demonstrated false-green validation for runtime-inert routing fields; high confidence.** Stage-1 reachability treats a node's `on_success`, `routes` and `fork_to` as producers regardless of node_type ([state.py:2467](../../../../src/elspeth/web/composer/state.py#L2467), [state.py:2475](../../../../src/elspeth/web/composer/state.py#L2475)). Its docstring says it "must follow the same routing model as generate_yaml() and DAG build", but gate lowering never emits `on_success` ([yaml_generator.py:227](../../../../src/elspeth/web/composer/yaml_generator.py#L227); runtime `GateSettings` has no such field and is `extra="forbid"`), and transform lowering never emits `fork_to` ([yaml_generator.py:203](../../../../src/elspeth/web/composer/yaml_generator.py#L203)). Trigger: `upsert_node` a gate with `on_success="side"` (or a transform with `fork_to=["side"]`), then a transform consuming `side`. Both calls succeed; the returned `validation.is_valid` is `True` with no errors; `validate_pipeline_for_trained_operator` on the same state fails `graph_structure` with "No producer for connection 'side'". Positive control: the same topology with the gate routing `true → side` is valid in both validators. The aggregation and coalesce `routes`/`fork_to` cases follow from the same code but were not probed (source-established). Consequence: the tool's own validity signal tells the model a graph is complete when it cannot run; the defect surfaces only at runtime preflight/validation, as a missing-producer error far from the field that caused it. Existing tests encode the Stage-1 reading: producer-resolver fixtures build gates with `on_success` ([test_producer_resolver.py:152](../../../../tests/unit/web/composer/test_producer_resolver.py#L152), [:164](../../../../tests/unit/web/composer/test_producer_resolver.py#L164)), and an AST test pins the body of `_runtime_connection_targets` ([test_producer_resolver.py:473](../../../../tests/unit/web/composer/test_producer_resolver.py#L473)).
+**upsert_node-N1 — demonstrated false-green validation for runtime-inert routing fields; high confidence.** Stage-1 reachability treats a node's `on_success`, `routes` and `fork_to` as producers regardless of node_type ([state.py:2467](../../../../src/elspeth/web/composer/state.py#L2467), [state.py:2475](../../../../src/elspeth/web/composer/state.py#L2475)). Its docstring says it "must follow the same routing model as generate_yaml() and DAG build", but gate lowering never emits `on_success` ([yaml_generator.py:227](../../../../src/elspeth/web/composer/yaml_generator.py#L227); runtime `GateSettings` has no such field and is `extra="forbid"`), and transform lowering never emits `fork_to` ([yaml_generator.py:203](../../../../src/elspeth/web/composer/yaml_generator.py#L203)). Trigger: `upsert_node` a gate with `on_success="side"` (or a transform with `fork_to=["side"]`), then a transform consuming `side`. Both calls succeed; the returned `validation.is_valid` is `True` with no errors; `validate_pipeline_for_trained_operator` on the same state fails `graph_structure` with "No producer for connection 'side'". Positive control: the same topology with the gate routing `true → side` is valid in both validators. The aggregation (`fork_to`, `routes`) and coalesce (`routes`, `fork_to`) cases are also demonstrated: in each, the tool result and `state.validate()` are valid while the runtime validator fails "No producer for connection 'side'". Each has a positive control (a lowered producer, valid in both validators) and an isolation control (inert field absent: Stage-1 `node_input_not_reachable` on `node:t1`). See §7.1 probe 1. Consequence: the tool's own validity signal tells the model a graph is complete when it cannot run. This is demonstrated in a scripted freeform compose turn (§7.1 probe 2). Both upsert_node results the model received said `is_valid: true`. The failure reached it only through the loop's pre-finalisation runtime preflight message, and through `preview_pipeline` when the model called it. In both it appears as `1. [?:transform_t1_<hash>] No producer for connection 'side'`. That line has no error code (`?`), names the consuming transform rather than the gate, and never mentions `on_success`. Existing tests encode the Stage-1 reading: producer-resolver fixtures build gates with `on_success` ([test_producer_resolver.py:152](../../../../tests/unit/web/composer/test_producer_resolver.py#L152), [:164](../../../../tests/unit/web/composer/test_producer_resolver.py#L164)), and an AST test pins the body of `_runtime_connection_targets` ([test_producer_resolver.py:473](../../../../tests/unit/web/composer/test_producer_resolver.py#L473)).
 
 **upsert_node-N2 — demonstrated inconsistent wrong-kind field admission; high confidence.** One canonical node per kind, plus each field the kind does not own, through public dispatch with `validate_arguments=True` (in-memory handler/dispatch run):
 
@@ -82,7 +82,26 @@ Every "no finding" field is discarded by its kind's lowering (§3), so the store
 
 **upsert_node-N3 — demonstrated propagation of inert fields through the advertised authoring payload; high confidence.** A transform stored with inert `fork_to` and `trigger` returns both in `get_pipeline_state(component='set_pipeline_arguments')`, which is the payload upsert_node's own replacement refusal tells the model to read ([transforms.py:679–682](../../../../src/elspeth/web/composer/tools/transforms.py#L679)). Resubmitting that payload through `set_pipeline` succeeds with `validation.is_valid=True` (in-memory dispatch). Once admitted, inert fields are carried forward by the documented read-modify-write loop rather than corrected by it.
 
-**upsert_node-N4 — demonstrated queue-path divergence from shared post-commit work; moderate confidence on consequence.** Replacing configured transform `after` (sink-mirror edge `after → result`) with a canonical queue `after` leaves the stale edge in state (`edge_not_lowerable` on `edge:after-output`); replacing it with a gate removes the edge through `_reconcile_node_sink_mirror_edges`. The stale edge is reported, not silent. The same early return also skips `_post_mutation_invariant_error`, `reconcile_authoritative_reviews` and `composition_review_contract_error` (source-established). Whether a queue insertion can leave review evidence stale, given that review applicability reads the output-stream graph ([interpretation_state.py:3467](../../../../src/elspeth/web/interpretation_state.py#L3467)), is a hypothesis.
+**upsert_node-N4 — demonstrated queue-path divergence from shared post-commit work, including stale review evidence that blocks later mutations; high confidence.** Replacing configured transform `after` (sink-mirror edge `after → result`) with a canonical queue `after` leaves the stale edge in state (`edge_not_lowerable` on `edge:after-output`); replacing it with a gate removes the edge through `_reconcile_node_sink_mirror_edges`. The stale edge is reported, not silent. The same early return also skips `_post_mutation_invariant_error`, `reconcile_authoritative_reviews` and `composition_review_contract_error`.
+
+The review consequence is demonstrated (§7.1 probe 4). Review applicability reads the output-stream graph ([interpretation_state.py:3467](../../../../src/elspeth/web/interpretation_state.py#L3467)), and the prompt-shield artifact hash binds every upstream path, including declared queues.
+- Fixture: the owned `_reviewed_shield_state()` (`web_scrape → mid → classify`, with a resolved prompt-shield `pipeline_decision` on the LLM).
+- Probe: `upsert_node` queue `inbound` (`id == input`) succeeds and changes the review's derived artifact hash. The row stays `resolved` with the old hash, so `pending_execution_interpretation_sites` reports nothing owed, and `materialize_state_for_execution` raises `InterpretationReviewIntegrityError: node 'classify' pipeline-decision review hash drifted`.
+- After that, three later mutations are refused with `review_reconciliation_failed`, "resolved interpretation requirement 'prompt_injection_shield_review:classify' hash drifted":
+  - an unrelated `upsert_node` (a new passthrough);
+  - `remove_node` of the queue itself;
+  - `patch_node_options` on `classify`.
+
+  The only tested escape is `remove_node classify`, which succeeds by deleting the reviewed LLM node.
+- Controls on the same fixture:
+  - a non-queue graph change (`remove_node mid`) re-opens the review cleanly (`pending`, `InterpretationReviewPending`);
+  - the same unrelated `upsert_node` without the queue succeeds and keeps the review.
+
+Not shown:
+- whether `set_pipeline` can recover the draft (the fixture's hand-built `web_scrape` options fail bulk plugin prevalidation, so that control could not run);
+- whether a live session reaches this state through the real resolve route.
+
+Consequence: one admitted queue insertion turns server-owned review evidence into an integrity fault. Among the tested tools, the draft can then only be changed by deleting the reviewed node.
 
 **upsert_node-N5 — demonstrated undisclosed node-name precondition; high confidence.** The emitted `id` schema is `{"type": "string", "description": "Unique node identifier."}`. `splice_transform` ([transforms.py:2203](../../../../src/elspeth/web/composer/tools/transforms.py#L2203)) and `set_pipeline` `nodes[].id` ([schema_contract.py:386](../../../../src/elspeth/web/composer/tools/schema_contract.py#L386)) disclose the runtime node-name pattern, length cap and reserved labels via `_disclose_node_name_constraints`. `upsert_node` with id `""`, a 60-character id or `"bad id!"` each succeeds and persists with `node_id_invalid`. `set_pipeline` also persists a bad id as a draft, so this finding concerns disclosure parity, not a refusal difference.
 
@@ -112,7 +131,7 @@ For SG-07 specifically, preserve every admitted field until kind-specific valida
 
 For N1/N2, make Stage-1 reachability read connections through one per-kind "what this kind publishes at runtime" authority shared with lowering, instead of reading `on_success`/`routes`/`fork_to` off every node. Pair it with one intrinsic per-kind field contract — the generalisation of `queue_node_contract_error` and the row_union guard — used by upsert_node, set_pipeline and `validate()`. Decide per field whether a wrong-kind value refuses the mutation (recommended for fields lowering discards) or is reported as a node error; never neither. Regression: the N2 matrix as a parametrised test with no "persisted, no finding" cell; the N1 gate-`on_success` and transform-`fork_to` cases must be invalid in Stage 1 and agree with `validate_pipeline`; the positive control (gate route to the same connection) stays valid. Compatibility: persisted sessions holding such fields will begin reporting errors (or refusing re-submission); that is an honest reinspection requirement, not a migration. The AST pin and gate fixtures in `test_producer_resolver.py` must change with the fix.
 
-For N4, run the queue candidate through the same post-commit sequence as other kinds (sink-mirror reconciliation, blocking invariants, review reconciliation and contract), with the intrinsic queue guard as an additional precondition rather than a replacement for the shared sequence.
+For N4, run the queue candidate through the same post-commit sequence as other kinds (sink-mirror reconciliation, blocking invariants, review reconciliation and contract), with the intrinsic queue guard as an additional precondition rather than a replacement for the shared sequence. Regression: the §7.1 probe-4 case. A queue inserted on a reviewed LLM's input must re-open the prompt-shield review as `pending`, and must not leave a resolved row whose hash has drifted. A later unrelated mutation must still succeed.
 
 ### 6.1 Simple enhancements
 
@@ -134,14 +153,14 @@ For N4, run the queue candidate through the same post-commit sequence as other k
 - [tests/unit/web/composer/test_transform_tools_review_and_guard_parity.py:1](../../../../tests/unit/web/composer/test_transform_tools_review_and_guard_parity.py#L1) — upsert/patch/splice/bulk guard parity.
 - [tests/unit/web/composer/test_explicit_failure_choices.py:1](../../../../tests/unit/web/composer/test_explicit_failure_choices.py#L1) — preserve/require explicit failure choices.
 - [tests/unit/web/composer/test_upsert_node_replacement_presence.py:1](../../../../tests/unit/web/composer/test_upsert_node_replacement_presence.py#L1) — public replacements must not erase omitted plugin configuration (not run by this review).
-- [tests/unit/web/composer/test_transform_rejection_contracts.py:154](../../../../tests/unit/web/composer/test_transform_rejection_contracts.py#L154) — queue `id != input` refusal through upsert_node; no scope-field case (not run by this review).
+- [tests/unit/web/composer/test_transform_rejection_contracts.py:154](../../../../tests/unit/web/composer/test_transform_rejection_contracts.py#L154) — queue `id != input` refusal through upsert_node; no scope-field case (run as part of the §7.1 probe-5 baseline).
 - [tests/unit/web/composer/test_producer_resolver.py:473](../../../../tests/unit/web/composer/test_producer_resolver.py#L473) — AST pin on `_runtime_connection_targets`, relevant to any N1 fix.
 
 The lane inspected the named test bodies and ran a serial focused selection at this baseline. Initial run: `exit=1; 550 passed, 6 failed`; the six failures required the absent optional Azure identity SDK. After the parent installed frozen Azure/AWS extras, rerunning only those six cases produced `exit=0; 6 passed, 42 deselected`. This is local handler/dispatch evidence, not live provider, PostgreSQL contention or deployed-browser acceptance.
 
 Controlled SG-07 reproduction exited 0 with a canonical queue positive control. For each of `scope_name`, `scope_opener`, `scope_policy`, the owned queue guard reported `Queue 'joined' does not accept field(s): [...]`, while public dispatch returned `success=True` and stored `(None, None, None)`. The comparison exercises actual JSON-schema admission, the production handler and owned invariant; it does not use a mock queue validator.
 
-**Sheet review probes (2026-11-09).** These were in-memory handler/dispatch runs, not end-to-end service runs. Each used `execute_tool(..., validate_arguments=True)` with the `_state()`/`_context()` fixtures from `tests/unit/web/composer/test_splice_transform_tool.py`. `elspeth.__file__` resolved into the assessment worktree. No pytest, provider or network was used.
+**Sheet review probes (2026-11-09).** These were in-memory handler/dispatch runs, not end-to-end service runs. Each used `execute_tool(..., validate_arguments=True)` with the `_state()`/`_context()` fixtures from `tests/unit/web/composer/test_splice_transform_tool.py`. `elspeth.__file__` resolved into the assessment worktree. Those in-memory probes used no pytest, provider or network; the pytest probe runs are in §7.1.
 
 ```text
 N1  stage-1 isolation (identical gate routes {true: result, false: discard}; only on_success differs):
@@ -163,7 +182,92 @@ SG-03 identical replacement version 4->5, content equal, progress True
 
 Runtime validation used `validate_pipeline_for_trained_operator` and `SimpleNamespace(data_dir=<lane scratch directory>)` as its settings. Source and sink paths were placed under `managed_blob_directory(<scratch>)/<session_id>` and `<scratch>/outputs/<session_id>`. Instrument control: the first runtime attempt with fixture-relative paths failed `path_allowlist` for both the control and the case, so it said nothing about routing. Only the rerun, in which the control passed every runtime check, is used as evidence.
 
-**Confidence:** high for the cited current-source contracts and reported controlled observations; moderate for proposed architectural improvements, which require design review. **Information gaps and caveats:** no live provider/model compliance, hosted UI, PostgreSQL contention, future `.10 lite` behaviour or unlisted plugin qualification is claimed. N1 for aggregation/coalesce `routes`/`fork_to`, the N4 review consequence, the MCP `data_dir=None` path policy and how a runtime-preflight failure from N1 reaches the model in a real freeform turn are unverified. Named test coverage is evidence for its assertions, not universal tool correctness. **Risk:** the proposed production changes are unimplemented; acceptance checks above must demonstrate successful behaviour and invalid-input refusal before relying on them.
+**Confidence:** high for the cited current-source contracts and reported controlled observations; moderate for proposed architectural improvements, which require design review. **Information gaps and caveats:** no live provider/model compliance, hosted UI, PostgreSQL contention, future `.10 lite` behaviour or unlisted plugin qualification is claimed. The freeform-turn evidence for N1 used a scripted model and a clean-patched advisor checkpoint, not a live provider. Two N4 points are untested: whether `set_pipeline` can recover a draft in the probe-4 state, and whether a live session reaches that state through the real resolve route. Whether MCP mutation-time admission of out-of-root provider paths is intended is a maintainer question (§3.1). Named test coverage is evidence for its assertions, not universal tool correctness. **Risk:** the proposed production changes are unimplemented; acceptance checks above must demonstrate successful behaviour and invalid-input refusal before relying on them.
+
+### 7.1 Probe runs (2026-11-09)
+
+These probes ran against the 0.8.9 production source in the assessment worktree.
+- `$WT` is the worktree root. `$L` is the lane-private probe directory, `.claude/lanes/composer-sheet-review-20261109/probes/upsert_node`. All scripts, logs and `TMPDIR` are under `$L`.
+- Every run used the fail-closed prefix `HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 NO_PROXY= LITELLM_LOCAL_MODEL_COST_MAP=True ELSPETH_DISABLE_NETWORK=1 PYTHONDONTWRITEBYTECODE=1`.
+- Every run also used the in-process guard `$L/un_guard.py`. It makes `litellm.acompletion`, `litellm.completion`, `provider_gateway._litellm_acompletion`, `pipeline_planner._litellm_acompletion` and IPv4/IPv6 `socket.connect` raise. Its positive control (each entry point raises when called unscripted) passed in every log, and every arm recorded zero guard hits.
+- `elspeth.__file__` resolved to `$WT/src/elspeth/__init__.py` in every log.
+- Pytest probes ran through `$L/run_pytest.sh`, which uses `-n 0 -p no:cacheprovider --rootdir $WT -c $WT/pyproject.toml`. Conftests were loaded with `-p tests.conftest -p tests.unit.conftest -p tests.unit.web.conftest -p tests.unit.web.composer.conftest -p tests.integration.conftest -p tests.integration.web.conftest`. `--setup-show` confirmed the autouse fixtures `_composer_available_for_phase3` and `_fenced_compose_for_legacy_tests`.
+
+| # | Probe | Finding | Outcome | Exit | Log |
+|---|---|---|---|---|---|
+| 1 | Aggregation/coalesce Stage-1 vs runtime validity | N1 | **confirmed** | 0 | `$L/probe1.log` |
+| 2 | Scripted freeform turn with the gate-`on_success` pair | N1 (turn) | **confirmed** | 0 (4 passed) | `$L/probe2.log` |
+| 3 | MCP `persist_directory="/etc/x"` | §3.1 MCP row | **confirmed** admission; caught later by preview | 0 (6 passed) | `$L/probe3.log` |
+| 4 | Review status after a queue insertion | N4 | **confirmed**, worse than hypothesised | 0 (1 passed) | `$L/probe4.log` |
+| 5 | Existing suites touched by §6.1, before any change | baseline | **inconclusive** (a baseline by construction: it tests no finding; 307 passed) | 0 | `$L/probe5.log` |
+
+**Probe 1** (`cd $WT && <prefix> PYTHONPATH=$L:$WT:$WT/src:$WT/elspeth-lints/src <venv>/bin/python $L/probe1_n1_agg_coalesce.py $L`).
+- Base fixture: `_state()` with the source and sink repointed under `managed_blob_directory(<scratch>)/<sid>` and `<scratch>/outputs/<sid>`. Each node was authored with public `execute_tool("upsert_node", validate_arguments=True)`.
+- The lane report's aggregation options (`actual_field`, `predicted_field`) had to name two different fields: the plugin refuses identical ones. The source schema gained a `label` column for this.
+- Runtime used `validate_pipeline_for_trained_operator(state, SimpleNamespace(data_dir=<scratch>), yaml_generator, session_id=<sid>)`.
+
+```text
+                                      (stage1 is_valid, runtime is_valid)
+AGG  ctl_pos  on_success=side                 (True,  True)
+AGG  ctl_iso  no inert field                  (False, False)  node:t1 node_input_not_reachable
+AGG  probe    fork_to=[side]                  (True,  False)  "No producer for connection 'side'"
+AGG  probe    routes={true: side}             (True,  False)  same
+COAL ctl_pos  merged -> gate g2 true:side     (True,  True)
+COAL ctl_iso  no inert field                  (False, False)  node:t1 node_input_not_reachable
+COAL probe    routes={true: side}             (True,  False)  same
+COAL probe    fork_to=[side]                  (True,  False)  same
+lowered aggregation keys: input,name,on_error,on_success,options,plugin   (no fork_to/routes)
+lowered coalesce keys:    branches,merge,name,on_success,policy           (no fork_to/routes)
+```
+
+**Probe 2** (`$L/run_pytest.sh probe2 $L/test_probe2_n1_turn.py --setup-show`).
+- Harness: cloned from the set_source lane. It runs `_run_one_turn_for_test` on an auto-commit session with a real `data_dir`. The primary model is a scripted `_call_llm` (`create_autospec`), the advisor checkpoint is patched with `_clean_advisor_checkpoint`, and every litellm alias is guarded.
+- Arm a: the model authors gate `g` (`routes {true: result, false: discard}`, `on_success: side`) and transform `t1` (`input: side`), then says "Done."
+- Both tool results said `success: true, is_valid: true` with no errors.
+- The loop then injected the following message twice (5 LLM awaits in total):
+
+```text
+[composer-system] Pre-finalisation runtime preflight found contract violation(s) …
+1. [?:transform_t1_e7eff0f8b3dc] No producer for connection 'side'. Did you mean: middle?
+```
+
+The message names `t1` but not `g`, and carries no error code.
+- Arm b adds a `preview_pipeline` call. Its `runtime_preflight.errors[0]` is `component_id=transform_t1_…, component_type=null, error_code=null`, with the same message.
+- Controls:
+  - isolation (no `on_success`): the t1 result is already `is_valid: false` with `node:t1 node_input_not_reachable`;
+  - positive (gate `routes true: side`): preview runtime preflight `is_valid: true`.
+- Incidental: the persisted `preview_pipeline` tool row carries `_unknown_response` and no `runtime_preflight`, so the failure the model saw is not in the stored transcript row.
+
+**Probe 3** (`$L/run_pytest.sh probe3 $L/test_probe3_mcp_persist_directory.py`).
+
+| Arm | Route | `persist_directory` | Result |
+|---|---|---|---|
+| A | `composer_mcp.server._dispatch_tool` | `/etc/x` | `success: true`, version 1→2, stored `/etc/x` |
+| A | `composer_mcp.server._dispatch_tool` | `outputs/chroma` | `success: true`, version 1→2, stored `outputs/chroma` |
+| B | shipped `_build_stdio_server` (set_source, upsert_node, set_output, preview_pipeline) | `/etc/x` | upsert `success: true`; preview Stage-1 valid, runtime preflight fails `path_allowlist` ("Path traversal blocked …") |
+| B | same | in-root | `path_allowlist` passes; preflight fails later on unrelated `plugin_instantiation` |
+| C | web-style `execute_tool` with `data_dir` and `session_id` | `/outside-session/…` | refused `provider_config_path_policy_invalid`, version unchanged |
+| C | same | in-root | `success: true` |
+
+In both arm B runs, `generate_yaml` omitted both the key `persist_directory` and the authored value, while the same export did contain `rag_retrieval` and `docs` (positive control). `/etc/x` did not exist after the run.
+
+**Probe 4** (`$L/run_pytest.sh probe4 $L/test_probe4_n4_review.py`).
+- Fixture: the owned `_reviewed_shield_state()` from `test_transform_tools_review_and_guard_parity.py`. Every call was public `execute_tool(validate_arguments=True)`.
+
+```text
+ctl_baseline              resolved  hash==derived True   pending []                       materialize CompositionState
+probe_queue (upsert)      resolved  hash==derived False  pending []                       materialize RAISED InterpretationReviewIntegrityError … hash drifted   success True v1->2
+ctl_nonqueue_remove_mid   pending   -                    pending [classify pipeline_decision] materialize InterpretationReviewPending  success True
+followup_after_queue      upsert_node new passthrough -> success False review_reconciliation_failed "… 'prompt_injection_shield_review:classify' hash drifted"
+recovery_remove_queue     remove_node inbound        -> success False review_reconciliation_failed (same)
+patch_classify            patch_node_options classify {temperature: 0.0} -> success False review_reconciliation_failed (same)
+remove_classify           remove_node classify       -> success True v2->3 (only tested escape: deletes the reviewed node)
+followup_control_no_queue same upsert on the un-queued state -> success True, review kept resolved and coherent
+```
+
+On the un-queued state, `patch_node_options` is refused for a different reason (`plugin_options_invalid`: the fixture's hand-built `llm` options lack `schema`), so that call is not a clean control. `remove_node classify` also succeeds there. The `set_pipeline` control could not discriminate. The owned fixture's hand-built `web_scrape` options fail bulk prevalidation (`plugin_options_invalid`), both for an unchanged resubmission and with the queue added. It is recorded as not run.
+
+**Probe 5** (`cd $WT && <prefix> PYTHONPATH=$WT/src:$WT/elspeth-lints/src TMPDIR=$L/tmp <venv>/bin/python -m pytest tests/unit/web/composer/test_tool_schema_contract.py tests/unit/web/composer/test_producer_resolver.py tests/unit/web/composer/test_transform_rejection_contracts.py -n 0 -p no:cacheprovider -o pythonpath="$WT/src $WT/elspeth-lints/src"`): `exit=0`, 307 passed. This is the pre-change baseline for §6.1 items 2 and 3, for the N1 fix (including the `_runtime_connection_targets` AST pin) and for the queue refusal tests. It is not a test of any finding.
 
 ## Runtime argument schema and measured exposure
 

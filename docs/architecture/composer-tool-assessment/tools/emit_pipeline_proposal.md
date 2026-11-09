@@ -63,8 +63,12 @@ Admission has one durable effect before any user decision. A candidate whose
 the operation fence during plan construction. The blob id is deterministic and
 the write is idempotent ([custody](../../../../src/elspeth/web/composer/pipeline_planner.py#L3110),
 [reservation](../../../../src/elspeth/web/blobs/service.py#L2804)), so an
-unchanged resubmission reuses the blob. Whether a later refused or stale proposal
-releases that blob has not been traced. The model receives no user-visible reply
+unchanged resubmission reuses the blob. A scripted run shows the `ready` blob row
+and its file exist while no proposal row exists yet. Nothing on the rejection
+path releases the blob. Pipeline rejection touches only the proposal, proposal-event
+and session tables, and every blob-row delete belongs to explicit deletion, fork
+cleanup or pending-reservation cleanup (§7, `emit_pipeline_proposal-N4`). A refused
+proposal therefore leaves its inline blob in the session. The model receives no user-visible reply
 channel: the staged turn's message is one of the fixed `PIPELINE_STAGED_*` server
 strings ([protocol](../../../../src/elspeth/web/composer/protocol.py#L209)), and
 any prose the model sends with the accepted terminal call is not delivered.
@@ -172,8 +176,8 @@ focused protocol tests give counterevidence to those claims.
 
 **Provisional findings from the sheet review** (the coordinator will renumber them):
 
-- **`emit_pipeline_proposal-N1` — demonstrated by introspection, source-established
-  as dead code.** The missing-source branch
+- **`emit_pipeline_proposal-N1` — demonstrated (scripted planner run plus
+  two-gate mutation, §7).** The missing-source branch
   ([L4515](../../../../src/elspeth/web/composer/pipeline_planner.py#L4515)) cannot be
   reached from provider input. Its helper's docstring says "Both `source` and
   `sources` are optional on the terminal schema"
@@ -185,13 +189,25 @@ focused protocol tests give counterevidence to those claims.
   ([tests](../../../../tests/unit/web/composer/test_pipeline_planner.py#L4287)).
   The test named `..._gets_bounded_no_source_repair` asserts schema feedback, not
   `no_source_configured`. No incorrect behaviour reaches the planner. The
-  documentation and branch are stale.
-- **`emit_pipeline_proposal-N2` — source-established, intent unverified.** The same
+  documentation and branch are stale. The mutation run shows the branch is
+  reachable only when both gates are removed. With the precheck `oneOf` removed,
+  Pydantic still answers `canonical_schema` (rule `value_error`). With the
+  source-xor validator also neutered, the branch fires `no_source_configured`.
+  The dead branch's feedback carries an `explanation` and a `suggested_fix`. The
+  live path gives the model only `{"path":"pipeline","rule":"oneOf"}`, the same
+  for a missing source and for both sources (enhancements 1 and 4).
+- **`emit_pipeline_proposal-N2` — demonstrated (scripted planner run, §7), intent
+  unverified.** The same
   model mistake, a terminal that is not alone, is repairable with a discovery
   sibling but fatal with a recovery sibling. The recovery check at
   [L4352](../../../../src/elspeth/web/composer/pipeline_planner.py#L4352) runs before
   the terminal check at [L4401](../../../../src/elspeth/web/composer/pipeline_planner.py#L4401).
-  No test covers terminal plus recovery.
+  The run ended terminal + `handoff_to_user` (either order) and terminal +
+  `restore_parked_graph` with `MALFORMED_RESPONSE` "recovery control must be the only
+  tool call". Each made one provider request, with no dispatch and no candidate
+  construction. The same happened with an escape hatch configured. Terminal +
+  `list_sources` was repaired by `TERMINAL_CALL_NOT_ALONE`. No repository test
+  covers terminal plus recovery.
   `test_mixed_recovery_batch_is_rejected_before_dispatch` uses `list_sources` with
   `handoff_to_user`. The per-request instruction says only that "a mixed terminal batch
   executes no calls" ([L1936](../../../../src/elspeth/web/composer/pipeline_planner.py#L1936)).
@@ -203,12 +219,18 @@ focused protocol tests give counterevidence to those claims.
   `test_unparseable_arguments_below_cap_without_length_finish_stay_fatal`
   ([tests](../../../../tests/unit/web/composer/test_pipeline_planner_protocol_rejections.py#L257)).
   The tool description gives no hint that these mistakes are unrecoverable.
-- **`emit_pipeline_proposal-N4` — source-established effect-disclosure gap.**
+- **`emit_pipeline_proposal-N4` — demonstrated effect-disclosure gap (scripted
+  run for the pre-approval write; controlled static trace for retention, §7).**
   Admitting a candidate with `inline_blob` writes a durable session blob before
-  user approval (§2). A planner proposal can also be auto-committed without
+  user approval (§2). The run found one `ready` row with `created_by="assistant"`
+  and its file, and zero proposal rows. A candidate that is not admitted leaves
+  no residue. A planner proposal can also be auto-committed without
   per-proposal review under `auto_commit` with a green preflight. Neither effect is
-  stated in the tool description or the skills. Cleanup of the blob after a
-  refused or stale proposal is **unverified**.
+  stated in the tool description or the skills. No rejection or settlement path
+  releases the blob, so it outlives a refused proposal. The only blob-row deletes
+  found are explicit `delete_blob`, fork cleanup and pending-reservation cleanup.
+  Session-deletion cascade was not traced. Runtime reject-then-query was not exercised.
+  Whether retention is intended is a maintainer decision.
 - **`emit_pipeline_proposal-N5` — intended (test-pinned), audit consequence.** On a
   `PlannerHandoff`, staging passes `private_candidates=()`
   ([L1191](../../../../src/elspeth/web/composer/planning_application.py#L1191);
@@ -397,7 +419,7 @@ The review located but did not independently execute all proposal-lifecycle and
 runtime acceptance tests. No live provider, PostgreSQL contention or browser
 execution was exercised.
 
-The sheet review ran no tests. It used two read-only introspections with both
+The original sheet review ran no tests. It used two read-only introspections with both
 source roots on `PYTHONPATH`, and `elspeth.__file__` resolved into this checkout.
 (1) `Draft202012Validator(canonical_set_pipeline_schema())`: the known-good
 single-source document gave no errors. Omitting both sources and supplying both
@@ -406,7 +428,27 @@ each gave only `oneOf` at `['oneOf']`, and `source: null` gave `type`.
 `handoff_to_user`, `restore_parked_graph`, `emit_pipeline_proposal`. The terminal
 carries `strict: False` on `openai_strict` and no `strict` key on `none`. Neither
 `set_pipeline` nor `request_interpretation_review` is in the discovery set.
-N2's fatal outcome and N4's blob-retention question are source traces only.
+
+**Probe runs (2026-11-09, production tree `3b28d537b`).** `$WT` is the worktree and
+`$L` is `.claude/lanes/composer-sheet-review-20261109/probes/emit_pipeline_proposal`
+in the main checkout. The ad-hoc probe files live in `$L`, not in
+`tests/`. They import the planner unit-test helpers and load the four test conftests as
+plugins: `pytest $L/<probe>.py -c $WT/pyproject.toml --rootdir=$WT -p tests.conftest
+-p tests.unit.conftest -p tests.unit.web.conftest -p tests.unit.web.composer.conftest -n 0 -s`.
+Every run printed `elspeth.__file__` and `pipeline_planner.__file__` under the tree
+being measured. Each mutant ran against its own copy. For mutA and mutB, `$WT/src` was replaced by
+`$L/<variant>/src` in both `PYTHONPATH` and `-o pythonpath`, and `redaction.__file__`
+was printed as well. All three resolved into the variant copy. The worktree's named
+test ids ran in the brief's fixed pytest form.
+
+| Probe | Finding | Outcome | Exit | Observed |
+|---|---|---|---|---|
+| `$L/test_probe_n2.py` | N2 | confirmed | 0 | Controls discriminate. (a) `list_sources`+`handoff_to_user` → `MALFORMED_RESPONSE`. (b) `list_sources`+terminal → `TERMINAL_CALL_NOT_ALONE` on both calls, then accepted with `repair_count=1`. Probe: terminal+`handoff_to_user` (both orders), terminal+`restore_parked_graph`, and terminal+handoff with a hatch configured each gave `MALFORMED_RESPONSE` "recovery control must be the only tool call". Each made 1 provider request, with dispatch and `build_set_pipeline_candidate` called 0 times. One private candidate `received_not_dispatched` and one attempt `response/malformed_response/terminal`. |
+| 3 named ids in [test_pipeline_planner.py](../../../../tests/unit/web/composer/test_pipeline_planner.py) (`…_bounded_no_source_repair`, `…_each_get_schema_feedback`, `test_escape_hatch_retains_terminal_candidate_across_pre_custody_rejections`) | N1 control | confirmed | 0 | 4 passed (3 ids, one parametrized). |
+| `$L/test_probe_n1.py` on baseline, mutA, mutB | N1 mutation | confirmed | 0 / 0 / 0 (probe); 0 / 1 / 1 (controls) | mutA is a lane copy of `src/` with `oneOf` stripped at the planner precheck call site. mutB is mutA plus the `_exactly_one_source_configuration` raise neutered. Missing source, by tree: baseline `canonical_schema` `rule: oneOf`; mutA `canonical_schema` `rule: value_error`; mutB `no_source_configured` with explanation and suggested fix. Both sources, by tree: baseline `oneOf`; mutA `value_error`; mutB `source_binding_ambiguous`. Controls: mutA 2 failed and 2 passed; mutB 3 failed and 1 passed. |
+| `$L/test_probe_n4.py` plus id `test_invalid_inline_draft_exhaustion_leaves_zero_pre_custody_residue` | N4 pre-approval write | confirmed | 0 / 0 | Admitted inline candidate: blob rows went 0 → 1, `ready`, `created_by="assistant"`, id equal to the bound `source.blob_id`, file on disk, and 0 `composition_proposals` rows. Negative control: a non-admitted inline candidate leaves 0 rows and 0 files. |
+| `$L/n4-static-trace.log` (grep/awk, controlled) | N4 release on reject/stale | confirmed (static) | 0 | Known-positive: the custody write sites are found. Every `blobs_table` delete in `src/elspeth/web` traces to one of three paths. (1) Explicit deletion: `delete_blob` → `_delete_blob_with_ledger` → `_commit_blob_deletion_plan` → `commit_blob_deletion`. (2) Pending-row cleanup inside `_persist_fenced_blob_record`: `discard_pending_blob` on failed create, and `_reconcile_abandoned_creations_locked` → `retire_abandoned_blob_reservation`. `_discard_nonidempotent_reservation` deletes only `status == "pending"`. (3) Fork cleanup from the fork route. The rejection modules: `pipeline_rejection_custody.py` has 0 `blob` mentions and `pipeline_settlement.py` has 1 (the storage-ceiling setting). The reject handler body in `proposals.py` (L724–860) has 0. That file's other 20 mentions are on the accept path, which shows the grep is live. The `SessionServiceImpl` rejection methods touch only `composition_proposals_table`, `proposal_events_table` and `sessions_table`. A runtime reject-then-query was not exercised. |
+
 Source/local protocol confidence is high; a claim of
 full end-to-end readiness would be unsupported. Unifying lifecycle receipts has
 high integrity/compatibility risk if authored identity, required controls,
