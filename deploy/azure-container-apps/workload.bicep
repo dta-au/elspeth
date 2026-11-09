@@ -86,6 +86,10 @@ param composerTransportIdleCeilingSeconds int
 @minValue(1)
 param composerMaxCompositionTurns int
 
+@description('REQUIRED, NO DEFAULT. Prompt-token limit of the model gateway in front of the composer; the context budgeter sheds history to stay under it. Set it to the gateway\'s actual limit.')
+@minValue(1)
+param composerContextMaxPromptTokens int
+
 @description('Maximum tool turns for a discovery request.')
 @minValue(1)
 param composerMaxDiscoveryTurns int
@@ -327,6 +331,7 @@ var contractEnvironment = [
     value: string(composerTransportIdleCeilingSeconds)
   }
   { name: 'ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS', value: string(composerMaxCompositionTurns) }
+  { name: 'ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS', value: string(composerContextMaxPromptTokens) }
   { name: 'ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS', value: string(composerMaxDiscoveryTurns) }
   { name: 'ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS', value: string(composerTimeoutSeconds) }
   { name: 'ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE', value: string(composerRateLimitPerMinute) }

@@ -23,6 +23,7 @@ def reserved_environment: [
   "ELSPETH_WEB__SECRET_KEY", "ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY",
   "ELSPETH_FINGERPRINT_KEY", "ELSPETH_WEB__OPERATOR_METRICS_BEARER_TOKEN",
   "AZURE_CLIENT_ID", "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS",
+  "ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS",
   "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS", "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS",
   "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE", "ELSPETH_WEB__AUTH_PROVIDER",
   "ELSPETH_WEB__REGISTRATION_MODE", "ELSPETH_WEB__COMPOSER_ENDPOINT_BASE_URL",
@@ -50,7 +51,7 @@ def reserved_environment: [
 (.candidateSourceSha | concrete and test("^[0-9a-f]{40}$")) and
 (.revisionSuffix | concrete and test("^[a-z][a-z0-9-]*[a-z0-9]$") and length <= 64 and (contains("--") | not)) and
 (.composerTransportIdleCeilingSeconds | positive_integer and . <= 240) and
-([.composerMaxCompositionTurns, .composerMaxDiscoveryTurns,
+([.composerMaxCompositionTurns, .composerContextMaxPromptTokens, .composerMaxDiscoveryTurns,
   .composerTimeoutSeconds, .composerRateLimitPerMinute] | all(positive_integer)) and
 (.composerTransportIdleCeilingSeconds > 30) and
 (.authProvider | IN("oidc", "entra", "vanguard", "google")) and

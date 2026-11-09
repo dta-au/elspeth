@@ -137,6 +137,10 @@ against each parameter file, never on Bicep text.
 - `composerMaxCompositionTurns`, `composerMaxDiscoveryTurns`,
   `composerTimeoutSeconds`, `composerRateLimitPerMinute` — required runtime
   budgets, supplied to web and both doctors. `extraEnvironment` is web-only.
+- `composerContextMaxPromptTokens` — required, no default: the prompt-token
+  limit of your model gateway, which the context budgeter keeps each planner
+  request under. The shipped `200000` is a placeholder; set your gateway's
+  actual limit.
 - `authProvider` — explicit nonlocal production authentication, with SSO
   settings, first administrator subject and quota defaults in `extraEnvironment`;
   keep `registrationMode=closed`. Local authentication would put SQLite on NFS.
