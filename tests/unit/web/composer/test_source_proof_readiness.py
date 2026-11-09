@@ -864,6 +864,7 @@ async def test_all_terminal_entrances_preserve_the_source_stop_across_end(
         settings=_make_settings(
             data_dir=tmp_path,
             composer_max_composition_turns=1 if entrance == "composition_cap" else 5,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=1 if entrance == "discovery_cap" else 10,
         ),
     )

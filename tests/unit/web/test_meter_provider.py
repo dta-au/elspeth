@@ -48,6 +48,7 @@ def test_meter_provider_is_not_noop(tmp_path: Path) -> None:
     settings = WebSettings(
         data_dir=tmp_path,
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
@@ -131,6 +132,7 @@ def test_metrics_endpoint_returns_prometheus_format(tmp_path: Path) -> None:
     settings = WebSettings(
         data_dir=tmp_path,
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,

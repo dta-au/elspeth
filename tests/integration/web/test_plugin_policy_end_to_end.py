@@ -247,6 +247,7 @@ def _profiles(policy: WebPluginPolicy) -> OperatorProfileRegistry:
     settings = WebSettings(
         secret_key="0123456789abcdef0123456789abcdef",
         composer_max_composition_turns=4,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=4,
         composer_timeout_seconds=60,
         composer_rate_limit_per_minute=20,
@@ -845,6 +846,7 @@ def test_server_profile_scope_survives_lowering_and_same_name_user_shadow(
     resolver = ScopedSecretResolver(service, "local")
     settings = WebSettings(
         composer_max_composition_turns=4,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=4,
         composer_timeout_seconds=60,
         composer_rate_limit_per_minute=20,
@@ -906,6 +908,7 @@ def test_validate_pipeline_resolves_server_profile_before_plugin_construction(
     settings = WebSettings(
         data_dir=tmp_path,
         composer_max_composition_turns=4,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=4,
         composer_timeout_seconds=60,
         composer_rate_limit_per_minute=20,
@@ -1066,6 +1069,7 @@ def _required_control_posture(tmp_path: Path) -> tuple[WebSettings, PluginAvaila
         data_dir=tmp_path,
         composer_model="test/planner",
         composer_max_composition_turns=3,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=2,
         composer_timeout_seconds=20.0,
         composer_rate_limit_per_minute=10,
