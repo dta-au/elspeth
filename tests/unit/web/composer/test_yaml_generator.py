@@ -21,11 +21,13 @@ from elspeth.web.composer.yaml_generator import (
     _PUBLIC_SOURCE_LINKAGE_KEYS,
     _PUBLIC_STORAGE_OPTION_KEYS,
     PUBLIC_EXPORT_REBIND_GUIDANCE,
+    PUBLIC_EXPORT_REDACTED_NODE_MARKER_PREFIX,
     PUBLIC_EXPORT_REDACTED_OUTPUT_MARKER_PREFIX,
     PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX,
     PUBLIC_EXPORT_REDACTION_HEADER,
     _generate_pipeline_dict,
     generate_pipeline_dict,
+    generate_public_composition_dict,
     generate_public_pipeline_dict,
     generate_public_yaml,
     generate_yaml,
@@ -1671,9 +1673,10 @@ class TestPublicExportRedactionMarker:
     def test_public_export_redaction_reports_stripped_keys_per_component(self) -> None:
         assert public_export_redaction(self._redacted_state()) == {
             "sources": {"source": ["blob_ref", "path"]},
+            "nodes": {},
             "outputs": {"out": ["path"]},
         }
-        assert public_export_redaction(self._clean_state()) == {"sources": {}, "outputs": {}}
+        assert public_export_redaction(self._clean_state()) == {"sources": {}, "nodes": {}, "outputs": {}}
 
     def test_marker_labels_cover_every_stripped_key(self) -> None:
         """A new storage/linkage key must not KeyError inside a user's export.
@@ -1684,3 +1687,108 @@ class TestPublicExportRedactionMarker:
         here rather than 500-ing the export route.
         """
         assert set(_MARKER_LABELS) == _PUBLIC_STORAGE_OPTION_KEYS | _PUBLIC_SOURCE_LINKAGE_KEYS
+
+
+_NODE_MARKER_BLOB_ID = "22222222-2222-4222-8222-222222222222"
+_NODE_MARKER_SHA256 = "ab" * 32
+_NODE_INLINE_MARKER = {
+    "blob_ref": _NODE_MARKER_BLOB_ID,
+    "mode": "inline_content",
+    "sha256": _NODE_MARKER_SHA256,
+    "encoding": "utf-8",
+}
+
+
+class TestPublicProjectionRemovesNodeBlobMarkers:
+    """A transform's uploaded-file marker leaves the public projection whole.
+
+    Transforms bind an uploaded file through a widened ``blob_ref`` marker
+    nested anywhere in their options (``reference_join`` lookup tables,
+    file-backed prompts). The recursive projection used to drop only the
+    marker's ``blob_ref`` key, leaving a headless ``{mode, sha256, encoding}``
+    fragment in share snapshots, library publications and exports: no longer
+    a marker, still carrying the source file's digest, and accounted for
+    nowhere in the redaction report.
+    """
+
+    @staticmethod
+    def _state(node_options: dict[str, object]) -> CompositionState:
+        return CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="lookup",
+                options={"schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            ),
+            nodes=(
+                NodeSpec(
+                    id="lookup",
+                    node_type="transform",
+                    plugin="reference_join",
+                    input="source_out",
+                    on_success="out",
+                    on_error="discard",
+                    options=node_options,
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+            ),
+            edges=(),
+            outputs=(OutputSpec(name="out", plugin="json", options={}, on_write_failure="discard"),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def test_keyed_marker_is_removed_whole(self) -> None:
+        state = self._state({"tables": {"t": {"reference_content": _NODE_INLINE_MARKER, "reference_format": "csv"}}})
+
+        public = generate_public_composition_dict(state)
+
+        assert public["nodes"][0]["options"] == {"tables": {"t": {"reference_format": "csv"}}}
+
+    def test_marker_in_a_list_is_removed_whole(self) -> None:
+        state = self._state({"parts": ["intro", _NODE_INLINE_MARKER, "outro"]})
+
+        public = generate_public_composition_dict(state)
+
+        assert public["nodes"][0]["options"] == {"parts": ["intro", "outro"]}
+
+    def test_no_fragment_or_file_digest_reaches_public_yaml(self) -> None:
+        state = self._state({"tables": {"t": {"reference_content": _NODE_INLINE_MARKER, "reference_format": "csv"}}})
+
+        rendered = generate_public_yaml(state)
+
+        assert _NODE_MARKER_SHA256 not in rendered
+        assert "inline_content" not in rendered
+        assert _NODE_MARKER_BLOB_ID not in rendered
+
+    def test_ordinary_nested_option_mappings_survive(self) -> None:
+        """Negative control: only blob-linkage mappings are removed."""
+        options = {"tables": {"t": {"reference_content": "id,name\n1,a\n", "reference_format": "csv"}}, "schema": {"mode": "observed"}}
+
+        public = generate_public_composition_dict(self._state(options))
+
+        assert public["nodes"][0]["options"] == options
+
+    def test_redaction_reports_each_removed_node_marker_by_option_path(self) -> None:
+        state = self._state(
+            {
+                "tables": {"t": {"reference_content": _NODE_INLINE_MARKER, "reference_format": "csv"}},
+                "parts": ["intro", _NODE_INLINE_MARKER],
+            }
+        )
+
+        assert public_export_redaction(state)["nodes"] == {"lookup": ["parts[1]", "tables.t.reference_content"]}
+
+    def test_redaction_header_names_the_node(self) -> None:
+        state = self._state({"tables": {"t": {"reference_content": _NODE_INLINE_MARKER, "reference_format": "csv"}}})
+
+        header = public_export_redaction_header(state)
+
+        assert f"{PUBLIC_EXPORT_REDACTED_NODE_MARKER_PREFIX}lookup stripped=blob-linkage" in header
+        assert _NODE_MARKER_BLOB_ID not in header
+        assert _NODE_MARKER_SHA256 not in header

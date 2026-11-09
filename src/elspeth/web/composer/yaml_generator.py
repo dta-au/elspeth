@@ -491,8 +491,19 @@ def _recursive_public_option_projection(
     strip_storage_here: bool = False,
     custody_subtree: bool = False,
     strip_bind_source_mode: bool = False,
+    path: str = "",
+    removed_blob_markers: list[str] | None = None,
 ) -> Any:
-    """Project options without treating arbitrary plugin data as custody."""
+    """Project options without treating arbitrary plugin data as custody.
+
+    A nested mapping carrying ``blob_ref`` is a widened blob marker (plugin
+    configs are ``extra="forbid"``, so the key is web-side linkage). It is
+    removed WHOLE: dropping only its ``blob_ref`` would leave a headless
+    ``{mode, sha256, encoding}`` fragment that names no file yet still
+    carries the file's digest. Each removed marker's option path is appended
+    to ``removed_blob_markers`` when a list is supplied, so the redaction
+    account is produced by the scrub itself and cannot drift from it.
+    """
     if isinstance(value, Mapping):
         projected: dict[str, Any] = {}
         for key, nested in value.items():
@@ -502,23 +513,39 @@ def _recursive_public_option_projection(
                 continue
             if strip_bind_source_mode and key == "mode" and nested == "bind_source":
                 continue
+            child_path = f"{path}.{key}" if path else str(key)
+            if isinstance(nested, Mapping) and "blob_ref" in nested:
+                if removed_blob_markers is not None:
+                    removed_blob_markers.append(child_path)
+                continue
             child_custody_subtree = custody_subtree or key in _PUBLIC_CUSTODY_SUBTREE_KEYS
             projected[key] = _recursive_public_option_projection(
                 nested,
                 custody_subtree=child_custody_subtree,
                 strip_bind_source_mode=False,
+                path=child_path,
+                removed_blob_markers=removed_blob_markers,
             )
         return projected
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [
-            _recursive_public_option_projection(
-                item,
-                strip_storage_here=strip_storage_here,
-                custody_subtree=custody_subtree,
-                strip_bind_source_mode=strip_bind_source_mode,
+        items: list[Any] = []
+        for index, item in enumerate(value):
+            item_path = f"{path}[{index}]"
+            if isinstance(item, Mapping) and "blob_ref" in item:
+                if removed_blob_markers is not None:
+                    removed_blob_markers.append(item_path)
+                continue
+            items.append(
+                _recursive_public_option_projection(
+                    item,
+                    strip_storage_here=strip_storage_here,
+                    custody_subtree=custody_subtree,
+                    strip_bind_source_mode=strip_bind_source_mode,
+                    path=item_path,
+                    removed_blob_markers=removed_blob_markers,
+                )
             )
-            for item in value
-        ]
+        return items
     return value
 
 
@@ -581,15 +608,19 @@ def generate_yaml(state: CompositionState) -> str:
 
 
 class PublicExportRedaction(TypedDict):
-    """What the public projection stripped, per component (top-level options).
+    """What the public projection stripped, per component.
 
-    Keys are component names; values are the sorted top-level option keys the
-    projection removed (storage path carriers and blob linkage). Components
-    that lost nothing are absent, so an empty mapping pair means the export
-    is complete as-is.
+    Keys are component names (node ids for ``nodes``). For sources and
+    outputs, values are the sorted top-level option keys the projection
+    removed (storage path carriers and blob linkage). For nodes, values are
+    the sorted option paths (``tables.t.reference_content``, ``parts[1]``)
+    of the uploaded-file markers the projection removed whole. Components
+    that lost nothing are absent, so all-empty mappings mean the export is
+    complete as-is.
     """
 
     sources: dict[str, list[str]]
+    nodes: dict[str, list[str]]
     outputs: dict[str, list[str]]
 
 
@@ -598,10 +629,15 @@ class PublicExportRedaction(TypedDict):
 # so exporter and importer share one authority. Do not re-derive them.
 PUBLIC_EXPORT_REDACTION_HEADER = "# ELSPETH public export — custody-redacted; NOT runnable as exported."
 PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX = "# redacted-source: "
+PUBLIC_EXPORT_REDACTED_NODE_MARKER_PREFIX = "# redacted-node: "
 PUBLIC_EXPORT_REDACTED_OUTPUT_MARKER_PREFIX = "# redacted-output: "
 PUBLIC_EXPORT_REBIND_GUIDANCE = (
     "Re-bind each redacted source on import by uploading its data to the target session and passing "
     'source_blob_ids={"<source name>": "<session blob id>"}; sink paths are re-authored on import.'
+)
+PUBLIC_EXPORT_NODE_REBIND_GUIDANCE = (
+    "Each redacted node lost an uploaded file it read; upload that file to the target session and "
+    "attach it to the named option again after import."
 )
 
 _PUBLIC_SOURCE_LINKAGE_KEYS = frozenset({"blob_ref", "blob_id"})
@@ -623,12 +659,18 @@ def public_export_redaction(state: CompositionState) -> PublicExportRedaction:
         stripped = sorted(key for key in source.options if key in _PUBLIC_STORAGE_OPTION_KEYS or key in _PUBLIC_SOURCE_LINKAGE_KEYS)
         if stripped:
             sources[source_name] = stripped
+    nodes: dict[str, list[str]] = {}
+    for node in state.nodes:
+        removed_markers: list[str] = []
+        _recursive_public_option_projection(node.options, removed_blob_markers=removed_markers)
+        if removed_markers:
+            nodes[node.id] = sorted(removed_markers)
     outputs: dict[str, list[str]] = {}
     for output in state.outputs:
         stripped = sorted(key for key in output.options if key in _PUBLIC_STORAGE_OPTION_KEYS or key == "blob_id")
         if stripped:
             outputs[output.name] = stripped
-    return {"sources": sources, "outputs": outputs}
+    return {"sources": sources, "nodes": nodes, "outputs": outputs}
 
 
 def sources_reading_uploaded_blobs(state: CompositionState) -> tuple[str, ...]:
@@ -674,14 +716,20 @@ def public_export_redaction_header(state: CompositionState) -> str:
     derived from the same state the body is.
     """
     redaction = public_export_redaction(state)
-    if not redaction["sources"] and not redaction["outputs"]:
+    if not redaction["sources"] and not redaction["nodes"] and not redaction["outputs"]:
         return ""
     lines = [PUBLIC_EXPORT_REDACTION_HEADER]
     for source_name, keys in redaction["sources"].items():
         lines.append(f"{PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX}{source_name} stripped={_marker_labels(keys)}")
+    for node_id in redaction["nodes"]:
+        # Option paths stay off the prose line (they are data on the
+        # structured route response); every node entry is blob linkage.
+        lines.append(f"{PUBLIC_EXPORT_REDACTED_NODE_MARKER_PREFIX}{node_id} stripped={_MARKER_LABELS['blob_ref']}")
     for output_name, keys in redaction["outputs"].items():
         lines.append(f"{PUBLIC_EXPORT_REDACTED_OUTPUT_MARKER_PREFIX}{output_name} stripped={_marker_labels(keys)}")
     lines.append(f"# {PUBLIC_EXPORT_REBIND_GUIDANCE}")
+    if redaction["nodes"]:
+        lines.append(f"# {PUBLIC_EXPORT_NODE_REBIND_GUIDANCE}")
     return "\n".join(lines) + "\n"
 
 

@@ -3025,8 +3025,83 @@ sinks:
         # the bind_source "mode" marker is web-layer bookkeeping and stays out.
         assert body["redaction"] == {
             "stripped_source_options": {"source": ["blob_ref", "path"]},
+            "stripped_node_options": {},
             "stripped_output_options": {"out": ["path"]},
             "blob_linked_sources": ["source"],
+            "rebind_guidance": PUBLIC_EXPORT_REBIND_GUIDANCE,
+        }
+        assert body["yaml"].startswith(PUBLIC_EXPORT_REDACTION_HEADER)
+
+    @pytest.mark.asyncio
+    async def test_yaml_export_accounts_for_a_node_file_marker_it_removed(self, tmp_path: Path) -> None:
+        """A transform's uploaded-file marker is removed whole and named.
+
+        Before the fix the export kept a headless ``{mode, sha256, encoding}``
+        fragment in the node's options and returned no redaction account at
+        all, because nothing else in this graph was stripped.
+        """
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        blob_id = "22222222-2222-4222-8222-222222222222"
+        file_digest = "cd" * 32
+        session = await service.create_session("alice", "Node file", "local")
+        await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(
+                source={
+                    "plugin": "csv",
+                    "on_success": "lookup_in",
+                    "options": {"schema": {"mode": "observed"}},
+                    "on_validation_failure": "discard",
+                },
+                nodes=[
+                    {
+                        "id": "lookup",
+                        "node_type": "transform",
+                        "plugin": "reference_join",
+                        "input": "lookup_in",
+                        "on_success": "out",
+                        "on_error": "discard",
+                        "options": {
+                            "tables": {
+                                "t": {
+                                    "reference_content": {
+                                        "blob_ref": blob_id,
+                                        "mode": "inline_content",
+                                        "sha256": file_digest,
+                                        "encoding": "utf-8",
+                                    },
+                                    "reference_format": "csv",
+                                }
+                            }
+                        },
+                    }
+                ],
+                outputs=[{"name": "out", "plugin": "json", "options": {}, "on_write_failure": "discard"}],
+                metadata_={"name": "Node file", "description": ""},
+                is_valid=True,
+            ),
+            provenance="session_seed",
+        )
+
+        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
+            return ValidationResult(is_valid=True, checks=[], errors=[])
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
+            resp = client.get(f"/api/sessions/{session.id}/state/yaml")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert blob_id not in json.dumps(body, sort_keys=True)
+        assert file_digest not in json.dumps(body, sort_keys=True)
+        exported_node_options = yaml.safe_load(body["yaml"])["transforms"][0]["options"]
+        assert exported_node_options == {"tables": {"t": {"reference_format": "csv"}}}
+        assert body["redaction"] == {
+            "stripped_source_options": {},
+            "stripped_node_options": {"lookup": ["tables.t.reference_content"]},
+            "stripped_output_options": {},
+            "blob_linked_sources": [],
             "rebind_guidance": PUBLIC_EXPORT_REBIND_GUIDANCE,
         }
         assert body["yaml"].startswith(PUBLIC_EXPORT_REDACTION_HEADER)

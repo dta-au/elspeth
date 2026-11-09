@@ -230,9 +230,12 @@ class StateYamlRedaction(TypedDict):
     ``identity_sidecar``) forbids blob identity beside the scrubbed YAML,
     which is why ``blob_linked_sources`` carries the sources whose
     verified blob linkage was stripped rather than the ids themselves.
+    ``stripped_node_options`` names, per node id, the option paths of the
+    uploaded-file markers the projection removed from that node.
     """
 
     stripped_source_options: dict[str, list[str]]
+    stripped_node_options: dict[str, list[str]]
     stripped_output_options: dict[str, list[str]]
     blob_linked_sources: list[str]
     rebind_guidance: str
@@ -1414,9 +1417,10 @@ async def get_state_yaml(
 
         response: StateYamlResponse = {"yaml": yaml_str}
         export_redaction = public_export_redaction(state)
-        if export_redaction["sources"] or export_redaction["outputs"]:
+        if export_redaction["sources"] or export_redaction["nodes"] or export_redaction["outputs"]:
             response["redaction"] = {
                 "stripped_source_options": export_redaction["sources"],
+                "stripped_node_options": export_redaction["nodes"],
                 "stripped_output_options": export_redaction["outputs"],
                 # Names from the custody-verified sidecar map; the UUID values
                 # stay server-side (scrub ruling 2304d57fb).
