@@ -235,14 +235,10 @@ Examples of complete workflow scope, whether built atomically or in batches:
 
 ### Step Descriptions
 
-Every source, node, and output accepts an optional `description`: one short
-sentence of plain prose saying what that step does, shown to human reviewers on
-the Spec tab beside the raw config. Supply it whenever you create a step, and
-refresh it whenever you change what the step does — a stale description is
-worse than none. Describe the step's purpose in the user's terms ("Fetch each
-page at its url"), not its plugin mechanics. Descriptions are informational
-only: they never affect validation, routing, or execution, and they are not a
-substitute for review — the reviewer approves the actual configuration.
+The capability core defines the optional `description` on every source, node,
+and output. Describe the step's purpose in the user's terms ("Fetch each page
+at its url"), not its plugin mechanics, and refresh it whenever you change what
+the step does — a stale description is worse than none.
 
 ## Reply Register
 
@@ -1281,10 +1277,6 @@ tool; opt-out skips the human card, not the audit row.
 | `llm_model_choice` | backend (auto-staged when `options.model` is set) | YOU | Never author the row. Call when you author the model identifier and the user did not name the exact slug verbatim. Use `user_term="llm_model_choice:<node_id>"` and omit `llm_draft`; the server resolves current `options.model`. A profile-bound node (`options.profile`) has NO model-choice card. Surface the required card before ending; pending user approval is a valid terminal handoff. |
 | `source_data_contract` | backend (computed from current graph demand) | YOU | Request on current missing source fields for a source the composer cannot preflight; omit `llm_draft`. Never author a row or field list. |
 
-None of this matrix's vocabulary belongs in user prose — the register rule
-governs how every kind is described to the user (approval cards to review
-and approve).
-
 A registered `pipeline_decision` demanded by policy or this skill is NEVER
 waived because the user's instruction already made the decision — the review
 row RECORDS that decision for the audit trail. User authorship changes the
@@ -1422,9 +1414,6 @@ repairs.
 Do not stop in pending-review state when raw scraped content cleanup is
 implemented only by a sink name, output name, metadata text, or direct
 LLM/scraper-to-sink route.
-Do not call `request_interpretation_review` or tell the user review cards are
-waiting while the latest mutation reports non-review validation errors; repair
-the topology first, then surface the review cards.
 Review acceptance is not required before adding a missing schema-proven cleanup
 transform or repairing a dead cleanup stream; carry the pending review requirements
 forward and repair the structure first.
@@ -1485,7 +1474,6 @@ These are common one-shot mappings:
 | Consumer requires fields not produced upstream | Correct the upstream producer, or narrow the consumer's `required_input_fields` if the requirement was overstated. On an `llm` node, narrowing alone trades one rejection for another: a `prompt_template` may not read a `row.<field>` its `required_input_fields` omits, so drop the template reference in the same edit. |
 | A cleanup or projection transform consumes a field that no upstream node guarantees, and the user-requested producer is absent from the current graph | Restore the missing producer node — this is the silent-downgrade pattern from **Requested Workflow Integrity**. The cleanup transform's field requirements are the trace of what the dropped node was supposed to produce. Do not repair by deleting requested result mappings. Resubmit the full `set_pipeline` with the missing node restored and wired before the cleanup transform. Reapply the model-node review preflight when the restored node is a model transform. |
 | `set_pipeline` rejected with "Duplicate consumer for connection" | A single upstream output is wired to two or more consumers. Insert a gate node between the upstream and the two consumers, or restructure so each connection has exactly one consumer. Do not remove either consumer node to resolve the conflict; the user requested both. |
-| `set_pipeline` rejected due malformed or invalid tool arguments | Rebuild the same requested topology with valid tool arguments and retry the full `set_pipeline`; do not stop or shrink the workflow. |
 | Rejected `set_pipeline` used `source.inline_blob` and the source blob is absent afterward | Failed mutations do not create reusable blobs. Resubmit with the same corrected `source.inline_blob`, or where your palette offers `create_blob` call it with the same artifact and retry using the returned `blob_id`; do not ask for a blob id. |
 | Generated source path is outside the allowed blob directory | Keep the generated artifact, create a blob from the generated rows, bind it as the source, and retry the complete workflow. Do not ask for an upload or replace the source with an imaginary path. |
 | Rejected pipeline included a fake review, recommendation, or placeholder node | Remove the fake node from the next full `set_pipeline` arguments, put the requirement in `interpretation_requirements` on the real source/LLM/cleanup node, and retry the full topology. Do not call `remove_node`; rejected mutations did not persist that node. |
