@@ -118,6 +118,13 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("composer/provider_discovery_response.py", "to_wire", "code"),
         ("composer/provider_discovery_response.py", "to_wire", "self.error_code"),
         ("composer/tools/generation.py", "_execute_explain_validation_error", "code"),
+        # The exact explain_validation_code catalogue lookup succeeds before
+        # the input is echoed as a canonical code; unknown text is not echoed.
+        ("composer/tools/generation.py", "_execute_explain_validation_error", "error_text"),
+        # Selected only from catalogue keys bound by identity to the matched
+        # record; ambiguous/unowned prose omits it. The subset pin below
+        # requires every catalogue key to belong to the closed registry.
+        ("composer/tools/generation.py", "_execute_explain_validation_error", "matched_code"),
         # Source-proof completion retains detector-owned blocking codes (the
         # _blocking_diagnostic closed set is pinned below) and existing
         # state.validate() entries, whose producers this census already scans.
@@ -333,6 +340,27 @@ class TestRegistryCensus:
     def test_instrument_flags_a_planted_unreviewed_forwarder(self) -> None:
         planted = "def f(state, code):\n    return _failure_result(state, 'm', error_code=code)\n"
         assert _unreviewed_forwarders(_code_sites("planted.py", planted)) == {("planted.py", "f", "code")}
+
+    @pytest.mark.parametrize("expression", ["error_text", "matched_code"])
+    def test_diagnostic_code_forwarder_is_reviewed_at_its_exact_site(self, expression: str) -> None:
+        source = f"def _execute_explain_validation_error():\n    return {{'error_code': {expression}}}\n"
+        sites = _code_sites("composer/tools/generation.py", source)
+        assert len(sites) == 1 and not sites[0].is_literal, "probe premise: one nonliteral forwarding site"
+        assert _unreviewed_forwarders(sites) == set()
+
+    @pytest.mark.parametrize("expression", ["error_text", "matched_code"])
+    @pytest.mark.parametrize("changed", ["expression", "function", "path"])
+    def test_diagnostic_code_forwarder_review_does_not_cover_a_changed_site(self, expression: str, changed: str) -> None:
+        path = "composer/tools/generation.py"
+        function = "_execute_explain_validation_error"
+        if changed == "expression":
+            expression = f"{expression}_unreviewed"
+        elif changed == "function":
+            function = "_execute_unreviewed_diagnostic"
+        else:
+            path = "composer/tools/unreviewed_generation.py"
+        source = f"def {function}():\n    return {{'error_code': {expression}}}\n"
+        assert _unreviewed_forwarders(_code_sites(path, source)) == {(path, function, expression)}
 
     def test_every_emitted_literal_code_is_registered(self) -> None:
         assert _unregistered_literals(_live_code_sites()) == set()
