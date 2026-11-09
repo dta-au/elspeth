@@ -2516,6 +2516,75 @@ async def test_get_shareable_link_keeps_the_original_lifespan(
     assert payload.expires_at - payload.created_at == timedelta(seconds=86400)
 
 
+@pytest.mark.asyncio
+async def test_preview_lists_each_file_once_with_every_use(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+):
+    blob_service = _FakeBlobService()
+    blob_id = blob_service.add(session_record.id, filename="customers.csv", content=b"id,name\n1,Ada\n")
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=_file_bound_state(state_record, source_blob=blob_id, node_value=_inline_marker(blob_id)),
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+        blob_service=blob_service,
+    )
+
+    response = await service.preview_shareable_files(session_id=session_record.id, session_operation_context=session_operation_context)
+
+    assert response.importable is True
+    assert response.not_importable_reason is None
+    assert [(f.filename, f.size_bytes, f.used_by) for f in response.files] == [
+        ("customers.csv", len(b"id,name\n1,Ada\n"), ["source 'source'", "node 'lookup' (tables.t.reference_content)"])
+    ]
+    assert blob_service.reads == [blob_id]
+    assert set(blob_service.contexts) == {session_operation_context}
+
+
+@pytest.mark.asyncio
+async def test_preview_reports_llm_authored_file_as_not_importable(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+):
+    blob_service = _FakeBlobService()
+    user_blob = blob_service.add(session_record.id, filename="customers.csv", content=b"id\n1\n")
+    llm_blob = blob_service.add(
+        session_record.id,
+        filename="notes.txt",
+        content=b"assistant wrote this\n",
+        mime_type="text/plain",
+        creation_modality=CreationModality.LLM_GENERATED,
+    )
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=_file_bound_state(state_record, source_blob=user_blob, node_value=_inline_marker(llm_blob)),
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+        blob_service=blob_service,
+    )
+
+    response = await service.preview_shareable_files(session_id=session_record.id, session_operation_context=session_operation_context)
+
+    assert response.importable is False
+    assert response.not_importable_reason == "'notes.txt' was written by the assistant and cannot be shared for import"
+    assert sorted(f.filename for f in response.files) == ["customers.csv", "notes.txt"]
+
+
 def _v2_blob(**overrides: object) -> dict[str, Any]:
     blob: dict[str, Any] = {
         "pipeline_metadata": {"name": "Demo", "description": ""},

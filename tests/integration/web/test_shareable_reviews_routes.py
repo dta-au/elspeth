@@ -30,7 +30,7 @@ from elspeth.core.canonical import canonical_json
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
-from elspeth.web.sessions.models import blobs_table, composer_completion_events_table
+from elspeth.web.sessions.models import blobs_table, chat_messages_table, composer_completion_events_table
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.shareable_reviews.signer import ShareTokenPayload
 from tests.fixtures.identities import ensure_test_identity
@@ -549,6 +549,114 @@ def test_get_shared_inspect_blob_expired_returns_404(
     assert response.status_code == 404
 
 
+def _seed_uploaded_file_source(client: TestClient, session_id: UUID, content: bytes) -> dict[str, str]:
+    uploaded = client.post(
+        f"/api/sessions/{session_id}/blobs",
+        files={"file": ("customers.csv", content, "text/csv")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    blob = uploaded.json()
+    with client.app.state.session_engine.connect() as conn:
+        storage_path = conn.execute(select(blobs_table.c.storage_path).where(blobs_table.c.id == blob["id"])).scalar_one()
+    state_d = _passthrough_composition_state(client.app.state.settings.data_dir, session_id).to_dict()
+    state_d["sources"]["source"]["options"].update({"path": storage_path, "blob_ref": blob["id"]})
+    asyncio.run(
+        _save_composition_state_with_compose_authority(
+            client.app.state.session_service,
+            session_id,
+            CompositionStateData(
+                sources=state_d["sources"],
+                nodes=state_d["nodes"],
+                edges=state_d["edges"],
+                outputs=state_d["outputs"],
+                metadata_=state_d["metadata"],
+                is_valid=True,
+                validation_errors=None,
+            ),
+            provenance="session_seed",
+        )
+    )
+    return {"id": blob["id"], "content_hash": blob["content_hash"], "storage_path": storage_path}
+
+
+def test_preview_lists_each_file_once_with_every_use(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    client, session_id = audit_readiness_client_with_state
+    content = b"id,name\n1,Ada\n"
+    _seed_uploaded_file_source(client, session_id, content)
+
+    response = client.get(f"/api/sessions/{session_id}/shareable-files")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "files": [{"filename": "customers.csv", "size_bytes": len(content), "used_by": ["source 'source'"]}],
+        "importable": True,
+        "not_importable_reason": None,
+    }
+
+
+def test_preview_reports_llm_authored_file_as_not_importable(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    client, session_id = audit_readiness_client_with_state
+    seeded = _seed_uploaded_file_source(client, session_id, b"id\n1\n")
+    with client.app.state.session_engine.begin() as conn:
+        conn.execute(
+            chat_messages_table.insert().values(
+                id="msg-1",
+                session_id=str(session_id),
+                role="user",
+                content="please write notes",
+                sequence_no=1,
+                writer_principal="route_user_message",
+                created_at=datetime.now(UTC),
+            )
+        )
+        conn.execute(
+            blobs_table.update()
+            .where(blobs_table.c.id == seeded["id"])
+            .values(
+                creation_modality="llm_generated",
+                created_from_message_id="msg-1",
+                creating_model_identifier="model",
+                creating_model_version="1",
+                creating_provider="provider",
+                creating_composer_skill_hash="a" * 64,
+                creating_arguments_hash="b" * 64,
+            )
+        )
+
+    response = client.get(f"/api/sessions/{session_id}/shareable-files")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["importable"] is False
+    assert body["not_importable_reason"] == "'customers.csv' was written by the assistant and cannot be shared for import"
+    assert [f["filename"] for f in body["files"]] == ["customers.csv"]
+
+
+def test_preview_route_is_owner_only_404_for_other_user(
+    audit_readiness_test_client: TestClient,
+    audit_readiness_other_user_session_id: UUID,
+) -> None:
+    response = audit_readiness_test_client.get(f"/api/sessions/{audit_readiness_other_user_session_id}/shareable-files")
+    assert response.status_code == 404
+
+
+def test_preview_response_contains_no_blob_identity(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    client, session_id = audit_readiness_client_with_state
+    seeded = _seed_uploaded_file_source(client, session_id, b"id,name\n1,Ada\n")
+
+    response = client.get(f"/api/sessions/{session_id}/shareable-files")
+
+    assert response.status_code == 200, response.text
+    for private in (seeded["id"], seeded["storage_path"], seeded["content_hash"]):
+        assert private not in response.text
+
+
 def test_review_write_endpoints_use_write_bucket_and_resolve_stays_strict(
     audit_readiness_client_with_state: tuple[TestClient, UUID],
 ) -> None:
@@ -560,6 +668,8 @@ def test_review_write_endpoints_use_write_bucket_and_resolve_stays_strict(
     assert r1.status_code in (200, 409)
     r2 = client.get(f"/api/sessions/{session_id}/shareable-link")
     assert r2.status_code in (200, 409)
+    r3 = client.get(f"/api/sessions/{session_id}/shareable-files")
+    assert r3.status_code == 200
     # get_shared_inspect (token resolve) remains strict: the second
     # resolve trips the limit=1 strict bucket.
     token = "not-a-real-token"

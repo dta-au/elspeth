@@ -98,6 +98,25 @@ class ShareableLinkResponse(_StrictResponse):
     payload_digest: str
 
 
+class ShareableFileView(_StrictResponse):
+    """One file an importable share would carry, as the owner sees it.
+
+    Deliberately carries no blob id, storage path or content hash.
+    """
+
+    filename: str
+    size_bytes: int
+    used_by: list[str]
+
+
+class ShareableFilesResponse(_StrictResponse):
+    """Returned by ``GET /api/sessions/{session_id}/shareable-files``."""
+
+    files: list[ShareableFileView]
+    importable: bool
+    not_importable_reason: str | None
+
+
 # ── Strict Pydantic mirrors of CompositionState dataclasses ──────────────
 #
 # These models are the wire-boundary contract for the inspect response.

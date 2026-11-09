@@ -118,6 +118,8 @@ from elspeth.web.shareable_reviews.file_manifest import (
 from elspeth.web.shareable_reviews.models import (
     CompositionStateResponse,
     MarkReadyForReviewResponse,
+    ShareableFilesResponse,
+    ShareableFileView,
     ShareableLinkResponse,
     SharedInspectResponse,
 )
@@ -367,6 +369,27 @@ def _check_shareable_blob(record: BlobRecord, content: bytes | None) -> str | No
     if len(content) != record.size_bytes or hashlib.sha256(content).hexdigest() != record.content_hash:
         return f"'{name}' does not match its recorded content and cannot be shared for import"
     return None
+
+
+@dataclass(frozen=True, slots=True)
+class _InspectedFile:
+    """One bound blob as read and judged: ``refusal`` is ``None`` when it can travel."""
+
+    bindings: list[FileBinding]
+    record: BlobRecord | None
+    content: bytes | None
+    refusal: str | None
+
+
+def _describe_use(binding: FileBinding) -> str:
+    """Name where a file is used, for the owner's preview."""
+    if binding.kind in ("source_blob_ref", "source_blob_rows"):
+        return f"source '{binding.source_name}'"
+    if binding.field_path is None:
+        raise RuntimeError("inline_content binding without a field_path")
+    owner, _, path = binding.field_path.partition(".options.")
+    kind, _, name = owner.partition(":")
+    return f"{kind} '{name}' ({path})"
 
 
 def _binding_site(binding: FileBinding) -> str:
@@ -911,6 +934,94 @@ class ShareableReviewService:
 
     # ── private helpers ─────────────────────────────────────────────
 
+    async def _inspect_bound_files(
+        self,
+        composition_state: CompositionState,
+        *,
+        session_operation_context: SessionOperationContext,
+        stop_on_refusal: bool,
+    ) -> tuple[list[_InspectedFile], str | None]:
+        """Read each file ``composition_state`` binds once and judge it.
+
+        Returns one ``_InspectedFile`` per distinct blob, in collector order,
+        and a refusal for a binding collection that is itself malformed. The
+        share freeze and the owner's preview both go through here, so they
+        refuse for exactly the same reasons. With ``stop_on_refusal`` the walk
+        ends at the first refused file (the freeze raises on it); without it
+        every file is judged (the preview lists what it can).
+        """
+        try:
+            bound = collect_file_bindings(composition_state)
+        except ShareManifestError as exc:
+            return [], f"a file in this pipeline cannot be shared for import: {exc.detail}"
+        bindings_by_blob: dict[UUID, list[FileBinding]] = {}
+        for item in bound:
+            bindings_by_blob.setdefault(item.blob_id, []).append(item.binding)
+
+        inspected: list[_InspectedFile] = []
+        for blob_id, bindings in bindings_by_blob.items():
+            try:
+                record = await self._blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
+            except BlobNotFoundError:
+                inspected.append(
+                    _InspectedFile(
+                        bindings=bindings,
+                        record=None,
+                        content=None,
+                        refusal=f"the file used by {_binding_site(bindings[0])} no longer exists; reattach it before sharing for import",
+                    )
+                )
+                if stop_on_refusal:
+                    break
+                continue
+            content: bytes | None = None
+            refusal: str | None = None
+            if record.status == "ready":
+                try:
+                    content = await self._blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context)
+                except (BlobNotFoundError, BlobStateError):
+                    refusal = f"'{record.filename}' changed while preparing the share; retry"
+            if refusal is None:
+                refusal = _check_shareable_blob(record, content)
+            inspected.append(_InspectedFile(bindings=bindings, record=record, content=content, refusal=refusal))
+            if refusal is not None and stop_on_refusal:
+                break
+        return inspected, None
+
+    async def preview_shareable_files(
+        self,
+        *,
+        session_id: UUID,
+        session_operation_context: SessionOperationContext,
+    ) -> ShareableFilesResponse:
+        """List the files an importable share of the current state would carry.
+
+        Same refusal rules as ``mark_ready_for_review(allow_import=True)``,
+        reported instead of raised. Reads blobs under the caller's context and
+        stores nothing. The response names no blob id, path or hash.
+        """
+        state_record = await self._session_service.get_current_state(session_id)
+        if state_record is None:
+            return ShareableFilesResponse(files=[], importable=False, not_importable_reason="No composition state exists for this session")
+        inspected, collect_refusal = await self._inspect_bound_files(
+            state_from_record(state_record), session_operation_context=session_operation_context, stop_on_refusal=False
+        )
+        reason = collect_refusal
+        views: dict[str, ShareableFileView] = {}
+        for item in inspected:
+            if item.refusal is not None and reason is None:
+                reason = item.refusal
+            if item.record is None:
+                continue
+            # Identical bytes travel as one file, so list them once.
+            key = item.record.content_hash if item.record.content_hash is not None else str(item.record.id)
+            view = views.setdefault(key, ShareableFileView(filename=item.record.filename, size_bytes=item.record.size_bytes, used_by=[]))
+            for binding in item.bindings:
+                label = _describe_use(binding)
+                if label not in view.used_by:
+                    view.used_by.append(label)
+        return ShareableFilesResponse(files=list(views.values()), importable=reason is None, not_importable_reason=reason)
+
     async def _verify_shareable_files(
         self,
         composition_state: CompositionState,
@@ -927,42 +1038,20 @@ class ShareableReviewService:
         become one manifest entry carrying both blobs' binding sites; the
         first blob's filename and MIME type name it.
         """
-        try:
-            bound = collect_file_bindings(composition_state)
-        except ShareManifestError as exc:
-            raise CompositionNotRunnableError(
-                reason="file_not_shareable",
-                detail=f"a file in this pipeline cannot be shared for import: {exc.detail}",
-            ) from exc
-        bindings_by_blob: dict[UUID, list[FileBinding]] = {}
-        for item in bound:
-            bindings_by_blob.setdefault(item.blob_id, []).append(item.binding)
-
+        inspected, collect_refusal = await self._inspect_bound_files(
+            composition_state, session_operation_context=session_operation_context, stop_on_refusal=True
+        )
+        if collect_refusal is not None:
+            raise CompositionNotRunnableError(reason="file_not_shareable", detail=collect_refusal)
         frozen_by_sha: dict[str, _FrozenFile] = {}
-        for blob_id, bindings in bindings_by_blob.items():
-            try:
-                record = await self._blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
-            except BlobNotFoundError:
-                raise CompositionNotRunnableError(
-                    reason="file_not_shareable",
-                    detail=f"the file used by {_binding_site(bindings[0])} no longer exists; reattach it before sharing for import",
-                ) from None
-            content: bytes | None = None
-            if record.status == "ready":
-                try:
-                    content = await self._blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context)
-                except (BlobNotFoundError, BlobStateError):
-                    raise CompositionNotRunnableError(
-                        reason="file_not_shareable",
-                        detail=f"'{record.filename}' changed while preparing the share; retry",
-                    ) from None
-            refusal = _check_shareable_blob(record, content)
-            if refusal is not None:
-                raise CompositionNotRunnableError(reason="file_not_shareable", detail=refusal)
-            # _check_shareable_blob returned None, so the bytes were read and
-            # match the row's non-null content_hash.
-            if content is None or record.content_hash is None:
-                raise RuntimeError("_check_shareable_blob passed a blob without verified content")
+        for item in inspected:
+            if item.refusal is not None:
+                raise CompositionNotRunnableError(reason="file_not_shareable", detail=item.refusal)
+            record, content, bindings = item.record, item.content, item.bindings
+            # No refusal, so the bytes were read and match the row's
+            # non-null content_hash.
+            if record is None or content is None or record.content_hash is None:
+                raise RuntimeError("_inspect_bound_files passed a blob without verified content")
             binding_json = [file_binding_to_json(binding) for binding in bindings]
             if record.content_hash in frozen_by_sha:
                 frozen_by_sha[record.content_hash].entry["bindings"].extend(binding_json)

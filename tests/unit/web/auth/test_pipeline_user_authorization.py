@@ -93,7 +93,7 @@ _PIPELINE_USER_ROUTES: dict[str, frozenset[str]] = {
     ),
     "src/elspeth/web/secrets/routes.py": frozenset({"list_secrets", "create_secret", "delete_secret", "validate_secret"}),
     "src/elspeth/web/preferences/routes.py": frozenset({"get_preferences", "update_preferences"}),
-    "src/elspeth/web/shareable_reviews/routes.py": frozenset({"mark_ready_for_review", "get_shareable_link"}),
+    "src/elspeth/web/shareable_reviews/routes.py": frozenset({"mark_ready_for_review", "get_shareable_link", "get_shareable_files"}),
     "src/elspeth/web/composer/tutorial_run_routes.py": frozenset(
         {"get_tutorial_sample", "get_readiness", "run_tutorial", "cancel_tutorial", "delete_tutorial_orphans"}
     ),

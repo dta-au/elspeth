@@ -635,6 +635,7 @@ _STATE_MATERIALIZATION_DISPOSITIONS = {
     "src/elspeth/web/sessions/service.py:SessionServiceImpl.resolve_interpretation_event._sync.state_from_record": "interpretation_internal",
     "src/elspeth/web/sessions/service.py:SessionServiceImpl._settle_pipeline_composition_proposal._sync.state_from_record": "proposal_internal",
     "src/elspeth/web/shareable_reviews/service.py:ShareableReviewService.mark_ready_for_review.state_from_record": "validation_guard_downstream",
+    "src/elspeth/web/shareable_reviews/service.py:ShareableReviewService.preview_shareable_files.state_from_record": "read_only_diagnostics",
     "src/elspeth/web/shareable_reviews/service.py:_build_snapshot.state_from_record": "validated_publication",
 }
 

@@ -1,9 +1,10 @@
 """FastAPI router for the shareable-reviews endpoints.
 
-Phase 6A Task 6 (UX redesign 2026-05). Three routes:
+Phase 6A Task 6 (UX redesign 2026-05). Four routes:
 
 * ``POST /api/sessions/{session_id}/mark-ready-for-review``
 * ``GET  /api/sessions/{session_id}/shareable-link``
+* ``GET  /api/sessions/{session_id}/shareable-files``
 * ``GET  /api/sessions/shared/{token}``
 
 The first two require ``verify_session_ownership`` — same byte-identical
@@ -41,6 +42,7 @@ from elspeth.web.sessions.protocol import SessionServiceProtocol
 from elspeth.web.shareable_reviews.models import (
     MarkReadyForReviewRequest,
     MarkReadyForReviewResponse,
+    ShareableFilesResponse,
     ShareableLinkResponse,
     SharedInspectResponse,
 )
@@ -56,7 +58,7 @@ _NO_STORE = "no-store"
 def create_shareable_reviews_router() -> APIRouter:
     """Create the shareable-reviews router.
 
-    Three endpoints; see module docstring for the access-control matrix.
+    Four endpoints; see module docstring for the access-control matrix.
     """
     router = APIRouter(tags=["shareable-reviews"])
 
@@ -156,6 +158,44 @@ def create_shareable_reviews_router() -> APIRouter:
             result = await service.get_shareable_link(session_id=session_id, user_id=user.user_id)
         except CompositionNotRunnableError as exc:
             raise HTTPException(status_code=409, detail=exc.detail or exc.reason) from exc
+        return JSONResponse(
+            content=result.model_dump(mode="json"),
+            headers={"Cache-Control": _NO_STORE},
+        )
+
+    @router.get(
+        "/api/sessions/{session_id}/shareable-files",
+        response_model=ShareableFilesResponse,
+    )
+    async def get_shareable_files(
+        session_id: UUID,
+        request: Request,
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
+        # Write bucket: a cheap DB read for the owner's share dialog, not an LLM call.
+        rate_limiter: WebRateLimiter = Depends(get_write_rate_limiter),  # noqa: B008
+    ) -> JSONResponse:
+        """List the files an importable share of the current state would carry.
+
+        Owner-only (404 for anyone else). Reads blobs but writes nothing, so
+        it takes BLOB_READ authority rather than a COMPOSE lease and never
+        conflicts with a live compose. A graph that cannot be shared for
+        import answers 200 with ``importable: false`` and the reason.
+        """
+        await rate_limiter.check(user.user_id)
+        await verify_session_ownership(session_id, user, request)
+        service: ShareableReviewService = request.app.state.shareable_review_service
+        session_service: SessionServiceProtocol = request.app.state.session_service
+        lease = await SessionOperationLease.acquire(
+            session_service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.BLOB_READ,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
+        try:
+            result = await service.preview_shareable_files(session_id=session_id, session_operation_context=lease.context)
+        finally:
+            await lease.close()
         return JSONResponse(
             content=result.model_dump(mode="json"),
             headers={"Cache-Control": _NO_STORE},
