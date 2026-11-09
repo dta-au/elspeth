@@ -1020,15 +1020,21 @@ async def test_retained_operation_context_reaches_selected_planner_wire(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("equal_current", [False, True], ids=["new", "already-current"])
 async def test_happy_path_returns_proposal_and_audits_exact_marked_wire_payload(
     tmp_path: Path,
     tool_context: ToolContext,
+    equal_current: bool,
 ) -> None:
     pipeline = _pipeline(tmp_path)
     completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": pipeline})))
     recorder = BufferingRecorder()
     lifecycle_events: list[str] = []
     policy = _budget()
+    context, _, _ = _candidate_context(tmp_path, _TEST_SESSION_ID)
+    candidate = build_set_pipeline_candidate(pipeline, _empty_state(), context)
+    assert candidate.acceptable
+    current = candidate.result.updated_state if equal_current else _empty_state()
 
     proposal = await _plan(
         tmp_path=tmp_path,
@@ -1037,11 +1043,20 @@ async def test_happy_path_returns_proposal_and_audits_exact_marked_wire_payload(
         recorder=recorder,
         budget=policy,
         lifecycle=_lifecycle(lifecycle_events),
+        current_state=current,
     )
 
     assert deep_thaw(proposal.proposal.pipeline) == pipeline
     assert proposal.proposal.base == AbsentBase()
     assert proposal.proposal.repair_count == 0
+    if equal_current:
+        from elspeth.web.composer.pipeline_proposal import composition_content_hash
+
+        assert proposal.candidate_state is not None
+        assert composition_content_hash(proposal.candidate_state) == composition_content_hash(current)
+        # Terminal authoring is represented by the accepted DONE attempt;
+        # it must not manufacture an executor dispatch to prove equality.
+        assert recorder.invocations == ()
     assert lifecycle_events == ["before", "scope-enter", "scope-exit", "settled:complete"]
     assert len(completion.requests) == 1
     sent = completion.requests[0]

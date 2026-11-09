@@ -659,6 +659,12 @@ class PlanningApplication:
             required_work=required_work,
             visible_tool_events=visible_tool_events,
         )
+        if plan.candidate_state is not None and composition_content_hash(plan.candidate_state) == composition_content_hash(state):
+            return ComposerResult(
+                message="The pipeline is unchanged; the finalized proposal already matches the current composition.",
+                state=state,
+                raw_assistant_content="",
+            )
         arguments = cast(dict[str, Any], deep_thaw(plan.proposal.pipeline))
         redacted_arguments = redact_tool_call_arguments(
             "set_pipeline",

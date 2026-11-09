@@ -48,6 +48,223 @@ pytest_plugins = ("tests.unit.web.coordination.test_composer_operation_authority
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owned", [False, True], ids=["public", "owned"])
+@pytest.mark.parametrize(
+    "recovered,argument_site",
+    [(False, None), (True, None), (False, "build"), (False, "executor")],
+    ids=["fresh", "persisted-success", "build-argument", "executor-argument"],
+)
+async def test_real_canonical_terminal_refusal_http_rejects_once_without_state_publication(
+    operation_store, tmp_path, monkeypatch, owned, recovered, argument_site
+):
+    from dataclasses import replace
+
+    from sqlalchemy import func
+
+    from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+    from elspeth.core.canonical import stable_hash
+    from elspeth.web.catalog.policy_view import PolicyCatalogView
+    from elspeth.web.composer.audit import begin_dispatch, dispatch_with_audit
+    from elspeth.web.composer.pipeline_commit import _bind_executor_content_hash
+    from elspeth.web.composer.pipeline_proposal import (
+        PipelineProposal,
+        PresentBase,
+        composition_content_hash,
+        owned_composition_state_authority,
+        owned_composition_state_review_arguments,
+    )
+    from elspeth.web.composer.protocol import ToolArgumentError
+    from elspeth.web.composer.redaction import redact_tool_call_arguments
+    from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+    from elspeth.web.composer.tools import ToolContext, build_set_pipeline_candidate, execute_tool
+    from elspeth.web.dependencies import create_catalog_service
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+    from elspeth.web.sessions.models import chat_messages_table, composition_states_table
+    from elspeth.web.sessions.protocol import CompositionStateData
+    from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
+    from tests.integration.web.composer.test_pipeline_proposal_lifecycle import _runnable_pipeline
+    from tests.unit.web.coordination.test_composer_operation_authority import start
+
+    engine, repository, _authority, service, sid = operation_store
+    record, running = start(operation_store)
+    context = running.session_operation_context
+    from uuid import UUID
+
+    user = await service.add_message_with_transcript(
+        sid,
+        "user",
+        "Keep the current pipeline",
+        operation_id=UUID(record.operation_id),
+        requested_state_id=None,
+        writer_principal="route_user_message",
+        session_operation_context=context,
+        running=running,
+    )
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    public = _runnable_pipeline(tmp_path, sid)
+    empty = _initial_composition_state()
+    candidate = build_set_pipeline_candidate(
+        public,
+        empty,
+        ToolContext(
+            catalog=policy,
+            plugin_snapshot=snapshot,
+            data_dir=str(tmp_path),
+            session_id=str(sid),
+            session_engine=engine,
+            session_operation_context=context,
+            session_operation_authority=service.session_operation_authority,
+            user_id="alice",
+            require_data_dir_for_paths=True,
+        ),
+    )
+    assert candidate.acceptable
+    state = replace(candidate.result.updated_state, version=7)
+    payload = state.to_dict()
+    saved = await service.save_composition_state(
+        sid,
+        CompositionStateData(
+            sources=payload["sources"],
+            nodes=payload["nodes"],
+            edges=payload["edges"],
+            outputs=payload["outputs"],
+            metadata_=payload["metadata"],
+        ),
+        provenance="tool_call",
+        session_operation_context=context,
+    )
+    proposed = state
+    if argument_site == "executor":
+        proposed = replace(state, metadata=replace(state.metadata, name="Changed candidate"))
+        public["metadata"] = {"name": proposed.metadata.name, "description": proposed.metadata.description}
+    arguments = owned_composition_state_authority(proposed) if owned else public
+    plan = PipelinePlanResult(
+        proposal=PipelineProposal.create(
+            pipeline=arguments, base=PresentBase(saved.id, composition_content_hash(state)), repair_count=0, skill_hash=stable_hash("skill")
+        ),
+        tool_call_id="equal-terminal",
+        custody_result="not_required",
+        model_identifier="model",
+        model_version="v1",
+        provider="test",
+    )
+    row = await service.create_pipeline_composition_proposal(
+        session_id=sid,
+        plan=plan,
+        summary="Keep pipeline",
+        rationale="Requested",
+        affects=("graph",),
+        actor="composer-web:user:alice",
+        arguments_redacted_json=redact_tool_call_arguments(
+            "set_pipeline", owned_composition_state_review_arguments(arguments) if owned else arguments, telemetry=NoopRedactionTelemetry()
+        ),
+        composer_model_identifier="model",
+        composer_model_version="v1",
+        composer_provider="test",
+        session_operation_context=context,
+        user_message_id=user.message.id,
+    )
+    binding = None
+    if recovered:
+        recorder = BufferingRecorder()
+
+        async def dispatch():
+            return execute_tool(
+                "set_pipeline",
+                public,
+                state,
+                policy,
+                plugin_snapshot=snapshot,
+                data_dir=str(tmp_path),
+                session_id=str(sid),
+                session_engine=engine,
+                session_operation_context=context,
+                session_operation_authority=service.session_operation_authority,
+                user_id="alice",
+            )
+
+        outcome = await dispatch_with_audit(
+            recorder=recorder,
+            audit=begin_dispatch(row.tool_call_id, "set_pipeline", arguments, version_before=state.version, actor="user:alice"),
+            do_dispatch=dispatch,
+            version_after_provider=lambda result: result.updated_state.version,
+            arg_error_payload_factory=lambda exc: {"error_class": "ToolArgumentError", "error_code": exc.category.value},
+        )
+        assert outcome.result.success
+        invocation = _bind_executor_content_hash(
+            recorder.invocations[0], executor_content_hash=composition_content_hash(outcome.result.updated_state)
+        )
+        bindings = await _persist_tool_invocations(
+            service, sid, (invocation,), None, plugin_crash_pending=False, session_operation_context=context
+        )
+        (binding,) = bindings
+    repository.release(context)
+    app = mounted_app(operation_store, tmp_path)
+    import elspeth.web.composer.pipeline_commit as commit
+
+    def forbid_execution(*args, **kwargs):
+        pytest.fail("equal pending acceptance dispatched the executor")
+
+    argument_error = ToolArgumentError(
+        argument="set_pipeline arguments",
+        expected="object conforming to SetPipelineArgumentsModel",
+        actual_type="invalid_schema",
+        code="SCHEMA_VALIDATION",
+        category=ToolArgumentErrorCategory.SCHEMA_SHAPE,
+    )
+
+    def refuse_argument(*args, **kwargs):
+        raise argument_error
+
+    monkeypatch.setattr(commit, "execute_tool", refuse_argument if argument_site == "executor" else forbid_execution)
+    if argument_site == "build":
+        monkeypatch.setattr(commit, "build_set_pipeline_candidate", refuse_argument)
+    with engine.connect() as conn:
+        before = conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        url = f"/api/sessions/{sid}/proposals/{row.id}/accept"
+        response = await client.post(url, json={"draft_hash": plan.proposal.draft_hash})
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"]["error_type"] == ("proposal_argument_invalid" if argument_site else "proposal_no_change")
+        diagnosis = (
+            f"The composer's proposed change has invalid arguments: {argument_error.safe_message} "
+            if argument_site
+            else "The composer's proposed change does not change the current composition. "
+        )
+        assert response.json()["detail"]["detail"] == (
+            diagnosis + "The proposal has been automatically rejected. Ask the composer to revise and resubmit."
+        )
+        repeat = await client.post(url, json={"draft_hash": plan.proposal.draft_hash})
+        assert repeat.status_code == 409
+    reloaded = await service.get_authoritative_pipeline_proposal(session_id=sid, proposal_id=row.id)
+    assert reloaded.row.status == "rejected"
+    assert reloaded.row.committed_state_id is None
+    assert (await service.get_current_state(sid)).id == saved.id
+    events = proposal_events(engine, row.id)
+    assert len(events) == 1
+    assert events[0].actor == "system:pipeline_commit:user:alice"
+    assert events[0].payload["reason_code"] == ("validation_failed" if argument_site else "no_change")
+    assert events[0].payload["dispatch"] == (binding.to_dict() if binding is not None else None)
+    with engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 1
+        if argument_site != "executor":
+            assert conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one() == before
+        else:
+            audit_rows = conn.execute(select(chat_messages_table.c.tool_calls).where(chat_messages_table.c.role == "audit")).scalars().all()
+            invocations = [
+                item["invocation"]
+                for calls in audit_rows
+                if calls
+                for item in calls
+                if item["_kind"] == "audit" and item["invocation"]["tool_call_id"] == row.tool_call_id
+            ]
+            assert len(invocations) == 1
+            assert invocations[0]["status"] == "arg_error"
+
+
+@pytest.mark.asyncio
 @pytest.mark.timeout(30, method="thread")
 @pytest.mark.parametrize("rejection_outcome", ["returned", "raised", "unknown"])
 async def test_actual_manual_rejection_keeps_authority_read_outer_cancellations_on_later_outcome(
@@ -235,11 +452,16 @@ def proposal_events(engine, proposal_id):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("manual", [False, True])
-async def test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body(operation_store, tmp_path, monkeypatch, manual):
+@pytest.mark.parametrize(
+    "code,reason", [("VALIDATION_FAILED", "validation_failed"), ("NO_CHANGE", "no_change"), ("ARGUMENT_ERROR", "validation_failed")]
+)
+async def test_actual_canonical_failure_rejects_under_registered_child_and_keeps_body(
+    operation_store, tmp_path, monkeypatch, manual, code, reason
+):
     engine, repository, _authority, _service, sid = operation_store
     expected, running = await prepared_rejection(operation_store)
     app = mounted_app(operation_store, tmp_path)
-    body = PipelineCommitError("actual controlled validation failure", code="VALIDATION_FAILED")
+    body = PipelineCommitError("actual controlled validation failure", code=code)
 
     async def fail_candidate(**kwargs):
         raise body
@@ -263,6 +485,12 @@ async def test_actual_canonical_failure_rejects_under_registered_child_and_keeps
                 json={"draft_hash": expected.authority.proposal.draft_hash},
             )
         assert response.status_code == 422
+        if code in {"NO_CHANGE", "ARGUMENT_ERROR"}:
+            payload = response.json()["detail"]
+            assert "error_type" in payload, payload
+            assert payload["error_type"] == ("proposal_no_change" if code == "NO_CHANGE" else "proposal_argument_invalid")
+            assert payload["tool_name"] == "set_pipeline"
+            assert "automatically rejected" in payload["detail"]
         assert len(bound) == 1
         bound[0].assert_completed()
         receipts = bound[0].failure_receipts()
@@ -305,7 +533,111 @@ async def test_actual_canonical_failure_rejects_under_registered_child_and_keeps
     events = proposal_events(engine, expected.authority.row.id)
     assert len(events) == 1
     assert events[0].actor == "system:pipeline_commit:user:alice"
-    assert events[0].payload["reason_code"] == "validation_failed"
+    assert events[0].payload["reason_code"] == reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["before_sql", "after_sql"])
+async def test_no_change_required_rejection_keeps_exact_cancellations_and_projects_actual_sql(
+    operation_store, tmp_path, monkeypatch, boundary
+):
+    from elspeth.web.sessions.service import SessionServiceImpl
+
+    engine, repository, _authority, _service, _sid = operation_store
+    expected, running = await prepared_rejection(operation_store)
+    app = mounted_app(operation_store, tmp_path)
+    body = PipelineCommitError("pipeline proposal does not change the current composition", code="NO_CHANGE")
+
+    async def no_change(**kwargs):
+        raise body
+
+    monkeypatch.setattr(pipeline_settlement, "prepare_pipeline_proposal_commit", no_change)
+    parent = RequiredWorkCoordinator(
+        RequiredWorkAuthority(
+            RequiredAuthorityKind.DURABLE_COMPOSE,
+            running.session_operation_context,
+            running.claim.operation_id,
+            running.claim.attempt,
+        )
+    )
+    binding = RequiredWorkBinding(parent, 9, 13, RequiredWorkRole.TURN, running)
+    entered, release = threading.Event(), threading.Event()
+    handoffs = []
+    after_sql_cancel = asyncio.CancelledError("exact owned postSQL cancellation")
+    if boundary == "after_sql":
+        from elspeth.web.sessions import service as service_module
+
+        class CancelledCounter:
+            def add(self, amount, attributes):
+                raise after_sql_cancel
+
+        monkeypatch.setattr(service_module, "_PIPELINE_SETTLEMENT_COUNTER", CancelledCounter())
+
+    def park_sql(_conn, _cursor, statement, _parameters, _context, _many):
+        if boundary == "before_sql" and statement.startswith("UPDATE composition_proposals"):
+            entered.set()
+            assert release.wait(5)
+
+    actual_finish = SessionServiceImpl.reject_pipeline_composition_proposal_finish_once
+
+    async def observe_return(self, **kwargs):
+        handoff = await actual_finish(self, **kwargs)
+        handoffs.append(handoff)
+        return handoff
+
+    monkeypatch.setattr(SessionServiceImpl, "reject_pipeline_composition_proposal_finish_once", observe_return)
+    event.listen(engine, "before_cursor_execute", park_sql)
+    task = asyncio.create_task(
+        pipeline_settlement.settle_pipeline_proposal_under_compose_lock(
+            services=composer_app_services(app),
+            user_id="alice",
+            authority=expected.authority,
+            draft_hash=expected.authority.proposal.draft_hash,
+            session_operation_context=running.session_operation_context,
+            commit_timeout_seconds=5,
+            running=running,
+            required_work=parent,
+            required_binding=binding,
+        )
+    )
+    try:
+        if boundary == "before_sql":
+            async with asyncio.timeout(5):
+                while not entered.is_set():
+                    await asyncio.sleep(0.01)
+            for index in range(2):
+                task.cancel(f"no-change-{boundary}-{index}")
+                await asyncio.sleep(0.03)
+                assert not task.done()
+        release.set()
+        with pytest.raises(BaseExceptionGroup) as caught:
+            await task
+        leaves = originals(caught.value)
+        assert any(leaf is body for leaf in leaves)
+        assert len(handoffs) == 1
+        originals_delivered = handoffs[0].sql_outcome.deferred_cancellations if boundary == "before_sql" else handoffs[0].post_sql_failures
+        assert len(originals_delivered) == (2 if boundary == "before_sql" else 1)
+        if boundary == "after_sql":
+            assert originals_delivered[0] is after_sql_cancel
+        assert all(any(leaf is delivery for leaf in leaves) for delivery in originals_delivered)
+        parent.assert_completed()
+        producer = next(ticket for ticket in parent.tickets if ticket.key.source is RequiredWorkSource.REQUIRED_CONTINUATION_PRODUCER)
+        child = parent._child_registrations[producer]
+        sql = next(ticket for ticket in child.tickets if ticket.key.source is RequiredWorkSource.PROPOSAL_REJECTION_SQL)
+        projection = next(ticket for ticket in child.tickets if ticket.key.source is RequiredWorkSource.PROPOSAL_REJECTION_PROJECTION)
+        assert sql.complete and projection.complete and projection._projection_started
+        assert sql._finish_once_handoff is not None
+        assert producer.key.transition_ordinal == 9 and producer.key.semantic_ordinal == 13
+        events = proposal_events(engine, expected.authority.row.id)
+        assert len(events) == 1
+        assert events[0].actor == "system:pipeline_commit:user:alice"
+        assert events[0].payload["reason_code"] == "no_change"
+        assert events[0].payload["dispatch"] is not None
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        event.remove(engine, "before_cursor_execute", park_sql)
+        repository.release(running.session_operation_context)
 
 
 @pytest.mark.asyncio

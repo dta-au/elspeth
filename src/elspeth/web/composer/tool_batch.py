@@ -1819,6 +1819,26 @@ async def run_tool_batch(
                         semantic=True,
                     )
                     interpretation_requirements_are_internal = True
+                if (
+                    candidate.acceptable
+                    and candidate.prepared_inline_blob is None
+                    and composition_content_hash(candidate.result.updated_state) == composition_content_hash(state)
+                ):
+                    finalized_candidate_result = finalize_tool_result(
+                        candidate.result,
+                        tool_name=tool_name,
+                        catalog=ctx.policy_catalog,
+                        context=candidate_context,
+                        prior_validation=candidate_prior_validation,
+                    )
+                    if composition_content_hash(finalized_candidate_result.updated_state) == composition_content_hash(state):
+                        unapplied_admission = _unapplied_admission(
+                            finalized_candidate_result,
+                            "no_change",
+                            state=state,
+                            validation=candidate_prior_validation,
+                            runtime_preflight=last_runtime_preflight,
+                        )
             except BaseException as exc:
                 # Re-raise exactly once from inside dispatch_with_audit so the
                 # established ARG_ERROR / PLUGIN_CRASH authority records the

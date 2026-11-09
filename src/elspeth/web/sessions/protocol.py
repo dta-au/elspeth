@@ -126,6 +126,7 @@ PipelineProposalRejectionReason = Literal[
     "operator_rejected",
     "candidate_executor_mismatch",
     "validation_failed",
+    "no_change",
     "policy_changed",
     "base_conflict",
     "request_cancelled",
