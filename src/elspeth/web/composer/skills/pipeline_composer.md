@@ -40,8 +40,9 @@ keep these in view the whole turn.
    then surface it where your palette offers the review tool. Authorship, not vocabulary — do not scan for "magic words".
    (See Subjective LLM Terms for the review interaction.)
 3. **Reconcile fields end-to-end.** Every field a node requires must be produced
-   by an upstream node. Before `set_pipeline`, check each consumer's
-   `required_input_fields` against what the source and transforms actually emit.
+   by an upstream node. Before `set_pipeline`, check each consumer's declared
+   input requirement (`required_input_fields`; `schema.required_fields` on a
+   batch-aware node) against what the source and transforms actually emit.
    (See the capability core's Field Wiring contract.)
 4. **Never surface `llm_prompt_template`.** The backend auto-stages and surfaces
    it for every LLM node; `request_interpretation_review(kind="llm_prompt_template")`
@@ -56,7 +57,9 @@ keep these in view the whole turn.
    it names, and that result's `validation` / `validation_delta` says what still
    needs repair. Never call `get_pipeline_state` to confirm components named in
    that echo. Read state only for an untouched component, a whole-document
-   question, or a successful mutation that omitted the echo.
+   question, or a successful mutation that omitted the echo. A successful
+   result whose `post_call_hints` reports the pipeline unchanged was a no-op:
+   there is nothing to confirm.
 
 **Done means** exactly one terminal state: a valid preview; OR all required
 review cards surfaced with no other validation errors; OR a named-gap refusal;
@@ -111,7 +114,7 @@ Classify the user's latest request before acting.
 | --- | --- |
 | Build, edit, or validate a pipeline | Identify planned plugins; load missing schemas; mutate state; preview or surface review cards. |
 | Ask about plugins, options, models, secrets, or audit | Use the relevant discovery tool, then answer from its result. |
-| Ask what happened in a past run | Use Landscape/run-analysis tools outside this composer skill; do not mutate pipeline state. |
+| Ask what happened in a past run | The composer has no run-analysis tool: say so, and do not mutate pipeline state or infer run results from the saved graph. |
 | Validation error or unclear rejection | Use `explain_validation_error` or `get_plugin_assistance`; apply the one-shot repair; preview again. |
 | Safety/security concern, unsupported shape, repeated convergence failure | Use the configured escalation path; if none is available, stop with a named gap and ask the operator. |
 
@@ -184,7 +187,7 @@ For ordinary build/edit turns, the action path is:
 | Edit intent | Use |
 | --- | --- |
 | Create a new pipeline or perform an intentional full rebuild | `set_pipeline`, or bounded construction batches as described below |
-| Perform a one-transform insertion between existing nodes on a direct linear path | `splice_transform` |
+| Perform a one-transform insertion between existing nodes on a direct linear path | `splice_transform`, only when the saved `edges` list holds an `on_success` edge joining those two nodes; it refuses a pipeline whose `edges` is empty, so there use `upsert_node` for the new node and re-point the successor's `input` |
 | Make an option-only edit to an existing node | `patch_node_options` |
 | Add or rewire a node in an existing pipeline, when neither narrower row above fits | `upsert_node` / `upsert_edge` |
 
@@ -329,8 +332,8 @@ If a `set_pipeline` attempt with `source.inline_blob` is rejected, do not assume
 the inline blob was bound or that any blob id from the failed call is reusable.
 Keep the exact same generated source artifact, repair the rejected source options
 or topology, and either resubmit the full `set_pipeline` with the same
-`source.inline_blob` or call `create_blob` explicitly and use the returned
-`blob_id`. Do not call `list_blobs` and stop because a blob from a failed
+`source.inline_blob` or, where your palette offers `create_blob`, call it
+explicitly and use the returned `blob_id`. Do not call `list_blobs` and stop because a blob from a failed
 mutation is absent.
 
 When a mutation fails with validation errors and the tool response includes
@@ -472,7 +475,12 @@ is the `issue_code` to pass to `get_plugin_assistance` for the repair.
 Two `status` values ride under `data` regardless of `success`.
 `APPROVAL_REQUIRED` (with `proposal_id`, `tool_name`, `summary`, `message`)
 means the change is a proposal awaiting human approval and nothing was
-applied: tell the user it awaits approval and stop. `PREVALIDATION_REJECTED`
+applied: tell the user it awaits approval and stop. Its `validation`
+describes the unchanged saved graph, not the proposed change, so never report
+the proposal as validated. Each mutation call becomes its own proposal against
+that same saved graph, and accepting one makes the others stale: when changes
+await approval, make the whole requested change in ONE mutation call.
+`PREVALIDATION_REJECTED`
 with `applied` false (`candidate_version`, `message`) means the candidate was
 not applied: repair from `validation`, which describes the rejected candidate,
 not the unchanged state the envelope's `version` names. Nothing changed, so
@@ -549,7 +557,7 @@ A successful incremental mutation carries `applied_component` (`source`,
 (`new_errors`, `resolved_errors`, `new_warnings`, `resolved_warnings`, each a
 list of the entries described above); read the delta to choose the next
 repair and never re-read state to confirm the echo. `post_call_hints` are
-plugin-authored next steps.
+advisory next-step notes from the plugin or the server.
 <!-- taught:end -->
 
 <!-- taught:begin tool-data patch_node_options data.server_owned_metadata_note; tool-data patch_source_options data.server_owned_metadata_note; tool-data set_pipeline data.server_owned_metadata_note; tool-data set_source data.server_owned_metadata_note; tool-data set_source_from_blob data.server_owned_metadata_note; tool-data set_source_from_blobs data.server_owned_metadata_note; tool-data upsert_node data.server_owned_metadata_note -->
@@ -578,6 +586,19 @@ applied successful mutation: `is_valid`, `checks`, `readiness`
 It neither changes the structural verdict nor undoes the mutation; mutation
 success alone does not establish execution readiness.
 <!-- taught:end -->
+
+Where changes await approval, a mutation that would change nothing returns
+success with no `applied_component`, an empty `affected_nodes` and a
+`post_call_hints` entry saying the pipeline is unchanged and no proposal was
+submitted. Do not re-read state, and do not tell the user anything awaits
+approval. A refused mutation there returns as an ordinary failure to repair,
+with no approval card.
+
+`preview_pipeline` reports structure and contract verdicts, never row data: do
+not present rows you composed yourself as preview output. If `diff_pipeline`
+refuses with `diff_baseline_unavailable`, this surface gave it no baseline: do
+not retry it, describe the change from this turn's own results, and never tell
+the user that earlier versions do not exist.
 
 ## Audit Boundaries
 
@@ -656,6 +677,8 @@ source-binding patch. `create_blob` alone is not progress on pipeline state.
 
 If a generated-source mutation is rejected because `source.options.path` is
 outside the allowed blob directory, keep the same source artifact and workflow:
+resubmit it as `source.inline_blob` with no authored `path`, or where your
+palette offers it
 call `create_blob` with the generated artifact, then retry the full requested
 topology using `source.blob_id` or `set_source_from_blob`. Do not stop in prose,
 ask for a file upload, or shrink the workflow after this repairable path error.
@@ -1453,14 +1476,14 @@ These are common one-shot mappings:
 | `field_name_lookup_unreachable` | A template reads a declared field by a spelling other than its name (`row['Score_Text']` under `required_input_fields: [score_text]`), and no row reaching the node carries that spelling as the field's source header: on every path the field comes from a headerless source, a source `field_mapping` or rename target, a node that creates it, or a statistics-style aggregation or collector (each records the field under its own name only), or a transform renames the field that header names away. Rewrite the lookup to the declared name the message gives (`row['score_text']` / `row.score_text`) with `patch_node_options`; do not add a node to recreate the header spelling. |
 | `union_field_collision` (runtime reason) | A union merge received two values for the same field and the externally configured collision policy failed that merge group. Inspect the contributing branches and their field names in the run diagnostics; give branch results distinct names or change the external runtime policy outside Composer. Composer cannot author that policy. |
 | Joined or enriched field disagrees with a consumer's required type | Consult the producer's `get_plugin_schema` and `get_plugin_assistance` to establish actual output types. Preserve supplied reference data. Keep the consumer's contract aligned with those types when that meets the request; otherwise discover and configure an explicit conversion before the consumer. A type declaration alone is not proof of conversion. Any format change must be permitted by the user's data requirements. |
-| Producer guarantees are empty and producer is source | Patch source schema using inspected fields. |
+| Producer guarantees are empty and producer is source | For rows you generated, or when the required fields are known, declare them in the source `schema` (`mode: flexible` with `fields`). Never author `schema.guaranteed_fields` for uploaded or path-bound data; that promise is the user's, through the `source_data_contract` review. |
 | Consumer requires a generated or inspected source field but source guarantees are empty | Declare that known field through the selected source's schema-defined contract mechanism, then retry; do not ask the user to confirm a field you authored or inspected. |
 | Producer guarantees are empty and producer is a transform | Patch that transform schema or use plugin assistance for the plugin-owned contract. |
 | Consumer requires fields not produced upstream | Correct the upstream producer, or narrow the consumer's `required_input_fields` if the requirement was overstated. On an `llm` node, narrowing alone trades one rejection for another: a `prompt_template` may not read a `row.<field>` its `required_input_fields` omits, so drop the template reference in the same edit. |
 | A cleanup or projection transform consumes a field that no upstream node guarantees, and the user-requested producer is absent from the current graph | Restore the missing producer node — this is the silent-downgrade pattern from **Requested Workflow Integrity**. The cleanup transform's field requirements are the trace of what the dropped node was supposed to produce. Do not repair by deleting requested result mappings. Resubmit the full `set_pipeline` with the missing node restored and wired before the cleanup transform. Reapply the model-node review preflight when the restored node is a model transform. |
 | `set_pipeline` rejected with "Duplicate consumer for connection" | A single upstream output is wired to two or more consumers. Insert a gate node between the upstream and the two consumers, or restructure so each connection has exactly one consumer. Do not remove either consumer node to resolve the conflict; the user requested both. |
 | `set_pipeline` rejected due malformed or invalid tool arguments | Rebuild the same requested topology with valid tool arguments and retry the full `set_pipeline`; do not stop or shrink the workflow. |
-| Rejected `set_pipeline` used `source.inline_blob` and the source blob is absent afterward | Failed mutations do not create reusable blobs. Resubmit with the same corrected `source.inline_blob`, or call `create_blob` with the same artifact and retry using the returned `blob_id`; do not ask for a blob id. |
+| Rejected `set_pipeline` used `source.inline_blob` and the source blob is absent afterward | Failed mutations do not create reusable blobs. Resubmit with the same corrected `source.inline_blob`, or where your palette offers `create_blob` call it with the same artifact and retry using the returned `blob_id`; do not ask for a blob id. |
 | Generated source path is outside the allowed blob directory | Keep the generated artifact, create a blob from the generated rows, bind it as the source, and retry the complete workflow. Do not ask for an upload or replace the source with an imaginary path. |
 | Rejected pipeline included a fake review, recommendation, or placeholder node | Remove the fake node from the next full `set_pipeline` arguments, put the requirement in `interpretation_requirements` on the real source/LLM/cleanup node, and retry the full topology. Do not call `remove_node`; rejected mutations did not persist that node. |
 | `on_success` is neither a sink nor a known connection, or an output is unreferenced | Keep the requested nodes and outputs. Set the final producer's `on_success` to the existing sink name, or use `upsert_edge(edge_type="on_success")` from the final producer to the sink so routing is synchronized. |

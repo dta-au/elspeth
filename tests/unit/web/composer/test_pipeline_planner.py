@@ -273,12 +273,16 @@ _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES = 188
 # orientation appended to PLANNER_TERMINAL_INSTRUCTION then measures 136,235 B,
 # +961 B: the planner is told its surface, the tools the shared skill names
 # that it lacks, which review rows it authors and its own rejection shape.
-# Price only the 505 B excess over the prior pin, keeping zero new headroom
-# and the exact-boundary / +1-byte overflow control. NOT YET OPERATOR-RULED:
-# this allowance follows the 2026-10-18 direction on justified guidance
-# growth and is flagged for the maintainer in
+# The capability core's corrections then measure 136,587 B, +352 B: row_union
+# branch keys are fork_to names, batch-aware plugins declare
+# schema.required_fields, and a result that reports the pipeline unchanged
+# needs no confirming read (the first two are the lines behind two observed
+# planner rejections). Price only the 857 B excess over the prior 135,730 B
+# pin, keeping zero new headroom and the exact-boundary / +1-byte overflow
+# control. NOT YET OPERATOR-RULED: this allowance follows the 2026-10-18
+# direction on justified guidance growth and is flagged for the maintainer in
 # docs/architecture/composer-remediation/reports/skill-rework-report.md.
-_SKILL_REWORK_0812_CANONICAL_BYTES = 505
+_SKILL_REWORK_0812_CANONICAL_BYTES = 857
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
