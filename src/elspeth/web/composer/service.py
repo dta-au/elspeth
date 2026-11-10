@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
@@ -42,7 +43,9 @@ from elspeth.contracts.blobs import BlobServiceProtocol
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.composer_audit import ComposerToolInvocation, PrivateToolAuthoring
 from elspeth.contracts.composer_llm_audit import (
+    ComposerContextBudgetRecord,
     ComposerLLMCall,
+    ComposerLLMRequestByteSplit,
 )
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
@@ -94,6 +97,14 @@ from elspeth.web.composer.composition_completion import (
     _append_interpretation_review_handoff_message,
     _with_advisor_gate_decision,
 )
+from elspeth.web.composer.context_budget import (
+    ContextBudgetPolicy,
+    ContextBudgetRefusal,
+    SheddableKind,
+    SheddableSegment,
+    decide_context_budget,
+)
+from elspeth.web.composer.context_budget_apply import largest_component, latest_round_trip_start, message_bytes, stubbed_tool_message
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.control_messages import anti_anchor_control_envelope
 from elspeth.web.composer.discovery_cache import (
@@ -120,6 +131,8 @@ from elspeth.web.composer.prompt_guard_rendering import JsonPath, json_content_p
 from elspeth.web.composer.prompts import (
     build_messages,
     build_run_diagnostics_messages,
+    build_state_context_message,
+    history_message_indices,
     render_system_prompt,
 )
 from elspeth.web.composer.protocol import (
@@ -534,6 +547,65 @@ def _chat_ingress_inputs_for_compose(
     return inputs
 
 
+# ``build_messages`` layout: system skill, catalog, then the chat history.
+_CONTEXT_BUDGET_HISTORY_START: Final[int] = 2
+
+
+@dataclass(frozen=True, slots=True)
+class _ContextBudgetFrame:
+    """What the compose loop's context budget needs to label one turn's requests.
+
+    Captured once per turn, right after ``build_messages``: the session's
+    budget history, each emitted history message's ``chat_history`` index and
+    sheddable kind (``None`` = protected), and the exact inputs of the state
+    message so it can be re-rendered with omission counts. Per-turn local
+    data, never shared between requests.
+    """
+
+    history: ContextBudgetHistory
+    history_entries: tuple[tuple[int, SheddableKind | None], ...]
+    state_message_content: str
+    state: CompositionState
+    policy_catalog: PolicyCatalogView
+    plugin_snapshot: PluginAvailabilitySnapshot
+    schemas_loaded: frozenset[tuple[str, str]]
+
+    @property
+    def state_index(self) -> int:
+        return _CONTEXT_BUDGET_HISTORY_START + len(self.history_entries)
+
+
+@dataclass(frozen=True, slots=True)
+class _ContextBudgetRefusalScope:
+    """Compose-loop locals a context-budget refusal reports, in the style of the other convergence raises."""
+
+    state: CompositionState
+    initial_version: int
+    composition_turns_used: int
+    discovery_turns_used: int
+    failed_turn: FailedTurnMetadata | None
+    recorder: BufferingRecorder
+
+
+def _context_budget_component_bytes(
+    split: ComposerLLMRequestByteSplit, *, state_index: int, latest_start: int | None, sheddable_bytes: int
+) -> dict[str, int]:
+    """Name each component of a measured request; ``other`` excludes what could still be shed."""
+    sizes = split.message_bytes
+    if latest_start is not None and latest_start <= state_index + 1:
+        raise InvariantError("compose-loop tool round precedes the current user message")
+    named = {
+        "system": sizes[0],
+        "catalog": sizes[1],
+        "tools": split.tools_bytes if split.tools_bytes is not None else 0,
+        "state": sizes[state_index],
+        "current_message": sizes[state_index + 1],
+        "latest_tool_round": sum(sizes[latest_start:]) if latest_start is not None else 0,
+    }
+    named["other"] = split.total_bytes - sum(named.values()) - sheddable_bytes
+    return named
+
+
 # Task 6 Step 3 (elspeth-bff8fe6864, belt-and-braces): once a genuine repair
 # tool call lands following a FLAGGED END advisor pass, elide the injected
 # advisor sign-off message from ``llm_messages`` so no later model call in
@@ -723,6 +795,12 @@ class ComposerServiceImpl:
         from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
         self._max_tool_calls_per_turn: int = self._settings.composer_max_tool_calls_per_turn
+        self._context_budget_policy = ContextBudgetPolicy(
+            max_prompt_tokens=settings.composer_context_max_prompt_tokens,
+            max_request_bytes=settings.composer_planner_max_request_bytes,
+            shed_above=settings.composer_context_shed_above,
+            shed_to=settings.composer_context_shed_to,
+        )
         self._telemetry: _SessionsTelemetry = build_sessions_telemetry(meter=metrics.get_meter("elspeth.web.composer"))
         self._redaction_telemetry: RedactionTelemetry = OtelRedactionTelemetry()
 
@@ -1431,27 +1509,200 @@ class ComposerServiceImpl:
         tools: list[dict[str, Any]],
         recorder: BufferingRecorder,
         turn_evidence: TurnEvidence | None,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], BlobDeliveryAttempt | None]:
-        """Freeze the selected input and derive the gateway's exact marked hash."""
+        budget_frame: _ContextBudgetFrame,
+        state: CompositionState,
+        initial_version: int,
+        composition_turns_used: int,
+        discovery_turns_used: int,
+        failed_turn: FailedTurnMetadata | None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], BlobDeliveryAttempt | None, ComposerContextBudgetRecord]:
+        """Freeze the selected input, fit it to the context budget, and derive the gateway's exact marked hash.
+
+        Shedding is applied to the copy before cache markers are added, so the
+        request that is hashed, recorded and sent is one request. The caller's
+        ``messages`` list and the transcript owner keep the unshed messages.
+        """
         from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
 
         selected_messages, selected_tools = deepcopy(messages), deepcopy(tools)
-        delivery = None
         if turn_evidence is not None:
             turn_evidence.transcript.observe_messages(messages)
-            marked_messages, marked_tools = selected_messages, selected_tools
-            if supports_anthropic_prompt_cache_markers(self._model):
-                marked_messages, marked_tools_or_none = apply_anthropic_cache_markers(
-                    selected_messages, selected_tools, mark_history_tail=True
-                )
-                marked_tools = marked_tools_or_none if marked_tools_or_none is not None else selected_tools
+        refusal_scope = _ContextBudgetRefusalScope(
+            state=state,
+            initial_version=initial_version,
+            composition_turns_used=composition_turns_used,
+            discovery_turns_used=discovery_turns_used,
+            failed_turn=failed_turn,
+            recorder=recorder,
+        )
+        selected_messages, budget_record, bytes_per_token = self._shed_to_context_budget(
+            messages=selected_messages, tools=selected_tools, frame=budget_frame, recorder=recorder, refusal_scope=refusal_scope
+        )
+        marked_messages, marked_tools = selected_messages, selected_tools
+        if supports_anthropic_prompt_cache_markers(self._model):
+            marked_messages, marked_tools_or_none = apply_anthropic_cache_markers(selected_messages, selected_tools, mark_history_tail=True)
+            marked_tools = marked_tools_or_none if marked_tools_or_none is not None else selected_tools
+        marked_split = message_bytes(marked_messages, marked_tools or None)
+        if marked_split.total_bytes > self._context_budget_policy.max_request_bytes:
+            kept_history = len(budget_frame.history_entries) - len(budget_record.shed_history_indices)
+            raise self._context_budget_refusal(
+                ContextBudgetRefusal(
+                    ceiling="bytes",
+                    estimated_tokens=math.ceil(marked_split.total_bytes / bytes_per_token),
+                    request_bytes=marked_split.total_bytes,
+                ),
+                _context_budget_component_bytes(
+                    marked_split,
+                    state_index=_CONTEXT_BUDGET_HISTORY_START + kept_history,
+                    latest_start=latest_round_trip_start(marked_messages),
+                    sheddable_bytes=0,
+                ),
+                refusal_scope,
+            )
+        delivery = None
+        if turn_evidence is not None:
             delivery = turn_evidence.prepare_delivery(
                 detach_prompt_guard_messages(marked_messages)[0],
                 previous_calls=recorder.llm_calls,
                 tools=marked_tools or None,
                 scope="primary",
             )
-        return selected_messages, selected_tools, delivery
+        return selected_messages, selected_tools, delivery, budget_record
+
+    def _shed_to_context_budget(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        frame: _ContextBudgetFrame,
+        recorder: BufferingRecorder,
+        refusal_scope: _ContextBudgetRefusalScope,
+    ) -> tuple[list[dict[str, Any]], ComposerContextBudgetRecord, float]:
+        """Label the request's segments, decide, and apply the decision to ``messages`` (a private copy).
+
+        Returns the messages to send, the record of the decision, and the
+        bytes-per-token ratio it used.
+        """
+        state_index = frame.state_index
+        if len(messages) < state_index + 2 or messages[state_index]["content"] != frame.state_message_content:
+            raise InvariantError("compose-loop request does not have the layout its context budget frame describes")
+        split = message_bytes(messages, tools or None)
+        latest_start = latest_round_trip_start(messages)
+
+        segments: list[SheddableSegment] = []
+        for position, (chat_index, kind) in enumerate(frame.history_entries):
+            saving = split.message_bytes[_CONTEXT_BUDGET_HISTORY_START + position]
+            if kind is not None and saving > 0:
+                segments.append(SheddableSegment(kind=kind, key=f"history:{chat_index}", saving_bytes=saving))
+        # A provider may reuse a tool-call id across rounds; one key then
+        # covers every earlier result that carries it.
+        tool_positions: dict[str, list[int]] = {}
+        tool_savings: dict[str, int] = {}
+        for index in range(state_index + 2, latest_start if latest_start is not None else len(messages)):
+            message = messages[index]
+            if message["role"] != "tool":
+                continue
+            saving = split.message_bytes[index] - message_bytes([stubbed_tool_message(message)], None).total_bytes
+            if saving <= 0:
+                continue
+            key = f"tool:{message['tool_call_id']}"
+            tool_positions.setdefault(key, []).append(index)
+            tool_savings[key] = tool_savings.get(key, 0) + saving
+        segments.extend(
+            SheddableSegment(kind=SheddableKind.TOOL_RESULT, key=key, saving_bytes=saving) for key, saving in tool_savings.items()
+        )
+
+        previously_shed = set(frame.history.previously_shed_history)
+        for call in recorder.llm_calls:
+            if call.context_budget is not None:
+                previously_shed.update(f"history:{index}" for index in call.context_budget.shed_history_indices)
+                previously_shed.update(f"tool:{tool_call_id}" for tool_call_id in call.context_budget.stubbed_tool_call_ids)
+
+        try:
+            decision = decide_context_budget(
+                policy=self._context_budget_policy,
+                request_bytes=split.total_bytes,
+                segments=segments,
+                bytes_per_token=frame.history.bytes_per_token,
+                previously_shed=frozenset(previously_shed),
+            )
+        except ContextBudgetRefusal as refusal:
+            raise self._context_budget_refusal(
+                refusal,
+                _context_budget_component_bytes(
+                    split,
+                    state_index=state_index,
+                    latest_start=latest_start,
+                    sheddable_bytes=sum(segment.saving_bytes for segment in segments),
+                ),
+                refusal_scope,
+            ) from refusal
+        record = ComposerContextBudgetRecord.from_shed_keys(
+            policy_hash=decision.policy_hash,
+            bytes_per_token=decision.bytes_per_token,
+            estimated_tokens_before=decision.estimated_tokens_before,
+            estimated_tokens_after=decision.estimated_tokens_after,
+            shed_keys=decision.shed_keys,
+        )
+        shed = frozenset(decision.shed_keys)
+        if not shed:
+            return messages, record, decision.bytes_per_token
+
+        shed_history_positions = {
+            _CONTEXT_BUDGET_HISTORY_START + position
+            for position, (chat_index, _kind) in enumerate(frame.history_entries)
+            if f"history:{chat_index}" in shed
+        }
+        stub_positions = {index for key, positions in tool_positions.items() if key in shed for index in positions}
+        shed_kinds = [frame.history_entries[index - _CONTEXT_BUDGET_HISTORY_START][1] for index in shed_history_positions]
+        applied: list[dict[str, Any]] = []
+        for index, message in enumerate(messages):
+            if index in shed_history_positions:
+                continue
+            if index == state_index and shed_history_positions:
+                applied.append(
+                    build_state_context_message(
+                        frame.state,
+                        frame.policy_catalog,
+                        plugin_snapshot=frame.plugin_snapshot,
+                        schemas_loaded=frame.schemas_loaded,
+                        conversation_omissions={
+                            "prior_user_requests_omitted": shed_kinds.count(SheddableKind.USER_REQUEST),
+                            "prior_assistant_messages_omitted": shed_kinds.count(SheddableKind.ASSISTANT_PROSE),
+                        },
+                    )
+                )
+            elif index in stub_positions:
+                applied.append(stubbed_tool_message(message))
+            else:
+                applied.append(message)
+        return applied, record, decision.bytes_per_token
+
+    def _context_budget_refusal(
+        self,
+        refusal: ContextBudgetRefusal,
+        component_bytes: Mapping[str, int],
+        scope: _ContextBudgetRefusalScope,
+    ) -> ComposerConvergenceError:
+        """Build the pre-dispatch refusal for a request the context budget cannot fit."""
+        return ComposerConvergenceError.capture(
+            max_turns=scope.composition_turns_used + scope.discovery_turns_used,
+            budget_exhausted="composition",
+            state=scope.state,
+            initial_version=scope.initial_version,
+            tool_invocations=scope.recorder.invocations,
+            llm_calls=scope.recorder.llm_calls,
+            reason="context_budget_exceeded",
+            evidence={
+                "ceiling": refusal.ceiling,
+                "estimated_tokens": refusal.estimated_tokens,
+                "request_bytes": refusal.request_bytes,
+                "max_prompt_tokens": self._context_budget_policy.max_prompt_tokens,
+                "max_request_bytes": self._context_budget_policy.max_request_bytes,
+                "largest_component": largest_component(component_bytes),
+            },
+            failed_turn=scope.failed_turn,
+        )
 
     async def _call_model_turn(
         self,
@@ -1467,16 +1718,19 @@ class ComposerServiceImpl:
         composition_turns_used: int,
         discovery_turns_used: int,
         failed_turn: FailedTurnMetadata | None,
+        budget_frame: _ContextBudgetFrame,
         provider_owner: ProviderInvocationOwner | None = None,
         turn_evidence: TurnEvidence | None = None,
     ) -> _CallModelOutcome:
         """Phase P1 of the compose loop — one LLM call with cap enforcement.
 
-        Emits the model-call progress event, calls the provider before the
-        cooperative deadline, and enforces ``_max_tool_calls_per_turn``.
-        A cap breach raises :class:`ComposerConvergenceError` with the
-        ``tool_call_cap_exceeded`` reason directly; no carrier is returned
-        in that case.
+        Emits the model-call progress event, fits the request to the context
+        budget, calls the provider before the cooperative deadline, and
+        enforces ``_max_tool_calls_per_turn``. A request the budget cannot fit
+        raises :class:`ComposerConvergenceError` with the
+        ``context_budget_exceeded`` reason before any provider call. A cap
+        breach raises it with the ``tool_call_cap_exceeded`` reason directly;
+        no carrier is returned in either case.
 
         ``failed_turn`` is the driver's running metadata for the LAST
         persisted tool-call turn — carried here only so a wall-clock timeout
@@ -1485,8 +1739,17 @@ class ComposerServiceImpl:
         turn has been persisted yet.
         """
         await emit_progress(progress, model_call_progress_event(message))
-        selected_messages, selected_tools, delivery = self._prepare_primary_delivery(
-            messages=llm_messages, tools=tools, recorder=recorder, turn_evidence=turn_evidence
+        selected_messages, selected_tools, delivery, budget_record = self._prepare_primary_delivery(
+            messages=llm_messages,
+            tools=tools,
+            recorder=recorder,
+            turn_evidence=turn_evidence,
+            budget_frame=budget_frame,
+            state=state,
+            initial_version=initial_version,
+            composition_turns_used=composition_turns_used,
+            discovery_turns_used=discovery_turns_used,
+            failed_turn=failed_turn,
         )
         completion = await self._call_llm_before_deadline(
             selected_messages,
@@ -1499,6 +1762,7 @@ class ComposerServiceImpl:
             discovery_turns_used=discovery_turns_used,
             failed_turn=failed_turn,
             provider_owner=provider_owner,
+            context_budget=budget_record,
         )
         assistant_tool_calls = completion.tool_batch.calls
         self._enforce_tool_call_cap(
@@ -1721,6 +1985,7 @@ class ComposerServiceImpl:
         composition_turns_used: int,
         discovery_turns_used: int,
         advisor_checkpoint_passes_used: int,
+        budget_frame: _ContextBudgetFrame,
         session_operation_context: SessionOperationContext | None = None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         advisor_review_state: _AdvisorReviewState | None = None,
@@ -1990,11 +2255,17 @@ class ComposerServiceImpl:
                     }
                 )
                 provider_failures: tuple[type[Exception], ...] = (TimeoutError, _BadRequestLLMError, *advisor_provider_failure_types())
-                selected_reply_messages, selected_reply_tools, reply_delivery = self._prepare_primary_delivery(
+                selected_reply_messages, selected_reply_tools, reply_delivery, reply_budget_record = self._prepare_primary_delivery(
                     messages=reply_messages,
                     tools=recovery_tool_definitions(self._planner_dialect),
                     recorder=recorder,
                     turn_evidence=turn_evidence,
+                    budget_frame=budget_frame,
+                    state=state,
+                    initial_version=initial_version,
+                    composition_turns_used=composition_turns_used,
+                    discovery_turns_used=discovery_turns_used,
+                    failed_turn=failed_turn,
                 )
                 if remaining > 0:
                     await emit_progress(
@@ -2013,6 +2284,7 @@ class ComposerServiceImpl:
                             timeout=remaining,
                             recorder=recorder,
                             provider_custody=self._new_primary_custody(provider_owner),
+                            context_budget=reply_budget_record,
                         )
                     except provider_failures:
                         # The call audit retains the failure; a trusted notice
@@ -2186,8 +2458,17 @@ class ComposerServiceImpl:
                 # B-4D-3 fix: give the LLM one last chance to see the
                 # tool results and produce a text response.
                 await emit_progress(progress, model_call_progress_event(message))
-                selected_final_messages, selected_final_tools, final_delivery = self._prepare_primary_delivery(
-                    messages=llm_messages, tools=tools, recorder=recorder, turn_evidence=turn_evidence
+                selected_final_messages, selected_final_tools, final_delivery, final_budget_record = self._prepare_primary_delivery(
+                    messages=llm_messages,
+                    tools=tools,
+                    recorder=recorder,
+                    turn_evidence=turn_evidence,
+                    budget_frame=budget_frame,
+                    state=state,
+                    initial_version=initial_version,
+                    composition_turns_used=new_composition_turns_used,
+                    discovery_turns_used=discovery_turns_used,
+                    failed_turn=failed_turn,
                 )
                 completion = await self._call_llm_before_deadline(
                     selected_final_messages,
@@ -2202,6 +2483,7 @@ class ComposerServiceImpl:
                     discovery_turns_used=discovery_turns_used,
                     failed_turn=failed_turn,
                     provider_owner=provider_owner,
+                    context_budget=final_budget_record,
                 )
                 recovery_result = self._terminal_recovery_result(
                     completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
@@ -2464,6 +2746,15 @@ class ComposerServiceImpl:
             plugin_snapshot=plugin_snapshot,
             policy_catalog=policy_catalog,
         )
+        budget_frame = self._context_budget_frame(
+            chat_history=messages,
+            llm_messages=llm_messages,
+            state=state,
+            session_id=session_id,
+            plugin_snapshot=plugin_snapshot,
+            policy_catalog=policy_catalog,
+            history=context_budget_history if context_budget_history is not None else ContextBudgetHistory.empty(),
+        )
         turn_evidence.transcript.begin_messages(llm_messages)
         tools = composer_loop_tool_definitions(self._planner_dialect)
         if recovery_context is not None:
@@ -2590,6 +2881,7 @@ class ComposerServiceImpl:
                 composition_turns_used=composition_turns_used,
                 discovery_turns_used=discovery_turns_used,
                 failed_turn=failed_turn,
+                budget_frame=budget_frame,
                 provider_owner=provider_owner,
                 turn_evidence=turn_evidence,
             )
@@ -3147,6 +3439,7 @@ class ComposerServiceImpl:
                 composition_turns_used=composition_turns_used,
                 discovery_turns_used=discovery_turns_used,
                 advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+                budget_frame=budget_frame,
                 plugin_snapshot=plugin_snapshot,
                 advisor_review_state=advisor_review_state,
                 completion_gates=completion_gates,
@@ -3240,6 +3533,46 @@ class ComposerServiceImpl:
         except OSError as exc:
             raise ComposerServiceError(f"Failed to load deployment skill ({type(exc).__name__})") from exc
 
+    def _context_budget_frame(
+        self,
+        *,
+        chat_history: list[ComposerHistoryMessage],
+        llm_messages: list[dict[str, Any]],
+        state: CompositionState,
+        session_id: str | None,
+        plugin_snapshot: PluginAvailabilitySnapshot,
+        policy_catalog: PolicyCatalogView,
+        history: ContextBudgetHistory,
+    ) -> _ContextBudgetFrame:
+        """Label this turn's history and capture the state message inputs, right after :meth:`_build_messages`.
+
+        A history row carrying the user-authorship marker is a user request; an
+        assistant row is assistant prose; any other row is protected.
+        ``schemas_loaded`` is read synchronously after the build, so it is the
+        value the state message was rendered with.
+        """
+        entries: list[tuple[int, SheddableKind | None]] = []
+        for chat_index in history_message_indices(chat_history):
+            history_message = chat_history[chat_index]
+            kind: SheddableKind | None = None
+            if COMPOSER_HISTORY_USER_AUTHORED_KEY in history_message:
+                if history_message[COMPOSER_HISTORY_USER_AUTHORED_KEY] is not True or history_message["role"] != "user":
+                    raise InvariantError("composer user-authorship marker is malformed")
+                kind = SheddableKind.USER_REQUEST
+            elif history_message["role"] == "assistant":
+                kind = SheddableKind.ASSISTANT_PROSE
+            entries.append((chat_index, kind))
+        state_index = _CONTEXT_BUDGET_HISTORY_START + len(entries)
+        return _ContextBudgetFrame(
+            history=history,
+            history_entries=tuple(entries),
+            state_message_content=llm_messages[state_index]["content"],
+            state=state,
+            policy_catalog=policy_catalog,
+            plugin_snapshot=plugin_snapshot,
+            schemas_loaded=self._schema_disclosure.schemas_loaded_for_session(session_id),
+        )
+
     def _new_primary_custody(self, provider_owner: ProviderInvocationOwner | None) -> ProviderCallCustody | None:
         if provider_owner is None:
             return None
@@ -3259,6 +3592,7 @@ class ComposerServiceImpl:
         composition_turns_used: int,
         discovery_turns_used: int,
         failed_turn: FailedTurnMetadata | None,
+        context_budget: ComposerContextBudgetRecord,
         provider_owner: ProviderInvocationOwner | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call the LLM with a per-call timeout derived from the deadline.
@@ -3315,7 +3649,7 @@ class ComposerServiceImpl:
             try:
                 if provider_custody is None:
                     return await self._provider_gateway._call_llm_with_audit(
-                        messages, tools, timeout=remaining, recorder=recorder, credential_state=state
+                        messages, tools, timeout=remaining, recorder=recorder, credential_state=state, context_budget=context_budget
                     )
                 return await self._provider_gateway._call_llm_with_audit(
                     messages,
@@ -3324,6 +3658,7 @@ class ComposerServiceImpl:
                     recorder=recorder,
                     provider_custody=provider_custody,
                     credential_state=state,
+                    context_budget=context_budget,
                 )
             except PromptGuardRefused as exc:
                 raise exc.with_evidence(
