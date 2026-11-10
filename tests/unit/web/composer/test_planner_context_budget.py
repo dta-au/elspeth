@@ -452,6 +452,37 @@ async def test_the_escape_hatch_request_sheds_its_conversation_context_and_keeps
         assert call.context_budget.shed_hatch_event_indices == ()
 
 
+@pytest.mark.asyncio
+async def test_each_planner_call_uses_the_ratio_measured_on_its_own_model(tmp_path: Path, tool_context: ToolContext) -> None:
+    """The planner's calls take the planner model's ratio; the escape hatch's call takes the hatch model's."""
+    history = ContextBudgetHistory(
+        bytes_per_token=2.5,
+        previously_shed_history=frozenset(),
+        bytes_per_token_by_model=(("some/other-model", 2.5), (_UNMARKED, 4.25), ("test/advisor", 3.5)),
+    )
+    completion = _hatch_completion()
+    recorder = BufferingRecorder()
+    with pytest.raises(PlannerDeclined):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            intent="The latter.",
+            context_budget_history=history,
+            model_overrides={
+                "model_identifier": _UNMARKED,
+                "max_discovery_turns": 1,
+                "escape_hatch_model": "test/advisor",
+                "escape_hatch_provider": "test-provider",
+            },
+        )
+
+    assert [call.model_requested for call in recorder.llm_calls] == [_UNMARKED, _UNMARKED, "test/advisor"]
+    ratios = [call.context_budget.bytes_per_token for call in recorder.llm_calls if call.context_budget is not None]
+    assert ratios == [repr(4.25), repr(4.25), repr(3.5)]
+
+
 _CONTEXT_REDUCED_HEADLINE = "Earlier conversation is no longer visible to the composer."
 
 
@@ -1001,6 +1032,7 @@ def _fit_hatch_request(
         hatch_transcript=transcript,
         policy=policy,
         history=ContextBudgetHistory.empty(),
+        model="test/advisor",
         earlier_calls=earlier_calls,
         mark_for_cache=False,
     )
@@ -1106,6 +1138,7 @@ def test_a_hatch_message_that_is_not_the_labelled_transcript_is_a_framework_bug(
             hatch_transcript=transcript,
             policy=_context_policy(max_request_bytes=1_000_000),
             history=ContextBudgetHistory.empty(),
+            model="test/advisor",
             earlier_calls=(),
             mark_for_cache=False,
         )

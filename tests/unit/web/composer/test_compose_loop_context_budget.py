@@ -946,3 +946,28 @@ async def test_a_result_stubbed_on_an_earlier_call_stays_stubbed_in_the_reply_st
         assert record.stubbed_tool_call_ids == expected
         assert (first in selected[5]["content"]) == (not expected)
         assert second in selected[7]["content"]
+
+
+# --- The bytes-per-token ratio is the budgeted model's own ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_compose_loop_uses_the_ratio_measured_on_its_own_model() -> None:
+    model = "openrouter/openai/gpt-5.5"
+    service, session_id = _service(_GENEROUS_TOKENS, composer_model=model)
+    provider = _RecordingProvider(_make_llm_response(content="Done."))
+    # The newest budgeted call of any model was the escape hatch's; the compose loop's own model measured 4.25.
+    budget_history = ContextBudgetHistory(
+        bytes_per_token=2.5,
+        previously_shed_history=frozenset(),
+        bytes_per_token_by_model=(("test/escape-hatch", 2.5), (model, 4.25)),
+    )
+
+    result = await _compose(service, session_id, [], provider, budget_history=budget_history)
+
+    (call,) = result.llm_calls
+    assert call.model_requested == model
+    assert call.context_budget is not None
+    assert call.context_budget.bytes_per_token == repr(4.25)
+    assert call.request_byte_split is not None
+    assert call.context_budget.estimated_tokens_before == -(-call.request_byte_split.total_bytes * 100 // 425)
