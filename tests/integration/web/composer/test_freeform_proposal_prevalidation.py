@@ -1632,26 +1632,39 @@ async def test_unapplied_incremental_feedback_then_repair_stages_once(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "call_kind", ("noop", "refusal", "argument", "at-cap-noop", "at-cap-refusal", "at-cap-blob-refusal", "change", "inline")
+    "call_kind", ("blob-refusal", "blob-argument", "at-cap-noop", "at-cap-refusal", "at-cap-blob-refusal", "change", "inline")
 )
 async def test_proposal_cap_counts_only_admitted_changes(tmp_path: Path, call_kind: str) -> None:
+    """The per-turn cap counts published proposals only.
+
+    Explicit approval refuses a response carrying more than one
+    composition-changing mutation before publication, so the ten admitted
+    proposals are blob deletions and at most one composition call rides in the
+    tail. The eleven-call non-admitted cases are blob calls for the same reason.
+    """
+    from tests.helpers.session_fences import fenced_operation_context
+
     harness = _harness(tmp_path)
     state = _incremental_base_state(tmp_path)
     at_cap = call_kind.startswith("at-cap") or call_kind in {"change", "inline"}
-    calls = [
-        {"id": f"call_change_{i}", "name": "set_metadata", "arguments": {"patch": {"name": f"change-{i}"}}}
-        for i in range(10 if at_cap else 0)
-    ]
+    calls = []
+    for i in range(10 if at_cap else 0):
+        with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as operation:
+            blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+                UUID(harness.session_id), f"retained-{i}.txt", b"original", "text/plain", session_operation_context=operation
+            )
+        calls.append({"id": f"call_change_{i}", "name": "delete_blob", "arguments": {"blob_id": str(blob.id)}})
+    seeded_blobs = len(calls)
     tool_name, arguments = (
-        ("patch_node_options", {"node_id": "absent", "patch": {}}) if "refusal" in call_kind else ("set_metadata", {"patch": {}})
+        ("patch_node_options", {"node_id": "absent", "patch": {}}) if call_kind == "at-cap-refusal" else ("set_metadata", {"patch": {}})
     )
     if call_kind == "change":
         tool_name, arguments = "set_metadata", {"patch": {"name": "excess"}}
-    if call_kind == "argument":
-        tool_name, arguments = "set_metadata", {"patch": "invalid"}
+    if call_kind == "blob-argument":
+        tool_name, arguments = "delete_blob", {"blob_id": 7}
     if call_kind == "inline":
         tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
-    if call_kind == "at-cap-blob-refusal":
+    if call_kind in {"blob-refusal", "at-cap-blob-refusal"}:
         tool_name, arguments = "delete_blob", {"blob_id": str(uuid4())}
     calls.extend({"id": f"call_tail_{i}", "name": tool_name, "arguments": arguments} for i in range(1 if at_cap else 11))
     llm = _ScriptedLLM(_fake_llm_response(tool_calls=tuple(calls)), _fake_llm_response(content="Done."))
@@ -1681,7 +1694,8 @@ async def test_proposal_cap_counts_only_admitted_changes(tmp_path: Path, call_ki
             assert result.state is state
     proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
     assert len(proposals) == (10 if at_cap else 0)
-    assert _count_rows(harness.engine, blobs_table) == 0
+    assert {proposal.tool_name for proposal in proposals} == ({"delete_blob"} if at_cap else set())
+    assert _count_rows(harness.engine, blobs_table) == seeded_blobs
 
 
 @pytest.mark.asyncio
@@ -2602,6 +2616,18 @@ async def test_inline_same_text_with_new_blob_authority_is_a_real_change(tmp_pat
     first_proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
     assert len(first_proposals) == 1
     original_blob_id = first_proposals[0].arguments_json["source"]["blob_id"]
+    # Explicit approval keeps one composition proposal outstanding, so the user
+    # settles the first before the second request can stage another.
+    first_metadata = first_proposals[0].pipeline_metadata
+    assert first_metadata is not None
+    await harness.sessions.reject_pipeline_composition_proposal(
+        session_id=UUID(harness.session_id),
+        proposal_id=first_proposals[0].id,
+        draft_hash=first_metadata.draft_hash,
+        reason="operator_rejected",
+        dispatch=None,
+        actor="user:proposal-prevalidation-user",
+    )
     arguments["source"]["inline_blob"]["filename"] = "new-authority.csv"
     second_llm = _ScriptedLLM(
         _tool_turn("call_new_inline_authority", "set_pipeline", arguments), _fake_llm_response(content="Ready for review.")
@@ -2664,8 +2690,18 @@ async def test_auto_commit_set_pipeline_uses_candidate_builder_once(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("publisher", ["canonical", "ordinary", "promoted"])
-@pytest.mark.parametrize("repair_batch", ["later", "same"])
+@pytest.mark.parametrize(
+    ("publisher", "repair_batch"),
+    [
+        ("canonical", "later"),
+        ("ordinary", "later"),
+        ("promoted", "later"),
+        # Explicit approval refuses a response carrying two composition-changing
+        # mutations before either is published, so a same-response repair exists
+        # only beside the blob-only ("ordinary") publisher.
+        ("ordinary", "same"),
+    ],
+)
 async def test_publication_resource_race_refuses_once_then_allows_valid_repair(tmp_path: Path, publisher: str, repair_batch: str) -> None:
     from sqlalchemy import update
 
@@ -2714,14 +2750,15 @@ async def test_publication_resource_race_refuses_once_then_allows_valid_repair(t
             conn.execute(update(blobs_table).values(status="pending" if len(calls) == 1 else "ready"))
         return await api(**kwargs)
 
-    repair_count = 10 if repair_batch == "same" else 1
+    # One repair: a second composition proposal could not be staged while the first is pending.
+    repair_count = 1
     repair_calls = tuple(
         {"id": f"call_repaired_{index}", "name": "set_metadata", "arguments": {"patch": {"name": f"repair-{index}"}}}
         for index in range(repair_count)
     )
     repair_ids = tuple(call["id"] for call in repair_calls)
     if repair_batch == "same":
-        # The refusal and all ten admitted proposals must share one counter.
+        # The refusal and the admitted proposal share one batch and one counter.
         responses = (_fake_llm_response(tool_calls=({"id": "call_raced", "name": tool_name, "arguments": arguments}, *repair_calls)),)
     else:
         responses = (_tool_turn("call_raced", tool_name, arguments), _fake_llm_response(tool_calls=repair_calls))
@@ -2765,7 +2802,7 @@ async def test_publication_resource_race_refuses_once_then_allows_valid_repair(t
             )
     assert len(calls) == (1 if publisher == "canonical" else 1 + repair_count)
     assert [call.args[0] for call in handlers.call_args_list] == ["set_metadata"] * (repair_count + int(publisher == "promoted"))
-    assert [len(dispatched.tool_outcomes) for dispatched in dispatches] == ([11] if repair_batch == "same" else [1, 1])
+    assert [len(dispatched.tool_outcomes) for dispatched in dispatches] == ([2] if repair_batch == "same" else [1, 1])
     assert dispatches[0].mutation_success_observed is False
     feedback = [message for message in llm.message_snapshots[1] if message.get("tool_call_id") == "call_raced"]
     assert len(feedback) == 1

@@ -102,7 +102,7 @@ from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.required_controls import wire_required_controls
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.composer.state import CompositionState
-from elspeth.web.composer.tools import RuntimePreflight
+from elspeth.web.composer.tools import RuntimePreflight, is_blob_store_only_mutation_tool
 from elspeth.web.composer.visible_tool_event import VisibleToolEvent, visible_response_gap
 from elspeth.web.composer.withheld_replies import WithheldReply, withheld_reply_envelope
 from elspeth.web.execution.schemas import ValidationResult
@@ -679,6 +679,26 @@ class PlanningApplication:
         sessions = self._sessions_service
         current_preferences = await sessions.get_composer_preferences(session_id)
         auto_commit_authorized = preferences.trust_mode == "auto_commit" and current_preferences.trust_mode == "auto_commit"
+        if current_preferences.trust_mode == "explicit_approve":
+            # One composition proposal outstanding, as in the compose loop
+            # (``tool_batch._approval_containment_refusal``): a second pipeline
+            # drawn against the same base could never be accepted beside the
+            # first. The provider has already planned and its audit is durable
+            # above; only this publication is refused.
+            pending = [
+                proposal
+                for proposal in await sessions.list_composition_proposals(session_id, status="pending")
+                if not is_blob_store_only_mutation_tool(proposal.tool_name)
+            ]
+            if pending:
+                return ComposerResult(
+                    message=(
+                        f"A new proposal was not recorded because proposal {pending[0].id} is still awaiting your decision. "
+                        "Accept it, or reject it if it can no longer be accepted, then send your request again."
+                    ),
+                    state=state,
+                    raw_assistant_content="",
+                )
 
         # Stage 2 over the state this proposal WOULD produce (elspeth-2ed41f0a4a).
         #

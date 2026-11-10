@@ -161,7 +161,7 @@ class _FakeProposalRow:
 
 
 class _FakeSessionsService:
-    """Models only the two methods ``_stage_pipeline_plan`` calls."""
+    """Models only the methods ``_stage_pipeline_plan`` calls."""
 
     def __init__(self, trust_mode: str) -> None:
         self._trust_mode = trust_mode
@@ -170,6 +170,13 @@ class _FakeSessionsService:
     async def get_composer_preferences(self, session_id: UUID) -> _FakePreferences:
         del session_id
         return _FakePreferences(trust_mode=self._trust_mode)
+
+    async def list_composition_proposals(self, session_id: UUID, *, status: str | None = None) -> list[Any]:
+        # No proposal is pending in these scenarios; the explicit-approval
+        # one-outstanding guard reads this before publishing.
+        del session_id
+        assert status == "pending"
+        return []
 
     async def create_pipeline_composition_proposal(self, **kwargs: Any) -> _FakeProposalRow:
         self.created_proposals.append(kwargs)

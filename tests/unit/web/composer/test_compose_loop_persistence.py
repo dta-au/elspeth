@@ -619,6 +619,37 @@ async def test_field_mapper_patch_batch_uses_owned_identity_and_refuses_stale_sn
         assert current.nodes[0]["options"]["mapping"] == {"customer_key": "customer_id"}
 
 
+async def _blob_deletion_calls(
+    service: ComposerServiceImpl,
+    session_id: str,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    prefix: str,
+    count: int,
+) -> tuple[tuple[str, str, dict[str, Any]], ...]:
+    """Create ``count`` blobs and return one approval-required ``delete_blob`` call for each.
+
+    Explicit approval refuses a response that carries more than one
+    composition-changing mutation before any of them is published, so the
+    per-turn pending-proposal cap is reachable only through blob-store-only
+    proposals. The cap tests therefore stage blob deletions.
+    """
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from tests.helpers.session_fences import fenced_operation_context
+
+    sessions_service = cast(Any, service)._sessions_service
+    monkeypatch.setattr(service, "_session_engine", sessions_service._engine)
+    calls = []
+    for index in range(count):
+        with fenced_operation_context(sessions_service._engine, session_id, operation_kind=SessionOperationKind.CREATE) as context:
+            blob = await BlobServiceImpl(sessions_service._engine, data_dir).create_blob(
+                UUID(session_id), f"{prefix}-{index}.txt", b"must remain untouched", "text/plain", session_operation_context=context
+            )
+        calls.append((f"{prefix}_{index}", "delete_blob", {"blob_id": str(blob.id)}))
+    return tuple(calls)
+
+
 def _assert_provider_tool_batch_rejection(caught: BaseException | None, expected_message: str) -> None:
     assert type(caught) is _MalformedLLMResponseError
     assert str(caught) == f"LLM tool batch failed admission: {expected_message}"
@@ -1356,6 +1387,7 @@ async def test_explicit_approval_batch_caps_after_first_ten_admitted_publication
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     proposal_count: int,
 ) -> None:
     sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
@@ -1373,7 +1405,14 @@ async def test_explicit_approval_batch_caps_after_first_ten_admitted_publication
 
     monkeypatch.setattr(sessions_service, "create_composition_proposal", _record_real_proposal)
     response = _tool_batch_response(
-        *((f"call_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}}) for index in range(proposal_count))
+        *await _blob_deletion_calls(
+            composer_service_with_real_sessions,
+            result_session_id,
+            tmp_path,
+            monkeypatch,
+            prefix="call_proposal",
+            count=proposal_count,
+        )
     )
 
     caught = await _capture_tool_batch_rejection(
@@ -1452,8 +1491,15 @@ async def test_proposal_cap_excludes_schema_errors_and_semantic_refusals(
         composer_service_with_real_sessions,
         session_id=result_session_id,
         response=_tool_batch_response(
-            *((f"call_valid_attempt_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}}) for index in range(9)),
-            ("call_schema_invalid_attempt", "set_metadata", {}),
+            *await _blob_deletion_calls(
+                composer_service_with_real_sessions,
+                result_session_id,
+                tmp_path,
+                monkeypatch,
+                prefix="call_valid_attempt",
+                count=9,
+            ),
+            ("call_schema_invalid_attempt", "delete_blob", {}),
             (
                 "call_semantic_invalid_attempt",
                 "set_pipeline",
@@ -1479,9 +1525,10 @@ async def test_proposal_cap_excludes_schema_errors_and_semantic_refusals(
     )
 
     assert caught is None
-    # Schema validation fails before handler dispatch; only the nine admitted
-    # metadata handlers execute. The canonical refusal has its own builder.
-    assert handler_calls == ["set_metadata"] * 9
+    # Schema validation fails before handler dispatch, the nine admitted blob
+    # deletions are staged without running their effect handler, and the
+    # canonical refusal has its own builder.
+    assert handler_calls == []
     with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
         assert set(
             conn.execute(
@@ -1525,10 +1572,16 @@ async def test_proposal_cap_excludes_schema_errors_and_semantic_refusals(
 
 
 @pytest.mark.asyncio
-async def test_proposal_attempt_cap_excludes_discovery_and_immediate_create_blob(
+async def test_discovery_and_immediate_create_blob_do_not_block_the_one_staged_proposal(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
 ) -> None:
+    """Only composition-changing mutations count toward one-proposal containment.
+
+    The pending-proposal cap's own exclusion of discovery and ``create_blob``
+    is pinned with real blob custody in
+    ``tests/integration/web/composer/test_explicit_approval_containment.py``.
+    """
     sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
     with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
         conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
@@ -1547,7 +1600,7 @@ async def test_proposal_attempt_cap_excludes_discovery_and_immediate_create_blob
                     "content": "immediate non-proposal content",
                 },
             ),
-            *((f"call_boundary_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}}) for index in range(10)),
+            ("call_boundary_proposal", "set_metadata", {"patch": {"name": "proposal"}}),
         ),
     )
 
@@ -1557,10 +1610,10 @@ async def test_proposal_attempt_cap_excludes_discovery_and_immediate_create_blob
             conn.execute(
                 select(composition_proposals_table.c.tool_call_id).where(composition_proposals_table.c.session_id == result_session_id)
             ).scalars()
-        ) == {f"call_boundary_proposal_{index}" for index in range(10)}
+        ) == {"call_boundary_proposal"}
         assert (
             len(conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).fetchall())
-            == 10
+            == 1
         )
 
 
@@ -1589,19 +1642,24 @@ async def test_proposal_attempt_cap_includes_approval_required_blob_only_mutatio
                 UUID(result_session_id), "retained.txt", b"must remain untouched", "text/plain", session_operation_context=context
             )
         arguments = {"blob_id": str(blob.id)}
+    change_count = 9 if blob_case == "admitted-tenth" else 10
+    staged_calls = await _blob_deletion_calls(
+        composer_service_with_real_sessions,
+        result_session_id,
+        tmp_path,
+        monkeypatch,
+        prefix="call_blob_boundary_proposal",
+        count=change_count,
+    )
     resources_before = _blob_mutation_resources_for_test(sessions_service._engine, tmp_path)
     events = _record_real_batch_progress(monkeypatch)
-    change_count = 9 if blob_case == "admitted-tenth" else 10
     model_feedback: list[dict[str, Any]] = []
 
     caught = await _capture_tool_batch_rejection(
         composer_service_with_real_sessions,
         session_id=result_session_id,
         response=_tool_batch_response(
-            *(
-                (f"call_blob_boundary_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}})
-                for index in range(change_count)
-            ),
+            *staged_calls,
             ("call_approval_required_blob_only", "delete_blob", arguments),
         ),
         model_feedback=model_feedback,
