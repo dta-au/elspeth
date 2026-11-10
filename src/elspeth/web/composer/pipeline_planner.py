@@ -100,6 +100,7 @@ from elspeth.web.composer.context_budget import (
 from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
     CONTEXT_BUDGET_TRANSCRIPT_GAP_ALLOWANCE_BYTES,
+    first_history_shed_of_turn,
     largest_component,
     latest_round_trip_start,
     message_bytes,
@@ -139,6 +140,7 @@ from elspeth.web.composer.planner_authoring_aids import (
 )
 from elspeth.web.composer.private_diagnostic_facts import bind_received_response, capture_received_response
 from elspeth.web.composer.progress import (
+    context_reduced_progress_event,
     emit_progress,
     model_call_progress_event,
     tool_batch_progress_event,
@@ -4015,6 +4017,10 @@ async def _plan_pipeline_inner(
         if request_size > budget_policy.max_request_bytes:
             raise PipelinePlannerError("planner request byte budget exhausted", code="REQUEST_BYTES_EXHAUSTED")
         await emit_progress(lifecycle.progress, model_call_progress_event(intent))
+        # Derived from this call's decision; the turn's earlier call records
+        # say whether the shed was already announced.
+        if first_history_shed_of_turn(context_budget, recorder.llm_calls):
+            await emit_progress(lifecycle.progress, context_reduced_progress_event())
 
         def record_provider_failure(
             exc: BaseException,

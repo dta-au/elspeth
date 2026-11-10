@@ -24,6 +24,7 @@ import type {
 } from "./sessionOperationRetry";
 import * as api from "@/api/client";
 import {
+  COMPOSE_CONTEXT_BUDGET_EXCEEDED,
   COMPOSE_USER_CANCEL_ABORT_REASON,
   isComposeRefreshOnlyFailureCode,
   isComposePermanentRefusal,
@@ -96,6 +97,11 @@ const CONVERGENCE_BUDGET_MESSAGE =
  *    so the chat copy and the /composer-progress snapshot cannot drift.
  */
 function formatConvergenceError(apiErr: ApiError): string {
+  // The compose loop's context budget refusal rides the convergence 422 but
+  // spent no turn budget; its detail is the server's refusal, verbatim.
+  if (apiErr.failure_code === COMPOSE_CONTEXT_BUDGET_EXCEEDED) {
+    return apiErr.detail;
+  }
   if (apiErr.reason !== "convergence_wall_clock_timeout") {
     return CONVERGENCE_BUDGET_MESSAGE;
   }
