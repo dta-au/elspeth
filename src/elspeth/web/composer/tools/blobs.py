@@ -1748,7 +1748,7 @@ def admit_blob_mutation(tool_name: str, arguments: object, state: CompositionSta
     from elspeth.web.blobs.replacement import BlobReplacementCoordinator
 
     if tool_name not in {"update_blob", "delete_blob"}:
-        raise ValueError("blob admission requires update_blob or delete_blob")
+        raise AuditIntegrityError("blob admission requires update_blob or delete_blob")
     deleting = tool_name == "delete_blob"
     deletion_arguments = _validate_mutation_arguments(BlobIdArgumentsModel, arguments, "delete_blob arguments") if deleting else None
     if context.session_engine is None or context.session_id is None:
