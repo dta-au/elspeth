@@ -1123,6 +1123,25 @@ allowed_dict_patterns:
   # treats it as a separate shape; only `messages (list)` is whitelisted here.
   - "src/elspeth/web/composer/llm_response_parsing.py:apply_anthropic_cache_markers:messages (list)"
   - "src/elspeth/web/composer/prompts.py:build_messages:return (list)"
+  # Composer context budget (0.8.12): the budgeter measures and sheds the same
+  # LiteLLM chat-completion message and tool payloads the call sites above
+  # send. It reads roles, tool-call ids and byte sizes and replaces a tool
+  # result's content with a constant stub; it never derives an internal
+  # record from these dicts. Each request's decision is an owned
+  # ContextBudgetDecision, not one of these payloads.
+  - "src/elspeth/web/composer/prompts.py:build_state_context_message:return"
+  - "src/elspeth/web/composer/context_budget_apply.py:message_bytes:messages (list)"
+  - "src/elspeth/web/composer/context_budget_apply.py:stubbed_tool_message:message"
+  - "src/elspeth/web/composer/context_budget_apply.py:stubbed_tool_message:return"
+  - "src/elspeth/web/composer/context_budget_apply.py:latest_round_trip_start:messages (list)"
+  - "src/elspeth/web/composer/context_budget_apply.py:tool_result_segments:messages (list)"
+  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._shed_to_context_budget:messages (list)"
+  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._shed_to_context_budget:tools (list)"
+  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._context_budget_frame:llm_messages (list)"
+  - "src/elspeth/web/composer/pipeline_planner.py:_planner_request_message:return"
+  - "src/elspeth/web/composer/pipeline_planner.py:_hatch_transcript_message:return"
+  - "src/elspeth/web/composer/pipeline_planner.py:_fit_planner_context_budget:messages (list)"
+  - "src/elspeth/web/composer/pipeline_planner.py:_fit_planner_context_budget:tools (list)"
 
   # WEB BLOB/SESSION PIPELINE ADAPTERS — canonical runtime/YAML dict shape.
   # These helpers bridge SQL composition rows to the existing YAML/runtime
