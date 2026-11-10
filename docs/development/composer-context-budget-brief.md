@@ -9,11 +9,14 @@ so the per-component request byte split from fix 4A is being recorded.
 
 The design that answers Phase 2 is
 [`docs/superpowers/specs/2026-11-09-composer-context-budget-design.md`](../superpowers/specs/2026-11-09-composer-context-budget-design.md),
-built for 0.8.13. Before every Web Composer provider call, on both the compose
-loop and the planner, a pure budgeter in
+built for 0.8.13. Before each compose-loop and planner provider call (the
+escape hatch included), a pure budgeter in
 `src/elspeth/web/composer/context_budget.py` sheds context to fit two
 ceilings, records what it shed on the call record (`context_budget`), or
-refuses with `context_budget_exceeded` before any provider call.
+refuses with `context_budget_exceeded` before any provider call. Advisor and
+review calls are not yet budgeted: they still carry the whole session
+transcript and can be rejected by the gateway for size, which leaves the
+advisor unavailable for that turn.
 
 Settings (`WebSettings`, `src/elspeth/web/config.py`):
 
@@ -27,13 +30,17 @@ Settings (`WebSettings`, `src/elspeth/web/config.py`):
 Shed order, oldest first within each: tool-result bodies from earlier round
 trips of the current turn (replaced by a fixed stub), prior assistant prose,
 escape-hatch transcript events, prior user requests. Tokens are estimated
-from bytes with the session's last recorded bytes-per-token ratio (3.0 before
-its first successful call).
+from the request's content bytes with the bytes-per-token ratio of the
+session's newest successful budgeted call on the same model (failing that, on
+any model), clamped to 2.0-5.0; before the session has one the ratio is 3.0.
+The byte ceiling is checked against the request as sent (canonical JSON of
+its messages and tools).
 
 Not done: the Phase 1 records investigation below, and its acceptance
 evidence (replaying the affected users' failing sessions through the new
-policy), were not carried out. The design bounds all four growth paths
-instead of the one a records investigation might single out. No live
+policy), were not carried out. The design bounds the four growth paths its
+spec lists instead of the one a records investigation might single out; the
+advisor's transcript is a fifth and is not bounded. No live
 provider run has exercised the budget.
 
 ---

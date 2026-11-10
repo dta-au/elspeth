@@ -30,27 +30,40 @@ fractions of the token cap; `SHED_TO` must be below `SHED_ABOVE`.
 
 ### Composer
 
-- **The Composer sheds context to fit an operator-set budget.** Before every
-  Web Composer provider call, on the compose loop and the planner, the server
-  removes context in a fixed order until the request fits the prompt-token cap
-  and the request-byte ceiling: earlier tool results in the current turn
-  (each body replaced by a fixed stub; the call and result message stay),
-  then earlier assistant prose, then escape-hatch transcript events, then the
-  oldest earlier user requests, oldest first within each. Shedding starts
-  above `SHED_ABOVE` of the cap and continues to `SHED_TO`. The system skill,
+- **The Composer sheds context to fit an operator-set budget.** Before each
+  compose-loop and planner provider call (the escape hatch and the reply
+  after staged review cards included; advisor and review calls are not, see
+  Known limits), the server removes context in a fixed order until the
+  request fits the prompt-token cap and the request-byte ceiling: earlier
+  tool results in the current turn (each body replaced by a fixed stub; the
+  call and result message stay), then earlier assistant prose, then
+  escape-hatch transcript events, then the oldest earlier user requests,
+  oldest first within each. Shedding starts above `SHED_ABOVE` of the cap and
+  continues to `SHED_TO`. What was shed stays shed, and nothing more is shed
+  until the reduced request crosses `SHED_ABOVE` again; it is restored only
+  when the whole request is back at or under `SHED_TO`. The system skill,
   catalog, tool definitions, current request, pipeline state and latest tool
   round trip are never removed. The budgeter makes no provider call and adds
   no text of its own beyond the stub and counts of omitted messages.
+- **The two ceilings are measured differently.** The request-byte ceiling is
+  checked against the request as sent (the JSON of its messages and tools,
+  escaping included), which is what a gateway's body cap sees. The token
+  estimate uses the request's content bytes, the same measure as the stored
+  `request_byte_split`.
 - **What was shed is recorded on each call.** Composer call records gain a
   `context_budget` field (the policy hash, estimated tokens before and after,
-  the ratio used, and what was removed or stubbed). Older records without it
-  read as "no shedding recorded".
+  the `bytes_per_token` ratio the estimate used, and what was removed or
+  stubbed). Older records without it read as "no shedding recorded".
 - **A request that cannot fit is refused with a named cause.** When the
   protected content alone exceeds either ceiling, the server refuses before
   any provider call with `context_budget_exceeded`: "This conversation is too
   large for the composer to continue. Start a new session, or shorten your
-  request." It offers no Retry. This also replaces the generic failure
-  previously shown when the planner's request-byte ceiling refused a request.
+  request." It offers no Retry. The compose loop and the planner both answer
+  it with HTTP 422. This also replaces the generic failure previously shown
+  when the planner's request-byte ceiling refused a request. One case does
+  not fail the turn: if the optional reply after review cards are staged
+  cannot fit, no provider call is made, the turn completes, and the reply is
+  reported as unavailable, as it is when the provider fails that call.
 - **Users are told when history is shed.** A turn whose model call leaves
   earlier conversation out shows the progress notice "Earlier conversation is
   no longer visible to the composer."
@@ -59,12 +72,19 @@ fractions of the token cap; `SHED_TO` must be below `SHED_ABOVE`.
 - **`composer_skill_hash` changes.** The composer skill gains one paragraph
   explaining the counts of omitted earlier messages.
 
-Known limits: token counts are estimated from request bytes using the
-session's last recorded bytes-per-token ratio (3.0 before its first
-successful call), not a tokenizer. If the provider still rejects a request
-for context length, it is recorded as before and there is no automatic retry.
-The planner measures its request on a slightly larger basis than the compose
-loop, so it sheds a little earlier.
+Known limits:
+
+- Token counts are estimated from request content bytes, not a tokenizer. The
+  bytes-per-token ratio comes from the session's newest successful budgeted
+  call on the same model (failing that, on any model), clamped to 2.0-5.0.
+  Until the session has such a call the ratio is 3.0, which over-estimates
+  tokens; this includes the first turn of an existing session after the
+  upgrade.
+- If the provider still rejects a request for context length, it is recorded
+  as before and there is no automatic retry.
+- Advisor and review calls are not yet bounded by the context budget. In a
+  long session with the advisor enabled, such a call can still be rejected by
+  the gateway for size; the advisor is then unavailable for that turn.
 
 ---
 
