@@ -575,6 +575,11 @@ def _recover_read_bodies(events: list[dict[str, Any]], reader: TranscriptBlobRea
 # The availability gap a transcript reduced to fit the context budget carries.
 CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP: Final[str] = "oldest_events_omitted_for_context_budget"
 
+# Where the current request's full text lives; the event carrying one of these
+# as its ``content_ref`` stands for the current request.
+AdvisorRequestReference = Literal["complete_original_user_request_section", "initial_planner_request.intent"]
+_REQUEST_REFERENCES: Final[frozenset[str]] = frozenset(get_args(AdvisorRequestReference))
+
 
 @final
 @dataclass(frozen=True, slots=True)
@@ -588,7 +593,7 @@ class AdvisorVisibleTranscript:
 
     def with_request_reference(
         self,
-        reference: Literal["complete_original_user_request_section", "initial_planner_request.intent"],
+        reference: AdvisorRequestReference,
     ) -> AdvisorVisibleTranscript:
         """Point to the existing full request in another owned entry path."""
         payload = json.loads(self.provider_json)
@@ -615,9 +620,18 @@ class AdvisorVisibleTranscript:
         return tuple(len(json.dumps(event, ensure_ascii=False).encode("utf-8")) + 1 for event in payload["events"])
 
     def sheddable_event_indices(self) -> tuple[int, ...]:
-        """Indices of the events that carry no ``content_ref`` (the current request is a reference)."""
+        """Indices of every event except the current request's reference.
+
+        A legacy ``content_ref`` (``legacy_invocations[0].result_canonical``)
+        points inside its own event, so dropping that event leaves no
+        reference dangling.
+        """
         payload = json.loads(self.provider_json)
-        return tuple(index for index, event in enumerate(payload["events"]) if "content_ref" not in event)
+        return tuple(
+            index
+            for index, event in enumerate(payload["events"])
+            if "content_ref" not in event or event["content_ref"] not in _REQUEST_REFERENCES
+        )
 
     def without_events(self, indices: frozenset[int]) -> AdvisorVisibleTranscript:
         """Drop sheddable events to fit a context budget; the gap is disclosed once.
