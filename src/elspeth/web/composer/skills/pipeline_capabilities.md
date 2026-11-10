@@ -396,6 +396,12 @@ Self/forward references, duplicate outputs and overwriting arriving fields are
 refused. A failed lookup releases no partially enriched row; the node's error
 route receives the original entry row.
 
+For a selected `file_inject`, each `files` entry is one whole file written into
+a row field. `mode: select` writes the entry named by the row's `key_field`
+value to `output_field`, with `on_miss` for a row that names none; `mode: all`
+writes every entry to that entry's own `output_field`. State `format` on every
+entry.
+
 ### Optional operator-led chain compaction
 
 You may offer an optional combined LLM step after inspecting the complete linear

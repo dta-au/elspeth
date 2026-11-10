@@ -265,6 +265,20 @@ _INFORMATION_BOUNDARY_DISCOVERY_CANONICAL_BYTES = 3840
 # The system message and tools are unchanged. Price only this measured 188 B,
 # preserving the finite tripwire and exact-boundary / +1-byte overflow control.
 _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES = 188
+# file_inject transform (2026-11-10). Operator ruling 2026-11-10 (John): the
+# cap is a trigger to review for waste, not a reason to cut; with no obvious
+# cut, the measured increase is authorised. Measured on the same live request,
+# omitting only the file_inject summary in the catalog control: 135,730 B
+# without the plugin and its teaching, 136,597 B with both: +867 B. The
+# discovery-digest entry is +509 B (508 B entry, 1 B list separator) and its
+# outer JSON escaping +30 B; the capability-core passage on the two modes is
+# +322 B of system text and +6 B of escaping. Payload and tool-palette bytes are
+# identical, and the small-catalog case measures the same 136,597 B. The waste
+# review removed the mode/format sentence and the content rule that the two
+# skill files would otherwise each have carried. Price only this measured
+# growth: the baseline, 10% band and prior headroom (zero before this change)
+# are preserved, with the exact-boundary / +1-byte overflow control.
+_FILE_INJECT_CATALOG_CANONICAL_BYTES = 867
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
@@ -276,6 +290,7 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _QUALIFICATION_SCAFFOLD_CANONICAL_BYTES
     + _INFORMATION_BOUNDARY_DISCOVERY_CANONICAL_BYTES
     + _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES
+    + _FILE_INJECT_CATALOG_CANONICAL_BYTES
 )
 
 
