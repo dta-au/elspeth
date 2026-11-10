@@ -21,7 +21,7 @@
 - Any new walker over planner-authored option values carries `@observation_boundary(tier=3, …)` like `_recursive_public_option_projection` (`src/elspeth/web/composer/yaml_generator.py`), with a `test_ref` when it raises.
 - Composer invariants: import copies an owner-authored graph; the server authors no pipeline structure; no tutorial-specific code.
 - Run focused tests with `-n 0`; run tests to a log file and read the exit code (AGENTS.md § Test Verification Policy).
-- Changelog entries go under `## Unreleased (0.8.10)` in `CHANGELOG.md`.
+- Changelog entries go under `## Unreleased (0.8.11)` in `CHANGELOG.md`.
 
 ## Review Focus
 
@@ -52,7 +52,7 @@ The public projection keeps each `blob_rows` entry minus `blob_id`, leaking `pay
 - [ ] **Step 2: Run** `.venv/bin/python -m pytest tests/unit/web/composer/test_yaml_generator.py -n 0 -k "BlobRows or marker_labels"` — expect the three new tests FAIL.
 - [ ] **Step 3: Implement.** Add `"blobs"` to the source-level linkage set (`_PUBLIC_SOURCE_LINKAGE_KEYS`) and strip it at source top level in the projection (the `strip_bind_source_mode=True` call is the source-only call). Add `"blobs": "blob-linkage"` to `_MARKER_LABELS`. `sources_reading_uploaded_blobs` then also names `blob_rows` sources — intended.
 - [ ] **Step 4: Run** the yaml generator, yaml importer and `tests/unit/web/sessions/test_routes_state.py` files — all PASS.
-- [ ] **Step 5: Commit** `fix(composer): remove blob_rows file entries from the public projection` and add one bullet under the existing `## Unreleased (0.8.10)` › `### Composer` changelog entry.
+- [ ] **Step 5: Commit** `fix(composer): remove blob_rows file entries from the public projection` and add one bullet under the existing `## Unreleased (0.8.11)` › `### Composer` changelog entry.
 
 ### Task 2: File-binding collector
 
@@ -340,7 +340,7 @@ The public projection keeps each `blob_rows` entry minus `blob_id`, leaking `pay
 **Files:**
 - Create: `src/elspeth/web/frontend/tests/e2e/shared-graph-import.spec.ts`
 - Modify: `src/elspeth/web/frontend/tests/e2e/setup/global-setup.ts` (register a second user, `e2e-recipient`)
-- Modify: `CHANGELOG.md` (`## Unreleased (0.8.10)`: the feature, the storage-growth cost with dta-au/elspeth#356, the LLM-authored-file refusal, and the accepted crash/retry gaps)
+- Modify: `CHANGELOG.md` (`## Unreleased (0.8.11)`: the feature, the storage-growth cost with dta-au/elspeth#356, the LLM-authored-file refusal, and the accepted crash/retry gaps)
 - Modify: `docs/superpowers/specs/2026-11-09-shared-graph-import-design.md` (§2: plugin-policy violations are **refused** by the seeder with 422, as library fork does; LLM-authored files are not importable)
 
 - [ ] **Step 1: Write the Playwright spec:** the sharer seeds a session with an uploaded CSV source and a `reference_join` file (helpers `createSession`, `uploadBlob`, `seedCompositionState` in `tests/e2e/helpers/api.ts`), creates a 1-day import link through the dialog; the recipient opens it, clicks Import, lands in a session whose graph shows both files attached.

@@ -20,6 +20,13 @@ frozen snapshot of the pipeline. The reviewer sees:
 The reviewer cannot edit, execute, or fork the shared session. The
 inspect view is purely read-only.
 
+The owner can also tick **Let recipients import a copy** when creating the
+link. A recipient of such a link sees **Import a copy into my workspace**,
+which creates a new session of their own holding a copy of the graph and of
+every uploaded file it uses (see [Import-time](#import-time)). The shared
+session is never modified. Links created without that option, and links
+minted before it existed, stay view-only.
+
 ## Deployment requirements
 
 ### Required: `web.shareable_link_signing_key`
@@ -55,17 +62,24 @@ been leaked.
 
 Default: **30 days** (`2592000`).
 
-This is the absolute expiry stamped onto every newly minted token. The
-signer's `verify()` rejects tokens past this point regardless of their
-HMAC signature. Operators may lower or raise this to match their review
-cadence; values must be `> 0`.
+This is the longest lifetime a link can have. The owner picks 1 day, 7
+days or 30 days for each link; the dialog offers only the choices at or
+below this maximum and defaults to the longest of them. When none fits (a
+maximum below one day) the dialog says so and the link lasts the maximum.
+The server refuses a longer `lifetime_seconds` with 422, and re-minting
+keeps the chosen lifetime, clamped to the current maximum. The signer's
+`verify()` rejects tokens past their expiry regardless of their HMAC
+signature. Operators may lower or raise this to match their review cadence;
+values must be `> 0`.
 
-The lifetime is independent of the payload store retention policy. If
-your retention is shorter than the lifetime, the token may verify but
-the underlying blob may be gone — the route returns 404 with a "ask the
-sender for a fresh link" message. Operators choosing
-`payload_store_retention_days * 86400 < shareable_link_lifetime_seconds`
-accept this trade-off.
+Nothing in the web application deletes stored snapshots, or the files
+frozen into a link that allows import, from the payload store: they remain
+after the link expires (`payload_store_retention_days` does not apply to
+them). Identical bytes are stored once. Reclamation is tracked in
+[#356](https://github.com/dta-au/elspeth/issues/356). A snapshot or file
+removed by other means, for example by `elspeth purge` of a run payload with
+identical bytes, makes the link answer 404 with an "ask the sender for a
+fresh link" message.
 
 ## First-deploy operator action
 
@@ -158,14 +172,29 @@ The backend:
    failures return HTTP 409 — the user fixes the errors and tries again.
 2. Computes the Audit Readiness snapshot. If any row's `status` is
    `error`, returns 409 — sharing a known-broken state is share-theatre.
-3. Freezes the entire snapshot (composition + YAML + readiness panel)
-   into a canonical-JSON blob and computes its sha256 content-address.
-4. **Inserts an audit row** into `composer_completion_events_table` with
+3. **If import is allowed** (`allow_import: true`), reads every uploaded
+   file the graph is attached to (a source's `blob_ref`, a `blob_rows`
+   source's entries, transform inline-content markers) and checks each
+   against its recorded hash and size. Only a ready file the user uploaded
+   verbatim can travel; any other refuses the request with 409 naming the
+   file. It also records each sink output path that lies inside the owner's
+   session `outputs/` or `blobs/` folder.
+4. Freezes the entire snapshot (composition + YAML + readiness panel, and
+   for an import link the private file and sink-path manifests) into a
+   canonical-JSON blob and computes its sha256 content-address.
+5. **Stores each frozen file** in the payload store (import links only).
+6. **Inserts an audit row** into `composer_completion_events_table` with
    `event_type='mark_ready_for_review'` (sync, crash-on-failure).
-5. **Writes the blob** to the payload store, addressed by the digest.
-6. **Signs a token** encoding `(session, state, expiry, digest, owner)`
+7. **Writes the blob** to the payload store, addressed by the digest.
+8. **Signs a token** encoding `(session, state, expiry, digest, owner)`
    with HMAC-SHA256 over the canonical envelope.
-7. Returns `{token, share_url, expires_at, payload_digest}` to the UI.
+9. Returns `{token, share_url, expires_at, payload_digest}` to the UI.
+
+Before the owner confirms, the dialog reads
+`GET /api/sessions/{session_id}/shareable-files`: the files an import link
+would carry (name, size, where each is used), whether the graph can be
+shared for import and why not, and `max_lifetime_seconds`. It judges each
+file from its stored record and reads no file content.
 
 The audit row carries the digest and the expiry. The token carries the
 same fields plus a random nonce that distinguishes two tokens minted at
@@ -214,7 +243,37 @@ hash route `#/shared/{token}` and makes a backend call to
 The resolve path does NOT call `ReadinessService.compute_snapshot` —
 the audit_readiness field is read directly from the frozen blob. This
 guarantees the reviewer sees the owner's mark-time view, not a drifted
-fresh-fetch view.
+fresh-fetch view. For an import link the response also lists the frozen
+files by name and size; it never carries their hashes, blob ids or paths.
+
+### Import-time
+
+On a link that allows import, the recipient clicks **Import a copy into my
+workspace** (`POST /api/sessions/shared/{token}/import`). Any signed-in user
+with the deployment-wide `user` role who holds the link can import it; the
+request uses the same strict per-user rate limit as opening the link. The
+backend:
+
+1. **Verifies and reads everything first:** the token (401 if tampered or
+   expired), the import opt-in (403 for a view-only link), the snapshot and
+   every frozen file (404 "ask the sender for a fresh link" if one is gone).
+   Nothing is created until these reads succeed.
+2. **Creates a new session** owned by the recipient, titled "Copy of
+   ‹pipeline name›".
+3. **Copies each frozen file** into it as an ordinary upload, under the
+   recipient's storage quotas (413 when over quota).
+4. **Seeds the graph** through the ordinary YAML importer, with its credential,
+   plugin-policy and redaction checks, re-attaching every file binding to the
+   recipient's copy and re-basing each recorded sink path under the same
+   folder of the recipient's session. A sink path outside the owner's session
+   folders does not travel and must be set in the copy. A graph using a
+   plugin the recipient may not use is refused with 422.
+5. **Records provenance** as `shared_import` in the new state's
+   `composer_meta` (the snapshot digest, the sharer, and each file's copy).
+
+Any failure after step 2 archives the new session. Each import creates a new
+session; the owner is not notified and nothing is written on the owner's
+side.
 
 ## YAML export audit
 
@@ -377,8 +436,28 @@ Ask the sender to re-mint and resend.
 
 ### `GET /sessions/shared/{token}` returns 404
 
-The payload store has reaped the blob. Ask the sender to **Save for review**
-again and send the newly returned URL. Re-minting cannot restore the blob.
+The snapshot is no longer in the payload store. Ask the sender to **Save for
+review** again and send the newly returned URL. Re-minting cannot restore the
+blob.
+
+### `POST /mark-ready-for-review` returns 409 naming a file
+
+The link was created with import allowed and a file the graph uses cannot
+travel: it is not ready, has no recorded hash, no longer matches its recorded
+content, was written by the assistant, or was produced by a pipeline run.
+Only files the user uploaded travel. Re-attach the file, or create a
+view-only link.
+
+### `POST /mark-ready-for-review` returns 422 "a shared link can last at most …"
+
+The requested lifetime is longer than `shareable_link_lifetime_seconds`.
+The dialog offers only lifetimes the deployment accepts.
+
+### `POST /sessions/shared/{token}/import` returns 403
+
+Either the link is view-only ("This share link does not allow import"), or
+the recipient's account lacks the deployment-wide `user` role
+(`error_type: user_role_required`). The import page names which.
 
 ## Frontend surfaces (post-Phase-6B)
 
@@ -401,10 +480,13 @@ The user-facing entry points landed by Phase 6B:
   have the button disabled.
 * **Save-for-review dialog** —
   `components/composer/SaveForReviewDialog.tsx`. Mounted at app-root so
-  the verb can open it from any focused view. Three observable states:
-  spinner (in-flight), error banner (with Try-again button), or
-  success panel (share URL + copy-to-clipboard + Open-in-new-tab link
-  + expiry timestamp). The share URL is the absolute form
+  the verb can open it from any focused view. It opens on a configure
+  step — **Let recipients import a copy** (off by default, listing the
+  files that would travel) and **Link expires after** (only the lifetimes
+  the deployment accepts) — and mints nothing until **Create link**. Then
+  three observable states: spinner (in-flight), error banner (with
+  Try-again button), or success panel (share URL + copy-to-clipboard +
+  Open-in-new-tab link + expiry timestamp). The share URL is the absolute form
   `${location.origin}/#/shared/{token}` — the backend returns the
   path-only suffix and the frontend prepends `location.origin`.
 * **Shared inspect view** — `components/shared/SharedInspectView.tsx`.
@@ -412,7 +494,10 @@ The user-facing entry points landed by Phase 6B:
   hash matches `#/shared/{token}`. Renders read-only: pipeline
   metadata, the six-row audit-readiness panel served verbatim from the
   frozen blob, and the rendered YAML. The composer chat panel, run
-  controls, and edit affordances are deliberately absent.
+  controls, and edit affordances are deliberately absent. On a link that
+  allows import it shows the files that come with it and **Import a copy
+  into my workspace**, which navigates to the new session on success and
+  otherwise names the reason it was refused.
 * **Narrative results panel** —
   `components/composer/NarrativeResults.tsx`, conditionally rendered
   by `InlineRunResults` when `useNarrativeMode().narrativeMode` is

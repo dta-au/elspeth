@@ -1,8 +1,8 @@
 # Shared graph import — design
 
-**Status:** implemented on this branch for 0.8.10 (2026-11-09). §2 records where the
+**Status:** implemented on this branch for 0.8.11 (2026-11-09; moved from 0.8.10). §2 records where the
 implementation departs from the approved design.
-**Target release:** 0.8.10.
+**Target release:** 0.8.11.
 **Branch:** `claude/brave-albattani-yjqujo` (built on `claude/vibrant-euler-tora25`).
 
 ## Goal
@@ -76,7 +76,11 @@ blob ids or storage paths). The dialog gains:
    files that will travel: name, size, and which component and option uses each.
 2. **"Link expires after"**: 1 day, 7 days, 30 days. The server refuses any value
    above `shareable_link_lifetime_seconds` (422); the browser is not trusted to
-   enforce the cap.
+   enforce the cap. The file-list route also returns that maximum
+   (`max_lifetime_seconds`), and the dialog offers only the choices at or below
+   it, defaulting to the longest. When none fits (or the file list could not be
+   loaded) it offers no choice, says so, and sends no `lifetime_seconds`, so the
+   server maximum applies.
 
 **Server, on confirm:**
 
@@ -175,11 +179,15 @@ would need a sessions-schema change. Order of operations:
    Chris setting them. Tom's session id never appears in Chris's graph. A sink
    whose path was outside Tom's session folders is not recorded and lands
    without that option, so Chris (or the composer) sets it, as when importing a
-   public YAML export; a non-file sink's configuration is unaffected. The
-   manifest is server-written, but a recorded path that is empty, absolute or
-   contains `..` is refused as an integrity error before Chris's session is
-   created, and `sink_path_bindings` (also open to the ordinary YAML import
-   route) can only produce a path inside the caller's own session folders.
+   public YAML export; a non-file sink's configuration is unaffected. Nor is a
+   path whose part below the folder is longer than 1024 characters, holds a
+   control character, or is shaped like a credential recorded. The
+   manifest is server-written, but a recorded path that is empty, absolute,
+   contains `..` or would not be recorded for those reasons is refused as an
+   integrity error before Chris's session is created, and
+   `sink_path_bindings` (also open to the ordinary YAML import route) refuses
+   the same paths and can only produce a path inside the caller's own session
+   folders.
    Links minted before this was added carry no `sink_paths`; their copies'
    sinks still need setting.
 6. **Record provenance** in the seeded state's `composer_meta` as
@@ -203,11 +211,17 @@ answers 422 and the new session is archived, as library fork does (the design
 said such graphs would still import).
 
 **Files written by the assistant cannot be shared for import.** Only files whose
-bytes the user uploaded verbatim travel. If the graph is attached to a file the
-assistant wrote (any non-verbatim creation modality), creating an import link
-is refused with 409 naming the file ("'‹name›' was written by the assistant and
-cannot be shared for import"), and the dialog's file preview says so before the
-owner confirms. View-only sharing of the same graph is unaffected.
+bytes the user uploaded verbatim travel: the blob's creator must be the user
+and its creation modality verbatim, read as a pair. If the graph is attached to
+a file the assistant wrote (assistant-created, or any non-verbatim creation
+modality), creating an import link is refused with 409 naming the file
+("'‹name›' was written by the assistant and cannot be shared for import"); a
+file a pipeline run produced is refused the same way ("'‹name›' was produced by
+a pipeline run and cannot be shared for import"). The dialog's file preview
+says so before the owner confirms; it judges each file from its blob row and
+never reads file content, so a file whose bytes no longer match its row is
+refused only when the link is created. View-only sharing of the same graph is
+unaffected.
 
 ### 3. Failure handling
 

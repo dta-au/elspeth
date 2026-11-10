@@ -154,6 +154,22 @@ The precedent for `hmac.compare_digest` at boundary verifiers is `core/payload_s
 * The catalog already serializes `capability_tags`. Phase 6 adds zero new fields to the wire — no Protocol modification, no TypeScript type extension, no new frontend hook field.
 * A future opt-in (e.g. "supports-streaming-results") is a one-line plugin change with no infrastructure work.
 
+### D9. A link can opt in to import (amendment, 0.8.11)
+
+**Decision:** The owner chooses, per link, whether recipients may import a copy. Without the opt-in a link stays read-only exactly as D4–D6 describe; links minted before this amendment are read as view-only. With it, `POST /api/sessions/shared/{token}/import` creates a **new session owned by the recipient** holding a copy of the graph and of the files it uses. The shared session itself is never modified, so the "inspect view is read-only" boundary below still holds for the shared session; what changes is that a link can now hand file bytes to its holder.
+
+**What the opt-in changes:**
+
+* **Who can import.** Any signed-in identity holding the link that has the deployment-wide `user` role (`require_pipeline_user`); a signed-in identity without it gets 403 `user_role_required`. The token stays a capability, not an authenticator (D6), and the import uses the strict per-user rate limit, like opening a link.
+* **Frozen files.** At mark time, every uploaded file the graph is attached to (a source's `blob_ref`, a `blob_rows` source's entries, transform inline-content markers) is read under the owner's session, checked against its recorded hash and size, and stored in the payload store before the audit row is written. Only a ready file the user uploaded verbatim travels: a file the assistant wrote or a pipeline run produced refuses the share with 409 naming the file. The snapshot carries a private file manifest (names, MIME types, sha256 values, binding sites) and a private sink-path manifest, both bound by `payload_digest`; the inspect response exposes only file names and sizes. Later edits or deletion on the owner's side do not affect the frozen copy, and the owner cannot delete it.
+* **Lifespan.** The owner picks 1, 7 or 30 days; `shareable_link_lifetime_seconds` becomes the maximum and the server refuses a longer value (422). Re-minting keeps the chosen lifespan, clamped to the current maximum. D5 is unchanged: there is still no per-link revocation.
+* **Import.** The token, snapshot and every frozen file are read and verified before anything is created. The recipient's session is seeded through the ordinary YAML importer (credential, plugin-policy and redaction checks included), with each file copied into the new session as an ordinary blob under the recipient's quotas and every binding re-attached to the copy. A failure after the session exists archives it. The import is recorded as `shared_import` provenance in the new state's `composer_meta`; nothing is written on the owner's side.
+* **Sink paths.** A sink `path`, `file` or `persist_directory` inside the owner's session `outputs/` or `blobs/` folder is recorded as a folder plus relative path and re-authored under the same folder of the recipient's session. Any other sink path does not travel. A recorded path that could leave the recipient's folder is an integrity error and no session is created.
+
+**Amends D4's retention bullet:** nothing in the web app reclaims payload-store content, so snapshots and frozen files stay stored after a link expires. Reclamation is tracked in [#356](https://github.com/dta-au/elspeth/issues/356).
+
+**Design record:** [docs/superpowers/specs/2026-11-09-shared-graph-import-design.md](../../superpowers/specs/2026-11-09-shared-graph-import-design.md).
+
 ## Consequences
 
 ### What this commits us to
