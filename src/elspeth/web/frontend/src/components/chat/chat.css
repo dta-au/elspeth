@@ -924,7 +924,10 @@
 
 .chat-input-hint {
   position: absolute;
-  right: 0;
+  /* The row is the composer well: its padding inset Send from the padding
+     box this offset is measured against, so the hint shares Send's right
+     edge only if it takes the same inset. */
+  right: var(--space-sm);
   bottom: calc(var(--size-control) + var(--space-xs) + var(--space-sm));
   flex-basis: 100%;
   padding: 0 0 var(--space-xs);

@@ -1118,7 +1118,10 @@ describe("ChatInput keyboard hint in the composition row (elspeth-1b7227936c)", 
     expect(rowRule).toMatch(/min-height:\s*calc\([^;]*var\(--size-control\)/s);
     const hintRule = css.match(/\n\.chat-input-hint\s*\{([^}]*)\}/s)?.[1];
     expect(hintRule).toMatch(/position:\s*absolute/);
-    expect(hintRule).toMatch(/right:\s*0/);
+    // The row is the composer well (padding --space-sm): Send sits inside
+    // that padding, so the hint takes the same inset to share Send's right
+    // edge (pinned as a rendered fact by expectComposerInputGeometry).
+    expect(hintRule).toMatch(/right:\s*var\(--space-sm\)/);
     expect(hintRule).toMatch(/bottom:\s*calc\(var\(--size-control\)/);
     // Still carries its own-line basis for the regimes that put it back in
     // flow (below); inert while positioned.
