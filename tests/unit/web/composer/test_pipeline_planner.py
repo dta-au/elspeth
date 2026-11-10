@@ -286,9 +286,9 @@ _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES = 188
 # non-optional fields then measures 139,224 B, +13 B. Price only the 3,494 B
 # excess over the prior 135,730 B pin, keeping zero new headroom and the
 # exact-boundary / +1-byte overflow control. If the gate_routing aid is
-# declined, the value is 1,682. NOT YET OPERATOR-RULED: this allowance follows the 2026-10-18
-# direction on justified guidance growth and is flagged for the maintainer in
-# docs/architecture/composer-remediation/reports/skill-rework-report.md.
+# declined, the value is 1,682. Operator ruling 2026-11-10: the 3,494 B
+# allowance, gate_routing aid included, is approved; the prompt is scheduled
+# for a per-surface restructure that is expected to replace this pin.
 _SKILL_REWORK_0812_CANONICAL_BYTES = 3494
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
