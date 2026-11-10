@@ -9,6 +9,25 @@ mostly design work, plus a handful of small defects found too late in the day.
 
 ## A. Design work (do these first; they change what the model is told and how proposals behave)
 
+Designs for A1 to A3 now exist, each written by a Fable lead directing Astra
+and each independently reviewed. They are on branch `docs/composer-0812-design`
+under `docs/architecture/composer-remediation/design/` (`*-design.md` with a
+matching `*-design-review.md`). All three reviews say "sound with corrections".
+
+**Reconcile them before implementing anything.** The three designs were
+written in parallel and contradict each other at their seams:
+
+- A2 and A3 both claim session epoch 79.
+- A3 retires a stale proposal at write time (`head_advanced`); A2 retires it at
+  compose start (`base_conflict`) and refuses `request_interpretation_review`
+  while a proposal is pending, which makes part of A3's contract moot.
+- A1 builds its first step and its metric on `approval_batch_not_atomic` and
+  `approval_proposal_pending`, which A2 deletes; A1 and A2 give the session
+  context object different shapes.
+- A2's "safe stopping point" after step 3 is not safe in explicit-approval
+  mode: a planner supersede can silently replace the user's pending plan.
+- The `diff_pipeline` baseline (A3) is not reconciled with A2's working state.
+
 ### A1. Per-surface skill restructure
 
 The planner receives the whole composer skill, and about 29% of it is not
@@ -62,17 +81,22 @@ not a message defect.
 | B7 | The web server does not boot on CPython 3.14.3 (uv build): `ProcessWatchdog` calls `os.pidfd_open` unconditionally while `requires-python` is `>=3.12`. Add a fallback or bound the range. | boot trace, 2026-11-10 |
 | B8 | `remove_output` leaving edges is fixed and unit-tested, never exercised live. | `deepseek-postmerge-probe.md` |
 
-Three more were in progress when this was written (`explain_validation_error`
-not knowing `canonical_schema`; `_validate_transform_provider_config_path`
-gate ordering; an `invented_source` row admitted on a verbatim bind). If
-`evening-fixes-0812-report.md` exists and they are merged, they are done;
-otherwise they belong in this table.
+| B9 | Three fixes written by Sol and held out of 0.8.12: `explain_validation_error` learns `canonical_schema` and five others; `_validate_transform_provider_config_path` ordering (may be a no-op: the `upsert_node` caller already returned the right error); a contradictory `invented_source` row refused on a verbatim bind. Committed as WIP on `fix/composer-0812-evening`, unreviewed, no valid broad test run. | `evening-fixes-0812-report.md` on that branch |
+| B10 | Credential-shaped prose in model reasoning (`password: "..."`) loses the whole turn (`credential_material_rejected`). Refusing reasoning is a documented control (security-assurance pack F8, EV-227). A withhold-instead fix is on `fix/composer-reasoning-credential-withhold` with an adversarial review: safe, but it does not help Anthropic (signed thinking blocks still refuse), leaves no stored trace of a withhold, and leaves the assurance pack false. Needs a ruling, then one piece of work covering all three. | `credential-reasoning-withhold-report.md` and `-review.md` on that branch |
+| B11 | `batch_replicate`: the model declares the node-created `copy_index` in the node's input schema; the `schema_contract_violation` fix text points at the source. Two of three live runs exhausted the repair budget. `batch_stats` assistance does not name its output fields. | `deepseek-batch-plugins-probe.md` |
+| B12 | 94 registered rejection codes have no `explain_validation_error` entry (268 registered, 174 explained; 15 of the 94 are audit categories, 3 are dead). The planner never sees raw rejection messages, so a catalogue entry is the only help it gets. Recommended: split the registry into model-facing and not, with a test requiring an explanation for every model-facing code. | `rejection-code-explanation-recon.md` on `fix/composer-0812-evening` |
+| B13 | `gate_expression_preview_memory_exhaustion` can fire only if the evaluator's constructor fails: `ExpressionParser.evaluate` wraps `MemoryError` as `unexpected_error`. Decide whether `evaluate` should let it propagate (a core change). The skill row at `pipeline_composer.md:1468` still says to declare numeric fields for every gate evaluation failure. | `gate-eval-kind-repair-report.md` |
+| B14 | `fork_coalesce` used 57% more reasoning and one extra provider call on the final tree than on the morning baseline. Not investigated. | `deepseek-final-battery-0812.md` |
+| B15 | Gate preview samples the first 8 KB of a CSV, so the last sampled row can be cut off and lack correctly spelt fields; a correct gate condition on a larger CSV is then blocked. A kind-aware rewrite of the `gate_expression_type_mismatch_against_source_schema` advice failed review on this and is being reworked on `fix/composer-gate-eval-kind-repair` (not in 0.8.12). | `gate-eval-kind-repair-review.md` on that branch |
 
 ## C. Operator decisions outstanding
 
-- Web-authorise the three hidden batch plugins (`batch_stats`,
-  `batch_replicate`, `batch_experiment_compare`) or keep them hidden. The
-  skill text currently does not mention them.
+- Decided 2026-11-10: the three batch plugins (`batch_stats`,
+  `batch_replicate`, `batch_experiment_compare`) are authorised through the
+  deployment allowlist, and are on the dev box. With them, all nine live runs
+  of the three affected battery cases built with the intended plugin. Still
+  open: the AWS ECS default allowlist carries no batch plugins at all;
+  widening it is a decision about what a cold install exposes.
 - The 30 trust-tier findings classified as correct code in
   `tier-adjudication-0812.md` await the judge pass before signing. No
   allowlist entry or signature was created.
@@ -92,6 +116,17 @@ otherwise they belong in this table.
 - The alias-gate red seen once in a full-suite run did not reproduce on any
   frozen commit (`gate-reds-0812-report.md`). Investigate only if it recurs in
   a frozen run.
+
+## Measured result of the 0.8.12 day
+
+One DeepSeek round of the 19-case battery on the final tree against the
+morning baseline, one run per case, one counting script
+(`deepseek-final-battery-0812.md`). On the 16 cases the plugin authorisation
+did not affect: reasoning tokens 145,651 to 83,786 (-42%), all output tokens
+-38%, compose wall time 403 s to 289 s (-28%, indicative), prompt tokens +4%.
+Input dominates the token count ten to one, so total tokens are flat. The
+instrument defects listed in the A1 design (the planner byte ceiling, the
+battery driver's skill hash) apply to any future before/after claim.
 
 ## How to work it
 

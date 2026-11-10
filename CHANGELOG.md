@@ -7,11 +7,7 @@ All notable changes to ELSPETH are documented here.
 ## 0.8.12 - Unreleased (Composer tool remediation)
 
 This entry records the Composer tool remediation that follows the 0.8.11
-candidate. It is in development: the changes below are integrated on the
-remediation branch, but the combined test, proof and PostgreSQL gates have not
-yet run on the integrated tree, and the package version has not been advanced.
-The entry will be completed, and corrected where verification disagrees,
-before the release is cut.
+candidate. Verification status is recorded in the pull request.
 
 ### Composer
 
@@ -39,6 +35,37 @@ before the release is cut.
   delivered to the model.
 - **Queue scope fields reach node admission.** Three queue scope fields that
   were dropped before `NodeSpec` admission are now carried through.
+- **Under explicit approval, one composition proposal is pending at a time.**
+  Each mutation in a multi-edit response used to be previewed against the same
+  unchanged state and staged as its own proposal, so accepting them in turn
+  produced stale or contradictory pipelines. A response carrying more than one
+  mutation is now refused whole (`approval_batch_not_atomic`), and a mutation
+  is refused while a composition proposal is pending
+  (`approval_proposal_pending`); both refusals tell the model what to do next.
+  This contains the defect and does not redesign it: auto-commit sessions and
+  blob-only proposals are not covered.
+- **`diff_pipeline` answers in freeform sessions.** It compares the current
+  state with the state at the start of the request, and says so when held
+  proposals are not included. Asked one turn after an edit it reports no
+  change; the intended baseline is still to be decided.
+- **Transforms can be spliced into planner-built pipelines.** Splicing no
+  longer requires visual edges that planner-built pipelines do not carry.
+- **Removing an output removes its edges.**
+- **An oversized blob read is reported as a size refusal.** It was reported
+  as a credential problem. The new code is `blob_content_size_limit`.
+- **Malformed blob references are refused at proposal admission**
+  (`proposal_blob_reference_malformed`), and a pending option change keeps the
+  blobs it depends on.
+- **A pending proposal's tool result states the next action.**
+- **JSON preview warnings and record-count evidence are admitted** by the
+  preview response contract instead of failing it.
+- **A Chroma client-mode configuration with a null persistence directory is
+  admitted** without bypassing path confinement.
+- **Recovery tools are recognised in persisted planner receipts.**
+- **Composer skill text corrected.** Contradictory and stale instructions were
+  removed or rewritten in place. The text was not restructured; about
+  a third of what the proposal planner receives still describes tools it does
+  not have.
 
 ### MCP server
 
@@ -70,6 +97,14 @@ before the release is cut.
   directory or change the configured root.
 - A pending approval for a change that is now known to be refused or to be a
   no-op settles as terminal instead of remaining pending.
+- Under explicit approval a model response with several mutations is refused
+  and the model is asked to send one. Sessions that relied on several
+  proposals being staged from one response will see one proposal per turn.
+- New refusal codes a client may receive: `approval_batch_not_atomic`,
+  `approval_proposal_pending`, `blob_content_size_limit`,
+  `proposal_blob_reference_malformed`.
+- No schema epoch changed. Existing session and Landscape stores load
+  unchanged.
 
 ---
 
