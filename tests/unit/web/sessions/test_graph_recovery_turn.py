@@ -8,6 +8,7 @@ from unittest.mock import create_autospec
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select, update
 
@@ -271,6 +272,57 @@ async def test_provider_park_alias_restores_exact_advertised_graph_and_retains_r
     assert received.operation_id == record.session_operation_id
     assert received.operation_epoch == record.session_operation_epoch
     assert facts["provider_tool_name"] == "restore_parked_graph" and facts["physical_call_id"]
+    assert received.tool_name == "restore_parked_graph"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["handoff_to_user", "hallucinated_tool"])
+async def test_planner_received_tool_category_is_persisted(tmp_path, monkeypatch, tool_name):
+    app, service = _make_app(tmp_path)
+    session = await service.create_session("alice", "Receipt classification", "local")
+    await service.save_composition_state(session.id, checkpoint_data(_EMPTY_STATE), provenance="session_seed")
+    model = "anthropic/claude-opus-4-7"
+    composer = ComposerServiceImpl.for_trained_operator(
+        catalog=app.state.catalog_service,
+        settings=_make_settings(data_dir=tmp_path, composer_model=model),
+        sessions_service=service,
+        session_engine=app.state.session_engine,
+    )
+    monkeypatch.setattr(composer, "_availability", ComposerAvailability(True, model, "anthropic"))
+    app.state.composer_service = composer
+    requests = []
+
+    async def provider(*args, **kwargs):
+        requests.append(kwargs)
+        return _response_with_call_id("category-call", tool_name, {"action": "reset_to_turn_start", "message": "Let's clarify the input."})
+
+    monkeypatch.setattr("litellm.acompletion", provider)
+    async with _running_job(app, service, session.id, kind="compose_message", content="Let's clarify the input.") as job:
+        if tool_name == "hallucinated_tool":
+            with pytest.raises(HTTPException) as refused:
+                await _run(app, job)
+            assert refused.value.status_code == 502
+            assert refused.value.detail["planner_code"] == "DISCOVERY_ONLY"
+        else:
+            await _run(app, job)
+        assert job.observation.audit_cohort_durable
+    assert len(requests) == 1
+    rows = await service.get_messages(session.id, limit=None)
+    private = [
+        ComposerDiagnosticEvidence.from_envelope(row.tool_calls[0], expected_session_id=str(session.id))
+        for row in rows
+        if row.tool_calls and row.tool_calls[0].get("_kind") == "composer_diagnostic_evidence"
+    ]
+    (received,) = [
+        item
+        for item in private
+        if item.status == "received_response"
+        and item.result.content is not None
+        and json.loads(item.result.content).get("provider_tool_call_id") == "category-call"
+    ]
+    assert received.tool_name == ("unknown_tool" if tool_name == "hallucinated_tool" else tool_name)
+    assert received.operation_id == job.lease.context.fence.operation_id
+    assert received.operation_epoch == job.lease.context.fence.operation_epoch
 
 
 @pytest.mark.asyncio

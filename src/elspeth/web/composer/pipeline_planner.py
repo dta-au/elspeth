@@ -3918,7 +3918,7 @@ async def _plan_pipeline_inner(
                 response,
                 namespace=private_response_namespace,
                 ordinal=ordinal,
-                known_tools=frozenset(_WIRE_TOOL_DEFS[effective_dialect]) | {_TERMINAL_TOOL_NAME},
+                known_tools=frozenset(_WIRE_TOOL_DEFS[effective_dialect]) | {_TERMINAL_TOOL_NAME} | frozenset(PLANNER_RECOVERY_TOOL_NAMES),
             )
 
             def record_response_call(
