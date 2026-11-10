@@ -123,6 +123,15 @@ describe("header floating surfaces (elspeth-4d38a73632)", () => {
     expect(declaredValue(versionDropdown as Rule, "color")).toBe(
       "var(--color-text)",
     );
+
+    // Dialogs are not portalled: the session switcher mounts its archive
+    // confirm inside the header, so the shared dialog surface owes the same.
+    const sharedCss = stripComments(
+      readFileSync("src/styles/shared.css", "utf8"),
+    );
+    expect(sharedCss).toMatch(
+      /\.app-dialog,\s*\.confirm-dialog\s*\{[^}]*position:\s*fixed[^}]*(?:^|;)\s*color:\s*var\(--color-text\)/m,
+    );
   });
 
   // z-index is deliberately NOT compared here: the two menus sit on different
