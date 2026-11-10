@@ -3620,6 +3620,7 @@ class TestPreviewProofStep:
                     session_operation_context=context,
                 )
             assert result.data["preview_is_valid"] is False
+            self.last_blocking_codes = sorted({d["code"] for d in result.data["proof_diagnostics"] if d["severity"] == "blocking"})
             return [d for d in result.data["proof_diagnostics"] if d["code"] == "gate_expression_type_mismatch_against_source_schema"]
 
     def test_observed_csv_gate_missing_key_does_not_prescribe_numeric_typing(self) -> None:
@@ -3675,6 +3676,77 @@ class TestPreviewProofStep:
         assert "numeric" not in text
         assert ": int" not in text
         assert "simulated allocation failure" not in text
+
+    def test_observed_csv_gate_on_a_correct_field_is_not_blocked_by_the_byte_cut(self) -> None:
+        """A CSV over the 8 KiB sample bound: the row the byte cut lands in lacks its
+        trailing fields. A correctly spelt, string-safe condition must not be blocked
+        with missing_key because of that sampling artefact."""
+        from sqlalchemy import update
+
+        from elspeth.web.blobs.service import content_hash as _content_hash
+        from elspeth.web.sessions.models import blobs_table
+
+        small_mismatch = self._preview_gate_against_observed_csv("row['price'] == '9'")
+        assert small_mismatch == []
+        small_codes = self.last_blocking_codes
+
+        content = ("order_id,customer,price\n" + "".join(f"O-{i},{'n' * 150},9\n" for i in range(400))).encode()
+        assert len(content) > 8 * 1024
+        self.csv_storage_path.write_bytes(content)
+        with self.engine.begin() as conn:
+            conn.execute(
+                update(blobs_table)
+                .where(blobs_table.c.id == self.csv_blob_id)
+                .values(size_bytes=len(content), content_hash=_content_hash(content))
+            )
+
+        assert self._preview_gate_against_observed_csv("row['price'] == '9'") == []
+        # The whole blocking set is what the small, uncut CSV yields: the byte cut adds no blocker.
+        assert self.last_blocking_codes == small_codes
+
+    def test_observed_csv_gate_get_of_a_misspelt_field_checks_the_name_before_typing(self) -> None:
+        """``row.get('prcie') >= 100`` evaluates None >= int and the evaluator reports
+        incompatible_types, so the repair must send the model to the field name first."""
+        mismatch = self._preview_gate_against_observed_csv("row.get('prcie') >= 100")
+        assert mismatch
+        diag = mismatch[0]
+        assert diag["severity"] == "blocking"
+        assert "'prcie'" in diag["message"]
+        repair = diag["suggested_repair"]
+        assert "inspect_source" in repair
+        assert repair.index("inspect_source") < repair.index("explicit numeric type")
+
+    def test_observed_csv_gate_get_on_a_short_row_checks_the_name_before_typing(self) -> None:
+        """The field exists in the header but the failing row is short: row.get() is None
+        there. The model is sent to the observed fields first, not straight to a type."""
+        from sqlalchemy import update
+
+        from elspeth.web.blobs.service import content_hash as _content_hash
+        from elspeth.web.sessions.models import blobs_table
+
+        content = b"order_id,customer,price\nO-1,ann,9\nO-2,bob\n"
+        self.csv_storage_path.write_bytes(content)
+        with self.engine.begin() as conn:
+            conn.execute(
+                update(blobs_table)
+                .where(blobs_table.c.id == self.csv_blob_id)
+                .values(size_bytes=len(content), content_hash=_content_hash(content))
+            )
+
+        mismatch = self._preview_gate_against_observed_csv("len(row.get('price')) > 0")
+        assert mismatch
+        diag = mismatch[0]
+        assert diag["evidence_locator"]["sample_row_index"] == 1
+        assert "'price'" in diag["message"] and "does not carry" in diag["message"]
+        repair = diag["suggested_repair"]
+        assert repair.index("inspect_source") < repair.index("explicit numeric type")
+
+    def test_observed_csv_gate_get_of_a_present_field_keeps_unconditional_typing_repair(self) -> None:
+        mismatch = self._preview_gate_against_observed_csv("row.get('price') >= 100")
+        assert mismatch
+        repair = mismatch[0]["suggested_repair"]
+        assert "price: int" in repair
+        assert "inspect_source" not in repair
 
     def test_observed_csv_gate_incompatible_types_keeps_numeric_typing_repair(self) -> None:
         mismatch = self._preview_gate_against_observed_csv("row['price'] >= 100")

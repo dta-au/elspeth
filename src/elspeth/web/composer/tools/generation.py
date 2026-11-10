@@ -2975,15 +2975,60 @@ def _source_schema_mode(source: SourceSpec) -> str | None:
     return mode.strip().lower()
 
 
-def _sample_csv_rows(content: bytes, *, filename: str, max_rows: int = 100) -> tuple[dict[str, str], ...]:
-    text = content[: 8 * 1024].decode("utf-8", errors="replace")
+def _csv_record_is_terminated(record_text: str, record: list[str], *, delimiter: str) -> bool:
+    """Whether ``record_text`` (the final record of a cut prefix) is a whole record.
+
+    A trailing newline can still belong to an open quoted field. Re-parsing the
+    record with one more newline appended leaves it unchanged only when the
+    record really ended at that newline (the same test ``source_inspection``
+    applies to its sample tail). Works on structure only; no value is inspected.
+    """
+    if not record_text.endswith(("\r", "\n")):
+        return False
+    return next(csv.reader(io.StringIO(record_text + "\n", newline=""), delimiter=delimiter)) == record
+
+
+def _sample_csv_rows(
+    content: bytes,
+    *,
+    filename: str,
+    total_size_bytes: int,
+    max_rows: int = 100,
+) -> tuple[dict[str, str], ...]:
+    """Bounded rows from the head of an observed CSV, never including a cut record.
+
+    ``content`` is a prefix of a blob of ``total_size_bytes``. When the byte cut
+    (``len(sample) < total_size_bytes``) lands inside a record, that record
+    lacks its trailing fields, and a correct gate condition would fail on it.
+    It is therefore excluded; a blob that was not cut keeps its final record
+    even without a terminator. A prefix too short to hold a complete header
+    yields no rows.
+    """
+    sample = content[: 8 * 1024]
+    cut = total_size_bytes > len(sample)
+    text = sample.decode("utf-8", errors="replace")
     delimiter = "\t" if filename.lower().endswith(".tsv") else ","
-    reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
+    stream = io.StringIO(text, newline="")
+    reader = csv.reader(stream, delimiter=delimiter)
+    header: list[str] | None = None
     rows: list[dict[str, str]] = []
-    for index, row in enumerate(reader):
-        if index >= max_rows:
+    record_start = 0
+    for record in reader:
+        record_end = stream.tell()
+        record_text = text[record_start:record_end]
+        record_start = record_end
+        if cut and record_end == len(text) and not _csv_record_is_terminated(record_text, record, delimiter=delimiter):
             break
-        rows.append({key: value for key, value in row.items() if type(key) is str and value is not None})
+        if header is None:
+            header = record
+            continue
+        if not record:
+            continue
+        if len(rows) >= max_rows:
+            break
+        # Short rows lack their trailing keys and extra values have no key, as
+        # with ``csv.DictReader``'s defaults.
+        rows.append(dict(zip(header, record, strict=False)))
     return tuple(rows)
 
 
@@ -3022,6 +3067,7 @@ def _gate_expression_type_diagnostics_for_observed_csv(
     blob_id: str,
     filename: str,
     content: bytes,
+    total_size_bytes: int,
 ) -> list[Mapping[str, Any]]:
     """Evaluate provably field-preserving source-fed gates against sampled rows.
 
@@ -3035,7 +3081,7 @@ def _gate_expression_type_diagnostics_for_observed_csv(
     if _source_schema_mode(source) != "observed":
         return []
 
-    rows = _sample_csv_rows(content, filename=filename)
+    rows = _sample_csv_rows(content, filename=filename, total_size_bytes=total_size_bytes)
     if not rows:
         return []
 
@@ -3095,11 +3141,16 @@ def _gate_expression_type_diagnostics_for_observed_csv(
             try:
                 parser.evaluate(row)
             except ExpressionEvaluationError as exc:
+                # Names this condition reads that the failing row does not
+                # carry: names only, no value. Tells a misspelt (or short-row)
+                # ``row.get('typo')`` from a real string-vs-number mismatch.
+                absent_fields = tuple(name for name in fields if name not in row)
                 message, suggested_repair = _gate_evaluation_failure_text(
                     exc.kind,
                     node_id=node.id,
                     condition=condition,
                     field=field,
+                    absent_fields=absent_fields,
                 )
                 diagnostics.append(
                     _blocking_diagnostic(
@@ -3161,19 +3212,43 @@ def _gate_evaluation_failure_text(
     node_id: str,
     condition: str,
     field: str | None,
+    absent_fields: tuple[str, ...],
 ) -> tuple[str, str]:
     """Value-free ``(message, suggested_repair)`` for a gate that failed on sampled rows.
 
     Dispatches on the closed ``ExpressionEvaluationKind`` so the text names the
-    actual cause: only ``incompatible_types`` is the observed-CSV string-typing
-    problem that the numeric-field-type repair fixes. Every other kind would be
-    mis-repaired by it (a misspelt field name is not cured by declaring a type).
-    Only ``kind`` is used — never the evaluator text, which can quote row
-    values and the observed key set.
+    actual cause: only ``incompatible_types`` can be the observed-CSV
+    string-typing problem that the numeric-field-type repair fixes. Every other
+    kind would be mis-repaired by it (a misspelt field name is not cured by
+    declaring a type).
+
+    ``absent_fields`` are the field names the condition reads (operator-authored
+    text, already quoted in the condition) that the failing sampled row does
+    not carry. It
+    separates, without any row value, a ``row.get()`` of a misspelt name (the
+    ``None`` it yields cannot be compared, so the evaluator reports
+    ``incompatible_types``) from a genuine string-vs-number mismatch; when it is
+    non-empty the typing repair is offered only after the name check.
+
+    Only ``kind`` and those names are used — never the evaluator text, which
+    can quote row values and the observed key set.
     """
     subject = f"Gate '{node_id}' condition {condition!r}"
     match kind:
         case "incompatible_types":
+            if absent_fields:
+                names = ", ".join(repr(name) for name in absent_fields)
+                return (
+                    f"{subject} fails against sampled observed CSV rows before runtime. It reads {names}, which the "
+                    "sampled row it failed on does not carry; row.get() of an absent field yields None, and None "
+                    "cannot be compared, so a misspelt field name is reported as a type failure. Otherwise observed CSV source values "
+                    f"are strings unless the source schema declares explicit field types. {_GATE_EVALUATION_WITHHELD_NOTE}",
+                    f"First compare {names} with the source's observed field names (call inspect_source) and "
+                    "correct a misspelt name in the gate condition. Only if the names are right and the field is "
+                    "meant to be numeric, patch the source schema to declare it with an explicit numeric type, for "
+                    "example schema.mode='fixed' or 'flexible' with schema.fields including <field>: int, then "
+                    "re-run preview_pipeline.",
+                )
             return (
                 f"{subject} fails against sampled observed CSV rows before runtime. Observed CSV "
                 "source values are strings unless the source schema declares explicit field types. "
@@ -3184,11 +3259,13 @@ def _gate_evaluation_failure_text(
             )
         case "missing_key":
             return (
-                f"{subject} reads a field that the sampled observed CSV rows do not carry. This is a "
-                f"field-name problem, not a field-typing mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
+                f"{subject} reads a field that a sampled observed CSV row does not carry. Either the name is not "
+                "a column of the source, or that row is shorter than the header; the check covers only the "
+                f"first rows of the file. It is not a field-typing mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
                 "Compare every field name the condition reads with the source's observed field names "
-                "(call inspect_source), correct the spelling in the gate condition or the source "
-                "column mapping, then re-run preview_pipeline.",
+                "(call inspect_source) and correct a misspelt name in the gate condition or the source "
+                "column mapping. If the names are right, some data rows are short: fix the source data or guard "
+                "the read, for example row.get('<field>') is not None and <condition>, then re-run preview_pipeline.",
             )
         case "index_out_of_range":
             return (
@@ -3204,18 +3281,18 @@ def _gate_evaluation_failure_text(
             )
         case "arithmetic_overflow":
             return (
-                f"{subject} overflows during arithmetic on a sampled row. This is not a field-typing "
-                f"mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
-                "Simplify the arithmetic so it cannot produce out-of-range results (avoid large powers "
-                "or repeated multiplication), then re-run preview_pipeline.",
+                f"{subject} produced a number too large to represent during arithmetic. This is not a "
+                f"field-typing mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
+                "Remove or shrink very large literals in the arithmetic, or compare the operands "
+                "directly instead of computing with them, then re-run preview_pipeline.",
             )
         case "invalid_value":
             return (
-                f"{subject} applied an operation to a sampled value that the operation cannot accept "
+                f"{subject} passed a sampled or literal value that a function in the condition cannot accept "
                 f"(an invalid value, not a wrong declared type). {_GATE_EVALUATION_WITHHELD_NOTE}",
-                "Restructure the condition so the operation only receives values it accepts (for "
-                "example avoid converting free-text fields with int() or float()), then re-run "
-                "preview_pipeline.",
+                "Check the arguments of the function call: for example decimal_within requires a "
+                "non-negative tolerance and finite numbers. Correct the literal arguments or compare "
+                "directly instead, then re-run preview_pipeline.",
             )
         case "non_finite_result":
             return (
@@ -4167,6 +4244,7 @@ def _compute_proof_diagnostics_for_source(
                 blob_id=str(blob_id),
                 filename=blob["filename"],
                 content=content,
+                total_size_bytes=total_size_bytes,
             )
         )
         diagnostics.extend(
