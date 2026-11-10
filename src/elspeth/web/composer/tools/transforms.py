@@ -74,7 +74,7 @@ from elspeth.web.composer.tools._common import (
     review_reconciliation_failure_message,
 )
 from elspeth.web.composer.tools._naming_disclosure import _disclose_node_name_constraints
-from elspeth.web.composer.tools.blobs import _llm_authored_inline_prompt_surface_error
+from elspeth.web.composer.tools.blobs import _file_inject_node_option_error, _llm_authored_inline_prompt_surface_error
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
     ToolKind,
@@ -792,6 +792,18 @@ def _execute_upsert_node(
         if prompt_surface_error is not None:
             return _saved_graph_rejection_result(
                 state, prompt_surface_error, error_code="llm_authored_inline_blob_content", rejected_component=node_ref
+            )
+        # file_inject content is a user-uploaded file on every authoring path.
+        file_inject_error = _file_inject_node_option_error(
+            context,
+            tool_name="upsert_node",
+            node_id=node_id,
+            plugin=plugin,
+            options=review_options,
+        )
+        if file_inject_error is not None:
+            return _saved_graph_rejection_result(
+                state, file_inject_error, error_code="file_inject_content_not_uploaded", rejected_component=node_ref
             )
 
         prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
@@ -1870,6 +1882,18 @@ def _execute_patch_node_options(
             return _saved_graph_rejection_result(
                 state, prompt_surface_error, error_code="llm_authored_inline_blob_content", rejected_component=node_ref
             )
+        # file_inject content is a user-uploaded file on every authoring path.
+        file_inject_error = _file_inject_node_option_error(
+            context,
+            tool_name="patch_node_options",
+            node_id=node_id,
+            plugin=current.plugin,
+            options=new_options,
+        )
+        if file_inject_error is not None:
+            return _saved_graph_rejection_result(
+                state, file_inject_error, error_code="file_inject_content_not_uploaded", rejected_component=node_ref
+            )
 
     new_node = replace(current, options=new_options)
     # Third canonical mutation boundary: a patch that would break a queue's
@@ -2123,6 +2147,18 @@ def _prepare_transform_candidate(
     if prompt_surface_error is not None:
         return _saved_graph_rejection_result(
             state, prompt_surface_error, error_code="llm_authored_inline_blob_content", rejected_component=node_ref
+        )
+    # file_inject content is a user-uploaded file on every authoring path.
+    file_inject_error = _file_inject_node_option_error(
+        context,
+        tool_name=tool_name,
+        node_id=node_id,
+        plugin=plugin,
+        options=review_options,
+    )
+    if file_inject_error is not None:
+        return _saved_graph_rejection_result(
+            state, file_inject_error, error_code="file_inject_content_not_uploaded", rejected_component=node_ref
         )
 
     prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)

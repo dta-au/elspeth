@@ -42,6 +42,7 @@ from elspeth.web.coordination.composer_progress_authority import (
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.credential_guard import require_no_credential_material_in_state
+from elspeth.web.execution._validation_materialization import file_inject_state_refusals
 from elspeth.web.interpretation_state import (
     InterpretationReviewCapacityError,
     InterpretationReviewIntegrityError,
@@ -1313,6 +1314,7 @@ async def seed_state_from_runtime_yaml(
                 secret_service=secret_service,
                 user_id=str(user.user_id),
             )
+            _reject_file_inject_content_not_uploaded(imported_state)
             _reject_malformed_interpretation_requirements(imported_state)
             _reject_resolved_interpretation_requirements(imported_state)
             # Import must be atomic with respect to review recoverability. Reuse
@@ -1396,6 +1398,35 @@ async def seed_state_from_runtime_yaml(
             return _state_response(response_state, policy_catalog=catalog)
     finally:
         await lease.close()
+
+
+def _reject_file_inject_content_not_uploaded(state: CompositionState) -> None:
+    """Refuse an imported ``file_inject`` node whose content is not an attached upload.
+
+    In the composer a ``file_inject`` entry admits only a user-uploaded file,
+    and no ``default_content`` (``file_inject_state_refusals``, the predicate
+    /validate and run admission apply). Literal content in pasted YAML would
+    reach row data, and from there a prompt, with no review, so it is refused
+    here with what a person can do about it. An ``inline_content`` marker is
+    left untouched: which blob it names is judged where the blob is resolved.
+    """
+    refusals = file_inject_state_refusals(state)
+    if not refusals:
+        return
+    refusal = refusals[0]
+    if refusal.cause == "default_content":
+        action = "Remove default_content from the YAML and use on_miss: null or on_miss: fail, then import again."
+    else:
+        action = (
+            f"Remove '{refusal.option_path}' from the YAML and import again, upload the file in this session, then attach it to that entry."
+        )
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Imported YAML: file_inject node '{refusal.node_name}' option '{refusal.option_path}' is refused: "
+            f"{refusal.problem}. In the composer, file_inject content must be a file the user uploaded. {action}"
+        ),
+    )
 
 
 def _reject_malformed_interpretation_requirements(state: CompositionState) -> None:
@@ -1522,6 +1553,7 @@ async def seed_state_for_e2e(
                 secret_service=request.app.state.scoped_secret_resolver,
                 user_id=str(user.user_id),
             )
+            _reject_file_inject_content_not_uploaded(seeded_state)
             _reject_malformed_interpretation_requirements(seeded_state)
             from elspeth.web.composer.interpretation_surfacing import prepare_pending_interpretation_event_drafts_for_state
 

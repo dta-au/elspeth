@@ -103,7 +103,15 @@ from elspeth.web.composer.tools.declarations import (
     ToolKind,
 )
 from elspeth.web.credential_guard import CREDENTIAL_REFUSAL_DETAIL, CredentialMaterialRefused, require_no_credential_material
-from elspeth.web.execution._validation_materialization import is_llm_authored_prompt_surface_binding, llm_prompt_surface_field
+from elspeth.web.execution._validation_materialization import (
+    FILE_INJECT_PLUGIN,
+    FileInjectContentRefusal,
+    file_inject_blob_refusal,
+    file_inject_option_refusals,
+    guarded_inline_surface_field,
+    is_llm_authored_prompt_surface_binding,
+    llm_prompt_surface_field,
+)
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, reconcile_authoritative_reviews
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
 from elspeth.web.sessions.models import (
@@ -923,18 +931,24 @@ def _llm_authored_prompt_surface_error(
     there carries no reviewable text, and the run substitutes the blob bytes
     afterwards. The guarded domain and the modality rule are
     ``is_llm_authored_prompt_surface_binding``, the predicate /validate and run
-    admission apply too. An unknown or non-``llm`` node returns ``None`` so the
-    marker writer reports the missing node.
+    admission apply too; it also covers a ``file_inject`` node's ``files``,
+    which refuse with that plugin's own text. An unknown or unguarded node
+    returns ``None`` so the marker writer reports the missing node.
     """
-    surface = llm_prompt_surface_field(field_path)
-    llm_node_names = frozenset(node.id for node in state.nodes if node.plugin == "llm")
+    node_plugins = {node.id: node.plugin for node in state.nodes if node.plugin is not None}
+    surface = guarded_inline_surface_field(field_path, node_plugins=node_plugins)
     if surface is None or not is_llm_authored_prompt_surface_binding(
         field_path,
-        llm_node_names=llm_node_names,
+        node_plugins=node_plugins,
         creation_modality=creation_modality,
     ):
         return None
-    node_id, option_path = surface
+    file_inject_refusal = file_inject_blob_refusal(
+        field_path, blob_id=blob_id, node_plugins=node_plugins, creation_modality=creation_modality
+    )
+    if file_inject_refusal is not None:
+        return _file_inject_refusal_message(tool_name="wire_blob_inline_ref", refusal=file_inject_refusal)
+    node_id, option_path, _plugin = surface
     return _llm_authored_prompt_surface_message(
         tool_name="wire_blob_inline_ref",
         blob_id=blob_id,
@@ -1010,7 +1024,7 @@ def _llm_authored_inline_prompt_surface_error(
                 continue
             if is_llm_authored_prompt_surface_binding(
                 field_path,
-                llm_node_names=(node_id,),
+                node_plugins={node_id: plugin},
                 creation_modality=CreationModality(blob["creation_modality"]),
             ):
                 return _llm_authored_prompt_surface_message(
@@ -1019,6 +1033,96 @@ def _llm_authored_inline_prompt_surface_error(
                     node_id=node_id,
                     option_path=option_path,
                 )
+    return None
+
+
+def _file_inject_refusal_message(*, tool_name: str, refusal: FileInjectContentRefusal) -> str:
+    """The repairable refusal for ``file_inject`` content that is not a user-uploaded file.
+
+    One text for every tool and every cause (an LLM-authored blob, literal
+    content, ``default_content``); only the clause saying what was wrong
+    differs. The problem and the repair are the predicate module's, so
+    /validate words them the same way.
+    """
+    return (
+        f"{tool_name} cannot set file_inject node '{refusal.node_name}' option '{refusal.option_path}': {refusal.problem}. {refusal.repair}"
+    )
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "node plugin options authored through an LLM composer tool call (upsert_node, patch_node_options, splice_transform, set_pipeline)"
+    ),
+    source_param="options",
+    suppresses=(),
+    invariant=(
+        "returns the repairable file_inject refusal text when the options carry literal content, any default_content, "
+        "or a marker naming an LLM-authored blob in this session, and None for every other options shape; "
+        "never raises on options"
+    ),
+    non_raising=True,
+)
+def _file_inject_node_option_error(
+    context: ToolContext,
+    *,
+    tool_name: str,
+    node_id: str,
+    plugin: str | None,
+    options: Mapping[str, Any],
+) -> str | None:
+    """Refuse a node-option write that gives ``file_inject`` content other than a user-uploaded file.
+
+    Applied by every tool that can write node options (``upsert_node``,
+    ``patch_node_options``, ``splice_transform``, ``set_pipeline``), on the
+    options the node would hold. Literal content and ``default_content`` are
+    refused from the options alone. A marker's blob is looked up in this
+    session and refused when LLM-authored; a marker is not judged when no
+    session engine is attached or its blob is not in this session, and
+    /validate and run admission then apply the same rule to the blob they
+    resolve. Returns ``None`` for every other plugin.
+    """
+    if plugin != FILE_INJECT_PLUGIN:
+        return None
+    option_refusals = file_inject_option_refusals(node_id, options)
+    if option_refusals:
+        return _file_inject_refusal_message(tool_name=tool_name, refusal=option_refusals[0])
+    session_engine = context.session_engine
+    session_id = context.session_id
+    if session_engine is None or session_id is None:
+        return None
+    for key, value in deep_thaw(options).items():
+        for option_path, blob_id in _inline_content_marker_blob_ids(value, key):
+            blob = _sync_get_blob(session_engine, str(blob_id), session_id)
+            if blob is None:
+                continue
+            refusal = file_inject_blob_refusal(
+                f"node:{node_id}.options.{option_path}",
+                blob_id=blob_id,
+                node_plugins={node_id: plugin},
+                creation_modality=CreationModality(blob["creation_modality"]),
+            )
+            if refusal is not None:
+                return _file_inject_refusal_message(tool_name=tool_name, refusal=refusal)
+    return None
+
+
+def _file_inject_wired_marker_error(state: CompositionState, field_path: str) -> str | None:
+    """Refuse a wired marker that leaves a ``file_inject`` node with content that is not an attached upload.
+
+    ``wire_blob_inline_ref`` can only write a marker, so what it can break is
+    where the marker lands: ``default_content``, or beneath an entry's
+    ``content`` rather than at it. Judged on the node as written.
+    """
+    prefix, _separator, _rest = field_path.partition(".options.")
+    if not prefix.startswith("node:"):
+        return None
+    node_id = prefix.removeprefix("node:")
+    for node in state.nodes:
+        if node.id == node_id and node.plugin == FILE_INJECT_PLUGIN:
+            option_refusals = file_inject_option_refusals(node_id, node.options)
+            if option_refusals:
+                return _file_inject_refusal_message(tool_name="wire_blob_inline_ref", refusal=option_refusals[0])
     return None
 
 
@@ -1083,6 +1187,9 @@ def _execute_wire_blob_inline_ref(
         new_state = _apply_inline_blob_marker(state, ref.field_path, marker)
     except ValueError as exc:
         return _failure_result(state, str(exc))
+    file_inject_error = _file_inject_wired_marker_error(new_state, ref.field_path)
+    if file_inject_error is not None:
+        return _failure_result(state, file_inject_error, error_code="file_inject_content_not_uploaded")
     canonical_error = _composition_canonical_interpretation_requirement_error(
         new_state,
         tool_name="wire_blob_inline_ref",
