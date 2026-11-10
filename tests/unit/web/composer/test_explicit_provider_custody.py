@@ -389,6 +389,7 @@ async def test_actual_planner_producer_uses_physical_sdk_and_settles_failed_call
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
     from tests.unit.web.composer.test_pipeline_planner import (
         _budget,
+        _context_policy,
         _custody,
         _empty_state,
         _lifecycle,
@@ -442,6 +443,7 @@ async def test_actual_planner_producer_uses_physical_sdk_and_settles_failed_call
             rendered_skill=load_pipeline_capability_core() + "\nOrdinary bounded planner instructions.",
             repair_budget=0,
             budget_policy=_budget(),
+            context_policy=_context_policy(),
             custody_config=replace(
                 _custody(tmp_path), session_engine=engine, session_operation_context=context, session_operation_authority=authority
             ),
