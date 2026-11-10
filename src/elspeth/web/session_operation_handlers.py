@@ -14,6 +14,7 @@ import structlog
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+import elspeth.contracts.errors as contract_errors
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.repository import SessionOperationConflictError
 
@@ -25,12 +26,20 @@ def record_session_operation_fence_loss(request: Request, exc: SessionOperationF
     pipeline decisions and detached operation settlement remain audit-first.
     """
     route = request.scope["route"].path if "route" in request.scope else None
-    structlog.get_logger(__name__).warning(
-        "http_session_operation_fence_lost",
-        reason=exc.reason.value,
-        method=request.method,
-        route=route,
-    )
+    try:
+        structlog.get_logger(__name__).warning(
+            "http_session_operation_fence_lost",
+            reason=exc.reason.value,
+            method=request.method,
+            route=route,
+        )
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except Exception:
+        # Logging is the channel of last resort: an ordinary logging-backend
+        # failure must not turn the deterministic 404 into an unrelated 500.
+        # Registered framework/audit integrity failures still escape.
+        return
 
 
 def register_session_operation_exception_handlers(app: FastAPI) -> None:

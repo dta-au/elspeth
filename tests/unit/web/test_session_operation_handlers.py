@@ -108,3 +108,33 @@ def test_detached_fence_loss_projection_remains_pure_and_nonleaking(reason: Fenc
     assert projected.http_status == 404
     assert projected.body == {"detail": "Session not found"}
     assert logs == []
+
+
+@pytest.mark.asyncio
+async def test_a_failing_log_backend_cannot_replace_the_404(monkeypatch: pytest.MonkeyPatch) -> None:
+    class BrokenLogger:
+        def warning(self, *args: object, **kwargs: object) -> None:
+            raise OSError("log stream closed")
+
+    monkeypatch.setattr("elspeth.web.session_operation_handlers.structlog.get_logger", lambda *a, **k: BrokenLogger())
+    app = _fence_loss_app(FenceLossReason.LEASE_EXPIRED)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/sessions/{uuid4()}/blobs")
+
+    assert response.status_code == 404
+    assert response.content == b'{"detail":"Session not found"}'
+
+
+@pytest.mark.asyncio
+async def test_a_tier_one_failure_in_the_log_backend_still_escapes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.contracts.errors import AuditIntegrityError
+
+    class IntegrityLogger:
+        def warning(self, *args: object, **kwargs: object) -> None:
+            raise AuditIntegrityError("integrity failure inside the log backend")
+
+    monkeypatch.setattr("elspeth.web.session_operation_handlers.structlog.get_logger", lambda *a, **k: IntegrityLogger())
+    app = _fence_loss_app(FenceLossReason.LEASE_EXPIRED)
+    with pytest.raises(AuditIntegrityError):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            await client.post(f"/sessions/{uuid4()}/blobs")
