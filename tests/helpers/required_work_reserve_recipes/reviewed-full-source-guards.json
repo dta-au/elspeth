@@ -30,7 +30,7 @@
       "worker_lost_error",
       "project_composer_operation_error"
     ],
-    "sha256": "cdfd3808c76f1c75efc353ac106a0c5a357d872b9f199c50beba4ba6d1e6f2f0"
+    "sha256": "3702b26012bf5ad4784488f61ff2fa4e5c38b7ef43033b003dcd05259677e92b"
   },
   "src/elspeth/web/sessions/composer_operations.py": {
     "protected_exports": [
@@ -41,7 +41,7 @@
       "ComposerOperationRunning",
       "ComposerOperationFenceLost"
     ],
-    "sha256": "7f3564e6effb21ec97a71fbb07abbfb2c3c73a0a4998c45fa6c156eaad466923"
+    "sha256": "0cb6b9ccb1c0f2897c552dd4c71870015f56b888312971995625c13175ec837a"
   },
   "src/elspeth/web/sessions/proposal_authority.py": {
     "protected_exports": [],
