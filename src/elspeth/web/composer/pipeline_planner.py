@@ -84,6 +84,7 @@ from elspeth.web.composer.capability_skill import (
     PlannerCapabilityManifest,
     build_planner_capability_manifest,
 )
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.diagnostic_evidence import diagnostic_evidence_identity
 from elspeth.web.composer.discovery_cache import serialize_tool_result, tool_result_content_parts
 from elspeth.web.composer.discovery_response import (
@@ -3298,6 +3299,7 @@ async def plan_pipeline(
     candidate_finalizer: PipelineCandidateFinalizer,
     provider_service: SessionServiceProtocol | None = None,
     provider_owner: ProviderInvocationOwner | None = None,
+    context_budget_history: ContextBudgetHistory | None = None,
 ) -> PipelinePlanResult:
     """Plan and validate one proposal without publishing state or DB rows."""
     if (provider_service is None) != (provider_owner is None):
@@ -3376,6 +3378,7 @@ async def plan_pipeline(
                 candidate_finalizer=candidate_finalizer,
                 provider_service=provider_service,
                 provider_owner=provider_owner,
+                context_budget_history=context_budget_history,
             )
         outcome = "complete"
         trail.log_summary("accepted")
@@ -3459,6 +3462,7 @@ async def _plan_pipeline_inner(
     candidate_finalizer: PipelineCandidateFinalizer,
     provider_service: SessionServiceProtocol | None = None,
     provider_owner: ProviderInvocationOwner | None = None,
+    context_budget_history: ContextBudgetHistory | None = None,
 ) -> PipelinePlanResult:
     skill_hash = hashlib.sha256(rendered_skill.encode("utf-8")).hexdigest()
     deadline = _planner_deadline_time() + model_config.timeout_seconds
