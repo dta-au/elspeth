@@ -7711,6 +7711,89 @@ class TestRecomposeConvergencePartialState:
         assert detail["reason"] == "convergence_composition_budget"
         assert "timeout_seconds" not in detail
 
+    def test_compose_loop_context_budget_refusal_names_its_cause_on_the_operation_record(self, tmp_path) -> None:
+        """The compose loop's pre-dispatch refusal is not a non-convergence and must not read as one.
+
+        It is raised as a ``ComposerConvergenceError`` (the composition budget
+        discriminator, the ``context_budget_exceeded`` reason), whose default
+        detail claims the model kept calling tools. No provider call was made,
+        so the operation record is where the ceiling and the largest
+        component must be found.
+        """
+        import json as _json
+
+        from sqlalchemy import select
+
+        from elspeth.web.composer.protocol import ComposerConvergenceError
+        from elspeth.web.sessions.models import composer_async_operations_table
+
+        mock_composer = SimpleNamespace()
+        mock_composer.compose = AsyncMock(
+            spec=ComposerService.compose,
+            side_effect=ComposerConvergenceError(
+                max_turns=2,
+                budget_exhausted="composition",
+                partial_state=None,
+                reason="context_budget_exceeded",
+                evidence={
+                    "ceiling": "bytes",
+                    "estimated_tokens": 400_000,
+                    "request_bytes": 1_200_000,
+                    "max_prompt_tokens": 200_000,
+                    "max_request_bytes": 983_040,
+                    "largest_component": "latest_tool_round",
+                },
+            ),
+        )
+        app, _service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+
+        session_id = client.post("/api/sessions", json={"title": "context budget"}).json()["id"]
+        operation_id = str(uuid.uuid4())
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("Build me a pipeline", state_id=current_head_state_id_sync(client, session_id), operation_id=operation_id),
+        )
+
+        expected_detail = "This conversation is too large for the composer to continue. Start a new session, or shorten your request."
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert detail["error_type"] == "convergence"
+        assert detail["failure_code"] == "context_budget_exceeded"
+        assert detail["reason"] == "context_budget_exceeded"
+        assert detail["detail"] == expected_detail
+        assert detail["recovery_text"] == "Start a new session, or shorten your request."
+        assert detail["detail_codes"] == ["context_ceiling_bytes", "largest_component_latest_tool_round"]
+        assert "did not converge" not in response.text
+        assert "kept making tool calls" not in response.text
+
+        snapshot = client.get(f"/api/sessions/{session_id}/composer-progress").json()
+        assert snapshot["phase"] == "failed"
+        assert snapshot["reason"] == "context_budget_exceeded"
+
+        with app.state.session_engine.connect() as conn:
+            operation = (
+                conn.execute(select(composer_async_operations_table).where(composer_async_operations_table.c.operation_id == operation_id))
+                .mappings()
+                .one()
+            )
+        assert operation["status"] == "failed"
+        assert operation["failure_code"] == "http_error"
+        recorded = _json.loads(operation["result_json"])
+        assert recorded["error_type"] == "context_budget_exceeded"
+        assert recorded["body"]["detail"]["failure_code"] == "context_budget_exceeded"
+        assert recorded["body"]["detail"]["detail"] == expected_detail
+        assert recorded["body"]["detail"]["detail_codes"] == ["context_ceiling_bytes", "largest_component_latest_tool_round"]
+        assert "did not converge" not in operation["result_json"]
+
+        history = client.get(f"/api/sessions/{session_id}/operations", params={"operation_id": operation_id})
+        assert history.status_code == 200, history.text
+        (outcome,) = history.json()["items"]
+        assert outcome["error_type"] == "context_budget_exceeded"
+
     def test_convergence_redacts_blob_path_from_response_but_preserves_in_db(self, tmp_path) -> None:
         """When partial_state has a blob-backed source, the HTTP response must
         redact the internal storage path while the DB copy retains it."""

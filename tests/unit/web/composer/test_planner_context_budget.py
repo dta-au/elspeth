@@ -13,6 +13,7 @@ import json
 import math
 import time
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerLLMRequestByteSplit,
 )
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttemptOutcome, ComposerPlannerAttemptPhase, ComposerPlannerCode
+from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_CONTENT_PARTS_KEY, detach_prompt_guard_evidence
 from elspeth.core.canonical import canonical_json
@@ -59,6 +61,7 @@ from tests.unit.web.composer.test_pipeline_planner import (
     _budget,
     _context_policy,
     _empty_state,
+    _lifecycle,
     _pipeline,
     _plan,
     _response_with_call_id,
@@ -332,14 +335,25 @@ async def test_history_shed_on_an_earlier_turn_stays_shed_between_the_marks(tmp_
     assert sticky.context_budget is not None and sticky.context_budget.shed_history_indices == (1,)
 
 
-async def _hatch_run(
-    tmp_path: Path, tool_context: ToolContext, context: PlannerConversationContext, policy: ContextBudgetPolicy | None
-) -> tuple[_ScriptedCompletion, BufferingRecorder]:
-    completion = _ScriptedCompletion(
+def _hatch_completion() -> _ScriptedCompletion:
+    return _ScriptedCompletion(
         _response_with_call_id("state", "get_pipeline_state", {}),
         _response_with_call_id("sources", "list_sources", {}),
         _text_response("Please upload the input for JSON conversion."),
     )
+
+
+async def _hatch_run(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    context: PlannerConversationContext,
+    policy: ContextBudgetPolicy | None,
+    *,
+    progress: ComposerProgressSink | None = None,
+    completion: _ScriptedCompletion | None = None,
+) -> tuple[_ScriptedCompletion, BufferingRecorder]:
+    if completion is None:
+        completion = _hatch_completion()
     recorder = BufferingRecorder()
     with pytest.raises(PlannerDeclined):
         await _plan(
@@ -350,6 +364,7 @@ async def _hatch_run(
             intent="The latter.",
             conversation_context=context,
             context_policy=policy,
+            lifecycle=replace(_lifecycle(), progress=progress),
             model_overrides={
                 "model_identifier": _UNMARKED,
                 "max_discovery_turns": 1,
@@ -396,6 +411,45 @@ async def test_the_escape_hatch_request_sheds_its_conversation_context_and_keeps
     for call in recorder.llm_calls:
         assert call.context_budget is not None and call.context_budget.shed_history_indices == (1,)
         assert call.context_budget.shed_hatch_event_indices == ()
+
+
+_CONTEXT_REDUCED_HEADLINE = "Earlier conversation is no longer visible to the composer."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sheds", [True, False], ids=["shedding", "negative-control"])
+async def test_a_planner_turn_that_sheds_history_announces_it_once_before_the_first_shedding_call(
+    tmp_path: Path, tool_context: ToolContext, sheds: bool
+) -> None:
+    assistants = {1: "a" * 40_000}
+    context = _context(users={0: "Convert the data."}, assistants=assistants)
+    measured_completion, _ = await _hatch_run(tmp_path, tool_context, context, None)
+    hatch_bytes = _sent_bytes(measured_completion.requests[2]) + _ALLOWANCE + _TRANSCRIPT_ALLOWANCE
+    policy = _policy_shedding_to(hatch_bytes - _entry_saving(1, assistants[1]) + 200, shed_to=0.8) if sheds else None
+    completion = _hatch_completion()
+    # Each notice, with the number of provider calls already made when it was sent.
+    notices: list[tuple[ComposerProgressEvent, int]] = []
+    events: list[ComposerProgressEvent] = []
+
+    async def sink(event: ComposerProgressEvent) -> None:
+        events.append(event)
+        if event.reason == "context_reduced":
+            notices.append((event, len(completion.requests)))
+
+    _, recorder = await _hatch_run(tmp_path, tool_context, context, policy, progress=sink, completion=completion)
+
+    assert events, "the turn emitted its ordinary progress events"
+    shed = [call.context_budget.shed_history_indices for call in recorder.llm_calls if call.context_budget is not None]
+    if not sheds:
+        assert shed == [(), (), ()]
+        assert notices == []
+        return
+    # All three calls, the escape hatch included, shed the assistant message; one notice, before the first call.
+    assert shed == [(1,), (1,), (1,)]
+    ((notice, calls_before),) = notices
+    assert calls_before == 0
+    assert notice.phase == "calling_model"
+    assert notice.headline == _CONTEXT_REDUCED_HEADLINE
 
 
 @pytest.mark.asyncio
@@ -465,7 +519,13 @@ def _discovery_then_emit(tmp_path: Path, *, large_first: bool = True) -> _Script
 
 
 async def _discovery_run(
-    tmp_path: Path, tool_context: ToolContext, *, model: str, policy: ContextBudgetPolicy | None, large_first: bool = True
+    tmp_path: Path,
+    tool_context: ToolContext,
+    *,
+    model: str,
+    policy: ContextBudgetPolicy | None,
+    large_first: bool = True,
+    progress: ComposerProgressSink | None = None,
 ) -> tuple[_ScriptedCompletion, BufferingRecorder]:
     completion = _discovery_then_emit(tmp_path, large_first=large_first)
     recorder = BufferingRecorder()
@@ -475,6 +535,7 @@ async def _discovery_run(
         completion=completion,
         recorder=recorder,
         context_policy=policy,
+        lifecycle=replace(_lifecycle(), progress=progress),
         model_overrides={"model_identifier": model, "max_discovery_turns": 5},
     )
     assert len(completion.requests) == len(recorder.llm_calls) == 4
@@ -503,8 +564,15 @@ async def test_earlier_tool_results_are_stubbed_and_the_latest_round_is_intact(
     assert math.ceil(totals[2] / _FALLBACK_RATIO) <= shed_above * policy.max_prompt_tokens < math.ceil(totals[3] / _FALLBACK_RATIO)
     assert (totals[3] - first_saving) / _FALLBACK_RATIO <= shed_to * policy.max_prompt_tokens
 
-    completion, recorder = await _discovery_run(tmp_path, tool_context, model=model, policy=policy)
+    events: list[ComposerProgressEvent] = []
 
+    async def sink(event: ComposerProgressEvent) -> None:
+        events.append(event)
+
+    completion, recorder = await _discovery_run(tmp_path, tool_context, model=model, policy=policy, progress=sink)
+
+    # Stubbing a tool result sheds no conversation, so the turn sends no notice.
+    assert events and [event for event in events if event.reason == "context_reduced"] == []
     for request, call in zip(completion.requests, recorder.llm_calls, strict=True):
         _sent_matches_record(request, call)
     for ordinal, call in enumerate(recorder.llm_calls[:3]):

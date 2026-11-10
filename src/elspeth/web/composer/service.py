@@ -106,6 +106,7 @@ from elspeth.web.composer.context_budget import (
 )
 from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
+    first_history_shed_of_turn,
     largest_component,
     latest_round_trip_start,
     message_bytes,
@@ -130,6 +131,7 @@ from elspeth.web.composer.llm_response_parsing import (
 )
 from elspeth.web.composer.planning_application import PlanningApplication
 from elspeth.web.composer.progress import (
+    context_reduced_progress_event,
     convergence_progress_event,
     emit_progress,
     model_call_progress_event,
@@ -1385,7 +1387,7 @@ class ComposerServiceImpl:
             except ComposerConvergenceError as exc:
                 await emit_progress(
                     progress,
-                    convergence_progress_event(budget_exhausted=exc.budget_exhausted),
+                    convergence_progress_event(budget_exhausted=exc.budget_exhausted, reason=exc.reason),
                 )
                 # Has its own partial_state; route handler persists. Do not intercept.
                 raise
@@ -1510,7 +1512,7 @@ class ComposerServiceImpl:
             failed_turn=failed_turn,
         )
 
-    def _prepare_primary_delivery(
+    async def _prepare_primary_delivery(
         self,
         *,
         messages: list[dict[str, Any]],
@@ -1523,12 +1525,16 @@ class ComposerServiceImpl:
         composition_turns_used: int,
         discovery_turns_used: int,
         failed_turn: FailedTurnMetadata | None,
+        progress: ComposerProgressSink | None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], BlobDeliveryAttempt | None, ComposerContextBudgetRecord]:
         """Freeze the selected input, fit it to the context budget, and derive the gateway's exact marked hash.
 
         Shedding is applied to the copy before cache markers are added, so the
         request that is hashed, recorded and sent is one request. The caller's
         ``messages`` list and the transcript owner keep the unshed messages.
+        When this is the turn's first request whose decision sheds
+        conversation history, the shed is announced on ``progress`` before
+        the request is returned for sending.
         """
         from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
 
@@ -1575,6 +1581,8 @@ class ComposerServiceImpl:
                 tools=marked_tools or None,
                 scope="primary",
             )
+        if first_history_shed_of_turn(budget_record, recorder.llm_calls):
+            await emit_progress(progress, context_reduced_progress_event())
         return selected_messages, selected_tools, delivery, budget_record
 
     def _shed_to_context_budget(
@@ -1739,7 +1747,7 @@ class ComposerServiceImpl:
         turn has been persisted yet.
         """
         await emit_progress(progress, model_call_progress_event(message))
-        selected_messages, selected_tools, delivery, budget_record = self._prepare_primary_delivery(
+        selected_messages, selected_tools, delivery, budget_record = await self._prepare_primary_delivery(
             messages=llm_messages,
             tools=tools,
             recorder=recorder,
@@ -1750,6 +1758,7 @@ class ComposerServiceImpl:
             composition_turns_used=composition_turns_used,
             discovery_turns_used=discovery_turns_used,
             failed_turn=failed_turn,
+            progress=progress,
         )
         completion = await self._call_llm_before_deadline(
             selected_messages,
@@ -2255,7 +2264,7 @@ class ComposerServiceImpl:
                     }
                 )
                 provider_failures: tuple[type[Exception], ...] = (TimeoutError, _BadRequestLLMError, *advisor_provider_failure_types())
-                selected_reply_messages, selected_reply_tools, reply_delivery, reply_budget_record = self._prepare_primary_delivery(
+                selected_reply_messages, selected_reply_tools, reply_delivery, reply_budget_record = await self._prepare_primary_delivery(
                     messages=reply_messages,
                     tools=recovery_tool_definitions(self._planner_dialect),
                     recorder=recorder,
@@ -2266,6 +2275,7 @@ class ComposerServiceImpl:
                     composition_turns_used=composition_turns_used,
                     discovery_turns_used=discovery_turns_used,
                     failed_turn=failed_turn,
+                    progress=progress,
                 )
                 if remaining > 0:
                     await emit_progress(
@@ -2458,7 +2468,7 @@ class ComposerServiceImpl:
                 # B-4D-3 fix: give the LLM one last chance to see the
                 # tool results and produce a text response.
                 await emit_progress(progress, model_call_progress_event(message))
-                selected_final_messages, selected_final_tools, final_delivery, final_budget_record = self._prepare_primary_delivery(
+                selected_final_messages, selected_final_tools, final_delivery, final_budget_record = await self._prepare_primary_delivery(
                     messages=llm_messages,
                     tools=tools,
                     recorder=recorder,
@@ -2469,6 +2479,7 @@ class ComposerServiceImpl:
                     composition_turns_used=new_composition_turns_used,
                     discovery_turns_used=discovery_turns_used,
                     failed_turn=failed_turn,
+                    progress=progress,
                 )
                 completion = await self._call_llm_before_deadline(
                     selected_final_messages,
