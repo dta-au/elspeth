@@ -127,6 +127,15 @@ These settle items that were open below; where they differ, these win.
   "4. Hysteresis"): lands Friday 2026-11-13 night or later, depending on
   progress. It carries a required new setting, so it needs an upgrade note.
 - **0.8.12 and 0.8.11:** pre-approved through to `main`; merge commits.
+- **CI solo shard for performance-sensitive tests:** the sharing-graphs
+  session is identifying them and moving them into one shard that runs on its
+  own. It lands as an incidental change, either on top of 0.8.12 as hygiene or
+  in 0.8.13 with the context budget. Include this branch's
+  `tests/unit/composer_mcp/test_portable_supervisor.py` and
+  `test_standalone_lifecycle.py`. Evidence from 2026-11-10: failing children
+  sat in "closing landscape" and survived SIGKILL for over 2 s while host I/O
+  pressure was 12% (full) with CPU pressure at 0; a 15 s stall was not
+  reproduced directly.
 
 ## C. Operator decisions outstanding
 
