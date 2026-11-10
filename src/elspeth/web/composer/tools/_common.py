@@ -2352,6 +2352,11 @@ def _validate_source_path(
     Uses Path.resolve() + is_relative_to() to defeat ../ traversal.
     """
     require_mcp_root_context(mcp_root_authority, data_dir=data_dir, session_id=session_id)
+    if mcp_root_authority is None and data_dir is None and not require_data_dir:
+        # No confinement applies on this route, so the lexical path gate has
+        # nothing to protect; plugin option validation owns malformed values and
+        # carries the catalogued repair guidance.
+        return None
     for key in SOURCE_LOCAL_PATH_OPTION_KEYS:
         if key in options:
             if not is_local_path_value(options[key]):
