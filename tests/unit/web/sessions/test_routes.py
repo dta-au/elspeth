@@ -12016,7 +12016,7 @@ class TestSendMessageTranscriptSnapshot:
         """The route derives the context-budget history from the turn's records and hands it to compose.
 
         A stored budgeted call record that shed history index 1, with a
-        measured 400 bytes over 100 prompt tokens, must reach the composer as
+        recorded 400 wire bytes over 100 prompt tokens, must reach the composer as
         exactly that ratio, for its model, and that shed set.
         """
         mock_composer = _make_composer_mock(response_text="Budgeted")
@@ -12044,8 +12044,8 @@ class TestSendMessageTranscriptSnapshot:
                                 "model_requested": "test/composer-model",
                                 "status": "success",
                                 "prompt_tokens": 100,
-                                "request_byte_split": {"message_bytes": [400], "tools_bytes": None, "total_bytes": 400},
-                                "context_budget": {"shed_history_indices": [1]},
+                                "request_byte_split": {"message_bytes": [90], "tools_bytes": None, "total_bytes": 90},
+                                "context_budget": {"shed_history_indices": [1], "request_wire_bytes": 400},
                             },
                         }
                     ],

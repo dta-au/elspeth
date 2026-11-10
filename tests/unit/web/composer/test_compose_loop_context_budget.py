@@ -556,12 +556,12 @@ async def test_a_request_within_the_re_render_margin_sheds_one_more_segment_and_
 async def test_a_dispatched_request_never_exceeds_either_ceiling(model: str) -> None:
     """Over ceilings straddling the size after one shed, every request is sent within both ceilings or refused unsent."""
     user_request = _user(0, "Please read the CSV file.")
-    # The byte ceilings straddle the wire size after one shed; the token ceilings its content size.
-    one_shed_content, one_shed_wire = await _measure_sizes(model, [user_request, _SECOND_REPLY])
+    # Both ceilings straddle the wire size after one shed.
+    _one_shed_content, one_shed_wire = await _measure_sizes(model, [user_request, _SECOND_REPLY])
     history = [user_request, _FIRST_REPLY, _SECOND_REPLY]
     deltas = (-3_000, -400, -10, 0, 10, 100, 400)
     ceilings = [(_GENEROUS_TOKENS, one_shed_wire + delta) for delta in deltas]
-    ceilings += [(-(-(one_shed_content + delta) // 3), 960 * 1024) for delta in deltas]
+    ceilings += [(-(-(one_shed_wire + delta) // 3), 960 * 1024) for delta in deltas]
     sent = 0
     for max_prompt_tokens, max_request_bytes in ceilings:
         provider, outcome = await _compose_or_refusal(
@@ -706,19 +706,87 @@ async def test_protected_content_under_the_byte_ceiling_by_content_but_over_it_o
 
 
 @pytest.mark.asyncio
-async def test_the_token_estimate_is_on_content_bytes_not_wire_bytes() -> None:
+@_MODELS
+async def test_the_token_estimate_and_the_recorded_size_are_the_wire_bytes_of_the_request_sent(model: str) -> None:
     history = [_user(0, "Please read the CSV file."), _assistant(_ESCAPING_PROSE)]
-    content, wire = await _measure_sizes("openrouter/openai/gpt-5.5", history)
+    content, wire = await _measure_sizes(model, history)
     assert wire > content + len(_ESCAPING_PROSE) // 2
-    service, session_id = _service(_GENEROUS_TOKENS)
+    service, session_id = _service(_GENEROUS_TOKENS, composer_model=model)
     provider = _RecordingProvider(_make_llm_response(content="Done."))
 
     result = await _compose(service, session_id, history, provider)
 
     (call,) = result.llm_calls
+    (request,) = provider.requests
     assert call.context_budget is not None
-    # Fallback ratio 3.0 over the content split plus the omission allowance the decision carries.
-    assert call.context_budget.estimated_tokens_before == -(-(content + CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES) // 3)
+    # Fallback ratio 3.0 over the wire size plus the omission allowance the decision carries.
+    assert call.context_budget.estimated_tokens_before == -(-(wire + CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES) // 3)
+    # The record carries the exact wire size sent; the content split beside it is unchanged in meaning.
+    assert call.context_budget.request_wire_bytes == _wire_bytes(request) == wire
+    assert call.request_byte_split is not None and call.request_byte_split.total_bytes == content
+
+
+def _argument_heavy_turn(call_id: str, padding: str) -> Any:
+    """A tool-call turn with a few bytes of prose and large tool-call arguments."""
+    return _make_llm_response(
+        content="ok",
+        tool_calls=[{"id": call_id, "name": "set_metadata", "arguments": {"patch": {"name": call_id, "description": padding}}}],
+        request_id=f"chatcmpl-{call_id}",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ceiling", ["tokens", "bytes"])
+async def test_tool_call_arguments_count_toward_both_ceilings(ceiling: str) -> None:
+    """An assistant message with tiny content and large tool-call arguments is counted, not measured as its content.
+
+    Arguments are protected, so the second request of the turn, which carries
+    them, cannot be fitted: it is refused unsent rather than dispatched over
+    the ceiling.
+    """
+    model = "openrouter/openai/gpt-5.5"
+    base_content, base_wire = await _measure_sizes(model, [])
+    padding = "a" * 200_000
+    # The first request fits with room to spare; the arguments alone carry the second past the ceiling.
+    limit_bytes = base_wire + 100_000
+    max_prompt_tokens, max_request_bytes = (limit_bytes // 3, 960 * 1024) if ceiling == "tokens" else (_GENEROUS_TOKENS, limit_bytes)
+    service, session_id = _service(max_prompt_tokens, composer_model=model, composer_planner_max_request_bytes=max_request_bytes)
+    provider = _RecordingProvider(_argument_heavy_turn("call-1", padding), _make_llm_response(content="Done."))
+
+    with pytest.raises(ComposerConvergenceError) as exc_info:
+        await _compose(service, session_id, [], provider)
+
+    assert len(provider.requests) == 1
+    refusal = exc_info.value
+    assert refusal.reason == "context_budget_exceeded"
+    assert refusal.evidence["ceiling"] == ceiling
+    assert refusal.evidence["request_bytes"] > base_wire + len(padding)
+    assert len(refusal.llm_calls) == 1
+
+    # Control: the same turn under generous ceilings sends the second request, whose
+    # content split still counts that assistant message as its two bytes of prose.
+    generous, generous_session = _service(_GENEROUS_TOKENS, composer_model=model)
+    control = _RecordingProvider(_argument_heavy_turn("call-1", padding), _make_llm_response(content="Done."))
+    result = await _compose(generous, generous_session, [], control)
+    second = result.llm_calls[1]
+    assert second.request_byte_split is not None and second.context_budget is not None
+    assert second.request_byte_split.total_bytes < base_content + 20_000 < limit_bytes
+    assert second.context_budget.request_wire_bytes == _wire_bytes(control.requests[1]) > base_wire + len(padding)
+
+
+def test_the_wire_measure_counts_tool_call_arguments_and_thinking_blocks_that_the_content_split_leaves_out() -> None:
+    plain: list[dict[str, Any]] = [{"role": "system", "content": "s"}, {"role": "assistant", "content": "ok"}]
+    with_arguments = [
+        plain[0],
+        {
+            **plain[1],
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "t", "arguments": json.dumps({"pad": "a" * 5_000})}}],
+        },
+    ]
+    with_thinking = [plain[0], {**plain[1], "thinking_blocks": [{"type": "thinking", "thinking": "t" * 5_000, "signature": "sig"}]}]
+    for grown in (with_arguments, with_thinking):
+        assert message_bytes(grown, None).total_bytes == message_bytes(plain, None).total_bytes == 3
+        assert request_wire_bytes(grown, None) > request_wire_bytes(plain, None) + 5_000
 
 
 _ESCAPING_CONTENTS = [
@@ -936,7 +1004,12 @@ async def test_a_result_stubbed_on_an_earlier_call_stays_stubbed_in_the_reply_st
         seed=None,
         response=None,
         context_budget=ComposerContextBudgetRecord.from_shed_keys(
-            policy_hash="a" * 64, bytes_per_token=3.0, estimated_tokens_before=2, estimated_tokens_after=1, shed_keys=("tool:call-1",)
+            policy_hash="a" * 64,
+            bytes_per_token=3.0,
+            estimated_tokens_before=2,
+            estimated_tokens_after=1,
+            request_wire_bytes=1200,
+            shed_keys=("tool:call-1",),
         ),
     )
 
@@ -969,5 +1042,6 @@ async def test_the_compose_loop_uses_the_ratio_measured_on_its_own_model() -> No
     assert call.model_requested == model
     assert call.context_budget is not None
     assert call.context_budget.bytes_per_token == repr(4.25)
-    assert call.request_byte_split is not None
-    assert call.context_budget.estimated_tokens_before == -(-call.request_byte_split.total_bytes * 100 // 425)
+    (request,) = provider.requests
+    assert call.context_budget.request_wire_bytes == _wire_bytes(request)
+    assert call.context_budget.estimated_tokens_before == -(-_wire_bytes(request) * 100 // 425)

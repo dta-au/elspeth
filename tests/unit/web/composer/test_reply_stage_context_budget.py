@@ -187,7 +187,7 @@ async def test_a_context_budget_refusal_at_the_reply_stage_leaves_the_finished_t
             return decide(**kwargs)
         refused.append(True)
         raise composer._context_budget_refusal(
-            ContextBudgetRefusal(ceiling="tokens", estimated_tokens=10**9, content_bytes=10**9, wire_bytes=10**9),
+            ContextBudgetRefusal(ceiling="tokens", estimated_tokens=10**9, request_bytes=10**9),
             {"latest_tool_round": 10**9},
             kwargs["refusal_scope"],
         )
