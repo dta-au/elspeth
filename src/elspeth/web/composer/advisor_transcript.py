@@ -10,7 +10,7 @@ import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, cast, final, get_args
+from typing import Any, Final, Literal, cast, final, get_args
 from uuid import UUID
 
 from pydantic import JsonValue
@@ -572,6 +572,10 @@ def _recover_read_bodies(events: list[dict[str, Any]], reader: TranscriptBlobRea
             }
 
 
+# The availability gap a transcript reduced to fit the context budget carries.
+CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP: Final[str] = "oldest_events_omitted_for_context_budget"
+
+
 @final
 @dataclass(frozen=True, slots=True)
 class AdvisorVisibleTranscript:
@@ -595,6 +599,43 @@ class AdvisorVisibleTranscript:
         return AdvisorVisibleTranscript(
             self.request,
             stable_hash({"transcript": self.binding, "request_reference": reference}),
+            json.dumps(payload, ensure_ascii=False),
+            self.semantic_binding,
+        )
+
+    def event_bytes(self) -> tuple[int, ...]:
+        """UTF-8 bytes each event occupies in ``provider_json``, plus one for its separator.
+
+        Measured on the event's own serialization inside ``provider_json``, not
+        on canonical JSON, whose number rendering can be longer: removing
+        events while one remains removes at least these bytes, because each
+        separator is two. Removing a lone last event over-counts by one.
+        """
+        payload = json.loads(self.provider_json)
+        return tuple(len(json.dumps(event, ensure_ascii=False).encode("utf-8")) + 1 for event in payload["events"])
+
+    def sheddable_event_indices(self) -> tuple[int, ...]:
+        """Indices of the events that carry no ``content_ref`` (the current request is a reference)."""
+        payload = json.loads(self.provider_json)
+        return tuple(index for index, event in enumerate(payload["events"]) if "content_ref" not in event)
+
+    def without_events(self, indices: frozenset[int]) -> AdvisorVisibleTranscript:
+        """Drop sheddable events to fit a context budget; the gap is disclosed once.
+
+        ``binding`` describes the reduced transcript; ``request`` and
+        ``semantic_binding`` are unchanged. No indices returns this transcript.
+        """
+        if not indices:
+            return self
+        if not indices <= frozenset(self.sheddable_event_indices()):
+            raise ValueError("only sheddable transcript events can be omitted")
+        payload = json.loads(self.provider_json)
+        payload["events"] = [event for index, event in enumerate(payload["events"]) if index not in indices]
+        if CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP not in payload["availability_gaps"]:
+            payload["availability_gaps"].append(CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP)
+        return AdvisorVisibleTranscript(
+            self.request,
+            stable_hash({"transcript": self.binding, "omitted_events": sorted(indices)}),
             json.dumps(payload, ensure_ascii=False),
             self.semantic_binding,
         )
