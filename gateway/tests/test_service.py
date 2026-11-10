@@ -668,6 +668,47 @@ async def test_thinking_blocks_without_reasoning_capability_raise_capability_uns
     assert not upstream.called
 
 
+@respx.mock
+async def test_response_thinking_without_reasoning_capability_is_refused_not_returned(client):
+    """An adapter that does not declare REASONING must not hand thinking back.
+
+    The caller replays returned thinking on its next request, and ingress
+    refuses replayed thinking for such an adapter. Returning it would be a 200
+    the gateway cannot accept back.
+    """
+    from elspeth_llm_gateway.sdk.types import CanonicalThinkingBlock
+
+    _mock_token()
+    upstream = respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"ok": True}))
+    block = CanonicalThinkingBlock(kind="thinking", thinking="short", signature="sig")
+    canonical = CanonicalResponse(text="ok", finish_reason=FinishReason.STOP, thinking_blocks=(block,))
+    adapter = FakeAdapter(capabilities=frozenset({Capability.TEXT}), parse_success_result=canonical)
+    service = _service(_config(), adapter, client)
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.complete(_chat_request(), "req-thinking-undeclared")
+
+    assert exc_info.value.code == GatewayErrorCode.UPSTREAM_RESPONSE_INVALID
+    assert upstream.called
+
+
+@respx.mock
+async def test_response_thinking_with_reasoning_capability_is_returned(client):
+    """The control for the refusal above: a declared adapter returns thinking."""
+    from elspeth_llm_gateway.sdk.types import CanonicalThinkingBlock
+
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"ok": True}))
+    block = CanonicalThinkingBlock(kind="thinking", thinking="short", signature="sig")
+    canonical = CanonicalResponse(text="ok", finish_reason=FinishReason.STOP, thinking_blocks=(block,))
+    adapter = FakeAdapter(capabilities=frozenset({Capability.TEXT, Capability.REASONING}), parse_success_result=canonical)
+    service = _service(_config(), adapter, client)
+
+    response = await service.complete(_chat_request(), "req-thinking-declared")
+
+    assert response["choices"][0]["message"]["thinking_blocks"] == [{"type": "thinking", "thinking": "short", "signature": "sig"}]
+
+
 @pytest.mark.parametrize("oversized_field", ["thinking", "signature", "data"])
 @respx.mock
 async def test_response_thinking_block_strings_must_fit_next_request_bounds(client, oversized_field):
