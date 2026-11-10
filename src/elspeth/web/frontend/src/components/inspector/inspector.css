@@ -211,7 +211,9 @@
   --xy-minimap-node-stroke-color-default: var(--color-border-strong);
   /* ARGOnite: ordinary edges read the graph-edge role (>= 3:1 on the well). */
   --xy-edge-stroke-default: var(--color-graph-edge);
-  --xy-edge-stroke-selected-default: var(--color-focus-ring);
+  /* Same token as the selected node ring: selection is one colour, and is
+     never the keyboard focus colour. */
+  --xy-edge-stroke-selected-default: var(--color-selected-ring);
   /* Elevated, not --color-surface: the plate sits on the --color-bg canvas
      three sRGB units away, so it read as a hole punched through the connector
      rather than as a label chip (elspeth-f6da810e06). */

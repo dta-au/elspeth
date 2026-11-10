@@ -990,7 +990,8 @@ describe("GraphView", () => {
     expect(appCss).toContain("--xy-controls-button-color-default: var(--color-text);");
     expect(appCss).toContain("--xy-minimap-background-color-default: var(--color-surface);");
     expect(appCss).toContain("--xy-minimap-mask-stroke-color-default: var(--color-border-strong);");
-    expect(appCss).toContain("--xy-edge-stroke-selected-default: var(--color-focus-ring);");
+    expect(appCss).toContain("--xy-edge-stroke-selected-default: var(--color-selected-ring);");
+    expect(appCss).not.toContain("--xy-edge-stroke-selected-default: var(--color-focus-ring);");
     expect(appCss).toMatch(
       /\[data-theme="light"\][\s\S]*--xy-minimap-mask-background-color-default:\s*rgba\(15, 45, 53, 0\.12\);/,
     );
