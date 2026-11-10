@@ -653,6 +653,17 @@ class TestBuildSystemPrompt:
         result = build_system_prompt("")
         assert result == SYSTEM_PROMPT
 
+    def test_core_skill_gate_mismatch_row_defers_to_the_diagnostic_by_kind(self) -> None:
+        """The repair row must not tell the model to type fields for every gate evaluation failure."""
+        flattened = " ".join(build_system_prompt(None).split())
+        row_start = flattened.index("| `gate_expression_type_mismatch_against_source_schema` |")
+        row = flattened[row_start : flattened.index(" |", row_start + 60)]
+
+        assert "Apply the diagnostic's own `suggested_repair`" in row
+        assert "a misspelt field" in row
+        assert "For the string-vs-number case: declare numeric fields in source schema" in row
+        assert not row.split("| ")[2].startswith("Declare numeric fields")
+
     def test_core_skill_batches_complex_new_pipeline_builds(self) -> None:
         """Large builds save coherent batches and continue to the requested topology."""
         result = build_system_prompt(None)
