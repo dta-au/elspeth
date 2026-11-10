@@ -41,7 +41,8 @@ fractions of the token cap; `SHED_TO` must be below `SHED_ABOVE`.
   oldest first within each. Shedding starts above `SHED_ABOVE` of the cap and
   continues to `SHED_TO`. What was shed stays shed, and nothing more is shed
   until the reduced request crosses `SHED_ABOVE` again; it is restored only
-  when the whole request is back at or under `SHED_TO`. The system skill,
+  when the whole request is back at or under `SHED_TO`. A tool result stubbed
+  during a turn stays stubbed for the rest of that turn. The system skill,
   catalog, tool definitions, current request, pipeline state and latest tool
   round trip are never removed. The budgeter makes no provider call and adds
   no text of its own beyond the stub and counts of omitted messages.
@@ -63,10 +64,17 @@ fractions of the token cap; `SHED_TO` must be below `SHED_ABOVE`.
   large for the composer to continue. Start a new session, or shorten your
   request." It offers no Retry. The compose loop and the planner both answer
   it with HTTP 422. This also replaces the generic failure previously shown
-  when the planner's request-byte ceiling refused a request. One case does
-  not fail the turn: if the optional reply after review cards are staged
-  cannot fit, no provider call is made, the turn completes, and the reply is
-  reported as unavailable, as it is when the provider fails that call.
+  when the planner's request-byte ceiling refused a request. The refusal
+  names the ceiling and the largest component of the request as sent.
+- **A reply that cannot fit does not fail a finished turn.** If the optional
+  reply after review cards are staged cannot be fitted, no provider call is
+  made and the turn completes with its staged work intact. The user sees:
+  "This turn's work was completed, but the model's final reply could not be
+  produced because this conversation is too large for the composer. Start a
+  new session, or shorten your request." The refusal is recorded on the
+  turn's audit trail as an audit row (`composer_reply_stage_refusal`, reason
+  `context_budget_exceeded`) with the ceiling, the estimated tokens and
+  request bytes, the configured ceilings and the largest component.
 - **Users are told when history is shed.** A turn whose model call leaves
   earlier conversation out shows the progress notice "Earlier conversation is
   no longer visible to the composer."
