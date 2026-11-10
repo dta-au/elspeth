@@ -100,16 +100,14 @@ test.describe("Composer workspace browser accessibility", () => {
         .evaluateAll((elements) =>
           elements.map((element) => element.getAttribute("data-workspace-part")),
         );
-      // The bottom bar row is its own part since elspeth-9c94a58500: it
-      // follows both panes in DOM order because it sits BELOW both of them,
-      // spanning the two columns — so the sequence still reads as the visual
-      // order, left to right across the panes and then down to the bar.
+      // The toggle follows authoring in keyboard order while grid placement
+      // puts its action row below the pipeline, to the right of the fold.
       expect(parts).toEqual([
         "view-tabs",
         "authoring",
+        "action-bar",
         "separator",
         "artifact",
-        "action-bar",
       ]);
 
       const authoring = await composer.authoringPane().boundingBox();
@@ -129,12 +127,28 @@ test.describe("Composer workspace browser accessibility", () => {
       expect(authoring!.x + authoring!.width).toBeLessThanOrEqual(separator!.x);
       expect(separator!.x + separator!.width).toBeLessThanOrEqual(artifact!.x);
       expect(artifact!.x).toBeGreaterThan(authoring!.x);
-      expect(bottomBar!.y).toBeGreaterThanOrEqual(authoring!.y + authoring!.height - 1);
       expect(bottomBar!.y).toBeGreaterThanOrEqual(artifact!.y + artifact!.height - 1);
-      expect(bottomBar!.x).toBeLessThanOrEqual(authoring!.x);
+      expect(Math.abs(bottomBar!.x - separator!.x)).toBeLessThanOrEqual(1);
       expect(bottomBar!.x + bottomBar!.width).toBeGreaterThanOrEqual(
         artifact!.x + artifact!.width,
       );
+      expect(authoring!.y + authoring!.height).toBeGreaterThan(bottomBar!.y);
+      const collapseBox = await composer.collapseAuthoring().boundingBox();
+      expect(collapseBox).not.toBeNull();
+      expect(collapseBox!.x).toBeGreaterThanOrEqual(separator!.x);
+
+      await composer.authoringPane().evaluate((pane) => {
+        const focusable = Array.from(pane.querySelectorAll<HTMLElement>(
+          'button:enabled, textarea:enabled, input:enabled, select:enabled, a[href], [tabindex="0"], summary',
+        )).filter((element) => element.tabIndex >= 0 && element.getClientRects().length > 0);
+        const last = focusable.at(-1);
+        if (last === undefined) throw new Error("authoring pane has no focusable controls");
+        last.focus();
+      });
+      await page.keyboard.press("Tab");
+      await expect(composer.collapseAuthoring()).toBeFocused();
+      await page.keyboard.press("Tab");
+      await expect(page.getByRole("button", { name: "Share inspect link" })).toBeFocused();
     } finally {
       await deleteWorkspaceScenario(page, sessionId);
     }
@@ -210,14 +224,26 @@ test.describe("Composer workspace browser accessibility", () => {
     );
     try {
       const collapse = composer.collapseAuthoring();
+      const button = await collapse.elementHandle();
+      expect(button).not.toBeNull();
+      await expect(collapse).toHaveAttribute("aria-expanded", "true");
+      await expect(collapse).toHaveAttribute("aria-controls", "workspace-authoring-pane");
+      await expect(collapse.locator("svg")).toHaveAttribute("data-icon", "chevrons-left");
       await collapse.focus();
       await collapse.press("Enter");
       const restore = composer.restoreAuthoring();
       await expect(restore).toBeFocused();
+      expect(await restore.evaluate((element, original) => element === original, button!)).toBe(true);
+      await expect(restore).toHaveAttribute("aria-expanded", "false");
+      await expect(restore).toHaveAttribute("aria-controls", "workspace-authoring-pane");
+      await expect(restore).toHaveAttribute("aria-describedby", "workspace-collapsed-status");
+      await expect(restore.locator("svg")).toHaveAttribute("data-icon", "chevrons-right");
       await expect(composer.authoringPane()).toBeHidden();
       await expect(composer.separator()).toBeHidden();
       await restore.press("Enter");
       await expect(composer.collapseAuthoring()).toBeFocused();
+      expect(await composer.collapseAuthoring().evaluate((element, original) => element === original, button!)).toBe(true);
+      await expect(composer.collapseAuthoring().locator("svg")).toHaveAttribute("data-icon", "chevrons-left");
       await expect(composer.authoringPane()).toBeVisible();
       await expect(composer.separator()).toBeVisible();
     } finally {

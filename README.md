@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.10](https://img.shields.io/badge/status-0.8.10-green.svg)
+![Status: 0.8.12](https://img.shields.io/badge/status-0.8.12-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -98,7 +98,37 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
-## What changed in 0.8.10
+## What changed in 0.8.12
+
+0.8.12 is the Composer tool remediation. See the [release notes](CHANGELOG.md),
+which also record earlier releases.
+
+Under explicit approval, one composition proposal is pending at a time: a
+response carrying more than one mutation is refused whole, and a mutation is
+refused while a proposal is pending, with guidance to the model. This contains
+the defect rather than redesigning it; auto-commit sessions and blob-only
+proposals are not covered. Refusals and no-ops go back to the model as tool
+feedback instead of an approval card. `diff_pipeline` answers in freeform
+sessions, transforms can be spliced into planner-built pipelines, an oversized
+blob read is reported as a size refusal, and contradictory Composer skill text
+was corrected in place without restructuring it.
+
+MCP file paths are confined to the configured data directory, and the
+standalone MCP server runs under a supervisor that settles its child process on
+shutdown, failed start and parent death. Creating Landscape tables on PostgreSQL
+no longer breaks a later SQLite initialization in the same process.
+
+Session epoch 78 and Landscape epoch 50 are unchanged from the previous
+release; this release adds no schema-epoch cutover, so existing session and
+Landscape stores need no action. The 0.8.10 cutover guidance below continues to
+apply to older stores. Backwards compatibility is permitted and considered from 0.8.5 within
+explicitly supported boundaries. This release authorizes no in-place migration,
+reset or downgrade. Package metadata is 0.8.12; the package version alone does
+not establish qualification or image publication. Automatic image publication
+from main is held; verify the release tag and image digest before installing a
+published image.
+
+## Previously in 0.8.10
 
 0.8.10 carries the Composer performance remediation. Proposals, the
 `set_pipeline` schema and fixed tool definitions are verified once; restored
@@ -129,10 +159,7 @@ old workers isolated from the new stores. Compatible stores still require exact
 schema admission; unsupported stores are preserved and refused before incompatible
 writes. Backwards compatibility is permitted and considered from 0.8.5 within
 explicitly supported boundaries. This release authorizes no in-place migration,
-reset or downgrade. Package metadata is 0.8.10; the package version alone does not
-establish qualification or image publication. Automatic image publication from
-main is held; verify the release tag and image digest before installing a
-published image.
+reset or downgrade.
 
 Quota API quantities now use decimal strings for exact signed-64-bit values;
 older numeric clients must adapt their response parsing. Proxy deployments must

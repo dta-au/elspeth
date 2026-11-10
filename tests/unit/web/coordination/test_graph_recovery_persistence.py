@@ -1,10 +1,12 @@
 """Transactional recovery proofs with real session storage and no providers."""
 
 from dataclasses import replace
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, select, text, update
+from tests.fixtures.resource_identity import PARK_UUID_SPELLINGS, case_bearing_uuid, park_uuid_spelling
 from tests.unit.web.coordination.test_composer_operation_authority import response, start
 
 from elspeth.web.composer.graph_recovery import GraphRecoveryIntent
@@ -337,17 +339,19 @@ async def test_corrupt_park_identity_cannot_enter_model_context(operation_store)
 
 
 @pytest.mark.asyncio
-async def test_explicit_restore_uses_parked_identity_across_turns(operation_store):
-    _engine, repository, _authority, service, sid = operation_store
+@pytest.mark.parametrize("spelling", PARK_UUID_SPELLINGS)
+async def test_explicit_restore_uses_parked_identity_across_turns(operation_store, spelling):
+    engine, repository, _authority, service, sid = operation_store
     running, admission = await begin(operation_store)
     parked = replace(empty_recovery_state(), metadata=PipelineMetadata(name="Parked draft", description=""))
-    park = await service.prepare_graph_recovery(
-        sid,
-        context=admission.context,
-        intent=GraphRecoveryIntent("park", "Let's discuss.", None, "park-roundtrip"),
-        session_operation_context=running.session_operation_context,
-        candidate_state=parked,
-    )
+    with patch("elspeth.web.sessions.service.uuid.uuid4", autospec=True, side_effect=case_bearing_uuid):
+        park = await service.prepare_graph_recovery(
+            sid,
+            context=admission.context,
+            intent=GraphRecoveryIntent("park", "Let's discuss.", None, "park-roundtrip"),
+            session_operation_context=running.session_operation_context,
+            candidate_state=parked,
+        )
     await finish(operation_store, running, park)
     repository.release(running.session_operation_context)
     running, admission = await begin(operation_store, park.state_id)
@@ -362,11 +366,19 @@ async def test_explicit_restore_uses_parked_identity_across_turns(operation_stor
     restore = await service.prepare_graph_recovery(
         sid,
         context=admission.context,
-        intent=GraphRecoveryIntent("restore_parked_graph", "Let's discuss.", str(park.park_id), "restore-roundtrip"),
+        intent=GraphRecoveryIntent(
+            "restore_parked_graph", "Let's discuss.", park_uuid_spelling(str(park.park_id), spelling), "restore-roundtrip"
+        ),
         session_operation_context=running.session_operation_context,
     )
     assert restore.target_state_id == park.state_id and not restore.empty_fallback
     await finish(operation_store, running, restore)
     result = await service.get_current_state(sid)
     assert result.version == 3 and result.metadata_["name"] == "Parked draft"
+    assert result.id != park.state_id and result.derived_from_state_id == park.state_id
+    with engine.connect() as conn:
+        assert (
+            conn.execute(select(composition_states_table.c.provenance).where(composition_states_table.c.id == str(result.id))).scalar_one()
+            == "graph_recovery"
+        )
     assert not result.is_valid and result.composer_meta is None

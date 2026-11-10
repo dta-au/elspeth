@@ -498,6 +498,7 @@ def _refuse_evict_process(
 
 
 @pytest.mark.timeout(120)
+@pytest.mark.timing_sensitive
 def test_registered_process_ready_claim_has_one_owner_and_zero_mutation_loser(
     tmp_path: Path,
     request: pytest.FixtureRequest,
@@ -600,6 +601,7 @@ def test_registered_process_ready_claim_has_one_owner_and_zero_mutation_loser(
 
 
 @pytest.mark.timeout(120)
+@pytest.mark.timing_sensitive
 def test_registered_process_pending_sink_claim_preserves_bundle_and_refuses_predecessor(
     tmp_path: Path,
     request: pytest.FixtureRequest,
@@ -731,6 +733,7 @@ def test_registered_process_pending_sink_claim_preserves_bundle_and_refuses_pred
     assert _duplicate_terminal_outcome_tokens(crashed.db, crashed.run_id) == []
 
 
+@pytest.mark.timing_sensitive
 def test_child_process_initial_run_registration_is_one_atomic_epoch_one_image(tmp_path: Path) -> None:
     """RC-01: a spawned initial leader creates exactly one registry image."""
     database_url = f"sqlite:///{tmp_path / 'initial-registration.db'}"
@@ -779,6 +782,7 @@ def test_child_process_initial_run_registration_is_one_atomic_epoch_one_image(tm
 
 
 @pytest.mark.timeout(120)
+@pytest.mark.timing_sensitive
 def test_child_process_worker_and_lease_heartbeats_have_exact_owned_deltas(
     tmp_path: Path,
     request: pytest.FixtureRequest,
@@ -869,6 +873,7 @@ def test_child_process_worker_and_lease_heartbeats_have_exact_owned_deltas(
 
 
 @pytest.mark.timeout(120)
+@pytest.mark.timing_sensitive
 def test_inactive_registered_process_is_refused_for_claim_and_disposition_without_mutation(
     tmp_path: Path,
     request: pytest.FixtureRequest,
@@ -981,6 +986,7 @@ def test_inactive_registered_process_is_refused_for_claim_and_disposition_withou
 
 
 @pytest.mark.timeout(120)
+@pytest.mark.timing_sensitive
 def test_stale_and_foreign_recovery_authority_changes_only_refusal_evidence(
     tmp_path: Path,
     request: pytest.FixtureRequest,
@@ -1040,6 +1046,7 @@ def test_stale_and_foreign_recovery_authority_changes_only_refusal_evidence(
 
 
 @pytest.mark.timeout(120)
+@pytest.mark.timing_sensitive
 def test_registered_leader_process_recovers_transform_and_sink_redrive_exactly(
     tmp_path: Path,
     request: pytest.FixtureRequest,
@@ -1235,6 +1242,7 @@ def test_registered_leader_process_recovers_transform_and_sink_redrive_exactly(
 
 
 @pytest.mark.timeout(120)
+@pytest.mark.timing_sensitive
 def test_registered_process_coordination_release_takeover_join_depart_and_evict(
     tmp_path: Path,
     request: pytest.FixtureRequest,

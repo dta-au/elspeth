@@ -23,6 +23,7 @@ from scripts.ci_test_shards import (
     LONG_RUN_CASES,
     _publish_manifest,
     build_long_run_manifest,
+    build_timing_manifest,
     collection_digest,
     combine_shards,
     evidence_identity,
@@ -1375,33 +1376,52 @@ def _long_run_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version
             data.write()
             manifest["coverage_sha256"] = hashlib.sha256((folder / "coverage-data").read_bytes()).hexdigest()
         (folder / "shard-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    folder = artifacts / f"timing-shard-{version}-attempt-2"
+    folder.mkdir()
+    monkeypatch.setenv("GITHUB_JOB", "timing-sensitive")
+    timing_ids = ["test_sample.py::test_timing"]
+    manifest = build_timing_manifest(tmp_path, timing_ids, timing_ids)
+    manifest["python_version"] = version
+    manifest["exit_status"] = 0
+    manifest["timing_call_outcomes"] = dict.fromkeys(timing_ids, "passed")
+    manifest["timing_passed_count"] = len(timing_ids)
+    if version == "3.13":
+        source = tmp_path / "producer-timing" / "src" / "elspeth" / "sample.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("value = 1\nvalue += 1\nno_escape = 3\nreserve = 4\nrecovery = 5\ntiming = 6\n", encoding="utf-8")
+        data = coverage.CoverageData(basename=str(folder / "coverage-data"))
+        data.add_lines({str(source): {6}})
+        data.write()
+        manifest["coverage_sha256"] = hashlib.sha256((folder / "coverage-data").read_bytes()).hexdigest()
+    (folder / "shard-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setenv("GITHUB_JOB", "coverage")
     (tmp_path / "src" / "elspeth").mkdir(parents=True)
     (tmp_path / "src" / "elspeth" / "sample.py").write_text(
-        "value = 1\nvalue += 1\nno_escape = 3\nreserve = 4\nrecovery = 5\n", encoding="utf-8"
+        "value = 1\nvalue += 1\nno_escape = 3\nreserve = 4\nrecovery = 5\ntiming = 6\n", encoding="utf-8"
     )
     return artifacts
 
 
 @pytest.mark.parametrize("version", ["3.12", "3.13"])
-def test_long_run_consumer_requires_seven_producers_and_all_case_coverage(
+def test_long_run_consumer_requires_eight_producers_and_all_case_coverage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
 ) -> None:
     artifacts = _long_run_artifacts(tmp_path, monkeypatch, version)
     resolved = validate_long_run_shards(artifacts, 4, tmp_path, version)
-    assert len(resolved) == 7
+    assert len(resolved) == 8
     for case in LONG_RUN_CASES:
         assert resolved[f"landscape-proof-{case}-{version}"] == f"landscape-proof-{case}-{version}-attempt-2"
     assert resolved[f"ordinary-shard-{version}-0"] == f"ordinary-shard-{version}-0-attempt-1"
     databases = [folder / "coverage-data" for folder in artifacts.iterdir() if (folder / "coverage-data").exists()]
     if version == "3.13":
-        assert len(databases) == 7
+        assert len(databases) == 8
         for case, line in zip(LONG_RUN_CASES, [3, 4, 5], strict=True):
             data = coverage.CoverageData(basename=str(artifacts / resolved[f"landscape-proof-{case}-{version}"] / "coverage-data"))
             data.read()
             assert [data.lines(filename) for filename in data.measured_files()] == [[line]]
         combined = coverage.CoverageData(basename=str(tmp_path / ".coverage"))
         combined.read()
-        assert combined.lines(str(tmp_path / "src" / "elspeth" / "sample.py")) == [1, 2, 3, 4, 5]
+        assert combined.lines(str(tmp_path / "src" / "elspeth" / "sample.py")) == [1, 2, 3, 4, 5, 6]
     else:
         assert databases == []
         assert not (tmp_path / ".coverage").exists()
@@ -1624,12 +1644,12 @@ def test_long_run_consumer_retains_newest_attempt_content_policy(
             validate_long_run_shards(artifacts, 4, tmp_path, version)
     else:
         resolved = validate_long_run_shards(artifacts, 4, tmp_path, version)
-        assert len(resolved) == 7
+        assert len(resolved) == 8
         assert resolved[stem] == newer.name
         if version == "3.13":
             data = coverage.CoverageData(basename=str(tmp_path / ".coverage"))
             data.read()
-            assert data.lines(str(tmp_path / "src" / "elspeth" / "sample.py")) == [1, 2, 3, 4, 5]
+            assert data.lines(str(tmp_path / "src" / "elspeth" / "sample.py")) == [1, 2, 3, 4, 5, 6]
 
 
 @pytest.mark.parametrize("version", ["3.12", "3.13"])
@@ -1712,7 +1732,7 @@ def test_long_run_consumer_rederives_unequal_weights_instead_of_equal_defaults(
         if manifest["partition"] == "ordinary":
             manifest["selected_nodeids"] = [node for node in nodeids if weighted_assignment[node] == manifest["shard_index"]]
         report.write_text(json.dumps(manifest), encoding="utf-8")
-    assert len(validate_long_run_shards(artifacts, 4, tmp_path, version)) == 7
+    assert len(validate_long_run_shards(artifacts, 4, tmp_path, version)) == 8
     for report, manifest in manifests.items():
         if manifest["partition"] == "ordinary":
             manifest["selected_nodeids"] = [node for node in nodeids if old_assignment[node] == manifest["shard_index"]]
@@ -1730,6 +1750,7 @@ def test_partitioned_validator_consumes_real_successful_pytest_producers(tmp_pat
         "def no_escape():\n    return 3\n"
         "def reserve():\n    return 4\n"
         "def recovery():\n    return 5\n"
+        "def timing():\n    return 6\n"
     )
     (source / "sample.py").write_text(source_text, encoding="utf-8")
     module = tmp_path / LONG_RUN_CASES["no-escape"].split("::")[0]
@@ -1742,6 +1763,8 @@ def test_partitioned_validator_consumes_real_successful_pytest_producers(tmp_pat
     definitions += (
         "@pytest.mark.parametrize('value', range(40))\ndef test_ordinary(value):\n"
         f"    assert run_path({str(source / 'sample.py')!r})['double'](value) == value * 2\n"
+        "@pytest.mark.timing_sensitive\ndef test_timing():\n"
+        f"    assert run_path({str(source / 'sample.py')!r})['timing']() == 6\n"
     )
     module.write_text(definitions, encoding="utf-8")
     commit = evidence_identity(tmp_path)["tested_commit"]
@@ -1756,14 +1779,23 @@ def test_partitioned_validator_consumes_real_successful_pytest_producers(tmp_pat
     version = f"{sys.version_info.major}.{sys.version_info.minor}"
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
-    producers = [("ordinary", 8, index, None) for index in range(8)] + [("proof", 1, 0, case) for case in LONG_RUN_CASES]
+    producers = (
+        [("ordinary", 8, index, None) for index in range(8)] + [("proof", 1, 0, case) for case in LONG_RUN_CASES] + [("timing", 1, 0, None)]
+    )
     for partition, count, index, case in producers:
-        stem = f"ordinary-shard-{version}-{index}" if partition == "ordinary" else f"landscape-proof-{case}-{version}"
+        stem = (
+            f"ordinary-shard-{version}-{index}"
+            if partition == "ordinary"
+            else f"timing-shard-{version}"
+            if partition == "timing"
+            else f"landscape-proof-{case}-{version}"
+        )
         folder = artifacts / f"{stem}-attempt-2"
         folder.mkdir()
-        monkeypatch.setenv("GITHUB_JOB", "test" if partition == "ordinary" else "proof")
+        monkeypatch.setenv("GITHUB_JOB", "test" if partition == "ordinary" else "timing-sensitive" if partition == "timing" else "proof")
         monkeypatch.setenv("COVERAGE_FILE", str(folder / "coverage-data"))
         extra = [f"--cov={source}", "--cov-config=/dev/null", "--cov-report=", "--cov-fail-under=0"] if version == "3.13" else []
+        extra += ["-m", "timing_sensitive" if partition == "timing" else "not timing_sensitive"]
         result, report = _partition_run(tmp_path, partition, count, index, extra_args=extra, case=case)
         assert result.returncode == 0, result.stdout + result.stderr
         report.rename(folder / "shard-manifest.json")
@@ -1771,8 +1803,8 @@ def test_partitioned_validator_consumes_real_successful_pytest_producers(tmp_pat
             data = coverage.CoverageData(basename=str(folder / "coverage-data"))
             data.read()
             executed = set(data.lines(str(source / "sample.py")))
-            expected = {2} if case is None else {dict(zip(LONG_RUN_CASES, [4, 6, 8], strict=True))[case]}
-            assert executed & {2, 4, 6, 8} == expected
+            expected = {10} if partition == "timing" else {2} if case is None else {dict(zip(LONG_RUN_CASES, [4, 6, 8], strict=True))[case]}
+            assert executed & {2, 4, 6, 8, 10} == expected
     destination = tmp_path / "aggregate"
     (destination / "src" / "elspeth").mkdir(parents=True)
     (destination / "src" / "elspeth" / "sample.py").write_text(source_text, encoding="utf-8")
@@ -1780,11 +1812,11 @@ def test_partitioned_validator_consumes_real_successful_pytest_producers(tmp_pat
     profile.parent.mkdir(parents=True)
     shutil.copyfile(tmp_path / DURATION_PROFILE_PATH, profile)
     resolved = validate_long_run_shards(artifacts, 8, destination, version)
-    assert len(resolved) == 11
+    assert len(resolved) == 12
     if version == "3.13":
         data = coverage.CoverageData(basename=str(destination / ".coverage"))
         data.read()
-        assert data.lines(str(destination / "src" / "elspeth" / "sample.py")) == list(range(1, 9))
+        assert data.lines(str(destination / "src" / "elspeth" / "sample.py")) == list(range(1, 11))
 
 
 def test_partitioned_cli_returns_selected_attempt_provenance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1811,7 +1843,7 @@ def test_partitioned_cli_returns_selected_attempt_provenance(tmp_path: Path, mon
     )
     assert result.returncode == 0, result.stdout + result.stderr
     selected = json.loads(result.stdout)["selected_artifacts"]
-    assert len(selected) == 7
+    assert len(selected) == 8
     assert selected["ordinary-shard-3.12-0"] == "ordinary-shard-3.12-0-attempt-1"
     for case in LONG_RUN_CASES:
         assert selected[f"landscape-proof-{case}-3.12"] == f"landscape-proof-{case}-3.12-attempt-2"
@@ -1852,7 +1884,7 @@ def test_workflow_requires_all_shards_and_combined_unchanged_floors() -> None:
     assert jobs["test"]["env"]["PYTEST_WORKERS"] == "2"
     assert "matrix.shard" in jobs["test"]["env"]["CI_CHECKOUT_PATH"]
     aggregate = jobs["coverage"]
-    assert aggregate["needs"] == ["test", "landscape-proof"]
+    assert aggregate["needs"] == ["test", "landscape-proof", "timing-sensitive"]
     assert (
         aggregate["if"]
         == "always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)"
@@ -1860,6 +1892,7 @@ def test_workflow_requires_all_shards_and_combined_unchanged_floors() -> None:
     commands = "\n".join(step.get("run", "") for step in aggregate["steps"])
     assert "needs.test.result" in commands
     assert "needs.landscape-proof.result" in commands
+    assert "needs.timing-sensitive.result" in commands
     for floor in (85, 92, 99, 90, 62):
         assert f"--fail-under={floor}" in commands
     assert "coverage" in jobs["ci-success"]["needs"]
@@ -1903,16 +1936,17 @@ def _assert_activation_contract(jobs: dict[str, Any]) -> None:
     assert junit["if"] == "always()"
     assert junit["with"]["name"] == "pytest-junit-${{ matrix.python-version }}-${{ matrix.shard }}-attempt-${{ github.run_attempt }}"
     aggregate = jobs["coverage"]
-    assert aggregate["needs"] == ["test", "landscape-proof"]
+    assert aggregate["needs"] == ["test", "landscape-proof", "timing-sensitive"]
     gate = _activation_step(aggregate, "Require every test shard and exhaustive proof to pass")
     assert aggregate["steps"][0] is gate
-    for producer in ("test", "landscape-proof"):
+    for producer in ("test", "landscape-proof", "timing-sensitive"):
         assert f'if [ "${{{{ needs.{producer}.result }}}}" != "success" ]; then' in gate["run"]
     assert "continue-on-error" not in gate and "||" not in gate["run"]
     for version in ("3.12", "3.13"):
         for partition, pattern in (
             ("ordinary", f"ordinary-shard-{version}-*-attempt-*"),
             ("proof", f"landscape-proof-*-{version}-attempt-*"),
+            ("timing", f"timing-shard-{version}-attempt-*"),
         ):
             download = _activation_step(aggregate, f"Download Python {version} {partition} evidence")
             assert download["uses"] == "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
@@ -1939,9 +1973,10 @@ def _assert_activation_contract(jobs: dict[str, Any]) -> None:
         ]
         assert "if" not in validation and "continue-on-error" not in validation
     success = jobs["ci-success"]
-    assert "landscape-proof" in success["needs"] and "coverage" in success["needs"]
+    assert {"landscape-proof", "timing-sensitive", "coverage"} <= set(success["needs"])
     assert success["if"] == "always()"
     assert 'if [[ "${{ needs.landscape-proof.result }}" != "success" ]]; then' in _activation_step(success, "Check all jobs passed")["run"]
+    assert 'if [[ "${{ needs.timing-sensitive.result }}" != "success" ]]; then' in _activation_step(success, "Check all jobs passed")["run"]
     report = _activation_step(aggregate, "Upload combined coverage report")
     assert report["if"] == "always()"
     assert report["with"]["name"] == "coverage-report-attempt-${{ github.run_attempt }}"
@@ -1991,16 +2026,38 @@ def test_activation_contract_refuses_disconnected_proof_paths(mutation: str) -> 
         _assert_activation_contract(jobs)
 
 
+@pytest.mark.parametrize("mutation", ["dependency", "native_result", "download", "success_dependency", "success_result"])
+def test_activation_contract_refuses_disconnected_timing_paths(mutation: str) -> None:
+    jobs = copy.deepcopy(_activation_workflow_jobs())
+    if mutation == "dependency":
+        jobs["coverage"]["needs"].remove("timing-sensitive")
+    elif mutation == "native_result":
+        step = _activation_step(jobs["coverage"], "Require every test shard and exhaustive proof to pass")
+        step["run"] = step["run"].replace("needs.timing-sensitive.result", "needs.test.result")
+    elif mutation == "download":
+        jobs["coverage"]["steps"].remove(_activation_step(jobs["coverage"], "Download Python 3.12 timing evidence"))
+    elif mutation == "success_dependency":
+        jobs["ci-success"]["needs"].remove("timing-sensitive")
+    elif mutation == "success_result":
+        step = _activation_step(jobs["ci-success"], "Check all jobs passed")
+        step["run"] = step["run"].replace("needs.timing-sensitive.result", "needs.test.result")
+    with pytest.raises((AssertionError, KeyError)):
+        _assert_activation_contract(jobs)
+
+
 @pytest.mark.parametrize(
     "job_name,step_name", [("coverage", "Require every test shard and exhaustive proof to pass"), ("ci-success", "Check all jobs passed")]
 )
 @pytest.mark.parametrize("proof_result", ["success", "failure", "skipped", "cancelled", "timed_out", ""])
-def test_native_proof_result_must_succeed_before_evidence_or_ci_success(job_name: str, step_name: str, proof_result: str) -> None:
+@pytest.mark.parametrize("required_producer", ["landscape-proof", "timing-sensitive"])
+def test_native_proof_result_must_succeed_before_evidence_or_ci_success(
+    job_name: str, step_name: str, proof_result: str, required_producer: str
+) -> None:
     job = _activation_workflow_jobs()[job_name]
     run = _activation_step(job, step_name)["run"]
-    run = run.replace("${{ needs.landscape-proof.result }}", proof_result)
+    run = run.replace("${{ needs." + required_producer + ".result }}", proof_result)
     for producer in job["needs"]:
-        if producer != "landscape-proof":
+        if producer != required_producer:
             run = run.replace(f"${{{{ needs.{producer}.result }}}}", "success")
     assert "${{" not in run
     completed = subprocess.run(["bash", "-e", "-c", run], capture_output=True, text=True, check=False, timeout=5)
@@ -2036,5 +2093,5 @@ def test_yaml_partition_validation_consumes_real_tiny_evidence_and_refuses_missi
     if omit_proof:
         assert "Missing producer evidence" in completed.stderr
     else:
-        assert len(json.loads(completed.stdout)["selected_artifacts"]) == 11
+        assert len(json.loads(completed.stdout)["selected_artifacts"]) == 12
     assert (tmp_path / ".coverage").exists() is (version == "3.13" and not omit_proof)

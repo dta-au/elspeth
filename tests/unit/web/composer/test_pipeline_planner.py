@@ -265,6 +265,41 @@ _INFORMATION_BOUNDARY_DISCOVERY_CANONICAL_BYTES = 3840
 # The system message and tools are unchanged. Price only this measured 188 B,
 # preserving the finite tripwire and exact-boundary / +1-byte overflow control.
 _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES = 188
+# Composer skill rework for 0.8.12 (2026-11-10), measured per commit with the
+# ceiling lowered to 1 in a throwaway plugin, same interpreter and catalog:
+# 135,274 B after the capability core lost its stale recipe / every-surface /
+# trust-boundary text and the interpretation-requirement schema note was
+# shortened (two commits, both under the 135,730 B pin). The planner surface
+# orientation appended to PLANNER_TERMINAL_INSTRUCTION then measures 136,235 B,
+# +961 B: the planner is told its surface, the tools the shared skill names
+# that it lacks, which review rows it authors and its own rejection shape.
+# The capability core's corrections then measure 136,587 B, +352 B: row_union
+# branch keys are fork_to names, batch-aware plugins declare
+# schema.required_fields, and a result that reports the pipeline unchanged
+# needs no confirming read (the first two are the lines behind two observed
+# planner rejections). The missing hot-path facts then measure 139,211 B,
+# +2,624 B: boolean route labels, source coercion spellings, declared-field
+# guarantees, sink typing and the inline_blob position in the capability core,
+# plus a worked source -> gate -> two sinks exemplar with two rules in the
+# authoring aids (the gate_routing aid is 1,812 B of it: the request measures
+# 137,412 B with that aid withheld). Qualifying the guarantee sentence to
+# non-optional fields then measures 139,224 B, +13 B. Price only the 3,494 B
+# excess over the prior 135,730 B pin, keeping zero new headroom and the
+# exact-boundary / +1-byte overflow control. If the gate_routing aid is
+# declined, the value is 1,682. Operator ruling 2026-11-10: the 3,494 B
+# allowance, gate_routing aid included, is approved; the prompt is scheduled
+# for a per-surface restructure that is expected to replace this pin.
+# Follow-up the same day, after a live battery showed planners sending the
+# pipeline as a JSON-encoded string or beside an empty sources map: the
+# instruction states the argument shape, and the review corrections (discard
+# and fork as route destinations, fixed-sink refusal of undeclared fields, the
+# exemplar's source made fixed) land in the core and the aid. Measured
+# 139,533 B, +309 B. A live round then had three candidates rejected for a
+# bare `mode: flexible`, so the core says which schema modes need `fields`:
+# measured 139,608 B, +75 B. The value follows the measurement under the
+# operator's standing direction that this threshold tracks the working
+# system: 3,878 B over the prior 135,730 B pin.
+_SKILL_REWORK_0812_CANONICAL_BYTES = 3878
 # file_inject transform (2026-11-10). Operator ruling 2026-11-10 (John): the
 # cap is a trigger to review for waste, not a reason to cut; with no obvious
 # cut, the measured increase is authorised. Measured on the same live request,
@@ -296,6 +331,7 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _QUALIFICATION_SCAFFOLD_CANONICAL_BYTES
     + _INFORMATION_BOUNDARY_DISCOVERY_CANONICAL_BYTES
     + _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES
+    + _SKILL_REWORK_0812_CANONICAL_BYTES
     + _FILE_INJECT_CATALOG_CANONICAL_BYTES
 )
 
@@ -1041,15 +1077,21 @@ async def test_retained_operation_context_reaches_selected_planner_wire(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("equal_current", [False, True], ids=["new", "already-current"])
 async def test_happy_path_returns_proposal_and_audits_exact_marked_wire_payload(
     tmp_path: Path,
     tool_context: ToolContext,
+    equal_current: bool,
 ) -> None:
     pipeline = _pipeline(tmp_path)
     completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": pipeline})))
     recorder = BufferingRecorder()
     lifecycle_events: list[str] = []
     policy = _budget()
+    context, _, _ = _candidate_context(tmp_path, _TEST_SESSION_ID)
+    candidate = build_set_pipeline_candidate(pipeline, _empty_state(), context)
+    assert candidate.acceptable
+    current = candidate.result.updated_state if equal_current else _empty_state()
 
     proposal = await _plan(
         tmp_path=tmp_path,
@@ -1058,11 +1100,20 @@ async def test_happy_path_returns_proposal_and_audits_exact_marked_wire_payload(
         recorder=recorder,
         budget=policy,
         lifecycle=_lifecycle(lifecycle_events),
+        current_state=current,
     )
 
     assert deep_thaw(proposal.proposal.pipeline) == pipeline
     assert proposal.proposal.base == AbsentBase()
     assert proposal.proposal.repair_count == 0
+    if equal_current:
+        from elspeth.web.composer.pipeline_proposal import composition_content_hash
+
+        assert proposal.candidate_state is not None
+        assert composition_content_hash(proposal.candidate_state) == composition_content_hash(current)
+        # Terminal authoring is represented by the accepted DONE attempt;
+        # it must not manufacture an executor dispatch to prove equality.
+        assert recorder.invocations == ()
     assert lifecycle_events == ["before", "scope-enter", "scope-exit", "settled:complete"]
     assert len(completion.requests) == 1
     sent = completion.requests[0]
@@ -1749,6 +1800,61 @@ async def test_digest_omission_keeps_inventory_available_after_details_close(
     assert tool_result["success"] is True
     assert tool_result.get("error_code") != "DISCOVERY_NO_GAIN"
     assert [invocation.tool_name for invocation in recorder.invocations] == ["list_sources"]
+
+
+@pytest.mark.asyncio
+async def test_alias_metadata_success_resolves_the_canonical_fact_in_the_next_planner_request(tmp_path, tool_context):
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from tests.fixtures.resource_identity import uuid_spelling
+
+    engine, origin = await _session_context()
+    try:
+        with fenced_operation_context(engine, origin.session_id) as context:
+            blob = await BlobServiceImpl(engine, tmp_path).create_blob(
+                UUID(origin.session_id), "identity.csv", b"name,score\nada,42\n", "text/csv", session_operation_context=context
+            )
+            pipeline = _inline_pipeline(tmp_path)
+            del pipeline["source"]["inline_blob"]
+            pipeline["source"]["blob_id"] = str(blob.id)
+            alias = uuid_spelling(str(blob.id), "braced")
+            completion = _ScriptedCompletion(
+                _response_with_call_id("metadata-alias", "get_blob_metadata", {"blob_id": alias}),
+                _response_with_call_id("emit-identity", "emit_pipeline_proposal", {"pipeline": pipeline}),
+            )
+            custody = replace(
+                _custody(tmp_path),
+                session_engine=engine,
+                session_operation_context=context,
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+            )
+            key = f"blob.metadata:{blob.id}"
+            policy = pipeline_planner.PlannerDiscoveryPolicy(
+                manifest=pipeline_planner.PlannerInformationManifest(supplied=frozenset(), unresolved=frozenset({key})),
+                discovery_tool_names=PLANNER_DISCOVERY_TOOL_NAMES,
+                unresolved_classes=(),
+            )
+            with patch.object(pipeline_planner.PlannerDiscoveryPolicy, "initial", return_value=policy):
+                await _plan(
+                    tmp_path=tmp_path,
+                    tool_context=tool_context,
+                    completion=completion,
+                    originating_message=origin,
+                    custody_config=custody,
+                    information_aware=True,
+                )
+            first = next(
+                json.loads(m["content"])
+                for m in completion.requests[1]["messages"]
+                if m.get("tool_call_id") == "metadata-alias" and m["role"] == "tool"
+            )
+            assert first["success"] is True
+            assert first["data"]["id"] == str(blob.id)
+            initial = json.loads(completion.requests[0]["messages"][2]["content"])
+            assert initial["information_manifest"]["unresolved"] == [key]
+            closure = "All declared information gaps are closed; emit the terminal proposal now."
+            assert sum(m.get("content") == closure for m in completion.requests[1]["messages"]) == 1
+    finally:
+        engine.dispose()
 
 
 def test_pipeline_information_semantic_dominance_is_directional() -> None:
@@ -2910,9 +3016,91 @@ async def test_missing_source_candidate_fails_closed_before_full_candidate_is_ac
             "severity": "high",
             "error_code": "canonical_schema",
             "error_class": "SchemaValidationError",
-            "schema_violations": [{"path": "pipeline", "rule": "oneOf"}],
+            "schema_violations": [
+                {
+                    "path": "pipeline",
+                    "rule": "oneOf",
+                    "detail": "Supply exactly one of source, sources and omit the other key entirely, even as an empty value.",
+                }
+            ],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_json_encoded_pipeline_string_is_rejected_with_a_located_type_violation(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A provider that stringifies the whole document is told so, not handed a bare code.
+
+    Live planners sent ``{"pipeline": "<json text>"}`` and received a
+    ``canonical_schema`` entry with no violation at all, then resent the same
+    string until the repair budget was spent.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": json.dumps(_pipeline(tmp_path))})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
+
+    assert proposal.proposal.repair_count == 1
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    assert feedback["validation"]["errors"] == [
+        {
+            "component": "pipeline",
+            "severity": "high",
+            "error_code": "canonical_schema",
+            "error_class": "SchemaValidationError",
+            "schema_violations": [
+                {
+                    "path": "pipeline",
+                    "rule": "type",
+                    "constraint": "object",
+                    "detail": "pipeline must be a JSON object, not a JSON-encoded string.",
+                }
+            ],
+        }
+    ]
+    # Value-free: nothing from the rejected string is echoed back.
+    assert "metadata" not in completion.requests[1]["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_source_beside_an_empty_sources_map_is_told_which_keys_are_exclusive(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The second live shape: a valid ``source`` plus ``"sources": {}``."""
+    both = _pipeline(tmp_path)
+    both["sources"] = {}
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": both})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
+
+    assert proposal.proposal.repair_count == 1
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    (entry,) = feedback["validation"]["errors"]
+    assert entry["error_code"] == "canonical_schema"
+    assert {
+        "path": "pipeline",
+        "rule": "oneOf",
+        "detail": "Supply exactly one of source, sources and omit the other key entirely, even as an empty value.",
+    } in entry["schema_violations"]
+
+
+def test_exclusive_required_detail_abstains_for_any_other_one_of_shape() -> None:
+    assert pipeline_planner._exclusive_required_detail([{"required": ["a"]}, {"required": ["b"]}]) == (
+        "Supply exactly one of a, b and omit the other key entirely, even as an empty value."
+    )
+    assert pipeline_planner._exclusive_required_detail([{"required": ["a"]}]) is None
+    assert pipeline_planner._exclusive_required_detail([{"required": ["a"]}, {"type": "object"}]) is None
+    assert pipeline_planner._exclusive_required_detail([{"required": ["a", "b"]}, {"required": ["c"]}]) is None
+    assert pipeline_planner._exclusive_required_detail("oneOf") is None
 
 
 def _feedback_result(validation: ValidationSummary, state: CompositionState | None = None) -> ToolResult:
@@ -4305,7 +4493,13 @@ _MISSING_SOURCE_SCHEMA_FEEDBACK = {
                 "severity": "high",
                 "error_code": "canonical_schema",
                 "error_class": "SchemaValidationError",
-                "schema_violations": [{"path": "pipeline", "rule": "oneOf"}],
+                "schema_violations": [
+                    {
+                        "path": "pipeline",
+                        "rule": "oneOf",
+                        "detail": "Supply exactly one of source, sources and omit the other key entirely, even as an empty value.",
+                    }
+                ],
             }
         ],
     },
@@ -5596,6 +5790,7 @@ async def test_cancellation_during_custody_settles_then_reraises_without_proposa
 
 
 @pytest.mark.asyncio
+@pytest.mark.timing_sensitive
 async def test_real_inline_custody_returns_only_blob_id_and_ready_row(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -7062,6 +7257,7 @@ async def test_escape_hatch_omits_endpoint_kwargs_when_only_primary_configured(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timing_sensitive
 async def test_escape_hatch_provider_identity_reaches_inline_custody(
     tmp_path: Path,
     tool_context: ToolContext,

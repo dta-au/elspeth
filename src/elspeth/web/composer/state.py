@@ -8292,7 +8292,8 @@ class CompositionState:
         if not any(o.name == output_name for o in self.outputs):
             return None
         outputs = tuple(o for o in self.outputs if o.name != output_name)
-        return replace(self, outputs=outputs, version=self.version + 1)
+        edges = tuple(e for e in self.edges if e.from_node != output_name and e.to_node != output_name)
+        return replace(self, outputs=outputs, edges=edges, version=self.version + 1)
 
     def with_metadata(self, patch: dict[str, Any]) -> CompositionState:
         """Update metadata fields from partial dict. Version incremented."""

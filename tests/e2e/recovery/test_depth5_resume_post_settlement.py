@@ -352,6 +352,7 @@ def test_depth5_in_process_abort_after_settlement_resumes_to_the_baseline_outcom
     _assert_resumed_matches_baseline(crash_dir / "audit.db", baseline)
 
 
+@pytest.mark.timing_sensitive
 def test_depth5_process_death_after_settlement_resumes_to_the_baseline_outcome(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, baseline: _LegOutcome
 ) -> None:

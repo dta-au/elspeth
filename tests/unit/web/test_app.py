@@ -633,6 +633,7 @@ class TestHealthEndpoint:
         assert response.json() == {"status": "ok"}
 
     @pytest.mark.asyncio
+    @pytest.mark.timing_sensitive
     async def test_health_responds_during_malicious_jinja_render(self, tmp_path) -> None:
         app = create_app(_settings(tmp_path))
         attempted = threading.Event()
@@ -669,6 +670,7 @@ class TestHealthEndpoint:
         assert client.get("/api/ready").status_code == 503
 
     @pytest.mark.asyncio
+    @pytest.mark.timing_sensitive
     async def test_health_remains_responsive_while_blob_resolution_blocks_in_worker(self, tmp_path, monkeypatch) -> None:
         import elspeth.web.readiness as readiness_module
 
@@ -770,6 +772,7 @@ class TestReadinessEndpoint:
         assert all(check["detail"] == "readiness request timed out" for check in payload["checks"])
 
     @pytest.mark.asyncio
+    @pytest.mark.timing_sensitive
     async def test_never_finishing_compute_returns_fallback_within_hard_five_second_ceiling(
         self,
         tmp_path,
@@ -5038,6 +5041,7 @@ class TestBootPrimeOpenRouterCatalogGate:
         failed = self._event(logs, "openrouter_catalog_boot_prime_failed")
         assert failed["log_level"] == "warning"
 
+    @pytest.mark.timing_sensitive
     def test_slow_drip_prime_is_bounded_by_a_total_deadline(self, tmp_path, monkeypatch) -> None:
         """A response that never stalls long enough for httpx's per-read timeout still ends at the deadline.
 

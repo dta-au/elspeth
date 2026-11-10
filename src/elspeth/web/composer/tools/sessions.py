@@ -91,6 +91,7 @@ from elspeth.web.composer.tools._common import (
     _normalize_echoed_interpretation_requirements,
     _normalize_trusted_legacy_interpretation_requirements,
     _options_with_default_llm_reviews,
+    _path_policy_refusal_message,
     _post_mutation_invariant_error,
     _prevalidate_sink,
     _prevalidate_source_for_context,
@@ -1236,11 +1237,20 @@ def build_set_pipeline_candidate(
         if credential_error is not None:
             return _candidate(credential_error)
 
-        path_error = _validate_source_path(legacy_src_options, data_dir, session_id=session_id)
+        path_error = _validate_source_path(
+            legacy_src_options,
+            data_dir,
+            session_id=session_id,
+            require_data_dir=context.require_data_dir_for_paths,
+            mcp_root_authority=context.mcp_root_authority,
+        )
         if path_error is not None:
             return _failure_result(
                 state,
-                "Source file path options (path or file) must use this session's permitted source locations. Use the session's blob binding or an authorized source path.",
+                _path_policy_refusal_message(
+                    context,
+                    "Source file path options (path or file) must use this session's permitted source locations. Use the session's blob binding or an authorized source path.",
+                ),
                 error_code="source_path_policy_invalid",
                 rejected_component="source",
             )
@@ -1449,12 +1459,21 @@ def build_set_pipeline_candidate(
             if credential_error is not None:
                 _record_component_rejection(_candidate(credential_error))
                 continue
-            path_error = _validate_source_path(src_options, data_dir, session_id=session_id)
+            path_error = _validate_source_path(
+                src_options,
+                data_dir,
+                session_id=session_id,
+                require_data_dir=context.require_data_dir_for_paths,
+                mcp_root_authority=context.mcp_root_authority,
+            )
             if path_error is not None:
                 _record_component_rejection(
                     _failure_result(
                         state,
-                        "Source file path options (path or file) must use this session's permitted source locations. Use the session's blob binding or an authorized source path.",
+                        _path_policy_refusal_message(
+                            context,
+                            "Source file path options (path or file) must use this session's permitted source locations. Use the session's blob binding or an authorized source path.",
+                        ),
                         error_code="source_path_policy_invalid",
                         rejected_component=source_ref,
                     )
@@ -1677,12 +1696,21 @@ def build_set_pipeline_candidate(
             # retrieval). Parity with the per-output sink-path check below so
             # a bulk set_pipeline cannot wave through an escaping transform
             # path while rejecting an escaping sink path.
-            provider_path_error = _validate_transform_provider_config_path(review_options, data_dir, session_id=session_id)
+            provider_path_error = _validate_transform_provider_config_path(
+                review_options,
+                data_dir,
+                session_id=session_id,
+                require_data_dir=context.require_data_dir_for_paths,
+                mcp_root_authority=context.mcp_root_authority,
+            )
             if provider_path_error is not None:
                 _record_component_rejection(
                     _failure_result(
                         state,
-                        "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
+                        _path_policy_refusal_message(
+                            context,
+                            "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
+                        ),
                         error_code="provider_config_path_policy_invalid",
                         rejected_component=node_ref,
                     )
@@ -1822,12 +1850,22 @@ def build_set_pipeline_candidate(
         if credential_error is not None:
             _record_component_rejection(_candidate(credential_error))
             continue
-        out_path_error = _validate_sink_path(out_options, data_dir, session_id=session_id)
+        out_path_error = _validate_sink_path(
+            out_options,
+            data_dir,
+            plugin=out_plugin,
+            session_id=session_id,
+            require_data_dir=context.require_data_dir_for_paths,
+            mcp_root_authority=context.mcp_root_authority,
+        )
         if out_path_error is not None:
             _record_component_rejection(
                 _failure_result(
                     state,
-                    "Output path options (path, file or persist_directory) must use this session's permitted destinations. Use an authorized session-local output path.",
+                    _path_policy_refusal_message(
+                        context,
+                        "Output path options (path, file or persist_directory) must use this session's permitted destinations. Use an authorized session-local output path.",
+                    ),
                     error_code="sink_path_policy_invalid",
                     rejected_component=output_ref,
                 )

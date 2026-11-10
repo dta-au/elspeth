@@ -22,6 +22,7 @@ from elspeth.contracts.blobs_inline import (
     BlobInlineValidationViolation,
     is_widened_blob_ref,
 )
+from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import PipelineLoweringError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
@@ -633,6 +634,7 @@ def materialize_validation_yaml(
     yaml_generator: YamlGenerator,
     data_dir: Path,
     session_id: str | None,
+    mcp_root_authority: McpConfiguredRootAuthority | None = None,
     blob_get_metadata: Callable[[UUID], BlobRecord | None] | None,
     load_yaml: Callable[[str], object],
     blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
@@ -676,7 +678,7 @@ def materialize_validation_yaml(
             readiness=_blocked_readiness(code="state_shape_materialization", detail=detail),
             semantic_contracts=interpretation.authored.semantic_contracts,
         )
-    pipeline_yaml = resolve_runtime_yaml_paths(pipeline_yaml, str(data_dir), session_id=session_id)
+    pipeline_yaml = resolve_runtime_yaml_paths(pipeline_yaml, str(data_dir), session_id=session_id, mcp_root_authority=mcp_root_authority)
 
     # Judged on the state, before any blob is substituted: after substitution a
     # literal and an attached upload are both strings. Run admission applies the

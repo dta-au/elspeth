@@ -4,7 +4,172 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## Unreleased (0.8.11)
+## 0.8.12 - 2026-11-10
+
+Composer tool remediation. Verification status is recorded in the pull
+request. The dated entry and package version do not establish qualification, a
+published tag or an image.
+
+### Composer
+
+- **Refusals and no-ops go back to the model, not to an approval card.** A
+  mutation is now run through validation-only admission before a proposal is
+  staged. A change the server already knows it will refuse, or one that would
+  change nothing, is returned to the model as tool feedback so it can repair
+  its request. Approval cards are created only for changes that pass
+  admission, so a user is no longer asked to approve a proposal that cannot
+  be accepted.
+- **Blob and secret changes are checked before a proposal is published.**
+  Blob update and delete prerequisites, quota and custody checks run at
+  admission. No blob-store effect is executed as a preview.
+- **A proposal that loses a race for its resource says so.** When the blob or
+  graph a staged proposal depends on changes before publication, the tool
+  reports the race instead of reporting that the proposal was staged.
+- **Blob and parked-graph selectors accept any spelling of a UUID.** Blob
+  lookups, bindings, retention, planner facts and proposal custody resolve a
+  UUID written in upper case, with braces or as a URN to the same blob, and
+  duplicate detection treats those spellings as one blob. Restoring a parked
+  graph canonicalises its selector the same way. The arguments the model
+  sent, and the hashes recorded over them, are preserved unchanged.
+- **A cache hit is audited as the envelope the model received.** The audit
+  record for a cached discovery result now matches the admitted envelope
+  delivered to the model.
+- **Queue scope fields reach node admission.** Three queue scope fields that
+  were dropped before `NodeSpec` admission are now carried through.
+- **Under explicit approval, one composition proposal is pending at a time.**
+  Each mutation in a multi-edit response used to be previewed against the same
+  unchanged state and staged as its own proposal, so accepting them in turn
+  produced stale or contradictory pipelines. A response carrying more than one
+  mutation is now refused whole (`approval_batch_not_atomic`), and a mutation
+  is refused while a composition proposal is pending
+  (`approval_proposal_pending`); both refusals tell the model what to do next.
+  This contains the defect and does not redesign it: auto-commit sessions and
+  blob-only proposals are not covered.
+- **`diff_pipeline` answers in freeform sessions.** It compares the current
+  state with the state at the start of the request, and says so when held
+  proposals are not included. Asked one turn after an edit it reports no
+  change; the intended baseline is still to be decided.
+- **Transforms can be spliced into planner-built pipelines.** Splicing no
+  longer requires visual edges that planner-built pipelines do not carry.
+- **Removing an output removes its edges.**
+- **An oversized blob read is reported as a size refusal.** It was reported
+  as a credential problem. The new code is `blob_content_size_limit`.
+- **Malformed blob references are refused at proposal admission**
+  (`proposal_blob_reference_malformed`), and a pending option change keeps the
+  blobs it depends on.
+- **A pending proposal's tool result states the next action.**
+- **JSON preview warnings and record-count evidence are admitted** by the
+  preview response contract instead of failing it.
+- **A Chroma client-mode configuration with a null persistence directory is
+  admitted** without bypassing path confinement.
+- **Recovery tools are recognised in persisted planner receipts.**
+- **Composer skill text corrected.** Contradictory and stale instructions were
+  removed or rewritten in place. The text was not restructured; about
+  a third of what the proposal planner receives still describes tools it does
+  not have.
+
+- **The gate-preview mismatch diagnostic names the actual failure.** It
+  reports a misspelt field, a short row, a zero divisor or a bad function
+  argument as such, instead of always advising a numeric source-schema type,
+  and the preview no longer samples a CSV row cut short by its 8 KiB byte
+  limit. Known and deferred: the preview keys sampled rows by the raw CSV
+  header where the runtime uses normalised names; the repair text now says so
+  and tells the model not to rename the field.
+- **Prompt review wording.** The Composer skill now says the server raises
+  every prompt review card, in place of wording that read as though prompts
+  go unreviewed.
+
+### Web interface
+
+- **The tutorial's audit step explains its LLM call count**, which includes
+  one reachability check made before the run starts.
+
+- **The ARGOnite skin.** The web interface takes the ARGOnite look in light
+  and dark themes, with a high-contrast palette built on the same hues.
+- **Header pills share one height**, the model chips included.
+- **The conversation runs the full height of the window.** The control that
+  hides and shows it now sits beside "Share inspect link".
+- **Selection is gold.** A selected node and a selected edge use one colour,
+  distinct from the keyboard focus colour.
+- Known and deferred: between workspace widths of 960 and 1041 px the pipeline
+  card is narrower than its 640 px target.
+- **The share dialog closes when the active session changes.** It stayed bound
+  to the session it was opened for, so after back/forward or a session switch
+  it could make a link for a pipeline the owner was no longer looking at.
+- **The share dialog says what an import-enabled link grants.** The success
+  text said read-only access even when the recipient could import an editable
+  copy with copies of the listed files.
+
+### LLM gateway
+
+- **Thinking from an adapter that does not declare `REASONING` is refused.**
+  The gateway returned it with a 200, then refused the caller's next turn when
+  that thinking was sent back. The response is now refused as upstream-invalid
+  on the first turn. The reference adapter declares `REASONING` and is
+  unaffected; an operator adapter with this defect will now fail earlier.
+
+### Plugins
+
+- **`file_inject` transform.** Writes the content of whole files, bound as
+  configuration, into row fields. The content is part of node identity, so
+  editing a bound file between a run and its resume refuses the resume. It is
+  in the default web plugin set. In the Composer its content must be a file the
+  user uploaded: content written by the planner is refused. A shipped example
+  is in `examples/file_inject/`.
+
+### MCP server
+
+- **File paths are confined to the configured data directory.** File paths
+  authored over MCP are resolved against the configured data directory and a
+  path outside it is refused at admission, including the explicit-null case
+  that previously bypassed the check.
+- **The standalone MCP server owns its process lifecycle.** The installed CLI
+  runs the server under a private supervisor that keeps custody of the child
+  process, so shutdown, a failed start, loss of the control channel and the
+  death of the parent all settle the child instead of leaving it running.
+  Work started during preflight is retained and settled through shutdown.
+  The supervisor uses the same portable path on every platform; it has been
+  exercised on Linux only.
+
+### Landscape
+
+- **Creating Landscape tables on PostgreSQL no longer breaks a later SQLite
+  initialization in the same process.** PostgreSQL table creation left
+  transient constraint rules on the shared schema metadata, which suppressed
+  inline foreign keys when a SQLite Landscape was created afterwards. Table
+  creation is now serialized and restores the original rules, including when
+  the DDL fails.
+
+### Upgrade notes
+
+- An MCP client that authors a file path outside the configured data
+  directory is now refused. Move the file under the data
+  directory or change the configured root.
+- A pending approval for a change that is now known to be refused or to be a
+  no-op settles as terminal instead of remaining pending.
+- Under explicit approval a model response with several mutations is refused
+  and the model is asked to send one. Sessions that relied on several
+  proposals being staged from one response will see one proposal per turn.
+- New refusal codes a client may receive: `approval_batch_not_atomic`,
+  `approval_proposal_pending`, `blob_content_size_limit`,
+  `proposal_blob_reference_malformed`.
+- No schema epoch changed. Existing session and Landscape stores load
+  unchanged. Session epoch 78 and Landscape epoch 50 are unchanged from the
+  previous release; this release adds no schema-epoch cutover. Existing 0.8.10 session and
+  Landscape stores need no action, and the 0.8.10 cutover guidance below
+  continues to apply to older stores. This authorizes no migration, reset,
+  restamping or downgrade.
+
+### Publication and acceptance
+
+Automatic image publication from main remains held. The 0.8.12 tag and
+container publication follow successful required checks and the protected
+merge. Operator signing, live-provider acceptance and deployment remain
+separate steps.
+
+---
+
+## 0.8.11 - 2026-11-10
 
 This section records changes on the 0.8.11 candidate. It does not establish
 qualification, a published tag or an image.

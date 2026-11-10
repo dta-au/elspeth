@@ -92,6 +92,8 @@ files:
     dict[str, Any]: 18
   src/elspeth/contracts/preflight.py:
     Mapping[str, Any]: 1
+  src/elspeth/contracts/process_watchdog_wire.py:
+    dict[str, object]: 2
   src/elspeth/contracts/prompt_guard.py:
     Mapping[str, Any]: 5
     dict[str, Any]: 3
@@ -1031,8 +1033,6 @@ files:
     Mapping[str, object]: 1
     dict[str, object]: 3
   src/elspeth/web/preferences/service.py:
-    dict[str, object]: 2
-  src/elspeth/web/process_watchdog_codec.py:
     dict[str, object]: 2
   src/elspeth/web/provider_config_policy.py:
     Mapping[str, Any]: 4

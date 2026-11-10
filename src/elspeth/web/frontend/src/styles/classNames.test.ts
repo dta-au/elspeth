@@ -260,10 +260,6 @@ const RULE_LESS_BY_DESIGN: Record<string, string> = {
   "shared-inspect-banner":
     "Treatment carried by the inline BANNER_STYLE constant, same " +
     "lift-and-shift deferral as shared-inspect-view (elspeth-2ff1b0b4ad).",
-  "side-rail-execute-reason--advisory":
-    "Deliberate no-op modifier: sidebar.css documents that it exists for " +
-    "future differentiation and intentionally shares the defined base rule " +
-    "today (no colour-only signal).",
   "pipeline-validation-summary--neutral":
     "Tone modifier whose siblings only tint a glyph descendant; the neutral " +
     "branch renders no glyph, so there is nothing for a rule to tint. Base " +

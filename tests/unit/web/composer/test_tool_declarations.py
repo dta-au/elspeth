@@ -584,7 +584,7 @@ class TestStep3DiscoveryTierMigration:
     def test_diff_pipeline(self) -> None:
         assert self._get("diff_pipeline") == {
             "name": "diff_pipeline",
-            "description": "Compare the current pipeline with the baseline supplied by this surface, which may be the request-start state. "
+            "description": "Compare with this surface's baseline (Web Composer: request-start state, fixed across provider rounds). "
             "On success `data` carries `from_version` (the baseline; the version it "
             "changed TO is the envelope's own `version`), `sources_changed`, "
             "`metadata_changed`, `total_changes`, `warnings_introduced`, "

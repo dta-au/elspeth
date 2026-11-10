@@ -1118,7 +1118,10 @@ describe("ChatInput keyboard hint in the composition row (elspeth-1b7227936c)", 
     expect(rowRule).toMatch(/min-height:\s*calc\([^;]*var\(--size-control\)/s);
     const hintRule = css.match(/\n\.chat-input-hint\s*\{([^}]*)\}/s)?.[1];
     expect(hintRule).toMatch(/position:\s*absolute/);
-    expect(hintRule).toMatch(/right:\s*0/);
+    // The row is the composer well (padding --space-sm): Send sits inside
+    // that padding, so the hint takes the same inset to share Send's right
+    // edge (pinned as a rendered fact by expectComposerInputGeometry).
+    expect(hintRule).toMatch(/right:\s*var\(--space-sm\)/);
     expect(hintRule).toMatch(/bottom:\s*calc\(var\(--size-control\)/);
     // Still carries its own-line basis for the regimes that put it back in
     // flow (below); inert while positioned.
@@ -1316,5 +1319,53 @@ describe("ChatInput overflow glyph (elspeth-b720e0b932)", () => {
     const rule = css.match(/\.chat-input-icon\s*\{([^}]*)\}/s)?.[1];
     expect(rule).toMatch(/stroke:\s*currentColor/);
     expect(rule).toMatch(/fill:\s*none/);
+  });
+});
+
+describe("ChatInput composer well CSS (ARGOnite Task 8)", () => {
+  const css = readFileSync("src/components/chat/chat.css", "utf8");
+  const rule = (selector: string): string => {
+    const escaped = selector.replace(/[.:()-]/g, "\\$&");
+    return css.match(new RegExp(`\\n${escaped}\\s*\\{([^}]*)\\}`, "s"))?.[1] ?? "";
+  };
+
+  it("makes the row a recessed card well", () => {
+    const row = rule(".chat-input-row");
+    expect(row).toMatch(/border-radius:\s*var\(--radius-card\)/);
+    expect(row).toMatch(/background-color:\s*var\(--color-surface-input\)/);
+    expect(row).toMatch(/box-shadow:\s*var\(--shadow-track\)/);
+    expect(row).toMatch(/border:\s*1px solid var\(--color-input-border\)/);
+  });
+
+  it("strips the textarea's own border and background", () => {
+    const textarea = rule(".chat-input-textarea");
+    expect(textarea).toMatch(/border:\s*none/);
+    expect(textarea).toMatch(/background-color:\s*transparent/);
+  });
+
+  it("moves the keyboard focus indication onto the well", () => {
+    expect(css).toMatch(
+      /\.chat-input-row:has\(\.chat-input-textarea:focus-visible\)\s*\{[^}]*outline:\s*2px solid var\(--color-focus-ring\)/s,
+    );
+    // Buttons inside the well must not light it (double ring, mouse clicks).
+    expect(css).not.toMatch(/\.chat-input-row:focus-within/);
+  });
+
+  it("puts the focus ring back on the textarea where :has() is unsupported", () => {
+    // The textarea's own outline is removed, so an engine that cannot match
+    // the :has() rule above would show no keyboard focus at all.
+    const removal = css.indexOf("\n.chat-input-textarea:focus-visible {");
+    const fallback = css.match(
+      /@supports not selector\(:has\(\*\)\)\s*\{\s*\.chat-input-textarea:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-focus-ring\)/s,
+    );
+    expect(removal).toBeGreaterThan(-1);
+    expect(fallback).not.toBeNull();
+    // Equal specificity: the fallback only wins if it comes later.
+    expect(fallback?.index ?? -1).toBeGreaterThan(removal);
+  });
+
+  it("rounds the icon buttons into circles and the send button into a pill", () => {
+    expect(rule(".chat-input-icon-btn")).toMatch(/border-radius:\s*var\(--radius-pill\)/);
+    expect(rule(".chat-input-send-btn")).toMatch(/border-radius:\s*var\(--radius-pill\)/);
   });
 });

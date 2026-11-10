@@ -19,7 +19,7 @@
 // ============================================================================
 
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef, type ButtonHTMLAttributes, type ReactNode } from "react";
 
@@ -871,6 +871,26 @@ describe("TutorialTurn4Run", () => {
     );
     expect(screen.getByRole("button", { name: "Run" })).toBeInTheDocument();
     expect(await axe(container)).toHaveNoViolations();
+  });
+
+  it("titles the run step's authoring pane for what it holds, not 'Conversation'", () => {
+    // ARGOnite: ComposerWorkspace's authoring pane carries a title bar. On the
+    // run turn the pane holds the run preamble, notices and results — no
+    // conversation — so the frame threads a run-specific title through.
+    render(
+      <TutorialTurn4Run
+        sessionId="sess-a11y-run-title"
+        onCompleted={() => {}}
+        onCancelled={() => {}}
+      />,
+    );
+    const pane = screen.getByRole("region", { name: "Authoring pane" });
+    expect(
+      within(pane).getByRole("heading", { level: 2, name: "Run results" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Conversation" }),
+    ).not.toBeInTheDocument();
   });
 
   it("has no axe violations while the run is executing", async () => {
