@@ -450,7 +450,10 @@ export function ArtifactWorkspaceSurface({
     }
     tabRefs.current[pending]?.focus({ preventScroll: true });
     pendingTabFocusRef.current = null;
-  }, [activeArtifactTab, state.artifactVisible]);
+    // No dependency list: a request for the tab that is already active (and
+    // visible) changes neither dependency, so it must be consumed on the
+    // commit that re-attaches the tab refs, whatever else changed.
+  });
 
   useLayoutEffect(() => {
     const previousActiveTab = previousActiveTabRef.current;
