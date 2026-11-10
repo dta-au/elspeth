@@ -6,7 +6,8 @@ owner of check ordering and ledger mutation.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Mapping
+import re
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Literal, cast
@@ -14,7 +15,7 @@ from uuid import UUID
 
 import yaml
 
-from elspeth.contracts.blobs import AllowedMimeType, BlobNotFoundError, BlobRecord, BlobStateError
+from elspeth.contracts.blobs import AllowedMimeType, BlobCreator, BlobNotFoundError, BlobRecord, BlobStateError
 from elspeth.contracts.blobs_inline import (
     BlobContentResolutionError,
     BlobInlineRef,
@@ -216,8 +217,37 @@ FILE_INJECT_CONTENT_OPTION_ROOT: Final = "files"
 FILE_INJECT_DEFAULT_CONTENT_OPTION: Final = "default_content"
 #: The marker the authoring tools accept, as the planner is taught to write it.
 FILE_INJECT_UPLOAD_MARKER_SHAPE: Final = '{"blob_ref": "<blob_id>", "mode": "inline_content", "sha256": "<content_hash>"}'
+#: The creator the upload route records. Assistant- and pipeline-created blobs
+#: can also be VERBATIM, so a creation modality alone does not mean "uploaded".
+USER_BLOB_CREATOR: Final[BlobCreator] = "user"
 
-FileInjectRefusalCause = Literal["llm_authored_blob", "literal_content", "default_content"]
+FileInjectRefusalCause = Literal["not_user_uploaded_blob", "literal_content", "default_content", "unaddressable_entry"]
+#: One option-key segment of an inline-reference field path, as ``BlobInlineRef``
+#: validates it. An entry whose name is not such a segment cannot be named by
+#: ``wire_blob_inline_ref``, and a marker beneath it cannot be resolved.
+_INLINE_REF_PATH_SEGMENT: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+_ENTRY_NAME_RULE: Final = "in the composer an entry name must start with a letter or '_' and contain only letters, digits, '_' and '-'"
+
+
+def is_user_uploaded_blob(*, created_by: str, creation_modality: CreationModality) -> bool:
+    """Whether a blob is a file the user uploaded: created by the user and not LLM-authored.
+
+    Creator and modality are read as a pair, as the share freeze reads them
+    (``shareable_reviews.service._check_shareable_blob``): a blob the composer
+    created from text in the user's message, a pipeline output and a session-fork
+    copy of either all record ``VERBATIM`` without being an upload. A fork copy
+    keeps its source's creator, so a copied upload is still an upload.
+    """
+    return created_by == USER_BLOB_CREATOR and not is_llm_authored_creation_modality(creation_modality)
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimePluginNode:
+    """One plugin node of a runtime config dict: its name, plugin, and options as found (``None`` when absent)."""
+
+    name: str
+    plugin: str
+    options: object
 
 
 @trust_boundary(
@@ -226,14 +256,14 @@ FileInjectRefusalCause = Literal["llm_authored_blob", "literal_content", "defaul
     source_param="config",
     suppresses=(),
     invariant=(
-        "returns the name-to-plugin map of every well-formed node entry and skips any section, node, name or "
-        "plugin of another shape; never raises on config and never coerces a value"
+        "returns every node entry that is a dict with a string name and a string plugin and skips any section or "
+        "node of another shape; never raises on config and never coerces a value"
     ),
     non_raising=True,
 )
-def runtime_config_node_plugins(config: Mapping[str, object]) -> dict[str, str]:
-    """Node name to plugin for a runtime config dict, over the sections ``_discover_blob_content_refs`` walks."""
-    node_plugins: dict[str, str] = {}
+def _runtime_config_plugin_nodes(config: Mapping[str, object]) -> list[_RuntimePluginNode]:
+    """Every well-formed plugin node, over the sections ``_discover_blob_content_refs`` walks."""
+    found: list[_RuntimePluginNode] = []
     for collection_key in _NODE_COLLECTION_KEYS:
         if collection_key not in config:
             continue
@@ -249,18 +279,36 @@ def runtime_config_node_plugins(config: Mapping[str, object]) -> dict[str, str]:
             name = node_dict["name"]
             plugin = node_dict["plugin"]
             if type(name) is str and type(plugin) is str:
-                node_plugins[name] = plugin
-    return node_plugins
+                found.append(_RuntimePluginNode(name, plugin, node_dict["options"] if "options" in node_dict else None))
+    return found
+
+
+@trust_boundary(
+    tier=3,
+    source="runtime pipeline config dict generated from web/LLM-authored composition state",
+    source_param="config",
+    suppresses=(),
+    invariant=(
+        "returns the name-to-plugin map of every well-formed node entry and skips any section, node, name or "
+        "plugin of another shape; never raises on config and never coerces a value"
+    ),
+    non_raising=True,
+)
+def runtime_config_node_plugins(config: Mapping[str, object]) -> dict[str, str]:
+    """Node name to plugin for a runtime config dict."""
+    return {node.name: node.plugin for node in _runtime_config_plugin_nodes(config)}
 
 
 def guarded_inline_surface_field(field_path: str, *, node_plugins: Mapping[str, str]) -> tuple[str, str, str] | None:
-    """Return ``(node_name, option_path, plugin)`` when an inline-ref path is in the guarded domain.
+    """Return ``(node_name, option_path, plugin)`` when an inline-ref path is in a guarded domain.
 
-    The one definition of where an LLM-authored blob may not be bound, shared
-    by the authoring tools, /validate and run admission:
+    The one definition of where a blob binding is judged, shared by the
+    authoring tools, /validate and run admission:
 
-    * on an ``llm`` node, a prompt surface or the model (``llm_prompt_surface_field``);
-    * on a ``file_inject`` node, anything at or beneath ``files``, whose content
+    * on an ``llm`` node, a prompt surface or the model (``llm_prompt_surface_field``),
+      which admits no LLM-authored blob (``is_llm_authored_prompt_surface_binding``);
+    * on a ``file_inject`` node, anything at or beneath ``files``, which admits
+      only a file the user uploaded (``file_inject_blob_refusal``): its content
       is written into row data and can reach a prompt that no review reads.
 
     ``node_plugins`` maps node name to plugin, built by each caller from the
@@ -286,19 +334,19 @@ def is_llm_authored_prompt_surface_binding(
     node_plugins: Mapping[str, str],
     creation_modality: CreationModality,
 ) -> bool:
-    """Whether binding a blob of ``creation_modality`` at ``field_path`` is refused.
+    """Whether binding a blob of ``creation_modality`` at an ``llm`` node's ``field_path`` is refused.
 
     ADR-034 admits ``inline_content`` markers in prompt fields so a USER-uploaded
     prompt artifact can back an ``llm`` node. The ``llm_prompt_template`` and
     ``llm_model_choice`` reviews read those options as strings, and the run
     substitutes blob bytes afterwards, so an LLM-authored blob there would become
     the executed prompt or model with no operator review. Only user-verbatim blob
-    content may stand in for that text. ``file_inject`` content has the same
-    route to a prompt and no review at all, so its ``files`` are guarded too.
+    content may stand in for that text. The rule is modality-only and covers
+    ``llm`` nodes only; ``file_inject`` has its own, stricter rule
+    (``file_inject_blob_refusal``).
     """
-    return guarded_inline_surface_field(field_path, node_plugins=node_plugins) is not None and is_llm_authored_creation_modality(
-        creation_modality
-    )
+    surface = guarded_inline_surface_field(field_path, node_plugins=node_plugins)
+    return surface is not None and surface[2] == "llm" and is_llm_authored_creation_modality(creation_modality)
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,49 +354,83 @@ class FileInjectContentRefusal:
     """One reason a ``file_inject`` node is refused in the composer.
 
     In the composer the only value accepted at ``files.<entry>.content`` is an
-    ``inline_content`` marker for a user-uploaded blob, and ``default_content``
-    is not accepted in any form: both are written into row data, can reach an
-    LLM prompt, and have no review. A settings file run from the CLI is not
-    judged by this; its author wrote it.
+    ``inline_content`` marker for a file the user uploaded
+    (``is_user_uploaded_blob``), and ``default_content`` is not accepted in any
+    form: both are written into row data, can reach an LLM prompt, and have no
+    review. An entry whose name an inline blob reference cannot address can
+    never hold an upload, so it is refused too. A settings file run from the
+    CLI is not judged by this; its author wrote it.
     """
 
     node_name: str
     option_path: str
     cause: FileInjectRefusalCause
     blob_id: UUID | None = None
+    #: The ``files`` entry, when the refusal was found by walking the mapping.
+    #: A name with a dot cannot be recovered from ``option_path``.
+    entry: str | None = None
 
     @property
     def field_path(self) -> str:
         return f"node:{self.node_name}.options.{self.option_path}"
 
     @property
+    def entry_name(self) -> str | None:
+        """The ``files`` entry this refusal names, or ``None`` when it names no single entry."""
+        if self.entry is not None:
+            return self.entry
+        prefix = f"{FILE_INJECT_CONTENT_OPTION_ROOT}."
+        if not self.option_path.startswith(prefix):
+            return None
+        entry_name = self.option_path.removeprefix(prefix).removesuffix(".content")
+        return entry_name if entry_name else None
+
+    @property
     def problem(self) -> str:
         """What was wrong, without the refused value."""
-        if self.cause == "llm_authored_blob":
-            return f"blob '{self.blob_id}' was created by the composer, not uploaded by the user"
+        if self.cause == "not_user_uploaded_blob":
+            return f"blob '{self.blob_id}' is not a file the user uploaded"
         if self.cause == "literal_content":
             return "it holds literal content, not an uploaded file"
+        if self.cause == "unaddressable_entry":
+            return f"an uploaded file cannot be attached to an entry named {self.entry!r}: {_ENTRY_NAME_RULE}"
         return "default_content is not accepted in the composer"
 
     @property
+    def _content_path(self) -> str:
+        entry_name = self.entry_name
+        return (
+            f"node:{self.node_name}.options.{FILE_INJECT_CONTENT_OPTION_ROOT}."
+            f"{'<entry_name>' if entry_name is None else entry_name}.content"
+        )
+
+    @property
     def repair(self) -> str:
-        """The path that works, naming this node and entry."""
+        """The path that works for the planner, naming this node and entry."""
         if self.cause == "default_content":
+            return "Use on_miss: null or on_miss: fail and handle the miss downstream."
+        if self.cause == "unaddressable_entry":
             return (
-                "Use on_miss: null or on_miss: fail and handle the miss downstream. Fallback text must be a file "
-                "the user uploaded, attached as its own files entry."
+                "Give the entry a name of that form, then attach the user's upload to it. In mode select the entry "
+                "name must equal the row's key value, so normalise the key field upstream first."
             )
-        keys = self.option_path.split(".")
-        entry_name = keys[1] if len(keys) > 1 else "<entry_name>"
-        content_path = f"node:{self.node_name}.options.{FILE_INJECT_CONTENT_OPTION_ROOT}.{entry_name}.content"
         return (
             "In the composer, file_inject content must be a file the user uploaded: "
             "(1) tell the user to save the text as a file and upload it; "
             "(2) once it is uploaded, find it with list_blobs / get_blob_metadata; "
-            f"(3) attach it: for an entry that already exists, wire_blob_inline_ref at '{content_path}'; "
+            f"(3) attach it: for an entry that already exists, wire_blob_inline_ref at '{self._content_path}'; "
             "when the call creates the node or the entry, set that entry's content to "
             f"{FILE_INJECT_UPLOAD_MARKER_SHAPE} with the blob's id and content_hash."
         )
+
+    @property
+    def repair_for_person(self) -> str:
+        """The same path, worded for a person reading a refused run or import."""
+        if self.cause == "default_content":
+            return "Remove default_content and use on_miss: null or on_miss: fail."
+        if self.cause == "unaddressable_entry":
+            return "Rename the entry to a name of that form, then attach the uploaded file to it."
+        return f"Save the text as a file, upload it in this session, then attach the upload at '{self._content_path}'."
 
 
 @trust_boundary(
@@ -358,8 +440,9 @@ class FileInjectContentRefusal:
     suppresses=(),
     invariant=(
         "parses each entry's content with is_widened_blob_ref into an owned WidenedBlobRefShape; returns a refusal "
-        "for any non-null default_content and for every content that is not an inline_content marker, and an empty "
-        "tuple for every other options shape; never raises on options"
+        "for any non-null default_content, for every entry whose name is not an inline-reference path segment and "
+        "for every content that is not an inline_content marker, and an empty tuple for every other options shape; "
+        "never raises on options"
     ),
     non_raising=True,
 )
@@ -368,9 +451,10 @@ def file_inject_option_refusals(node_name: str, options: Mapping[str, object]) -
 
     Judged on the options as authored, before blob substitution: afterwards a
     marker and a literal are both strings. ``default_content`` set to anything
-    but null is refused; so is a ``content`` that is not an ``inline_content``
-    marker. Whether a marker's blob was uploaded by the user is
-    ``file_inject_blob_refusal``, which needs the blob record.
+    but null is refused; so is an entry whose name no inline blob reference can
+    address, and a ``content`` that is not an ``inline_content`` marker. Whether
+    a marker's blob was uploaded by the user is ``file_inject_blob_refusal``,
+    which needs the blob record.
     """
     thawed = deep_thaw(options)
     refusals: list[FileInjectContentRefusal] = []
@@ -382,13 +466,17 @@ def file_inject_option_refusals(node_name: str, options: Mapping[str, object]) -
     if type(files) is not dict:
         return tuple(refusals)
     for entry_name, entry in files.items():
-        if type(entry) is not dict or "content" not in entry:
+        if type(entry) is not dict:
+            continue
+        entry_path = f"{FILE_INJECT_CONTENT_OPTION_ROOT}.{entry_name}"
+        if type(entry_name) is not str or _INLINE_REF_PATH_SEGMENT.fullmatch(entry_name) is None:
+            refusals.append(FileInjectContentRefusal(node_name, entry_path, "unaddressable_entry", entry=str(entry_name)))
+            continue
+        if "content" not in entry:
             continue
         marker = is_widened_blob_ref(entry["content"])
         if marker is None or marker.mode != "inline_content":
-            refusals.append(
-                FileInjectContentRefusal(node_name, f"{FILE_INJECT_CONTENT_OPTION_ROOT}.{entry_name}.content", "literal_content")
-            )
+            refusals.append(FileInjectContentRefusal(node_name, f"{entry_path}.content", "literal_content", entry=entry_name))
     return tuple(refusals)
 
 
@@ -397,13 +485,42 @@ def file_inject_blob_refusal(
     *,
     blob_id: UUID,
     node_plugins: Mapping[str, str],
+    created_by: str,
     creation_modality: CreationModality,
 ) -> FileInjectContentRefusal | None:
-    """The refusal for an LLM-authored blob bound at or beneath a ``file_inject`` node's ``files``."""
+    """The refusal for a blob the user did not upload, bound at or beneath a ``file_inject`` node's ``files``."""
     surface = guarded_inline_surface_field(field_path, node_plugins=node_plugins)
-    if surface is None or surface[2] != FILE_INJECT_PLUGIN or not is_llm_authored_creation_modality(creation_modality):
+    if surface is None or surface[2] != FILE_INJECT_PLUGIN:
         return None
-    return FileInjectContentRefusal(surface[0], surface[1], "llm_authored_blob", blob_id)
+    if is_user_uploaded_blob(created_by=created_by, creation_modality=creation_modality):
+        return None
+    return FileInjectContentRefusal(surface[0], surface[1], "not_user_uploaded_blob", blob_id)
+
+
+def file_inject_blob_refusals(
+    refs: Iterable[BlobInlineRef],
+    records_by_blob_id: Mapping[UUID, BlobRecord],
+    *,
+    node_plugins: Mapping[str, str],
+) -> tuple[FileInjectContentRefusal, ...]:
+    """``file_inject_blob_refusal`` for every resolved inline ref, in ref order.
+
+    ``records_by_blob_id`` holds the record already read for each ref's blob,
+    so /validate and both run-admission sites judge the record they resolved.
+    """
+    refusals: list[FileInjectContentRefusal] = []
+    for ref in refs:
+        record = records_by_blob_id[ref.blob_id]
+        refusal = file_inject_blob_refusal(
+            ref.field_path,
+            blob_id=ref.blob_id,
+            node_plugins=node_plugins,
+            created_by=record.created_by,
+            creation_modality=record.creation_modality,
+        )
+        if refusal is not None:
+            refusals.append(refusal)
+    return tuple(refusals)
 
 
 def file_inject_state_refusals(state: CompositionState) -> tuple[FileInjectContentRefusal, ...]:
@@ -434,33 +551,16 @@ def file_inject_runtime_config_refusals(config: Mapping[str, object]) -> tuple[F
     not a mapping is left to settings validation, which refuses it.
     """
     refusals: list[FileInjectContentRefusal] = []
-    for collection_key in _NODE_COLLECTION_KEYS:
-        if collection_key not in config:
-            continue
-        nodes = config[collection_key]
-        if type(nodes) is not list:
-            continue
-        for node in cast(list[object], nodes):
-            if type(node) is not dict:
-                continue
-            node_dict = cast(dict[str, object], node)
-            if "plugin" not in node_dict or node_dict["plugin"] != FILE_INJECT_PLUGIN:
-                continue
-            if "name" not in node_dict or "options" not in node_dict:
-                continue
-            name = node_dict["name"]
-            options = node_dict["options"]
-            if type(name) is str and type(options) is dict:
-                refusals.extend(file_inject_option_refusals(name, cast(dict[str, object], options)))
+    for node in _runtime_config_plugin_nodes(config):
+        if node.plugin == FILE_INJECT_PLUGIN and type(node.options) is dict:
+            refusals.extend(file_inject_option_refusals(node.name, cast(dict[str, object], node.options)))
     return tuple(refusals)
 
 
 def file_inject_admission_message(refusals: Collection[FileInjectContentRefusal]) -> str:
-    """The run-admission refusal text for one or more ``file_inject`` refusals."""
-    bound = "; ".join(f"{refusal.field_path}: {refusal.problem}" for refusal in refusals)
-    return (
-        f"{bound}. In the composer a file_inject entry admits only a user-uploaded file attached as inline content, and no default_content"
-    )
+    """The run-admission refusal text: each refused path, what was wrong, and what a person does about it."""
+    refused = " ".join(f"{refusal.field_path}: {refusal.problem}. {refusal.repair_for_person}" for refusal in refusals)
+    return f"In the composer a file_inject entry admits only a file the user uploaded, and no default_content. {refused}"
 
 
 def _file_inject_validation_error(refusal: FileInjectContentRefusal) -> ValidationError:
@@ -492,7 +592,7 @@ def _llm_authored_prompt_surface_refs(
     *,
     node_plugins: Mapping[str, str],
 ) -> list[BlobInlineRef]:
-    """Inline refs that bind an LLM-authored blob into the guarded domain.
+    """Inline refs that bind an LLM-authored blob into an ``llm`` prompt surface or model.
 
     Called only after the metadata validation found no violation, so every ref
     is well formed and its blob resolved: ``records_by_blob_id`` holds the
@@ -677,28 +777,16 @@ def materialize_validation_yaml(
                 semantic_contracts=interpretation.authored.semantic_contracts,
             )
         # Readiness parity with run admission (InlineBlobPromptSurfaceAdmissionError):
-        # the same predicate refuses an LLM-authored blob in an llm prompt surface
-        # or model, or in a file_inject node's files, here, so /validate is not
-        # ready for exactly the pipelines whose run would be refused after
-        # creation. Node names and plugins are read from the runtime config the
+        # the same predicates refuse an LLM-authored blob in an llm prompt surface
+        # or model, and a blob the user did not upload in a file_inject node's
+        # files, here, so /validate is not ready for exactly the pipelines whose
+        # run would be refused after creation. Node names and plugins are read from the runtime config the
         # refs were discovered in, as run admission reads them.
         node_plugins = runtime_config_node_plugins(config_dict)
+        file_inject_blob_refs = file_inject_blob_refusals(refs, resolved_records, node_plugins=node_plugins)
+        if file_inject_blob_refs:
+            return _file_inject_validation_failure(file_inject_blob_refs, interpretation)
         llm_authored_refs = _llm_authored_prompt_surface_refs(refs, resolved_records, node_plugins=node_plugins)
-        file_inject_blob_refusals = [
-            refusal
-            for ref in llm_authored_refs
-            if (
-                refusal := file_inject_blob_refusal(
-                    ref.field_path,
-                    blob_id=ref.blob_id,
-                    node_plugins=node_plugins,
-                    creation_modality=resolved_records[ref.blob_id].creation_modality,
-                )
-            )
-            is not None
-        ]
-        if file_inject_blob_refusals:
-            return _file_inject_validation_failure(file_inject_blob_refusals, interpretation)
         if llm_authored_refs:
             detail = "; ".join(f"{ref.field_path}: llm_authored" for ref in llm_authored_refs)
             return PhaseFailure(

@@ -272,9 +272,9 @@ _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES = 188
 # without the summary and the capability-core passage, 136,597 B with both:
 # +867 B. That is HARNESS growth: this harness renders the capability core
 # only. The upload-rule passage in pipeline_composer.md rides every production
-# planner request and is outside this measurement: +839 canonical B there
-# (815 B raw + 24 B escaping; rendered production system message 138,554 ->
-# 139,393 B with the same encoder; re-measured after the passage gained the
+# planner request and is outside this measurement: +869 canonical B there
+# (844 B raw + 25 B escaping; rendered production system message 138,554 ->
+# 139,423 B with the same encoder; re-measured after the passage gained the
 # upload marker shape and the default_content rule). Of the 867 B, the discovery-digest entry is
 # +509 B (508 B entry, 1 B list separator) and its outer JSON escaping +30 B;
 # the capability-core passage on the two modes is +322 B of system text and

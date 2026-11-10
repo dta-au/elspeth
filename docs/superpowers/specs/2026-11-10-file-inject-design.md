@@ -214,8 +214,16 @@ with an observed input field.
 
 ### Wiring
 
-The planner attaches an uploaded blob with the existing `wire_blob_inline_ref`
-tool at `node:<node_id>.options.files.<entry_name>.content`. No new tool.
+The planner attaches an uploaded blob in one of two ways, and no new tool is
+added:
+
+- for an entry that already exists, with the existing `wire_blob_inline_ref`
+  tool at `node:<node_id>.options.files.<entry_name>.content`;
+- when a call creates the node or the entry (`upsert_node`, `splice_transform`,
+  `set_pipeline`, `patch_node_options`), by setting that entry's `content` to
+  the marker `{"blob_ref": "<blob_id>", "mode": "inline_content", "sha256":
+  "<content_hash>"}` in the same call. An entry without `content` fails config
+  validation, so a node cannot be created first and wired afterwards.
 
 ### Upload-only guard
 
@@ -225,9 +233,15 @@ templates, because the prompt review reads those options as strings and would
 not see blob-substituted text. `file_inject` exists to feed prompts, so a
 planner-written blob bound to its `content` would reach a prompt unreviewed.
 
-The guarded domain is extended: a blob whose creation modality is LLM-authored
-is refused at `files.<name>.content` (and at any marker at or beneath `files`)
-on a `file_inject` node. The refusal is applied at the same three points as the
+The guarded domain is extended: only a file the user uploaded is accepted at
+`files.<name>.content` (and at any marker at or beneath `files`) on a
+`file_inject` node. A blob counts as user-uploaded only when it was created by
+the user (`created_by == "user"`) and its creation modality is not
+LLM-authored. Both are read as a pair because a blob the composer created from
+text in the user's message, a pipeline output and a session-fork copy of either
+all record a verbatim modality without being an upload; a fork copy keeps its
+source's creator, so a copied upload is still an upload. The existing `llm`
+prompt-surface guard is unchanged and stays modality-only. The refusal is applied at the same three points as the
 existing guard, through the same predicate module so the three cannot drift:
 
 1. authoring — `wire_blob_inline_ref` and the node-option tools
@@ -246,14 +260,26 @@ that carries one is refused at `/validate` and run admission. Literal `content`
 in a hand-written settings file run from the CLI is unaffected: its author wrote
 it.
 
-Every refusal, for a planner-created blob and for literal content alike, is
+Every refusal, for a blob the user did not upload and for literal content alike, is
 repairable and steers the planner to the path that works, naming the actual node
 id and entry name:
 
 1. tell the user they need to save the text as a file and upload it;
 2. once it is uploaded, find it with `list_blobs` / `get_blob_metadata`;
-3. attach it with `wire_blob_inline_ref` at
-   `node:<node_id>.options.files.<entry_name>.content`.
+3. attach it: for an entry that already exists, with `wire_blob_inline_ref` at
+   `node:<node_id>.options.files.<entry_name>.content`; when the call creates
+   the node or the entry, by putting the marker for that upload in the entry's
+   `content`.
+
+An inline blob reference addresses option keys that start with a letter or `_`
+and contain only letters, digits, `_` and `-`. An entry with any other name (a
+dot, a space, a leading digit) can never hold an upload, so in the composer such
+an entry is refused at the same points, and the refusal says to rename it. In
+`mode: select` the entry name must equal the row's key value, so a key that
+does not fit is normalised upstream.
+
+`default_content` is refused in the composer in any form, at the same points,
+and its refusal steers to `on_miss: null` or `on_miss: fail`.
 
 The wording is specific to `file_inject`. It must not suggest planner-created
 files are refused elsewhere: a planner-created source and planner-written prompt
@@ -365,13 +391,20 @@ Recorded here so the spec matches what was built.
   `{"blob_ref": "<blob_id>", "mode": "inline_content", "sha256": "<content_hash>"}`
   in the same call. No new incomplete state was added. A wrong or stale hash
   fails closed at `/validate` and at run admission.
+- **Entry names in the composer** must be inline-reference path segments
+  (`[A-Za-z_][A-Za-z0-9_-]*`). Without this refusal a marker beneath, say,
+  `"v1.2"` was stored by the authoring tools and `/validate` then raised on the
+  field path. CLI settings accept any quoted, non-empty entry name as before.
+- **"User-uploaded" is creator and modality together** (`created_by == "user"`
+  and a modality that is not LLM-authored), for `file_inject` only.
 - **`default_content` is refused in the composer** in any form (literal or
   marker), at authoring, YAML import, `/validate` and run admission: it is
   planner-authorable text written into rows on a miss. The refusal steers to
   `on_miss: null` or `on_miss: fail`. CLI settings are unaffected.
 - **YAML import** refuses literal `content` and `default_content` on a
   `file_inject` node with HTTP 400; an `inline_content` marker is left
-  untouched.
+  untouched. YAML whose entry has no `content` imports, and the upload is then
+  attached to that entry.
 - **One error code**, `file_inject_content_not_uploaded`, covers the three
   refusal causes. The pipeline planner's feedback withholds validator messages,
   so the code carries static guidance with the same working path.

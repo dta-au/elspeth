@@ -1808,14 +1808,14 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
     ),
     DirectValidationGuidance(
         "file_inject_content_not_uploaded",
-        "In the composer, file_inject content must be a file the user uploaded: a composer-created blob, literal "
-        "content and default_content are refused for this plugin. The candidate was not applied.",
+        "In the composer, file_inject content must be a file the user uploaded: anything else is refused for this "
+        "plugin, and so is default_content. The candidate was not applied.",
         "Tell the user to save the text as a file and upload it. Once it is uploaded, find it with list_blobs / "
         "get_blob_metadata and attach it: for an entry that already exists, wire_blob_inline_ref at "
         "node:<node_id>.options.files.<entry_name>.content; when the call creates the node or the entry, set that "
         'entry\'s content to {"blob_ref": "<blob_id>", "mode": "inline_content", "sha256": "<content_hash>"} with the '
         "blob's id and content_hash. Instead of default_content use on_miss: null or on_miss: fail and handle the "
-        "miss downstream.",
+        "miss downstream. An entry name must start with a letter or '_' and contain only letters, digits, '_' and '-'.",
     ),
     DirectValidationGuidance(
         "llm_retry_budget_policy",
