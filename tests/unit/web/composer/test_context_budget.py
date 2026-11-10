@@ -384,3 +384,12 @@ def test_sticky_set_is_kept_while_unshed_wire_bytes_are_over_the_ceiling_even_at
         previously_shed=frozenset({"tool:a"}),
     )
     assert d.shed_keys == ("tool:a",)
+
+
+@pytest.mark.parametrize("ratio", [float("inf"), float("-inf"), float("nan"), 0.0, -1.0])
+def test_a_ratio_that_is_not_a_finite_positive_number_is_rejected(ratio: float) -> None:
+    """An infinite ratio would estimate zero tokens for any request and switch the token ceiling off."""
+    with pytest.raises(ValueError, match="bytes_per_token must be a finite positive number"):
+        decide_context_budget(
+            policy=_policy(), content_bytes=10**9, wire_bytes=10, segments=[], bytes_per_token=ratio, previously_shed=frozenset()
+        )

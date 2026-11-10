@@ -1697,7 +1697,8 @@ class ComposerServiceImpl:
                 content_bytes=sent_split.total_bytes + omission_allowance,
                 wire_bytes=request_wire_bytes(sent_messages, sent_tools) + omission_allowance,
                 segments=segments,
-                bytes_per_token=frame.history.bytes_per_token,
+                # The ratio measured on this model's own budgeted calls, when the session has one.
+                bytes_per_token=frame.history.ratio_for(self._model),
                 previously_shed=previously_shed_keys(frame.history, recorder.llm_calls),
             )
         except ContextBudgetRefusal as refusal:
