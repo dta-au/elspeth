@@ -140,7 +140,7 @@ component; `row_union` requires an explicit `on_success` connection.
   not in scope and is rejected. `get_expression_grammar` is the full grammar
   authority. A boolean `condition` routes on exactly the labels `"true"` and
   `"false"`; each route value is a sink name, a downstream node's `input`
-  connection, or `fork`.
+  connection, `fork`, or `discard`.
   Gate expression-evaluation failures use the optional node-level `on_error`
   policy: set it to `discard`, a declared sink name, or an eligible enclosing
   bound-region closer as described above. Omit it to preserve
@@ -323,7 +323,9 @@ Source validation failures use `on_validation_failure`.
 Non-optional fields declared under `fixed`/`flexible` are guaranteed. For rows you generated,
 declare typed `fields` for what a consumer requires; you need not author
 `guaranteed_fields`. Sinks never coerce: declare sink `schema.fields` with
-the types that arrive when the output's columns are known.
+the types that arrive when the output's columns are known. A `fixed` schema
+refuses any field it does not declare; use `flexible`, or project first, when
+an upstream node adds fields.
 A downstream input type declaration validates arriving values without converting them:
 value-dependent mismatches use `on_error`; provable contradictions may be refused
 at build. Only `int` widens to `float`. Declare actual types; use `any` for created

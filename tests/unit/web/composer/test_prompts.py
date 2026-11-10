@@ -1629,8 +1629,14 @@ class TestHotPathAuthoringFacts:
         assert "Non-optional fields declared under `fixed`/`flexible` are guaranteed" in flattened
         declared = SchemaConfig.from_dict({"mode": "flexible", "fields": ["kept: str", "maybe: str?"]})
         assert declared.get_effective_guaranteed_fields() == frozenset({"kept"})
-        assert "omits or substitutes any part of the request, say so first in your reply and in `metadata.description`" in flattened
-        assert "if the missing part is the request's core operation, decline with the named gap instead" in flattened
+        # Disclosure is conditioned on a named gap: it is not a third outcome
+        # beside "repair the node, or refuse with a named gap".
+        assert (
+            "If a non-core part of the request is a named gap and you deliver the rest, say so first in your reply and in "
+            "`metadata.description`" in flattened
+        )
+        assert "if the gap is the request's core operation, decline instead" in flattened
+        assert "omits or substitutes any part of the request" not in flattened
 
 
 class TestMutationEchoOperatingContract:
