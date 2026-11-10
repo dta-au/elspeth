@@ -570,11 +570,13 @@ def _exercise_process_death_seam(
 
 @pytest.mark.skipif(os.name != "posix", reason="SIGKILL exit-code oracle is POSIX-specific")
 @pytest.mark.parametrize("seam_value", _PROCESS_DEATH_SEAMS)
+@pytest.mark.timing_sensitive
 def test_process_death_reopens_same_sink_effect_and_publishes_once(tmp_path: Path, seam_value: str) -> None:
     _exercise_process_death_seam(tmp_path, seam_value)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="SIGKILL exit-code oracle is POSIX-specific")
+@pytest.mark.timing_sensitive
 def test_single_process_profile_covers_complete_sink_effect_process_death_matrix(
     tmp_path: Path,
     request: pytest.FixtureRequest,
@@ -592,6 +594,7 @@ def test_single_process_profile_covers_complete_sink_effect_process_death_matrix
 
 @pytest.mark.skipif(os.name != "posix", reason="SIGKILL exit-code oracle is POSIX-specific")
 @pytest.mark.parametrize("seam_value", ["before_effect", "remote_commit", "after_finalize_before_response"])
+@pytest.mark.timing_sensitive
 def test_power_automate_process_death_reconciles_original_delivery(tmp_path: Path, seam_value: str) -> None:
     from tests.integration.pipeline.test_power_automate_effect_recovery import exercise_power_automate_process_death
 

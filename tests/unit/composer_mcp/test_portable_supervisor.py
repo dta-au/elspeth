@@ -94,7 +94,10 @@ def test_real_owned_completion_and_status(tmp_path, mode):
         assert (tmp_path / "unbound-refused").exists()
 
 
-@pytest.mark.parametrize("mode", ["wrong-nonce", "wrong-pid", "partial-hello", "no-handshake", "peer-flood"])
+@pytest.mark.parametrize(
+    "mode",
+    ["wrong-nonce", "wrong-pid", "partial-hello", "no-handshake", pytest.param("peer-flood", marks=pytest.mark.timing_sensitive)],
+)
 def test_authentication_and_partial_startup_fail_closed(tmp_path, mode):
     process = launch(tmp_path, mode)
     out, receipt = finish(process, tmp_path)
@@ -131,6 +134,7 @@ def test_deadline_survives_real_protocol_and_child_faults(tmp_path, mode):
         assert (tmp_path / "required-observed").exists()
 
 
+@pytest.mark.timing_sensitive
 def test_production_grace_independently_kills_stuck_loop(tmp_path):
     process = launch(tmp_path, "production-grace", speed=1)
     wait_event(process, tmp_path, "armed")
@@ -157,6 +161,7 @@ def test_catchable_parent_stop_is_channel_intent_then_exact_kill(tmp_path, mode)
         assert process.returncode != 0 and receipt["returncode"] == -signal.SIGKILL
 
 
+@pytest.mark.timing_sensitive
 @pytest.mark.parametrize(
     "mode",
     [
@@ -305,6 +310,7 @@ def test_inherited_sigchld_ignore_is_reset_before_actual_spawn(tmp_path):
     assert receipt["returncode"] == 7 and receipt["reaped"]
 
 
+@pytest.mark.timing_sensitive
 def test_healthy_child_fails_closed_when_supervisor_is_killed(tmp_path):
     process = launch(tmp_path, "supervisor-loss")
     wait_event(process, tmp_path, "ready")

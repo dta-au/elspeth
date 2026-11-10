@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
+
 from elspeth.contracts.enums import BackpressureMode, TelemetryGranularity
 from elspeth.contracts.events import RunStarted, TelemetryEvent
 from elspeth.core.events import EventBus
@@ -182,6 +184,7 @@ class TestTelemetryManagerReentrance:
         # - count>1: Re-entrance allowed but bounded
         # - count=100: Hit safety limit (would have overflowed)
 
+    @pytest.mark.timing_sensitive
     def test_reentrant_export_does_not_infinite_loop(self) -> None:
         """Verify that re-entrant exports terminate in reasonable time.
 

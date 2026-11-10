@@ -279,6 +279,7 @@ class TestNoOpLimiterProperties:
 
     @given(weight=weights)
     @settings(max_examples=30)
+    @pytest.mark.timing_sensitive
     def test_acquire_never_blocks(self, weight: int) -> None:
         """Property: NoOpLimiter.acquire() never blocks."""
         limiter = NoOpLimiter()
