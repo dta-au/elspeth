@@ -31,6 +31,7 @@ from tests.integration.web.composer.test_freeform_proposal_prevalidation import 
     _Harness,
     _harness,
     _incremental_base_state,
+    _inline_pipeline_args,
     _persisted_tool_content,
     _ScriptedLLM,
     _tool_turn,
@@ -89,15 +90,24 @@ def _assert_refused(payload: dict[str, Any], *, error_code: str, version: int) -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("second_tool", ("set_metadata", "set_pipeline"), ids=("two-incremental", "incremental-plus-set-pipeline"))
+@pytest.mark.parametrize(
+    "second_tool",
+    ("set_metadata", "set_pipeline", "set_pipeline_inline"),
+    ids=("two-incremental", "incremental-plus-set-pipeline", "incremental-plus-inline-set-pipeline"),
+)
 async def test_batch_with_two_staged_edits_is_refused_before_effects_then_one_complete_change_stages(
     tmp_path: Path, second_tool: str
 ) -> None:
     harness = _harness(tmp_path)
     state = _incremental_base_state(tmp_path)
-    second_arguments = (
-        {"patch": {"name": "second"}} if second_tool == "set_metadata" else _valid_pipeline_args(tmp_path, metadata_name="second")
-    )
+    second_arguments = {
+        "set_metadata": {"patch": {"name": "second"}},
+        "set_pipeline": _valid_pipeline_args(tmp_path, metadata_name="second"),
+        # The one call type with a pre-publication custody effect: its inline
+        # blob must not be materialised for a refused call.
+        "set_pipeline_inline": _inline_pipeline_args(tmp_path),
+    }[second_tool]
+    second_tool = "set_metadata" if second_tool == "set_metadata" else "set_pipeline"
     early_llm = _ScriptedLLM(
         _fake_llm_response(
             tool_calls=(
@@ -119,6 +129,7 @@ async def test_batch_with_two_staged_edits_is_refused_before_effects_then_one_co
     assert [call.args[0] for call in handlers.call_args_list] == ["get_pipeline_state"]
 
     assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
+    assert _count_rows(harness.engine, blobs_table) == 0
     assert refused_result.state is state
     for call_id in ("call_first", "call_second"):
         message = _assert_refused(
