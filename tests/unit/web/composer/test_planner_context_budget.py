@@ -815,14 +815,21 @@ async def test_the_escape_hatch_sheds_its_oldest_transcript_events_after_assista
     hatch_bytes = _sent_bytes(measured_hatch) + _ALLOWANCE + _TRANSCRIPT_ALLOWANCE
     # Shedding the assistant message and the two oldest events lands under the low mark; one fewer does not.
     target = hatch_bytes - _entry_saving(1, assistants[1]) - event_sizes[sheddable[0]] - event_sizes[sheddable[1]]
-    policy = _policy_shedding_to(target + 30, shed_to=0.8)
-    assert hatch_bytes / _FALLBACK_RATIO > policy.shed_above * policy.max_prompt_tokens
+    # The two calls before the hatch already shed the assistant message, and it
+    # stays shed. The hatch call sheds more only when the request with that
+    # message gone is itself over the high mark, so the high mark sits one
+    # event above the low mark: below what the transcript adds.
+    low_bytes = target + 30
+    policy = _policy_shedding_to(low_bytes, shed_above=0.8 * (low_bytes + event_sizes[sheddable[0]]) / low_bytes, shed_to=0.8)
+    assert (hatch_bytes - _entry_saving(1, assistants[1])) / _FALLBACK_RATIO > policy.shed_above * policy.max_prompt_tokens
 
     completion, recorder = await _hatch_run(tmp_path, tool_context, context, policy)
 
     hatch_request = completion.requests[2]
     hatch_call = recorder.llm_calls[2]
     _sent_matches_record(hatch_request, hatch_call)
+    for earlier_call in recorder.llm_calls[:2]:
+        assert earlier_call.context_budget is not None and earlier_call.context_budget.shed_history_indices == (1,)
     assert hatch_call.context_budget is not None
     assert hatch_call.context_budget.shed_history_indices == (1,)
     assert hatch_call.context_budget.shed_hatch_event_indices == sheddable[:2]

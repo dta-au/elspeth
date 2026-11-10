@@ -188,3 +188,113 @@ def test_segment_rejects_non_positive_saving() -> None:
         _seg(TOOL_RESULT, "tool:a", 0)
     with pytest.raises(ValueError):
         _seg(TOOL_RESULT, "tool:a", -1)
+
+
+def test_sticky_segments_are_shed_before_the_ranked_remainder() -> None:
+    # A previously shed user request outranks nothing by kind, yet it is shed
+    # first: the sticky set is kept whole before any new segment is chosen.
+    segs = [
+        _seg(USER_REQUEST, "history:0", 100),
+        _seg(TOOL_RESULT, "tool:a", 100),
+        _seg(ASSISTANT_PROSE, "history:1", 100),
+    ]
+    d = decide_context_budget(
+        policy=_policy(), request_bytes=1000, segments=segs, bytes_per_token=1.0, previously_shed=frozenset({"history:0"})
+    )
+    # 1000 - 100 (sticky) = 900 is over the high mark, so shedding continues by kind to the low mark.
+    assert d.shed_keys == ("history:0", "tool:a", "history:1")
+    assert d.estimated_tokens_after == 700
+
+
+def test_over_is_judged_on_the_size_with_the_sticky_set_already_shed() -> None:
+    # Unshed the request is far over the high mark; with the sticky set shed it
+    # sits inside the band, so nothing new is shed.
+    segs = [
+        _seg(ASSISTANT_PROSE, "history:1", 400),
+        _seg(ASSISTANT_PROSE, "history:3", 90),
+        _seg(USER_REQUEST, "history:0", 60),
+    ]
+    d = decide_context_budget(
+        policy=_policy(), request_bytes=1200, segments=segs, bytes_per_token=1.0, previously_shed=frozenset({"history:1"})
+    )
+    assert d.shed_keys == ("history:1",)
+    assert d.estimated_tokens_before == 1200 and d.estimated_tokens_after == 800
+
+
+def test_sticky_set_alone_over_the_byte_ceiling_keeps_shedding() -> None:
+    segs = [_seg(TOOL_RESULT, "tool:a", 100), _seg(TOOL_RESULT, "tool:b", 100)]
+    d = decide_context_budget(
+        policy=_policy(cap=10**9, max_bytes=500),
+        request_bytes=650,
+        segments=segs,
+        bytes_per_token=1.0,
+        previously_shed=frozenset({"tool:a"}),
+    )
+    assert d.shed_keys == ("tool:a", "tool:b")
+
+
+def _grow_session(turns: int) -> list[tuple[int, int, tuple[str, ...], tuple[str, ...]]]:
+    """Replay a growing session: 300 protected bytes; each turn adds a 60-byte request and a 90-byte reply.
+
+    Returns per turn (unshed size, size after, shed keys, newly shed keys).
+    The shed set carried to the next turn is the one this turn recorded.
+    """
+    rows: list[tuple[int, int, tuple[str, ...], tuple[str, ...]]] = []
+    carried: frozenset[str] = frozenset()
+    for turn in range(1, turns + 1):
+        segs: list[SheddableSegment] = []
+        for prior in range(turn - 1):
+            segs.append(_seg(USER_REQUEST, f"history:{2 * prior}", 60))
+            segs.append(_seg(ASSISTANT_PROSE, f"history:{2 * prior + 1}", 90))
+        full = 300 + 150 * (turn - 1)
+        d = decide_context_budget(policy=_policy(), request_bytes=full, segments=segs, bytes_per_token=1.0, previously_shed=carried)
+        newly = tuple(key for key in d.shed_keys if key not in carried)
+        rows.append((full, d.estimated_tokens_after, d.shed_keys, newly))
+        carried = frozenset(d.shed_keys)
+    return rows
+
+
+def test_growing_session_sheds_once_then_holds_the_band_until_the_kept_size_crosses_the_high_mark() -> None:
+    rows = _grow_session(10)
+    # Turns 1-4 are under the high mark.
+    assert all(shed == () for _full, _after, shed, _newly in rows[:4])
+    # Turn 5 crosses it (900 > 850) and sheds the four prior replies to reach the low mark.
+    assert rows[4] == (900, 540, ("history:1", "history:3", "history:5", "history:7"), ("history:1", "history:3", "history:5", "history:7"))
+    # Turns 6 and 7: unshed 1050 and 1200, but with the sticky set shed 690 and 840 — inside the band.
+    assert rows[5] == (1050, 690, rows[4][2], ())
+    assert rows[6] == (1200, 840, rows[4][2], ())
+    # The reply produced on turn 5 (history:9) is still sent on turn 6, and turn 6's (history:11) on turn 7.
+    assert "history:9" not in rows[5][2] and "history:11" not in rows[6][2]
+    # Turn 8: the kept size 990 crosses the high mark, so it sheds again to the low mark.
+    assert rows[7][0] == 1350 and rows[7][1] == 600
+    assert rows[7][3] == ("history:9", "history:11", "history:13", "history:0", "history:2")
+    # Turn 9 holds; turn 10 (kept 900) sheds again.
+    assert rows[8][3] == () and rows[8][1] == 750
+    assert rows[9][3] != () and rows[9][1] == 600
+
+
+def test_within_a_turn_tool_stubs_hold_the_band_between_sheds() -> None:
+    # 300 protected bytes; every call adds a tool round of 150 bytes of which
+    # stubbing saves 120. The latest round is protected, so it is no segment.
+    carried: set[str] = set()
+    newly_by_call: list[tuple[str, ...]] = []
+    after_by_call: list[int] = []
+    for call in range(1, 10):
+        segs = [_seg(TOOL_RESULT, f"tool:c{earlier}", 120) for earlier in range(1, call)]
+        full = 300 + 150 * call
+        d = decide_context_budget(
+            policy=_policy(), request_bytes=full, segments=segs, bytes_per_token=1.0, previously_shed=frozenset(carried)
+        )
+        newly_by_call.append(tuple(key for key in d.shed_keys if key not in carried))
+        after_by_call.append(d.estimated_tokens_after)
+        # Within a turn every earlier call's stubs stay stubbed.
+        assert carried <= set(d.shed_keys)
+        carried.update(d.shed_keys)
+    # Call 4 (900) is the first over the high mark: it stubs the three earlier results.
+    assert newly_by_call[:4] == [(), (), (), ("tool:c1", "tool:c2", "tool:c3")]
+    assert after_by_call[3] == 540
+    # Calls 5 and 6 stub nothing new (kept 690, 840); call 7 (kept 990) stubs again.
+    assert newly_by_call[4:6] == [(), ()]
+    assert after_by_call[4:6] == [690, 840]
+    assert newly_by_call[6] == ("tool:c4", "tool:c5", "tool:c6") and after_by_call[6] == 630
+    assert newly_by_call[7] == ()
