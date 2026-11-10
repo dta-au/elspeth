@@ -148,8 +148,14 @@ def decide_context_budget(
     segments: Sequence[SheddableSegment],
     bytes_per_token: float | None,
     previously_shed: frozenset[str],
+    held: frozenset[str] = frozenset(),
 ) -> ContextBudgetDecision:
     """Decide which segments to shed from one request, or refuse.
+
+    ``previously_shed`` are keys an earlier call shed; they follow the release
+    rule below. ``held`` are keys that must stay shed whatever the size: a
+    caller passes the tool results stubbed earlier in the current turn, which
+    stay stubbed for the rest of that turn.
 
     ``request_bytes`` is the wire size of the request as it will be sent: the
     canonical JSON of the body's ``{messages, tools}``, escaping and framing
@@ -186,17 +192,17 @@ def decide_context_budget(
     # the request with that sticky set already shed -- what would be sent if
     # nothing new were shed. Judging it on the unshed size would shed again on
     # every call once a session had crossed the high mark, pinning the request
-    # at the low mark and changing the sent prefix each time.
-    sticky: list[SheddableSegment] = []
-    if not fits_low(request_bytes):
-        sticky = [segment for segment in segments if segment.key in previously_shed]
+    # at the low mark and changing the sent prefix each time. Held keys are
+    # never restored.
+    released = fits_low(request_bytes)
+    sticky = [segment for segment in segments if segment.key in held or (segment.key in previously_shed and not released)]
     kept = request_bytes - sum(segment.saving_bytes for segment in sticky)
     over = tokens(kept) > high or kept > policy.max_request_bytes
 
     shed: list[SheddableSegment] = list(sticky)
     if over:
         remaining = sorted(
-            (segment for segment in segments if segment.key not in previously_shed),
+            (segment for segment in segments if segment.key not in previously_shed and segment.key not in held),
             key=lambda segment: _KIND_RANK[segment.kind],
         )
         after = kept

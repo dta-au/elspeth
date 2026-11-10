@@ -101,6 +101,7 @@ from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
     CONTEXT_BUDGET_TRANSCRIPT_GAP_ALLOWANCE_BYTES,
     first_history_shed_of_turn,
+    held_tool_keys,
     largest_component,
     latest_round_trip_start,
     message_bytes,
@@ -3524,6 +3525,7 @@ def _fit_planner_context_budget(
             segments=segments,
             bytes_per_token=history.ratio_for(model),
             previously_shed=previously_shed_keys(history, earlier_calls),
+            held=held_tool_keys(earlier_calls),
         )
     except ContextBudgetRefusal as refusal:
         raise _planner_context_budget_exhausted(

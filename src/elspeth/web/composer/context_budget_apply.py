@@ -145,6 +145,16 @@ def previously_shed_keys(history: ContextBudgetHistory, calls: Iterable[Composer
     return frozenset(shed)
 
 
+def held_tool_keys(calls: Iterable[ComposerLLMCall]) -> frozenset[str]:
+    """The tool results the turn's earlier ``calls`` stubbed: they stay stubbed for the rest of the turn."""
+    return frozenset(
+        f"tool:{tool_call_id}"
+        for call in calls
+        if call.context_budget is not None
+        for tool_call_id in call.context_budget.stubbed_tool_call_ids
+    )
+
+
 def first_history_shed_of_turn(record: ComposerContextBudgetRecord, earlier_calls: Iterable[ComposerLLMCall]) -> bool:
     """Whether this call's decision sheds conversation history and no earlier call of the turn did.
 
