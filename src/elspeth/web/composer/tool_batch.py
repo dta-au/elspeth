@@ -429,6 +429,7 @@ async def _approval_containment_refusal(
     *,
     sessions_service: SessionServiceProtocol,
     session_id: UUID,
+    current_state_id: str | None,
 ) -> tuple[Literal["batch", "pending"], str] | None:
     """Return ``(reason, message)`` when this batch may not stage a composition proposal.
 
@@ -445,8 +446,11 @@ async def _approval_containment_refusal(
     if staged > 1:
         return (
             "batch",
-            f"This session requires approval for pipeline changes and this response carried {staged} of them. All {staged} "
-            "were refused before any effect: nothing was applied and no proposal was recorded. Separate proposals are each "
+            # Counted by tool name, so a sibling that fails its own argument
+            # checks is included: the wording is true of every call whatever
+            # each one's own result says.
+            f"This session requires approval for pipeline changes and this response carried {staged} pipeline-change "
+            "calls. None of them was applied and no proposal was recorded. Separate proposals are each "
             "drawn against the same saved pipeline, so the user could only ever accept one of them. Submit the whole "
             "intended result as one change: a single set_pipeline call containing every edit, with no other pipeline "
             "mutation in the same response.",
@@ -459,11 +463,19 @@ async def _approval_containment_refusal(
         ]
         if pending:
             others = f" ({len(pending) - 1} more are also pending)" if len(pending) > 1 else ""
+            # Accept refuses a proposal whose recorded base is no longer the
+            # current state, so offering "accept" for one would be false.
+            base = pending[0].base_state_id
+            decision = (
+                "It can no longer be accepted because the saved pipeline changed after it was created: tell the user they "
+                "must reject it first, then ask again."
+                if base is not None and str(base) != current_state_id
+                else "Tell the user they must accept or reject the pending proposal first, then ask again."
+            )
             return (
                 "pending",
                 f"Proposal {pending[0].id} ({pending[0].tool_name}) is still awaiting the user's decision{others}. Nothing "
-                "from this call was applied and no new proposal was recorded. Do not retry or rephrase this change: tell "
-                "the user they must accept or reject the pending proposal first, then ask again.",
+                f"from this call was applied and no new proposal was recorded. Do not retry or rephrase this change. {decision}",
             )
     return None
 
@@ -1196,6 +1208,7 @@ async def run_tool_batch(
             assistant_tool_calls,
             sessions_service=turn_sessions_service,
             session_id=turn_session_uuid,
+            current_state_id=current_state_id,
         )
         if turn_sessions_service is not None
         and turn_session_uuid is not None
