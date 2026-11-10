@@ -505,11 +505,11 @@ def build_context_string(
         "schema_contract_evidence": schema_contract_evidence,
     }
     if conversation_omissions is not None:
+        if set(conversation_omissions) != {"prior_user_requests_omitted", "prior_assistant_messages_omitted"}:
+            raise ValueError("conversation_omissions must hold exactly the two non-negative omission counts")
         user_requests_omitted = conversation_omissions["prior_user_requests_omitted"]
         assistant_messages_omitted = conversation_omissions["prior_assistant_messages_omitted"]
-        if len(conversation_omissions) != 2 or any(
-            type(count) is not int or count < 0 for count in (user_requests_omitted, assistant_messages_omitted)
-        ):
+        if any(type(count) is not int or count < 0 for count in (user_requests_omitted, assistant_messages_omitted)):
             raise ValueError("conversation_omissions must hold exactly the two non-negative omission counts")
         if user_requests_omitted > 0 or assistant_messages_omitted > 0:
             context["conversation_omissions"] = {

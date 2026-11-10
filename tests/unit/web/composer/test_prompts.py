@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlMode, PluginCapability
@@ -1738,3 +1740,42 @@ class TestMutationEchoOperatingContract:
         assert "Only when that mutation omitted the echo or its echo does not cover the affected component" in flattened
         assert "Read `get_pipeline_state`" not in flattened
         assert "Read the current pipeline state" not in flattened
+
+
+class TestConversationOmissions:
+    """``build_context_string(conversation_omissions=...)`` carries only integer counts."""
+
+    def test_counts_above_zero_are_emitted_at_top_level(self) -> None:
+        context = build_context_string(
+            _empty_state(),
+            _stub_catalog(),
+            conversation_omissions={"prior_user_requests_omitted": 1, "prior_assistant_messages_omitted": 3},
+        )
+        payload = json.loads(context.split("\n", 1)[1])
+        assert payload["conversation_omissions"] == {"prior_user_requests_omitted": 1, "prior_assistant_messages_omitted": 3}
+
+    @pytest.mark.parametrize(
+        "omissions", [None, {"prior_user_requests_omitted": 0, "prior_assistant_messages_omitted": 0}], ids=["absent", "zero"]
+    )
+    def test_no_omission_leaves_the_context_unchanged(self, omissions: dict[str, int] | None) -> None:
+        baseline = build_context_string(_empty_state(), _stub_catalog())
+        assert build_context_string(_empty_state(), _stub_catalog(), conversation_omissions=omissions) == baseline
+        assert "conversation_omissions" not in baseline
+
+    @pytest.mark.parametrize(
+        "omissions",
+        [
+            {"prior_user_requests_omitted": 1},
+            {"prior_assistant_messages_omitted": 1},
+            {},
+            {"prior_user_requests_omitted": 1, "prior_assistant_messages_omitted": 1, "recap": 1},
+            {"prior_user_requests_omitted": 1, "assistant_omitted": 1},
+            {"prior_user_requests_omitted": -1, "prior_assistant_messages_omitted": 1},
+            {"prior_user_requests_omitted": True, "prior_assistant_messages_omitted": 1},
+            {"prior_user_requests_omitted": 1, "prior_assistant_messages_omitted": 1.0},
+        ],
+        ids=["missing-assistant", "missing-user", "empty", "extra-key", "wrong-key", "negative", "bool", "float"],
+    )
+    def test_malformed_omissions_raise_value_error(self, omissions: dict[str, Any]) -> None:
+        with pytest.raises(ValueError, match="conversation_omissions must hold exactly the two non-negative omission counts"):
+            build_context_string(_empty_state(), _stub_catalog(), conversation_omissions=omissions)
