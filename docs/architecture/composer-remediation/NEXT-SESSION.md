@@ -100,8 +100,14 @@ These settle items that were open below; where they differ, these win.
 - **B10, credential-shaped reasoning:** withhold the reasoning and keep the
   turn, covering Anthropic thinking blocks, with a stored record of each
   withhold and the assurance pack (F8, EV-227) updated. "Make sure the model
-  has a way out": a refusal on this path must reach the model as feedback it
-  can act on, not end the turn with no route forward.
+  has a way out", in the operator's terms: do not just block the text. Tell
+  the model plainly what was withheld or refused and why, and always leave it
+  a way to hand back to the user and say "I have no meaningful way forward"
+  with the reason. Historically the model was trapped retrying against
+  controls it could not satisfy until the turn timed out. Treat this as a
+  general requirement on every refusal the model can hit, and check for it
+  when reviewing A1 to A3: no control may leave the model without a terminal
+  "return to the user with the problem" move.
 - **B1, stringified `pipeline`:** approved. Decode at the provider boundary;
   it is Tier-3 parsing, consistent with the tiering policy.
 - **B2, `diff_pipeline` baseline:** compare against the last accepted state.
