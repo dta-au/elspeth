@@ -51,6 +51,7 @@ from elspeth.web.composer.audit_storage import (
 from elspeth.web.composer.availability import ComposerAvailability
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 from elspeth.web.composer.composer_preflight import ComposerPreflight
+from elspeth.web.composer.context_budget import ContextBudgetPolicy
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.discovery_cache import RuntimePreflightCache as _RuntimePreflightCache
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext
@@ -1205,6 +1206,12 @@ class PlanningApplication:
                     max_request_bytes=self._settings.composer_planner_max_request_bytes,
                     max_completion_tokens=self._settings.composer_planner_max_completion_tokens,
                     max_cumulative_provider_cost=self._settings.composer_planner_max_cumulative_provider_cost,
+                ),
+                context_policy=ContextBudgetPolicy(
+                    max_prompt_tokens=self._settings.composer_context_max_prompt_tokens,
+                    max_request_bytes=self._settings.composer_planner_max_request_bytes,
+                    shed_above=self._settings.composer_context_shed_above,
+                    shed_to=self._settings.composer_context_shed_to,
                 ),
                 custody_config=custody_config,
                 lifecycle=self._planner_request_lifecycle(progress),

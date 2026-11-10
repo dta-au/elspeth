@@ -60,6 +60,8 @@ from elspeth.web.composer import pipeline_planner
 from elspeth.web.composer.audit import BufferingRecorder, llm_call_audit_envelope, planner_attempt_audit_envelope
 from elspeth.web.composer.audit_storage import private_diagnostic_drafts
 from elspeth.web.composer.capability_skill import load_pipeline_capability_core
+from elspeth.web.composer.context_budget import ContextBudgetPolicy
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.pipeline_planner import (
     _FINALIZER_OWNS_NOTHING,
     _REPEAT_NOTICE,
@@ -769,6 +771,19 @@ def _budget(**overrides: object) -> PlannerBudgetPolicy:
     return PlannerBudgetPolicy(**values)  # type: ignore[arg-type]
 
 
+def _context_policy(
+    *,
+    max_prompt_tokens: int = 100_000_000,
+    max_request_bytes: int = 100_000_000,
+    shed_above: float = 0.85,
+    shed_to: float = 0.6,
+) -> ContextBudgetPolicy:
+    """A context budget far above any scripted request by default, so nothing is shed unless a test lowers it."""
+    return ContextBudgetPolicy(
+        max_prompt_tokens=max_prompt_tokens, max_request_bytes=max_request_bytes, shed_above=shed_above, shed_to=shed_to
+    )
+
+
 def _model(completion: _ScriptedCompletion, **overrides: object) -> PlannerModelConfig:
     # Scripted replies live at the physical SDK boundary in _plan, so this
     # configuration cannot bypass guard/provider admission through a callback.
@@ -871,6 +886,8 @@ async def _plan(
     policy_override: Any = None,
     retained_operation_context: pipeline_planner.RetainedOperationContext | None = None,
     turn_evidence: pipeline_planner.TurnEvidence | None = None,
+    context_policy: ContextBudgetPolicy | None = None,
+    context_budget_history: ContextBudgetHistory | None = None,
 ) -> Any:
     # Candidate validation needs the real plugin contracts.  ``tool_context``
     # remains in the test signature so the standard composer fixture proves
@@ -965,6 +982,8 @@ async def _plan(
                     rendered_skill=rendered_skill or f"{load_pipeline_capability_core()}\n\nYou are the bounded ELSPETH pipeline planner.",
                     repair_budget=repair_budget,
                     budget_policy=budget or _budget(),
+                    context_policy=context_policy or _context_policy(),
+                    context_budget_history=context_budget_history,
                     custody_config=custody,
                     lifecycle=lifecycle or _lifecycle(),
                     recorder=recorder or BufferingRecorder(),

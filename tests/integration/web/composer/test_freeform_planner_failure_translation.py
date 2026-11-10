@@ -1068,6 +1068,7 @@ def test_recompose_freeform_planner_failure_is_translated(
 _ALL_PLANNER_CODES = (
     "COMPLETION_TOKENS_EXCEEDED",
     "COMPOSITION_EXHAUSTED",
+    "CONTEXT_BUDGET_EXHAUSTED",
     "COST_CAP_EXCEEDED",
     "COST_UNAVAILABLE",
     "DECLINED",
