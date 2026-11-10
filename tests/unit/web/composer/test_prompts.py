@@ -795,7 +795,8 @@ class TestBuildSystemPrompt:
         assert "`mode: select`" in core and "`mode: all`" in core
         assert "`key_field`" in core and "`on_miss`" in core
         assert "State `format` on every entry" in core
-        assert build_system_prompt(None).count("`mode: select`") == 1
+        # Said once: the interaction skill must not carry a second copy of the passage.
+        assert " ".join(build_system_prompt(None).split()).count("For a selected `file_inject`") == 1
 
     def test_core_skill_rejects_persona_column_and_format_fabrication(self) -> None:
         """Panel-persona prose must not override inspected source facts."""
