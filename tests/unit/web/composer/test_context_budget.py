@@ -340,3 +340,43 @@ def test_a_ratio_that_is_not_a_finite_positive_number_is_rejected(ratio: float) 
     """An infinite ratio would estimate zero tokens for any request and switch the token ceiling off."""
     with pytest.raises(ValueError, match="bytes_per_token must be a finite positive number"):
         decide_context_budget(policy=_policy(), request_bytes=10**9, segments=[], bytes_per_token=ratio, previously_shed=frozenset())
+
+
+def test_held_keys_stay_shed_when_the_unshed_request_is_back_under_the_low_mark() -> None:
+    """Within a turn a stubbed tool result stays stubbed; only cross-turn history follows the release rule."""
+    segs = [_seg(TOOL_RESULT, "tool:a", 100), _seg(ASSISTANT_PROSE, "history:1", 100), _seg(TOOL_RESULT, "tool:b", 100)]
+    d = decide_context_budget(
+        policy=_policy(),
+        request_bytes=500,
+        segments=segs,
+        bytes_per_token=1.0,
+        previously_shed=frozenset({"history:1", "tool:a"}),
+        held=frozenset({"tool:a"}),
+    )
+    # 500 is under the low mark: the history message is restored, the held stub is not, nothing new is shed.
+    assert d.shed_keys == ("tool:a",)
+    assert d.estimated_tokens_after == 400
+    # Control: without the hold, the same request releases everything.
+    released = decide_context_budget(
+        policy=_policy(), request_bytes=500, segments=segs, bytes_per_token=1.0, previously_shed=frozenset({"history:1", "tool:a"})
+    )
+    assert released.shed_keys == ()
+
+
+def test_held_keys_count_as_already_shed_above_the_low_mark_and_keep_segment_order() -> None:
+    segs = [_seg(ASSISTANT_PROSE, "history:1", 100), _seg(TOOL_RESULT, "tool:a", 100), _seg(TOOL_RESULT, "tool:b", 100)]
+    d = decide_context_budget(
+        policy=_policy(),
+        request_bytes=1000,
+        segments=segs,
+        bytes_per_token=1.0,
+        previously_shed=frozenset({"history:1"}),
+        held=frozenset({"tool:a"}),
+    )
+    # 1000 - 200 = 800 is inside the band: exactly the sticky and held sets, in segment order.
+    assert d.shed_keys == ("history:1", "tool:a")
+    # A held key that matches no segment is ignored.
+    d = decide_context_budget(
+        policy=_policy(), request_bytes=500, segments=segs, bytes_per_token=1.0, previously_shed=frozenset(), held=frozenset({"tool:gone"})
+    )
+    assert d.shed_keys == ()
