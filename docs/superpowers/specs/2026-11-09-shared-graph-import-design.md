@@ -89,6 +89,10 @@ blob ids or storage paths). The dialog gains:
    source `blob_ref` bindings and widened `inline_content` markers at any depth in
    node options. For each, require the blob to be `ready` and its stored
    `content_hash` and size to match; otherwise refuse with 409 naming the file.
+   (As built: stored bytes that fail the blob service's own hash check, or are
+   missing, raise `BlobIntegrityError` / `BlobContentMissingError` and answer
+   500; the 409 mismatch is reachable only when the file changed between the
+   row check and the content read.)
 3. Copy each referenced file's bytes into the payload store (content-addressed).
 4. Write the snapshot with two new fields:
    - `import_allowed: bool`
@@ -227,7 +231,8 @@ unaffected.
 
 | When | Situation | Result |
 |---|---|---|
-| Share | Referenced file missing, not ready, or hash/size mismatch | 409 naming the file; no token |
+| Share | Referenced file missing, not ready, or changed while the share is read | 409 naming the file; no token |
+| Share | Stored bytes fail their hash check, or are missing from storage | 500; no token |
 | Share | Payload-store write fails part-way | No token; stray bytes remain (dta-au/elspeth#356) |
 | Share | Lifespan above the server maximum | 422 |
 | Import | Token tampered or expired | 401 |

@@ -640,7 +640,8 @@ into a new session of their own (ADR-022 D9).
   checked against its recorded hash and size, and stored in the payload store
   before the audit record is written. Only a ready file the user uploaded
   verbatim is accepted; a file the assistant wrote or a pipeline run produced
-  refuses the link.
+  refuses the link (409). Stored bytes that fail their hash check, or are
+  missing, fail the request with 500; no link is issued either way.
 - **Token.** HMAC-SHA256 over a canonical-JSON envelope: version, session,
   state, creation and expiry times, a random nonce, the snapshot's digest and
   the creator's identity. The key is `shareable_link_signing_key`, separate

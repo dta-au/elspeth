@@ -7,8 +7,9 @@ recovery procedure when a signing key is compromised or rotated.
 ## When to use this feature
 
 A composer user with a valid composition state can mint a **shareable
-link** that grants a different authenticated user read-only access to a
-frozen snapshot of the pipeline. The reviewer sees:
+link** that lets a different authenticated user view a frozen snapshot of
+the pipeline and, only when the owner allows it, import a copy (below). The
+reviewer sees:
 
 * The composition graph (sources, transforms, sinks), as a redacted
   public projection.
@@ -177,7 +178,8 @@ The backend:
    source's entries, transform inline-content markers) and checks each
    against its recorded hash and size. Only a ready file the user uploaded
    verbatim can travel; any other refuses the request with 409 naming the
-   file. It also records each sink output path that lies inside the owner's
+   file. Stored bytes that fail their own hash check, or are missing from
+   storage, fail the request with 500 instead. It also records each sink output path that lies inside the owner's
    session `outputs/` or `blobs/` folder.
 4. Freezes the entire snapshot (composition + YAML + readiness panel, and
    for an import link the private file and sink-path manifests) into a
@@ -267,7 +269,11 @@ backend:
    recipient's copy and re-basing each recorded sink path under the same
    folder of the recipient's session. A sink path outside the owner's session
    folders does not travel and must be set in the copy. A graph using a
-   plugin the recipient may not use is refused with 422.
+   plugin the recipient may not use is refused with 422; the body carries no
+   text, only `error_code`, `component_id` and `plugin_id`, from which the
+   import page names the component and why it is unavailable. The YAML
+   size cap and the credential check also answer 422, and the seeder's other
+   refusals answer 400 with a plain-language detail.
 5. **Records provenance** as `shared_import` in the new state's
    `composer_meta` (the snapshot digest, the sharer, and each file's copy).
 
@@ -443,10 +449,16 @@ blob.
 ### `POST /mark-ready-for-review` returns 409 naming a file
 
 The link was created with import allowed and a file the graph uses cannot
-travel: it is not ready, has no recorded hash, no longer matches its recorded
-content, was written by the assistant, or was produced by a pipeline run.
-Only files the user uploaded travel. Re-attach the file, or create a
-view-only link.
+travel: it is missing or not ready, has no recorded hash, was written by the
+assistant, or was produced by a pipeline run. Only files the user uploaded
+travel. Re-attach the file, or create a view-only link. A 409 saying the file
+"changed while preparing the share" or "does not match its recorded content"
+means it was replaced while the link was being created; retry.
+
+A file whose stored bytes no longer match their recorded hash, or whose bytes
+are missing from storage, is not a 409: the request fails with 500 and no
+link is created. That is storage corruption or loss, not something the user
+can fix by retrying; investigate the blob store.
 
 ### `POST /mark-ready-for-review` returns 422 "a shared link can last at most …"
 
@@ -497,7 +509,10 @@ The user-facing entry points landed by Phase 6B:
   controls, and edit affordances are deliberately absent. On a link that
   allows import it shows the files that come with it and **Import a copy
   into my workspace**, which navigates to the new session on success and
-  otherwise names the reason it was refused.
+  otherwise names the reason it was refused (for a plugin-policy refusal, the
+  component and why its plugin is unavailable). After a refusal a retry
+  cannot change (400, 403, 422) the button stays disabled until the page is
+  reloaded.
 * **Narrative results panel** —
   `components/composer/NarrativeResults.tsx`, conditionally rendered
   by `InlineRunResults` when `useNarrativeMode().narrativeMode` is

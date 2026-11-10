@@ -66,10 +66,11 @@
  * Import errors keep the loaded view on screen and show an inline alert:
  * capability 401 → expired, 403 with ``user_role_required`` → the account's
  * role, other 403 → the link does not allow importing, 404 → ask for a fresh
- * link, 413 → storage quota, 422 → the server's reason, 429 → wait and retry,
- * 503 → unavailable, authentication 401 → sign-in recovery, anything else →
- * generic message. The button stays disabled after a 403 or 422 (a retry
- * cannot succeed) and is re-enabled otherwise.
+ * link, 413 → storage quota, 422 → the refused component (plugin policy), the
+ * size cap or the server's reason, 400 → the seeder's reason, 429 → wait and
+ * retry, 503 → unavailable, authentication 401 → sign-in recovery, anything
+ * else → generic message. The button stays disabled after a 400, 403 or 422
+ * (a retry cannot succeed) and is re-enabled otherwise.
  */
 
 import { type JSX, useEffect, useRef, useState, type CSSProperties } from "react";
@@ -221,14 +222,71 @@ interface ImportFailure {
   final: boolean;
 }
 
+const IMPORT_REFUSED = "This pipeline can't be imported into your workspace";
+
+/** Why a plugin-policy refusal (``error_code`` on the 422) blocks the import. */
+const POLICY_REASON: Readonly<Record<string, string>> = {
+  plugin_not_enabled: "isn't enabled for your account",
+  plugin_not_installed: "isn't installed on this server",
+  plugin_unavailable: "isn't available on this server",
+  credential_unavailable: "needs a credential your account doesn't have",
+  profile_unavailable: "needs a profile that isn't available to your account",
+  plugin_not_allowed_on_web: "can't be used in the web workspace",
+};
+
+/** HTTP reason phrases ``buildApiError`` falls back to when a body carries no
+ *  text: never a reason worth showing. */
+const BARE_STATUS_TEXT = new Set(["Bad Request", "Unprocessable Entity"]);
+
+/** The server's own explanation, when the body carried one. */
+function _serverReason(exc: unknown): string | null {
+  if (!_isApiError(exc) || typeof exc.detail !== "string") return null;
+  const detail = exc.detail.trim();
+  return detail.length > 0 && !BARE_STATUS_TEXT.has(detail) ? detail : null;
+}
+
+/** Copy for a seeder refusal: a 400, or a 422 the policy and size cases do
+ *  not cover (the credential guard's, which carries its own text). */
+function _refusedWithReason(exc: unknown): string {
+  const reason = _serverReason(exc);
+  return reason === null ? IMPORT_REFUSED : `${IMPORT_REFUSED}: ${reason}`;
+}
+
+/** Copy for a 422 from the import route. Three shapes reach it:
+ *
+ *  * the plugin-policy refusal, ``{detail: {error_code, component_id,
+ *    plugin_id, snapshot_fingerprint, request_id}}`` with no text at all;
+ *  * the YAML length cap, FastAPI's validation array on ``detail``;
+ *  * the credential guard, ``{detail: {error_type, detail, ...}}``.
+ *
+ *  The recorded bodies live in ``src/test/fixtures/shared-import-refusals.json``
+ *  and the backend pins them. */
+function _import422Message(exc: unknown): string {
+  if (_isApiError(exc)) {
+    if (typeof exc.plugin_id === "string" && exc.plugin_id.length > 0) {
+      const why = (exc.error_type !== undefined ? POLICY_REASON[exc.error_type] : undefined)
+        ?? "isn't available to your account";
+      const where = typeof exc.component_id === "string" && exc.component_id.length > 0
+        ? ` (in "${exc.component_id}")`
+        : "";
+      return `This pipeline uses ${exc.plugin_id}${where}, which ${why}, so it can't be imported into your workspace.`;
+    }
+    if (exc.error_type === undefined && exc.errors !== undefined && exc.errors.length > 0) {
+      return "This pipeline is too large to import into your workspace.";
+    }
+  }
+  return _refusedWithReason(exc);
+}
+
 /** User-facing copy for a failed import, on top of the shared classifier.
  *
  *  Two different refusals answer 403: the viewer's account lacks the role
  *  every pipeline write requires (``error_type: user_role_required``), or the
- *  link is view-only. A 422 is the seeder refusing the graph for this viewer
- *  (a component their policy disallows, say): its detail says why. Neither a
- *  403 nor a 422 can succeed on retry, and each retry would build and archive
- *  a session, so the button stays disabled for them. */
+ *  link is view-only. A 422 or a 400 is the seeder refusing this graph for
+ *  this viewer (a component their policy disallows, a binding it cannot
+ *  accept, the size cap): each is decided by the snapshot and the viewer's
+ *  account, not by timing. None of these can succeed on retry, and each retry
+ *  would build and archive a session, so the button stays disabled for them. */
 function _importFailure(exc: unknown): ImportFailure {
   const classified = _classifyError(exc);
   if (classified.authentication) return { message: classified.message, final: false };
@@ -247,14 +305,10 @@ function _importFailure(exc: unknown): ImportFailure {
       return { message: classified.message, final: false };
     case 413:
       return { message: "You don't have enough storage to import these files", final: false };
+    case 400:
+      return { message: _refusedWithReason(exc), final: true };
     case 422:
-      return {
-        message:
-          _isApiError(exc) && typeof exc.detail === "string" && exc.detail.trim().length > 0
-            ? exc.detail
-            : "This pipeline can't be imported into your workspace",
-        final: true,
-      };
+      return { message: _import422Message(exc), final: true };
     case 429:
       return { message: "Too many import attempts. Wait a minute and try again.", final: false };
     case 503:

@@ -27,7 +27,9 @@ from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.yaml_importer import MAX_RUNTIME_YAML_IMPORT_CHARS
 from elspeth.web.config import WebSettings
+from elspeth.web.plugin_policy.availability import RequestPluginSnapshotFactory
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
+from elspeth.web.sessions.composer_app_services import composer_app_services
 from elspeth.web.sessions.models import blobs_table, sessions_table
 from elspeth.web.sessions.protocol import CompositionStateData, SessionNotFoundError
 from elspeth.web.shareable_reviews import importer as importer_module
@@ -44,6 +46,8 @@ _CSV_REF = b"id,region\n1,North\n"
 _DOC_B = b"first document\n"
 _DOC_C = b"second document\n"
 _INLINE_PATH = "node:lookup.options.tables.t.reference_content"
+# The import refusal bodies the frontend's tests replay through the client parser.
+_FRONTEND_REFUSAL_FIXTURE = Path(__file__).resolve().parents[4] / "src/elspeth/web/frontend/src/test/fixtures/shared-import-refusals.json"
 
 
 @dataclass
@@ -298,6 +302,27 @@ def _assert_one_session_created_and_archived(
     assert _session_ids(client, actor, _CHRIS) == listed_before
 
 
+def _assert_matches_frontend_fixture(response: Any, case: str) -> None:
+    """The refusal body is byte-for-byte the one the import page's tests replay.
+
+    ``SharedInspectView.test.tsx`` feeds each recorded body through the real
+    client parser, so a change to the server's shape fails here, naming the
+    fixture, instead of leaving the frontend tests green against a body the
+    server no longer sends. Only per-request values are normalised: the
+    request id and the plugin-snapshot fingerprint.
+    """
+    recorded = json.loads(_FRONTEND_REFUSAL_FIXTURE.read_text(encoding="utf-8"))[case]
+    body = response.json()
+    detail = body["detail"]
+    if isinstance(detail, dict):
+        for volatile in ("request_id", "snapshot_fingerprint"):
+            if volatile in detail:
+                assert isinstance(detail[volatile], str)
+                assert detail[volatile]
+                detail[volatile] = recorded["body"]["detail"][volatile]
+    assert {"status": response.status_code, "statusText": response.reason_phrase, "body": body} == recorded
+
+
 def _session_blobs(client: SyncASGITestClient, session_id: str) -> list[dict[str, Any]]:
     with client.app.state.session_engine.connect() as conn:
         rows = conn.execute(select(blobs_table).where(blobs_table.c.session_id == session_id)).mappings().all()
@@ -538,6 +563,7 @@ def test_import_oversized_yaml_is_refused_and_creates_no_session(
     response = _import(client, actor, shared.token)
 
     assert response.status_code == 422, response.text
+    _assert_matches_frontend_fixture(response, "yaml_too_large")
     assert created_sessions == []
     assert _stored_session_ids(client, _CHRIS) == stored_before
 
@@ -601,25 +627,47 @@ def test_import_copy_hash_mismatch_archives_the_new_session(
     _assert_one_session_created_and_archived(client, actor, created_sessions, listed_before=listed_before)
 
 
+class _FactoryWithout:
+    """The app's plugin snapshot factory with one plugin made unavailable.
+
+    Keeps both entry points of ``RequestPluginSnapshotFactory``: routes call
+    it with a user, and the app's composer worker calls ``for_user_id`` on
+    every scan. A bare function would serve the routes but kill the worker.
+    """
+
+    def __init__(self, wrapped: RequestPluginSnapshotFactory, removed: PluginId) -> None:
+        self._wrapped = wrapped
+        self._removed = removed
+
+    def __call__(self, user: UserIdentity) -> PluginAvailabilitySnapshot:
+        return self.for_user_id(user.user_id)
+
+    def for_user_id(self, user_id: str) -> PluginAvailabilitySnapshot:
+        snapshot = self._wrapped.for_user_id(user_id)
+        return replace(snapshot, available=snapshot.available - {self._removed})
+
+
 def test_import_seed_failure_archives_the_new_session(
     client: SyncASGITestClient, actor: _Actor, created_sessions: list[UUID], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     shared = _tom_shares(client, actor, with_rows=True)
     listed_before = _session_ids(client, actor, _CHRIS)
     created_sessions.clear()
-    original_factory = client.app.state.plugin_snapshot_factory
     blob_rows = PluginId("source", "blob_rows")
-
-    def _without_blob_rows(user: object) -> PluginAvailabilitySnapshot:
-        snapshot = original_factory(user)
-        return replace(snapshot, available=snapshot.available - {blob_rows})
-
-    monkeypatch.setattr(client.app.state, "plugin_snapshot_factory", _without_blob_rows)
+    monkeypatch.setattr(
+        client.app.state,
+        "plugin_snapshot_factory",
+        _FactoryWithout(client.app.state.plugin_snapshot_factory, blob_rows),
+    )
+    # The app's composer worker resolves the factory by principal id on every
+    # scan; a stand-in it cannot use kills the worker and drains the app.
+    assert blob_rows not in composer_app_services(client.app).plugin_snapshot_for_user_id(_CHRIS).available
 
     response = _import(client, actor, shared.token)
 
     assert response.status_code == 422, response.text
     assert response.json()["detail"]["plugin_id"] == str(blob_rows)
+    _assert_matches_frontend_fixture(response, "plugin_policy")
     _assert_one_session_created_and_archived(client, actor, created_sessions, listed_before=listed_before)
 
 

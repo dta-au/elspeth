@@ -7,6 +7,7 @@ web/ (not composer/ or execution/) to avoid cross-package coupling.
 
 from __future__ import annotations
 
+import unicodedata
 from pathlib import Path, PurePosixPath
 from typing import Final, Literal
 from uuid import UUID
@@ -168,6 +169,10 @@ def session_folder_path(data_dir: str | Path, folder: SessionFolder, *, session_
 
 # Longest session-relative path accepted anywhere one is recorded or bound.
 MAX_SESSION_RELATIVE_PATH_CHARS: Final = 1024
+# Unicode categories refused in a session-relative path: ``Cc`` (C0, DEL and
+# C1, which includes NEL U+0085), ``Zl`` (U+2028) and ``Zp`` (U+2029). Each
+# breaks a line in some log viewer or terminal.
+_LINE_BREAKING_CATEGORIES: Final = frozenset({"Cc", "Zl", "Zp"})
 
 
 def normalise_session_relative_path(value: str) -> str:
@@ -178,14 +183,15 @@ def normalise_session_relative_path(value: str) -> str:
     separator on another platform) or a NUL byte: none of these can name a
     file below a session folder. Also raises for a value longer than
     ``MAX_SESSION_RELATIVE_PATH_CHARS`` or holding any other control
-    character (C0 or DEL): such a name is persisted into state and echoed in
-    validation messages and logs, where a newline forges a line.
+    character (C0, DEL or C1) or a Unicode line or paragraph separator
+    (U+2028, U+2029): such a name is persisted into state and echoed in
+    validation messages and logs, where a line break forges a line.
     """
     if "\\" in value or "\x00" in value:
         raise ValueError("a session-relative path must not contain a backslash or NUL byte")
     if len(value) > MAX_SESSION_RELATIVE_PATH_CHARS:
         raise ValueError(f"a session-relative path must not be longer than {MAX_SESSION_RELATIVE_PATH_CHARS} characters")
-    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+    if any(unicodedata.category(char) in _LINE_BREAKING_CATEGORIES for char in value):
         raise ValueError("a session-relative path must not contain a control character")
     pure = PurePosixPath(value)
     if pure.is_absolute():

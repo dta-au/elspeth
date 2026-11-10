@@ -56,15 +56,17 @@ qualification, a published tag or an image.
   place under the recipient's new session, so the copy validates without
   setting it; a sink path outside the sharer's session folders does not travel
   and must be set in the copy, as does one longer than 1024 characters, one
-  holding a control character, or one shaped like a credential. Sinks that do
+  holding a control character (C0, DEL or C1) or a Unicode line or paragraph
+  separator, or one shaped like a credential. Sinks that do
   not write a local file are unaffected. The ordinary YAML import accepts the
   same re-basing as `sink_path_bindings`, which can only name a path inside
   the caller's own session folders and refuses those same paths. A graph using
   a plugin the recipient's policy disallows is refused with 422 and the new
   session is archived. The import page names the reason for a refusal: an
-  account without the pipeline-user role, a view-only link, the server's
-  detail for a 422, too many attempts (429) and an unavailable import (503)
-  each have their own message.
+  account without the pipeline-user role, a view-only link, a component whose
+  plugin the recipient's policy disallows (named, with why), a graph over the
+  YAML size cap, the server's detail for any other import refusal, too many
+  attempts (429) and an unavailable import (503) each have their own message.
 - **Only files the user uploaded can be shared for import.** If the graph is
   attached to a file the assistant created or a pipeline run produced, rather
   than one the user uploaded, creating an import link is refused with 409
@@ -82,7 +84,8 @@ qualification, a published tag or an image.
   process that dies mid-import can leave a half-built "Copy of …" session for
   the recipient to delete, and a deliberate retry after a network failure can
   create a second copy. The Import button is disabled while its request is in
-  flight, and stays disabled after a refusal a retry cannot change (403, 422).
+  flight, and stays disabled after a refusal a retry cannot change (400, 403,
+  422).
 - **YAML import can re-attach files to transforms and multi-file sources.**
   `POST /api/sessions/{id}/state/yaml` accepts `inline_blob_bindings`, keyed by
   component and option path, which rebuilds an inline-content file marker

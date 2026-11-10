@@ -274,11 +274,28 @@ class TestSessionFolderRelativePaths:
             pytest.param("a\tb.csv", id="tab"),
             pytest.param("a\x1bb.csv", id="escape"),
             pytest.param("a\x7fb.csv", id="delete"),
+            pytest.param("a\x85INFO fake log line.csv", id="c1-next-line"),
+            pytest.param("a\x9bb.csv", id="c1-control-sequence-introducer"),
+            pytest.param(f"a{chr(0x2028)}INFO fake log line.csv", id="line-separator"),
+            pytest.param(f"a{chr(0x2029)}INFO fake log line.csv", id="paragraph-separator"),
         ],
     )
     def test_normalise_refuses_control_characters(self, value: str) -> None:
         with pytest.raises(ValueError, match="control character"):
             normalise_session_relative_path(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("café/résumé.csv", id="latin-1-letters"),
+            pytest.param(f"{chr(0xA0)}leading-nbsp.csv", id="no-break-space"),
+            pytest.param("日本/データ.csv", id="cjk"),
+        ],
+    )
+    def test_normalise_keeps_printable_non_ascii(self, value: str) -> None:
+        # Negative control for the refusal above: the C1 range ends at U+009F,
+        # so ordinary letters just past it must still be accepted.
+        assert normalise_session_relative_path(value) == value
 
     def test_normalise_bounds_the_path_length(self) -> None:
         longest = "a" * MAX_SESSION_RELATIVE_PATH_CHARS

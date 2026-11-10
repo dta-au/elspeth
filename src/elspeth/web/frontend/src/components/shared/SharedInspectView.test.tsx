@@ -1,5 +1,7 @@
+import { readFileSync } from "node:fs";
 import type { JSX } from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { parseResponse } from "@/api/client";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useSessionStore } from "@/stores/sessionStore";
@@ -601,12 +603,8 @@ describe("SharedInspectView import", () => {
     ],
     [{ status: 404, detail: "gone" }, "ask the sender for a fresh link", true],
     [{ status: 413, detail: "quota" }, "You don't have enough storage to import these files", true],
-    [
-      { status: 422, detail: "Plugin 'llm' is not allowed for your account" },
-      "Plugin 'llm' is not allowed for your account",
-      false,
-    ],
     [{ status: 422 }, "This pipeline can't be imported into your workspace", false],
+    [{ status: 400 }, "This pipeline can't be imported into your workspace", false],
     [{ status: 429, detail: "Rate limit exceeded" }, "Too many import attempts. Wait a minute and try again.", true],
     [
       { status: 503, detail: "Importing a shared pipeline is unavailable" },
@@ -626,6 +624,84 @@ describe("SharedInspectView import", () => {
     expect(window.location.hash).toBe("#/shared/abc");
     // The loaded view stays on screen after a failed import.
     expect(screen.getByTestId("shared-inspect-loaded")).toBeInTheDocument();
+  });
+
+  // Refusal bodies recorded from the real import route. The backend test
+  // (tests/unit/web/shareable_reviews/test_importer.py) asserts the server
+  // still sends exactly these, so this replay cannot drift from the wire.
+  const REFUSALS = JSON.parse(
+    readFileSync("src/test/fixtures/shared-import-refusals.json", "utf8"),
+  ) as Record<string, { status: number; statusText: string; body: unknown }>;
+
+  /** The error the real client parser raises for a recorded response. */
+  async function parsedRefusal(
+    recorded: { status: number; statusText: string; body: unknown },
+  ): Promise<unknown> {
+    const response = new Response(JSON.stringify(recorded.body), {
+      status: recorded.status,
+      statusText: recorded.statusText,
+      headers: { "Content-Type": "application/json" },
+    });
+    try {
+      await parseResponse<unknown>(response);
+    } catch (error) {
+      return error;
+    }
+    throw new Error("expected the recorded refusal to be rejected");
+  }
+
+  async function importFailsWith(failure: unknown): Promise<HTMLElement> {
+    await renderImportable();
+    vi.spyOn(api, "importSharedSnapshot").mockRejectedValueOnce(failure);
+    await userEvent.click(screen.getByRole("button", BUTTON));
+    return screen.findByTestId("shared-inspect-import-error");
+  }
+
+  it("names the component a plugin-policy refusal is about", async () => {
+    const alert = await importFailsWith(await parsedRefusal(REFUSALS.plugin_policy));
+    expect(alert).toHaveTextContent(
+      'This pipeline uses source:blob_rows (in "docs"), which isn\'t enabled for your account, '
+        + "so it can't be imported into your workspace.",
+    );
+    expect(alert).not.toHaveTextContent("Unprocessable Entity");
+    expect(screen.getByRole("button", BUTTON)).toBeDisabled();
+  });
+
+  it("still explains a plugin-policy refusal behind a proxy that drops the status text", async () => {
+    const alert = await importFailsWith(
+      await parsedRefusal({ ...REFUSALS.plugin_policy, statusText: "" }),
+    );
+    expect(alert).toHaveTextContent("This pipeline uses source:blob_rows");
+    expect(screen.getByRole("button", BUTTON)).toBeDisabled();
+  });
+
+  it("says the pipeline is too large when the YAML cap refuses it", async () => {
+    const alert = await importFailsWith(await parsedRefusal(REFUSALS.yaml_too_large));
+    expect(alert).toHaveTextContent("This pipeline is too large to import into your workspace.");
+    expect(alert).not.toHaveTextContent("Unprocessable Entity");
+    expect(screen.getByRole("button", BUTTON)).toBeDisabled();
+  });
+
+  it("shows the seeder's reason for a 400 refusal and does not offer a retry", async () => {
+    const alert = await importFailsWith(await parsedRefusal({
+      status: 400,
+      statusText: "Bad Request",
+      body: { detail: "source_blob_rows.docs lists the same blob more than once" },
+    }));
+    expect(alert).toHaveTextContent(
+      "This pipeline can't be imported into your workspace: source_blob_rows.docs lists the same blob more than once",
+    );
+    expect(screen.getByRole("button", BUTTON)).toBeDisabled();
+  });
+
+  it("does not show a bare status text as the reason", async () => {
+    const alert = await importFailsWith(await parsedRefusal({
+      status: 422,
+      statusText: "Unprocessable Entity",
+      body: { detail: { error_type: "something_new" } },
+    }));
+    expect(alert).toHaveTextContent("This pipeline can't be imported into your workspace");
+    expect(alert).not.toHaveTextContent("Unprocessable Entity");
   });
 
   it("does not blame the link for a missing role", async () => {
