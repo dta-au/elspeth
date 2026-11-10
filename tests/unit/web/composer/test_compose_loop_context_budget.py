@@ -16,10 +16,17 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
-from elspeth.core.canonical import stable_hash
+from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.context_budget import CONTEXT_BUDGET_TOOL_RESULT_STUB
+from elspeth.web.composer.context_budget_apply import (
+    CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
+    message_bytes,
+    request_wire_bytes,
+    stubbed_tool_message,
+    tool_result_segments,
+)
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.prompts import STATE_CONTEXT_PREFIX
 from elspeth.web.composer.protocol import (
@@ -103,6 +110,7 @@ async def _compose(
     tool_data: dict[str, Any] | None = None,
     budget_history: ContextBudgetHistory | None = None,
     progress: Any = None,
+    message: str = "Build a CSV pipeline",
 ) -> Any:
     state = _empty_state()
     results = iter(range(2, 100))
@@ -124,7 +132,7 @@ async def _compose(
         patch.object(service._preflight, "cached_runtime_preflight", new_callable=AsyncMock, return_value=_passing_preflight()),
     ):
         return await service.compose(
-            "Build a CSV pipeline", history, state, session_id=session_id, context_budget_history=budget_history, progress=progress
+            message, history, state, session_id=session_id, context_budget_history=budget_history, progress=progress
         )
 
 
@@ -162,6 +170,11 @@ async def _base_request_bytes() -> int:
     split = result.llm_calls[0].request_byte_split
     assert split is not None
     return int(split.total_bytes)
+
+
+def _wire_bytes(request: dict[str, Any]) -> int:
+    """Canonical JSON bytes of the ``{messages, tools}`` a provider request carried: what the byte ceiling bounds."""
+    return len(canonical_json({"messages": request["messages"], "tools": request["tools"]}).encode("utf-8"))
 
 
 def _cap_for(base_bytes: int) -> int:
@@ -467,25 +480,30 @@ async def test_anthropic_shed_request_is_marked_hashed_recorded_and_sent_as_one(
 _MODELS = pytest.mark.parametrize("model", ["openrouter/openai/gpt-5.5", _ANTHROPIC_MODEL], ids=["unmarked", "anthropic-marked"])
 
 
-async def _measure_split_total(model: str, history: list[ComposerHistoryMessage]) -> int:
-    """The recorded byte split of a request under a generous cap: what the record and the byte guard measure."""
+async def _measure_sizes(model: str, history: list[ComposerHistoryMessage], message: str = "Build a CSV pipeline") -> tuple[int, int]:
+    """Under a generous cap: the recorded content split (the token basis) and the wire bytes sent (the byte-ceiling basis)."""
     service, session_id = _service(_GENEROUS_TOKENS, composer_model=model)
     provider = _RecordingProvider(_make_llm_response(content="Done."))
-    result = await _compose(service, session_id, history, provider)
+    result = await _compose(service, session_id, history, provider, message=message)
     split = result.llm_calls[0].request_byte_split
     assert split is not None
     assert "conversation_omissions" not in _state_context(provider.requests[0]["messages"])
-    return int(split.total_bytes)
+    return int(split.total_bytes), _wire_bytes(provider.requests[0])
 
 
 async def _compose_or_refusal(
-    model: str, history: list[ComposerHistoryMessage], *, max_prompt_tokens: int, max_request_bytes: int
+    model: str,
+    history: list[ComposerHistoryMessage],
+    *,
+    max_prompt_tokens: int,
+    max_request_bytes: int,
+    message: str = "Build a CSV pipeline",
 ) -> tuple[_RecordingProvider, Any]:
     """Compose under the given ceilings; return the provider and either the result or the refusal."""
     service, session_id = _service(max_prompt_tokens, composer_model=model, composer_planner_max_request_bytes=max_request_bytes)
     provider = _RecordingProvider(_make_llm_response(content="Done."))
     try:
-        result = await _compose(service, session_id, history, provider)
+        result = await _compose(service, session_id, history, provider, message=message)
     except ComposerConvergenceError as refusal:
         return provider, refusal
     return provider, result
@@ -506,7 +524,8 @@ async def test_a_request_within_the_re_render_margin_sheds_one_more_segment_and_
     the second reply too and the request is sent at or under the ceiling.
     """
     user_request = _user(0, "Please read the CSV file.")
-    max_request_bytes = await _measure_split_total(model, [user_request, _SECOND_REPLY]) + 10
+    _content, wire = await _measure_sizes(model, [user_request, _SECOND_REPLY])
+    max_request_bytes = wire + 10
 
     provider, result = await _compose_or_refusal(
         model, [user_request, _FIRST_REPLY, _SECOND_REPLY], max_prompt_tokens=_GENEROUS_TOKENS, max_request_bytes=max_request_bytes
@@ -516,7 +535,7 @@ async def test_a_request_within_the_re_render_margin_sheds_one_more_segment_and_
     (request,) = provider.requests
     (call,) = result.llm_calls
     _assert_record_matches_request(call, request)
-    assert call.request_byte_split is not None and call.request_byte_split.total_bytes <= max_request_bytes
+    assert _wire_bytes(request) <= max_request_bytes
     assert [m for m in request["messages"] if m["role"] == "assistant"] == []
     assert user_request["content"] in [m["content"] for m in request["messages"]]
     assert _state_context(request["messages"])["conversation_omissions"] == {
@@ -532,11 +551,12 @@ async def test_a_request_within_the_re_render_margin_sheds_one_more_segment_and_
 async def test_a_dispatched_request_never_exceeds_either_ceiling(model: str) -> None:
     """Over ceilings straddling the size after one shed, every request is sent within both ceilings or refused unsent."""
     user_request = _user(0, "Please read the CSV file.")
-    one_shed = await _measure_split_total(model, [user_request, _SECOND_REPLY])
+    # The byte ceilings straddle the wire size after one shed; the token ceilings its content size.
+    one_shed_content, one_shed_wire = await _measure_sizes(model, [user_request, _SECOND_REPLY])
     history = [user_request, _FIRST_REPLY, _SECOND_REPLY]
     deltas = (-3_000, -400, -10, 0, 10, 100, 400)
-    ceilings = [(_GENEROUS_TOKENS, one_shed + delta) for delta in deltas]
-    ceilings += [(-(-(one_shed + delta) // 3), 960 * 1024) for delta in deltas]
+    ceilings = [(_GENEROUS_TOKENS, one_shed_wire + delta) for delta in deltas]
+    ceilings += [(-(-(one_shed_content + delta) // 3), 960 * 1024) for delta in deltas]
     sent = 0
     for max_prompt_tokens, max_request_bytes in ceilings:
         provider, outcome = await _compose_or_refusal(
@@ -548,8 +568,9 @@ async def test_a_dispatched_request_never_exceeds_either_ceiling(model: str) -> 
             continue
         sent += 1
         (call,) = outcome.llm_calls
-        assert call.request_byte_split is not None
-        assert call.request_byte_split.total_bytes <= max_request_bytes, (max_prompt_tokens, max_request_bytes)
+        (request,) = provider.requests
+        # The byte ceiling holds on the bytes of the request actually sent.
+        assert _wire_bytes(request) <= max_request_bytes, (max_prompt_tokens, max_request_bytes)
         assert call.context_budget is not None
         assert call.context_budget.estimated_tokens_after <= max_prompt_tokens, (max_prompt_tokens, max_request_bytes)
     assert sent >= len(ceilings) - 2  # the two tightest ceilings may refuse; the rest are sent
@@ -589,7 +610,13 @@ async def test_the_final_byte_guard_refuses_a_request_the_decision_did_not_fit()
     wrapper grows the current message after the decision to prove the guard
     still refuses rather than sends.
     """
-    max_request_bytes = await _base_request_bytes() + 1_000
+    base_content, base_wire = await _measure_sizes("openrouter/openai/gpt-5.5", [])
+    # The growth is all quotes: 300 000 content bytes, 600 000 on the wire. The
+    # grown request's content is under the ceiling and its wire size is over,
+    # so only a guard that compares wire bytes refuses it.
+    growth = '"' * 300_000
+    max_request_bytes = base_wire + 450_000
+    assert base_content + len(growth) < max_request_bytes < base_wire + 2 * len(growth)
     service, session_id = _service(_GENEROUS_TOKENS, composer_planner_max_request_bytes=max_request_bytes)
     provider = _RecordingProvider(_make_llm_response(content="Done."))
     decide = service._shed_to_context_budget
@@ -599,7 +626,7 @@ async def test_the_final_byte_guard_refuses_a_request_the_decision_did_not_fit()
         grown = list(messages)
         current = kwargs["frame"].state_index + 1
         assert grown[current]["content"] == "Build a CSV pipeline"
-        grown[current] = {**grown[current], "content": grown[current]["content"] + "x" * 200_000}
+        grown[current] = {**grown[current], "content": grown[current]["content"] + growth}
         return grown, record, bytes_per_token
 
     with (
@@ -612,9 +639,117 @@ async def test_the_final_byte_guard_refuses_a_request_the_decision_did_not_fit()
     assert provider.requests == []
     error = exc_info.value
     assert error.reason == "context_budget_exceeded"
+    assert error.llm_calls == ()
     assert error.evidence["ceiling"] == "bytes"
-    assert error.evidence["request_bytes"] > max_request_bytes + 190_000
+    assert error.evidence["request_bytes"] == base_wire + 2 * len(growth)
     assert error.evidence["largest_component"] == "current_message"
+
+
+# --- Wire bytes against the byte ceiling; content bytes for the token estimate -----------------
+
+# Content that grows when carried as a JSON string: quotes, backslashes, a
+# JSON document nested as a string twice, and control characters.
+_ESCAPING_UNIT = '"q" \\ ' + json.dumps(json.dumps({"k": 'v"\\'})) + " \n\t\u0001\u001f "
+_ESCAPING_PROSE = _ESCAPING_UNIT * 600
+
+
+@pytest.mark.asyncio
+@_MODELS
+async def test_a_request_under_the_byte_ceiling_by_content_but_over_it_on_the_wire_is_shed(model: str) -> None:
+    user_request = _user(0, "Please read the CSV file.")
+    history = [user_request, _assistant(_ESCAPING_PROSE)]
+    full_content, full_wire = await _measure_sizes(model, history)
+    _kept_content, kept_wire = await _measure_sizes(model, [user_request])
+    max_request_bytes = full_wire - 5_000
+    # Unshed, the content measure is under the ceiling and the wire size is over it;
+    # without the reply the wire size fits with room for the re-rendered state message.
+    assert full_content < max_request_bytes < full_wire
+    assert kept_wire + 1_000 < max_request_bytes
+
+    provider, result = await _compose_or_refusal(model, history, max_prompt_tokens=_GENEROUS_TOKENS, max_request_bytes=max_request_bytes)
+
+    assert not isinstance(result, ComposerConvergenceError), result
+    (request,) = provider.requests
+    (call,) = result.llm_calls
+    assert _wire_bytes(request) <= max_request_bytes
+    assert call.context_budget is not None
+    assert call.context_budget.shed_history_indices == (1,)
+    assert [m for m in request["messages"] if m["role"] == "assistant"] == []
+    _assert_record_matches_request(call, request)
+
+
+@pytest.mark.asyncio
+@_MODELS
+async def test_protected_content_under_the_byte_ceiling_by_content_but_over_it_on_the_wire_is_refused_unsent(model: str) -> None:
+    current_message = "Build a CSV pipeline. " + _ESCAPING_PROSE
+    full_content, full_wire = await _measure_sizes(model, [], message=current_message)
+    max_request_bytes = full_wire - 5_000
+    assert full_content < max_request_bytes < full_wire
+
+    provider, refusal = await _compose_or_refusal(
+        model, [], max_prompt_tokens=_GENEROUS_TOKENS, max_request_bytes=max_request_bytes, message=current_message
+    )
+
+    assert isinstance(refusal, ComposerConvergenceError), refusal
+    assert provider.requests == []
+    assert refusal.reason == "context_budget_exceeded"
+    assert refusal.llm_calls == ()
+    assert refusal.evidence["ceiling"] == "bytes"
+    # The refusal reports the wire size, the measure the ceiling bounds.
+    assert refusal.evidence["request_bytes"] == full_wire
+    assert refusal.evidence["max_request_bytes"] == max_request_bytes
+
+
+@pytest.mark.asyncio
+async def test_the_token_estimate_is_on_content_bytes_not_wire_bytes() -> None:
+    history = [_user(0, "Please read the CSV file."), _assistant(_ESCAPING_PROSE)]
+    content, wire = await _measure_sizes("openrouter/openai/gpt-5.5", history)
+    assert wire > content + len(_ESCAPING_PROSE) // 2
+    service, session_id = _service(_GENEROUS_TOKENS)
+    provider = _RecordingProvider(_make_llm_response(content="Done."))
+
+    result = await _compose(service, session_id, history, provider)
+
+    (call,) = result.llm_calls
+    assert call.context_budget is not None
+    # Fallback ratio 3.0 over the content split plus the omission allowance the decision carries.
+    assert call.context_budget.estimated_tokens_before == -(-(content + CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES) // 3)
+
+
+_ESCAPING_CONTENTS = [
+    '"' * 500,
+    "\\" * 500,
+    json.dumps(json.dumps({"rows": ['a"b', "c\\d"] * 40})),
+    "\u0000\u0001\u001f\n\r\t" * 100,
+    _ESCAPING_PROSE,
+    "plain ascii with nothing to escape " * 20,
+    "non-ASCII \u00e9\u4e2d\U0001f600 \u2028\u2029 " * 40,
+]
+
+
+@pytest.mark.parametrize("content", _ESCAPING_CONTENTS)
+def test_a_segments_wire_saving_is_never_less_than_its_content_saving(content: str) -> None:
+    """The byte-ceiling arithmetic subtracts content savings from wire bytes; that is safe only while this holds."""
+    prefix: list[dict[str, Any]] = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    tool_round: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "t", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": content},
+    ]
+    messages = [*prefix, *tool_round]
+    segments, positions = tool_result_segments(messages, message_bytes(messages, None), start=2, stop=len(messages))
+    (segment,) = segments
+    stubbed = [stubbed_tool_message(m) if i in positions[segment.key] else m for i, m in enumerate(messages)]
+    assert request_wire_bytes(messages, None) - request_wire_bytes(stubbed, None) >= segment.saving_bytes
+
+    # Removing a history message: the content saving is the message's content bytes.
+    history = [*prefix, {"role": "assistant", "content": content}, {"role": "user", "content": "now"}]
+    content_saving = message_bytes(history, None).message_bytes[2]
+    assert content_saving == len(content.encode("utf-8"))
+    assert request_wire_bytes(history, None) - request_wire_bytes([*history[:2], history[3]], None) >= content_saving
 
 
 # --- The shed-history notice ----------------------------------------------------------------

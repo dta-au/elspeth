@@ -38,6 +38,7 @@ from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
     CONTEXT_BUDGET_TRANSCRIPT_GAP_ALLOWANCE_BYTES,
     largest_component,
+    message_bytes,
 )
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.llm_response_parsing import _hash_and_measure_request, build_llm_call_record
@@ -82,8 +83,13 @@ def _entry_saving(index: int, content: str) -> int:
 
 
 def _sent_bytes(request: dict[str, Any]) -> int:
-    """A sent request on the measure the decision and the final request byte check use."""
+    """A sent request's wire bytes: what the byte ceiling and the final request byte check bound."""
     return _planner_request_size(request["messages"], request["tools"])
+
+
+def _content_bytes(request: dict[str, Any]) -> int:
+    """A sent request's content split total: what the token estimate and the shed marks are judged on."""
+    return int(_hash_and_measure_request(request["messages"], request["tools"])[2].total_bytes)
 
 
 def _payload(request: dict[str, Any]) -> dict[str, Any]:
@@ -246,9 +252,9 @@ async def test_assistant_prose_is_shed_before_user_requests(tmp_path: Path, tool
     users_only_request, _ = await _decline(tmp_path, tool_context, _context(users=users))
     full_context = _context(users=users, assistants=assistants)
     full_request, _ = await _decline(tmp_path, tool_context, full_context)
-    users_only_bytes = _sent_bytes(users_only_request)
-    # The decision's input: the request as sent plus the omission allowance.
-    full_bytes = _sent_bytes(full_request) + _ALLOWANCE
+    users_only_bytes = _content_bytes(users_only_request)
+    # The decision's token input: the content of the request as sent plus the omission allowance.
+    full_bytes = _content_bytes(full_request) + _ALLOWANCE
     low_bytes = users_only_bytes + _ALLOWANCE + 500
     policy = _policy_shedding_to(low_bytes)
     assert full_bytes / _FALLBACK_RATIO > policy.shed_above * policy.max_prompt_tokens  # over the high mark
@@ -279,6 +285,39 @@ async def test_assistant_prose_is_shed_before_user_requests(tmp_path: Path, tool
     assert budget.policy_hash == policy.audit_hash
 
 
+# Content that grows when carried as a JSON string: quotes, backslashes, a JSON document nested as a string twice.
+_ESCAPING_PROSE = ('"q" \\ ' + json.dumps(json.dumps({"k": 'v"\\'})) + " ") * 600
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", [_ANTHROPIC, _UNMARKED], ids=["anthropic-marked", "unmarked"])
+async def test_the_token_estimate_is_on_content_bytes_and_the_byte_ceiling_on_wire_bytes(
+    tmp_path: Path, tool_context: ToolContext, model: str
+) -> None:
+    users = {0: "Build CSV to JSON."}
+    assistants = {1: _ESCAPING_PROSE}
+    context = _context(users=users, assistants=assistants)
+    full_request, full_call = await _decline(tmp_path, tool_context, context, model=model)
+    content, wire = _content_bytes(full_request), _sent_bytes(full_request)
+    assert wire > content + len(_ESCAPING_PROSE) // 2
+    # Under generous ceilings the estimate is the content split over the ratio, not the wire size over it.
+    assert full_call.context_budget is not None
+    assert full_call.context_budget.estimated_tokens_before == math.ceil((content + _ALLOWANCE) / _FALLBACK_RATIO)
+
+    # A byte ceiling between the two sizes: content fits, the wire does not, so the reply is shed.
+    cap_bytes = wire - 5_000
+    assert content + _ALLOWANCE < cap_bytes < wire
+    request, call = await _decline(tmp_path, tool_context, context, policy=_context_policy(max_request_bytes=cap_bytes), model=model)
+
+    assert _sent_bytes(request) <= cap_bytes
+    assert call.context_budget is not None
+    assert call.context_budget.shed_history_indices == (1,)
+    assert call.context_budget.estimated_tokens_before == math.ceil((content + _ALLOWANCE) / _FALLBACK_RATIO)
+    assert call.context_budget.estimated_tokens_after == math.ceil(
+        (content + _ALLOWANCE - _entry_saving(1, assistants[1])) / _FALLBACK_RATIO
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("keep", "expected_retained"), [(1, [2]), (0, [])], ids=["newest-retained", "none-retained"])
 async def test_oldest_user_requests_are_shed_last_and_counted(
@@ -287,7 +326,7 @@ async def test_oldest_user_requests_are_shed_last_and_counted(
     users = {0: "r" * 40_000, 1: "s" * 40_000, 2: "t" * 40_000}
     context = _context(users=users)
     full_request, _ = await _decline(tmp_path, tool_context, context)
-    full_bytes = _sent_bytes(full_request) + _ALLOWANCE
+    full_bytes = _content_bytes(full_request) + _ALLOWANCE
     shed_saving = sum(_entry_saving(index, text) for index, text in users.items() if index not in expected_retained)
     policy = _policy_shedding_to(full_bytes - shed_saving + 100)
     assert full_bytes / _FALLBACK_RATIO > policy.shed_above * policy.max_prompt_tokens
@@ -307,7 +346,7 @@ async def test_oldest_user_requests_are_shed_last_and_counted(
 async def test_history_shed_on_an_earlier_turn_stays_shed_between_the_marks(tmp_path: Path, tool_context: ToolContext) -> None:
     context = _context(users={0: "Build CSV to JSON."}, assistants={1: "a" * 20_000})
     full_request, _ = await _decline(tmp_path, tool_context, context)
-    full_bytes = _sent_bytes(full_request) + _ALLOWANCE
+    full_bytes = _content_bytes(full_request) + _ALLOWANCE
     ratio = 4.0
     # The full request sits at 70% of the cap: under the high mark, over the low mark.
     policy = _context_policy(max_prompt_tokens=math.ceil(full_bytes / ratio / 0.7), max_request_bytes=1_000_000)
@@ -384,7 +423,7 @@ async def test_the_escape_hatch_request_sheds_its_conversation_context_and_keeps
     assistants = {1: "a" * 40_000}
     context = _context(users={0: "Convert the data."}, assistants=assistants)
     measured_completion, measured_recorder = await _hatch_run(tmp_path, tool_context, context, None)
-    first_bytes, _, hatch_bytes = (_sent_bytes(request) + _ALLOWANCE for request in measured_completion.requests)
+    first_bytes, _, hatch_bytes = (_content_bytes(request) + _ALLOWANCE for request in measured_completion.requests)
     hatch_bytes += _TRANSCRIPT_ALLOWANCE
     saving = _entry_saving(1, assistants[1])
     policy = _policy_shedding_to(hatch_bytes - saving + 200, shed_to=0.8)
@@ -424,7 +463,7 @@ async def test_a_planner_turn_that_sheds_history_announces_it_once_before_the_fi
     assistants = {1: "a" * 40_000}
     context = _context(users={0: "Convert the data."}, assistants=assistants)
     measured_completion, _ = await _hatch_run(tmp_path, tool_context, context, None)
-    hatch_bytes = _sent_bytes(measured_completion.requests[2]) + _ALLOWANCE + _TRANSCRIPT_ALLOWANCE
+    hatch_bytes = _content_bytes(measured_completion.requests[2]) + _ALLOWANCE + _TRANSCRIPT_ALLOWANCE
     policy = _policy_shedding_to(hatch_bytes - _entry_saving(1, assistants[1]) + 200, shed_to=0.8) if sheds else None
     completion = _hatch_completion()
     # Each notice, with the number of provider calls already made when it was sent.
@@ -489,7 +528,7 @@ async def test_a_re_rendered_request_keeps_the_state_it_was_first_sent_with(tmp_
 
     measured_completion = script(_ScriptedCompletion)
     await run(measured_completion, None)
-    first_bytes, second_bytes = (_sent_bytes(request) + _ALLOWANCE for request in measured_completion.requests)
+    first_bytes, second_bytes = (_content_bytes(request) + _ALLOWANCE for request in measured_completion.requests)
     policy = _policy_shedding_to(second_bytes - _entry_saving(1, "a" * 40_000) + 200, shed_to=0.8)
     assert first_bytes / _FALLBACK_RATIO > policy.shed_above * policy.max_prompt_tokens
 
@@ -548,8 +587,8 @@ async def test_earlier_tool_results_are_stubbed_and_the_latest_round_is_intact(
     tmp_path: Path, tool_context: ToolContext, model: str
 ) -> None:
     measured_completion, _ = await _discovery_run(tmp_path, tool_context, model=model, policy=None)
-    # No conversation context, so no omission allowance.
-    totals = [_sent_bytes(request) for request in measured_completion.requests]
+    # No conversation context, so no omission allowance. The marks are judged on content bytes.
+    totals = [_content_bytes(request) for request in measured_completion.requests]
     first_result = measured_completion.requests[3]["messages"][4]
     assert first_result["role"] == "tool" and first_result["tool_call_id"] == "schema-llm"
     first_saving = len(first_result["content"].encode("utf-8")) - len(CONTEXT_BUDGET_TOOL_RESULT_STUB.encode("utf-8"))
@@ -707,10 +746,12 @@ async def test_a_dispatched_request_never_exceeds_either_ceiling(tmp_path: Path,
     assistants = {1: "a" * 20_000, 2: "b" * 5_000}
     context = _context(users={0: "Build CSV to JSON."}, assistants=assistants)
     full_request, _ = await _decline(tmp_path, tool_context, context, model=model)
+    # The byte ceilings straddle the wire size after one shed; the token ceilings its content size.
     one_shed = _sent_bytes(full_request) - _entry_saving(1, assistants[1])
+    one_shed_content = _content_bytes(full_request) - _entry_saving(1, assistants[1])
     policies = [_context_policy(max_request_bytes=one_shed + delta) for delta in (-6_000, -400, -10, 0, 10, 100, 400)]
     policies += [
-        _context_policy(max_prompt_tokens=math.ceil((one_shed + delta) / _FALLBACK_RATIO), max_request_bytes=1_000_000)
+        _context_policy(max_prompt_tokens=math.ceil((one_shed_content + delta) / _FALLBACK_RATIO), max_request_bytes=1_000_000)
         for delta in (-6_000, -400, -10, 0, 10, 100, 400)
     ]
     sent_count = 0
@@ -812,7 +853,7 @@ async def test_the_escape_hatch_sheds_its_oldest_transcript_events_after_assista
     sheddable = measured_transcript.sheddable_event_indices()
     event_sizes = measured_transcript.event_bytes()
     assert len(sheddable) >= 3
-    hatch_bytes = _sent_bytes(measured_hatch) + _ALLOWANCE + _TRANSCRIPT_ALLOWANCE
+    hatch_bytes = _content_bytes(measured_hatch) + _ALLOWANCE + _TRANSCRIPT_ALLOWANCE
     # Shedding the assistant message and the two oldest events lands under the low mark; one fewer does not.
     target = hatch_bytes - _entry_saving(1, assistants[1]) - event_sizes[sheddable[0]] - event_sizes[sheddable[1]]
     # The two calls before the hatch already shed the assistant message, and it
@@ -948,7 +989,7 @@ def _fit_hatch_request(
     ]
     if policy is None:
         # Between the marks: the request is not over the high mark, but above the low mark.
-        size = _request_size_of(messages) + _TRANSCRIPT_ALLOWANCE
+        size = _content_size_of(messages) + _TRANSCRIPT_ALLOWANCE
         policy = _context_policy(max_prompt_tokens=math.ceil(size / _FALLBACK_RATIO / 0.7), max_request_bytes=1_000_000)
         assert policy.shed_to * policy.max_prompt_tokens < size / _FALLBACK_RATIO <= policy.shed_above * policy.max_prompt_tokens
     before = deepcopy(messages)
@@ -969,6 +1010,10 @@ def _fit_hatch_request(
 
 def _request_size_of(messages: list[dict[str, Any]]) -> int:
     return _planner_request_size(detach_prompt_guard_evidence(messages).messages, [])
+
+
+def _content_size_of(messages: list[dict[str, Any]]) -> int:
+    return int(message_bytes(messages, []).total_bytes)
 
 
 def _earlier_call(shed_keys: tuple[str, ...]) -> ComposerLLMCall:

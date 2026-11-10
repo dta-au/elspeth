@@ -3436,15 +3436,16 @@ def _fit_planner_context_budget(
     exceeds a ceiling.
 
     The decision is fed the request as it will be sent and checked: cache
-    markers applied when ``mark_for_cache``, prompt-guard keys detached,
-    measured by :func:`_planner_request_size` (the measure of the final
-    ``REQUEST_BYTES_EXHAUSTED`` check), plus the omission allowance when
-    history may be shed and the transcript gap allowance when transcript
-    events may be shed. Segment savings are content bytes, never more than
-    what removing the segment saves on that measure, so a request the
-    decision admits passes the final check while anything remains sheddable.
-    Token estimates use the same measure, so they over-count the provider's
-    tokens by the request's JSON escaping.
+    markers applied when ``mark_for_cache``, prompt-guard keys detached, in
+    two sizes. The wire size is :func:`_planner_request_size` (the measure of
+    the final ``REQUEST_BYTES_EXHAUSTED`` check) and is what the byte ceiling
+    bounds. The content size is the call record's byte split, the basis the
+    stored bytes-per-token ratio is calibrated on, and gives the token
+    estimate. Both carry the omission allowance when history may be shed and
+    the transcript gap allowance when transcript events may be shed. Segment
+    savings are content bytes, never more than what removing the segment
+    saves on the wire, so a request the decision admits passes the final
+    check while anything remains sheddable.
     """
     if (hatch_transcript_index is None) != (hatch_transcript is None):
         raise FrameworkBugError("the hatch transcript and its message index are set together")
@@ -3510,12 +3511,11 @@ def _fit_planner_context_budget(
     scratch_messages, scratch_tools = apply_anthropic_cache_markers(messages, tools) if mark_for_cache else (messages, tools)
 
     try:
+        sent_tools = scratch_tools if scratch_tools is not None else tools
         decision = decide_context_budget(
             policy=policy,
-            request_bytes=_planner_request_size(
-                detach_prompt_guard_evidence(scratch_messages).messages, scratch_tools if scratch_tools is not None else tools
-            )
-            + omission_allowance,
+            content_bytes=message_bytes(scratch_messages, sent_tools).total_bytes + omission_allowance,
+            wire_bytes=_planner_request_size(detach_prompt_guard_evidence(scratch_messages).messages, sent_tools) + omission_allowance,
             segments=segments,
             bytes_per_token=history.bytes_per_token,
             previously_shed=previously_shed_keys(history, earlier_calls),
