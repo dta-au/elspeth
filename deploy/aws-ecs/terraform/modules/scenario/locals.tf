@@ -167,6 +167,7 @@ locals {
     "sink:json",
     "sink:text",
     "transform:field_mapper",
+    "transform:file_inject",
     "transform:line_explode",
     "transform:llm",
     "transform:reference_join",
