@@ -12,6 +12,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import event, select
 
+from elspeth.contracts.credential_material import DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
@@ -2678,6 +2679,35 @@ class TestGetBlobContentGuards:
         with self.engine.begin() as conn:
             conn.execute(blobs_table.update().where(blobs_table.c.id == self.blob_id).values(size_bytes=len(data), content_hash=digest))
         return digest
+
+    @pytest.mark.parametrize(("character", "extra_bytes"), [("x", 1), ("é", 1), ("x", 0)], ids=["ascii-over", "utf8-over", "at-limit"])
+    def test_content_inspection_size_limit_is_distinct_from_credentials(self, character: str, extra_bytes: int) -> None:
+        limit = DEFAULT_CREDENTIAL_TRAVERSAL_POLICY.max_string_bytes
+        content = character * (limit // len(character.encode("utf-8"))) + "x" * extra_bytes
+        assert len(content.encode("utf-8")) == limit + extra_bytes
+        self._replace_content(content)
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            result = execute_tool(
+                "get_blob_content",
+                {"blob_id": self.blob_id},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+        if extra_bytes:
+            assert not result.success
+            assert result.data is None
+            assert result.validation.errors[0].error_code == "blob_content_size_limit"
+            assert f"{limit}-byte" in result.validation.errors[0].message
+            assert "inspection limit" in result.validation.errors[0].message
+        else:
+            assert result.success, result
+            assert result.data["content"]
+            assert result.data["start_char"] == 0
 
     @pytest.mark.parametrize(
         "content",

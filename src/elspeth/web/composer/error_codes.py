@@ -48,6 +48,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "batch_transform_misplaced",
         "batch_dependency_refused",
         "batch_value_field_not_numeric",
+        "blob_content_size_limit",
         "bound_region_aggregation_invalid",
         "bound_region_sink_inside",
         "canonical_schema",
