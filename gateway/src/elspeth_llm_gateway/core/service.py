@@ -176,6 +176,13 @@ def _validate_canonical_response(response: CanonicalResponse, request: ChatReque
         raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID)
     if response.text is not None and (type(response.text) is not str or len(response.text) > bounds.max_string_chars):
         raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID)
+    # Returned thinking is replayed on the next request, where bounds_check
+    # counts each of its strings. Refuse here rather than truncate: the
+    # signature and redacted data are opaque and must stay byte-exact.
+    for block in response.thinking_blocks:
+        for value in (block.thinking, block.signature, block.data):
+            if value is not None and len(value) > bounds.max_string_chars:
+                raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID)
 
     seen_ids = {call.id for message in request.messages for call in (message.tool_calls or [])}
     for call in response.tool_calls:
