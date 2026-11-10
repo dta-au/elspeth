@@ -77,7 +77,7 @@ from elspeth.web.interpretation_state import (
     materialize_state_for_authoring,
     materialize_state_for_execution,
 )
-from elspeth.web.paths import is_local_path_value, require_mcp_root_context
+from elspeth.web.paths import is_absent_sink_path, is_local_path_value, require_mcp_root_context
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import PolicyValidationStage, validate_plugin_policy
@@ -349,6 +349,8 @@ def validate_path_policy(
             if key not in output.options:
                 continue
             value = output.options[key]
+            if is_absent_sink_path(output.plugin, output.options.get("mode"), key, value):
+                continue
             if not is_local_path_value(value):
                 return _path_value_failure(
                     component_id=output.name,

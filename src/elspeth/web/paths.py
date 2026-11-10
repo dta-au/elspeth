@@ -49,6 +49,15 @@ def is_local_path_value(value: object) -> bool:
     return type(value) is str and bool(value) and "\x00" not in value
 
 
+def is_absent_sink_path(plugin: object, mode: object, key: str, value: object) -> bool:
+    """Only Chroma client mode permits an explicitly absent local directory.
+
+    Other path keys still require paths, and non-null directories still pass
+    through confinement. The plugin config validates the remaining connection.
+    """
+    return plugin == "chroma_sink" and mode == "client" and key == "persist_directory" and value is None
+
+
 def resolve_data_path(value: str, data_dir: str) -> Path:
     """Resolve a path value against data_dir (relative) or as-is (absolute).
 

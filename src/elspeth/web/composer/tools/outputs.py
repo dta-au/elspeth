@@ -182,6 +182,7 @@ def _execute_set_output(
     path_error = _validate_sink_path(
         sink_options,
         context.data_dir,
+        plugin=plugin,
         session_id=context.session_id,
         require_data_dir=context.require_data_dir_for_paths,
         mcp_root_authority=context.mcp_root_authority,
@@ -311,6 +312,7 @@ def _execute_patch_output_options(
     path_error = _validate_sink_path(
         new_options,
         context.data_dir,
+        plugin=current.plugin,
         session_id=context.session_id,
         require_data_dir=context.require_data_dir_for_paths,
         mcp_root_authority=context.mcp_root_authority,
