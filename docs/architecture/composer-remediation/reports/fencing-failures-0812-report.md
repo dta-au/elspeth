@@ -48,7 +48,7 @@ Read: the full diff of `f9c23c59c` for `database.py` and `src/elspeth/web/schema
 Conclusion: correct for what this pin guards; no source change needed.
 
 - **The diff is only the helper, its module lock and three call sites.** No line containing `install_deadline_guard` or the journal is in the diff.
-- **Guard order is unchanged.** The three `install_deadline_guard` calls are where they were. In `_setup_engine` and `from_url` the journal is attached first, then the guard is installed, and table creation runs after both.
+- **Guard order is unchanged.** The three `install_deadline_guard` calls are where they were. In `LandscapeDB._setup_engine` and `LandscapeDB.from_url` the journal is attached first, then the guard is installed, and table creation runs after both.
 - **The lock cannot deadlock on itself.** It is a non-reentrant `threading.Lock` held across DDL. The helper is called only from the three sites in `database.py` and from `init_landscape_schema` in `schema_probe.py`; nothing in `journal.py`, `lease_deadlines.py` or `database_clock.py` calls it, so no commit hook re-enters it.
 - **The helper restores state on failure.** `_create_rule` values are captured before `create_all` and restored in `finally`, the same pattern `src/elspeth/web/sessions/schema.py` already uses.
 
@@ -82,15 +82,33 @@ Every pytest run used the worktree's interpreter with `PYTHONPATH=<tree>/src:<tr
 | 12 functions on the worktree before the repair | 33 failed, 22 passed, exit 1 | `head-before.log` |
 | 12 functions on the worktree after the repair | 55 passed, exit 0 | `head-after.log` |
 | `test_web_reserve_reviewed_contracts.py`, `test_static_direct_writers.py`, `test_masquerade_gate.py` and the two approved xfails | 431 passed, 2 xfailed, exit 0 | `final-modules.log` |
+| Whole fencing file without the three `landscape_long_run` cases (763 cases) plus `test_sink_effect_reserve_contract.py` (21), on the committed re-pin `f44d7809d` | 784 passed, exit 0 | `rest-of-file.log` |
+| `test_web_landscape_mutation_fencing.py::test_required_work_reserve_admission_on_actual_sources`, `-n 0`, same commit | 1 passed in 389 s, exit 0 | `reserve-proof-node.log` |
 | `python -m scripts.check_contracts` | exit 0 (census unchanged: 2617 soft occurrences, 418 files, 60 boundary-parsed) | `check_contracts.log` |
 | `ruff check` and `ruff format --check` on the touched test file | exit 0 | terminal |
+| `mypy` on the touched test file | exit 1: 222 errors in 4 test files, none on the changed lines | `mypy-test-file.log` |
+
+The re-pin turns the registry proof from false to true for every test that consults it, not only the 12 that were failing, so the rest of the file was re-run after the commit: all 763 non-long-run cases pass, as do the modules that import the fencing module's proofs (`test_web_reserve_reviewed_contracts.py`, `test_sink_effect_reserve_contract.py`). The reserve-admission proof that the gate repair certified was re-measured for the same reason and still passes. HEAD was `c3b733113` before and after these two runs; its only difference from `f44d7809d` is this report.
+
+The `mypy` result is not a gate result. Tests are outside the type-checked surface (`src/` and `elspeth-lints/src/`), the errors are in code this work did not touch (161 in the fencing test, the rest in three files it imports), and the change is a comment and one string value in a `dict` of strings.
+
+The runner for the attribution rows, per tree, with the 12 functions passed as `file::function` node ids:
+
+```bash
+cd <tree> && PYTHONPATH=<tree>/src:<tree>/elspeth-lints/src:<lane>/tools \
+  <worktree>/.venv/bin/python -m pytest <12 node ids> \
+  --rootdir <tree> -c <tree>/pyproject.toml -o "pythonpath=<tree>/src <tree>/elspeth-lints/src" \
+  -p prov_plugin -p no:cacheprovider -n 6 -rA --junitxml <lane>/<label>.xml > <lane>/<label>.log 2>&1
+```
+
+`prov_plugin` is the lane-private plugin that records the import paths and unit count. The scripts are `tools/run_rev.sh`, `tools/extract.sh`, `tools/outcomes.py` and `tools/controls.sh` in the lane directory.
 
 The two maintainer-approved xfails (`test_all_production_sessions_writers_are_reviewed_typed_authorities` and `test_baseline_capture_is_self_consistent`) are still XFAIL, and their reason text is identical to the previous agent's `batch-b.log`. Neither was edited.
 
 ## Not run
 
-- `mypy`: the only touched file is a test, and the gated mypy surface is `src/` and `elspeth-lints/src/`. No file in that surface changed.
-- The rest of `test_web_landscape_mutation_fencing.py` (the other 708 cases, which passed on this branch in the previous agent's run, and the three `landscape_long_run` proofs). The edit is one digest value and a comment; the other digest of `database.py` in the file was not touched.
+- The other two `landscape_long_run` proofs in the fencing file. They have not been run to completion on this branch, before or after this change.
+- `mypy` on the gated surface: no file in it changed.
 - The full `pytest tests/` suite and the PostgreSQL testcontainer selection.
 
 ## Blockers
