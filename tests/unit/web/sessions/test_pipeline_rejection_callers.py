@@ -824,6 +824,19 @@ async def test_actual_planner_resource_race_retains_receipts_and_original_cancel
     expected, running = await prepared_rejection(operation_store)
     planner = _harness(tmp_path / "planner").service._planning_application
     planner._sessions_service_optional = service
+    if trust_modes[1] == "explicit_approve":
+        # Explicit approval keeps one composition proposal outstanding, so the
+        # planner refuses to publish beside the fixture's undecided proposal
+        # and would never reach the creation race under test. Decide it first.
+        await service.reject_pipeline_composition_proposal(
+            session_id=sid,
+            proposal_id=expected.authority.row.id,
+            draft_hash=expected.authority.proposal.draft_hash,
+            reason="operator_rejected",
+            dispatch=None,
+            actor="user:alice",
+            session_operation_context=running.session_operation_context,
+        )
     prior_occurrences = _invocation_occurrences(_chat_rows(service, str(sid)))
     assert prior_occurrences == {expected.authority.row.tool_call_id: 1}
     blob = await BlobServiceImpl(engine, tmp_path).create_blob(
