@@ -38,6 +38,8 @@ from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
     CONTEXT_BUDGET_TRANSCRIPT_GAP_ALLOWANCE_BYTES,
     largest_component,
+    message_bytes,
+    message_wire_split,
 )
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.llm_response_parsing import _hash_and_measure_request, build_llm_call_record
@@ -1007,6 +1009,32 @@ def test_a_refusal_names_the_transcript_without_the_events_that_could_still_be_s
     assert named["transcript"] == content_bytes - hatch_sheddable
     assert named["other"] == 0
     assert largest_component(named) == "transcript"
+
+
+def test_a_planner_refusal_names_the_tool_round_whose_arguments_dominate() -> None:
+    """Components are sized on the wire, so tool-call arguments beside a few bytes of prose are not invisible."""
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": "s" * 3_000},
+        {"role": "user", "content": "r" * 2_000},
+        _planner_request_message({"intent": "Convert the data."}),
+        {
+            "role": "assistant",
+            "content": "ok",
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "t", "arguments": json.dumps({"pad": "a" * 20_000})}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "done"},
+    ]
+
+    def named(split: ComposerLLMRequestByteSplit) -> str:
+        return largest_component(
+            _planner_context_budget_components(
+                split, latest_start=3, hatch_transcript_index=None, history_sheddable=0, tool_sheddable=0, hatch_sheddable=0
+            )
+        )
+
+    assert named(message_wire_split(messages, [])) == "latest_tool_round"
+    # Control: the content split counts that assistant message as its two bytes of prose.
+    assert named(message_bytes(messages, [])) == "system"
 
 
 def _fit_hatch_request(

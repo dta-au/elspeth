@@ -26,6 +26,7 @@ from elspeth.web.composer.context_budget import CONTEXT_BUDGET_TOOL_RESULT_STUB
 from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
     message_bytes,
+    message_wire_split,
     request_wire_bytes,
     stubbed_tool_message,
     tool_result_segments,
@@ -761,6 +762,9 @@ async def test_tool_call_arguments_count_toward_both_ceilings(ceiling: str) -> N
     assert refusal.reason == "context_budget_exceeded"
     assert refusal.evidence["ceiling"] == ceiling
     assert refusal.evidence["request_bytes"] > base_wire + len(padding)
+    # The refusal names the component that is actually largest on the wire: the tool round
+    # whose arguments fill the request, not the largest piece of string content.
+    assert refusal.evidence["largest_component"] == "latest_tool_round"
     assert len(refusal.llm_calls) == 1
 
     # Control: the same turn under generous ceilings sends the second request, whose
@@ -787,6 +791,10 @@ def test_the_wire_measure_counts_tool_call_arguments_and_thinking_blocks_that_th
     for grown in (with_arguments, with_thinking):
         assert message_bytes(grown, None).total_bytes == message_bytes(plain, None).total_bytes == 3
         assert request_wire_bytes(grown, None) > request_wire_bytes(plain, None) + 5_000
+        # The per-message wire sizes a refusal names its components from count them too.
+        wire_split = message_wire_split(grown, None)
+        assert wire_split.message_bytes[1] > 5_000 and wire_split.tools_bytes is None
+        assert wire_split.total_bytes == sum(wire_split.message_bytes)
 
 
 _ESCAPING_CONTENTS = [
