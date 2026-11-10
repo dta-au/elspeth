@@ -10,11 +10,16 @@ Verifies the extracted Langfuse tracing utilities work correctly:
 
 from __future__ import annotations
 
+import json
+import threading
 from dataclasses import dataclass, field
+from functools import partial
 from types import SimpleNamespace, TracebackType
 from typing import Any
 from unittest.mock import patch
+from uuid import uuid4
 
+import httpx
 import pytest
 
 import elspeth.contracts.errors as contract_errors
@@ -513,3 +518,104 @@ class TestSdkBoundaryContainment:
 
         with pytest.raises(contract_errors.FrameworkBugError, match="invariant broken"):
             tracer.flush()
+
+
+def test_real_langfuse_sdk_exports_success_and_error_generations(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SDK signature drift must fail through missing spans or attributes.
+
+    Keep the real client, observations, updates, and batch span processor. Only
+    replace the exporter and HTTP transport so the test cannot send telemetry.
+    An isolated provider avoids changing the process-global tracing provider.
+    """
+    import langfuse
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    existing_threads = set(threading.enumerate())
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    http_client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={})))
+    real_client_type = langfuse.Langfuse
+    monkeypatch.setattr(
+        langfuse,
+        "Langfuse",
+        partial(real_client_type, tracer_provider=provider, httpx_client=http_client, span_exporter=exporter),
+    )
+    # A separate resource-manager key prevents sharing SDK state with other
+    # tracing tests; shutdown below joins this client's background workers.
+    config = LangfuseTracingConfig(
+        public_key=f"pk-test-{uuid4().hex}",
+        secret_key="test-only",
+        host="https://langfuse.example.invalid",
+    )
+    tracer = create_langfuse_tracer("test_transform", config)
+    assert isinstance(tracer, ActiveLangfuseTracer)
+    assert isinstance(tracer.client, real_client_type)
+    try:
+        with patch("elspeth.plugins.transforms.llm.langfuse._handle_trace_failure", autospec=True) as trace_failure:
+            tracer.record_success(
+                parent=_ROW_PARENT,
+                query_name="classify",
+                prompt="Classify this",
+                system_prompt="Return one label",
+                response_content="positive",
+                model="test-model",
+                usage=TokenUsage.known(10, 20),
+                latency_ms=42.5,
+                extra_metadata={"deployment": "test-deployment"},
+            )
+            tracer.record_error(
+                parent=_OPERATION_PARENT,
+                query_name="source",
+                prompt="Generate one row",
+                error_message="rate limited",
+                model="test-model",
+                latency_ms=5000.0,
+            )
+            tracer.flush()
+        trace_failure.assert_not_called()
+
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 4
+        generations = [span for span in spans if span.name == "llm_call"]
+        parents = {span.context.span_id: span for span in spans if span.name == "elspeth.test_transform"}
+        assert len(generations) == len(parents) == 2
+        for generation in generations:
+            assert generation.parent is not None
+            parent = parents[generation.parent.span_id]
+            assert generation.context.trace_id == parent.context.trace_id
+            assert parent.parent is None
+            # SDK 5 uses ingestion-v4 JSON encoding for metadata values.
+            assert json.loads(parent.attributes["langfuse.observation.metadata.plugin"]) == "test_transform"
+            assert generation.attributes["langfuse.observation.type"] == "generation"
+            assert generation.attributes["langfuse.observation.model.name"] == "test-model"
+            if json.loads(parent.attributes["langfuse.observation.metadata.query"]) == "classify":
+                assert json.loads(parent.attributes["langfuse.observation.metadata.state_id"]) == "state-1"
+                assert json.loads(parent.attributes["langfuse.observation.metadata.token_id"]) == "tok-1"
+                assert json.loads(parent.attributes["langfuse.observation.metadata.deployment"]) == "test-deployment"
+                assert json.loads(generation.attributes["langfuse.observation.input"]) == [
+                    {"role": "system", "content": "Return one label"},
+                    {"role": "user", "content": "Classify this"},
+                ]
+                assert generation.attributes["langfuse.observation.output"] == "positive"
+                assert json.loads(generation.attributes["langfuse.observation.usage_details"]) == {"input": 10, "output": 20}
+                assert generation.attributes["langfuse.observation.metadata.latency_ms"] == "42.5"
+            else:
+                assert json.loads(parent.attributes["langfuse.observation.metadata.query"]) == "source"
+                assert json.loads(parent.attributes["langfuse.observation.metadata.operation_id"]) == "operation-1"
+                assert "langfuse.observation.metadata.state_id" not in parent.attributes
+                assert "langfuse.observation.metadata.token_id" not in parent.attributes
+                assert json.loads(generation.attributes["langfuse.observation.input"]) == [
+                    {"role": "user", "content": "Generate one row"},
+                ]
+                assert generation.attributes["langfuse.observation.level"] == "ERROR"
+                assert generation.attributes["langfuse.observation.status_message"] == "rate limited"
+                assert generation.attributes["langfuse.observation.metadata.latency_ms"] == "5000.0"
+    finally:
+        tracer.client.shutdown()
+        # SDK shutdown leaves its separate prompt-refresh manager until atexit.
+        # Join it here so this real-client test leaves no worker in pytest.
+        tracer.client._resources.prompt_cache._task_manager.shutdown()
+        provider.shutdown()
+        http_client.close()
+        assert not [thread.name for thread in threading.enumerate() if thread not in existing_threads]

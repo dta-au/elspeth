@@ -10,6 +10,18 @@ Composer tool remediation. Verification status is recorded in the pull
 request. The dated entry and package version do not establish qualification, a
 published tag or an image.
 
+### Dependencies
+
+- **The remaining Python dependency advisories are fixed.**
+  OpenTelemetry moves to 1.45.1 with the Prometheus exporter at 0.66b1,
+  and operator telemetry custody is adapted to the new reader ownership and
+  exporter internals. These SDK and exporter versions are exact pins because
+  custody verifies their implementation at startup. Langfuse moves from SDK
+  3 to 5.2, allowing packaging 26.3 and patched virtualenv 21.15.6. Azure
+  Monitor moves with the compatible OpenTelemetry stack to 1.8.12 / b59.
+  Existing tracing configuration remains supported; installs must use the
+  updated lock rather than upgrading the telemetry SDK independently.
+
 ### Composer
 
 - **Refusals and no-ops go back to the model, not to an approval card.** A
@@ -142,6 +154,11 @@ published tag or an image.
 
 ### Upgrade notes
 
+- Langfuse tracing now requires Langfuse Cloud or a self-hosted server at
+  version 4.59.0 or newer. Upgrade an older server before upgrading ELSPETH;
+  Langfuse SDK 5 no longer supports self-hosted v3 or older v4 servers.
+  The configuration field names remain unchanged. See the
+  [Langfuse SDK upgrade guide](https://langfuse.com/docs/observability/sdk/upgrade-path/python-v4-to-v5).
 - An MCP client that authors a file path outside the configured data
   directory is now refused. Move the file under the data
   directory or change the configured root.
@@ -398,7 +415,7 @@ establish qualification, a published tag or an image.
 - **Still open.** The application's OpenTelemetry 1.40 pin (CVE-2026-114603)
   and eight virtualenv advisories remain. OpenTelemetry 1.45 breaks web start-up
   and operator telemetry custody, and virtualenv 21.14.7 or later needs
-  packaging 26, which langfuse 3 forbids. Both need their own change.
+  packaging 26, which langfuse 3 forbids. These are resolved together in 0.8.12.
 
 ### Upgrade notes
 
