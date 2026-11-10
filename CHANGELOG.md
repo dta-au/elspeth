@@ -93,6 +93,20 @@ published tag or an image.
   distinct from the keyboard focus colour.
 - Known and deferred: between workspace widths of 960 and 1041 px the pipeline
   card is narrower than its 640 px target.
+- **The share dialog closes when the active session changes.** It stayed bound
+  to the session it was opened for, so after back/forward or a session switch
+  it could make a link for a pipeline the owner was no longer looking at.
+- **The share dialog says what an import-enabled link grants.** The success
+  text said read-only access even when the recipient could import an editable
+  copy with copies of the listed files.
+
+### LLM gateway
+
+- **Thinking from an adapter that does not declare `REASONING` is refused.**
+  The gateway returned it with a 200, then refused the caller's next turn when
+  that thinking was sent back. The response is now refused as upstream-invalid
+  on the first turn. The reference adapter declares `REASONING` and is
+  unaffected; an operator adapter with this defect will now fail earlier.
 
 ### Plugins
 
