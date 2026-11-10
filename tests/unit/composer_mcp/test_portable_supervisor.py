@@ -71,8 +71,9 @@ def launch(directory, mode, *, speed=1, ignored_chld=False):
 
 
 def finish(process, directory, *, timeout=15):
-    # The probe's shorter outer alarm unwinds the real production owner, which
-    # kills/reaps its own Popen child before this outer process timeout expires.
+    # At speed > 1 the probe's 12 s alarm unwinds the real production owner (which
+    # kills/reaps its own Popen child) before this 15 s timeout; at speed 1 the probe's
+    # alarm is 45 s, so a timeout here fires first and the cleanup below applies.
     try:
         out, err = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as error:
@@ -169,6 +170,7 @@ def test_finish_timeout_also_stops_runner_in_separate_session(tmp_path):
     )
     process = subprocess.Popen([sys.executable, "-c", command], stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     runner_pid = None
+    runner_gone = False
     try:
         assert process.stdout is not None
         runner_pid = int(process.stdout.readline())
@@ -179,8 +181,11 @@ def test_finish_timeout_also_stops_runner_in_separate_session(tmp_path):
         while (fields := read_proc_stat(runner_pid)) is not None and fields[2] != "Z":
             assert time.monotonic() < deadline, "detached runner survived probe timeout cleanup"
             time.sleep(0.01)
+        runner_gone = True
     finally:
-        if runner_pid is not None:
+        if runner_pid is not None and not runner_gone:
+            # Only a runner never observed gone is signalled: once it has exited
+            # its number may belong to an unrelated process.
             with suppress(ProcessLookupError):
                 os.killpg(runner_pid, signal.SIGKILL)
         if process.poll() is None:
@@ -225,6 +230,24 @@ def test_probe_alarm_records_owner_proc_and_stacks(tmp_path, monkeypatch):
     assert f"child_pid={child_pids[0]}" in diagnostics and "proc:" in diagnostics
     assert f"threads=[{child_pids[0]}:" in diagnostics
     assert "test_probe_alarm_records_owner_proc_and_stacks" in diagnostics
+
+
+def test_probe_event_files_are_published_complete(tmp_path, monkeypatch):
+    """Readers take a file's existence as readiness and parse it at once."""
+    from tests.helpers import portable_supervisor_probe as probe
+
+    seen = []
+    real_replace = os.replace
+
+    def observing_replace(source, destination):
+        seen.append((Path(destination).exists(), Path(source).read_text()))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(probe.os, "replace", observing_replace)
+    probe.event(tmp_path, "ready")
+    assert seen == [(False, str(os.getpid()))]
+    assert (tmp_path / "ready").read_text() == str(os.getpid())
+    assert not list(tmp_path.glob("*.pending"))
 
 
 def test_probe_records_child_import_and_connection_timeline(tmp_path):

@@ -18,7 +18,11 @@ sys.path.insert(0, str(ROOT))
 def event(directory: Path, name: str) -> None:
     with (directory / "timeline.jsonl").open("a", encoding="utf-8") as timeline:
         timeline.write(json.dumps({"event": name, "pid": os.getpid(), "monotonic_ns": time.monotonic_ns()}) + "\n")
-    (directory / name).write_text(str(os.getpid()))
+    # Publish complete content: readers treat the file's existence as readiness
+    # and parse it at once, so it must never be visible half-written.
+    pending = directory / f".{name}.{os.getpid()}.pending"
+    pending.write_text(str(os.getpid()))
+    os.replace(pending, directory / name)
 
 
 def supervise(directory: Path, mode: str, speed: int, ignored_chld: bool) -> int:

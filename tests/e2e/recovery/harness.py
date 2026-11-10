@@ -411,7 +411,11 @@ class SpawnedProcessAtSeam:
             self._process.kill()
             self._process.join(timeout=_PROCESS_CLEANUP_JOIN_SECONDS)
         if self._process.is_alive():
-            evidence = self._diagnostics.snapshot(self._process)
+            try:
+                evidence = self._diagnostics.snapshot(self._process)
+            except OSError as snapshot_failure:
+                # Evidence is best effort: it must never displace the failure.
+                evidence = f"snapshot unavailable: {snapshot_failure!r}"
             raise AssertionError(f"could not clean up child at process seam {self._seam!s}\n{evidence}")
         self._ready_reader.close()
         self._release_writer.close()
