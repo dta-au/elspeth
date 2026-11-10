@@ -212,6 +212,7 @@ TRANSFORMS:
   blob_json_expand     - Parse a JSON document and emit one output row per record.
   blob_text_expand     - Decode a text blob from the payload store and emit one row per line or chunk.
   field_mapper         - Map, rename, and select row fields.
+  file_inject          - Write whole bound files into row fields: one chosen by a row value, or all of them.
   json_explode         - Explode a JSON array field into multiple rows.
   keyword_filter       - Filter rows containing blocked content patterns.
   line_explode         - Explode a string field into one output row per line.
@@ -788,6 +789,56 @@ Composer. The composer's `/validate` and
 `/execute`
 endpoints use the same runtime assembly and graph validation contracts as
 `elspeth validate` and `elspeth run` — there is no separate UI-only validator.
+
+### Attach uploaded files to rows
+
+The `file_inject` transform writes the whole content of a file into a row
+field. A typical use is handling guidance for an LLM step: rows of type `A`
+get the A guidance, rows of type `B` get the B guidance. It can also put the
+same files on every row.
+
+In Composer the content must be a file you uploaded:
+
+1. Save the text as a file. Use `.txt` for plain text, or `.json`, `.jsonl`,
+   or `.csv` when later steps need the parsed data.
+2. Upload it with **Upload file** in the chat input. Upload one file per
+   entry.
+3. Ask for it to be attached. For example: "Attach `guidance_a.txt` to rows
+   where `type` is A and `guidance_b.txt` where it is B, in a field called
+   `guidance`." For the same file on every row: "Put `policy.txt` on every row
+   as `policy_text`."
+
+Composer attaches each upload to its entry and states the entry's format:
+`text`, `json`, `jsonl`, or `csv`. The format is not taken from the file name,
+so say which you want if it is not obvious.
+
+What Composer will not do:
+
+- **Write the content for you.** The LLM cannot type text into a `file_inject`
+  entry or create the file itself. If you ask for guidance you have not
+  uploaded, it tells you to save the text as a file and upload it, and attaches
+  it once the upload exists. The content reaches your rows, and from there a
+  prompt, without a review step, so it must be text you supplied.
+- **Use `default_content`.** A fallback value for rows that match no entry is
+  not available in Composer. Ask for unmatched rows to fail and go to an error
+  output (`on_miss: fail`, the default) or to carry a null (`on_miss: null`).
+- **Import literal content.** **Import YAML** refuses a `file_inject` node
+  whose `content` is written out as text, or that sets `default_content`. The
+  message names the node and the option. Remove that option from the YAML,
+  import again, upload the file in the session, then ask for it to be attached.
+
+The same rule is checked again when the pipeline is validated and when a run
+is admitted, so a pipeline that carries literal or LLM-created `file_inject`
+content does not run.
+
+An attached file can be up to 256 KiB, and all inline attachments in one
+pipeline can total 1 MiB. Files are attached as text. This rule applies only to
+`file_inject`: Composer can still create a source or draft prompt text for you,
+each behind its own review.
+
+Settings files run with `elspeth run` are not restricted this way. There,
+name the file with `content_file` beside the settings file; see
+[Bound files as row fields](../reference/configuration.md#bound-files-as-row-fields).
 
 ### The first-run tutorial
 
