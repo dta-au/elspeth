@@ -9448,7 +9448,7 @@ def _reserve_exception_registration_effect(units, app_uses):
             for statement in registrar.body[1:]
         )
         or hashlib.sha256(stable_ast_dump(registrar).encode("utf-8")).hexdigest()
-        != "5e18486157f3fbe44e927af08a3aa913ced6e8af39cc2aa98872be61ac7e6967"
+        != "0393632015d4152dfdbc6e3b22badbda6a4ce23cd77f1f9b3f2924a280645762"
     ):
         return ["application exception registration has unreviewed source-visible effects"], None
     imports = [
