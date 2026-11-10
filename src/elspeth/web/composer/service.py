@@ -111,6 +111,7 @@ from elspeth.web.composer.context_budget_apply import (
     latest_round_trip_start,
     message_bytes,
     previously_shed_keys,
+    request_wire_bytes,
     stubbed_tool_message,
     tool_result_segments,
 )
@@ -1556,14 +1557,19 @@ class ComposerServiceImpl:
         if supports_anthropic_prompt_cache_markers(self._model):
             marked_messages, marked_tools_or_none = apply_anthropic_cache_markers(selected_messages, selected_tools, mark_history_tail=True)
             marked_tools = marked_tools_or_none if marked_tools_or_none is not None else selected_tools
-        marked_split = message_bytes(marked_messages, marked_tools or None)
-        if marked_split.total_bytes > self._context_budget_policy.max_request_bytes:
+        # The final guard, on the bytes that will be sent. The decision was fed
+        # this wire measure, so it is reached only if applying the decision
+        # grew the request past what the decision's allowances cover.
+        marked_wire_bytes = request_wire_bytes(marked_messages, marked_tools or None)
+        if marked_wire_bytes > self._context_budget_policy.max_request_bytes:
+            marked_split = message_bytes(marked_messages, marked_tools or None)
             kept_history = len(budget_frame.history_entries) - len(budget_record.shed_history_indices)
             raise self._context_budget_refusal(
                 ContextBudgetRefusal(
                     ceiling="bytes",
                     estimated_tokens=math.ceil(marked_split.total_bytes / bytes_per_token),
-                    request_bytes=marked_split.total_bytes,
+                    content_bytes=marked_split.total_bytes,
+                    wire_bytes=marked_wire_bytes,
                 ),
                 _context_budget_component_bytes(
                     marked_split,
@@ -1620,16 +1626,23 @@ class ComposerServiceImpl:
         segments.extend(tool_segments)
 
         # The decision measures the request as it will be sent: with cache
-        # markers, plus the worst case the omission counts can add.
+        # markers, plus the worst case the omission counts can add. It takes
+        # two sizes: the content split for the token estimate (the basis the
+        # stored bytes-per-token ratio is calibrated on) and the wire bytes
+        # for the byte ceiling (what the gateway's body cap sees).
+        sent_messages: list[dict[str, Any]] = messages
+        sent_tools: list[dict[str, Any]] | None = tools or None
         sent_split = split
         if supports_anthropic_prompt_cache_markers(self._model):
-            scratch_messages, scratch_tools = apply_anthropic_cache_markers(messages, tools, mark_history_tail=True)
-            sent_split = message_bytes(scratch_messages, scratch_tools or None)
+            sent_messages, marked_tools = apply_anthropic_cache_markers(messages, tools, mark_history_tail=True)
+            sent_tools = marked_tools or None
+            sent_split = message_bytes(sent_messages, sent_tools)
 
         try:
             decision = decide_context_budget(
                 policy=self._context_budget_policy,
-                request_bytes=sent_split.total_bytes + omission_allowance,
+                content_bytes=sent_split.total_bytes + omission_allowance,
+                wire_bytes=request_wire_bytes(sent_messages, sent_tools) + omission_allowance,
                 segments=segments,
                 bytes_per_token=frame.history.bytes_per_token,
                 previously_shed=previously_shed_keys(frame.history, recorder.llm_calls),
@@ -1704,7 +1717,8 @@ class ComposerServiceImpl:
             evidence={
                 "ceiling": refusal.ceiling,
                 "estimated_tokens": refusal.estimated_tokens,
-                "request_bytes": refusal.request_bytes,
+                # Wire bytes: the measure ``max_request_bytes`` bounds.
+                "request_bytes": refusal.wire_bytes,
                 "max_prompt_tokens": self._context_budget_policy.max_prompt_tokens,
                 "max_request_bytes": self._context_budget_policy.max_request_bytes,
                 "largest_component": largest_component(component_bytes),
