@@ -948,3 +948,12 @@ async def test_deletion_facet_admission_preserves_exact_prepare_file_evidence_co
             ),
         )
     assert _resources(db_engine, tmp_path) == before
+
+
+@pytest.mark.parametrize("tool_name", ["get_blob_metadata", "create_blob", ""])
+def test_admission_refuses_a_foreign_tool_name_as_an_owned_invariant_breach(
+    blob_service, db_engine, compose_context, tmp_path, tool_name
+) -> None:
+    """The caller routes only update/delete here; anything else is our own bug, not tool feedback."""
+    with pytest.raises(AuditIntegrityError, match="blob admission requires update_blob or delete_blob"):
+        blobs.admit_blob_mutation(tool_name, {}, _empty_state(), _context(blob_service, db_engine, compose_context, tmp_path))
