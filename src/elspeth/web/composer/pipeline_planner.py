@@ -105,6 +105,7 @@ from elspeth.web.composer.context_budget_apply import (
     largest_component,
     latest_round_trip_start,
     message_bytes,
+    message_wire_split,
     previously_shed_keys,
     request_wire_bytes,
     stubbed_tool_message,
@@ -3390,7 +3391,11 @@ def _planner_context_budget_components(
     tool_sheddable: int,
     hatch_sheddable: int,
 ) -> dict[str, int]:
-    """Name each component of a measured planner request; ``request``, ``transcript`` and ``other`` exclude what could still be shed."""
+    """Name each component of a planner request sized per message on the wire (:func:`message_wire_split`).
+
+    ``request``, ``transcript`` and ``other`` exclude what the decision
+    credited the sheddable segments with.
+    """
     sizes = split.message_bytes
     protected_end = hatch_transcript_index if hatch_transcript_index is not None else _PLANNER_REQUEST_INDEX
     if latest_start is not None and latest_start <= protected_end:
@@ -3531,7 +3536,7 @@ def _fit_planner_context_budget(
         raise _planner_context_budget_exhausted(
             refusal.ceiling,
             _planner_context_budget_components(
-                split,
+                message_wire_split(messages, tools),
                 latest_start=latest_start,
                 hatch_transcript_index=hatch_transcript_index,
                 history_sheddable=history_sheddable,
