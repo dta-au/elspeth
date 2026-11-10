@@ -3,6 +3,8 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
+import { PANE_GUTTER, WORKSPACE_INLINE_GUTTERS } from "./useWorkspacePaneState";
+
 // Structural contracts for the workspace chrome — the pane seam, the bottom
 // action bar — from the 2026-08-14 professionalisation
 // review.
@@ -22,6 +24,11 @@ const css = readFileSync(
   "utf8",
 );
 const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, "");
+// shared.css owns the base .artifact-tab chrome the track rules build on.
+const sharedCss = readFileSync(
+  join(process.cwd(), "src/styles/shared.css"),
+  "utf8",
+).replace(/\/\*[\s\S]*?\*\//g, "");
 
 interface Rule {
   selector: string;
@@ -78,6 +85,8 @@ describe("workspace action bar rhythm (elspeth-fca731fb28)", () => {
   // completion groups stayed at 8px, so the eye bonded "Audit N issues" to
   // "Share inspect link" at exactly the viewport where the bar is most crowded.
   const gapBearingSelectors = [
+    ".workspace-action-bar-slot",
+    ".workspace-pane-controls",
     ".workspace-action-bar",
     ".workspace-action-bar .completion-bar",
   ];
@@ -128,18 +137,14 @@ describe("workspace action bar rhythm (elspeth-fca731fb28)", () => {
     ).toBe("var(--color-surface-hover)");
   });
 
-  it("takes the bar's padding and the collapse control's standoff from one inset", () => {
-    // The two rows meet across the pane divider and must share one bottom edge
-    // and one optical center — a BLOCK-axis contract: both sides express the
-    // standoff as --workspace-bar-inset, so it no longer depends on a 16px
-    // browser root. The bar's INLINE inset is the artifact column's shared
-    // --artifact-gutter (elspeth-87195dda2c); the collapse control lives in
-    // the authoring column, which keeps its own --space-sm inline margin.
+  it("takes the bar's padding and the stable toggle's standoff from one inset", () => {
+    // Task A: toggle and actions share the pipeline-column flex row; their
+    // block standoffs still move together in the short-screen regime.
     expect(declaration(".workspace-action-bar", "padding")).toBe(
-      "var(--workspace-bar-inset) var(--artifact-gutter)",
+      "var(--workspace-bar-inset) 0",
     );
-    expect(declaration(".workspace-collapse-control", "margin")).toBe(
-      "var(--workspace-bar-inset) var(--space-sm)",
+    expect(declaration(".workspace-pane-controls", "margin")).toBe(
+      "var(--workspace-bar-inset) 0",
     );
   });
 });
@@ -207,35 +212,41 @@ describe("workspace completion group (recut 2026-08-15, supersedes elspeth-c6fd7
     );
   });
 
-  it("tints settled Checks-badge verdicts with the matching semantic pair", () => {
+  it("fills settled Checks-badge verdicts with the tone and knocks the glyph out", () => {
     // Recut 2026-08-15, relocated with the chips-to-Checks-tab move: the
     // settled verdict surface is now the Checks tab's glyph badge. Each tone
-    // pairs the banner-family alpha background with the SAME family's text
-    // colour, so fill and glyph cannot disagree about the verdict (the
-    // glyph — count, checkmark, or bang — stays the information carrier,
-    // WCAG 1.4.1). busy and neutral deliberately stay dots on the base
-    // badge rule: in-flight and not-yet-checked are neither good nor bad.
+    // rule carries its fill AND its glyph colour together, so fill and glyph
+    // cannot disagree about the verdict (the glyph — count, checkmark, or
+    // bang — stays the information carrier, WCAG 1.4.1). busy and neutral
+    // deliberately stay dots on the base badge rule: in-flight and
+    // not-yet-checked are neither good nor bad.
+    // ARGOnite: the badge is a pill FILLED with the tone colour (design doc,
+    // "Checks tab badge"), so the glyph is knocked out in --color-surface —
+    // AA on every tone in both themes, gated in colorContrast.test.ts.
     const glyph = ".artifact-tab-badge--glyph";
-    expect(declaration(`${glyph}[data-tone="success"]`, "background-color")).toBe(
-      "var(--color-success-bg)",
-    );
-    expect(declaration(`${glyph}[data-tone="success"]`, "color")).toBe(
-      "var(--color-success)",
-    );
-    expect(declaration(`${glyph}[data-tone="warning"]`, "background-color")).toBe(
-      "var(--color-warning-bg)",
-    );
-    expect(declaration(`${glyph}[data-tone="warning"]`, "color")).toBe(
-      "var(--color-warning)",
-    );
-    expect(declaration(`${glyph}[data-tone="error"]`, "background-color")).toBe(
-      "var(--color-error-bg)",
-    );
-    expect(declaration(`${glyph}[data-tone="error"]`, "color")).toBe(
-      "var(--color-error)",
-    );
+    for (const tone of ["success", "warning", "error"]) {
+      expect(declaration(`${glyph}[data-tone="${tone}"]`, "background-color")).toBe(
+        `var(--color-${tone})`,
+      );
+      expect(declaration(`${glyph}[data-tone="${tone}"]`, "color")).toBe(
+        "var(--color-surface)",
+      );
+    }
     expect(cssWithoutComments).not.toContain(`${glyph}[data-tone="busy"]`);
     expect(cssWithoutComments).not.toContain(`${glyph}[data-tone="neutral"]`);
+  });
+
+  it("the Checks glyph badge can hold a two-digit count (Review Focus 4)", () => {
+    // ARGOnite: the real checks-open state reads "Checks 25", which a 1.4em
+    // box at 11-12px cannot hold. A 20px pill with a 20px floor and its own
+    // horizontal padding grows with the count instead of clipping it.
+    const glyph = ".artifact-tab-badge--glyph";
+    expect(declaration(glyph, "min-width")).toBe("20px");
+    expect(declaration(glyph, "min-height")).toBe("20px");
+    expect(declaration(glyph, "border-radius")).toBe("var(--radius-pill)");
+    const padding = declaration(glyph, "padding").split(" ");
+    const inline = padding.length > 1 ? padding[1] : padding[0];
+    expect(Number.parseFloat(inline)).toBeGreaterThan(0);
   });
 
   it("centers the members instead of stretching them to the bar's height", () => {
@@ -272,28 +283,22 @@ describe("workspace stacking order (elspeth-cf4b08e271)", () => {
 });
 
 describe("workspace bottom edge (elspeth-215c989bed, elspeth-9c94a58500)", () => {
-  // The bottom rule of the application was drawn by two elements in two grid
-  // columns — the action bar in the artifact column and a mirrored band on the
-  // authoring pane — and every way of making them the same height failed in
-  // turn: a token formula (elspeth-215c989bed) that encoded "the bar is one
-  // control row" and broke when the block-reason line made it 87px
-  // (elspeth-97db9c22e5), then a measured height that a ResizeObserver kept
-  // publishing. The restructure retires the seam itself: ONE grid item spans
-  // both columns and paints the rule and the fill once, and its height is its
-  // content because it is a content-sized grid row. These pins are the shape
-  // of that guarantee as it reads in the stylesheet; the rendered facts — the
-  // rule spanning the full width, the collapse control registered with the
-  // bar's controls through a wrap — are asserted in
-  // composer-workspace-geometry.spec.ts.
+  // Task A: the conversation spans both rows to the bottom gutter; the
+  // content-sized action row belongs only to the pipeline column. No mirrored
+  // band, measured height or subgrid is needed to keep the two bottoms honest.
   const slot = ".workspace-action-bar-slot";
 
-  it("paints the rule and the fill once, on one item spanning both columns", () => {
-    expect(declaration(slot, "grid-column")).toBe("1 / -1");
-    expect(declaration(slot, "grid-template-columns")).toBe("subgrid");
-    expect(declaration(slot, "border-top")).toBe(
-      "1px solid var(--color-border, currentcolor)",
-    );
-    expect(declaration(slot, "background")).toBe("var(--color-surface, Canvas)");
+  it("places the bar under the pipeline while conversation spans both rows", () => {
+    expect(declaration(slot, "grid-column")).toBe("2");
+    expect(declaration(slot, "display")).toBe("flex");
+    expect(ruleFor(slot)).not.toMatch(/(?:^|;)\s*grid-template-columns:/);
+    expect(declaration(".workspace-authoring-slot", "grid-row")).toBe("1 / 3");
+    expect(declaration(".workspace-artifact-slot", "grid-row")).toBe("1");
+    // ARGOnite: the bar is transparent on the --color-bg canvas between and
+    // below the pane cards; the top rule and the surface fill are retired.
+    // The slot is transparent on the canvas below the pipeline card.
+    expect(declaration(slot, "background")).toBe("transparent");
+    expect(ruleFor(slot)).not.toMatch(/(?:^|;)\s*border[a-z-]*:/);
 
     // The bar itself must NOT draw them too, or the bottom edge is back to
     // having two owners — the exact shape being retired.
@@ -332,27 +337,19 @@ describe("workspace bottom edge (elspeth-215c989bed, elspeth-9c94a58500)", () =>
     ).toBe("3");
   });
 
-  it("seats the collapse control in the row's authoring cell, centred like the bar's controls", () => {
-    // The « control is a child of the bar row now (it had to be: in narrow
-    // Compose view the action bar is hidden and the control alone gives the
-    // row its height). Column 1 is the authoring cell. Its block alignment
-    // must be the SAME as the bar's cross-axis alignment: the bar centres its
-    // groups against a reason-tall completion group (elspeth-b4e88f0f8c), so
-    // a start-aligned control would sit above the buttons by half the
-    // difference — the seam misregistration again, one cell over.
-    expect(declaration(".workspace-collapse-control", "grid-column")).toBe("1");
-    expect(declaration(".workspace-collapse-control", "align-self")).toBe("center");
+  it("centres the stable toggle and actions in the same pipeline-column row", () => {
+    expect(declaration(slot, "align-items")).toBe("center");
+    expect(declaration(".workspace-pane-controls", "align-items")).toBe("center");
     expect(declaration(".workspace-action-bar", "align-items")).toBe("center");
-    expect(declaration(".workspace-action-bar-main", "grid-column")).toBe("2");
+    expect(declaration(".workspace-action-bar-main", "flex")).toBe("1");
+    expect(declaration(".workspace-action-bar-main", "min-width")).toBe("0");
   });
 
-  it("applies the standoff exactly once on each side of the seam", () => {
-    // The ticket's own warning: if the wrapper ALSO carried the inset, the
-    // density regime's --workspace-bar-inset override would tighten it twice.
-    // The bar's padding and the control's margin are the only two carriers
-    // (both pinned to the token in the rhythm describe above); neither the
-    // wrapper nor the artifact cell has any, so no rule pads it.
-    expect(ruleFor(slot)).not.toMatch(/(?:^|;)\s*padding[a-z-]*:/);
+  it("applies the bottom gutter once and keeps the shared block inset on its children", () => {
+    expect(declaration(slot, "padding")).toBe(
+      "0 var(--artifact-gutter) var(--space-pane-gutter) var(--space-pane-gutter)",
+    );
+    expect(ruleFor(slot)).not.toContain("var(--workspace-bar-inset)");
     expect(
       rules
         .filter((rule) => rule.selector.split(",").some((s) => s.trim().endsWith(".workspace-action-bar-main")))
@@ -423,9 +420,9 @@ describe("artifact column gutter (elspeth-87195dda2c)", () => {
   it.each([
     [".artifact-workspace-toolbar", "padding", "0 var(--artifact-gutter)"],
     [
-      ".workspace-action-bar",
+      ".workspace-action-bar-slot",
       "padding",
-      "var(--workspace-bar-inset) var(--artifact-gutter)",
+      "0 var(--artifact-gutter) var(--space-pane-gutter) var(--space-pane-gutter)",
     ],
     [
       ".artifact-workspace-panel .inline-run-results",
@@ -437,4 +434,197 @@ describe("artifact column gutter (elspeth-87195dda2c)", () => {
     expect(declaration(selector, property)).toBe(expected);
   });
 
+});
+
+/**
+ * Like declaration(), but for a selector that may share its rule with others
+ * in a selector list: every rule whose list contains `selector` contributes.
+ * Plain selector lists only — the naive comma split would cut a list selector
+ * that itself contains a comma inside :where()/:is() into fragments.
+ */
+function listedDeclaration(selector: string, property: string): string {
+  const declarations = rules
+    .filter((rule) => rule.selector.split(",").some((part) => part.trim() === selector))
+    .flatMap((rule) => [
+      ...rule.declarations.matchAll(
+        new RegExp(`(?:^|;)\\s*${property}:\\s*([^;]+);`, "g"),
+      ),
+    ])
+    .map((match) => match[1].replace(/\s+/g, " ").trim());
+
+  if (declarations.length !== 1) {
+    throw new Error(
+      `Expected exactly one ${property} for ${selector}, found ${declarations.length}`,
+    );
+  }
+  return declarations[0];
+}
+
+describe("ARGOnite pane cards, title bars and tab track", () => {
+  it("the active tab is a raised pill on a recessed track", () => {
+    // The tablist is a recessed track with a 4px inset; the selected tab is a
+    // raised pill on it, inactive tabs are muted text in the track. The tab
+    // rules stay at shared.css's (0,2,0)/(0,1,0) specificity via :where() and
+    // win on source order (workspace.css imports after shared.css).
+    // Both tablists sit in the track: the artifact tabs and the narrow-mode
+    // Compose/Pipeline view tabs.
+    for (const track of [
+      '.artifact-workspace-toolbar [role="tablist"]',
+      '.composer-workspace[data-layout-mode="narrow"] .workspace-view-tabs',
+    ]) {
+      expect(listedDeclaration(track, "box-shadow")).toBe("var(--shadow-track)");
+      expect(listedDeclaration(track, "background-color")).toBe("var(--color-track)");
+      expect(listedDeclaration(track, "border-radius")).toBe("var(--radius-pill)");
+      expect(listedDeclaration(track, "padding")).toBe("4px");
+    }
+
+    const scope = ":where(.artifact-workspace-toolbar, .workspace-view-tabs)";
+    const selected = `${scope} .artifact-tab[aria-selected="true"]`;
+    expect(declaration(selected, "box-shadow")).toBe("var(--shadow-pill)");
+    expect(declaration(selected, "background-color")).toBe("var(--color-pill)");
+    expect(declaration(selected, "color")).toBe("var(--color-on-pill)");
+    // ARGOnite (controller ruling): the pill's edge is a 3:1 border, not the
+    // shadow alone (gated vs --color-track in colorContrast.test.ts). Unselected
+    // tabs keep shared.css's 1px transparent border, so selection never shifts
+    // layout.
+    expect(declaration(selected, "border-color")).toBe("var(--color-text-muted)");
+    expect(sharedCss).toMatch(/^\.artifact-tab\s*\{[^}]*border:\s*1px solid transparent;/m);
+    expect(declaration(`${scope} .artifact-tab`, "color")).toBe(
+      "var(--color-text-muted)",
+    );
+    expect(declaration(`${scope} .artifact-tab`, "border-radius")).toBe(
+      "var(--radius-pill)",
+    );
+  });
+
+  it("keeps a disabled tab distinguishable from an enabled inactive one", () => {
+    // Inactive tabs in the track are --color-text-muted, which is exactly
+    // shared.css's :disabled colour, so colour alone no longer separates a
+    // gated tab (Spec/YAML/Checks with no composition) from an available one.
+    // The track's disabled rule adds a dimming cue on top, the same 0.6 the
+    // disabled .switch uses (WCAG 1.4.3 exempts inactive controls).
+    const scope = ":where(.artifact-workspace-toolbar, .workspace-view-tabs)";
+    expect(declaration(`${scope} .artifact-tab`, "color")).toBe(
+      "var(--color-text-muted)",
+    );
+    expect(declaration(`${scope} .artifact-tab:disabled`, "opacity")).toBe("0.6");
+  });
+
+  it("draws both panes as cards with the gutter between and around them", () => {
+    const pane = ".workspace-authoring-pane, .workspace-artifact-pane";
+    expect(declaration(pane, "border-radius")).toBe("var(--radius-pane)");
+    expect(declaration(pane, "box-shadow")).toBe("var(--shadow-card)");
+    expect(declaration(pane, "border")).toBe("1px solid var(--color-border)");
+    expect(declaration(pane, "background-color")).toBe("var(--color-surface)");
+
+    // Half a gutter each side of the column seam makes one full gutter
+    // between the cards, with the separator centred in it.
+    const half = "calc(var(--space-pane-gutter) / 2)";
+    const gutter = "var(--space-pane-gutter)";
+    expect(declaration(".workspace-authoring-slot", "padding")).toBe(
+      `${gutter} ${half} ${gutter} ${gutter}`,
+    );
+    expect(declaration(".workspace-artifact-slot", "padding")).toBe(
+      `${gutter} ${gutter} ${gutter} ${half}`,
+    );
+    // Task B: width preferences mean CARD pixels; the slot padding is extra.
+    expect(declaration(".composer-workspace", "grid-template-columns")).toBe(
+      "calc(var(--authoring-pane-width) + 1.5 * var(--space-pane-gutter)) minmax(0, 1fr)",
+    );
+    expect(declaration(".workspace-separator-slot", "grid-column")).toBe("1");
+    expect(declaration(".workspace-separator-slot", "justify-self")).toBe("end");
+    expect(declaration(".workspace-separator-slot", "width")).toBe("0");
+    expect(declaration(".workspace-separator", "left")).toBe("-12px");
+    expect(declaration(".workspace-separator", "width")).toBe("24px");
+    const tokensCss = readFileSync("src/styles/tokens.css", "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+    const gutters = [...tokensCss.matchAll(/--space-pane-gutter:\s*([^;]+);/g)];
+    expect(gutters.map((match) => match[1])).toEqual([`${PANE_GUTTER}px`]);
+    expect(WORKSPACE_INLINE_GUTTERS).toBe(3 * PANE_GUTTER);
+    expect(declaration('.composer-workspace[data-authoring-collapsed="true"]', "grid-template-columns")).toBe(
+      "0 minmax(0, 1fr)",
+    );
+    expect(declaration('.composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"]) .workspace-authoring-slot', "padding")).toBe("0");
+    expect(declaration('.composer-workspace[data-layout-mode="narrow"]', "grid-template-columns")).toBe("minmax(0, 1fr)");
+  });
+
+  it("keeps the narrow title in the outline without spending transcript height", () => {
+    const narrow = '.composer-workspace[data-layout-mode="narrow"]';
+    const bar = `${narrow} .workspace-pane-header`;
+    for (const [property, value] of Object.entries({
+      position: "absolute", width: "1px", height: "1px", "min-height": "0",
+      padding: "0", margin: "-1px", overflow: "hidden",
+      clip: "rect(0, 0, 0, 0)", "white-space": "nowrap", border: "0",
+    })) {
+      expect(declaration(bar, property)).toBe(value);
+    }
+    expect(ruleFor(bar)).not.toMatch(/display:\s*none|visibility:\s*hidden/);
+    expect(declaration(narrow, "min-height")).toBe("calc(480px + 4 * var(--space-pane-gutter))");
+    // The dock's larger floor remains independent of the ordinary reflow fix.
+    expect(declaration(`${narrow}:has(.decision-panel)`, "min-height")).toBe("640px");
+  });
+
+  it("gives both title bars the 46px pane-header band and its fill", () => {
+    for (const bar of [".workspace-pane-header", ".artifact-workspace-toolbar"]) {
+      expect(declaration(bar, "min-height")).toBe("var(--size-pane-header)");
+      expect(declaration(bar, "background-color")).toBe("var(--color-pane-header)");
+      expect(declaration(bar, "border-bottom")).toBe(
+        "1px solid var(--color-border, currentcolor)",
+      );
+    }
+    expect(declaration(".workspace-pane-title", "font-family")).toBe(
+      "var(--font-display)",
+    );
+    expect(declaration(".workspace-pane-title", "font-size")).toBe(
+      "var(--font-size-lg)",
+    );
+    expect(declaration(".workspace-pane-title", "font-weight")).toBe(
+      "var(--font-weight-bold)",
+    );
+  });
+
+  it("visually hides the Pipeline title below 900px of pane width, keeping it in the tree", () => {
+    // The pipeline pane is the query container; it is sized by its grid
+    // track, so inline-size containment cannot collapse it.
+    expect(declaration(".artifact-workspace", "container")).toBe(
+      "pipeline-pane / inline-size",
+    );
+    const block = /@container pipeline-pane \(width < 900px\) \{([^{}]*\{[^{}]*\})\s*\}/.exec(
+      cssWithoutComments,
+    );
+    expect(block).not.toBeNull();
+    const body = block![1];
+    expect(body).toMatch(/^\s*\.workspace-pane-title--collapsible\s*\{/);
+    // The visually-hidden recipe (base.css): clipped, not display:none, so the
+    // heading stays in the accessibility tree.
+    expect(body).toContain("position: absolute;");
+    expect(body).toContain("clip: rect(0, 0, 0, 0);");
+    expect(body).not.toMatch(/display:\s*none|visibility:\s*hidden/);
+  });
+});
+
+describe("run reason tone (ARGOnite Task 8)", () => {
+  const sidebarCss = readFileSync(
+    join(process.cwd(), "src/components/sidebar/sidebar.css"),
+    "utf8",
+  ).replace(/\/\*[\s\S]*?\*\//g, "");
+
+  function sidebarDecl(selector: string, property: string): string | undefined {
+    const rule = [...sidebarCss.matchAll(/([^{}]+)\{([^{}]*)\}/g)].find(
+      (match) => match[1].replace(/\s+/g, " ").trim() === selector,
+    );
+    return rule
+      ? new RegExp(`(?:^|;)\\s*${property}:\\s*([^;]+);`).exec(rule[2])?.[1].trim()
+      : undefined;
+  }
+
+  it("a blocking run reason reads at body-text colour", () => {
+    // ARGOnite: a block is the reason Run is unavailable, so it is not secondary text.
+    expect(sidebarDecl(".side-rail-execute-reason", "color")).toBe("var(--color-text)");
+  });
+
+  it("an advisory run note stays muted", () => {
+    expect(sidebarDecl(".side-rail-execute-reason--advisory", "color")).toBe(
+      "var(--color-text-muted)",
+    );
+  });
 });

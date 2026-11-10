@@ -21,6 +21,10 @@ export const AUTHORING_MIN = 360;
 export const AUTHORING_MAX = 640;
 export const ARTIFACT_MIN = 640;
 export const STANDARD_DESKTOP_MIN = 1536;
+// Paired with --space-pane-gutter by workspaceChrome.test.ts. Both card
+// widths exclude slot padding: two outer gutters and one shared seam gutter.
+export const PANE_GUTTER = 14;
+export const WORKSPACE_INLINE_GUTTERS = 3 * PANE_GUTTER;
 
 const STORED_LAYOUT_KEYS = new Set<PropertyKey>([
   "version",
@@ -102,7 +106,7 @@ export function paneBoundsForWidth(workspaceWidth: number): PaneBounds {
   const measuredWidth = isMeasuredWidth(workspaceWidth) ? workspaceWidth : 0;
   const max = Math.max(
     AUTHORING_MIN,
-    Math.min(AUTHORING_MAX, measuredWidth - ARTIFACT_MIN),
+    Math.min(AUTHORING_MAX, measuredWidth - ARTIFACT_MIN - WORKSPACE_INLINE_GUTTERS),
   );
   return {
     min: AUTHORING_MIN,
@@ -110,7 +114,8 @@ export function paneBoundsForWidth(workspaceWidth: number): PaneBounds {
     defaultWidth:
       measuredWidth < STANDARD_DESKTOP_MIN ? AUTHORING_MIN : 420,
     resizable:
-      measuredWidth >= AUTHORING_MIN + ARTIFACT_MIN && max > AUTHORING_MIN,
+      measuredWidth >= AUTHORING_MIN + ARTIFACT_MIN + WORKSPACE_INLINE_GUTTERS &&
+      max > AUTHORING_MIN,
   };
 }
 
