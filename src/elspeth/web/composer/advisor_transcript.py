@@ -584,7 +584,7 @@ _REQUEST_REFERENCES: Final[frozenset[str]] = frozenset(get_args(AdvisorRequestRe
 @final
 @dataclass(frozen=True, slots=True)
 class AdvisorVisibleTranscript:
-    """Immutable complete available visible chronology; all text is untrusted."""
+    """Immutable available visible chronology, possibly reduced to fit a context budget (see ``availability_gaps``); all text is untrusted."""
 
     request: str = field(repr=False)
     binding: str
