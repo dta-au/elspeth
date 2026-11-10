@@ -82,6 +82,7 @@ _FREE_TEXT_DISPOSITIONS = {
     "src/elspeth/web/sessions/schemas.py:RejectProposalRequest.reason": "unused_not_persisted",
     "src/elspeth/web/sessions/schemas.py:SendMessageRequest.content": "route_guard",
     "src/elspeth/web/sessions/schemas.py:UpdateSessionRequest.title": "route_guard",
+    "src/elspeth/web/shareable_reviews/models.py:MarkReadyForReviewRequest.file_manifest_fingerprint": "structural_identifier",
 }
 
 
