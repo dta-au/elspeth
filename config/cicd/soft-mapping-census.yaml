@@ -47,7 +47,7 @@ files:
   src/elspeth/contracts/composer_audit.py:
     dict[str, Any]: 1
   src/elspeth/contracts/composer_llm_audit.py:
-    dict[str, Any]: 1
+    dict[str, Any]: 2
   src/elspeth/contracts/composer_planner_audit.py:
     dict[str, Any]: 1
   src/elspeth/contracts/config/protocols.py:
@@ -804,6 +804,10 @@ files:
   src/elspeth/web/composer/composition_completion.py:
     Mapping[str, Any]: 2
     dict[str, Any]: 4
+  src/elspeth/web/composer/context_budget_apply.py:
+    dict[str, Any]: 6
+  src/elspeth/web/composer/context_budget_history.py:
+    Mapping[str, Any]: 2
   src/elspeth/web/composer/control_messages.py:
     Mapping[str, Any]: 1
   src/elspeth/web/composer/discovery_cache.py:
@@ -829,8 +833,8 @@ files:
   src/elspeth/web/composer/pipeline_custody.py:
     Mapping[str, Any]: 6
   src/elspeth/web/composer/pipeline_planner.py:
-    Mapping[str, Any]: 25
-    dict[str, Any]: 20
+    Mapping[str, Any]: 28
+    dict[str, Any]: 26
     dict[str, object]: 2
   src/elspeth/web/composer/pipeline_proposal.py:
     Mapping[str, Any]: 20
@@ -845,7 +849,7 @@ files:
     Mapping[str, Any]: 4
   src/elspeth/web/composer/prompts.py:
     Mapping[str, object]: 1
-    dict[str, Any]: 5
+    dict[str, Any]: 6
   src/elspeth/web/composer/proposals.py:
     Mapping[str, Any]: 4
   src/elspeth/web/composer/protocol.py:
@@ -881,7 +885,7 @@ files:
   src/elspeth/web/composer/service.py:
     Mapping[str, Any]: 3
     Mapping[str, object]: 1
-    dict[str, Any]: 15
+    dict[str, Any]: 20
   src/elspeth/web/composer/session_tool.py:
     boundary: 1
     dict[str, Any]: 4
@@ -1095,10 +1099,10 @@ files:
   src/elspeth/web/shareable_reviews/service.py:
     dict[str, object]: 1
 totals:
-  Mapping[str, Any]: 790
+  Mapping[str, Any]: 795
   Mapping[str, object]: 317
   MutableMapping[str, Any]: 8
   boundary: 65
-  dict[str, Any]: 1104
+  dict[str, Any]: 1123
   dict[str, object]: 402
-  soft: 2621
+  soft: 2645
