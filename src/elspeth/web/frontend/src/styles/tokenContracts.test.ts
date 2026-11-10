@@ -250,6 +250,7 @@ describe("line-height ladder (elspeth-ec5ba7ba21)", () => {
 
 describe("ARGOnite role tokens are theme-paired", () => {
   const PAIRED_TOKENS = [
+    "--size-header-pill-height",
     "--color-brand-navy",
     "--color-brand-yellow",
     "--color-on-nav",
@@ -273,6 +274,12 @@ describe("ARGOnite role tokens are theme-paired", () => {
       expect(() => rootToken(name), `${name} missing from :root`).not.toThrow();
       expect(() => lightToken(name), `${name} missing from light theme`).not.toThrow();
     }
+  });
+
+  it("keeps the header pill register on the same compact rung in both themes", () => {
+    expect(rootToken("--size-header-pill-height")).toBe("var(--size-control-compact)");
+    expect(lightToken("--size-header-pill-height")).toBe(rootToken("--size-header-pill-height"));
+    expect(Number.parseFloat(rootToken("--size-control-compact"))).toBeGreaterThanOrEqual(24);
   });
 
   it("orders the radii node < card < pane", () => {

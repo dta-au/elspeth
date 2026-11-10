@@ -29,9 +29,9 @@
    covers something. Offsetting merely moved the occlusion onto Graph/Spec/
    YAML/Run.
 
-   The reserve is the STRIP's height (a constant), not the header's (which is
-   40/37/45/~130px across the wrap and compact rules), so no measurement is
-   involved. It is unconditional because making it conditional on a notice
+   The reserve is the STRIP's height (a constant), independent of header
+   wrapping and compact rules, so no measurement is involved. It is
+   unconditional because making it conditional on a notice
    being mounted reintroduces exactly the arrival/dismiss shift
    elspeth-1c4687ff67 removed. */
 .app-root {
@@ -226,6 +226,7 @@
   align-items: center;
   height: var(--size-header-height);
   padding: 0 var(--space-md);
+  padding-bottom: var(--space-xs);
   border-bottom: 1px solid var(--color-border);
   background: var(--color-surface-nav);
   /* ARGOnite: text on the DTA green band is --color-on-nav. Floating menus
@@ -251,7 +252,7 @@
     min-height: var(--size-header-height);
     flex-wrap: wrap;
     row-gap: var(--space-xs);
-    padding: var(--space-xs) var(--space-md);
+    padding: var(--space-xs) var(--space-md) var(--space-sm);
   }
 
   .app-header-left {
@@ -262,18 +263,21 @@
 
 @media (min-width: 961px) and (max-height: 800px) {
   .app-header {
-    /* The row includes its 1px bottom border; reserve a full 36px content
-       box so compact controls never straddle adjacent application regions. */
-    height: calc(var(--size-control-compact) + 1px);
+    /* Keep the common pill register and the extra space below it, including
+       the band's 1px bottom border. */
+    height: calc(var(--size-header-pill-height) + var(--space-xs) + 1px);
     padding-inline: var(--space-sm);
   }
+}
 
-  .header-session-switcher-trigger,
-  .header-version-selector .version-selector-trigger,
-  .user-menu-trigger {
-    height: var(--size-control-compact);
-    min-height: var(--size-control-compact);
-  }
+/* The two model chips share a class: these four selectors size all five
+   header pills in every density regime. */
+.app-header .header-session-switcher-trigger,
+.app-header .version-selector-trigger,
+.app-header .chat-model-chip,
+.app-header .user-menu-trigger {
+  height: var(--size-header-pill-height);
+  min-height: var(--size-header-pill-height);
 }
 
 /* The header brand mark is rendered by the canonical <WordMark> primitive
@@ -346,11 +350,11 @@
    chat-panel headers (elspeth-8fa71e6d15): identity chrome belongs in the
    identity-chrome region, which has page width. Quiet reference chrome:
    mono + muted so it reads as provenance metadata, not a control.
-   --color-text-muted passes 4.5:1 on both themes' page backgrounds (pinned
+   The header-specific ink and tint below pass 4.5:1 in both themes (pinned
    by colorContrast.test.ts). Truncates rather than overflows
    (elspeth-0b70269ccc); the max-width fence keeps a long provider/model id
    from crowding the session switcher at the 1280px minimum supported width
-   — the full value stays available via the chip's aria-label. */
+   — the full value stays in the text and the raw id in its title. */
 .chat-model-chip {
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
@@ -380,6 +384,9 @@
    token. */
 .app-header .chat-model-chip {
   padding: var(--space-2xs) var(--space-sm);
+  /* A block line box keeps ellipsis working while centring the mono text in
+     the shared pill height, after its two padding edges. */
+  line-height: calc(var(--size-header-pill-height) - 2 * var(--space-2xs));
   border-radius: var(--radius-pill);
   background: var(--color-nav-control);
   color: var(--color-on-nav-muted);

@@ -372,9 +372,11 @@
      .btn or .btn-compact — do not redeclare min-height literally. */
   --size-control:         44px;
   --size-control-compact: 36px;
+  /* One register for the session, version, model and account header pills. */
+  --size-header-pill-height: var(--size-control-compact);
   /* Fixed app-header row height (desktop); the <=960px wrap rule reuses it as
      a min-height so a wrapped header never renders shorter than the fixed row. */
-  --size-header-height:   40px;
+  --size-header-height:   45px;
 
   /* ── Icon sizes (elspeth-7f63055e06) ─────────────────────────────────────── */
   --size-icon-sm: 16px;
@@ -408,6 +410,7 @@
 
 /* Light theme — applied via data-theme="light" attribute (set by useTheme hook) */
 [data-theme="light"] {
+  --size-header-pill-height: var(--size-control-compact);
   /* ── Backgrounds — ARGOnite three-family role palette (light) ──────────── */
   /* Workspace family — ARGO's pale green page under near-white panels
      (active editing surfaces).

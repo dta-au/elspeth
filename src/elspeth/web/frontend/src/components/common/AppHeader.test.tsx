@@ -57,18 +57,21 @@ describe("AppHeader", () => {
     expect(appRoot).toMatch(/height:\s*100vh;\s*height:\s*100dvh;/s);
   });
 
-  it("uses one compact control height for the short desktop header and version trigger", () => {
+  it("uses the shared pill height plus bottom breathing room in the short desktop header", () => {
+    // Task A: model pills join the three triggers at one height in every
+    // density regime; compact mode only reduces the surrounding band.
     const css = readFileSync("src/components/header/header.css", "utf8");
     const shortHeightRule = css.match(
       /@media \(min-width: 961px\) and \(max-height: 800px\)\s*\{([\s\S]*?)\n\}/,
     )?.[1];
     expect(shortHeightRule).toBeDefined();
     expect(shortHeightRule).toMatch(
-      /\.app-header\s*\{[^}]*height:\s*calc\(var\(--size-control-compact\) \+ 1px\);/s,
+      /\.app-header\s*\{[^}]*height:\s*calc\(var\(--size-header-pill-height\) \+ var\(--space-xs\) \+ 1px\);/s,
     );
-    expect(shortHeightRule).toMatch(
-      /\.header-session-switcher-trigger,\s*\.header-version-selector \.version-selector-trigger,\s*\.user-menu-trigger\s*\{[^}]*height:\s*var\(--size-control-compact\);[^}]*min-height:\s*var\(--size-control-compact\);/s,
+    expect(css).toMatch(
+      /\.app-header \.header-session-switcher-trigger,\s*\.app-header \.version-selector-trigger,\s*\.app-header \.chat-model-chip,\s*\.app-header \.user-menu-trigger\s*\{[^}]*height:\s*var\(--size-header-pill-height\);[^}]*min-height:\s*var\(--size-header-pill-height\);/s,
     );
+    expect(shortHeightRule).not.toMatch(/\.(?:header-session-switcher-trigger|version-selector-trigger|chat-model-chip|user-menu-trigger)\s*[{,]/);
     expect(shortHeightRule).not.toMatch(
       /height:\s*calc\(var\(--size-header-height\) - var\(--space-sm\)\)/,
     );
