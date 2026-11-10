@@ -54,6 +54,7 @@ from elspeth.web.composer.pipeline_planner import (
     _PlannerAttemptTrail,
 )
 from elspeth.web.composer.tools import ToolContext
+from tests.unit.web.composer.test_advisor_transcript import legacy_history_transcript
 from tests.unit.web.composer.test_pipeline_planner import (
     _budget,
     _context_policy,
@@ -790,18 +791,41 @@ _AWKWARD_EVENTS: list[Any] = [
     {"role": "assistant", "number": 1e20, "small": 1e-7, "nested": {"list": [1, 2.5, None, True]}},
     {"content_ref": "initial_planner_request.intent", "role": "user"},
     {"role": "tool", "content": '{"success": true}'},
+    # A legacy tool row: its content is a reference into its own invocation's serialized JSON strings.
+    {
+        "role": "tool",
+        "content_ref": "legacy_invocations[0].result_canonical",
+        "legacy_invocations": [
+            {
+                "tool_call_id": "legacy-1",
+                "arguments_canonical": '{"blob_id":"b","offset":1}',
+                "result_canonical": '{"data":{"content":"\\"quoted\\" \\u00e9 \\\\ \\n"},"success":true}',
+            }
+        ],
+    },
 ]
 
 
 @pytest.mark.parametrize("gaps", [[], ["authenticated_persisted_history_not_supplied"]], ids=["no-gaps", "a-gap"])
 @pytest.mark.parametrize(
     "events",
-    [_AWKWARD_EVENTS, _AWKWARD_EVENTS[:1], [_AWKWARD_EVENTS[2], _AWKWARD_EVENTS[3]]],
-    ids=["mixed", "single-event", "reference-last"],
+    [_AWKWARD_EVENTS, _AWKWARD_EVENTS[:1], [_AWKWARD_EVENTS[2], _AWKWARD_EVENTS[3]], _AWKWARD_EVENTS[5:]],
+    ids=["mixed", "single-event", "reference-last", "lone-legacy-reference"],
 )
 def test_transcript_event_savings_with_the_gap_allowance_never_exceed_the_bytes_shedding_saves(events: list[Any], gaps: list[str]) -> None:
     """For every prefix the budget can shed, counted savings minus the allowance are at most the bytes actually saved."""
-    transcript, message = _hatch_message(events, gaps)
+    transcript, _ = _hatch_message(events, gaps)
+    _assert_savings_bounded(transcript)
+
+
+@pytest.mark.parametrize("reference", [None, "initial_planner_request.intent"], ids=["original-section", "planner-intent"])
+def test_legacy_history_event_savings_with_the_gap_allowance_never_exceed_the_bytes_shedding_saves(reference: str | None) -> None:
+    """The same bound over a transcript built from legacy tool rows, whose events nest serialized JSON strings."""
+    _assert_savings_bounded(legacy_history_transcript(reference=reference))
+
+
+def _assert_savings_bounded(transcript: AdvisorVisibleTranscript) -> None:
+    message = _hatch_transcript_message(transcript)
     full = _request_size(message)
     sheddable = transcript.sheddable_event_indices()
     sizes = transcript.event_bytes()
@@ -924,6 +948,25 @@ def test_a_fitted_hatch_request_shedding_a_lone_event_never_exceeds_the_byte_cei
     assert sent >= 2  # the ceilings past the allowance are fitted, not refused
 
 
+def test_legacy_reference_events_are_shed_oldest_first_with_the_others() -> None:
+    """Over tightening ceilings, a legacy history's shed events are always a prefix of its sheddable events."""
+    transcript = legacy_history_transcript()
+    sheddable = transcript.sheddable_event_indices()
+    events = json.loads(transcript.provider_json)["events"]
+    assert [index for index in sheddable if "content_ref" in events[index]] == [1, 3]
+    full, _, _ = _fit_hatch_request(transcript, earlier_calls=(), policy=_context_policy(max_request_bytes=1_000_000))
+    full_bytes = _request_size_of(full) + _TRANSCRIPT_ALLOWANCE
+    sizes = transcript.event_bytes()
+    seen: set[tuple[int, ...]] = set()
+    for count in range(1, len(sheddable) + 1):
+        ceiling = full_bytes - sum(sizes[index] for index in sheddable[:count])
+        applied, record, policy = _fit_hatch_request(transcript, earlier_calls=(), policy=_context_policy(max_request_bytes=ceiling))
+        assert record.shed_hatch_event_indices == sheddable[: len(record.shed_hatch_event_indices)]
+        assert _request_size_of(applied) <= policy.max_request_bytes
+        seen.add(record.shed_hatch_event_indices)
+    assert sheddable in seen  # every event but the current request, legacy references included, was shed
+
+
 def test_a_hatch_message_that_is_not_the_labelled_transcript_is_a_framework_bug() -> None:
     transcript, _ = _hatch_message(_AWKWARD_EVENTS, [])
     other, _ = _hatch_message(_AWKWARD_EVENTS[1:], [])
@@ -946,15 +989,6 @@ def test_a_hatch_message_that_is_not_the_labelled_transcript_is_a_framework_bug(
             earlier_calls=(),
             mark_for_cache=False,
         )
-
-
-def _context_budget_refusal(outcome: PipelinePlannerError) -> PipelinePlannerError:
-    """The context budget refusal that ended a run, directly or as the context of the hatch's original exhaustion."""
-    if outcome.code == "CONTEXT_BUDGET_EXHAUSTED":
-        return outcome
-    refusal = outcome.__context__
-    assert type(refusal) is PipelinePlannerError and refusal.code == "CONTEXT_BUDGET_EXHAUSTED", (outcome.code, refusal)
-    return refusal
 
 
 async def _hatch_run_or_refusal(
@@ -1020,7 +1054,7 @@ async def test_a_dispatched_hatch_request_never_exceeds_either_ceiling(tmp_path:
             hatch_shed += bool(shed_events)
         else:
             # Only the budget may refuse, and only before dispatch.
-            _context_budget_refusal(outcome)
+            assert outcome.code == "CONTEXT_BUDGET_EXHAUSTED", (policy, outcome.code)
     assert hatch_sent >= len(policies) - 2  # the two tightest ceilings may refuse; the rest are sent
     assert hatch_shed >= 4  # the ceilings below the full hatch request shed transcript events to send it
 
@@ -1057,8 +1091,40 @@ async def test_a_hatch_request_whose_protected_content_cannot_fit_is_refused_aft
 
     completion, recorder, outcome = await _hatch_run_or_refusal(tmp_path, tool_context, _context_policy(max_request_bytes=cap_bytes))
 
-    # A failed hatch turn reports the exhaustion that engaged the hatch; the refusal is its context.
-    assert outcome.code == "DISCOVERY_EXHAUSTED"
-    refusal = _context_budget_refusal(outcome)
-    assert refusal.detail_codes == ("context_ceiling_bytes", "largest_component_reference")
+    # The refusal surfaces as itself, not as the exhaustion that engaged the hatch.
+    assert outcome.code == "CONTEXT_BUDGET_EXHAUSTED"
+    assert outcome.detail_codes == ("context_ceiling_bytes", "largest_component_reference")
+    assert len(completion.requests) == len(recorder.llm_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_another_hatch_turn_failure_still_surfaces_as_the_exhaustion_that_engaged_the_hatch(
+    tmp_path: Path, tool_context: ToolContext
+) -> None:
+    """Control: the hatch call is refused by the provider call budget, not the context budget."""
+    completion = _ScriptedCompletion(
+        _response_with_call_id("state", "get_pipeline_state", {}),
+        _response_with_call_id("sources", "list_sources", {}),
+        _text_response("Please upload the input for JSON conversion."),
+    )
+    recorder = BufferingRecorder()
+    with pytest.raises(PipelinePlannerError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            intent="The latter.",
+            budget=_budget(max_total_provider_calls=2),
+            model_overrides={
+                "model_identifier": _UNMARKED,
+                "max_discovery_turns": 1,
+                "escape_hatch_model": "test/advisor",
+                "escape_hatch_provider": "test-provider",
+            },
+        )
+
+    assert caught.value.code == "DISCOVERY_EXHAUSTED"
+    assert type(caught.value.__context__) is PipelinePlannerError
+    assert caught.value.__context__.code == "PROVIDER_CALLS_EXHAUSTED"
     assert len(completion.requests) == len(recorder.llm_calls) == 2

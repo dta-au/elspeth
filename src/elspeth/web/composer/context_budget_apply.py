@@ -40,7 +40,9 @@ CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES: Final[int] = 256
 # ``"oldest_events_omitted_for_context_budget"`` gap with its quotes and
 # separator, as JSON-escaped inside the transcript message's content (46), and
 # the one byte an event's saving over-counts when the transcript's only event
-# is removed. The planner adds it whenever transcript events may be shed.
+# is removed. Those total 47; the rest is margin so a longer gap spelling or
+# one more separator-level edge cannot silently turn the bound into an
+# over-count. The planner adds it whenever transcript events may be shed.
 CONTEXT_BUDGET_TRANSCRIPT_GAP_ALLOWANCE_BYTES: Final[int] = 64
 
 
