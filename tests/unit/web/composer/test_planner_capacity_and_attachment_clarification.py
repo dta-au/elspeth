@@ -40,6 +40,7 @@ from elspeth.web.required_work import (
 )
 from tests.unit.web.composer.test_pipeline_planner import (
     _budget,
+    _context_policy,
     _custody,
     _empty_state,
     _lifecycle,
@@ -199,6 +200,7 @@ async def test_length_stops_settle_each_owned_physical_provider_attempt(
                 rendered_skill=load_pipeline_capability_core() + "\nOrdinary bounded planner instructions.",
                 repair_budget=1,
                 budget_policy=_budget(),
+                context_policy=_context_policy(),
                 custody_config=replace(
                     _custody(tmp_path), session_engine=engine, session_operation_context=context, session_operation_authority=authority
                 ),
