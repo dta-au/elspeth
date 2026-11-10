@@ -207,13 +207,18 @@ def retained_operation_context_message(context: RetainedOperationContext | None)
 # keeps them bare constants rather than wrapped diagnostics, so they need no
 # ``_wrapped_diagnostic_template`` shape or trusted-suffix registration.
 PIPELINE_STAGED_AUTO_COMMIT_MESSAGE: Final[str] = "I prepared and validated the requested pipeline. ELSPETH will commit it atomically."
-PIPELINE_STAGED_REVIEW_MESSAGE: Final[str] = "I prepared and validated the requested pipeline for your review."
+PIPELINE_STAGED_REVIEW_MESSAGE: Final[str] = (
+    "I prepared and validated the requested pipeline for your review. The proposal has not been applied. "
+    "Review and accept it to apply the pipeline, or reject it if it is not what you want."
+)
 # Staged over a RED Stage-2 verdict. Auto-commit is downgraded to review
 # rather than hard-failed (the Shape-14 report-don't-block posture): a human
 # still reads the proposal, and a preflight false-red must not destroy an
 # otherwise stageable plan. It must simply never commit unreviewed.
 PIPELINE_STAGED_REVIEW_FINDINGS_MESSAGE: Final[str] = (
-    "I prepared the requested pipeline and staged it for your review. Validation found issues that must be fixed before it can run."
+    "I prepared the requested pipeline and staged it for your review. The proposal has not been applied. "
+    "Validation found issues that must be fixed before it can run. Inspect the findings and request a correction. "
+    "Review and accept the proposal only if you want to apply it for further editing, or reject it."
 )
 # Staged when Stage 2 could not be measured at all — it raised, timed out, or
 # the plan carried no candidate state. Deliberately distinct from the findings
@@ -221,8 +226,9 @@ PIPELINE_STAGED_REVIEW_FINDINGS_MESSAGE: Final[str] = (
 # objection, and collapsing the two would report a hole as a finding. Fails
 # closed — it never reads as validated and never auto-commits.
 PIPELINE_STAGED_REVIEW_PREFLIGHT_NOT_RUN_MESSAGE: Final[str] = (
-    "I prepared the requested pipeline and staged it for your review. "
-    "ELSPETH could not complete validation, so it is not confirmed runnable."
+    "I prepared the requested pipeline and staged it for your review. The proposal has not been applied. "
+    "ELSPETH could not complete validation, so it is not confirmed runnable. Request a validation retry or revise your request. "
+    "Review and accept the proposal only if you want to apply it for further editing, or reject it."
 )
 # Staged over the pending-interpretation handoff shape. Held apart from the
 # findings wording because it is NOT a validator objection: the pipeline is
@@ -232,7 +238,8 @@ PIPELINE_STAGED_REVIEW_PREFLIGHT_NOT_RUN_MESSAGE: Final[str] = (
 # It still blocks auto-commit — an unresolved review must not become canonical
 # state unreviewed.
 PIPELINE_STAGED_REVIEW_PENDING_INTERPRETATION_MESSAGE: Final[str] = (
-    "I prepared the requested pipeline and staged it for your review. It has interpretation review cards to resolve before it can run."
+    "The pipeline proposal needs your acceptance. Review and accept it to open its interpretation cards, "
+    "then resolve those cards before running. Reject the proposal if it is not what you want."
 )
 
 
