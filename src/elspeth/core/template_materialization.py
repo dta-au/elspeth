@@ -58,6 +58,13 @@ class FileBackedTemplateOption:
     # materialization and the in-memory rejection scan both leave it alone.
     top_level: bool = True
 
+    def __post_init__(self) -> None:
+        if not self.top_level and self.nested_in is None:
+            raise ValueError(
+                f"File-backed option {self.file_key!r} is unreachable: it has no top-level form (top_level=False) "
+                "and declares no nested container (nested_in=None)"
+            )
+
 
 @dataclass(frozen=True, slots=True)
 class MaterializedFileOption:
@@ -273,8 +280,13 @@ class TemplateOptionMaterializer:
                 raw_name = plugin_config["name"] if "name" in plugin_config else index
                 # The remediation list is DERIVED from the registry, not typed out:
                 # a hand-written list silently omits every key added after it,
-                # which is the failure this check exists to prevent.
-                inline_instead = ", ".join(rule.content_key for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY)
+                # which is the failure this check exists to prevent. Only the rules
+                # that apply to THIS node are listed: a nested-only content key is
+                # not an option any other plugin can inline.
+                nested_rules = tuple(rule for rule, _ in _nested_rules_for(plugin_name))
+                inline_instead = ", ".join(
+                    rule.content_key for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY if rule.top_level or rule in nested_rules
+                )
                 raise ValueError(
                     "load_settings_from_yaml_string() cannot expand file-backed template options "
                     f"{present} for {collection_name}[{raw_name!r}] because in-memory web execution "

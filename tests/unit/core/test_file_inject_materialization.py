@@ -10,6 +10,7 @@ from elspeth.contracts.enums import RunMode
 from elspeth.core.template_materialization import (
     FILE_BACKED_TEMPLATE_OPTION_KEYS,
     FILE_BACKED_TEMPLATE_OPTION_REGISTRY,
+    FileBackedTemplateOption,
     TemplateFileError,
     TemplateOptionMaterializer,
 )
@@ -133,3 +134,52 @@ def test_file_inject_does_not_resolve_another_plugins_nested_key(tmp_path: Path)
         crossed = _config(options)
         assert materializer.materialize_config(crossed) == crossed
         TemplateOptionMaterializer.reject_file_backed_options(crossed)
+
+
+_BASE_REMEDIATION_TAIL = (
+    "has no trusted settings file base path. Use load_settings() for file-backed "
+    "configs, or inline prompt_template, lookup, system_prompt, reference_content before web validation/execution."
+)
+
+
+@pytest.mark.parametrize(
+    ("plugin", "options", "present"),
+    [
+        ("reference_join", {"tables": {"products": {"reference_file": "p.csv"}}}, "[\"tables['products'].reference_file\"]"),
+        ("reference_join", {"reference_file": "p.csv"}, "['reference_file']"),
+        ("llm", {"template_file": "t.j2"}, "['template_file']"),
+    ],
+)
+def test_in_memory_rejection_text_is_unchanged_for_existing_plugins(plugin: str, options: dict, present: str) -> None:
+    """Byte-for-byte the message on base commit 84d07a8d: no nested-only `content`."""
+    with pytest.raises(ValueError) as exc:
+        TemplateOptionMaterializer.reject_file_backed_options(_config(options, plugin=plugin))
+
+    assert str(exc.value) == (
+        "load_settings_from_yaml_string() cannot expand file-backed template options "
+        f"{present} for transforms['bind'] because in-memory web execution " + _BASE_REMEDIATION_TAIL
+    )
+
+
+def test_in_memory_rejection_tells_file_inject_to_inline_content() -> None:
+    with pytest.raises(ValueError) as exc:
+        TemplateOptionMaterializer.reject_file_backed_options(_config({"files": {"A": {"content_file": "a.md"}}}))
+
+    assert str(exc.value) == (
+        "load_settings_from_yaml_string() cannot expand file-backed template options "
+        "[\"files['A'].content_file\"] for transforms['bind'] because in-memory web execution "
+        "has no trusted settings file base path. Use load_settings() for file-backed "
+        "configs, or inline prompt_template, lookup, system_prompt, reference_content, content before web validation/execution."
+    )
+
+
+def test_a_rule_with_neither_a_top_level_nor_a_nested_form_is_refused() -> None:
+    with pytest.raises(ValueError, match=r"'orphan_file'.*unreachable"):
+        FileBackedTemplateOption(
+            file_key="orphan_file",
+            content_key="orphan",
+            source_key="orphan_source",
+            label="Orphan file",
+            content_kind="text",
+            top_level=False,
+        )
