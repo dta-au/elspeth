@@ -4,6 +4,70 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## Unreleased (0.8.12)
+
+This section records changes intended for 0.8.12. It does not establish
+qualification, a published tag or an image.
+
+### Upgrade notes
+
+Neither schema epoch changes and no stored data is migrated, reset or
+rewritten. Two configuration changes are breaking:
+
+- **`ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` is required.** It has no
+  default; the web server will not start without it. Set it to the
+  prompt-token limit of the model gateway in front of the Composer. The
+  shipped deployment examples carry `200000` as a placeholder.
+- **The default of `composer_planner_max_request_bytes`
+  (`ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES`) is now 960 KiB** (it
+  was 2 MiB), and it now also bounds the compose loop, not only the planner.
+  A deployment that needs the old value must set it explicitly and raise the
+  gateway's body cap to match.
+
+Two optional settings are new: `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_ABOVE`
+(default `0.85`) and `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_TO` (default `0.60`),
+fractions of the token cap; `SHED_TO` must be below `SHED_ABOVE`.
+
+### Composer
+
+- **The Composer sheds context to fit an operator-set budget.** Before every
+  Web Composer provider call, on the compose loop and the planner, the server
+  removes context in a fixed order until the request fits the prompt-token cap
+  and the request-byte ceiling: earlier tool results in the current turn
+  (each body replaced by a fixed stub; the call and result message stay),
+  then earlier assistant prose, then escape-hatch transcript events, then the
+  oldest earlier user requests, oldest first within each. Shedding starts
+  above `SHED_ABOVE` of the cap and continues to `SHED_TO`. The system skill,
+  catalog, tool definitions, current request, pipeline state and latest tool
+  round trip are never removed. The budgeter makes no provider call and adds
+  no text of its own beyond the stub and counts of omitted messages.
+- **What was shed is recorded on each call.** Composer call records gain a
+  `context_budget` field (the policy hash, estimated tokens before and after,
+  the ratio used, and what was removed or stubbed). Older records without it
+  read as "no shedding recorded".
+- **A request that cannot fit is refused with a named cause.** When the
+  protected content alone exceeds either ceiling, the server refuses before
+  any provider call with `context_budget_exceeded`: "This conversation is too
+  large for the composer to continue. Start a new session, or shorten your
+  request." It offers no Retry. This also replaces the generic failure
+  previously shown when the planner's request-byte ceiling refused a request.
+- **Users are told when history is shed.** A turn whose model call leaves
+  earlier conversation out shows the progress notice "Earlier conversation is
+  no longer visible to the composer."
+- **The escape-hatch transcript header no longer says "Complete"**, because
+  the transcript can now be reduced to fit the budget.
+- **`composer_skill_hash` changes.** The composer skill gains one paragraph
+  explaining the counts of omitted earlier messages.
+
+Known limits: token counts are estimated from request bytes using the
+session's last recorded bytes-per-token ratio (3.0 before its first
+successful call), not a tokenizer. If the provider still rejects a request
+for context length, it is recorded as before and there is no automatic retry.
+The planner measures its request on a slightly larger basis than the compose
+loop, so it sheds a little earlier.
+
+---
+
 ## 0.8.12 - 2026-11-10
 
 Composer tool remediation. Verification status is recorded in the pull
