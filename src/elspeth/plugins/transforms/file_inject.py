@@ -12,13 +12,15 @@ Because the content is IN THE CONFIG, it flows into node identity and the
 topology hash, so editing a bound file between a run and its resume refuses
 the resume.
 
-This module currently holds the configuration half: the config models, the
-parsing of each entry and the declared types of the written fields. Every
-refusal here fires at config validation, before any row is processed.
+The config models parse every entry and declare the type of every written
+field, so each refusal that content can cause fires at config validation,
+before any row is processed. That leaves ``FileInject.process`` with a dict
+lookup and a copy: it parses nothing and evaluates nothing.
 """
 
 from __future__ import annotations
 
+import copy
 import csv
 import io
 import json
@@ -29,9 +31,15 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
+from elspeth.contracts import Determinism
+from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.identifiers import validate_field_name
-from elspeth.contracts.schema import FieldDefinition
+from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_missing_guaranteed_fields
+from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.config_content import (
     CanonicalSizeLimitExceededError,
@@ -41,6 +49,8 @@ from elspeth.plugins.infrastructure.config_content import (
     reject_duplicate_json_object_members,
     reject_nonfinite_constant,
 )
+from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 
 #: Upper bound on the canonical bytes of one entry's parsed value.
 MAX_FILE_INJECT_ENTRY_BYTES = 16 * 1024 * 1024
@@ -572,3 +582,211 @@ def added_output_fields(cfg: FileInjectConfig) -> tuple[FieldDefinition, ...]:
     """
     declared_by_name = {field.name: field for field in cfg.schema_config.fields or ()}
     return tuple(declared_by_name[name] if name in declared_by_name else written.definition for name, written in cfg._written.items())
+
+
+class FileInject(BaseTransform):
+    """Write whole bound files into row fields: one chosen by a row value, or all of them."""
+
+    # The top-level output_field (mode 'select') names a field this transform
+    # WRITES; key_field is the column it reads. Mode 'all' names its written
+    # fields per entry, under ``files``, which is not a column-naming option by
+    # ``is_column_naming_config_option`` and so needs no classification here.
+    output_naming_config_keys = frozenset({"output_field"})
+    name = "file_inject"
+    determinism = Determinism.DETERMINISTIC
+    plugin_version = "1.0.0"
+    source_file_hash: str | None = "sha256:564cbcd6ca70a378"
+    config_model = FileInjectConfig
+    passes_through_input = True
+    usage_when_to_use: str = (
+        "Use when rows need the whole content of a small file you can ship alongside the pipeline: a style "
+        "guide, rubric or instruction text for a later prompt, either the same files on every row or one "
+        "file chosen by a value on the row."
+    )
+    usage_when_not_to_use: str = (
+        "Not a source and not a way to read a file at runtime: the files are fixed at config time. Use a "
+        "source for pipeline input, reference_join to look up one entry of a keyed table, and "
+        "blob_csv_expand or blob_json_expand when a file's records should become rows."
+    )
+    example_use: str = """transform:
+  plugin: file_inject
+  options:
+    mode: select
+    key_field: document_kind
+    output_field: review_guidance
+    files:
+      "invoice":
+        content: "Check the totals against the line items.\n"
+        format: text
+      "contract":
+        content: "Check the parties, dates and signatures.\n"
+        format: text
+    on_miss: fail
+    schema:
+      mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("file", "enrichment", "prompt-context", "reference-data")
+
+    @classmethod
+    def probe_config(cls) -> dict[str, Any]:
+        return {
+            "schema": {"mode": "observed"},
+            "mode": "select",
+            "key_field": "file_inject_probe_key",
+            "output_field": "file_inject_probe_added_1",
+            "files": {"probe": {"content": "probe value", "format": "text"}},
+        }
+
+    def __init__(self, options: dict[str, Any]) -> None:
+        super().__init__(options)
+        cfg = FileInjectConfig.from_dict(options, plugin_name=self.name)
+        self._initialize_declared_input_fields(cfg)
+        #: mode 'select': (key_field, output_field). None in mode 'all';
+        #: config validation requires both options in 'select' and refuses
+        #: both in 'all'.
+        self._select = None if cfg.key_field is None or cfg.output_field is None else (cfg.key_field, cfg.output_field)
+        self._on_miss = cfg.effective_on_miss
+        self._default_content = cfg.default_content
+        self._parsed = cfg._parsed
+        self._entry_names = sorted(cfg.files)
+        #: mode 'all': (written field, entry name) in field order.
+        self._entry_by_field = tuple(
+            sorted((entry.output_field, name) for name, entry in cfg.files.items() if entry.output_field is not None)
+        )
+        self._written_fields = tuple(sorted(cfg._written))
+        self.declared_output_fields = frozenset(cfg._written)
+        self.input_schema = create_schema_from_config(cfg.schema_config, "FileInjectInput", allow_coercion=False)
+        field_by_name = {field.name: field for field in cfg.schema_config.fields or ()}
+        field_by_name.update((field.name, field) for field in added_output_fields(cfg))
+        guaranteed = tuple(sorted(set(cfg.schema_config.guaranteed_fields or ()) | self.declared_output_fields))
+        self._output_schema_config = SchemaConfig(
+            mode=cfg.schema_config.mode if cfg.schema_config.fields is not None else "flexible",
+            fields=declare_missing_guaranteed_fields(tuple(field_by_name.values()), guaranteed),
+            guaranteed_fields=guaranteed,
+            audit_fields=cfg.schema_config.audit_fields,
+            required_fields=cfg.schema_config.required_fields,
+        )
+        self.output_schema = create_schema_from_config(self._output_schema_config, "FileInjectOutput", allow_coercion=False)
+
+    @classmethod
+    def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
+        if issue_code is None:
+            return PluginAssistance(
+                plugin_name=cls.name,
+                issue_code=None,
+                summary="Write the whole content of bound files into row fields, for every row or chosen by a row value.",
+                composer_hints=(
+                    "The files are configuration, not a source: they are fixed when the run starts and are not fetched.",
+                    "mode has no default. mode: all writes every files entry onto every row, each to the output_field "
+                    "set inside that entry. mode: select writes one entry, the one whose name equals the row's "
+                    "key_field value, to the top-level output_field.",
+                    "In mode select the entry names are the key values. They are compared exactly, with no trimming "
+                    "and no case folding, and the key value must be a string; quote every entry name.",
+                    "on_miss applies to mode select only and defaults to fail, because a row without its guidance "
+                    "looks like any other row at a sink. Use null, or default with default_content, to continue instead. "
+                    "A row with no key_field, or a non-string value there, is a row error under every on_miss.",
+                    "Set format on every entry: text, json, jsonl or csv. It is never inferred from a file name. "
+                    "text writes the content as one string, unmodified; json writes the parsed value; jsonl and csv "
+                    "write a list, and csv cells remain strings.",
+                    "In the composer, discover an uploaded ready file with list_blobs and get_blob_metadata. "
+                    "Wire it with wire_blob_inline_ref at 'node:<node_id>.options.files.<entry_name>.content', "
+                    "once per entry.",
+                    "On the CLI put content_file: <name> under each entry, beside settings.yaml; the loader reads it "
+                    "into that entry's content.",
+                    "Only files the user has uploaded can be attached. When the user wants text they have not "
+                    "uploaded, tell them to save it as a file and upload it, then attach that upload. Do not use "
+                    "create_blob as a substitute, and do not paste the text into content yourself.",
+                    "An output field must not already exist on the arriving row: file_inject never overwrites, and "
+                    "a row that already carries the field is a row error. Pick a new name.",
+                    "Every entry is parsed when the configuration is validated, so malformed json, jsonl or csv "
+                    "fails there rather than on a row. Parsed values are capped per entry and per node; keep bound "
+                    "files small.",
+                    "To choose one record of a keyed table rather than one whole file, use reference_join.",
+                ),
+            )
+        return None
+
+    def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Give the probe row a key that names an entry, so mode 'select' hits."""
+        if self._select is None:
+            return [probe]
+        return [self._augment_invariant_probe_row(probe, field_name=self._select[0], value=self._entry_names[0])]
+
+    def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
+        del ctx
+        for field_name in self._written_fields:
+            if field_name in row:
+                return TransformResult.error(
+                    {
+                        "reason": "invalid_input",
+                        "field": field_name,
+                        "error": f"row already has a {field_name!r} field; file_inject does not overwrite an arriving field",
+                    },
+                    retryable=False,
+                )
+
+        # None in mode 'all', which has no key and so neither a match nor a miss.
+        matched: bool | None = None
+        if self._select is None:
+            written = [(field_name, self._parsed[entry_name]) for field_name, entry_name in self._entry_by_field]
+        else:
+            key_field, output_field = self._select
+            if key_field not in row:
+                return TransformResult.error(
+                    {
+                        "reason": "missing_field",
+                        "field": key_field,
+                        "error": f"row has no {key_field!r} field to select a file_inject entry by",
+                    },
+                    retryable=False,
+                )
+            key = row[key_field]
+            # Exact type, exact value: nothing is coerced, trimmed or case-folded,
+            # so an entry is selected only by the string the author wrote.
+            if type(key) is not str:
+                return TransformResult.error(
+                    {
+                        "reason": "type_mismatch",
+                        "field": key_field,
+                        "expected": "str",
+                        "actual": type(key).__name__,
+                        "error": f"the row's {key_field!r} must be a string to name a file_inject entry, got {type(key).__name__}",
+                    },
+                    retryable=False,
+                )
+            matched = key in self._parsed
+            if matched:
+                selected = self._parsed[key]
+            elif self._on_miss == "fail":
+                return TransformResult.error(
+                    {
+                        "reason": "file_inject_miss",
+                        "field": key_field,
+                        "error": f"no file_inject entry named for the row's {key_field!r}; entries: {self._entry_names}",
+                    },
+                    retryable=False,
+                )
+            else:
+                selected = self._default_content if self._on_miss == "default" else None
+            written = [(output_field, selected)]
+
+        output = copy.deepcopy(row.to_dict())
+        # The bound values live as long as the transform. A str is immutable;
+        # anything else is copied so no two rows ever hold the same object.
+        output.update((name, value if type(value) is str else copy.deepcopy(value)) for name, value in written)
+
+        output_contract = narrow_contract_to_output(input_contract=row.contract, output_row=output)
+        output_contract = self._apply_declared_output_field_contracts(output_contract)
+        output_contract = self._align_output_contract(output_contract)
+
+        return TransformResult.success(
+            PipelineRow(output, output_contract),
+            success_reason={
+                "action": "enriched",
+                "fields_added": [name for name, _ in written],
+                "metadata": ({"mode": "all"} if matched is None else {"mode": "select", "matched": matched, "on_miss": self._on_miss}),
+            },
+        )
+
+    def close(self) -> None:
+        """No resources to release: the files are configuration."""
