@@ -3741,6 +3741,15 @@ class TestPreviewProofStep:
         repair = diag["suggested_repair"]
         assert repair.index("inspect_source") < repair.index("explicit numeric type")
 
+    def test_observed_csv_gate_typing_repair_does_not_name_a_string_compared_field(self) -> None:
+        """With several fields in the condition, ``fields[0]`` need not be the numeric one:
+        the repair must not tell the model to type the string-compared field as an int."""
+        mismatch = self._preview_gate_against_observed_csv("row['customer'] == 'Alice' and row['price'] >= 100")
+        assert mismatch
+        repair = mismatch[0]["suggested_repair"]
+        assert "customer: int" not in repair
+        assert "<field>: int" in repair
+
     def test_observed_csv_gate_get_of_a_present_field_keeps_unconditional_typing_repair(self) -> None:
         mismatch = self._preview_gate_against_observed_csv("row.get('price') >= 100")
         assert mismatch

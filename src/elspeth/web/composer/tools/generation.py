@@ -3149,7 +3149,9 @@ def _gate_expression_type_diagnostics_for_observed_csv(
                     exc.kind,
                     node_id=node.id,
                     condition=condition,
-                    field=field,
+                    # Only a single-field condition can name the field to type;
+                    # with several, ``fields[0]`` may be a string-compared one.
+                    field=field if len(fields) == 1 else None,
                     absent_fields=absent_fields,
                 )
                 diagnostics.append(
@@ -3244,7 +3246,12 @@ def _gate_evaluation_failure_text(
                     "cannot be compared, so a misspelt field name is reported as a type failure. Otherwise observed CSV source values "
                     f"are strings unless the source schema declares explicit field types. {_GATE_EVALUATION_WITHHELD_NOTE}",
                     f"First compare {names} with the source's observed field names (call inspect_source) and "
-                    "correct a misspelt name in the gate condition. Only if the names are right and the field is "
+                    "correct a misspelt name in the gate condition. This check keys each sampled row by the file's raw "
+                    "header spelling, while the runtime row keys are the normalized names (runtime_headers); if the "
+                    "condition already uses a runtime name, tell the user the preview cannot judge it rather than "
+                    "renaming it to the raw spelling. If the names are right and the sampled row is merely short, "
+                    "guard the read, for example row.get('<field>') is not None and <condition>. Only if the "
+                    "names are right, the rows are complete and the field is "
                     "meant to be numeric, patch the source schema to declare it with an explicit numeric type, for "
                     "example schema.mode='fixed' or 'flexible' with schema.fields including <field>: int, then "
                     "re-run preview_pipeline.",
@@ -3255,17 +3262,24 @@ def _gate_evaluation_failure_text(
                 f"{_GATE_EVALUATION_WITHHELD_NOTE}",
                 "Patch the source schema to declare the compared field with an explicit numeric "
                 "type, for example schema.mode='fixed' or 'flexible' with schema.fields including "
-                f"{field + ': int' if field is not None else '<field>: int'}, then re-run preview_pipeline.",
+                f"{field + ': int' if field is not None else '<field>: int'}, then re-run preview_pipeline. "
+                "If the field is meant to stay text, the incompatibility is elsewhere in the condition: check "
+                "the operand and argument types of each comparison, function call and index in it, and correct "
+                "the one that mixes types.",
             )
         case "missing_key":
             return (
                 f"{subject} reads a field that a sampled observed CSV row does not carry. Either the name is not "
-                "a column of the source, or that row is shorter than the header; the check covers only the "
-                f"first rows of the file. It is not a field-typing mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
+                "a column of the source, or that row is shorter than the header, or the name is a normalized "
+                "runtime name (this check keys each sampled row by the file's raw header spelling); the check "
+                f"covers only the first rows of the file. It is not a field-typing mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
                 "Compare every field name the condition reads with the source's observed field names "
                 "(call inspect_source) and correct a misspelt name in the gate condition or the source "
                 "column mapping. If the names are right, some data rows are short: fix the source data or guard "
-                "the read, for example row.get('<field>') is not None and <condition>, then re-run preview_pipeline.",
+                "the read, for example row.get('<field>') is not None and <condition>, then re-run preview_pipeline. "
+                "If the condition already uses a runtime name from runtime_headers, the preview cannot judge it: "
+                "do not rename it to the raw spelling, and tell the user the preview check is blocking a name "
+                "that is correct at runtime.",
             )
         case "index_out_of_range":
             return (

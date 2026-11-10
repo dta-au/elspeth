@@ -143,3 +143,27 @@ def test_unknown_kind_is_refused_not_defaulted() -> None:
     unknown: Any = "not_a_kind"
     with pytest.raises(AssertionError):
         _gate_evaluation_failure_text(unknown, node_id="g", condition="c", field=None, absent_fields=())
+
+
+@pytest.mark.parametrize(
+    ("kind", "absent_fields"),
+    (("missing_key", ()), ("incompatible_types", ("order_amount",))),
+)
+def test_a_runtime_name_the_raw_keyed_sample_lacks_has_a_way_out(kind: ExpressionEvaluationKind, absent_fields: tuple[str, ...]) -> None:
+    # The preview keys sampled rows by the RAW header spelling; a gate written with
+    # the normalized runtime name is blocked although it is correct at runtime. The
+    # text must say so and leave the model a move that is not "rename to the raw name".
+    message, repair = _text(kind, absent_fields=absent_fields)
+    text = f"{message} {repair}"
+    assert "raw header spelling" in text
+    assert "runtime_headers" in text
+    assert "tell the user" in repair
+
+
+def test_incompatible_types_does_not_claim_typing_is_the_only_cause() -> None:
+    # starts_with(row['x'], 1) and row['x']['bad'] both raise incompatible_types and
+    # no numeric declaration cures them: the repair must also point inside the condition.
+    _, repair = _text("incompatible_types")
+    assert "the incompatibility is elsewhere in the condition" in repair
+    _, repair_absent = _text("incompatible_types", absent_fields=("price",))
+    assert "merely short" in repair_absent
