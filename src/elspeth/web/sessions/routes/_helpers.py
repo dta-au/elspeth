@@ -3219,7 +3219,7 @@ async def _handle_planner_failure(
         writer_principal="compose_loop",
         session_operation_context=session_operation_context,
     )
-    body: dict[str, object] = {
+    return status_code, {
         "error_type": "composer_planner_failure",
         "failure_code": failure_code,
         # The closed planner code reaches the CLIENT, not only the durable audit row above.
@@ -3231,13 +3231,11 @@ async def _handle_planner_failure(
         # with no provider content, usage, or model metadata.
         "planner_code": exc.code,
         "detail": detail,
-    }
-    if failure_code == CONTEXT_BUDGET_FAILURE_CODE:
         # A context budget refusal makes no provider call, so it leaves no
         # call record: the operation record, which seals this body, is where
         # the ceiling it hit and the largest component are kept.
-        body["detail_codes"] = sorted(set(exc.detail_codes))
-    return status_code, body
+        **({"detail_codes": sorted(set(exc.detail_codes))} if failure_code == CONTEXT_BUDGET_FAILURE_CODE else {}),
+    }
 
 
 async def _handle_convergence_error(
