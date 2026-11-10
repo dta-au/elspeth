@@ -36,8 +36,10 @@ Layer: L3 (web application).
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Self
 from uuid import UUID
+
+from pydantic import Field, model_validator
 
 from elspeth.web.audit_readiness.models import AuditReadinessSnapshot
 from elspeth.web.execution.schemas import _StrictResponse
@@ -55,10 +57,22 @@ class MarkReadyForReviewRequest(_StrictResponse):
     deployment maximum. A listed value above the deployment maximum is
     refused by the service (also 422) — the browser is not trusted to
     enforce the operator's cap.
+
+    ``file_manifest_fingerprint`` is the ``manifest_fingerprint`` the owner's
+    file preview (``GET .../shareable-files``) returned. It is required with
+    ``allow_import`` (422 without it): the share freezes files only if they
+    are still the ones the owner was shown.
     """
 
     allow_import: bool = False
     lifetime_seconds: Literal[86400, 604800, 2592000] | None = None
+    file_manifest_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _import_names_the_previewed_files(self) -> Self:
+        if self.allow_import and self.file_manifest_fingerprint is None:
+            raise ValueError("allow_import requires file_manifest_fingerprint from the shareable-files preview")
+        return self
 
 
 class MarkReadyForReviewResponse(_StrictResponse):
@@ -131,6 +145,10 @@ class ShareableFilesResponse(_StrictResponse):
     # refuses any longer ``lifetime_seconds``, so the dialog offers only
     # lifetimes at or below it.
     max_lifetime_seconds: int
+    # Fingerprint of the listed files, or ``None`` when they are not
+    # importable. An importable share sends it back as
+    # ``file_manifest_fingerprint``; it is a digest, not a file's content hash.
+    manifest_fingerprint: str | None
 
 
 # ── Strict Pydantic mirrors of CompositionState dataclasses ──────────────

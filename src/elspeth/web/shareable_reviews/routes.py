@@ -84,7 +84,9 @@ def create_shareable_reviews_router() -> APIRouter:
 
         Returns 409 with a generic detail if the composition fails either
         gate (validation or readiness-error), or — when import is allowed —
-        if a file it uses cannot be shared (the detail names the file).
+        if a file it uses cannot be shared (the detail names the file) or
+        the files differ from the ones the owner previewed
+        (``error_type: share_files_changed``).
         Returns 422 for a lifetime outside the offered set or above the
         deployment maximum. Returns 404 (byte-identical to "session does
         not exist") if the session belongs to a different user (IDOR).
@@ -118,12 +120,18 @@ def create_shareable_reviews_router() -> APIRouter:
                     session_operation_context=lease.context,
                     allow_import=options.allow_import,
                     lifetime_seconds=options.lifetime_seconds,
+                    confirmed_file_manifest=options.file_manifest_fingerprint,
                 )
             except CompositionNotRunnableError as exc:
                 if exc.reason == "lifetime_exceeds_maximum":
                     # A request the owner can fix by choosing a shorter
                     # lifetime, not a composition-state conflict.
                     raise HTTPException(status_code=422, detail=exc.detail or exc.reason) from exc
+                if exc.reason == "share_files_changed":
+                    # Typed so the dialog reloads the file list and asks the
+                    # owner to confirm again, instead of offering a retry
+                    # that would present the same stale fingerprint.
+                    raise HTTPException(status_code=409, detail={"error_type": exc.reason, "detail": exc.detail}) from exc
                 # ``from exc``: preserves the server-side __context__ chain for
                 # logs. Wire-facing ``detail`` is unaffected — only the internal
                 # traceback chain. The probing-attacker rationale that justifies

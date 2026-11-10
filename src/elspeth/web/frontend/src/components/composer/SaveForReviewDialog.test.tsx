@@ -30,6 +30,7 @@ const _FILES = {
   importable: true,
   not_importable_reason: null,
   max_lifetime_seconds: 2592000,
+  manifest_fingerprint: "f".repeat(64),
 };
 const _OPTIONS = { allowImport: true, lifetimeSeconds: 604800 } as const;
 
@@ -151,7 +152,7 @@ describe("SaveForReviewDialog", () => {
     fireEvent.click(screen.getByTestId("save-for-review-retry"));
 
     await waitFor(() => expect(apiSpy).toHaveBeenCalledTimes(2));
-    expect(apiSpy).toHaveBeenLastCalledWith("sess-retry", _OPTIONS);
+    expect(apiSpy).toHaveBeenLastCalledWith("sess-retry", { ..._OPTIONS, fileManifestFingerprint: _FILES.manifest_fingerprint });
     await waitFor(() =>
       expect(screen.getByTestId("save-for-review-success")).toBeInTheDocument(),
     );
@@ -435,9 +436,45 @@ describe("SaveForReviewDialog", () => {
     fireEvent.click(screen.getByRole("radio", { name: "7 days" }));
     fireEvent.click(screen.getByRole("button", { name: "Create link" }));
     await waitFor(() =>
-      expect(mint).toHaveBeenCalledWith("sess-cfg", { allowImport: true, lifetimeSeconds: 604800 }),
+      expect(mint).toHaveBeenCalledWith("sess-cfg", {
+        allowImport: true,
+        lifetimeSeconds: 604800,
+        fileManifestFingerprint: _FILES.manifest_fingerprint,
+      }),
     );
     await waitFor(() => expect(screen.getByTestId("save-for-review-success")).toBeInTheDocument());
+  });
+
+  it("files that changed since the preview bring back the configure step with the new list", async () => {
+    const changed = {
+      ..._FILES,
+      files: [{ filename: "salaries.csv", size_bytes: 9, used_by: ["source"] }],
+      manifest_fingerprint: "e".repeat(64),
+    };
+    const { fetchSpy, mint } = await _renderConfigure();
+    fetchSpy.mockResolvedValue(changed);
+    mint.mockReset().mockRejectedValueOnce({ status: 409, error_type: "share_files_changed", detail: "changed" })
+      .mockResolvedValueOnce(_validResponse);
+    fireEvent.click(screen.getByRole("checkbox", { name: "Let recipients import a copy" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create link" }));
+
+    const notice = await screen.findByTestId("save-for-review-configure-notice");
+    expect(notice).toHaveTextContent("changed since you reviewed them");
+    expect(screen.queryByTestId("save-for-review-retry")).toBeNull();
+    // Consent is asked again: the choice is unticked until the owner has the new list.
+    const checkbox = await screen.findByRole("checkbox", { name: "Let recipients import a copy" });
+    await waitFor(() => expect(checkbox).toBeEnabled());
+    expect(checkbox).not.toBeChecked();
+    fireEvent.click(checkbox);
+    expect(screen.getByTestId("save-for-review-file-list")).toHaveTextContent("salaries.csv");
+    fireEvent.click(screen.getByRole("button", { name: "Create link" }));
+    await waitFor(() =>
+      expect(mint).toHaveBeenLastCalledWith("sess-cfg", {
+        allowImport: true,
+        lifetimeSeconds: 2592000,
+        fileManifestFingerprint: changed.manifest_fingerprint,
+      }),
+    );
   });
 
   it("Create link with defaults sends a view-only 30 day link", async () => {
@@ -454,6 +491,7 @@ describe("SaveForReviewDialog", () => {
       importable: false,
       not_importable_reason: "a.csv is a blob source and cannot travel",
       max_lifetime_seconds: 2592000,
+      manifest_fingerprint: null,
     } as unknown as typeof _FILES);
     const checkbox = screen.getByRole("checkbox", { name: "Let recipients import a copy" });
     expect(checkbox).toBeDisabled();

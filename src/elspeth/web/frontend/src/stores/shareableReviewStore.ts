@@ -52,6 +52,8 @@ export type RequestPhase =
       /** Null while the file list loads, or when loading failed (see filesError). */
       files: ShareableFilesResponse | null;
       filesError: string | null;
+      /** Why the owner is back at this step after a refused mint, if they are. */
+      notice: string | null;
     }
   | { kind: "pending"; sessionId: string; epoch: number; options: MarkReadyOptions }
   | { kind: "resolved"; sessionId: string; response: MarkReadyForReviewResponse }
@@ -79,7 +81,10 @@ export interface ShareableReviewState {
   /** Open the dialog in the configure phase and load the shareable files. Does not mint. */
   openConfigure: (sessionId: string) => Promise<void>;
   /** Mint with the chosen options, from the configure phase's session. Also
-   *  accepted from the error phase so a failed mint can be retried. */
+   *  accepted from the error phase so a failed mint can be retried. An
+   *  importable share is bound to the file list the configure phase loaded;
+   *  if the server reports the files changed since, the dialog returns to
+   *  the configure phase with the current list. */
   confirmMark: (options: MarkReadyOptions) => Promise<void>;
   close: () => void;
   clearForSession: (sessionId: string) => void;
@@ -177,46 +182,30 @@ export const useShareableReviewStore = create<ShareableReviewState>((set, _get) 
         }
         return;
       }
-      const myEpoch = _nextEpoch();
-      const sessionSwitch =
-        _internal.lastSuccess !== null && _internal.lastSuccess.sessionId !== sessionId;
-      _commit({
-        ..._internal,
-        dialogOpen: true,
-        request: { kind: "configure", sessionId, epoch: myEpoch, files: null, filesError: null },
-        lastSuccess: sessionSwitch ? null : _internal.lastSuccess,
-      });
-      const isCurrent = (): boolean =>
-        _internal.request.kind === "configure" &&
-        _internal.request.epoch === myEpoch &&
-        _internal.request.sessionId === sessionId;
-      try {
-        const files = await fetchShareableFiles(sessionId);
-        if (!isCurrent()) return;
-        _commit({
-          ..._internal,
-          request: { kind: "configure", sessionId, epoch: myEpoch, files, filesError: null },
-        });
-      } catch (exc) {
-        if (!isCurrent()) return;
-        _commit({
-          ..._internal,
-          request: {
-            kind: "configure",
-            sessionId,
-            epoch: myEpoch,
-            files: null,
-            filesError: _messageFor(exc, "Could not load the files this link would share"),
-          },
-        });
-      }
+      await _configure(sessionId, null);
     },
 
     async confirmMark(options: MarkReadyOptions) {
-      if (_internal.request.kind !== "configure" && _internal.request.kind !== "error") {
+      const current = _internal.request;
+      if (current.kind === "error") {
+        // A retry repeats the options, fingerprint included, of the failed mint.
+        await _mint(current.sessionId, options);
         return;
       }
-      await _mint(_internal.request.sessionId, options);
+      if (current.kind !== "configure") {
+        return;
+      }
+      if (!options.allowImport) {
+        await _mint(current.sessionId, { allowImport: false, lifetimeSeconds: options.lifetimeSeconds });
+        return;
+      }
+      // Import is consent to the listed files, so it needs a loaded,
+      // importable list to name.
+      const fingerprint = current.files?.manifest_fingerprint ?? null;
+      if (fingerprint === null) {
+        return;
+      }
+      await _mint(current.sessionId, { ...options, fileManifestFingerprint: fingerprint });
     },
 
     close() {
@@ -241,6 +230,44 @@ export const useShareableReviewStore = create<ShareableReviewState>((set, _get) 
       _commit({ ..._internalInitial });
     },
   };
+
+  /** Enter the configure phase and load the files an importable share would carry. */
+  async function _configure(sessionId: string, notice: string | null): Promise<void> {
+    const myEpoch = _nextEpoch();
+    const sessionSwitch =
+      _internal.lastSuccess !== null && _internal.lastSuccess.sessionId !== sessionId;
+    _commit({
+      ..._internal,
+      dialogOpen: true,
+      request: { kind: "configure", sessionId, epoch: myEpoch, files: null, filesError: null, notice },
+      lastSuccess: sessionSwitch ? null : _internal.lastSuccess,
+    });
+    const isCurrent = (): boolean =>
+      _internal.request.kind === "configure" &&
+      _internal.request.epoch === myEpoch &&
+      _internal.request.sessionId === sessionId;
+    try {
+      const files = await fetchShareableFiles(sessionId);
+      if (!isCurrent()) return;
+      _commit({
+        ..._internal,
+        request: { kind: "configure", sessionId, epoch: myEpoch, files, filesError: null, notice },
+      });
+    } catch (exc) {
+      if (!isCurrent()) return;
+      _commit({
+        ..._internal,
+        request: {
+          kind: "configure",
+          sessionId,
+          epoch: myEpoch,
+          files: null,
+          filesError: _messageFor(exc, "Could not load the files this link would share"),
+          notice,
+        },
+      });
+    }
+  }
 
   async function _mint(sessionId: string, options: MarkReadyOptions): Promise<void> {
       // Double-click guard: if a POST is already in-flight for the same
@@ -294,6 +321,22 @@ export const useShareableReviewStore = create<ShareableReviewState>((set, _get) 
           _internal.request.epoch !== myEpoch ||
           _internal.request.sessionId !== sessionId
         ) {
+          return;
+        }
+        if (_isApiError(exc) && exc.status === 409 && exc.error_type === "share_files_changed") {
+          // The files differ from the list the owner agreed to. Retrying
+          // would present the same stale fingerprint, so return to the
+          // configure step: it reloads the list and its import choice
+          // starts unticked, so the owner confirms the current files.
+          // The dialog stays as the owner left it, open or closed.
+          const wasOpen = _internal.dialogOpen;
+          void _configure(
+            sessionId,
+            "The files this pipeline uses changed since you reviewed them. Check the list below and create the link again.",
+          );
+          if (!wasOpen) {
+            _commit({ ..._internal, dialogOpen: false });
+          }
           return;
         }
         let message = "Could not mint a shareable link";

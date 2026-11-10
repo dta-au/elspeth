@@ -41,7 +41,10 @@ qualification, a published tag or an image.
   those by default; when none fits, it offers no choice, says so, and the link
   lasts the maximum. A longer lifespan sent to the server is refused with 422,
   and "copy link again" keeps the chosen lifespan, clamped to the current
-  maximum. When import is allowed, every
+  maximum. Import consent is tied to the listed files: the share carries the
+  list's fingerprint, and if the files changed after the owner saw them the
+  server refuses (409, `share_files_changed`) and the dialog shows the current
+  list for the owner to confirm again. When import is allowed, every
   uploaded file the graph is attached to (source `blob_ref`, `blob_rows`
   entries, transform inline-content markers) is frozen into the share at
   creation, so later edits or deletion on the sharer's side do not break the

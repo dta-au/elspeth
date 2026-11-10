@@ -59,6 +59,7 @@ function _describeSeconds(seconds: number): string {
 interface ConfigureStepProps {
   files: ShareableFilesResponse | null;
   filesError: string | null;
+  notice: string | null;
   createDisabled: boolean;
   createDisabledTitle: string | undefined;
   onCreate: (allowImport: boolean, lifetimeSeconds: ShareLifetimeSeconds | null) => void;
@@ -70,6 +71,7 @@ interface ConfigureStepProps {
 function ConfigureStep({
   files,
   filesError,
+  notice,
   createDisabled,
   createDisabledTitle,
   onCreate,
@@ -102,6 +104,11 @@ function ConfigureStep({
 
   return (
     <div className="save-for-review-configure" data-testid="save-for-review-configure">
+      {notice !== null && (
+        <div role="alert" className="save-for-review-error" data-testid="save-for-review-configure-notice">
+          <p>{notice}</p>
+        </div>
+      )}
       <div className="save-for-review-option">
         <label className="save-for-review-option-label">
           <Input
@@ -327,6 +334,7 @@ export function SaveForReviewDialog(): JSX.Element | null {
             <ConfigureStep
               files={request.files}
               filesError={request.filesError}
+              notice={request.notice}
               createDisabled={!completionReady}
               createDisabledTitle={
                 !completionReady

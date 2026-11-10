@@ -179,8 +179,13 @@ The backend:
    against its recorded hash and size. Only a ready file the user uploaded
    verbatim can travel; any other refuses the request with 409 naming the
    file. Stored bytes that fail their own hash check, or are missing from
-   storage, fail the request with 500 instead. It also records each sink output path that lies inside the owner's
-   session `outputs/` or `blobs/` folder.
+   storage, fail the request with 500 instead. The request must carry
+   `file_manifest_fingerprint`, the fingerprint the file preview returned
+   (422 without it). If the files that would be frozen no longer match it,
+   the request is refused with 409 (`error_type: share_files_changed`) and
+   the dialog reloads the list so the owner confirms the current files. It
+   also records each sink output path that lies inside the owner's session
+   `outputs/` or `blobs/` folder.
 4. Freezes the entire snapshot (composition + YAML + readiness panel, and
    for an import link the private file and sink-path manifests) into a
    canonical-JSON blob and computes its sha256 content-address.
@@ -195,8 +200,10 @@ The backend:
 Before the owner confirms, the dialog reads
 `GET /api/sessions/{session_id}/shareable-files`: the files an import link
 would carry (name, size, where each is used), whether the graph can be
-shared for import and why not, and `max_lifetime_seconds`. It judges each
-file from its stored record and reads no file content.
+shared for import and why not, `max_lifetime_seconds`, and, when the graph
+can be shared for import, `manifest_fingerprint`. The fingerprint covers
+each file's content hash, size, name, type and every place it is used. It
+judges each file from its stored record and reads no file content.
 
 The audit row carries the digest and the expiry. The token carries the
 same fields plus a random nonce that distinguishes two tokens minted at

@@ -2152,6 +2152,7 @@ async def test_mark_ready_with_import_freezes_each_referenced_file_once(
         username=_OWNER_USERNAME,
         session_operation_context=session_operation_context,
         allow_import=True,
+        confirmed_file_manifest=await _previewed_manifest(service, session_record, session_operation_context),
     )
 
     record = blob_service.records[blob_id]
@@ -2239,6 +2240,7 @@ async def test_mark_ready_with_import_records_session_relative_sink_paths(
         username=_OWNER_USERNAME,
         session_operation_context=session_operation_context,
         allow_import=True,
+        confirmed_file_manifest=await _previewed_manifest(service, session_record, session_operation_context),
     )
 
     blob = _stored_snapshot(payload_store, response.payload_digest)
@@ -2283,11 +2285,26 @@ async def test_mark_ready_with_import_sorts_files_by_sha256(
         username=_OWNER_USERNAME,
         session_operation_context=session_operation_context,
         allow_import=True,
+        confirmed_file_manifest=await _previewed_manifest(service, session_record, session_operation_context),
     )
 
     files = _stored_snapshot(payload_store, response.payload_digest)["files"]
     assert [entry["sha256"] for entry in files] == sorted([hashlib.sha256(b"alpha\n").hexdigest(), hashlib.sha256(b"beta\n").hexdigest()])
     assert {entry["filename"] for entry in files} == {"a.csv", "b.txt"}
+
+
+_UNCHECKED_MANIFEST = "0" * 64
+
+
+async def _previewed_manifest(
+    service: ShareableReviewService,
+    session_record: _SessionRecord,
+    session_operation_context: SessionOperationContext,
+) -> str:
+    """The fingerprint the owner's file preview returns for the current state."""
+    preview = await service.preview_shareable_files(session_id=session_record.id, session_operation_context=session_operation_context)
+    assert preview.manifest_fingerprint is not None, preview.not_importable_reason
+    return preview.manifest_fingerprint
 
 
 async def _assert_refused_without_side_effects(
@@ -2300,6 +2317,7 @@ async def _assert_refused_without_side_effects(
     store_calls: list[bytes],
     reason: str,
     detail_fragment: str,
+    confirmed_file_manifest: str = _UNCHECKED_MANIFEST,
 ) -> None:
     with pytest.raises(CompositionNotRunnableError) as exc_info:
         await service.mark_ready_for_review(
@@ -2308,12 +2326,118 @@ async def _assert_refused_without_side_effects(
             username=_OWNER_USERNAME,
             session_operation_context=session_operation_context,
             allow_import=True,
+            # The default is never compared: those shares are refused first.
+            confirmed_file_manifest=confirmed_file_manifest,
         )
     assert exc_info.value.reason == reason
     assert detail_fragment in exc_info.value.detail
     assert _completion_rows(engine, session_record.id) == []
     assert store_calls == []
     assert observed_value(service._telemetry.session_completed_total) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    ["content", "filename", "added_use"],
+)
+async def test_mark_ready_with_import_refuses_files_that_changed_since_the_preview(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+):
+    """Consent covers the previewed files: a later, still shareable, set is not frozen."""
+    blob_service = _FakeBlobService()
+    previewed_blob = blob_service.add(session_record.id, filename="customers.csv", content=b"id\n1\n")
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=_file_bound_state(state_record, source_blob=previewed_blob, node_value="plain"),
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+        blob_service=blob_service,
+    )
+    previewed = await _previewed_manifest(service, session_record, session_operation_context)
+
+    if change == "content":
+        current_blob = blob_service.add(session_record.id, filename="customers.csv", content=b"id\n1\n2\n")
+        current_state = _file_bound_state(state_record, source_blob=current_blob, node_value="plain")
+    elif change == "filename":
+        current_blob = blob_service.add(session_record.id, filename="salaries.csv", content=b"id\n1\n")
+        current_state = _file_bound_state(state_record, source_blob=current_blob, node_value="plain")
+    else:
+        current_state = _file_bound_state(state_record, source_blob=previewed_blob, node_value=_inline_marker(previewed_blob))
+    changed_service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=current_state,
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+        blob_service=blob_service,
+    )
+    store_calls = _track_store(payload_store, monkeypatch)
+
+    await _assert_refused_without_side_effects(
+        changed_service,
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        session_record=session_record,
+        session_operation_context=session_operation_context,
+        store_calls=store_calls,
+        reason="share_files_changed",
+        detail_fragment="changed since you reviewed them",
+        confirmed_file_manifest=previewed,
+    )
+    # The current files are shareable: confirming them is all that was missing.
+    marked = await changed_service.mark_ready_for_review(
+        session_id=session_record.id,
+        user_id=session_record.user_id,
+        username=_OWNER_USERNAME,
+        session_operation_context=session_operation_context,
+        allow_import=True,
+        confirmed_file_manifest=await _previewed_manifest(changed_service, session_record, session_operation_context),
+    )
+    assert marked.token
+
+
+@pytest.mark.asyncio
+async def test_mark_ready_with_import_requires_the_previewed_manifest(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+):
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=state_record,
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+        blob_service=_FakeBlobService(),
+    )
+
+    with pytest.raises(ValueError, match="confirmed_file_manifest"):
+        await service.mark_ready_for_review(
+            session_id=session_record.id,
+            user_id=session_record.user_id,
+            username=_OWNER_USERNAME,
+            session_operation_context=session_operation_context,
+            allow_import=True,
+        )
+    assert _completion_rows(session_engine_with_row, session_record.id) == []
 
 
 @pytest.mark.asyncio
@@ -2849,6 +2973,7 @@ async def test_mark_ready_with_import_hashes_and_stores_files_off_the_event_loop
         username=_OWNER_USERNAME,
         session_operation_context=session_operation_context,
         allow_import=True,
+        confirmed_file_manifest=await _previewed_manifest(service, session_record, session_operation_context),
     )
 
     assert len(threads["verify"]) == 1
@@ -3049,6 +3174,7 @@ async def test_load_snapshot_returns_verified_payload_and_frozen_manifest(
         username=_OWNER_USERNAME,
         session_operation_context=session_operation_context,
         allow_import=True,
+        confirmed_file_manifest=await _previewed_manifest(service, session_record, session_operation_context),
     )
 
     payload, parsed = await service.load_snapshot(token=marked.token)
@@ -3103,6 +3229,7 @@ async def test_mark_ready_with_import_stores_files_before_the_audit_row(
             username=_OWNER_USERNAME,
             session_operation_context=session_operation_context,
             allow_import=True,
+            confirmed_file_manifest=await _previewed_manifest(service, session_record, session_operation_context),
         )
 
     assert _completion_rows(session_engine_with_row, session_record.id) == []
@@ -3221,6 +3348,7 @@ async def test_resolve_token_exposes_import_flag_and_file_names_only(
         username=_OWNER_USERNAME,
         session_operation_context=session_operation_context,
         allow_import=True,
+        confirmed_file_manifest=await _previewed_manifest(service, session_record, session_operation_context),
     )
 
     resolved = await service.resolve_token(token=marked.token, requesting_user_id="reviewer")
