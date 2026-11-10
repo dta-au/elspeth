@@ -12,7 +12,7 @@ string is the constant stub.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from typing import Any
+from typing import Any, Final
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMRequestByteSplit
 from elspeth.contracts.prompt_guard import (
@@ -23,6 +23,17 @@ from elspeth.contracts.prompt_guard import (
 from elspeth.web.composer.context_budget import CONTEXT_BUDGET_TOOL_RESULT_STUB, SheddableKind, SheddableSegment
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.llm_response_parsing import _hash_and_measure_request
+
+# Worst-case bytes a re-render after shedding history can add to a request
+# that the segment savings do not count. It bounds: the compose loop's
+# ``"conversation_omissions":{...}`` object with both counts; on the planner,
+# the ``"prior_assistant_messages_omitted":N`` key and the growth of
+# ``additional_prior_user_requests_omitted``'s digits, both as JSON-escaped
+# inside the request string; and the one separator a saving over-counts when
+# the last entry of a list is removed. Counts are sized as 20-digit integers.
+# Each call site adds it to the request size it feeds the decision whenever
+# history may be shed, so an admitted request still fits once re-rendered.
+CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES: Final[int] = 256
 
 
 def message_bytes(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> ComposerLLMRequestByteSplit:
