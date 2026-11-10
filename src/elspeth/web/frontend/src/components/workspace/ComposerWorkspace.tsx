@@ -29,7 +29,6 @@ const PENDING_PIPELINE_ARTIFACT_TABS: readonly ArtifactTab[] = [
 ];
 
 type NarrowView = "compose" | "pipeline";
-type FocusIntent = "collapse" | "restore" | null;
 
 export interface ComposerWorkspaceProps {
   authoring: ReactNode;
@@ -106,9 +105,7 @@ export function ComposerWorkspace({
   const artifactSlotRef = useRef<HTMLDivElement | null>(null);
   const authoringPaneRef = useRef<HTMLElement | null>(null);
   const artifactPaneRef = useRef<HTMLElement | null>(null);
-  const collapseControlRef = useRef<HTMLButtonElement | null>(null);
-  const restoreControlRef = useRef<HTMLButtonElement | null>(null);
-  const focusIntentRef = useRef<FocusIntent>(null);
+  const toggleControlRef = useRef<HTMLButtonElement | null>(null);
   const paneState = useWorkspacePaneState({
     workspaceWidth,
     sessionId: activeSessionId,
@@ -143,18 +140,6 @@ export function ComposerWorkspace({
   }, []);
 
   useLayoutEffect(() => {
-    const focusIntent = focusIntentRef.current;
-    const intentTarget =
-      focusIntent === "restore"
-        ? restoreControlRef.current
-        : focusIntent === "collapse"
-          ? collapseControlRef.current
-          : null;
-    if (intentTarget !== null) {
-      intentTarget.focus({ preventScroll: true });
-      focusIntentRef.current = null;
-    }
-
     const wasNarrow = previousNarrowRef.current;
     previousNarrowRef.current = narrow;
     if (wasNarrow === narrow) return;
@@ -165,9 +150,14 @@ export function ComposerWorkspace({
         narrowView === "compose"
           ? artifactSlotRef.current
           : authoringSlotRef.current;
+      const activeControlHidden =
+        activeElement instanceof HTMLElement &&
+        rootRef.current?.contains(activeElement) &&
+        activeElement.closest("[hidden], [inert]") !== null;
       if (
         !hiddenSlot?.contains(activeElement) &&
-        !separatorSlotRef.current?.contains(activeElement)
+        !separatorSlotRef.current?.contains(activeElement) &&
+        !activeControlHidden
       ) {
         return;
       }
@@ -230,13 +220,13 @@ export function ComposerWorkspace({
 
   const collapseAuthoring = (): void => {
     claimWorkspaceViewIntent();
-    focusIntentRef.current = "restore";
+    toggleControlRef.current?.focus({ preventScroll: true });
     paneState.setAuthoringCollapsed(true);
   };
 
   const restoreAuthoring = (): void => {
     claimWorkspaceViewIntent();
-    focusIntentRef.current = "collapse";
+    toggleControlRef.current?.focus({ preventScroll: true });
     paneState.setAuthoringCollapsed(false);
   };
 
@@ -345,8 +335,8 @@ export function ComposerWorkspace({
             hidden={authoringHidden}
             tabIndex={-1}
           >
-            {/* ARGOnite title bar: the pane's name only. The collapse and
-                restore controls stay in the bar row below (design doc). */}
+            {/* The title bar names the pane; its toggle follows the slot in
+                DOM order and sits in the pipeline's bottom action row. */}
             <header className="workspace-pane-header">
               <h2 className="workspace-pane-title">{authoringTitle}</h2>
             </header>
@@ -359,32 +349,45 @@ export function ComposerWorkspace({
               <ErrorBoundary label="Authoring pane">{authoring}</ErrorBoundary>
             </div>
           </section>
-          {paneState.authoringCollapsed && (
-            <div
-              className="workspace-collapsed-affordance"
-              data-tone={projectedCollapsedStatus?.tone}
+        </div>
+
+        {/* DOM order keeps the toggle next after the conversation controls.
+            Grid placement puts this content-sized row under the pipeline,
+            while the conversation card spans both desktop rows. */}
+        <div
+          className="workspace-action-bar-slot"
+          data-workspace-part="action-bar"
+        >
+          <div
+            className={`workspace-pane-controls${paneState.authoringCollapsed ? " workspace-collapsed-affordance" : ""}`}
+            data-tone={paneState.authoringCollapsed ? projectedCollapsedStatus?.tone : undefined}
+            hidden={authoringViewHidden}
+          >
+            <Button
+              ref={toggleControlRef}
+              variant="bare"
+              className={`workspace-pane-toggle ${paneState.authoringCollapsed ? "workspace-restore-control" : "workspace-collapse-control"}`}
+              title={paneState.authoringCollapsed ? "Restore authoring pane" : "Collapse authoring pane"}
+              aria-label={paneState.authoringCollapsed ? "Restore authoring pane" : "Collapse authoring pane"}
+              aria-expanded={!paneState.authoringCollapsed}
+              aria-controls="workspace-authoring-pane"
+              aria-describedby={paneState.authoringCollapsed ? "workspace-collapsed-status" : undefined}
+              onClick={paneState.authoringCollapsed ? restoreAuthoring : collapseAuthoring}
             >
+              <Icon
+                name={paneState.authoringCollapsed ? "chevrons-right" : "chevrons-left"}
+                className="workspace-pane-toggle-icon"
+              />
+            </Button>
+            {paneState.authoringCollapsed && (
               <div id="workspace-collapsed-status" role="status">
                 {collapsedStatusContent}
               </div>
-              <Button
-                ref={restoreControlRef}
-                variant="bare"
-                className="workspace-pane-toggle workspace-restore-control"
-                title="Restore authoring pane"
-                aria-label="Restore authoring pane"
-                aria-expanded={false}
-                aria-controls="workspace-authoring-pane"
-                aria-describedby="workspace-collapsed-status"
-                onClick={restoreAuthoring}
-              >
-                <Icon
-                  name="chevrons-right"
-                  className="workspace-pane-toggle-icon"
-                />
-              </Button>
-            </div>
-          )}
+            )}
+          </div>
+          <div className="workspace-action-bar-main" hidden={artifactViewHidden}>
+            {actionBar}
+          </div>
         </div>
 
         <div
@@ -432,63 +435,6 @@ export function ComposerWorkspace({
               {artifact}
             </div>
           </section>
-        </div>
-
-        {/* The application's bottom bar: ONE grid item spanning both columns
-            (elspeth-9c94a58500), carrying the rule and the fill once. Its two
-            cells are the parent grid's own columns (subgrid), so the collapse
-            control sits in the authoring column and the action bar in the
-            artifact column at every pane width, including the collapsed 0px
-            one — and the row is exactly as tall as its content, whichever
-            child is showing. Before this the bar was the artifact pane's last
-            flex child and the authoring pane painted a MIRRORED band to meet
-            it across the seam: first from a token formula, then from a
-            measured height a ResizeObserver published (elspeth-215c989bed,
-            elspeth-97db9c22e5). Two elements agreeing about one height is the
-            seam that produced both bugs; a single element has no height to
-            keep in sync.
-
-            The collapse control moved here from the authoring pane's tail
-            for the same reason: in narrow Compose view the action bar is
-            hidden, so the row's height has to come from the control alone,
-            and it can only do that as the row's own child. Its aria-controls
-            still names the pane; the disclosure button now sits OUTSIDE the
-            region it discloses, which is the same relationship the restore
-            button already has. Each child hides on the same fact that used
-            to hide its former parent — the control with the authoring pane,
-            the bar with the artifact view — so what is visible in each
-            state is unchanged, and the row itself hides when neither is. */}
-        <div
-          className="workspace-action-bar-slot"
-          data-workspace-part="action-bar"
-          hidden={authoringHidden && artifactViewHidden}
-        >
-          {/* Icon-form pane toggles (2026-08-15 UX review): the earlier
-              full-text secondary-chrome button shared height, border,
-              background, and spacing rhythm with the action-bar buttons one
-              gutter away, so Gestalt grouping read it as a sixth workflow
-              action. Both toggles now follow the pane's own icon+tooltip
-              convention (ChatInput's Upload/More buttons): icon-only, full
-              name kept as aria-label + title, chevrons pointing the way the
-              pane moves. aria-expanded/aria-controls make the disclosure
-              state machine-readable; the pair is two buttons (one per
-              state), each reporting the state it acts from. */}
-          <Button
-            ref={collapseControlRef}
-            variant="bare"
-            className="workspace-pane-toggle workspace-collapse-control"
-            title="Collapse authoring pane"
-            aria-label="Collapse authoring pane"
-            aria-expanded={!paneState.authoringCollapsed}
-            aria-controls="workspace-authoring-pane"
-            hidden={authoringHidden}
-            onClick={collapseAuthoring}
-          >
-            <Icon name="chevrons-left" className="workspace-pane-toggle-icon" />
-          </Button>
-          <div className="workspace-action-bar-main" hidden={artifactViewHidden}>
-            {actionBar}
-          </div>
         </div>
 
       </div>
