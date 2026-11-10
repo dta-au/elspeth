@@ -105,13 +105,20 @@ class TestBoundedCanonicalSize:
     def test_refusal_is_a_value_error(self) -> None:
         assert issubclass(CanonicalSizeLimitExceededError, ValueError)
 
-    def test_non_string_object_key_is_a_type_error(self) -> None:
+    def test_non_string_object_key_is_a_value_error(self) -> None:
         with pytest.raises(NonStringObjectKeyError, match="objects must use string keys"):
             bounded_canonical_size({1: "a"}, limit=1000)
-        assert issubclass(NonStringObjectKeyError, TypeError)
+        assert issubclass(NonStringObjectKeyError, ValueError)
+        assert not issubclass(NonStringObjectKeyError, TypeError)
 
-    def test_non_canonical_value_is_a_type_error_naming_the_type(self) -> None:
+    def test_non_canonical_value_is_a_value_error_naming_the_type(self) -> None:
         with pytest.raises(NonCanonicalValueTypeError, match="value of type set is not canonical JSON") as exc:
             bounded_canonical_size({"a": {1}}, limit=1000)
         assert exc.value.type_name == "set"
-        assert issubclass(NonCanonicalValueTypeError, TypeError)
+        assert issubclass(NonCanonicalValueTypeError, ValueError)
+        assert not issubclass(NonCanonicalValueTypeError, TypeError)
+
+    @pytest.mark.parametrize("value", ["x" * 100, {1: "a"}, [{1, 2}]])
+    def test_every_refusal_is_caught_as_value_error(self, value: object) -> None:
+        with pytest.raises(ValueError):
+            bounded_canonical_size(value, limit=10)

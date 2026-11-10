@@ -6,7 +6,8 @@ node identity. These helpers refuse the inputs that would make that identity
 ambiguous or unbounded: duplicate JSON object members, the non-finite JSON
 constants, and values whose canonical size exceeds a caller-chosen limit.
 
-The errors raised here are deliberately content-neutral. A caller that wants
+Every error raised here is a ``ValueError`` and deliberately content-neutral,
+so one ``except ValueError`` covers a whole parse. A caller that wants
 its own wording (naming its option, entry or limit) catches them and re-raises.
 """
 
@@ -30,14 +31,14 @@ class CanonicalSizeLimitExceededError(ValueError):
         super().__init__("canonical JSON size exceeds the limit")
 
 
-class NonStringObjectKeyError(TypeError):
+class NonStringObjectKeyError(ValueError):
     """A mapping being sized has a key that is not a ``str``."""
 
     def __init__(self) -> None:
         super().__init__("objects must use string keys")
 
 
-class NonCanonicalValueTypeError(TypeError):
+class NonCanonicalValueTypeError(ValueError):
     """A value being sized has a type canonical JSON cannot represent."""
 
     def __init__(self, type_name: str) -> None:
