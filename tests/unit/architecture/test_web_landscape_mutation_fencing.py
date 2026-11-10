@@ -16005,7 +16005,15 @@ _REVIEWED_REGISTRY_MODULES = {
     # changes refusal guidance. Deadline/journal installation order is retained.
     # Durable quota recovery adds calls.returned_model to required columns;
     # engine construction and deadline/journal guard ordering are unchanged.
-    "src/elspeth/core/landscape/database.py": "f95f6b921824bb82b58cc754fa86f6c3a46687d892ff810879b5abbb864ce246",
+    # f95f6b92… -> the value below (f9c23c59c): the three metadata.create_all
+    # calls go through the new module helper _create_landscape_tables, which
+    # holds a module lock and restores SQLAlchemy's transient constraint
+    # _create_rule values. That commit re-pinned _NEW_LANDSCAPE_STAMP_SOURCES
+    # but not this digest. The diff is the helper, its lock and the three call
+    # sites: all three install_deadline_guard calls, journal attachment before
+    # the guard, and guard installation before table creation are unchanged,
+    # and nothing in the journal, guard or clock modules calls the helper.
+    "src/elspeth/core/landscape/database.py": "032c18d341b47fc96ea110e88b222201ea98ab12754cc1527220e71c2b2c661f",
 }
 
 
