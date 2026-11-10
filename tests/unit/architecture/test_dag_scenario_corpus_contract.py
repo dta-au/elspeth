@@ -983,7 +983,11 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # (seven manifest lines). The canonical case JSON of the 0.8.9 manifest with
 # only engine:0.8.9 -> engine:0.8.10 substituted is byte-identical to the new
 # one, and this instrument reproduces the previous pin from the old manifest.
-EXPECTED_CASE_REGISTRY_SHA256 = "3538b2de3a4036fb2effdcbae99c2b4a0b7711b09252456a4514b93ca5636536"
+# Shared config-content helpers: JSONSource's manifest provenance token moved
+# to 0c356038d5722d0c when its non-finite-constant hook moved to
+# plugins/infrastructure/config_content.py. That token is the manifest's only
+# changed byte run; this digest was captured from this file's parity failure.
+EXPECTED_CASE_REGISTRY_SHA256 = "01ae33ed0301228dd8d276e3a6471ff4019a5525cd6dac71cd969faeb9ebe33b"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

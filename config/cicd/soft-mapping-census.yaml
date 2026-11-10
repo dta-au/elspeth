@@ -370,6 +370,8 @@ files:
     dict[str, Any]: 2
   src/elspeth/plugins/infrastructure/config_base.py:
     dict[str, Any]: 2
+  src/elspeth/plugins/infrastructure/config_content.py:
+    dict[str, object]: 2
   src/elspeth/plugins/infrastructure/display_headers.py:
     dict[str, Any]: 3
   src/elspeth/plugins/infrastructure/manager.py:
@@ -615,7 +617,7 @@ files:
     Mapping[str, Any]: 1
     Mapping[str, object]: 4
     dict[str, Any]: 11
-    dict[str, object]: 2
+    dict[str, object]: 1
   src/elspeth/plugins/transforms/report_assemble.py:
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/truncate.py:
@@ -1094,5 +1096,5 @@ totals:
   MutableMapping[str, Any]: 8
   boundary: 60
   dict[str, Any]: 1102
-  dict[str, object]: 400
-  soft: 2617
+  dict[str, object]: 401
+  soft: 2618
