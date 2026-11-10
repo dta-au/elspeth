@@ -500,6 +500,17 @@ _TRANSFORM_REJECTION_CASES = [
         "never silently overwritten",
         id="reference_join-declared-type-refuted-by-heterogeneous-table",
     ),
+    # ── file_inject ───────────────────────────────────────────────────────
+    pytest.param(
+        "file_inject",
+        {
+            "schema": _make_observed_schema(),
+            "mode": "all",
+            "files": {"style_guide": {"content": "Be brief.", "format": "text"}},  # mode all: no per-entry output_field
+        },
+        "needs an output_field",
+        id="file_inject-mode-all-entry-without-output_field",
+    ),
 ]
 
 _SOURCE_REJECTION_CASES = [

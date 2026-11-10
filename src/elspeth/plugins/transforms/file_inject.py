@@ -595,7 +595,7 @@ class FileInject(BaseTransform):
     name = "file_inject"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:564cbcd6ca70a378"
+    source_file_hash: str | None = "sha256:095243a6a51d1710"
     config_model = FileInjectConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -683,7 +683,7 @@ class FileInject(BaseTransform):
                     "In mode select the entry names are the key values. They are compared exactly, with no trimming "
                     "and no case folding, and the key value must be a string; quote every entry name.",
                     "on_miss applies to mode select only and defaults to fail, because a row without its guidance "
-                    "looks like any other row at a sink. Use null, or default with default_content, to continue instead. "
+                    "looks like any other row at a sink. Use null, or default with default_content, to continue. "
                     "A row with no key_field, or a non-string value there, is a row error under every on_miss.",
                     "Set format on every entry: text, json, jsonl or csv. It is never inferred from a file name. "
                     "text writes the content as one string, unmodified; json writes the parsed value; jsonl and csv "

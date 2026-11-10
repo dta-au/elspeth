@@ -220,6 +220,10 @@ EXPECTED_TRANSFORM_DETERMINISMS: dict[str, Determinism] = {
     "batch_threshold_summary": Determinism.DETERMINISTIC,
     "batch_top_k": Determinism.DETERMINISTIC,
     "field_mapper": Determinism.DETERMINISTIC,
+    # DETERMINISTIC, not IO_READ: file_inject's file content is materialized into
+    # its config at load (as reference_join's table is), so the transform opens
+    # nothing at row time.
+    "file_inject": Determinism.DETERMINISTIC,
     "json_explode": Determinism.DETERMINISTIC,
     "keyword_filter": Determinism.DETERMINISTIC,
     "line_explode": Determinism.DETERMINISTIC,

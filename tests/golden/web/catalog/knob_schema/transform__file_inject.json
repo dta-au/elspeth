@@ -1,0 +1,96 @@
+{
+  "knob_schema": {
+    "fields": [
+      {
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
+        "kind": "json-value",
+        "label": "Schema",
+        "name": "schema",
+        "nullable": false,
+        "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
+        "required": true,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
+        "item_kind": "text",
+        "kind": "string-list",
+        "label": "Required Input Fields",
+        "name": "required_input_fields",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "select writes the one entry whose name equals the row's key_field value to output_field. all writes every entry onto every row, each to its own output_field. There is no default.",
+        "enum": [
+          "select",
+          "all"
+        ],
+        "kind": "enum",
+        "label": "Mode",
+        "name": "mode",
+        "nullable": false,
+        "required": true,
+        "tier": "common"
+      },
+      {
+        "description": "Entry name to file. In mode 'select' the names are the key values and are compared exactly as written, so they must be quoted strings; in mode 'all' they are labels. At least one entry.",
+        "kind": "json-object",
+        "label": "Files",
+        "name": "files",
+        "nullable": false,
+        "required": true,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "mode 'select' only, and required there: the row field whose value names the entry.",
+        "kind": "text",
+        "label": "Key Field",
+        "name": "key_field",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "mode 'select' only, and required there: the row field the selected entry's value is written to.",
+        "kind": "text",
+        "label": "Output Field",
+        "name": "output_field",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "mode 'select' only. What to do when the row's key value names no entry: fail the row (the default), write null, or write default_content.",
+        "enum": [
+          "fail",
+          "null",
+          "default"
+        ],
+        "kind": "enum",
+        "label": "On Miss",
+        "name": "on_miss",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "The non-null value written when on_miss is 'default'. Required then, refused otherwise.",
+        "kind": "json-value",
+        "label": "Default Content",
+        "name": "default_content",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      }
+    ]
+  },
+  "plugin_kind": "transform",
+  "plugin_name": "file_inject"
+}

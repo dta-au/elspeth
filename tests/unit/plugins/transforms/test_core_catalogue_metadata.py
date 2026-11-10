@@ -20,6 +20,7 @@ from tests.fixtures.catalog_reference import (
 EXPECTED_CORE_TAGS = {
     "blob_csv_expand": ("csv", "blob", "tabular", "fan-out"),
     "field_mapper": ("fields", "mapping", "rename", "cleanup"),
+    "file_inject": ("file", "enrichment", "prompt-context", "reference-data"),
     "json_explode": ("json", "array", "fan-out", "deaggregation"),
     "keyword_filter": ("filtering", "regex", "content-screening"),
     "line_explode": ("text", "lines", "fan-out", "deaggregation"),
@@ -45,6 +46,7 @@ _PLACEHOLDER_MARKERS = ("todo", "tbd", "replace-me", "placeholder", "see the tec
 _REQUIRED_GUIDANCE = {
     "blob_csv_expand": (("payload-store", "csv blob", "rows"), ("file source", "binary parser")),
     "field_mapper": (("rename", "select", "drop"), ("expression", "type coercion")),
+    "file_inject": (("whole content", "small file"), ("runtime", "config time")),
     "json_explode": (("one json array field",), ("object flattening", "batch aggregation")),
     "keyword_filter": (("regex", "on_error"), ("general expression",)),
     "line_explode": (("text field", "rows"), ("file", "csv")),
