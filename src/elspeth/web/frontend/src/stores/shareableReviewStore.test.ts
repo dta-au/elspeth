@@ -17,6 +17,7 @@ const FILES = {
   importable: true,
   not_importable_reason: null,
   max_lifetime_seconds: 2592000,
+  manifest_fingerprint: "f".repeat(64) as string | null,
 };
 const OPTIONS = { allowImport: true, lifetimeSeconds: 86400 } as const;
 
@@ -241,7 +242,8 @@ describe("shareableReviewStore", () => {
     const mint = vi.spyOn(api, "markReadyForReview").mockResolvedValueOnce(validResponseFor("1"));
     await useShareableReviewStore.getState().openConfigure(SESSION_A);
     await useShareableReviewStore.getState().confirmMark(OPTIONS);
-    expect(mint).toHaveBeenCalledWith(SESSION_A, OPTIONS);
+    // An importable share names the file list the owner was shown.
+    expect(mint).toHaveBeenCalledWith(SESSION_A, { ...OPTIONS, fileManifestFingerprint: FILES.manifest_fingerprint });
     const state = useShareableReviewStore.getState();
     expect(state.request.kind).toBe("resolved");
     expect(state.latestResponse?.token).toBe("tk-1");
@@ -255,6 +257,53 @@ describe("shareableReviewStore", () => {
     expect(useShareableReviewStore.getState().error).toBe("a.csv cannot be shared");
   });
 
+  it("a view-only share sends no file fingerprint", async () => {
+    const mint = vi.spyOn(api, "markReadyForReview").mockResolvedValueOnce(validResponseFor("1"));
+    await useShareableReviewStore.getState().openConfigure(SESSION_A);
+    await useShareableReviewStore.getState().confirmMark({ allowImport: false, lifetimeSeconds: 86400 });
+    expect(mint).toHaveBeenCalledWith(SESSION_A, { allowImport: false, lifetimeSeconds: 86400 });
+  });
+
+  it("an importable share is not minted without a loaded, importable file list", async () => {
+    vi.spyOn(api, "fetchShareableFiles").mockReset().mockRejectedValueOnce({ status: 500, detail: "boom" });
+    const mint = vi.spyOn(api, "markReadyForReview");
+    await useShareableReviewStore.getState().openConfigure(SESSION_A);
+    await useShareableReviewStore.getState().confirmMark(OPTIONS);
+    expect(mint).not.toHaveBeenCalled();
+    expect(useShareableReviewStore.getState().request.kind).toBe("configure");
+  });
+
+  it("files that changed since the preview return the owner to a reloaded configure step", async () => {
+    const changed = {
+      ...FILES,
+      files: [{ filename: "salaries.csv", size_bytes: 9, used_by: ["source"] }],
+      manifest_fingerprint: "e".repeat(64),
+    };
+    const fetchFiles = vi.spyOn(api, "fetchShareableFiles").mockReset()
+      .mockResolvedValueOnce(FILES)
+      .mockResolvedValueOnce(changed);
+    const mint = vi.spyOn(api, "markReadyForReview")
+      .mockRejectedValueOnce({ status: 409, error_type: "share_files_changed", detail: "changed" })
+      .mockResolvedValueOnce(validResponseFor("2"));
+    await useShareableReviewStore.getState().openConfigure(SESSION_A);
+    await useShareableReviewStore.getState().confirmMark(OPTIONS);
+
+    await vi.waitFor(() =>
+      expect(useShareableReviewStore.getState().request).toMatchObject({ kind: "configure", files: changed }),
+    );
+    const state = useShareableReviewStore.getState();
+    expect(fetchFiles).toHaveBeenCalledTimes(2);
+    expect(state.dialogOpen).toBe(true);
+    expect(state.error).toBeNull();
+    expect(state.latestResponse).toBeNull();
+    expect(state.request).toMatchObject({ notice: expect.stringContaining("changed since you reviewed them") });
+
+    // Confirming again names the current list, not the stale one.
+    await useShareableReviewStore.getState().confirmMark(OPTIONS);
+    expect(mint).toHaveBeenLastCalledWith(SESSION_A, { ...OPTIONS, fileManifestFingerprint: changed.manifest_fingerprint });
+    expect(useShareableReviewStore.getState().request.kind).toBe("resolved");
+  });
+
   it("confirmMark is a no-op outside the configure phase", async () => {
     const mint = vi.spyOn(api, "markReadyForReview");
     await useShareableReviewStore.getState().confirmMark(OPTIONS);
@@ -266,7 +315,7 @@ describe("shareableReviewStore", () => {
     let resolveA: (v: typeof FILES) => void = () => {};
     vi.spyOn(api, "fetchShareableFiles")
       .mockReturnValueOnce(new Promise((resolve) => { resolveA = resolve; }))
-      .mockResolvedValueOnce({ ...FILES, importable: false });
+      .mockResolvedValueOnce({ ...FILES, importable: false, manifest_fingerprint: null });
     const first = useShareableReviewStore.getState().openConfigure(SESSION_A);
     await useShareableReviewStore.getState().openConfigure(SESSION_B);
     resolveA(FILES);
@@ -304,7 +353,7 @@ describe("shareableReviewStore", () => {
     await useShareableReviewStore.getState().confirmMark(failed.options);
 
     expect(mint).toHaveBeenCalledTimes(2);
-    expect(mint).toHaveBeenLastCalledWith(SESSION_A, OPTIONS);
+    expect(mint).toHaveBeenLastCalledWith(SESSION_A, { ...OPTIONS, fileManifestFingerprint: FILES.manifest_fingerprint });
     expect(useShareableReviewStore.getState().latestResponse?.token).toBe("tk-2");
   });
 });

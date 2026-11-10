@@ -203,6 +203,12 @@ export interface MarkReadyOptions {
   allowImport: boolean;
   /** ``null`` sends no lifetime: the server's configured maximum applies. */
   lifetimeSeconds: ShareLifetimeSeconds | null;
+  /**
+   * The ``manifest_fingerprint`` of the file list the owner was shown. Sent
+   * with an importable share, which the server refuses if the files changed
+   * since. The share store fills it in from the loaded file list.
+   */
+  fileManifestFingerprint?: string;
 }
 
 /** One file an importable share would carry, as the owner sees it. */
@@ -219,6 +225,8 @@ export interface ShareableFilesResponse {
   not_importable_reason: string | null;
   /** The longest link lifetime this deployment accepts, in seconds. */
   max_lifetime_seconds: number;
+  /** Identifies the listed files; ``null`` exactly when they are not importable. */
+  manifest_fingerprint: string | null;
 }
 
 /** Response from POST /api/sessions/shared/{token}/import. */

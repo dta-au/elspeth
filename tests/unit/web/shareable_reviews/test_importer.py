@@ -213,7 +213,12 @@ def _graph(
 
 
 def _share(client: SyncASGITestClient, session_id: UUID, *, allow_import: bool = True) -> dict[str, Any]:
-    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review", json={"allow_import": allow_import})
+    body: dict[str, object] = {"allow_import": allow_import}
+    if allow_import:
+        preview = client.get(f"/api/sessions/{session_id}/shareable-files")
+        assert preview.status_code == 200, preview.text
+        body["file_manifest_fingerprint"] = preview.json()["manifest_fingerprint"]
+    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review", json=body)
     assert marked.status_code == 200, marked.text
     return marked.json()
 

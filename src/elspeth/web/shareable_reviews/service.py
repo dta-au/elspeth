@@ -75,6 +75,7 @@ Layer: L3 (web application).
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import secrets
@@ -416,6 +417,44 @@ class _InspectedFile:
         freeze_fields(self, "bindings")
 
 
+def _manifest_entries(inspected: Sequence[_InspectedFile]) -> dict[str, ShareFileEntry]:
+    """Build the ``files`` manifest entries for inspected files, keyed by content hash.
+
+    Every file must already have passed inspection. Two blobs with identical
+    bytes share one content address, so they become one entry carrying both
+    blobs' binding sites; the first blob's filename and MIME type name it.
+    """
+    entries: dict[str, ShareFileEntry] = {}
+    for item in inspected:
+        record = item.record
+        if item.refusal is not None or record is None or record.content_hash is None:
+            raise RuntimeError("manifest entry requested for a file that did not pass inspection")
+        binding_json = [file_binding_to_json(binding) for binding in item.bindings]
+        if record.content_hash in entries:
+            entries[record.content_hash]["bindings"].extend(binding_json)
+            continue
+        entries[record.content_hash] = {
+            "sha256": record.content_hash,
+            "size_bytes": record.size_bytes,
+            "filename": record.filename,
+            "mime_type": record.mime_type,
+            "bindings": binding_json,
+        }
+    return entries
+
+
+def _file_manifest_fingerprint(entries: dict[str, ShareFileEntry]) -> str:
+    """Fingerprint the files an importable share would freeze.
+
+    Covers each file's content hash, size, name, type and every place it is
+    used, so any change to what would travel changes the fingerprint. The
+    owner's preview returns it and the share must present it back: consent to
+    import is consent to this exact file set.
+    """
+    canonical = canonical_json({"version": 1, "files": [entries[sha] for sha in sorted(entries)]})
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _describe_use(binding: FileBinding) -> str:
     """Name where a file is used, for the owner's preview."""
     if binding.kind in ("source_blob_ref", "source_blob_rows"):
@@ -666,6 +705,7 @@ class ShareableReviewService:
         session_operation_context: SessionOperationContext,
         allow_import: bool = False,
         lifetime_seconds: int | None = None,
+        confirmed_file_manifest: str | None = None,
     ) -> MarkReadyForReviewResponse:
         """Build a signed share artifact for ``(session_id, current state)``.
 
@@ -677,7 +717,11 @@ class ShareableReviewService:
 
         ``allow_import`` lets recipients import a copy: every file the
         composition uses is verified and frozen into the payload store, and
-        listed in the snapshot's private ``files`` manifest. ``lifetime_seconds``
+        listed in the snapshot's private ``files`` manifest. It requires
+        ``confirmed_file_manifest``, the fingerprint the owner's file preview
+        returned: if the files that would be frozen no longer match it the
+        share is refused (``share_files_changed``) so the owner reviews the
+        current list before consenting again. ``lifetime_seconds``
         is the link's lifespan; ``None`` means the deployment maximum, and a
         longer value is refused (``lifetime_exceeds_maximum``).
 
@@ -689,7 +733,9 @@ class ShareableReviewService:
            apply the mark-time gate (no row with status='error').
         3. When importing, read and verify every referenced file; any file
            that is not shareable refuses the whole share
-           (``file_not_shareable``) before anything is stored.
+           (``file_not_shareable``) before anything is stored, and so does
+           a file set that differs from the one the owner previewed
+           (``share_files_changed``).
         4. Build the canonical-JSON snapshot bytes; compute payload_digest.
         5. Store the verified file bytes.
         6. INSERT the audit row into ``composer_completion_events_table``.
@@ -701,6 +747,8 @@ class ShareableReviewService:
         fails the audit row stands as honest evidence of the attempt; no
         token is returned.
         """
+        if allow_import and confirmed_file_manifest is None:
+            raise ValueError("allow_import requires confirmed_file_manifest, the fingerprint from the file preview")
         max_lifetime_seconds = self._settings.shareable_link_lifetime_seconds
         if lifetime_seconds is None:
             lifetime_seconds = max_lifetime_seconds
@@ -778,11 +826,18 @@ class ShareableReviewService:
                 detail="composition changed while preparing the review snapshot; retry against the current state",
             )
 
-        frozen_files = (
-            await self._verify_shareable_files(composition_state, session_operation_context=session_operation_context)
-            if allow_import
-            else ()
-        )
+        frozen_files: tuple[_FrozenFile, ...] = ()
+        if allow_import and confirmed_file_manifest is not None:
+            frozen_files = await self._verify_shareable_files(composition_state, session_operation_context=session_operation_context)
+            # Consent is to the file set the owner previewed. This runs under
+            # the session's compose lease, so the set judged here is the set
+            # frozen below.
+            current_manifest = _file_manifest_fingerprint({frozen.entry["sha256"]: frozen.entry for frozen in frozen_files})
+            if not hmac.compare_digest(current_manifest, confirmed_file_manifest):
+                raise CompositionNotRunnableError(
+                    reason="share_files_changed",
+                    detail="the files this pipeline uses changed since you reviewed them; review the list and create the link again",
+                )
         # Sink paths inside this session's folders travel as session-relative
         # references, so the import can re-author them under the recipient's
         # session. A view-only share records none.
@@ -1072,8 +1127,11 @@ class ShareableReviewService:
         reported instead of raised. Reads blob rows (never their content)
         under the caller's context and stores nothing; a file whose bytes no
         longer match its row is refused by the share itself. The response
-        names no blob id, path or hash, and carries the deployment's maximum
-        link lifetime so the dialog offers only lifetimes the share accepts.
+        names no blob id, path or content hash, and carries the deployment's
+        maximum link lifetime so the dialog offers only lifetimes the share
+        accepts. When the files are importable it also carries
+        ``manifest_fingerprint``, which an importable share must present
+        back so it freezes exactly the files listed here.
         """
         max_lifetime_seconds = self._settings.shareable_link_lifetime_seconds
         state_record = await self._session_service.get_current_state(session_id)
@@ -1083,6 +1141,7 @@ class ShareableReviewService:
                 importable=False,
                 not_importable_reason="No composition state exists for this session",
                 max_lifetime_seconds=max_lifetime_seconds,
+                manifest_fingerprint=None,
             )
         inspected, collect_refusal = await self._inspect_bound_files(
             state_from_record(state_record), session_operation_context=session_operation_context, read_content=False
@@ -1106,6 +1165,7 @@ class ShareableReviewService:
             importable=reason is None,
             not_importable_reason=reason,
             max_lifetime_seconds=max_lifetime_seconds,
+            manifest_fingerprint=_file_manifest_fingerprint(_manifest_entries(inspected)) if reason is None else None,
         )
 
     async def _verify_shareable_files(
@@ -1129,30 +1189,17 @@ class ShareableReviewService:
         )
         if collect_refusal is not None:
             raise CompositionNotRunnableError(reason="file_not_shareable", detail=collect_refusal)
-        frozen_by_sha: dict[str, _FrozenFile] = {}
+        content_by_sha: dict[str, bytes] = {}
         for item in inspected:
             if item.refusal is not None:
                 raise CompositionNotRunnableError(reason="file_not_shareable", detail=item.refusal)
-            record, content, bindings = item.record, item.content, item.bindings
             # No refusal, so the bytes were read and match the row's
             # non-null content_hash.
-            if record is None or content is None or record.content_hash is None:
+            if item.record is None or item.content is None or item.record.content_hash is None:
                 raise RuntimeError("_inspect_bound_files passed a blob without verified content")
-            binding_json = [file_binding_to_json(binding) for binding in bindings]
-            if record.content_hash in frozen_by_sha:
-                frozen_by_sha[record.content_hash].entry["bindings"].extend(binding_json)
-                continue
-            frozen_by_sha[record.content_hash] = _FrozenFile(
-                content=content,
-                entry={
-                    "sha256": record.content_hash,
-                    "size_bytes": record.size_bytes,
-                    "filename": record.filename,
-                    "mime_type": record.mime_type,
-                    "bindings": binding_json,
-                },
-            )
-        return tuple(frozen_by_sha[sha] for sha in sorted(frozen_by_sha))
+            content_by_sha.setdefault(item.record.content_hash, item.content)
+        entries = _manifest_entries(inspected)
+        return tuple(_FrozenFile(content=content_by_sha[sha], entry=entries[sha]) for sha in sorted(entries))
 
     def _latest_mark_ready_event(self, *, session_id: UUID, state_id: UUID, user_id: str) -> Any | None:
         """Return the latest committed mark-ready event for this exact state."""

@@ -213,6 +213,15 @@ function validateShareableFilesResponse(body: unknown, status: number): Shareabl
   ) {
     throw unexpectedShape(status, "shareable-files");
   }
+  // An importable list always carries its fingerprint, and only then.
+  const manifestFingerprint = body.manifest_fingerprint;
+  if (
+    body.importable
+      ? !(typeof manifestFingerprint === "string" && /^[0-9a-f]{64}$/.test(manifestFingerprint))
+      : manifestFingerprint !== null
+  ) {
+    throw unexpectedShape(status, "shareable-files");
+  }
   return {
     files: body.files.map((file) => ({
       filename: file.filename,
@@ -222,6 +231,7 @@ function validateShareableFilesResponse(body: unknown, status: number): Shareabl
     importable: body.importable,
     not_importable_reason: body.not_importable_reason,
     max_lifetime_seconds: body.max_lifetime_seconds,
+    manifest_fingerprint: typeof manifestFingerprint === "string" ? manifestFingerprint : null,
   };
 }
 
@@ -237,7 +247,8 @@ function validateSharedImportResponse(body: unknown, status: number): SharedImpo
  *
  * ``options`` is required: the share dialog's configure step always chooses
  * whether recipients may import and how long the link lives. A ``null``
- * lifetime omits ``lifetime_seconds``, so the server's maximum applies.
+ * lifetime omits ``lifetime_seconds``, so the server's maximum applies. An
+ * importable share carries the fingerprint of the file list the owner saw.
  */
 export async function markReadyForReview(
   sessionId: string,
@@ -247,11 +258,13 @@ export async function markReadyForReview(
   const response = await authFetch(`/api/sessions/${sessionId}/mark-ready-for-review`, {
     method: "POST",
     headers: authHeaders("application/json"),
-    body: JSON.stringify(
-      options.lifetimeSeconds === null
-        ? { allow_import: options.allowImport }
-        : { allow_import: options.allowImport, lifetime_seconds: options.lifetimeSeconds },
-    ),
+    body: JSON.stringify({
+      allow_import: options.allowImport,
+      ...(options.lifetimeSeconds === null ? {} : { lifetime_seconds: options.lifetimeSeconds }),
+      ...(options.allowImport && options.fileManifestFingerprint !== undefined
+        ? { file_manifest_fingerprint: options.fileManifestFingerprint }
+        : {}),
+    }),
     signal,
   });
   return validateMarkReadyResponse(await parseResponse<unknown>(response), response.status);

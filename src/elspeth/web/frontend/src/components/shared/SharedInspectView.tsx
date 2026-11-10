@@ -335,6 +335,15 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
   const [importing, setImporting] = useState(false);
   const [importError, setImportError] = useState<ImportFailure | null>(null);
   const importingRef = useRef(false);
+  // App re-keys this view per token and unmounts it on any other route, so
+  // "still mounted" means "the user is still on the link they imported from".
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (token === null) return;
@@ -367,11 +376,17 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
       // The shared route is a separate App branch whose hash the session
       // router ignores: refresh the session list first so the composer tree
       // finds the new session, then switch to its canonical hash.
+      // The copy exists either way, so the list is refreshed even if the
+      // user has moved on; only someone still on this link is taken to it.
       await useSessionStore.getState().loadSessions();
-      window.location.hash = `#/${imported.session_id}`;
+      if (mountedRef.current) {
+        window.location.hash = `#/${imported.session_id}`;
+      }
     } catch (exc: unknown) {
-      setImportError(_importFailure(exc));
-      setImporting(false);
+      if (mountedRef.current) {
+        setImportError(_importFailure(exc));
+        setImporting(false);
+      }
     } finally {
       importingRef.current = false;
     }

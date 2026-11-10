@@ -210,7 +210,10 @@ def is_headless_blob_ref_fragment(value: object) -> bool:
         return False
     if not set(fragment).issubset(_ALLOWED_MARKER_KEYS):
         return False
-    return fragment["mode"] in ALLOWED_BLOB_REF_MODES
+    # Imported YAML can put any value under ``mode``; only a string can name a
+    # blob mode, and an unhashable value would raise on the membership test.
+    mode = fragment["mode"]
+    return type(mode) is str and mode in ALLOWED_BLOB_REF_MODES
 
 
 class BlobContentResolutionError(Exception):

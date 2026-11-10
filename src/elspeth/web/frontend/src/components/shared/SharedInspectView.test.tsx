@@ -572,6 +572,39 @@ describe("SharedInspectView import", () => {
     expect(order).toEqual(["load:#/shared/abc"]);
   });
 
+  it.each([
+    ["before the import returns", "import"],
+    ["while the session list reloads", "sessions"],
+  ])("does not navigate when the user left the link %s", async (_label, leaveDuring) => {
+    vi.spyOn(api, "fetchSharedInspect").mockResolvedValueOnce(importable);
+    const view = render(<SharedInspectView token="abc" />);
+    await screen.findByTestId("shared-inspect-loaded");
+    let resolveImport!: (v: { session_id: string; state_id: string }) => void;
+    vi.spyOn(api, "importSharedSnapshot").mockImplementationOnce(
+      () => new Promise((r) => { resolveImport = r; }),
+    );
+    let resolveSessions!: () => void;
+    const loadSessions = vi.fn().mockImplementation(
+      () => new Promise<void>((r) => { resolveSessions = r; }),
+    );
+    vi.spyOn(useSessionStore, "getState").mockReturnValue({ loadSessions } as never);
+    await userEvent.click(screen.getByRole("button", BUTTON));
+
+    // The user picks another pipeline: App unmounts this view.
+    const leave = (): void => {
+      window.location.hash = "#/other-session";
+      view.unmount();
+    };
+    if (leaveDuring === "import") leave();
+    resolveImport({ session_id: "sess-new", state_id: "st-1" });
+    await waitFor(() => expect(loadSessions).toHaveBeenCalledTimes(1));
+    if (leaveDuring === "sessions") leave();
+    resolveSessions();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(window.location.hash).toBe("#/other-session");
+  });
+
   it("disables the button while the import is in flight", async () => {
     await renderImportable();
     let resolve!: (v: { session_id: string; state_id: string }) => void;

@@ -70,7 +70,13 @@ Success means:
 **create link**. The configure step reads the file list from a new
 owner-only route, `GET /api/sessions/{session_id}/shareable-files`, which
 returns the current state's referenced files (name, size, binding sites; no
-blob ids or storage paths). The dialog gains:
+blob ids or storage paths) and, when they can be shared for import, a
+`manifest_fingerprint` over them. An importable share sends that fingerprint
+back as `file_manifest_fingerprint`; the server recomputes it under the
+session's compose lease from the files it is about to freeze and refuses a
+mismatch (409, `share_files_changed`), so the owner's consent covers exactly
+the files that travel. The dialog then reloads the list with the import choice
+unticked. The dialog gains:
 
 1. **"Let recipients import a copy"**, off by default. When ticked it lists the
    files that will travel: name, size, and which component and option uses each.

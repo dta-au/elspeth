@@ -504,6 +504,16 @@ describe("shareableReviews API client", () => {
     expect(headers?.["Content-Type"]).toBe("application/json");
   });
 
+  it.each([
+    ["an importable share carries the previewed file fingerprint", true, { allow_import: true, file_manifest_fingerprint: "f".repeat(64) }],
+    ["a view-only share carries no file fingerprint", false, { allow_import: false }],
+  ])("markReadyForReview: %s", async (_label, allowImport, expectedBody) => {
+    _mockJsonResponse(MARK_READY_BODY);
+    await markReadyForReview(SESSION_ID, { allowImport, lifetimeSeconds: null, fileManifestFingerprint: "f".repeat(64) });
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init?.body as string)).toEqual(expectedBody);
+  });
+
   it("fetchSharedInspect rejects a missing import_allowed", async () => {
     const body = _buildValidSharedInspectBody();
     delete body.import_allowed;
@@ -533,11 +543,13 @@ describe("shareableReviews API client", () => {
       importable: false,
       not_importable_reason: "too big",
       max_lifetime_seconds: 604800,
+      manifest_fingerprint: null,
     });
     const response = await fetchShareableFiles(SESSION_ID);
     expect(response.files[0].used_by).toEqual(["source"]);
     expect(response.not_importable_reason).toBe("too big");
     expect(response.max_lifetime_seconds).toBe(604800);
+    expect(response.manifest_fingerprint).toBeNull();
     const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(url).toBe(`/api/sessions/${SESSION_ID}/shareable-files`);
     expect(init?.method).toBe("GET");
@@ -549,6 +561,36 @@ describe("shareableReviews API client", () => {
       importable: true,
       not_importable_reason: null,
       max_lifetime_seconds: 86400,
+      manifest_fingerprint: "f".repeat(64),
+    });
+    await expect(fetchShareableFiles(SESSION_ID)).rejects.toMatchObject({
+      detail: expect.stringContaining("shareable-files"),
+    });
+  });
+
+  it("fetchShareableFiles returns the fingerprint of an importable list", async () => {
+    _mockJsonResponse({
+      files: [],
+      importable: true,
+      not_importable_reason: null,
+      max_lifetime_seconds: 86400,
+      manifest_fingerprint: "f".repeat(64),
+    });
+    expect((await fetchShareableFiles(SESSION_ID)).manifest_fingerprint).toBe("f".repeat(64));
+  });
+
+  it.each([
+    ["an importable list without a fingerprint", true, null],
+    ["an importable list with a malformed fingerprint", true, "abc"],
+    ["a missing fingerprint", true, undefined],
+    ["a fingerprint on a list that is not importable", false, "f".repeat(64)],
+  ])("fetchShareableFiles rejects %s", async (_label, importable, fingerprint) => {
+    _mockJsonResponse({
+      files: [],
+      importable,
+      not_importable_reason: importable ? null : "no",
+      max_lifetime_seconds: 86400,
+      manifest_fingerprint: fingerprint,
     });
     await expect(fetchShareableFiles(SESSION_ID)).rejects.toMatchObject({
       detail: expect.stringContaining("shareable-files"),
@@ -561,7 +603,13 @@ describe("shareableReviews API client", () => {
     ["zero", 0],
     ["fractional", 1.5],
   ])("fetchShareableFiles rejects a max_lifetime_seconds that is %s", async (_label, value) => {
-    _mockJsonResponse({ files: [], importable: true, not_importable_reason: null, max_lifetime_seconds: value });
+    _mockJsonResponse({
+      files: [],
+      importable: true,
+      not_importable_reason: null,
+      max_lifetime_seconds: value,
+      manifest_fingerprint: "f".repeat(64),
+    });
     await expect(fetchShareableFiles(SESSION_ID)).rejects.toMatchObject({
       detail: expect.stringContaining("shareable-files"),
     });

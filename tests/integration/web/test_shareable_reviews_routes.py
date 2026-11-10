@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -579,6 +580,15 @@ def _seed_uploaded_file_source(client: TestClient, session_id: UUID, content: by
     return {"id": blob["id"], "content_hash": blob["content_hash"], "storage_path": storage_path}
 
 
+def _import_share_body(client: TestClient, session_id: UUID, **extra: object) -> dict[str, object]:
+    """An importable share's body, confirming the files the preview lists now."""
+    preview = client.get(f"/api/sessions/{session_id}/shareable-files")
+    assert preview.status_code == 200, preview.text
+    fingerprint = preview.json()["manifest_fingerprint"]
+    assert fingerprint is not None, preview.json()["not_importable_reason"]
+    return {"allow_import": True, "file_manifest_fingerprint": fingerprint, **extra}
+
+
 def test_preview_lists_each_file_once_with_every_use(
     audit_readiness_client_with_state: tuple[TestClient, UUID],
 ) -> None:
@@ -594,7 +604,9 @@ def test_preview_lists_each_file_once_with_every_use(
         "importable": True,
         "not_importable_reason": None,
         "max_lifetime_seconds": client.app.state.settings.shareable_link_lifetime_seconds,
+        "manifest_fingerprint": response.json()["manifest_fingerprint"],
     }
+    assert re.fullmatch(r"[0-9a-f]{64}", response.json()["manifest_fingerprint"])
 
 
 def test_preview_reports_llm_authored_file_as_not_importable(
@@ -656,7 +668,11 @@ def test_preview_and_mark_ready_refuse_a_verbatim_file_the_user_did_not_upload(
         conn.execute(blobs_table.update().where(blobs_table.c.id == seeded["id"]).values(created_by=created_by))
 
     preview = client.get(f"/api/sessions/{session_id}/shareable-files")
-    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review", json={"allow_import": True})
+    marked = client.post(
+        f"/api/sessions/{session_id}/mark-ready-for-review",
+        # Refused before the fingerprint is compared.
+        json={"allow_import": True, "file_manifest_fingerprint": "0" * 64},
+    )
 
     assert preview.status_code == 200, preview.text
     assert preview.json()["importable"] is False
@@ -781,6 +797,33 @@ def test_mark_ready_accepts_absent_body(
     assert stored["files"] == []
 
 
+def test_mark_ready_refuses_files_that_changed_since_the_preview(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    """The owner consents to the previewed files; a swapped file is not frozen."""
+    client, session_id = audit_readiness_client_with_state
+    _seed_uploaded_file_source(client, session_id, b"id,name\n1,Ada\n")
+    previewed = _import_share_body(client, session_id)
+    swapped = _seed_uploaded_file_source(client, session_id, b"id,salary\n1,90000\n")
+
+    refused = client.post(f"/api/sessions/{session_id}/mark-ready-for-review", json=previewed)
+
+    assert refused.status_code == 409, refused.text
+    detail = refused.json()["detail"]
+    assert detail["error_type"] == "share_files_changed"
+    assert detail["detail"] == "the files this pipeline uses changed since you reviewed them; review the list and create the link again"
+    assert not client.app.state.payload_store.exists(swapped["content_hash"])
+    with client.app.state.session_engine.connect() as conn:
+        rows = conn.execute(
+            select(composer_completion_events_table).where(composer_completion_events_table.c.session_id == str(session_id))
+        ).all()
+    assert rows == []
+
+    confirmed = client.post(f"/api/sessions/{session_id}/mark-ready-for-review", json=_import_share_body(client, session_id))
+    assert confirmed.status_code == 200, confirmed.text
+    assert client.app.state.payload_store.exists(swapped["content_hash"])
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -788,6 +831,8 @@ def test_mark_ready_accepts_absent_body(
         pytest.param({"lifetime_seconds": "86400"}, id="string-lifetime"),
         pytest.param({"allow_import": "yes"}, id="non-bool-import"),
         pytest.param({"allow_import": True, "expires": 1}, id="extra-field"),
+        pytest.param({"allow_import": True}, id="import-without-previewed-files"),
+        pytest.param({"allow_import": True, "file_manifest_fingerprint": "not-a-fingerprint"}, id="malformed-fingerprint"),
     ],
 )
 def test_mark_ready_rejects_unknown_lifetime_with_422(
@@ -827,7 +872,7 @@ def test_mark_ready_with_lifetime_and_copy_link_keep_one_day(
     client, session_id = audit_readiness_client_with_state
     marked = client.post(
         f"/api/sessions/{session_id}/mark-ready-for-review",
-        json={"allow_import": True, "lifetime_seconds": 86400},
+        json=_import_share_body(client, session_id, lifetime_seconds=86400),
     )
     assert marked.status_code == 200, marked.text
     service = client.app.state.shareable_review_service
@@ -875,7 +920,7 @@ def test_mark_ready_with_import_freezes_an_uploaded_file(
         )
     )
 
-    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review", json={"allow_import": True})
+    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review", json=_import_share_body(client, session_id))
 
     assert marked.status_code == 200, marked.text
     payload_store = client.app.state.payload_store
@@ -906,7 +951,7 @@ def test_import_route_copies_the_shared_file_into_a_new_session(
     client, session_id = audit_readiness_client_with_state
     content = b"id,name\n1,Ada\n"
     seeded = _seed_uploaded_file_source(client, session_id, content)
-    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review", json={"allow_import": True})
+    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review", json=_import_share_body(client, session_id))
     assert marked.status_code == 200, marked.text
 
     imported = client.post(f"/api/sessions/shared/{marked.json()['token']}/import")

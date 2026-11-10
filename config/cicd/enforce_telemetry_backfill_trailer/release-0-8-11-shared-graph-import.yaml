@@ -1,0 +1,107 @@
+# Shared graph import (0.8.11): feature commits that touch cohort (a)
+# shareable_reviews without emitting or backfilling telemetry.
+#
+# The commit-msg hook was not installed in the session that authored them, so
+# the trailer was first demanded by the CI backstop on dta-au/elspeth#358.
+# Rewriting history is not available: release/0.8.11-candidate is published
+# and other branches are based on it. Later commits on the branch carry the
+# trailer.
+entries:
+  - commit_sha: bba347a04210f16241495c49e989146bf52a59fa
+    cohort: a
+    reason: |
+      Adds src/elspeth/web/shareable_reviews/file_manifest.py (235 lines),
+      the collector for the file bindings a composition uses. New feature
+      code for shared graph import; it emits no telemetry counter, so there
+      is no backfilled counter to attribute to an earlier cohort. History
+      cannot be rewritten: the commit is published on
+      release/0.8.11-candidate.
+    owner: tachyon-beep
+    expires: 2027-01-31
+  - commit_sha: d9bfe66d944ddc3cc651dbb6b9cfab1923507868
+    cohort: a
+    reason: |
+      Touches three files under src/elspeth/web/shareable_reviews/ to add
+      the per-link lifespan and the import opt-in that freezes files into
+      the share. Feature work on the share path itself; it adds no
+      telemetry counter emit. History cannot be rewritten: the commit is
+      published on release/0.8.11-candidate.
+    owner: tachyon-beep
+    expires: 2027-01-31
+  - commit_sha: 14d3c35b930aa07bfa6a1d9e4279ab0b0e238299
+    cohort: a
+    reason: |
+      Six inserted lines and one deleted in one file under
+      src/elspeth/web/shareable_reviews/, clamping a re-minted link's
+      lifespan to the current maximum. A behaviour fix with no telemetry
+      counter emit. History cannot be rewritten: the commit is published on
+      release/0.8.11-candidate.
+    owner: tachyon-beep
+    expires: 2027-01-31
+  - commit_sha: 280ff54404c067fc0ef5e48970b04331fdee7077
+    cohort: a
+    reason: |
+      Touches three files under src/elspeth/web/shareable_reviews/ to add
+      the owner's preview of the files a share would carry
+      (GET .../shareable-files). Feature work with no telemetry counter
+      emit. History cannot be rewritten: the commit is published on
+      release/0.8.11-candidate.
+    owner: tachyon-beep
+    expires: 2027-01-31
+  - commit_sha: 206c5e52cc158a82100868b58f762ac06467a499
+    cohort: a
+    reason: |
+      Twenty-one inserted lines in two files under
+      src/elspeth/web/shareable_reviews/, adding import_allowed and the
+      file list to the shared inspect response. Feature work with no
+      telemetry counter emit. History cannot be rewritten: the commit is
+      published on release/0.8.11-candidate.
+    owner: tachyon-beep
+    expires: 2027-01-31
+  - commit_sha: 10d527e0f66cf08cebdc8e0fa66e28ab168e3664
+    cohort: a
+    reason: |
+      Touches three files under src/elspeth/web/shareable_reviews/ to add
+      the importer and its route (POST .../shared/{token}/import). Feature
+      work with no telemetry counter emit. History cannot be rewritten: the
+      commit is published on release/0.8.11-candidate.
+    owner: tachyon-beep
+    expires: 2027-01-31
+  - commit_sha: 435f21f9b2e074c93aa69dd39528a422186ef5f0
+    cohort: a
+    reason: |
+      Eleven inserted lines in one file under
+      src/elspeth/web/shareable_reviews/, refusing an over-cap shared YAML
+      before the import session is created. A behaviour fix with no
+      telemetry counter emit. History cannot be rewritten: the commit is
+      published on release/0.8.11-candidate.
+    owner: tachyon-beep
+    expires: 2027-01-31
+  - commit_sha: 28cd00d0397eb4c053966c2ceb566cad2c7d1f3e
+    cohort: a
+    reason: |
+      Touches three files under src/elspeth/web/shareable_reviews/ to
+      record sink output paths in the share and re-base them on import.
+      Feature work with no telemetry counter emit. History cannot be
+      rewritten: the commit is published on release/0.8.11-candidate.
+    owner: tachyon-beep
+    expires: 2027-01-31
+  - commit_sha: a054c35b6f49456f2057e975c48d2b6f7684cccd
+    cohort: a
+    reason: |
+      Touches five files under src/elspeth/web/shareable_reviews/ to
+      harden file and sink-path handling after review. Behaviour fixes with
+      no telemetry counter emit. History cannot be rewritten: the commit is
+      published on release/0.8.11-candidate.
+    owner: tachyon-beep
+    expires: 2027-01-31
+  - commit_sha: 07c9f1e92da9b8dae0cbe8a45067d06a82a62733
+    cohort: a
+    reason: |
+      Thirteen inserted and four deleted lines in two files under
+      src/elspeth/web/shareable_reviews/, freezing the container fields of
+      two frozen dataclasses for the immutability lint. No telemetry
+      counter emit. History cannot be rewritten: the commit is published on
+      release/0.8.11-candidate.
+    owner: tachyon-beep
+    expires: 2027-01-31
