@@ -68,7 +68,21 @@ published tag or an image.
   a third of what the proposal planner receives still describes tools it does
   not have.
 
+- **The gate-preview mismatch diagnostic names the actual failure.** It
+  reports a misspelt field, a short row, a zero divisor or a bad function
+  argument as such, instead of always advising a numeric source-schema type,
+  and the preview no longer samples a CSV row cut short by its 8 KiB byte
+  limit. Known and deferred: the preview keys sampled rows by the raw CSV
+  header where the runtime uses normalised names; the repair text now says so
+  and tells the model not to rename the field.
+- **Prompt review wording.** The Composer skill now says the server raises
+  every prompt review card, in place of wording that read as though prompts
+  go unreviewed.
+
 ### Web interface
+
+- **The tutorial's audit step explains its LLM call count**, which includes
+  one reachability check made before the run starts.
 
 - **The ARGOnite skin.** The web interface takes the ARGOnite look in light
   and dark themes, with a high-contrast palette built on the same hues.
