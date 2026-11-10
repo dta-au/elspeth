@@ -22,6 +22,7 @@ from elspeth.contracts.composer_planner_audit import ComposerPlannerAttemptOutco
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.context_budget import CONTEXT_BUDGET_TOOL_RESULT_STUB, ContextBudgetPolicy
+from elspeth.web.composer.context_budget_apply import CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.llm_response_parsing import _hash_and_measure_request
 from elspeth.web.composer.pipeline_planner import (
@@ -30,10 +31,13 @@ from elspeth.web.composer.pipeline_planner import (
     PlannerDeclined,
     PlannerPriorAssistantMessage,
     PlannerPriorUserRequest,
+    _planner_request_message,
+    _planner_request_size,
     _PlannerAttemptTrail,
 )
 from elspeth.web.composer.tools import ToolContext
 from tests.unit.web.composer.test_pipeline_planner import (
+    _budget,
     _context_policy,
     _empty_state,
     _pipeline,
@@ -46,11 +50,17 @@ from tests.unit.web.composer.test_pipeline_planner import (
 _ANTHROPIC = "anthropic/claude-planner"
 _UNMARKED = "openai/gpt-planner"
 _FALLBACK_RATIO = 3.0
+_ALLOWANCE = CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES
 
 
 def _entry_saving(index: int, content: str) -> int:
     """Bytes an entry occupies inside the request message, plus its separator."""
     return len(canonical_json({"history_index": index, "content": content}).encode("utf-8")) + 1
+
+
+def _sent_bytes(request: dict[str, Any]) -> int:
+    """A sent request on the measure the decision and the final request byte check use."""
+    return _planner_request_size(request["messages"], request["tools"])
 
 
 def _payload(request: dict[str, Any]) -> dict[str, Any]:
@@ -172,6 +182,22 @@ def test_without_refuses_indices_it_does_not_hold(indices: frozenset[int]) -> No
         _context(users={0: "u0"}).without(indices)
 
 
+def test_the_largest_omission_counts_fit_the_context_budget_allowance() -> None:
+    """Re-rendering after removing every entry adds no more than the allowance on the decision's measure."""
+    largest = 2**53 - 1  # the largest integer canonical JSON encodes
+    before = _context(users={0: "u" * 50}, assistants={1: "a" * 50})
+    after = PlannerConversationContext(
+        prior_user_requests=(), additional_prior_user_requests_omitted=largest, prior_assistant_messages_omitted=largest
+    )
+    savings = _entry_saving(0, "u" * 50) + _entry_saving(1, "a" * 50)
+
+    def size(context: PlannerConversationContext) -> int:
+        message = _planner_request_message({"intent": "Build it.", "conversation_context": context.to_dict()})
+        return _planner_request_size([{"role": message["role"], "content": message["content"]}], [])
+
+    assert size(after) - (size(before) - savings) <= _ALLOWANCE
+
+
 # --- Conversation context at the call site ----------------------------------------------------
 
 
@@ -194,14 +220,16 @@ async def test_a_very_high_cap_sends_the_full_context_and_records_that_nothing_w
 async def test_assistant_prose_is_shed_before_user_requests(tmp_path: Path, tool_context: ToolContext) -> None:
     users = {0: "Build CSV to JSON.", 2: "Keep every row."}
     assistants = {1: "a" * 40_000, 3: "b" * 40_000}
-    _, users_only = await _decline(tmp_path, tool_context, _context(users=users))
+    users_only_request, _ = await _decline(tmp_path, tool_context, _context(users=users))
     full_context = _context(users=users, assistants=assistants)
-    full_request, full = await _decline(tmp_path, tool_context, full_context)
-    users_only_bytes = users_only.request_byte_split.total_bytes
-    full_bytes = full.request_byte_split.total_bytes
-    policy = _policy_shedding_to(users_only_bytes + 200)
+    full_request, _ = await _decline(tmp_path, tool_context, full_context)
+    users_only_bytes = _sent_bytes(users_only_request)
+    # The decision's input: the request as sent plus the omission allowance.
+    full_bytes = _sent_bytes(full_request) + _ALLOWANCE
+    low_bytes = users_only_bytes + _ALLOWANCE + 500
+    policy = _policy_shedding_to(low_bytes)
     assert full_bytes / _FALLBACK_RATIO > policy.shed_above * policy.max_prompt_tokens  # over the high mark
-    assert full_bytes - _entry_saving(1, assistants[1]) > (users_only_bytes + 200)  # one removal is not enough
+    assert full_bytes - _entry_saving(1, assistants[1]) > low_bytes  # one removal is not enough
 
     request, call = await _decline(tmp_path, tool_context, full_context, policy=policy)
 
@@ -235,10 +263,10 @@ async def test_oldest_user_requests_are_shed_last_and_counted(
 ) -> None:
     users = {0: "r" * 40_000, 1: "s" * 40_000, 2: "t" * 40_000}
     context = _context(users=users)
-    _, full = await _decline(tmp_path, tool_context, context)
-    full_bytes = full.request_byte_split.total_bytes
-    base_bytes = full_bytes - sum(_entry_saving(index, text) for index, text in users.items())
-    policy = _policy_shedding_to(base_bytes + sum(_entry_saving(index, users[index]) for index in expected_retained) + 100)
+    full_request, _ = await _decline(tmp_path, tool_context, context)
+    full_bytes = _sent_bytes(full_request) + _ALLOWANCE
+    shed_saving = sum(_entry_saving(index, text) for index, text in users.items() if index not in expected_retained)
+    policy = _policy_shedding_to(full_bytes - shed_saving + 100)
     assert full_bytes / _FALLBACK_RATIO > policy.shed_above * policy.max_prompt_tokens
 
     request, call = await _decline(tmp_path, tool_context, context, policy=policy)
@@ -255,8 +283,8 @@ async def test_oldest_user_requests_are_shed_last_and_counted(
 @pytest.mark.asyncio
 async def test_history_shed_on_an_earlier_turn_stays_shed_between_the_marks(tmp_path: Path, tool_context: ToolContext) -> None:
     context = _context(users={0: "Build CSV to JSON."}, assistants={1: "a" * 20_000})
-    _, full = await _decline(tmp_path, tool_context, context)
-    full_bytes = full.request_byte_split.total_bytes
+    full_request, _ = await _decline(tmp_path, tool_context, context)
+    full_bytes = _sent_bytes(full_request) + _ALLOWANCE
     ratio = 4.0
     # The full request sits at 70% of the cap: under the high mark, over the low mark.
     policy = _context_policy(max_prompt_tokens=math.ceil(full_bytes / ratio / 0.7), max_request_bytes=1_000_000)
@@ -321,7 +349,8 @@ async def test_the_escape_hatch_request_sheds_its_conversation_context_and_keeps
     assistants = {1: "a" * 40_000}
     context = _context(users={0: "Convert the data."}, assistants=assistants)
     measured_completion, measured = await _hatch_run(tmp_path, tool_context, context, None)
-    first_bytes, _, hatch_bytes = (call.request_byte_split.total_bytes for call in measured.llm_calls)
+    del measured
+    first_bytes, _, hatch_bytes = (_sent_bytes(request) + _ALLOWANCE for request in measured_completion.requests)
     saving = _entry_saving(1, assistants[1])
     policy = _policy_shedding_to(hatch_bytes - saving + 200, shed_to=0.8)
     # Both requests are over the high mark and fit once the assistant message is shed.
@@ -380,8 +409,9 @@ async def test_a_re_rendered_request_keeps_the_state_it_was_first_sent_with(tmp_
         assert len(completion.requests) == len(recorder.llm_calls) == 2
         return recorder
 
-    measured = await run(script(_ScriptedCompletion), None)
-    first_bytes, second_bytes = (call.request_byte_split.total_bytes for call in measured.llm_calls)
+    measured_completion = script(_ScriptedCompletion)
+    await run(measured_completion, None)
+    first_bytes, second_bytes = (_sent_bytes(request) + _ALLOWANCE for request in measured_completion.requests)
     policy = _policy_shedding_to(second_bytes - _entry_saving(1, "a" * 40_000) + 200, shed_to=0.8)
     assert first_bytes / _FALLBACK_RATIO > policy.shed_above * policy.max_prompt_tokens
 
@@ -432,8 +462,9 @@ async def _discovery_run(
 async def test_earlier_tool_results_are_stubbed_and_the_latest_round_is_intact(
     tmp_path: Path, tool_context: ToolContext, model: str
 ) -> None:
-    measured_completion, measured = await _discovery_run(tmp_path, tool_context, model=model, policy=None)
-    totals = [call.request_byte_split.total_bytes for call in measured.llm_calls]
+    measured_completion, _ = await _discovery_run(tmp_path, tool_context, model=model, policy=None)
+    # No conversation context, so no omission allowance.
+    totals = [_sent_bytes(request) for request in measured_completion.requests]
     first_result = measured_completion.requests[3]["messages"][4]
     assert first_result["role"] == "tool" and first_result["tool_call_id"] == "schema-llm"
     first_saving = len(first_result["content"].encode("utf-8")) - len(CONTEXT_BUDGET_TOOL_RESULT_STUB.encode("utf-8"))
@@ -489,8 +520,8 @@ async def test_earlier_tool_results_are_stubbed_and_the_latest_round_is_intact(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ceiling", ["tokens", "bytes"])
 async def test_an_oversized_intent_is_refused_before_any_provider_call(tmp_path: Path, tool_context: ToolContext, ceiling: str) -> None:
-    _, small = await _decline(tmp_path, tool_context, _context(users={0: "Build CSV to JSON."}))
-    base_bytes = small.request_byte_split.total_bytes
+    small_request, _ = await _decline(tmp_path, tool_context, _context(users={0: "Build CSV to JSON."}))
+    base_bytes = _sent_bytes(small_request)
     cap_bytes = base_bytes + 10_000
     policy = (
         _context_policy(max_prompt_tokens=math.ceil(cap_bytes / _FALLBACK_RATIO), max_request_bytes=1_000_000)
@@ -518,20 +549,17 @@ async def test_an_oversized_intent_is_refused_before_any_provider_call(tmp_path:
     assert recorder.llm_calls == ()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("model", [_ANTHROPIC, _UNMARKED], ids=["anthropic-marked", "unmarked"])
-async def test_an_applied_request_over_the_byte_ceiling_is_refused_before_any_provider_call(
-    tmp_path: Path, tool_context: ToolContext, model: str
-) -> None:
-    """The decision admits the request; re-rendering the omission count pushes it back over."""
-    assistants = {1: "a" * 20_000, 2: "b" * 150_000}
-    context = _context(users={0: "Build CSV to JSON."}, assistants=assistants)
-    _, full = await _decline(tmp_path, tool_context, context, model=_UNMARKED)
-    full_bytes = full.request_byte_split.total_bytes
-    cap_bytes = full_bytes - _entry_saving(1, assistants[1]) + 10
-    completion = _ScriptedCompletion(_text_response("Must not dispatch."))
+async def _decline_or_refusal(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    context: PlannerConversationContext,
+    *,
+    policy: ContextBudgetPolicy,
+    model: str,
+) -> tuple[_ScriptedCompletion, BufferingRecorder, PipelinePlannerError]:
+    """One planner call under ``policy``; the planner's byte budget is the same ceiling, as in production."""
+    completion = _ScriptedCompletion(_text_response("Which output format do you want?"))
     recorder = BufferingRecorder()
-
     with pytest.raises(PipelinePlannerError) as caught:
         await _plan(
             tmp_path=tmp_path,
@@ -539,23 +567,85 @@ async def test_an_applied_request_over_the_byte_ceiling_is_refused_before_any_pr
             completion=completion,
             recorder=recorder,
             conversation_context=context,
-            context_policy=_context_policy(max_request_bytes=cap_bytes),
+            context_policy=policy,
+            budget=_budget(max_request_bytes=policy.max_request_bytes),
             model_overrides={"model_identifier": model},
         )
+    return completion, recorder, caught.value
 
-    assert caught.value.code == ComposerPlannerCode.CONTEXT_BUDGET_EXHAUSTED.value
-    assert caught.value.detail_codes == ("context_ceiling_bytes", "largest_component_request")
-    assert completion.requests == []
-    assert recorder.llm_calls == ()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", [_ANTHROPIC, _UNMARKED], ids=["anthropic-marked", "unmarked"])
+async def test_a_request_within_the_re_render_margin_of_the_ceiling_sheds_one_more_segment_and_is_sent(
+    tmp_path: Path, tool_context: ToolContext, model: str
+) -> None:
+    """Shedding the first assistant message lands a few bytes under the ceiling before the re-render.
+
+    The re-rendered omission count (and, for Anthropic, the cache markers the
+    decision measured) would push it back over, so the decision sheds the
+    next assistant message too and the request is sent at or under the
+    ceiling. Nothing protected is anywhere near the ceiling.
+    """
+    assistants = {1: "a" * 20_000, 2: "b" * 5_000}
+    context = _context(users={0: "Build CSV to JSON."}, assistants=assistants)
+    full_request, _ = await _decline(tmp_path, tool_context, context, model=model)
+    cap_bytes = _sent_bytes(full_request) - _entry_saving(1, assistants[1]) + 10
+    policy = _context_policy(max_request_bytes=cap_bytes)
+
+    completion, recorder, outcome = await _decline_or_refusal(tmp_path, tool_context, context, policy=policy, model=model)
+
+    assert type(outcome) is PlannerDeclined
+    (request,) = completion.requests
+    (call,) = recorder.llm_calls
+    _sent_matches_record(request, call)
+    assert _sent_bytes(request) <= cap_bytes
+    assert call.request_byte_split.total_bytes <= cap_bytes
+    sent = _payload(request)["conversation_context"]
+    assert "prior_assistant_messages" not in sent and sent["prior_assistant_messages_omitted"] == 2
+    assert sent["prior_user_requests"] == [{"history_index": 0, "content": "Build CSV to JSON."}]
+    assert call.context_budget is not None
+    assert call.context_budget.shed_history_indices == (1, 2)
+    assert call.context_budget.estimated_tokens_after <= policy.max_prompt_tokens
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", [_ANTHROPIC, _UNMARKED], ids=["anthropic-marked", "unmarked"])
+async def test_a_dispatched_request_never_exceeds_either_ceiling(tmp_path: Path, tool_context: ToolContext, model: str) -> None:
+    """Over ceilings straddling the size after one shed, every request is sent within both ceilings or refused unsent."""
+    assistants = {1: "a" * 20_000, 2: "b" * 5_000}
+    context = _context(users={0: "Build CSV to JSON."}, assistants=assistants)
+    full_request, _ = await _decline(tmp_path, tool_context, context, model=model)
+    one_shed = _sent_bytes(full_request) - _entry_saving(1, assistants[1])
+    policies = [_context_policy(max_request_bytes=one_shed + delta) for delta in (-6_000, -400, -10, 0, 10, 100, 400)]
+    policies += [
+        _context_policy(max_prompt_tokens=math.ceil((one_shed + delta) / _FALLBACK_RATIO), max_request_bytes=1_000_000)
+        for delta in (-6_000, -400, -10, 0, 10, 100, 400)
+    ]
+    sent_count = 0
+    for policy in policies:
+        completion, recorder, outcome = await _decline_or_refusal(tmp_path, tool_context, context, policy=policy, model=model)
+        if type(outcome) is PlannerDeclined:
+            sent_count += 1
+            (request,) = completion.requests
+            (call,) = recorder.llm_calls
+            assert _sent_bytes(request) <= policy.max_request_bytes, policy
+            assert call.request_byte_split.total_bytes <= policy.max_request_bytes, policy
+            assert call.context_budget is not None
+            assert call.context_budget.estimated_tokens_after <= policy.max_prompt_tokens, policy
+        else:
+            # Only the budget may refuse, and only before dispatch.
+            assert outcome.code == "CONTEXT_BUDGET_EXHAUSTED", (policy, outcome.code)
+            assert completion.requests == [] and recorder.llm_calls == ()
+    assert sent_count >= len(policies) - 2  # the two tightest ceilings may refuse; the rest are sent
 
 
 @pytest.mark.asyncio
 async def test_a_later_call_whose_protected_content_cannot_fit_is_refused(tmp_path: Path, tool_context: ToolContext) -> None:
     """Earlier calls are sent; the refused call is never dispatched and leaves no call record."""
-    measured_completion, measured = await _discovery_run(tmp_path, tool_context, model=_UNMARKED, policy=None, large_first=False)
+    measured_completion, _ = await _discovery_run(tmp_path, tool_context, model=_UNMARKED, policy=None, large_first=False)
     # The second request is admitted; the third cannot fit even with the first result stubbed,
     # because its latest round (the larger result) is protected.
-    totals = [call.request_byte_split.total_bytes for call in measured.llm_calls]
+    totals = [_sent_bytes(request) for request in measured_completion.requests]
     protected_third = totals[2] - (
         len(measured_completion.requests[2]["messages"][4]["content"].encode("utf-8"))
         - len(CONTEXT_BUDGET_TOOL_RESULT_STUB.encode("utf-8"))
