@@ -23,7 +23,7 @@ import csv
 import io
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
@@ -35,6 +35,8 @@ from elspeth.contracts.schema import FieldDefinition
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.config_content import (
     CanonicalSizeLimitExceededError,
+    NonCanonicalValueTypeError,
+    NonStringObjectKeyError,
     bounded_canonical_size,
     reject_duplicate_json_object_members,
     reject_nonfinite_constant,
@@ -47,7 +49,39 @@ MAX_FILE_INJECT_ENTRY_BYTES = 16 * 1024 * 1024
 #: entry counts in both modes; in ``all`` mode this is what each row gains.
 MAX_FILE_INJECT_NODE_BYTES = 64 * 1024 * 1024
 
+#: Deepest container nesting accepted in a ``json`` entry, in each ``jsonl``
+#: line, and in ``default_content``. Far above any real document and far below
+#: the interpreter's recursion limit, which the size walk would otherwise hit.
+MAX_FILE_INJECT_JSON_DEPTH = 100
+
 InjectedFormat = Literal["text", "json", "jsonl", "csv"]
+
+
+def _refuse_deep_or_nonfinite(value: object) -> None:
+    """Refuse a value nested past the depth limit or holding a non-finite float.
+
+    Iterative on purpose: the values it guards against are the ones a
+    recursive walk cannot survive.
+    """
+    pending: list[tuple[object, int]] = [(value, 0)]
+    while pending:
+        item, depth = pending.pop()
+        if type(item) is float and not math.isfinite(item):
+            raise ValueError("holds a non-finite number (NaN or Infinity)")
+        # isinstance, not an exact-type test: this must descend into exactly
+        # what bounded_canonical_size descends into (any Mapping, list or
+        # tuple, e.g. a frozen options bag), or a container it skipped would
+        # reach that recursive walk unchecked.
+        children: Iterable[object]
+        if isinstance(item, Mapping):
+            children = item.values()
+        elif isinstance(item, (list, tuple)):
+            children = item
+        else:
+            continue
+        if depth >= MAX_FILE_INJECT_JSON_DEPTH:
+            raise ValueError(f"nested more than {MAX_FILE_INJECT_JSON_DEPTH} levels deep")
+        pending.extend((child, depth + 1) for child in children)
 
 
 def _finite_float(literal: str) -> float:
@@ -66,7 +100,7 @@ def _finite_float(literal: str) -> float:
 def _load_json(text: str) -> object:
     """Parse one JSON value under the strict rules shared with reference_join."""
     try:
-        return json.loads(
+        loaded: object = json.loads(
             text,
             object_pairs_hook=reject_duplicate_json_object_members,
             parse_constant=reject_nonfinite_constant,
@@ -75,7 +109,13 @@ def _load_json(text: str) -> object:
     except json.JSONDecodeError as exc:
         raise ValueError(f"not valid JSON: {exc}") from exc
     except RecursionError as exc:
-        raise ValueError("JSON is nested too deeply to parse") from exc
+        # The scanner gave up before the explicit check below could count.
+        raise ValueError(f"JSON is nested more than {MAX_FILE_INJECT_JSON_DEPTH} levels deep") from exc
+    try:
+        _refuse_deep_or_nonfinite(loaded)
+    except ValueError as exc:
+        raise ValueError(f"JSON is {exc}") from exc
+    return loaded
 
 
 def _parse_csv(text: str, *, delimiter: str) -> list[dict[str, str]]:
@@ -86,8 +126,8 @@ def _parse_csv(text: str, *, delimiter: str) -> list[dict[str, str]]:
     # carriage return survives in a header name or a last cell.
     stream = io.StringIO(text, newline=None)
     rows: list[dict[str, str]] = []
+    reader = csv.DictReader(stream, delimiter=delimiter, strict=True)
     try:
-        reader = csv.DictReader(stream, delimiter=delimiter, strict=True)
         fieldnames = reader.fieldnames
         if not fieldnames:
             raise ValueError("no CSV header row: the content is empty or starts with a blank line")
@@ -111,6 +151,13 @@ def _parse_csv(text: str, *, delimiter: str) -> list[dict[str, str]]:
                 )
             rows.append(dict(record))
     except csv.Error as exc:
+        # The csv module reports its per-cell cap only through this message;
+        # it is a size limit, not malformed CSV, so it is reported as one.
+        if str(exc).startswith("field larger than field limit"):
+            raise ValueError(
+                f"a cell exceeds the CSV per-cell limit of {csv.field_size_limit()} characters "
+                f"(near line {reader.line_num}). Shorten the cell, or bind the file as format 'text'."
+            ) from exc
         raise ValueError(f"not valid CSV: {exc}") from exc
     return rows
 
@@ -315,6 +362,16 @@ class FileInjectConfig(TransformDataConfig):
     def _require_field_name(cls, value: str | None) -> str | None:
         return None if value is None else validate_field_name(value, "output_field")
 
+    @field_validator("default_content")
+    @classmethod
+    def _require_canonical_default(cls, value: object) -> object:
+        # A field validator, so it runs before the inherited model validators:
+        # the env-placeholder scan walks this value recursively and would hit
+        # the recursion limit on a deeply nested one before it was refused.
+        if value is not None:
+            _default_content_size(value)
+        return value
+
     @model_validator(mode="after")
     def _validate_injection(self) -> FileInjectConfig:
         if not self.files:
@@ -325,6 +382,7 @@ class FileInjectConfig(TransformDataConfig):
         writers: dict[str, list[str]] = {}
         null_reason: str | None = None
         miss_values: list[object] = []
+        node_bytes = 0
         if self.mode == "all":
             for option, is_set in (
                 ("key_field", self.key_field is not None),
@@ -358,6 +416,7 @@ class FileInjectConfig(TransformDataConfig):
             if self.on_miss == "default":
                 if self.default_content is None:
                     raise ValueError("on_miss is 'default' but default_content is not set; to write a null, use on_miss: null")
+                node_bytes = _default_content_size(self.default_content)
                 miss_values.append(self.default_content)
             elif self.default_content is not None:
                 raise ValueError(f"default_content applies only when on_miss is 'default'; on_miss is {self.effective_on_miss!r}")
@@ -386,7 +445,6 @@ class FileInjectConfig(TransformDataConfig):
         # transform's __init__, so pre-validation and the engine agree on
         # rejection (test_validation_path_agreement).
         self._parsed = {}
-        node_bytes = 0
         for name, entry in self.files.items():
             try:
                 value = parse_injected_content(entry.content, fmt=entry.format, data_key=entry.data_key, delimiter=entry.delimiter)
@@ -401,8 +459,9 @@ class FileInjectConfig(TransformDataConfig):
                 ) from exc
             if node_bytes > MAX_FILE_INJECT_NODE_BYTES:
                 raise ValueError(
-                    f"files entries together exceed the {MAX_FILE_INJECT_NODE_BYTES}-byte per-node limit on parsed values "
-                    f"(reached at entry {name!r}). Reduce the files, or split them across nodes."
+                    f"files entries{' and default_content' if miss_values else ''} together exceed the "
+                    f"{MAX_FILE_INJECT_NODE_BYTES}-byte per-node limit on parsed values (reached at entry {name!r}). "
+                    "Reduce the files, or split them across nodes."
                 )
             self._parsed[name] = value
 
@@ -434,6 +493,28 @@ class FileInjectConfig(TransformDataConfig):
     def declared_input_fields(self) -> frozenset[str]:
         declared = super().declared_input_fields
         return declared if self.key_field is None else declared | frozenset({self.key_field})
+
+
+def _default_content_size(value: object) -> int:
+    """Canonical size of ``default_content``, refusing what a row cannot carry.
+
+    The value is written to row data on every miss, so it is held to the same
+    rules as bound content: canonical JSON, finite, bounded in depth and size.
+    """
+    try:
+        _refuse_deep_or_nonfinite(value)
+        return bounded_canonical_size(value, limit=MAX_FILE_INJECT_ENTRY_BYTES)
+    except CanonicalSizeLimitExceededError as exc:
+        raise ValueError(f"default_content exceeds the {MAX_FILE_INJECT_ENTRY_BYTES}-byte per-entry limit. Reduce it.") from exc
+    except NonStringObjectKeyError as exc:
+        raise ValueError("default_content must be canonical JSON: its objects must use string keys") from exc
+    except NonCanonicalValueTypeError as exc:
+        raise ValueError(
+            f"default_content must be canonical JSON: a value of type {exc.type_name} is not a string, number, "
+            "boolean, null, list or object. Quote it if text was intended."
+        ) from exc
+    except ValueError as exc:
+        raise ValueError(f"default_content {exc}") from exc
 
 
 def _origin(entry: FileInjectEntryConfig) -> str:

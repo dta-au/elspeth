@@ -8,6 +8,8 @@ sees the options.
 
 from __future__ import annotations
 
+import csv
+import datetime
 from typing import Any
 
 import pytest
@@ -126,7 +128,92 @@ def test_malformed_json_refused() -> None:
 def test_deeply_nested_json_refused() -> None:
     message = _refused(_all({"deep": {"content": "[" * 200_000, "format": "json", "output_field": "out"}}))
     assert "files entry 'deep'" in message
-    assert "nested too deeply" in message
+    assert "nested more than 100 levels deep" in message
+
+
+def test_json_nesting_at_the_depth_limit_is_accepted() -> None:
+    assert file_inject.MAX_FILE_INJECT_JSON_DEPTH == 100
+    value = _one("[" * 100 + "]" * 100, "json")
+    for _ in range(99):
+        assert type(value) is list
+        value = value[0]
+    assert value == []
+    assert _one('{"a":' * 100 + "1" + "}" * 100, "json") is not None
+    # The limit is per line, so the list jsonl builds around the lines is free.
+    lines = _one(("[" * 100 + "]" * 100 + "\n") * 2, "jsonl")
+    assert type(lines) is list
+    assert len(lines) == 2
+
+
+@pytest.mark.parametrize("depth", [101, 1500, 5000])
+@pytest.mark.parametrize("opener_closer", [("[", "]"), ('{"a":', "}")], ids=["arrays", "objects"])
+def test_balanced_json_nested_past_the_depth_limit_is_refused(depth: int, opener_closer: tuple[str, str]) -> None:
+    opener, closer = opener_closer
+    document = opener * depth + "1" + closer * depth
+    for fmt, content in (("json", document), ("jsonl", "1\n" + document + "\n")):
+        message = _refused(_all({"deep": {"content": content, "format": fmt, "output_field": "out"}}))
+        assert "files entry 'deep'" in message
+        assert "nested more than 100 levels deep" in message
+
+
+def test_csv_cell_over_the_per_cell_limit_is_refused_as_a_size_limit() -> None:
+    limit = csv.field_size_limit()
+    assert _one("k\n" + "x" * limit + "\n", "csv") == [{"k": "x" * limit}]
+    message = _refused(_all({"examples": {"content": "k\n" + "x" * (limit + 1) + "\n", "format": "csv", "output_field": "out"}}))
+    assert "files entry 'examples'" in message
+    assert f"a cell exceeds the CSV per-cell limit of {limit} characters" in message
+    assert "not valid CSV" not in message
+    assert csv.field_size_limit() == limit
+
+
+@pytest.mark.parametrize(
+    ("default_content", "fragment"),
+    [
+        (float("nan"), "default_content holds a non-finite number"),
+        ({"a": [float("inf")]}, "default_content holds a non-finite number"),
+        (datetime.date(2026, 1, 1), "default_content must be canonical JSON: a value of type date"),
+        ({1: "a"}, "default_content must be canonical JSON: its objects must use string keys"),
+        ({"a": {1, 2}}, "default_content must be canonical JSON: a value of type set"),
+    ],
+)
+def test_default_content_must_be_canonical_json(default_content: object, fragment: str) -> None:
+    files = {"A": {"content": "x", "format": "text"}}
+    assert fragment in _refused(_select(files, on_miss="default", default_content=default_content))
+
+
+def test_default_content_nested_past_the_depth_limit_is_refused() -> None:
+    deep: object = 1
+    for _ in range(5000):
+        deep = [deep]
+    files = {"A": {"content": "x", "format": "text"}}
+    assert "default_content nested more than 100 levels deep" in _refused(_select(files, on_miss="default", default_content=deep))
+
+
+def test_default_content_is_capped_and_counts_toward_the_node(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(file_inject, "MAX_FILE_INJECT_ENTRY_BYTES", 12)
+    monkeypatch.setattr(file_inject, "MAX_FILE_INJECT_NODE_BYTES", 20)
+    files = {"A": {"content": "x" * 8, "format": "text"}}
+    FileInjectConfig.model_validate(_select(files, on_miss="default", default_content="y" * 8))
+    message = _refused(_select(files, on_miss="default", default_content="y" * 11))
+    assert "default_content exceeds the 12-byte per-entry limit" in message
+    # 10 + 10 fits the node; one more byte of default does not.
+    message = _refused(_select(files, on_miss="default", default_content="y" * 9))
+    assert "files entries and default_content together exceed the 20-byte per-node limit" in message
+
+
+def test_mode_and_format_are_required() -> None:
+    message = _refused({"schema": OBSERVED, "files": {"a": _text()}})
+    assert "mode" in message
+    assert "Field required" in message
+    message = _refused(_all({"policy": {"content": "x", "output_field": "out"}}))
+    assert "files.policy.format" in message
+    assert "Field required" in message
+
+
+def test_parse_error_names_the_content_source() -> None:
+    entry = {"content": "{", "content_source": "rubrics/a.json", "format": "json", "output_field": "out"}
+    message = _refused(_all({"rubric": entry}))
+    assert "files entry 'rubric' (from rubrics/a.json): not valid JSON" in message
 
 
 @pytest.mark.parametrize(
