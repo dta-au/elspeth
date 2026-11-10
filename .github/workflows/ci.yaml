@@ -587,7 +587,10 @@ jobs:
   timing-sensitive:
     name: Timing-sensitive tests (Python ${{ matrix.python-version }})
     needs: [test]
-    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    # !cancelled(), not always(): this must run after failed ordinary shards,
+    # but with always() it also started after a cancelled run and then ignored
+    # every cancel request for up to its 120-minute timeout.
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     timeout-minutes: 120
     container:

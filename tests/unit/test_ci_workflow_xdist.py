@@ -169,7 +169,12 @@ def _assert_timing_workflow_contract(workflow: dict[str, Any]) -> None:
     job = workflow["jobs"]["timing-sensitive"]
     ordinary = workflow["jobs"]["test"]
     assert job["needs"] == ["test"]
-    assert job["if"] == "always() && (" + ordinary["if"] + ")"
+    # Runs after failed ordinary shards, but never after a cancelled run. With
+    # always() the job started once the cancelled shards finished and ran for up
+    # to its 120-minute timeout, ignoring every cancel request (run 42907094408,
+    # 2026-11-10: only a force-cancel stopped it).
+    # The ${{ }} wrapper is required: a bare leading "!" is a YAML tag.
+    assert job["if"] == "${{ !cancelled() && (" + ordinary["if"] + ") }}"
     assert job["name"] == "Timing-sensitive tests (Python ${{ matrix.python-version }})"
     assert job["timeout-minutes"] == 120
     assert "concurrency" not in job
