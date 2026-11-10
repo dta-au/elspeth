@@ -329,3 +329,112 @@ attributes about 130K reasoning characters to the review taxonomy) and the highe
 - Is the 3,494 B allowance acceptable, or should the gate exemplar wait for the split?
 - Should the planner be told about `diff_pipeline` and `preview_pipeline` at all, given they
   read the saved graph and not its draft?
+
+## 11. Second pass: regression repair, review findings, approval containment (2026-11-10)
+
+Commits on top of `fea48d82b`: `5af93d3ad`, `be3e24c25`, `238120ad9`.
+
+### 11.1 The `canonical_schema` regression (0 -> 7)
+
+Diagnosis, from the captured provider tap of round `ds-after-skill-1` (each rejected
+argument object re-validated against the terminal schema):
+
+| Count | Shape of the rejected emit | Violation |
+|---|---|---|
+| 5 | `{"pipeline": "<the whole pipeline as a JSON-encoded string>"}` (3 independent emits, 2 repeats) | `pipeline`: type, expected object |
+| 2 | a valid `source` beside `"sources": {}` | `pipeline`: oneOf (`source` / `sources`) |
+
+No reasoning trace cites a sentence of the reworked text for either shape. The repeats have
+a located cause: the rejection carried nothing actionable. A string pipeline returned no
+violation at all; the source/sources case returned only `{path: pipeline, rule: oneOf}`.
+The schema is right; I did not change it.
+
+Fixes (`5af93d3ad`): the rejection now reports `rule: type, constraint: object` with
+"pipeline must be a JSON object, not a JSON-encoded string", and a oneOf over bare
+`required` alternatives names the keys ("Supply exactly one of source, sources and omit the
+other key entirely, even as an empty value"). Only keys the pinned violation contract
+already has are used and nothing from the rejected document is echoed. Three tests cover
+it. `PLANNER_TERMINAL_INSTRUCTION` states the argument shape up front.
+
+### 11.2 Live verification, round `ds-after-skill-2`
+
+Probe server on the edited tree, six cases x 3 repeats, battery exit 0, 18/18 runs
+completed, server stopped by pid afterwards (port 8791 has no listener).
+
+| Case | Round 1 (1 run) | Round 2 (3 runs) |
+|---|---|---|
+| llm_source | FAILED, REPAIR_EXHAUSTED | completed x3 |
+| boolean_routing | completed, repair_count 3 | completed x3, repair_count 0, 0, 0 |
+| multi_query_assessment | completed, repair_count 2 | completed x3, repair_count 0, 0, 0 |
+| template_lookups | completed, repair_count 1 | completed x3, repair_count 1, 0, 1 |
+| report_assemble | completed, repair_count 1 | completed x3, repair_count 1, 0, 0 |
+| threshold_gate | completed, repair_count 0 | completed x3, repair_count 1, 0, 0 |
+
+`canonical_schema` rejections: 7 in 19 runs -> **2 in 18 runs, not 0**. Both are in one
+`llm_source` run: `deepseek-v4.1-flash` sent the pipeline as a JSON-encoded string three
+times running. Its reply after the first rejection reads "I passed the pipeline as a JSON
+string — it must be a JSON object. Repairing", and it then emitted a string again. The
+rejection is now understood; this model sometimes cannot act on it. The run completed
+because the advisor model (`deepseek-v4-pro`) took over and emitted an object. The
+`sources: {}` shape did not recur (0 of 26 emits). Other round-2 rejections: 7
+`plugin_options_invalid` (3 of them a bare `mode: flexible` without `fields`, fixed in text
+in `238120ad9` and not re-run live; 2 an empty csv `headers` mapping; 1 llm
+operator-profile; 1 line_explode same-name field), 1 `no_source_configured`, 1
+`no_sinks_configured`. All carried a usable `detail`.
+
+Limits: one model, small n, one round. Stringification is 4 of 37 runs with the reworked
+text against 0 of 19 before; that difference is not distinguishable from chance at this n,
+and I cannot attribute it to a sentence. The three flexible-without-fields rejections are
+plausibly mine (the core began recommending `flexible`), which is why the text now says
+which modes need `fields`.
+
+Decision for the maintainer: if stringified terminal arguments must never cost a repair
+round, the server could decode a string `pipeline` at the provider boundary before
+validation. That is a contract change to planner-output parsing, not skill text, so I did
+not make it.
+
+### 11.3 Review findings
+
+- S1 fixed: partial delivery is allowed only when the omitted non-core part is a named gap.
+- S2 fixed: "the server replaces an authored row" is true only for generated rows; on
+  verbatim user data the authored row survives as a false card. Text says so; a test
+  exercises both binds.
+- S3 fixed: the gate exemplar's source is `fixed`; core and aid say a fixed sink refuses
+  undeclared fields.
+- S4 fixed: route destinations list sink, downstream input connection, `fork`, `discard` in
+  both core and aid; a test admits a discard route.
+- S5 done (`238120ad9`): where changes await approval, exactly one composition-changing
+  call per response (one narrow edit or one complete `set_pipeline`); narrowest-tool and
+  staged-construction guidance is scoped to directly applied changes; with a proposal
+  pending, send the user to accept or reject it. Auto-commit guidance unchanged. The model
+  is never told its mode, so the rule keys on what it can see: an `APPROVAL_REQUIRED`
+  result or either refusal code. **Dependency:** `approval_batch_not_atomic` and
+  `approval_proposal_pending` are not in this branch (0 hits under `src/`); the text is
+  accurate only once the containment change lands with it.
+- N2 agreed, not fixed: the contradiction is in `tools/blobs.py`, another lane's file.
+- N6 agreed, not fixed: a mixed terminal batch is rejected without `validation.errors`;
+  that is code, not text.
+
+### 11.4 Scaffold allowance
+
+`_SKILL_REWORK_0812_CANONICAL_BYTES` is now **3,878** (measured request 139,608 B against
+the prior 135,730 B pin): 3,494 approved, +309 for the argument-shape instruction and S3/S4
+text, +75 for the schema-mode sentence. Set to the measurement under the ruling that the
+threshold follows the working system.
+
+### 11.5 Verification
+
+Focused composer unit set plus `tests/integration/web/composer`: 2068 passed, exit 0
+(`.claude/lanes/skill-rework/s5.log`). ruff check and format clean on touched tests; mypy
+clean on touched source as of `be3e24c25` (the last commit touches no Python source). The
+full suite was not re-run in this pass.
+
+### 11.6 Further code defects noticed (not fixed)
+
+11. `explain_validation_error("canonical_schema")` answers that the code is unknown, so the
+    model's documented recovery call is a dead end for this rejection.
+12. An authored `invented_source` row on a verbatim bind is admitted and shown as a review
+    card for data nobody invented (S2); the text warns against it, nothing refuses it.
+13. On the first approval-mode turn the model has no signal that changes await approval,
+    so its first multi-edit response will still be refused once before the rule applies.
+    Stating the mode in the request would remove that round.
