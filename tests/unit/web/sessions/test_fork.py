@@ -1060,6 +1060,50 @@ class TestForkEndpoint:
     """Route-level tests for POST /api/sessions/{id}/fork."""
 
     @pytest.mark.asyncio
+    async def test_missing_reservation_records_the_fence_reason_without_request_identity(self, tmp_path) -> None:
+        """The fork's local 404 mapping must retain the same operator diagnostic."""
+        from structlog.testing import capture_logs
+
+        from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
+
+        app, service, _blob_service = _make_fork_app(tmp_path)
+        session = await service.create_session("alice", "Original", "local")
+        message = await service.add_message(session.id, "user", "Go", writer_principal="route_user_message")
+        body = {
+            "operation_id": str(uuid.uuid4()),
+            "from_message_id": str(message.id),
+            "new_message_content": "Go edited",
+        }
+        with (
+            patch(
+                "elspeth.web.sessions.routes.sessions.reserve_or_replay_operation_receipt",
+                autospec=True,
+                side_effect=SessionOperationFenceLost(FenceLossReason.MISSING),
+            ),
+            capture_logs() as logs,
+        ):
+            response = TestClient(app).post(
+                f"/api/sessions/{session.id}/fork?token=SECRET",
+                json=body,
+                headers={"X-User": "private-user-identity"},
+            )
+
+        assert response.status_code == 404
+        assert response.content == b'{"detail":"Session not found"}'
+        assert logs == [
+            {
+                "event": "http_session_operation_fence_lost",
+                "reason": "missing",
+                "method": "POST",
+                "route": "/api/sessions/{session_id}/fork",
+                "log_level": "warning",
+            }
+        ]
+        for marker in (str(session.id), body["operation_id"], "SECRET", "private-user-identity"):
+            assert marker not in repr(logs)
+            assert marker not in response.text
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("phase", ["staging", "blob_copy"])
     async def test_fork_storage_accounting_outage_returns_and_replays_503(self, tmp_path, phase: str) -> None:
         """Both pre-child and staged failures preserve the accounting refusal."""

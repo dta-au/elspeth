@@ -54,6 +54,7 @@ def test_child_inventory_finds_owned_positive_and_empty_negative() -> None:
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="actual Linux controller-death and subreaper custody")
+@pytest.mark.timing_sensitive
 def test_actual_controller_death_stops_public_owner_and_reaps_runner(tmp_path: Path) -> None:
     helper = ROOT / "tests/helpers/composer_parent_death_probe.py"
     result = subprocess.run([sys.executable, str(helper), "subreaper", str(tmp_path)], capture_output=True, timeout=40)
@@ -226,6 +227,7 @@ async def _file(path: Path, seconds: float = 8.0) -> None:
     [("blocked", True), ("blocked", False), ("quarantine", True)],
     ids=["release-joins", "real-deadline-kills", "real-generation-expiry"],
 )
+@pytest.mark.timing_sensitive
 async def test_blocked_actual_preflight_retains_admission_until_join_or_deadline(
     tmp_path: Path, monkeypatch, mode: str, release: bool
 ) -> None:
@@ -355,6 +357,7 @@ async def test_embedded_construction_preserves_live_host_owner_and_coordinator(t
     await async_workers.shutdown_async_workers()
 
 
+@pytest.mark.timing_sensitive
 @pytest.mark.parametrize("owned", [False, True])
 def test_fresh_embedded_real_host_owner_and_missing_owner(tmp_path: Path, owned: bool) -> None:
     command = (

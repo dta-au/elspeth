@@ -5789,6 +5789,7 @@ async def test_cancellation_during_custody_settles_then_reraises_without_proposa
 
 
 @pytest.mark.asyncio
+@pytest.mark.timing_sensitive
 async def test_real_inline_custody_returns_only_blob_id_and_ready_row(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -7255,6 +7256,7 @@ async def test_escape_hatch_omits_endpoint_kwargs_when_only_primary_configured(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timing_sensitive
 async def test_escape_hatch_provider_identity_reaches_inline_custody(
     tmp_path: Path,
     tool_context: ToolContext,

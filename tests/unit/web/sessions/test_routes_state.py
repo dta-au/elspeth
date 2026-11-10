@@ -1090,6 +1090,7 @@ class TestYamlEndpoint:
     """Tests for GET /api/sessions/{id}/state/yaml."""
 
     @pytest.mark.asyncio
+    @pytest.mark.timing_sensitive
     async def test_yaml_template_validation_offloads_while_health_responds(self, tmp_path: Path, monkeypatch) -> None:
         import elspeth.web.sessions.routes.composer.state as state_routes
 
