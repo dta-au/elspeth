@@ -1,0 +1,23 @@
+"""Analyse py-spy raw stacks. spy.py FILE [incl-pattern ...]"""
+import sys, collections, re
+stacks = []
+for line in open(sys.argv[1]):
+    s, _, n = line.rstrip("\n").rpartition(" ")
+    stacks.append((s.split(";"), int(n)))
+total = sum(n for _, n in stacks)
+def bucket(fr):
+    if 'sqlalchemy' in fr: return 'sqlalchemy'
+    if 'rfc8785' in fr: return 'rfc8785'
+    if 'elspeth/' in fr: return 'elspeth'
+    if 'pydantic' in fr: return 'pydantic'
+    if '<frozen' in fr or 'importlib' in fr: return 'import'
+    return 'other'
+leaf = collections.Counter()
+for fr, n in stacks: leaf[bucket(fr[-1])] += n
+print("total samples", total)
+print("leaf bucket %:", {k: round(100*v/total,1) for k,v in leaf.most_common()})
+def incl(pat):
+    r = re.compile(pat)
+    return sum(n for fr, n in stacks if any(r.search(f) for f in fr))
+for pat in sys.argv[2:]:
+    v = incl(pat); print(f"{100*v/total:6.1f}%  {v:6d}  {pat}")

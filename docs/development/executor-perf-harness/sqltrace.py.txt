@@ -1,0 +1,24 @@
+"""Ordered SQL trace with ELSPETH call sites for a window of statements. sqltrace.py OUT LO HI -- <elspeth args>"""
+import re, sys, traceback
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
+out, lo, hi = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]); args = sys.argv[5:]
+n = [0]; lines = []
+def site():
+    fr = [f for f in traceback.extract_stack() if "/src/elspeth/" in f.filename and "sqltrace" not in f.filename]
+    return " < ".join(f"{f.name}@{f.filename.split('/src/elspeth/')[1].replace('core/landscape/','L/')}:{f.lineno}" for f in reversed(fr[-5:]))
+def rec(kind, sql=""):
+    n[0] += 1
+    if lo <= n[0] < hi:
+        lines.append(f"{n[0]:6d} {kind:6s} {re.sub(r'\\s+', ' ', sql)[:110]}\n         {site()}\n")
+@event.listens_for(Engine, "before_cursor_execute")
+def _b(conn, cursor, statement, parameters, context, executemany): rec("SQL", statement)
+@event.listens_for(Engine, "commit")
+def _c(conn): rec("COMMIT")
+@event.listens_for(Engine, "rollback")
+def _r(conn): rec("ROLLBK")
+from elspeth.cli import app
+sys.argv = ["elspeth", *args]
+try: app()
+except SystemExit: pass
+finally: open(out, "w").writelines(lines)

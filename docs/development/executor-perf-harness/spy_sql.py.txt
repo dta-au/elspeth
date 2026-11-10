@@ -1,0 +1,25 @@
+import sys, collections
+stacks = []
+for line in open(sys.argv[1]):
+    s, _, n = line.rstrip("\n").rpartition(" ")
+    stacks.append((s.split(";"), int(n)))
+total = sum(n for _, n in stacks)
+cat = collections.Counter()
+leafs = collections.Counter()
+for fr, n in stacks:
+    leaf = fr[-1]
+    j = ";".join(fr)
+    if 'sqlalchemy' not in leaf:
+        continue
+    if '.do_execute' in leaf: c = 'A native sqlite execute'
+    elif ('.do_commit' in leaf or '.do_rollback' in leaf or '.do_begin' in leaf or '_do_begin' in leaf or 'do_begin' in leaf): c = 'B native commit/rollback'
+    elif '_generate_cache_key' in j or '_gen_cache_key' in j: c = 'D cache-key generation'
+    elif '_execute_clauseelement' in j or '_execute_context' in j or 'exec_driver_sql' in j: c = 'E execute overhead (compile lookup, context, result)'
+    elif 'sqlalchemy/pool' in j or '_emit_begin' in j or 'begin_write' in fr[-2] or 'Connection.commit' in j or 'Connection.close' in j or 'Connection.begin' in j or 'Engine.connect' in j or '__exit__' in leaf or 'RootTransaction' in j or 'sqlalchemy/event' in leaf: c = 'F connection/txn/pool/events'
+    elif 'cursor.py' in leaf or 'result.py' in leaf or 'row.py' in leaf or '_row' in leaf: c = 'G result fetch'
+    else: c = 'C statement construction'
+    cat[c] += n
+    if c.startswith(sys.argv[2] if len(sys.argv) > 2 else 'Z'): leafs[leaf] += n
+for k, v in sorted(cat.items()): print(f"{100*v/total:5.1f}%  {k}")
+print(f"{100*sum(cat.values())/total:5.1f}%  all sqlalchemy-leaf")
+for k, v in leafs.most_common(25): print(f"   {100*v/total:5.2f}% {k}")

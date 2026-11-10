@@ -1,0 +1,164 @@
+diff --git a/src/elspeth/contracts/schema_contract.py b/src/elspeth/contracts/schema_contract.py
+index ce516e5d..320a69b4 100644
+--- a/src/elspeth/contracts/schema_contract.py
++++ b/src/elspeth/contracts/schema_contract.py
+@@ -168,6 +168,7 @@ class SchemaContract:
+     # Computed indices - populated in __post_init__
+     _by_normalized: Mapping[str, FieldContract] = field(default_factory=dict, repr=False, compare=False, hash=False)
+     _by_original: Mapping[str, str] = field(default_factory=dict, repr=False, compare=False, hash=False)
++    _version_hash_memo: str | None = field(default=None, init=False, repr=False, compare=False, hash=False)
+ 
+     def __post_init__(self) -> None:
+         """Build O(1) lookup indices after initialization.
+@@ -412,6 +413,8 @@ class SchemaContract:
+         """
+         from elspeth.contracts.hashing import canonical_json
+ 
++        if self._version_hash_memo is not None:
++            return self._version_hash_memo
+         field_defs = [
+             {
+                 "n": fc.normalized_name,
+@@ -430,7 +433,9 @@ class SchemaContract:
+                 "fields": field_defs,
+             }
+         )
+-        return hashlib.sha256(content.encode()).hexdigest()[:32]
++        digest = hashlib.sha256(content.encode()).hexdigest()[:32]
++        object.__setattr__(self, "_version_hash_memo", digest)
++        return digest
+ 
+     def to_checkpoint_format(self) -> dict[str, Any]:
+         """Full contract serialization for checkpoint storage.
+diff --git a/src/elspeth/core/landscape/database_clock.py b/src/elspeth/core/landscape/database_clock.py
+index a2699eec..e7f79763 100644
+--- a/src/elspeth/core/landscape/database_clock.py
++++ b/src/elspeth/core/landscape/database_clock.py
+@@ -16,11 +16,15 @@ from __future__ import annotations
+ 
+ from datetime import UTC, datetime, timedelta
+ 
+-from sqlalchemy import Connection, DateTime, func
++from sqlalchemy import Connection, DateTime, func, select
+ 
+ from elspeth.contracts.errors import AuditIntegrityError
+ 
+ 
++_SQLITE_DECISION_TIME = select(func.strftime("%Y-%m-%d %H:%M:%f", "now", type_=DateTime()))
++_SQLITE_TRANSACTION_TIME = select(func.current_timestamp())
++
++
+ def read_landscape_decision_time(conn: Connection) -> datetime:
+     """Sample fresh Landscape time after acquiring a decision's required locks.
+ 
+@@ -36,7 +40,7 @@ def read_landscape_decision_time(conn: Connection) -> datetime:
+             raise AuditIntegrityError(f"Tier 1: PostgreSQL clock_timestamp returned {type(stamped).__name__}, expected an aware datetime")
+         return stamped.astimezone(UTC)
+     if dialect == "sqlite":
+-        stamped = conn.scalar(func.strftime("%Y-%m-%d %H:%M:%f", "now", type_=DateTime()))
++        stamped = conn.scalar(_SQLITE_DECISION_TIME)
+         if type(stamped) is not datetime or stamped.tzinfo is not None:
+             raise AuditIntegrityError(f"Tier 1: SQLite strftime returned {type(stamped).__name__}, expected a naive UTC datetime")
+         return stamped.replace(tzinfo=UTC)
+@@ -58,7 +62,7 @@ def read_landscape_transaction_time(conn: Connection) -> datetime:
+             raise AuditIntegrityError(f"Tier 1: PostgreSQL CURRENT_TIMESTAMP returned {type(stamped).__name__}, expected an aware datetime")
+         return stamped.astimezone(UTC)
+     if dialect == "sqlite":
+-        stamped = conn.scalar(func.current_timestamp())
++        stamped = conn.scalar(_SQLITE_TRANSACTION_TIME)
+         if type(stamped) is not datetime or stamped.tzinfo is not None:
+             raise AuditIntegrityError(f"Tier 1: SQLite CURRENT_TIMESTAMP returned {type(stamped).__name__}, expected a naive UTC datetime")
+         return stamped.replace(tzinfo=UTC)
+diff --git a/src/elspeth/core/landscape/run_coordination_repository.py b/src/elspeth/core/landscape/run_coordination_repository.py
+index 5171e622..51d14546 100644
+--- a/src/elspeth/core/landscape/run_coordination_repository.py
++++ b/src/elspeth/core/landscape/run_coordination_repository.py
+@@ -63,7 +63,7 @@ from datetime import UTC, datetime, timedelta
+ from enum import Enum
+ from typing import Literal
+ 
+-from sqlalchemy import insert, select, update
++from sqlalchemy import bindparam, insert, select, update
+ from sqlalchemy.engine import Connection
+ from sqlalchemy.exc import OperationalError, SQLAlchemyError
+ 
+@@ -401,18 +401,38 @@ def _worker_deadline_key(*, run_id: str, worker_id: str) -> DeadlineKey:
+     return DeadlineKey(DeadlineKind.WORKER, (run_id, worker_id))
+ 
+ 
++_T = run_coordination_table
++_LEADER_SEAT = (
++    (_T.c.run_id == bindparam("p_run_id"))
++    & (_T.c.leader_worker_id == bindparam("p_worker_id"))
++    & (_T.c.leader_epoch == bindparam("p_epoch"))
++)
++_LEADER_RENEW = update(_T).where(_LEADER_SEAT).values(leader_heartbeat_expires_at=bindparam("p_expires"), updated_at=bindparam("p_now"))
++_LEADER_CAS = update(_T).where(_LEADER_SEAT).values(leader_epoch=_T.c.leader_epoch)
++_MEMBER_CAS = (
++    update(run_workers_table)
++    .where(
++        run_workers_table.c.run_id == bindparam("p_run_id"),
++        run_workers_table.c.worker_id == bindparam("p_worker_id"),
++        run_workers_table.c.status == "active",
++    )
++    .values(status="active")
++)
++
++
+ def _renew_leader_deadline_on(conn: Connection, *, token: CoordinationToken, window_seconds: float, verb: str) -> None:
+     """Renew the exact seat after its authority lock has already been acquired."""
+     database_now = read_landscape_decision_time(conn)
+     expires = database_now + timedelta(seconds=window_seconds)
+     renewed = conn.execute(
+-        update(run_coordination_table)
+-        .where(
+-            run_coordination_table.c.run_id == token.run_id,
+-            run_coordination_table.c.leader_worker_id == token.worker_id,
+-            run_coordination_table.c.leader_epoch == token.leader_epoch,
+-        )
+-        .values(leader_heartbeat_expires_at=expires, updated_at=database_now)
++        _LEADER_RENEW,
++        {
++            "p_run_id": token.run_id,
++            "p_worker_id": token.worker_id,
++            "p_epoch": token.leader_epoch,
++            "p_expires": expires,
++            "p_now": database_now,
++        },
+     )
+     if renewed.rowcount != 1:
+         raise RunLeadershipLostError(run_id=token.run_id, worker_id=token.worker_id, leader_epoch=token.leader_epoch, verb=verb)
+@@ -446,15 +466,7 @@ def verify_and_extend_leader_fence(
+     a fresh connection AFTER its rollback completes — writing it here on a
+     second connection would deadlock against the caller's own write lock.
+     """
+-    result = conn.execute(
+-        update(run_coordination_table)
+-        .where(
+-            run_coordination_table.c.run_id == token.run_id,
+-            run_coordination_table.c.leader_worker_id == token.worker_id,
+-            run_coordination_table.c.leader_epoch == token.leader_epoch,
+-        )
+-        .values(leader_epoch=run_coordination_table.c.leader_epoch)
+-    )
++    result = conn.execute(_LEADER_CAS, {"p_run_id": token.run_id, "p_worker_id": token.worker_id, "p_epoch": token.leader_epoch})
+     if result.rowcount != 1:
+         raise RunLeadershipLostError(
+             run_id=token.run_id,
+@@ -538,15 +550,7 @@ def verify_membership_fence(
+     :func:`fenced_member_transaction`) records the ``fence_refusal`` event on
+     a fresh connection AFTER its rollback completes.
+     """
+-    result = conn.execute(
+-        update(run_workers_table)
+-        .where(
+-            run_workers_table.c.run_id == member_token.run_id,
+-            run_workers_table.c.worker_id == member_token.worker_id,
+-            run_workers_table.c.status == "active",
+-        )
+-        .values(status="active")
+-    )
++    result = conn.execute(_MEMBER_CAS, {"p_run_id": member_token.run_id, "p_worker_id": member_token.worker_id})
+     if result.rowcount != 1:
+         registered = conn.execute(
+             select(run_workers_table.c.worker_id).where(

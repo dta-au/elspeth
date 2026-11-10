@@ -1,0 +1,26 @@
+"""Micro-benchmark: per-call statement construction vs a prebuilt bindparam statement."""
+import time, sqlalchemy
+from sqlalchemy import bindparam, create_engine, update, select, func, DateTime, text
+from elspeth.core.landscape.schema import run_coordination_table as t, metadata
+print("sqlalchemy", sqlalchemy.__version__)
+e = create_engine("sqlite://")
+metadata.create_all(e)
+N = 20000
+def per_call(conn, run_id, worker, epoch):
+    return conn.execute(update(t).where(t.c.run_id == run_id, t.c.leader_worker_id == worker, t.c.leader_epoch == epoch).values(leader_epoch=t.c.leader_epoch))
+PRE = update(t).where(t.c.run_id == bindparam("b_run"), t.c.leader_worker_id == bindparam("b_worker"), t.c.leader_epoch == bindparam("b_epoch")).values(leader_epoch=t.c.leader_epoch)
+def prebuilt(conn, run_id, worker, epoch):
+    return conn.execute(PRE, {"b_run": run_id, "b_worker": worker, "b_epoch": epoch})
+CLOCK = select(func.strftime("%Y-%m-%d %H:%M:%f", "now", type_=DateTime()))
+def clock_per_call(conn): return conn.scalar(func.strftime("%Y-%m-%d %H:%M:%f", "now", type_=DateTime()))
+def clock_prebuilt(conn): return conn.scalar(CLOCK)
+with e.connect() as conn:
+    for name, fn, args in (("fence per-call", per_call, ("r", "w", 1)), ("fence prebuilt", prebuilt, ("r", "w", 1)), ("clock per-call", clock_per_call, ()), ("clock prebuilt", clock_prebuilt, ())):
+        for _ in range(200): fn(conn, *args)
+        best = 1e9
+        for _ in range(3):
+            c0 = time.process_time()
+            for _ in range(N): fn(conn, *args)
+            best = min(best, time.process_time() - c0)
+        print(f"{name:16s} {1e6*best/N:7.1f} us/call")
+    assert clock_prebuilt(conn) is not None

@@ -1,0 +1,53 @@
+"""Count SQL statements/commits for one `elspeth run`. Usage: sqlcount.py OUT.json -- <elspeth args>"""
+import collections, json, re, sys, time, os
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
+
+out = sys.argv[1]
+args = sys.argv[3:]
+stmts = collections.Counter()
+stmt_time = collections.Counter()
+counts = collections.Counter()
+_t = {}
+
+def norm(s):
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\(\?(, \?)*\)", "(?..)", s)
+    return s[:400]
+
+@event.listens_for(Engine, "before_cursor_execute")
+def _b(conn, cursor, statement, parameters, context, executemany):
+    _t[id(cursor)] = time.perf_counter()
+
+@event.listens_for(Engine, "after_cursor_execute")
+def _a(conn, cursor, statement, parameters, context, executemany):
+    dt = time.perf_counter() - _t.pop(id(cursor), time.perf_counter())
+    k = norm(statement)
+    stmts[k] += 1
+    stmt_time[k] += dt
+    counts["statements"] += 1
+    counts["executemany"] += bool(executemany)
+
+@event.listens_for(Engine, "commit")
+def _c(conn): counts["commits"] += 1
+@event.listens_for(Engine, "rollback")
+def _r(conn): counts["rollbacks"] += 1
+@event.listens_for(Engine, "begin")
+def _bg(conn): counts["begins"] += 1
+@event.listens_for(Engine, "engine_connect")
+def _ec(conn): counts["connects"] += 1
+
+from elspeth.cli import app
+sys.argv = ["elspeth", *args]
+t0 = time.perf_counter(); c0 = time.process_time()
+code = 0
+try:
+    app()
+except SystemExit as e:
+    code = e.code
+finally:
+    res = {"exit": code, "wall": time.perf_counter() - t0, "cpu": time.process_time() - c0,
+           "counts": dict(counts), "cursor_time": sum(stmt_time.values()),
+           "statements": [{"n": n, "t": round(stmt_time[k], 4), "sql": k} for k, n in stmts.most_common()]}
+    json.dump(res, open(out, "w"), indent=1)
+    print("SQLCOUNT", {k: res[k] for k in ("exit", "wall", "cpu", "counts", "cursor_time")}, file=sys.stderr)

@@ -1,0 +1,15 @@
+import sys, collections
+from elspeth.contracts import schema_contract as sc
+calls = collections.Counter(); ids = set()
+orig = sc.SchemaContract.version_hash
+def vh(self):
+    calls["calls"] += 1
+    if self._version_hash_memo is None: calls["computed"] += 1
+    ids.add(id(self))
+    return orig(self)
+sc.SchemaContract.version_hash = vh
+from elspeth.cli import app
+sys.argv = ["elspeth", *sys.argv[1:]]
+try: app()
+except SystemExit: pass
+print("VH", dict(calls), "distinct ids", len(ids), file=sys.stderr)
