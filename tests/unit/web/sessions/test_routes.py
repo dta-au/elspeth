@@ -55,6 +55,7 @@ from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.control_messages import advisor_signoff_withheld_control_envelope, anti_anchor_control_envelope
 from elspeth.web.composer.diagnostic_evidence import (
     DIAGNOSTIC_EVIDENCE_KIND,
@@ -11927,6 +11928,72 @@ class TestSendMessageTranscriptSnapshot:
             f"a trailing audit row must not trip the conversation-scoped snapshot guard; got {resp.status_code}: {resp.text!r}"
         )
         assert resp.json()["message"]["content"] == "Still fine"
+
+    def test_send_message_passes_context_budget_history_from_the_transcript(self, tmp_path) -> None:
+        """The route derives the context-budget history from the turn's records and hands it to compose.
+
+        A stored call record that shed history index 1, with a measured
+        400 bytes over 100 prompt tokens, must reach the composer as exactly
+        that ratio and that shed set.
+        """
+        mock_composer = _make_composer_mock(response_text="Budgeted")
+        app, _service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+
+        class _ShedAuditRowService(SessionServiceImpl):
+            """The real service, with one stored call record that shed history appended to the transcript."""
+
+            async def add_message_with_transcript(self, *args: Any, **kwargs: Any):
+                result = await super().add_message_with_transcript(*args, **kwargs)
+                assert isinstance(result, MessageIngressFresh)
+                record, transcript = result.message, result.transcript
+                assert record.sequence_no is not None
+                shed_audit_row = ChatMessageRecord(
+                    id=uuid.uuid4(),
+                    session_id=record.session_id,
+                    role="audit",
+                    content=json.dumps({"_kind": "llm_call_audit"}),
+                    raw_content=None,
+                    tool_calls=[
+                        {
+                            "_kind": "llm_call_audit",
+                            "call": {
+                                "status": "success",
+                                "prompt_tokens": 100,
+                                "request_byte_split": {"message_bytes": [400], "tools_bytes": None, "total_bytes": 400},
+                                "context_budget": {"shed_history_indices": [1]},
+                            },
+                        }
+                    ],
+                    created_at=record.created_at,
+                    sequence_no=record.sequence_no + 1,
+                    composition_state_id=None,
+                    writer_principal="compose_loop",
+                    tool_call_id=None,
+                    parent_assistant_id=None,
+                )
+                return replace(result, transcript=[*transcript, shed_audit_row])
+
+        app.state.session_service = _ShedAuditRowService(
+            app.state.session_engine,
+            telemetry=app.state.sessions_telemetry,
+            log=structlog.get_logger("test"),
+        )
+        client = TestClient(app)
+        session_id = client.post("/api/sessions", json={"title": "Budget history"}).json()["id"]
+
+        resp = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("hello", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert mock_composer.compose.await_count == 1
+        assert mock_composer.compose.await_args.kwargs["context_budget_history"] == ContextBudgetHistory(
+            bytes_per_token=4.0, previously_shed_history=frozenset({"history:1"})
+        )
 
     def test_send_message_transcript_snapshot_contains_prior_turns(self, tmp_path) -> None:
         """The combined method feeds real history to the composer.

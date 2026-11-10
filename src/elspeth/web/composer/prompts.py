@@ -368,6 +368,7 @@ def build_context_string(
     *,
     plugin_snapshot: PluginAvailabilitySnapshot,
     schemas_loaded: frozenset[tuple[str, str]] = _SCHEMAS_LOADED_UNSET,
+    conversation_omissions: Mapping[str, int] | None = None,
 ) -> str:
     """Build the session-varying context message: state, progress, evidence.
 
@@ -405,6 +406,12 @@ def build_context_string(
             Non-service callers exercising the prompt builder
             directly should pass ``frozenset()`` to opt into the
             "tracked, empty" reading.
+        conversation_omissions: Counts of prior chat-history messages the
+            context budget removed from this request, keyed
+            ``prior_user_requests_omitted`` and
+            ``prior_assistant_messages_omitted``. Emitted as a top-level
+            ``conversation_omissions`` object only when either count is
+            above zero. Numbers only: the server writes no recap.
 
     Returns:
         A string with state and plugin info, suitable for a lower-priority
@@ -497,8 +504,62 @@ def build_context_string(
         },
         "schema_contract_evidence": schema_contract_evidence,
     }
+    if conversation_omissions is not None:
+        user_requests_omitted = conversation_omissions["prior_user_requests_omitted"]
+        assistant_messages_omitted = conversation_omissions["prior_assistant_messages_omitted"]
+        if len(conversation_omissions) != 2 or any(
+            type(count) is not int or count < 0 for count in (user_requests_omitted, assistant_messages_omitted)
+        ):
+            raise ValueError("conversation_omissions must hold exactly the two non-negative omission counts")
+        if user_requests_omitted > 0 or assistant_messages_omitted > 0:
+            context["conversation_omissions"] = {
+                "prior_user_requests_omitted": user_requests_omitted,
+                "prior_assistant_messages_omitted": assistant_messages_omitted,
+            }
 
     return f"{STATE_CONTEXT_PREFIX}\n{json.dumps(context, separators=_COMPACT_JSON_SEPARATORS)}"
+
+
+def build_state_context_message(
+    state: CompositionState,
+    catalog: PolicyCatalogView,
+    *,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    schemas_loaded: frozenset[tuple[str, str]] = _SCHEMAS_LOADED_UNSET,
+    conversation_omissions: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    """Build the state context user message, with its prompt-guard content parts."""
+    context_str = build_context_string(
+        state,
+        catalog,
+        plugin_snapshot=plugin_snapshot,
+        schemas_loaded=schemas_loaded,
+        conversation_omissions=conversation_omissions,
+    )
+    prefix = STATE_CONTEXT_PREFIX + "\n"
+    return {
+        "role": "user",
+        "content": context_str,
+        PROMPT_GUARD_CONTENT_PARTS_KEY: (
+            PromptGuardContentPart(prefix),
+            *json_content_parts(
+                context_str[len(prefix) :],
+                reference_paths=frozenset({("schema_contract_evidence", "schemas")}),
+                separators=_COMPACT_JSON_SEPARATORS,
+            ),
+        ),
+    }
+
+
+def _is_emitted_history_message(history_message: ComposerHistoryMessage) -> bool:
+    # Persisted tool turns can have no assistant prose, but history has no
+    # tool-call blocks to accompany those empty messages.
+    return not (history_message["role"] == "assistant" and history_message["content"] == "")
+
+
+def history_message_indices(chat_history: list[ComposerHistoryMessage]) -> tuple[int, ...]:
+    """Return the ``chat_history`` index of each history message ``build_messages`` emits, in order."""
+    return tuple(index for index, history_message in enumerate(chat_history) if _is_emitted_history_message(history_message))
 
 
 def build_messages(
@@ -583,8 +644,8 @@ def build_messages(
         }
     )
 
-    # 3. Chat history. Persisted tool turns can have no assistant prose, but
-    # history has no tool-call blocks to accompany those empty messages.
+    # 3. Chat history, without the empty assistant rows of persisted tool
+    # turns (see ``history_message_indices``).
     if chat_history:
         messages.extend(
             {
@@ -593,31 +654,18 @@ def build_messages(
                 if key not in {COMPOSER_HISTORY_USER_AUTHORED_KEY, COMPOSER_HISTORY_USER_MESSAGE_ID_KEY}
             }
             for history_message in chat_history
-            if not (history_message["role"] == "assistant" and history_message["content"] == "")
+            if _is_emitted_history_message(history_message)
         )
 
     # 4. Session-varying state context — after history so per-turn state
     # changes never invalidate the cached prefix over messages 1-3.
-    context_str = build_context_string(
-        state,
-        catalog,
-        plugin_snapshot=plugin_snapshot,
-        schemas_loaded=schemas_loaded,
-    )
-    prefix = STATE_CONTEXT_PREFIX + "\n"
     messages.append(
-        {
-            "role": "user",
-            "content": context_str,
-            PROMPT_GUARD_CONTENT_PARTS_KEY: (
-                PromptGuardContentPart(prefix),
-                *json_content_parts(
-                    context_str[len(prefix) :],
-                    reference_paths=frozenset({("schema_contract_evidence", "schemas")}),
-                    separators=_COMPACT_JSON_SEPARATORS,
-                ),
-            ),
-        }
+        build_state_context_message(
+            state,
+            catalog,
+            plugin_snapshot=plugin_snapshot,
+            schemas_loaded=schemas_loaded,
+        )
     )
 
     # 5. Current user message
