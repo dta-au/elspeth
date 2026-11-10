@@ -42,6 +42,7 @@ from elspeth.web.paths import (
     NESTED_LOCAL_PATH_OPTION_KEYS,
     SINK_LOCAL_PATH_OPTION_KEYS,
     SOURCE_LOCAL_PATH_OPTION_KEYS,
+    is_absent_sink_path,
     is_local_path_value,
     require_mcp_root_context,
     resolve_data_path,
@@ -133,10 +134,14 @@ def resolve_runtime_yaml_paths(
         if type(opts) is not dict:
             raise TypeError(f"YAML generator produced non-dict '{component_path}.options' value (got {type(opts).__name__})")
         path_options = cast(dict[str, Any], opts)
+        plugin = component["plugin"] if "plugin" in component else None
+        mode = path_options["mode"] if "mode" in path_options else None
         for key in path_option_keys:
             if key not in path_options:
                 continue
             value = path_options[key]
+            if sink_paths and is_absent_sink_path(plugin, mode, key, value):
+                continue
             if not is_local_path_value(value):
                 raise ValueError(f"{component_path}.options.{key} must be a nonempty string path without NUL")
             if not Path(value).is_absolute():

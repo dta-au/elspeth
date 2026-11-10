@@ -486,3 +486,37 @@ def test_only_the_green_constants_claim_validation() -> None:
     assert "validated" not in PIPELINE_STAGED_REVIEW_FINDINGS_MESSAGE
     assert "validated" not in PIPELINE_STAGED_REVIEW_PREFLIGHT_NOT_RUN_MESSAGE
     assert "validated" not in PIPELINE_STAGED_REVIEW_PENDING_INTERPRETATION_MESSAGE
+
+
+@pytest.mark.parametrize("trust_mode", ["auto_commit", "explicit_approve"])
+@pytest.mark.parametrize(
+    "preflight,expected_steps",
+    [
+        pytest.param(_green_result(), ("accept", "reject"), id="green-review"),
+        pytest.param(_red_result(), ("not been applied", "inspect", "correction", "reject"), id="findings"),
+        pytest.param(
+            _pending_review_result(),
+            ("accept it to open", "then resolve", "reject"),
+            id="interpretation-handoff",
+        ),
+        pytest.param(None, ("not been applied", "not confirmed runnable", "retry", "reject"), id="unconfirmed"),
+    ],
+)
+async def test_pending_proposal_messages_explain_next_action_in_each_trust_mode(
+    trust_mode: str, preflight: ValidationResult | None, expected_steps: tuple[str, ...]
+) -> None:
+    result, sessions = await _stage(
+        trust_mode=trust_mode,
+        preflight=preflight,
+        candidate_state=_changed_state(),
+    )
+
+    assert len(sessions.created_proposals) == 1
+    if preflight is not None and preflight.is_valid and trust_mode == "auto_commit":
+        assert result.pipeline_commit_intent is not None
+        assert result.message == PIPELINE_STAGED_AUTO_COMMIT_MESSAGE
+    else:
+        assert result.pipeline_commit_intent is None
+        for step in expected_steps:
+            assert step in result.message.lower()
+        assert "auto-commit" not in result.message.lower()

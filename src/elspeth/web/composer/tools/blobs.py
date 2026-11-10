@@ -43,6 +43,7 @@ from elspeth.contracts.blobs_inline import (
     is_widened_blob_ref,
 )
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.credential_material import DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
@@ -2156,6 +2157,15 @@ def _execute_get_blob_content(
 
     if data is None:
         return _failure_result(state, f"Blob storage file missing for '{blob_id}'.")
+
+    inspection_limit = DEFAULT_CREDENTIAL_TRAVERSAL_POLICY.max_string_bytes
+    if len(data) > inspection_limit:
+        return _failure_result(
+            state,
+            f"The attachment is {len(data)} bytes, exceeding the current {inspection_limit}-byte "
+            "whole-input credential inspection limit; no content was returned.",
+            error_code="blob_content_size_limit",
+        )
 
     # Guard 3 — decode safety.  Non-UTF-8 bytes are a Tier-3 external
     # input condition (the operator supplied content in an encoding we

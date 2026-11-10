@@ -193,6 +193,38 @@ def _sha() -> str:
     return "a" * 64
 
 
+@pytest.mark.parametrize(
+    "tool", ["patch_node_options", "patch_source_options", "patch_output_options", "upsert_node", "set_source", "set_output"]
+)
+def test_mutation_options_retain_only_owned_reference_positions(tool: str) -> None:
+    field = "patch" if tool.startswith("patch_") else "options"
+    arguments = {field: {"prompts": [{"blob_ref": BLOB_UUID, "mode": "inline_content", "sha256": _sha()}]}}
+    assert proposal_blob_reference_ids(tool, arguments) == (BLOB_UUID,)
+    assert proposal_blob_reference_ids(tool, {"description": arguments[field]}) == ()
+    assert proposal_blob_reference_ids("unknown_tool", arguments) == ()
+    with pytest.raises(ValueError, match="must be a mapping"):
+        proposal_blob_reference_ids(tool, {field: []})
+
+
+@pytest.mark.parametrize(
+    "tool", ["patch_node_options", "patch_source_options", "patch_output_options", "upsert_node", "set_source", "set_output"]
+)
+def test_mutation_options_absent_or_null_have_no_references(tool: str) -> None:
+    field = "patch" if tool.startswith("patch_") else "options"
+    assert proposal_blob_reference_ids(tool, {}) == ()
+    assert proposal_blob_reference_ids(tool, {field: None}) == ()
+
+
+@pytest.mark.parametrize(
+    "tool", ["patch_node_options", "patch_source_options", "patch_output_options", "upsert_node", "set_source", "set_output"]
+)
+@pytest.mark.parametrize("value", [[], "wrong-type"])
+def test_mutation_options_wrong_type_is_corruption(tool: str, value: object) -> None:
+    field = "patch" if tool.startswith("patch_") else "options"
+    with pytest.raises(ValueError, match="must be a mapping"):
+        proposal_blob_reference_ids(tool, {field: value})
+
+
 class TestLegacySetPipelineShapes:
     def test_source_blob_id_is_extracted(self) -> None:
         blob_id = str(uuid4())

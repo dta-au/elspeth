@@ -12,6 +12,7 @@ from sqlalchemy import Engine, select
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.blobs.protocol import BlobIntegrityError
+from elspeth.web.composer.discovery_response import admit_discovery_result
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools.generation import (
     ComposerProofContext,
@@ -95,6 +96,67 @@ def test_ready_proof_uses_actual_fenced_reader_once_and_outcomes_are_frozen(
     assert type(unavailable) is ProofUnavailable
     with pytest.raises(TypeError):
         unavailable.diagnostics[0]["evidence_locator"]["blob_id"] = "changed"
+
+
+@pytest.mark.parametrize(
+    ("content", "code", "severity"),
+    [
+        ('[{"amount": 10, "private_extra": 1}]', "csv_fixed_schema_omits_observed_columns", "blocking"),
+        ('[{"amount": 10, "private_extra": 1}, {"amount": 20}]', "json_fixed_schema_sample_omits_fields", "warning"),
+        ('[{"amount": 10}]', "source_inspection_failed", "blocking"),
+    ],
+)
+def test_json_source_preview_returns_normal_diagnostic_envelope(
+    proof_store: tuple[Engine, str, str, CompositionState, Path], tmp_path: Path, content: str, code: str, severity: str
+) -> None:
+    engine, session_id, _csv_blob_id, state, _path = proof_store
+    blob_id = _create_session_blob_for_test(
+        engine=engine, session_id=session_id, data_dir=tmp_path, filename="records.json", content=content
+    )
+    with engine.connect() as connection:
+        path = connection.execute(select(blobs_table.c.storage_path).where(blobs_table.c.id == blob_id)).scalar_one()
+    state = replace(
+        state,
+        sources={
+            "source": replace(
+                state.sources["source"],
+                plugin="json",
+                options={
+                    "path": path,
+                    "blob_ref": blob_id,
+                    "schema": {"mode": "fixed", "fields": ["amount: int"]},
+                    **({"format": "invalid-format"} if code == "source_inspection_failed" else {}),
+                },
+            )
+        },
+    )
+    with _blob_operation(engine, session_id) as (authority, operation):
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            session_id=session_id,
+            session_operation_authority=authority,
+            session_operation_context=operation,
+            runtime_preflight=_passing_preflight,
+        )
+    assert result.success, result
+    admitted = admit_discovery_result("preview_pipeline", result)
+    (diagnostic,) = [item for item in result.data["proof_diagnostics"] if item["code"] == code]
+    assert diagnostic["severity"] == severity
+    assert diagnostic["evidence_locator"]["source"] == "blob"
+    assert diagnostic["evidence_locator"]["blob_id"] == blob_id
+    assert diagnostic["evidence_locator"]["source_name"] == "source"
+    if code != "source_inspection_failed":
+        count_key = "sample_extra_record_count" if severity == "warning" else "selected_record_count"
+        assert diagnostic["evidence_locator"][count_key] == 1
+        assert diagnostic["evidence_locator"]["all_rows_inspected"] is True
+    wire_diagnostic = next(item for item in admitted.to_dict()["data"]["proof_diagnostics"] if item["code"] == code)
+    assert wire_diagnostic == diagnostic
+    assert result.data["preview_is_valid"] is (severity != "blocking")
 
 
 @pytest.mark.parametrize("status", ["pending", "error"])
