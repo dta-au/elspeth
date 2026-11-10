@@ -237,6 +237,9 @@ class TestHeadlessBlobRefFragment:
             {"mode": "observed"},  # schema mode, not a blob mode
             {"mode": "inline_content", "sha256": VALID_HASH, "fields": ["a"]},  # carries plugin keys
             {"sha256": VALID_HASH},  # no mode
+            {"mode": []},  # unhashable mode: ordinary plugin data, not a marker
+            {"mode": {}},
+            {"mode": 1},
             "inline_content",
             ["mode", "inline_content"],
             None,
