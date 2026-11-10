@@ -21,6 +21,14 @@ RECOVERY = "elspeth.web.process_recovery.ProcessRecovery"
 STANDALONE = "elspeth.composer_mcp.standalone"
 STANDALONE_REGISTRATION = WORKER + ".configure_standalone_executor_recovery"
 CELLS = {"_APPLICATION_FINALIZER_OWNER", "_INSTANCE_DRAINING"}
+# The standalone wrapper is admissible only while this cell is never cleared after an owner registers, so
+# outside stores, reflected replacement and namespace writes are refused even though it is not a producer cell.
+GUARD_CELLS = {"_RECOVERY_CALLBACK"}
+# Re-exports are second names for the same callable; a call through either is the same registration.
+REEXPORTS = {
+    APP + ".configure_required_executor_recovery": WORKER + ".configure_required_executor_recovery",
+    STANDALONE + ".configure_standalone_executor_recovery": STANDALONE_REGISTRATION,
+}
 PROTECTED_MODULES = {WORKER, APP, "elspeth.web.application_finalizers", "elspeth.web.process_recovery", "threading"}
 PROTECTED_BINDINGS = {
     WORKER + ".configure_required_executor_recovery",
@@ -442,14 +450,14 @@ def _namespace_effects(units, configured_function, standalone_function=None):
             if value is None:
                 return frozenset()
             if isinstance(value, ast.Name):
-                return env.get(value.id, frozenset({module + "." + value.id}))
+                return frozenset(REEXPORTS.get(q, q) for q in env.get(value.id, frozenset({module + "." + value.id})))
             if isinstance(value, ast.Attribute):
                 roots = qualify(value.value, env)
                 if value.attr == "__dict__" and roots & (PROTECTED_MODULES | {OWNER, RECOVERY}):
                     return frozenset(root + ".__namespace__" for root in roots & (PROTECTED_MODULES | {OWNER, RECOVERY}))
                 if value.attr == "__globals__" and WORKER + ".configure_required_executor_recovery" in roots:
                     return frozenset({WORKER + ".__namespace__"})
-                return frozenset(root + "." + value.attr for root in roots if root.count(".") < 8)
+                return frozenset(REEXPORTS.get(root + "." + value.attr, root + "." + value.attr) for root in roots if root.count(".") < 8)
             if isinstance(value, ast.IfExp):
                 return qualify(value.body, env) | qualify(value.orelse, env)
             if isinstance(value, ast.NamedExpr):
@@ -633,7 +641,7 @@ def _namespace_effects(units, configured_function, standalone_function=None):
         def protected(qualified):
             return (
                 qualified in PROTECTED_BINDINGS
-                or any(qualified == WORKER + "." + cell or qualified.startswith(WORKER + "." + cell + ".") for cell in CELLS)
+                or any(qualified == WORKER + "." + cell or qualified.startswith(WORKER + "." + cell + ".") for cell in CELLS | GUARD_CELLS)
                 or any(
                     qualified.startswith(owner + ".")
                     for owner in {
@@ -662,7 +670,7 @@ def _namespace_effects(units, configured_function, standalone_function=None):
                     and (
                         (
                             root.removesuffix(".__namespace__") == WORKER
-                            and (selector is None or selector in CELLS or protected(WORKER + "." + str(selector)))
+                            and (selector is None or selector in CELLS | GUARD_CELLS or protected(WORKER + "." + str(selector)))
                         )
                         or (root.removesuffix(".__namespace__") in {OWNER, RECOVERY})
                         or (selector is None or protected(root.removesuffix(".__namespace__") + "." + str(selector)))
@@ -700,6 +708,23 @@ def _namespace_effects(units, configured_function, standalone_function=None):
                 ):
                     failures.append("recovery protected namespace mutation/unsupported effect " + unit.path)
     return failures, references, configure_calls, standalone_calls
+
+
+STANDALONE_CALL = """configure_standalone_executor_recovery(
+    drain_seconds=10.0,
+    instance_draining=draining,
+    generation_unavailable=threading.Event(),
+    recovery_callback=recovery.required_generation_expired,
+)"""
+
+
+def _standalone_call_pinned(root, call):
+    """The call is the first statement of the single top-level ``try`` and equals the reviewed expression."""
+    tries = [node for node in root.body if isinstance(node, ast.Try)]
+    if len(tries) != 1 or not tries[0].body:
+        return False
+    first = tries[0].body[0]
+    return isinstance(first, ast.Expr) and first.value is call and _dump(call) == _dump(ast.parse(STANDALONE_CALL, mode="eval").body)
 
 
 def recovery_cell_contract(units):
@@ -848,6 +873,7 @@ def recovery_cell_contract(units):
         or len(standalone_calls) != 1
         or standalone_calls[0][0] is not standalone_unit
         or standalone_calls[0][2] is not standalone_root
+        or not _standalone_call_pinned(standalone_root, standalone_calls[0][1])
     ):
         failures.append("recovery standalone registration call/escape universe changed")
     module_initializers = {

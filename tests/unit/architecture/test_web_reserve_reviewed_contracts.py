@@ -1086,6 +1086,87 @@ def test_recovery_registration_refuses_an_unreviewed_site(module: str, body: str
     assert _recovery_contract_failures(sources) == expected
 
 
+@pytest.mark.parametrize(
+    ("module", "body", "expected"),
+    (
+        pytest.param(
+            "from elspeth.composer_mcp.standalone import configure_standalone_executor_recovery\n",
+            "    configure_standalone_executor_recovery(" + _RECOVERY_REGISTRATION_ARGUMENTS + ")\n",
+            [_RECOVERY_STANDALONE_UNIVERSE],
+            id="standalone-wrapper-through-its-reexport",
+        ),
+        pytest.param(
+            "from elspeth.composer_mcp import standalone\n",
+            "    standalone.configure_standalone_executor_recovery(" + _RECOVERY_REGISTRATION_ARGUMENTS + ")\n",
+            [_RECOVERY_STANDALONE_UNIVERSE],
+            id="standalone-wrapper-through-its-module",
+        ),
+        pytest.param(
+            "from elspeth.web.app import configure_required_executor_recovery\n",
+            "    configure_required_executor_recovery(" + _RECOVERY_REGISTRATION_ARGUMENTS + ")\n",
+            [_RECOVERY_UNIVERSE],
+            id="base-registration-through-the-app-reexport",
+        ),
+        pytest.param(
+            "from elspeth.web import async_workers\n",
+            "    async_workers._RECOVERY_CALLBACK = None\n",
+            ["recovery producer qualified binding/member replacement src/elspeth/web/unreviewed_recovery_site.py"],
+            id="outside-reset-of-the-guard-cell",
+        ),
+        pytest.param(
+            "from elspeth.web import async_workers\n",
+            "    async_workers._INSTANCE_DRAINING = None\n",
+            ["recovery producer qualified binding/member replacement src/elspeth/web/unreviewed_recovery_site.py"],
+            id="outside-reset-of-a-producer-cell-control",
+        ),
+        pytest.param(
+            "from elspeth.web import async_workers\n",
+            '    setattr(async_workers, "_RECOVERY_CALLBACK", None)\n',
+            ["recovery producer reflected replacement src/elspeth/web/unreviewed_recovery_site.py"],
+            id="reflected-reset-of-the-guard-cell",
+        ),
+    ),
+)
+def test_recovery_registration_refuses_reexported_calls_and_guard_cell_resets(module: str, body: str, expected: list[str]) -> None:
+    sources = _recovery_registration_sources()
+    sources["src/elspeth/web/unreviewed_recovery_site.py"] = (
+        "from __future__ import annotations\nimport threading\n" + module + "def unreviewed():\n" + body
+    )
+    assert _recovery_contract_failures(sources) == expected
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        pytest.param("instance_draining=draining,\n", "instance_draining=threading.Event(),\n", id="drain-event-not-the-recovery-event"),
+        pytest.param("recovery_callback=recovery.required_generation_expired,\n", "recovery_callback=print,\n", id="callback-replaced"),
+        pytest.param("drain_seconds=10.0,\n", "drain_seconds=1.0,\n", id="drain-seconds-changed"),
+    ),
+)
+def test_recovery_standalone_call_arguments_are_pinned(old: str, new: str) -> None:
+    sources = _recovery_registration_sources()
+    assert sources[_RECOVERY_STANDALONE].count(old) == 1
+    sources[_RECOVERY_STANDALONE] = sources[_RECOVERY_STANDALONE].replace(old, new)
+    assert _recovery_contract_failures(sources) == [_RECOVERY_STANDALONE_UNIVERSE]
+
+
+def test_recovery_standalone_call_must_not_be_repeated_or_conditional() -> None:
+    call = "        configure_standalone_executor_recovery(\n"
+    sources = _recovery_registration_sources()
+    assert sources[_RECOVERY_STANDALONE].count(call) == 1
+    sources[_RECOVERY_STANDALONE] = sources[_RECOVERY_STANDALONE].replace(
+        call, "        for _ in range(2):\n            configure_standalone_executor_recovery(\n"
+    )
+    # The loop body must stay syntactically valid; re-indent the original argument block under it.
+    start = sources[_RECOVERY_STANDALONE].index("            configure_standalone_executor_recovery(\n")
+    end = sources[_RECOVERY_STANDALONE].index("        )\n", start) + len("        )\n")
+    block = sources[_RECOVERY_STANDALONE][start:end]
+    lines = block.splitlines(keepends=True)
+    reindented = lines[0] + "".join("    " + line for line in lines[1:])
+    sources[_RECOVERY_STANDALONE] = sources[_RECOVERY_STANDALONE][:start] + reindented + sources[_RECOVERY_STANDALONE][end:]
+    assert _recovery_contract_failures(sources) == [_RECOVERY_STANDALONE_UNIVERSE]
+
+
 def test_recovery_registration_refuses_removal_of_either_reviewed_site() -> None:
     sources = _recovery_registration_sources()
     del sources[_RECOVERY_STANDALONE]
