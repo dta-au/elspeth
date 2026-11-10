@@ -29,8 +29,13 @@
 
 import { create } from "zustand";
 
-import { markReadyForReview } from "../api/shareableReviews";
-import type { ApiError, MarkReadyForReviewResponse } from "../types/api";
+import { fetchShareableFiles, markReadyForReview } from "../api/shareableReviews";
+import type {
+  ApiError,
+  MarkReadyForReviewResponse,
+  MarkReadyOptions,
+  ShareableFilesResponse,
+} from "../types/api";
 
 /**
  * Request-lifecycle discriminated union.
@@ -40,9 +45,19 @@ import type { ApiError, MarkReadyForReviewResponse } from "../types/api";
  */
 export type RequestPhase =
   | { kind: "idle" }
-  | { kind: "pending"; sessionId: string; epoch: number }
+  | {
+      kind: "configure";
+      sessionId: string;
+      epoch: number;
+      /** Null while the file list loads, or when loading failed (see filesError). */
+      files: ShareableFilesResponse | null;
+      filesError: string | null;
+      /** Why the owner is back at this step after a refused mint, if they are. */
+      notice: string | null;
+    }
+  | { kind: "pending"; sessionId: string; epoch: number; options: MarkReadyOptions }
   | { kind: "resolved"; sessionId: string; response: MarkReadyForReviewResponse }
-  | { kind: "error"; sessionId: string; message: string };
+  | { kind: "error"; sessionId: string; message: string; options: MarkReadyOptions };
 
 export interface ShareableReviewState {
   /** Whether the SaveForReviewDialog is mounted (orthogonal to request phase). */
@@ -63,7 +78,14 @@ export interface ShareableReviewState {
   error: string | null;
 
   // ── Mutators ──
-  openAndMark: (sessionId: string) => Promise<void>;
+  /** Open the dialog in the configure phase and load the shareable files. Does not mint. */
+  openConfigure: (sessionId: string) => Promise<void>;
+  /** Mint with the chosen options, from the configure phase's session. Also
+   *  accepted from the error phase so a failed mint can be retried. An
+   *  importable share is bound to the file list the configure phase loaded;
+   *  if the server reports the files changed since, the dialog returns to
+   *  the configure phase with the current list. */
+  confirmMark: (options: MarkReadyOptions) => Promise<void>;
   close: () => void;
   clearForSession: (sessionId: string) => void;
   reset: () => void;
@@ -95,7 +117,7 @@ function _isApiError(value: unknown): value is ApiError {
 /** Project canonical InternalState onto the public flat-field surface. */
 function _project(internal: InternalState): Omit<
   ShareableReviewState,
-  "openAndMark" | "close" | "clearForSession" | "reset"
+  "openConfigure" | "confirmMark" | "close" | "clearForSession" | "reset"
 > {
   const inFlight = internal.request.kind === "pending";
   const error = internal.request.kind === "error" ? internal.request.message : null;
@@ -124,6 +146,24 @@ function _project(internal: InternalState): Omit<
  *  directly; the internal record is updated alongside on each transition. */
 let _internal: InternalState = _internalInitial;
 
+/** Monotonic epoch shared by every in-flight phase (configure and pending). */
+let _epochCounter = 0;
+function _nextEpoch(): number {
+  _epochCounter += 1;
+  return _epochCounter;
+}
+
+function _messageFor(exc: unknown, fallback: string): string {
+  if (_isApiError(exc)) {
+    if (exc.status === 404) return "Session not found.";
+    if (exc.status === 401) return "Authentication required.";
+    if (typeof exc.detail === "string") return exc.detail;
+  } else if (exc instanceof Error) {
+    return exc.message;
+  }
+  return fallback;
+}
+
 export const useShareableReviewStore = create<ShareableReviewState>((set, _get) => {
   function _commit(next: InternalState): void {
     _internal = next;
@@ -133,96 +173,39 @@ export const useShareableReviewStore = create<ShareableReviewState>((set, _get) 
   return {
     ..._project(_internal),
 
-    async openAndMark(sessionId: string) {
-      // Double-click guard: if a POST is already in-flight for the same
-      // session, drop the re-entrant call. Audit rows are append-only —
-      // minting a second token would create a duplicate audit row.
+    async openConfigure(sessionId: string) {
+      // Never disturb a mint already in flight for this session.
       if (_internal.request.kind === "pending" && _internal.request.sessionId === sessionId) {
+        // The dialog may have been closed meanwhile; reopen it on the pending mint.
+        if (!_internal.dialogOpen) {
+          _commit({ ..._internal, dialogOpen: true });
+        }
         return;
       }
+      await _configure(sessionId, null);
+    },
 
-      // Capture this call's epoch BEFORE awaiting. The next openAndMark
-      // (same or different session) will bump the epoch when it sets its
-      // own pending phase; on resume we re-check our captured epoch against
-      // the live one. Mismatch ⇒ we were superseded; drop our late response.
-      const myEpoch =
-        _internal.request.kind === "pending" ? _internal.request.epoch + 1 : 1;
-
-      // Switching sessions while a previous response is still cached:
-      // wipe the cached lastSuccess so the dialog does not flash session
-      // A's URL while session B's POST is in flight. Same-session reentry
-      // keeps the cache.
-      const sessionSwitch =
-        _internal.lastSuccess !== null && _internal.lastSuccess.sessionId !== sessionId;
-
-      _commit({
-        ..._internal,
-        dialogOpen: true,
-        request: { kind: "pending", sessionId, epoch: myEpoch },
-        lastSuccess: sessionSwitch ? null : _internal.lastSuccess,
-      });
-
-      try {
-        const response = await markReadyForReview(sessionId);
-        // Stale-epoch check: a later openAndMark superseded us while we
-        // were awaiting. Our response must NOT clobber the new pending /
-        // resolved state. The server-side audit row was minted regardless;
-        // we just suppress the late client-side surfacing.
-        if (
-          _internal.request.kind !== "pending" ||
-          _internal.request.epoch !== myEpoch ||
-          _internal.request.sessionId !== sessionId
-        ) {
-          return;
-        }
-        _commit({
-          ..._internal,
-          request: { kind: "resolved", sessionId, response },
-          lastSuccess: { sessionId, response },
-        });
-      } catch (exc) {
-        if (
-          _internal.request.kind !== "pending" ||
-          _internal.request.epoch !== myEpoch ||
-          _internal.request.sessionId !== sessionId
-        ) {
-          return;
-        }
-        let message = "Could not mint a shareable link";
-        if (_isApiError(exc)) {
-          if (exc.status === 409) {
-            message =
-              exc.detail ??
-              "The composition is not ready for sharing — fix the surfaced errors and try again.";
-          } else if (exc.status === 404) {
-            message = "Session not found.";
-          } else if (exc.status === 401) {
-            message = "Authentication required.";
-          } else if (typeof exc.detail === "string") {
-            message = exc.detail;
-          }
-        } else if (exc instanceof Error) {
-          message = exc.message;
-        } else {
-          // Fallback: exc is neither an ApiError nor an Error instance.
-          // The generic banner remains, but record the actual exception
-          // for debugging — a silent fallback would hide misbehaviour at
-          // a lower layer (e.g. a `throw "string"` from a fetch wrapper).
-          // eslint-disable-next-line no-console
-          console.warn(
-            "shareableReviewStore: openAndMark failed with unexpected exception shape:",
-            exc,
-          );
-        }
-        _commit({
-          ..._internal,
-          // Cached lastSuccess is wiped on error to match the previous
-          // store's behaviour (the original code set
-          // `latestResponse: null` on the error path).
-          request: { kind: "error", sessionId, message },
-          lastSuccess: null,
-        });
+    async confirmMark(options: MarkReadyOptions) {
+      const current = _internal.request;
+      if (current.kind === "error") {
+        // A retry repeats the options, fingerprint included, of the failed mint.
+        await _mint(current.sessionId, options);
+        return;
       }
+      if (current.kind !== "configure") {
+        return;
+      }
+      if (!options.allowImport) {
+        await _mint(current.sessionId, { allowImport: false, lifetimeSeconds: options.lifetimeSeconds });
+        return;
+      }
+      // Import is consent to the listed files, so it needs a loaded,
+      // importable list to name.
+      const fingerprint = current.files?.manifest_fingerprint ?? null;
+      if (fingerprint === null) {
+        return;
+      }
+      await _mint(current.sessionId, { ...options, fileManifestFingerprint: fingerprint });
     },
 
     close() {
@@ -247,4 +230,149 @@ export const useShareableReviewStore = create<ShareableReviewState>((set, _get) 
       _commit({ ..._internalInitial });
     },
   };
+
+  /** Enter the configure phase and load the files an importable share would carry. */
+  async function _configure(sessionId: string, notice: string | null): Promise<void> {
+    const myEpoch = _nextEpoch();
+    const sessionSwitch =
+      _internal.lastSuccess !== null && _internal.lastSuccess.sessionId !== sessionId;
+    _commit({
+      ..._internal,
+      dialogOpen: true,
+      request: { kind: "configure", sessionId, epoch: myEpoch, files: null, filesError: null, notice },
+      lastSuccess: sessionSwitch ? null : _internal.lastSuccess,
+    });
+    const isCurrent = (): boolean =>
+      _internal.request.kind === "configure" &&
+      _internal.request.epoch === myEpoch &&
+      _internal.request.sessionId === sessionId;
+    try {
+      const files = await fetchShareableFiles(sessionId);
+      if (!isCurrent()) return;
+      _commit({
+        ..._internal,
+        request: { kind: "configure", sessionId, epoch: myEpoch, files, filesError: null, notice },
+      });
+    } catch (exc) {
+      if (!isCurrent()) return;
+      _commit({
+        ..._internal,
+        request: {
+          kind: "configure",
+          sessionId,
+          epoch: myEpoch,
+          files: null,
+          filesError: _messageFor(exc, "Could not load the files this link would share"),
+          notice,
+        },
+      });
+    }
+  }
+
+  async function _mint(sessionId: string, options: MarkReadyOptions): Promise<void> {
+      // Double-click guard: if a POST is already in-flight for the same
+      // session, drop the re-entrant call. Audit rows are append-only —
+      // minting a second token would create a duplicate audit row.
+      if (_internal.request.kind === "pending" && _internal.request.sessionId === sessionId) {
+        return;
+      }
+
+      // Capture this call's epoch BEFORE awaiting. The next confirmMark
+      // (same or different session) will bump the epoch when it sets its
+      // own pending phase; on resume we re-check our captured epoch against
+      // the live one. Mismatch ⇒ we were superseded; drop our late response.
+      const myEpoch = _nextEpoch();
+
+      // Switching sessions while a previous response is still cached:
+      // wipe the cached lastSuccess so the dialog does not flash session
+      // A's URL while session B's POST is in flight. Same-session reentry
+      // keeps the cache.
+      const sessionSwitch =
+        _internal.lastSuccess !== null && _internal.lastSuccess.sessionId !== sessionId;
+
+      _commit({
+        ..._internal,
+        dialogOpen: true,
+        request: { kind: "pending", sessionId, epoch: myEpoch, options },
+        lastSuccess: sessionSwitch ? null : _internal.lastSuccess,
+      });
+
+      try {
+        const response = await markReadyForReview(sessionId, options);
+        // Stale-epoch check: a later confirmMark superseded us while we
+        // were awaiting. Our response must NOT clobber the new pending /
+        // resolved state. The server-side audit row was minted regardless;
+        // we just suppress the late client-side surfacing.
+        if (
+          _internal.request.kind !== "pending" ||
+          _internal.request.epoch !== myEpoch ||
+          _internal.request.sessionId !== sessionId
+        ) {
+          return;
+        }
+        _commit({
+          ..._internal,
+          request: { kind: "resolved", sessionId, response },
+          lastSuccess: { sessionId, response },
+        });
+      } catch (exc) {
+        if (
+          _internal.request.kind !== "pending" ||
+          _internal.request.epoch !== myEpoch ||
+          _internal.request.sessionId !== sessionId
+        ) {
+          return;
+        }
+        if (_isApiError(exc) && exc.status === 409 && exc.error_type === "share_files_changed") {
+          // The files differ from the list the owner agreed to. Retrying
+          // would present the same stale fingerprint, so return to the
+          // configure step: it reloads the list and its import choice
+          // starts unticked, so the owner confirms the current files.
+          // The dialog stays as the owner left it, open or closed.
+          const wasOpen = _internal.dialogOpen;
+          void _configure(
+            sessionId,
+            "The files this pipeline uses changed since you reviewed them. Check the list below and create the link again.",
+          );
+          if (!wasOpen) {
+            _commit({ ..._internal, dialogOpen: false });
+          }
+          return;
+        }
+        let message = "Could not mint a shareable link";
+        if (_isApiError(exc)) {
+          if (exc.status === 409) {
+            message =
+              exc.detail ??
+              "The composition is not ready for sharing — fix the surfaced errors and try again.";
+          } else if (exc.status === 404) {
+            message = "Session not found.";
+          } else if (exc.status === 401) {
+            message = "Authentication required.";
+          } else if (typeof exc.detail === "string") {
+            message = exc.detail;
+          }
+        } else if (exc instanceof Error) {
+          message = exc.message;
+        } else {
+          // Fallback: exc is neither an ApiError nor an Error instance.
+          // The generic banner remains, but record the actual exception
+          // for debugging — a silent fallback would hide misbehaviour at
+          // a lower layer (e.g. a `throw "string"` from a fetch wrapper).
+          // eslint-disable-next-line no-console
+          console.warn(
+            "shareableReviewStore: mint failed with unexpected exception shape:",
+            exc,
+          );
+        }
+        _commit({
+          ..._internal,
+          // Cached lastSuccess is wiped on error to match the previous
+          // store's behaviour (the original code set
+          // `latestResponse: null` on the error path).
+          request: { kind: "error", sessionId, message, options },
+          lastSuccess: null,
+        });
+      }
+  }
 });

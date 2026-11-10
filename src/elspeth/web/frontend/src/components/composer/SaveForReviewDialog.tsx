@@ -2,9 +2,12 @@
  * SaveForReviewDialog — confirmation + share-URL display (Phase 6B Task 4).
  *
  * Mounted by App.tsx (top-level) and reads `dialogOpen`, `latestResponse`,
- * `inFlight`, and `error` from `useShareableReviewStore`. The dialog has
- * three observable states:
+ * `inFlight`, `error`, and the `request` phase from `useShareableReviewStore`.
+ * The dialog has four observable states:
  *
+ *   * request.kind === "configure" → the configure step: may recipients import
+ *     a copy (with the files that would travel), and how long the link lives.
+ *     Nothing is minted until "Create link".
  *   * inFlight=true  → "Minting share link..." spinner.
  *   * error set      → error banner with a "Try again" affordance.
  *   * latestResponse → share URL + expiry + copy-to-clipboard button.
@@ -23,11 +26,187 @@
 import { type JSX, useEffect, useRef, useState } from "react";
 
 import { Button, Input } from "@/components/ui";
+import type { ShareLifetimeSeconds, ShareableFilesResponse } from "@/types/api";
+import { formatBytes } from "@/utils/bytes";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useShareableReviewStore } from "@/stores/shareableReviewStore";
 
 const COPY_FEEDBACK_TIMEOUT_MS = 2000;
+
+const LIFETIME_CHOICES: ReadonlyArray<{ seconds: ShareLifetimeSeconds; label: string }> = [
+  { seconds: 86400, label: "1 day" },
+  { seconds: 604800, label: "7 days" },
+  { seconds: 2592000, label: "30 days" },
+];
+
+/** A whole number of days, hours or minutes when the value is one, else seconds. */
+function _describeSeconds(seconds: number): string {
+  const units: ReadonlyArray<[number, string]> = [
+    [86400, "day"],
+    [3600, "hour"],
+    [60, "minute"],
+  ];
+  for (const [size, unit] of units) {
+    if (seconds >= size && seconds % size === 0) {
+      const count = seconds / size;
+      return `${count} ${unit}${count === 1 ? "" : "s"}`;
+    }
+  }
+  return `${seconds} second${seconds === 1 ? "" : "s"}`;
+}
+
+interface ConfigureStepProps {
+  files: ShareableFilesResponse | null;
+  filesError: string | null;
+  notice: string | null;
+  createDisabled: boolean;
+  createDisabledTitle: string | undefined;
+  onCreate: (allowImport: boolean, lifetimeSeconds: ShareLifetimeSeconds | null) => void;
+  onReloadFiles: () => void;
+}
+
+/** The configure step. Mounted only while the request is in the configure
+ *  phase, so its choices reset to the defaults each time the dialog opens. */
+function ConfigureStep({
+  files,
+  filesError,
+  notice,
+  createDisabled,
+  createDisabledTitle,
+  onCreate,
+  onReloadFiles,
+}: ConfigureStepProps): JSX.Element {
+  const [allowImport, setAllowImport] = useState(false);
+  // The owner's pick, if any. The choices depend on the deployment maximum,
+  // which arrives with the file list, so the effective lifetime is derived.
+  const [pickedLifetime, setPickedLifetime] = useState<ShareLifetimeSeconds | null>(null);
+
+  // Only lifetimes the server accepts are offered. Until the maximum is known
+  // (or if the file list failed) none is, and the link takes the server maximum.
+  const maxLifetimeSeconds = files?.max_lifetime_seconds ?? null;
+  const lifetimeChoices = maxLifetimeSeconds === null
+    ? []
+    : LIFETIME_CHOICES.filter((choice) => choice.seconds <= maxLifetimeSeconds);
+  const largestChoice = lifetimeChoices.length > 0 ? lifetimeChoices[lifetimeChoices.length - 1].seconds : null;
+  const lifetime = lifetimeChoices.some((choice) => choice.seconds === pickedLifetime) ? pickedLifetime : largestChoice;
+
+  const loading = files === null && filesError === null;
+  const importable = files !== null && files.importable;
+  const importChecked = importable && allowImport;
+
+  let importNote: string | null = null;
+  if (filesError !== null) {
+    importNote = "Recipients cannot import a copy because the file list could not be loaded. You can still create a view-only link.";
+  } else if (files !== null && !files.importable) {
+    importNote = files.not_importable_reason ?? "This pipeline cannot be imported by recipients.";
+  }
+
+  return (
+    <div className="save-for-review-configure" data-testid="save-for-review-configure">
+      {notice !== null && (
+        <div role="alert" className="save-for-review-error" data-testid="save-for-review-configure-notice">
+          <p>{notice}</p>
+        </div>
+      )}
+      <div className="save-for-review-option">
+        <label className="save-for-review-option-label">
+          <Input
+            type="checkbox"
+            checked={importChecked}
+            disabled={!importable}
+            aria-describedby={importNote !== null ? "save-for-review-import-note" : undefined}
+            onChange={(e) => setAllowImport(e.currentTarget.checked)}
+            data-testid="save-for-review-import-checkbox"
+          />
+          <span>Let recipients import a copy</span>
+        </label>
+        {loading && (
+          <p role="status" className="save-for-review-tip" data-testid="save-for-review-files-loading">
+            Loading the files this link would share...
+          </p>
+        )}
+        {importNote !== null && (
+          <p id="save-for-review-import-note" className="save-for-review-tip" data-testid="save-for-review-import-note">
+            {importNote}
+          </p>
+        )}
+        {filesError !== null && (
+          <div role="alert" className="save-for-review-error" data-testid="save-for-review-files-error">
+            <p>{filesError}</p>
+            <Button compact type="button" onClick={onReloadFiles} data-testid="save-for-review-files-retry">
+              Reload files
+            </Button>
+          </div>
+        )}
+        {importChecked && files !== null && (
+          <div data-testid="save-for-review-file-list">
+            {files.files.length === 0 ? (
+              <p className="save-for-review-tip">No files travel with this graph.</p>
+            ) : (
+              <>
+                <p className="save-for-review-tip" id="save-for-review-file-list-heading">
+                  These files will be copied for anyone who imports the graph:
+                </p>
+                <ul className="save-for-review-file-list" aria-labelledby="save-for-review-file-list-heading">
+                  {files.files.map((file) => (
+                    <li key={file.filename}>
+                      <span className="save-for-review-file-name">{file.filename}</span>
+                      <span className="save-for-review-file-size">{formatBytes(file.size_bytes)}</span>
+                      <span className="save-for-review-file-used-by">
+                        Used by {file.used_by.join(", ")}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      {lifetimeChoices.length > 0 ? (
+        <fieldset className="save-for-review-lifetime">
+          <legend>Link expires after</legend>
+          {lifetimeChoices.map((choice) => (
+            <label key={choice.seconds} className="save-for-review-option-label">
+              <Input
+                type="radio"
+                name="save-for-review-lifetime"
+                value={choice.seconds}
+                checked={lifetime === choice.seconds}
+                onChange={() => setPickedLifetime(choice.seconds)}
+              />
+              <span>{choice.label}</span>
+            </label>
+          ))}
+        </fieldset>
+      ) : (
+        !loading && (
+          <p className="save-for-review-tip" data-testid="save-for-review-lifetime-note">
+            {maxLifetimeSeconds === null
+              ? "This link will last the longest this deployment allows."
+              : `Links on this deployment last at most ${_describeSeconds(maxLifetimeSeconds)}. This link will last that long.`}
+          </p>
+        )
+      )}
+
+      <div className="save-for-review-configure-actions">
+        <Button
+          type="button"
+          variant="primary"
+          disabled={createDisabled || loading}
+          aria-disabled={createDisabled || loading || undefined}
+          title={createDisabledTitle}
+          onClick={() => onCreate(importChecked, lifetime)}
+          data-testid="save-for-review-create"
+        >
+          Create link
+        </Button>
+      </div>
+    </div>
+  );
+}
 
 /** Convert a backend path-only share_url to an absolute URL on the current
  *  origin. The frontend handles this rather than the backend so the same
@@ -45,7 +224,9 @@ export function SaveForReviewDialog(): JSX.Element | null {
   const inFlight = useShareableReviewStore((s) => s.inFlight);
   const error = useShareableReviewStore((s) => s.error);
   const close = useShareableReviewStore((s) => s.close);
-  const openAndMark = useShareableReviewStore((s) => s.openAndMark);
+  const request = useShareableReviewStore((s) => s.request);
+  const openConfigure = useShareableReviewStore((s) => s.openConfigure);
+  const confirmMark = useShareableReviewStore((s) => s.confirmMark);
   const validationResult = useExecutionStore((s) => s.validationResult);
   const completionReady =
     validationResult?.readiness?.completion_ready === true;
@@ -112,12 +293,19 @@ export function SaveForReviewDialog(): JSX.Element | null {
 
   function _onRetry() {
     if (!completionReady) return;
-    // The store has the session id captured from the original openAndMark
-    // call. If we lost it (resetSession between attempts), the retry path
-    // would no-op; the user closes and re-opens via the CompletionBar.
-    const sessionId = useShareableReviewStore.getState().sessionIdForResponse;
-    if (sessionId !== null) {
-      void openAndMark(sessionId);
+    // Retry the mint with the options the owner chose. If the error phase is
+    // gone (reset between attempts) this no-ops; the user closes and re-opens
+    // via the CompletionBar.
+    const current = useShareableReviewStore.getState().request;
+    if (current.kind === "error") {
+      void confirmMark(current.options);
+    }
+  }
+
+  function _onReloadFiles() {
+    const current = useShareableReviewStore.getState().request;
+    if (current.kind === "configure") {
+      void openConfigure(current.sessionId);
     }
   }
 
@@ -142,13 +330,32 @@ export function SaveForReviewDialog(): JSX.Element | null {
             <h2 id="save-for-review-dialog-title">Share for review</h2>
           </header>
 
-          {inFlight && (
+          {request.kind === "configure" && (
+            <ConfigureStep
+              files={request.files}
+              filesError={request.filesError}
+              notice={request.notice}
+              createDisabled={!completionReady}
+              createDisabledTitle={
+                !completionReady
+                  ? validationResult?.readiness?.blockers[0]?.detail ??
+                    "Resolve completion blockers before creating a link."
+                  : undefined
+              }
+              onCreate={(allowImport, lifetimeSeconds) =>
+                void confirmMark({ allowImport, lifetimeSeconds })
+              }
+              onReloadFiles={_onReloadFiles}
+            />
+          )}
+
+          {request.kind !== "configure" && inFlight && (
             <div role="status" data-testid="save-for-review-spinner">
               Minting share link...
             </div>
           )}
 
-          {!inFlight && error !== null && (
+          {request.kind !== "configure" && !inFlight && error !== null && (
             <div role="alert" className="save-for-review-error" data-testid="save-for-review-error">
               <p>{error}</p>
               <Button
@@ -170,7 +377,7 @@ export function SaveForReviewDialog(): JSX.Element | null {
             </div>
           )}
 
-          {!inFlight && error === null && latestResponse !== null && absoluteShareUrl !== null && (
+          {request.kind !== "configure" && !inFlight && error === null && latestResponse !== null && absoluteShareUrl !== null && (
             <div className="save-for-review-success" data-testid="save-for-review-success">
               <p>
                 Share this link with your reviewer. It expires on{" "}

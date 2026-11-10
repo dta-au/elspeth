@@ -46,9 +46,13 @@
  *   * `<YamlDisplay>` for the frozen YAML.
  *
  * The composer chat panel, run controls, and edit affordances are
- * deliberately ABSENT — this is an inspect-only view, not a fork
- * surface (multi-user collaborative editing is out of scope per
- * plan 19a §"Scope boundaries").
+ * deliberately ABSENT — the view itself is read-only. When the link allows
+ * it (`import_allowed`), the one write affordance is "Import a copy into my
+ * workspace": it forks the frozen snapshot (and its files) into a NEW session
+ * owned by the viewer and navigates there. The shared snapshot is never
+ * modified; multi-user collaborative editing remains out of scope per plan 19a
+ * §"Scope boundaries". The import control and its file list render outside
+ * any `useReadOnly` consumer, so the read-only provider does not disable it.
  *
  * Error handling:
  *
@@ -58,11 +62,24 @@
  * * 404 (blob reaped) → "This shared snapshot is no longer available"
  *   with a "Ask the sender for a fresh link" message.
  * * Other / network → "Couldn't load the shared pipeline" with retry.
+ *
+ * Import errors keep the loaded view on screen and show an inline alert:
+ * capability 401 → expired, 403 with ``user_role_required`` → the account's
+ * role, other 403 → the link does not allow importing, 404 → ask for a fresh
+ * link, 413 → storage quota, 422 → the refused component (plugin policy), the
+ * size cap or the server's reason, 400 → the seeder's reason, 429 → wait and
+ * retry, 503 → unavailable, authentication 401 → sign-in recovery, anything
+ * else → generic message. The button stays disabled after a 400, 403 or 422
+ * (a retry cannot succeed) and is re-enabled otherwise.
  */
 
-import { type JSX, useEffect, useState, type CSSProperties } from "react";
+import { type JSX, useEffect, useRef, useState, type CSSProperties } from "react";
 
-import { fetchSharedInspect } from "@/api/shareableReviews";
+import { Button } from "@/components/ui";
+
+import { fetchSharedInspect, importSharedSnapshot } from "@/api/shareableReviews";
+import { useSessionStore } from "@/stores/sessionStore";
+import { formatBytes } from "@/utils/bytes";
 import { ReadOnlyProvider } from "@/contexts/ReadOnlyContext";
 import { SharedAuditReadinessPanel } from "./SharedAuditReadinessPanel";
 import { YamlDisplay } from "@/components/inspector/YamlDisplay";
@@ -131,6 +148,17 @@ const BANNER_STYLE: CSSProperties = {
   fontSize: "var(--font-size-sm)",
 };
 
+const FILE_LIST_STYLE: CSSProperties = {
+  margin: "0 0 var(--space-md)",
+  paddingLeft: "var(--space-lg)",
+  color: "var(--color-text-secondary)",
+  fontSize: "var(--font-size-sm)",
+};
+
+const NOT_FOUND_MESSAGE =
+  "This shared snapshot is no longer available. The original " +
+  "operator may need to re-share — ask the sender for a fresh link.";
+
 type LoadState =
   | { kind: "loading" }
   | { kind: "loaded"; response: SharedInspectResponse }
@@ -144,17 +172,26 @@ function _isApiError(value: unknown): value is ApiError {
   );
 }
 
-function _classifyError(exc: unknown): { status: number | null; message: string } {
+interface ClassifiedError {
+  status: number | null;
+  message: string;
+  /** A bare-bearer 401: the viewer's sign-in, not the link, was refused. */
+  authentication: boolean;
+}
+
+function _classifyError(exc: unknown): ClassifiedError {
   if (_isApiError(exc)) {
     if (exc.status === 401) {
       if (exc.error_type === "authentication_required") {
         return {
           status: 401,
+          authentication: true,
           message: "Your sign-in was not accepted for this request. Reload this link or sign in again.",
         };
       }
       return {
         status: 401,
+        authentication: false,
         message:
           "This share link is no longer valid. The link may have expired or " +
           "been revoked. Ask the sender for a fresh link.",
@@ -163,20 +200,122 @@ function _classifyError(exc: unknown): { status: number | null; message: string 
     if (exc.status === 404) {
       return {
         status: 404,
-        message:
-          "This shared snapshot is no longer available. The original " +
-          "operator may need to re-share — ask the sender for a fresh link.",
+        authentication: false,
+        message: NOT_FOUND_MESSAGE,
       };
     }
     return {
       status: exc.status,
+      authentication: false,
       message: exc.detail ?? "Couldn't load the shared pipeline.",
     };
   }
   if (exc instanceof Error) {
-    return { status: null, message: exc.message };
+    return { status: null, authentication: false, message: exc.message };
   }
-  return { status: null, message: "Couldn't load the shared pipeline." };
+  return { status: null, authentication: false, message: "Couldn't load the shared pipeline." };
+}
+
+interface ImportFailure {
+  message: string;
+  /** A retry cannot succeed: the button stays disabled. */
+  final: boolean;
+}
+
+const IMPORT_REFUSED = "This pipeline can't be imported into your workspace";
+
+/** Why a plugin-policy refusal (``error_code`` on the 422) blocks the import. */
+const POLICY_REASON: Readonly<Record<string, string>> = {
+  plugin_not_enabled: "isn't enabled for your account",
+  plugin_not_installed: "isn't installed on this server",
+  plugin_unavailable: "isn't available on this server",
+  credential_unavailable: "needs a credential your account doesn't have",
+  profile_unavailable: "needs a profile that isn't available to your account",
+  plugin_not_allowed_on_web: "can't be used in the web workspace",
+};
+
+/** HTTP reason phrases ``buildApiError`` falls back to when a body carries no
+ *  text: never a reason worth showing. */
+const BARE_STATUS_TEXT = new Set(["Bad Request", "Unprocessable Entity"]);
+
+/** The server's own explanation, when the body carried one. */
+function _serverReason(exc: unknown): string | null {
+  if (!_isApiError(exc) || typeof exc.detail !== "string") return null;
+  const detail = exc.detail.trim();
+  return detail.length > 0 && !BARE_STATUS_TEXT.has(detail) ? detail : null;
+}
+
+/** Copy for a seeder refusal: a 400, or a 422 the policy and size cases do
+ *  not cover (the credential guard's, which carries its own text). */
+function _refusedWithReason(exc: unknown): string {
+  const reason = _serverReason(exc);
+  return reason === null ? IMPORT_REFUSED : `${IMPORT_REFUSED}: ${reason}`;
+}
+
+/** Copy for a 422 from the import route. Three shapes reach it:
+ *
+ *  * the plugin-policy refusal, ``{detail: {error_code, component_id,
+ *    plugin_id, snapshot_fingerprint, request_id}}`` with no text at all;
+ *  * the YAML length cap, FastAPI's validation array on ``detail``;
+ *  * the credential guard, ``{detail: {error_type, detail, ...}}``.
+ *
+ *  The recorded bodies live in ``src/test/fixtures/shared-import-refusals.json``
+ *  and the backend pins them. */
+function _import422Message(exc: unknown): string {
+  if (_isApiError(exc)) {
+    if (typeof exc.plugin_id === "string" && exc.plugin_id.length > 0) {
+      const why = (exc.error_type !== undefined ? POLICY_REASON[exc.error_type] : undefined)
+        ?? "isn't available to your account";
+      const where = typeof exc.component_id === "string" && exc.component_id.length > 0
+        ? ` (in "${exc.component_id}")`
+        : "";
+      return `This pipeline uses ${exc.plugin_id}${where}, which ${why}, so it can't be imported into your workspace.`;
+    }
+    if (exc.error_type === undefined && exc.errors !== undefined && exc.errors.length > 0) {
+      return "This pipeline is too large to import into your workspace.";
+    }
+  }
+  return _refusedWithReason(exc);
+}
+
+/** User-facing copy for a failed import, on top of the shared classifier.
+ *
+ *  Two different refusals answer 403: the viewer's account lacks the role
+ *  every pipeline write requires (``error_type: user_role_required``), or the
+ *  link is view-only. A 422 or a 400 is the seeder refusing this graph for
+ *  this viewer (a component their policy disallows, a binding it cannot
+ *  accept, the size cap): each is decided by the snapshot and the viewer's
+ *  account, not by timing. None of these can succeed on retry, and each retry
+ *  would build and archive a session, so the button stays disabled for them. */
+function _importFailure(exc: unknown): ImportFailure {
+  const classified = _classifyError(exc);
+  if (classified.authentication) return { message: classified.message, final: false };
+  switch (classified.status) {
+    case 401:
+      return { message: "This share link has expired", final: false };
+    case 403:
+      if (_isApiError(exc) && exc.error_type === "user_role_required") {
+        return {
+          message: "Your account doesn't have the role needed to import pipelines. Ask an administrator for access.",
+          final: true,
+        };
+      }
+      return { message: "This link doesn't allow importing", final: true };
+    case 404:
+      return { message: classified.message, final: false };
+    case 413:
+      return { message: "You don't have enough storage to import these files", final: false };
+    case 400:
+      return { message: _refusedWithReason(exc), final: true };
+    case 422:
+      return { message: _import422Message(exc), final: true };
+    case 429:
+      return { message: "Too many import attempts. Wait a minute and try again.", final: false };
+    case 503:
+      return { message: "Importing shared pipelines is unavailable right now. Try again later.", final: false };
+    default:
+      return { message: "Couldn't import the shared pipeline", final: false };
+  }
 }
 
 function _returnToWorkspaceUrl(): string {
@@ -193,6 +332,18 @@ function _returnToWorkspaceUrl(): string {
 
 export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Element {
   const [state, setState] = useState<LoadState>({ kind: "loading" });
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState<ImportFailure | null>(null);
+  const importingRef = useRef(false);
+  // App re-keys this view per token and unmounts it on any other route, so
+  // "still mounted" means "the user is still on the link they imported from".
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (token === null) return;
@@ -214,6 +365,32 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
       controller.abort();
     };
   }, [token]);
+
+  async function importCopy(): Promise<void> {
+    if (token === null || importingRef.current) return;
+    importingRef.current = true;
+    setImporting(true);
+    setImportError(null);
+    try {
+      const imported = await importSharedSnapshot(token, new AbortController().signal);
+      // The shared route is a separate App branch whose hash the session
+      // router ignores: refresh the session list first so the composer tree
+      // finds the new session, then switch to its canonical hash.
+      // The copy exists either way, so the list is refreshed even if the
+      // user has moved on; only someone still on this link is taken to it.
+      await useSessionStore.getState().loadSessions();
+      if (mountedRef.current) {
+        window.location.hash = `#/${imported.session_id}`;
+      }
+    } catch (exc: unknown) {
+      if (mountedRef.current) {
+        setImportError(_importFailure(exc));
+        setImporting(false);
+      }
+    } finally {
+      importingRef.current = false;
+    }
+  }
 
   const displayState: LoadState = token === null
     ? {
@@ -293,6 +470,39 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
             </time>
             .
           </p>
+          {response.import_allowed && (
+            <section
+              aria-label="Import a copy"
+              data-testid="shared-inspect-import"
+            >
+              {response.files.length > 0 && (
+                <ul
+                  aria-label="Files that will be copied"
+                  data-testid="shared-inspect-import-files"
+                  style={FILE_LIST_STYLE}
+                >
+                  {response.files.map((file) => (
+                    <li key={file.filename}>
+                      {file.filename} ({formatBytes(file.size_bytes)})
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <Button
+                type="button"
+                variant="primary"
+                disabled={importing || importError?.final === true}
+                onClick={() => void importCopy()}
+              >
+                Import a copy into my workspace
+              </Button>
+              {importError !== null && (
+                <p role="alert" data-testid="shared-inspect-import-error">
+                  {importError.message}
+                </p>
+              )}
+            </section>
+          )}
           <h1 style={H1_STYLE} data-testid="shared-inspect-pipeline-name">
             {pipelineName}
           </h1>

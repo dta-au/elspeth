@@ -194,6 +194,28 @@ def is_widened_blob_ref(value: Any) -> WidenedBlobRefShape | None:
     )
 
 
+def is_headless_blob_ref_fragment(value: object) -> bool:
+    """Return whether ``value`` is a widened marker that has lost its ``blob_ref``.
+
+    A dict made only of marker keys, carrying a blob ``mode`` but no
+    ``blob_ref``, is not plugin data: it is what remains when a scrub removes
+    the linkage key from a marker instead of the whole marker. Such a value
+    names no file, so it can never be resolved; consumers refuse it rather
+    than admit it as an option value.
+    """
+    if type(value) is not dict:
+        return False
+    fragment = cast(dict[str, object], value)
+    if "blob_ref" in fragment or "mode" not in fragment:
+        return False
+    if not set(fragment).issubset(_ALLOWED_MARKER_KEYS):
+        return False
+    # Imported YAML can put any value under ``mode``; only a string can name a
+    # blob mode, and an unhashable value would raise on the membership test.
+    mode = fragment["mode"]
+    return type(mode) is str and mode in ALLOWED_BLOB_REF_MODES
+
+
 class BlobContentResolutionError(Exception):
     """Batched recoverable failures from inline blob content resolution."""
 

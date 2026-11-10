@@ -24,7 +24,9 @@ from elspeth_llm_gateway.core.config import GatewayConfig
 from elspeth_llm_gateway.core.contract import (
     Bounds,
     ChatMessage,
+    ChatRedactedThinkingBlock,
     ChatRequest,
+    ChatThinkingBlock,
     ChatTool,
     ChatToolCall,
     ResponseFormat,
@@ -39,6 +41,7 @@ from elspeth_llm_gateway.sdk.types import (
     CanonicalMessage,
     CanonicalRequest,
     CanonicalResponse,
+    CanonicalThinkingBlock,
     CanonicalToolCall,
     CanonicalToolDef,
     Capability,
@@ -59,7 +62,14 @@ def _canonicalize_message(message: ChatMessage) -> CanonicalMessage:
         content=None if message.role == "assistant" and message.content == "" and tool_calls else message.content,
         tool_calls=tool_calls,
         tool_call_id=message.tool_call_id,
+        thinking_blocks=tuple(_canonicalize_thinking_block(block) for block in (message.thinking_blocks or [])),
     )
+
+
+def _canonicalize_thinking_block(block: ChatThinkingBlock | ChatRedactedThinkingBlock) -> CanonicalThinkingBlock:
+    if isinstance(block, ChatThinkingBlock):
+        return CanonicalThinkingBlock(kind="thinking", thinking=block.thinking, signature=block.signature)
+    return CanonicalThinkingBlock(kind="redacted_thinking", data=block.data)
 
 
 def _canonicalize_tool(tool: ChatTool) -> CanonicalToolDef:
@@ -137,6 +147,11 @@ def _check_capabilities(request: ChatRequest, capabilities: frozenset[Capability
     if request.reasoning_effort is not None and Capability.REASONING not in capabilities:
         raise GatewayError(GatewayErrorCode.CAPABILITY_UNSUPPORTED)
 
+    # Replayed thinking must reach the model; an adapter that cannot carry it
+    # refuses instead of silently dropping it.
+    if Capability.REASONING not in capabilities and any(message.thinking_blocks for message in request.messages):
+        raise GatewayError(GatewayErrorCode.CAPABILITY_UNSUPPORTED)
+
 
 def _validate_canonical_response(response: CanonicalResponse, request: ChatRequest, bounds: Bounds) -> None:
     """Step 5's post-``parse_success`` validation.
@@ -161,6 +176,13 @@ def _validate_canonical_response(response: CanonicalResponse, request: ChatReque
         raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID)
     if response.text is not None and (type(response.text) is not str or len(response.text) > bounds.max_string_chars):
         raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID)
+    # Returned thinking is replayed on the next request, where bounds_check
+    # counts each of its strings. Refuse here rather than truncate: the
+    # signature and redacted data are opaque and must stay byte-exact.
+    for block in response.thinking_blocks:
+        for value in (block.thinking, block.signature, block.data):
+            if value is not None and len(value) > bounds.max_string_chars:
+                raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID)
 
     seen_ids = {call.id for message in request.messages for call in (message.tool_calls or [])}
     for call in response.tool_calls:

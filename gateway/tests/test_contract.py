@@ -17,7 +17,7 @@ from elspeth_llm_gateway.core.contract import (
     build_completion_response,
 )
 from elspeth_llm_gateway.core.errors import GatewayError, GatewayErrorCode
-from elspeth_llm_gateway.sdk.types import CanonicalResponse, CanonicalToolCall, CanonicalUsage, FinishReason
+from elspeth_llm_gateway.sdk.types import CanonicalResponse, CanonicalThinkingBlock, CanonicalToolCall, CanonicalUsage, FinishReason
 from pydantic import ValidationError
 
 # --- ChatRequest: unknown top-level fields rejected --------------------------
@@ -769,3 +769,80 @@ def test_chat_request_still_rejects_the_openrouter_reasoning_object():
     """Only the chat-completions spelling is accepted; one spelling per hint."""
     with pytest.raises(ValidationError):
         ChatRequest(model="m", messages=[{"role": "user", "content": "hi"}], reasoning={"effort": "high"})
+
+
+# --- ChatMessage: thinking_blocks ---------------------------------------------
+
+_THINKING = {"type": "thinking", "thinking": "let me think", "signature": "sig-abc"}
+_REDACTED = {"type": "redacted_thinking", "data": "opaque-blob"}
+_TOOL_CALL = {"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+
+
+def _thinking_conversation(blocks):
+    return [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": None, "thinking_blocks": blocks, "tool_calls": [_TOOL_CALL]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "42"},
+    ]
+
+
+def test_chat_request_accepts_assistant_thinking_blocks_in_native_shape():
+    """ELSPETH (via LiteLLM) replays the previous assistant turn's thinking
+    blocks on the next tool-loop request; Claude with thinking enabled
+    requires them."""
+    request = ChatRequest(model="m", messages=_thinking_conversation([_THINKING, _REDACTED]))
+    blocks = request.messages[1].thinking_blocks
+    assert [block.type for block in blocks] == ["thinking", "redacted_thinking"]
+    assert blocks[0].signature == "sig-abc"
+    assert blocks[1].data == "opaque-blob"
+
+
+@pytest.mark.parametrize(
+    "blocks",
+    [
+        [],
+        [{"type": "thinking", "thinking": "x"}],
+        [{"type": "thinking", "thinking": "x", "signature": ""}],
+        [{"type": "thinking", "thinking": "x", "signature": "s", "extra": 1}],
+        [{"type": "redacted_thinking", "data": ""}],
+        [{"type": "summary", "text": "x"}],
+    ],
+    ids=["empty", "no-signature", "blank-signature", "extra-key", "blank-data", "unknown-type"],
+)
+def test_chat_request_rejects_malformed_thinking_blocks(blocks):
+    with pytest.raises(ValidationError):
+        ChatRequest(model="m", messages=_thinking_conversation(blocks))
+
+
+def test_chat_message_rejects_thinking_blocks_off_the_assistant_role():
+    with pytest.raises(ValidationError):
+        ChatRequest(model="m", messages=[{"role": "user", "content": "hi", "thinking_blocks": [_THINKING]}])
+
+
+def test_bounds_check_counts_thinking_block_strings():
+    bounds = Bounds(max_messages=10, max_tools=10, max_string_chars=20, max_schema_bytes=1000, max_schema_depth=5)
+    long_signature = {"type": "thinking", "thinking": "x", "signature": "s" * 21}
+    request = ChatRequest(model="m", messages=_thinking_conversation([long_signature]))
+    with pytest.raises(GatewayError) as exc_info:
+        bounds_check(request, bounds)
+    assert exc_info.value.code == GatewayErrorCode.INVALID_REQUEST
+
+
+def test_build_completion_response_emits_thinking_blocks_in_native_shape():
+    canonical = CanonicalResponse(
+        text=None,
+        tool_calls=(CanonicalToolCall(call_id="call_1", name="lookup", arguments_json="{}"),),
+        finish_reason=FinishReason.TOOL_CALLS,
+        thinking_blocks=(
+            CanonicalThinkingBlock(kind="thinking", thinking="let me think", signature="sig-abc"),
+            CanonicalThinkingBlock(kind="redacted_thinking", data="opaque-blob"),
+        ),
+    )
+    body = build_completion_response(response_id="r", created=0, model_alias="m", canonical=canonical)
+    assert body["choices"][0]["message"]["thinking_blocks"] == [_THINKING, _REDACTED]
+
+
+def test_build_completion_response_omits_thinking_blocks_when_absent():
+    canonical = CanonicalResponse(text="hi", finish_reason=FinishReason.STOP)
+    body = build_completion_response(response_id="r", created=0, model_alias="m", canonical=canonical)
+    assert "thinking_blocks" not in body["choices"][0]["message"]

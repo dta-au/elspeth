@@ -439,6 +439,34 @@ class TestCreateAndRead:
         )
         assert record.content_hash == content_hash(content)
 
+    @pytest.mark.asyncio
+    async def test_create_blob_hashes_content_off_the_event_loop(
+        self, blob_service, session_id, compose_context, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Hashing a whole upload (up to the session quota) must not stall the loop."""
+        loop_thread = threading.get_ident()
+        hashed_on: list[int] = []
+        original = blob_service_module.content_hash
+
+        def recording_content_hash(data: bytes) -> str:
+            hashed_on.append(threading.get_ident())
+            return original(data)
+
+        monkeypatch.setattr(blob_service_module, "content_hash", recording_content_hash)
+
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="audit.txt",
+            content=b"hash me in a worker",
+            mime_type="text/plain",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+
+        assert record.content_hash == original(b"hash me in a worker")
+        assert hashed_on
+        assert loop_thread not in hashed_on
+
 
 # ---------------------------------------------------------------------------
 # list_blobs — session-scoped isolation

@@ -23,7 +23,16 @@ def build_invoke(request: CanonicalRequest) -> InvokePlan:
     # TRANSLATION POINT: build your upstream's real request path and body
     # from request.messages, request.model_target, request.temperature,
     # request.seed, request.max_tokens, request.tools, request.tool_choice,
-    # request.tool_choice_function, and request.response_format.
+    # request.tool_choice_function, request.response_format, and (only when
+    # you declare Capability.REASONING) request.reasoning_effort plus each
+    # assistant message's thinking_blocks.
+    #
+    # Reasoning: map reasoning_effort ("low"/"medium"/"high") onto your
+    # upstream's own control (an effort setting or a thinking-token budget).
+    # Replay every assistant message's thinking_blocks to the upstream in
+    # order and byte-for-byte, signature/data included: a model such as Claude
+    # with thinking enabled rejects a tool-loop turn whose previous assistant
+    # message lacks its signed thinking.
     #
     # InvokePlan.path is relative to the configured upstream_origin and is
     # fail-closed by construction: no leading slash, no scheme, no '..', no

@@ -7,10 +7,14 @@ from pathlib import Path
 import pytest
 
 from elspeth.web.paths import (
+    MAX_SESSION_RELATIVE_PATH_CHARS,
     allowed_sink_directories,
     allowed_source_directories,
+    locate_in_session_folder,
+    normalise_session_relative_path,
     resolve_data_path,
     resolve_sink_data_path,
+    session_folder_path,
 )
 
 
@@ -187,3 +191,115 @@ class TestResolutionNeverAdoptsAnEscapingPath:
 
         assert not any(resolved.is_relative_to(directory) for directory in allowed)
         assert allowed == ()
+
+
+class TestSessionFolderRelativePaths:
+    """Locate a resolved path inside a session's folders and rebuild it in another session."""
+
+    @pytest.mark.parametrize(
+        ("resolved", "expected"),
+        [
+            ("/tmp/data/outputs/sess-a/report.csv", ("outputs", Path("report.csv"))),
+            ("/tmp/data/outputs/sess-a/nested/deep/out.jsonl", ("outputs", Path("nested/deep/out.jsonl"))),
+            ("/tmp/data/blobs/sess-a/out.jsonl", ("blobs", Path("out.jsonl"))),
+            ("/tmp/data/outputs/sess-a", ("outputs", Path("."))),
+        ],
+    )
+    def test_locates_a_path_inside_the_session_folders(self, resolved: str, expected: tuple[str, Path]) -> None:
+        assert locate_in_session_folder(Path(resolved), "/tmp/data", session_id="sess-a") == expected
+
+    @pytest.mark.parametrize(
+        "resolved",
+        [
+            "/tmp/data/outputs/sess-b/report.csv",
+            "/tmp/data/outputs/report.csv",
+            "/tmp/data/blobs/report.csv",
+            "/tmp/data/other/sess-a/report.csv",
+            "/etc/passwd",
+        ],
+    )
+    def test_a_path_outside_the_session_folders_is_not_located(self, resolved: str) -> None:
+        assert locate_in_session_folder(Path(resolved), "/tmp/data", session_id="sess-a") is None
+
+    def test_session_folder_path_builds_under_the_named_session(self) -> None:
+        assert session_folder_path("/tmp/data", "blobs", session_id="sess-b", relative_path="nested/out.jsonl") == Path(
+            "/tmp/data/blobs/sess-b/nested/out.jsonl"
+        )
+
+    @pytest.mark.parametrize("session_id", ["", ".", "..", "a/b", "a\\b"])
+    def test_malformed_session_id_is_refused(self, session_id: str) -> None:
+        with pytest.raises(ValueError, match="malformed session_id"):
+            locate_in_session_folder(Path("/tmp/data/outputs/x"), "/tmp/data", session_id=session_id)
+        with pytest.raises(ValueError, match="malformed session_id"):
+            session_folder_path("/tmp/data", "outputs", session_id=session_id, relative_path="x")
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("report.csv", "report.csv"),
+            ("nested/deep/out.jsonl", "nested/deep/out.jsonl"),
+            ("nested/./out.jsonl", "nested/out.jsonl"),
+            ("nested//out.jsonl", "nested/out.jsonl"),
+            ("./report.csv", "report.csv"),
+        ],
+    )
+    def test_normalise_accepts_and_normalises_a_relative_path(self, value: str, expected: str) -> None:
+        assert normalise_session_relative_path(value) == expected
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            ".",
+            "./",
+            "/etc/passwd",
+            "//server/share",
+            "../x",
+            "nested/../../x",
+            "nested/../x",
+            "..\\x",
+            "nested\\out.csv",
+            "bad\x00name",
+        ],
+    )
+    def test_normalise_refuses_empty_absolute_dotdot_and_backslash(self, value: str) -> None:
+        with pytest.raises(ValueError):
+            normalise_session_relative_path(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("a\nINFO fake log line.csv", id="newline"),
+            pytest.param("a\rb.csv", id="carriage-return"),
+            pytest.param("a\tb.csv", id="tab"),
+            pytest.param("a\x1bb.csv", id="escape"),
+            pytest.param("a\x7fb.csv", id="delete"),
+            pytest.param("a\x85INFO fake log line.csv", id="c1-next-line"),
+            pytest.param("a\x9bb.csv", id="c1-control-sequence-introducer"),
+            pytest.param(f"a{chr(0x2028)}INFO fake log line.csv", id="line-separator"),
+            pytest.param(f"a{chr(0x2029)}INFO fake log line.csv", id="paragraph-separator"),
+        ],
+    )
+    def test_normalise_refuses_control_characters(self, value: str) -> None:
+        with pytest.raises(ValueError, match="control character"):
+            normalise_session_relative_path(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("café/résumé.csv", id="latin-1-letters"),
+            pytest.param(f"{chr(0xA0)}leading-nbsp.csv", id="no-break-space"),
+            pytest.param("日本/データ.csv", id="cjk"),
+        ],
+    )
+    def test_normalise_keeps_printable_non_ascii(self, value: str) -> None:
+        # Negative control for the refusal above: the C1 range ends at U+009F,
+        # so ordinary letters just past it must still be accepted.
+        assert normalise_session_relative_path(value) == value
+
+    def test_normalise_bounds_the_path_length(self) -> None:
+        longest = "a" * MAX_SESSION_RELATIVE_PATH_CHARS
+        assert MAX_SESSION_RELATIVE_PATH_CHARS == 1024
+        assert normalise_session_relative_path(longest) == longest
+        with pytest.raises(ValueError, match="longer than 1024"):
+            normalise_session_relative_path(longest + "a")

@@ -36,11 +36,43 @@ Layer: L3 (web application).
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Self
+from uuid import UUID
+
+from pydantic import Field, model_validator
 
 from elspeth.web.audit_readiness.models import AuditReadinessSnapshot
 from elspeth.web.execution.schemas import _StrictResponse
 from elspeth.web.sessions.schemas import CompositionObject
+
+
+class MarkReadyForReviewRequest(_StrictResponse):
+    """Optional body of ``POST /api/sessions/{session_id}/mark-ready-for-review``.
+
+    An absent body keeps the original behaviour: a view-only link that lasts
+    the deployment's ``shareable_link_lifetime_seconds``.
+
+    ``lifetime_seconds`` is the closed set the dialog offers (1, 7 or 30
+    days); anything else is a 422 from validation. ``None`` means the
+    deployment maximum. A listed value above the deployment maximum is
+    refused by the service (also 422) — the browser is not trusted to
+    enforce the operator's cap.
+
+    ``file_manifest_fingerprint`` is the ``manifest_fingerprint`` the owner's
+    file preview (``GET .../shareable-files``) returned. It is required with
+    ``allow_import`` (422 without it): the share freezes files only if they
+    are still the ones the owner was shown.
+    """
+
+    allow_import: bool = False
+    lifetime_seconds: Literal[86400, 604800, 2592000] | None = None
+    file_manifest_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _import_names_the_previewed_files(self) -> Self:
+        if self.allow_import and self.file_manifest_fingerprint is None:
+            raise ValueError("allow_import requires file_manifest_fingerprint from the shareable-files preview")
+        return self
 
 
 class MarkReadyForReviewResponse(_StrictResponse):
@@ -79,6 +111,44 @@ class ShareableLinkResponse(_StrictResponse):
     expires_at: datetime
     state_id: str
     payload_digest: str
+
+
+class SharedImportResponse(_StrictResponse):
+    """Returned by ``POST /api/sessions/shared/{token}/import``.
+
+    The recipient's new session and the composition state the import seeded
+    into it.
+    """
+
+    session_id: UUID
+    state_id: str
+
+
+class ShareableFileView(_StrictResponse):
+    """One file an importable share would carry, as the owner sees it.
+
+    Deliberately carries no blob id, storage path or content hash.
+    """
+
+    filename: str
+    size_bytes: int
+    used_by: list[str]
+
+
+class ShareableFilesResponse(_StrictResponse):
+    """Returned by ``GET /api/sessions/{session_id}/shareable-files``."""
+
+    files: list[ShareableFileView]
+    importable: bool
+    not_importable_reason: str | None
+    # The deployment's ``shareable_link_lifetime_seconds``: the share
+    # refuses any longer ``lifetime_seconds``, so the dialog offers only
+    # lifetimes at or below it.
+    max_lifetime_seconds: int
+    # Fingerprint of the listed files, or ``None`` when they are not
+    # importable. An importable share sends it back as
+    # ``file_manifest_fingerprint``; it is a digest, not a file's content hash.
+    manifest_fingerprint: str | None
 
 
 # ── Strict Pydantic mirrors of CompositionState dataclasses ──────────────
@@ -199,6 +269,17 @@ class CompositionStateResponse(_StrictResponse):
     outputs: list[OutputSpecResponse]
 
 
+class SharedFileSummary(_StrictResponse):
+    """A file that comes with a share link, as the recipient sees it.
+
+    Name and size only: content hashes, blob ids, MIME types and binding
+    sites stay in the private snapshot manifest.
+    """
+
+    filename: str
+    size_bytes: int
+
+
 class SharedInspectResponse(_StrictResponse):
     """Returned by ``GET /api/sessions/shared/{token}``.
 
@@ -223,6 +304,11 @@ class SharedInspectResponse(_StrictResponse):
 
     ``expires_at`` lets the frontend show "this link expires in N days"
     without re-decoding the token.
+
+    ``import_allowed`` says whether the link lets the recipient import the
+    pipeline into their own session; ``files`` lists the files that come
+    with it (names and sizes only, in manifest order). Legacy snapshots
+    report ``import_allowed=False`` and no files.
     """
 
     session_id: str
@@ -235,3 +321,5 @@ class SharedInspectResponse(_StrictResponse):
     created_by_username: str
     created_at: datetime
     expires_at: datetime
+    import_allowed: bool
+    files: list[SharedFileSummary]

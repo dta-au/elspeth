@@ -626,3 +626,91 @@ async def test_reasoning_effort_without_capability_raises_capability_unsupported
 
     assert exc_info.value.code == GatewayErrorCode.CAPABILITY_UNSUPPORTED
     assert not upstream.called
+
+
+# --- thinking_blocks ---------------------------------------------------------------
+
+_THINKING_BLOCK = {"type": "thinking", "thinking": "let me think", "signature": "sig-abc"}
+_TOOL_TURN = [
+    {"role": "user", "content": "hi"},
+    {
+        "role": "assistant",
+        "content": None,
+        "thinking_blocks": [_THINKING_BLOCK, {"type": "redacted_thinking", "data": "opaque-blob"}],
+        "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}],
+    },
+    {"role": "tool", "tool_call_id": "call_1", "content": "42"},
+]
+
+
+def test_to_canonical_request_carries_assistant_thinking_blocks_in_order():
+    canonical = to_canonical_request(_chat_request(messages=_TOOL_TURN), {"target": "backend-a"})
+    assistant = canonical.messages[1]
+    assert [(block.kind, block.thinking, block.signature, block.data) for block in assistant.thinking_blocks] == [
+        ("thinking", "let me think", "sig-abc", None),
+        ("redacted_thinking", None, None, "opaque-blob"),
+    ]
+    assert canonical.messages[0].thinking_blocks == ()
+
+
+@respx.mock
+async def test_thinking_blocks_without_reasoning_capability_raise_capability_unsupported_before_upstream_call(client):
+    """Replayed thinking blocks need an adapter that can hand them back to the
+    model; one that cannot refuses rather than silently dropping them."""
+    adapter = FakeAdapter(capabilities=frozenset({Capability.TEXT, Capability.TOOLS}))
+    service = _service(_config(), adapter, client)
+    upstream = respx.post(UPSTREAM_URL)
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.complete(_chat_request(messages=_TOOL_TURN), "req-cap-thinking")
+
+    assert exc_info.value.code == GatewayErrorCode.CAPABILITY_UNSUPPORTED
+    assert not upstream.called
+
+
+@pytest.mark.parametrize("oversized_field", ["thinking", "signature", "data"])
+@respx.mock
+async def test_response_thinking_block_strings_must_fit_next_request_bounds(client, oversized_field):
+    """A returned thinking block is replayed on the caller's next request, where
+    ``bounds_check`` counts each of its strings. One that would be refused
+    there must not be returned as a 200 the gateway cannot accept back; the
+    signed and opaque values are never truncated to make them fit."""
+    from elspeth_llm_gateway.sdk.types import CanonicalThinkingBlock
+
+    _mock_token()
+    upstream = respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"ok": True}))
+    long_value = "x" * 100
+    block = (
+        CanonicalThinkingBlock(kind="redacted_thinking", data=long_value)
+        if oversized_field == "data"
+        else CanonicalThinkingBlock(
+            kind="thinking",
+            thinking=long_value if oversized_field == "thinking" else "short",
+            signature=long_value if oversized_field == "signature" else "sig",
+        )
+    )
+    canonical = CanonicalResponse(text="ok", finish_reason=FinishReason.STOP, thinking_blocks=(block,))
+    adapter = FakeAdapter(capabilities=frozenset({Capability.TEXT, Capability.REASONING}), parse_success_result=canonical)
+    service = _service(_config(ELSPETH_LLM_GATEWAY_MAX_STRING_CHARS="40"), adapter, client)
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.complete(_chat_request(reasoning_effort="low"), "req-oversized-thinking")
+
+    assert exc_info.value.code == GatewayErrorCode.UPSTREAM_RESPONSE_INVALID
+    assert upstream.called
+
+
+@respx.mock
+async def test_response_thinking_blocks_at_the_bound_are_returned(client):
+    from elspeth_llm_gateway.sdk.types import CanonicalThinkingBlock
+
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"ok": True}))
+    block = CanonicalThinkingBlock(kind="thinking", thinking="t" * 40, signature="s" * 40)
+    canonical = CanonicalResponse(text="ok", finish_reason=FinishReason.STOP, thinking_blocks=(block,))
+    adapter = FakeAdapter(capabilities=frozenset({Capability.TEXT, Capability.REASONING}), parse_success_result=canonical)
+    service = _service(_config(ELSPETH_LLM_GATEWAY_MAX_STRING_CHARS="40"), adapter, client)
+
+    response = await service.complete(_chat_request(reasoning_effort="low"), "req-thinking-at-bound")
+
+    assert response["choices"][0]["message"]["thinking_blocks"] == [{"type": "thinking", "thinking": "t" * 40, "signature": "s" * 40}]

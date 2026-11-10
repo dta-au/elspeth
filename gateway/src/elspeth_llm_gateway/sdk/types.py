@@ -56,8 +56,40 @@ class CanonicalToolCall(BaseModel):
     arguments_json: str
 
 
+class CanonicalThinkingBlock(BaseModel):
+    """One block of a reasoning model's thinking, in canonical form.
+
+    Mirrors the native wire shapes ELSPETH and LiteLLM carry as
+    ``thinking_blocks``: ``thinking`` has the model's thinking text and an
+    opaque ``signature``; ``redacted_thinking`` has only opaque ``data``. The
+    opaque values must reach the upstream model byte-for-byte: models such as
+    Claude with thinking enabled reject a tool-loop turn whose previous
+    assistant message lacks its signed thinking.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["thinking", "redacted_thinking"]
+    thinking: str | None = None
+    signature: str | None = None
+    data: str | None = None
+
+    @model_validator(mode="after")
+    def _check_fields_match_kind(self) -> Self:
+        if self.kind == "thinking":
+            if self.thinking is None or not self.signature or self.data is not None:
+                raise ValueError("a thinking block needs thinking and a non-empty signature, and no data")
+        elif not self.data or self.thinking is not None or self.signature is not None:
+            raise ValueError("a redacted_thinking block needs non-empty data, and no thinking or signature")
+        return self
+
+
 class CanonicalMessage(BaseModel):
-    """A single chat message in canonical form."""
+    """A single chat message in canonical form.
+
+    ``thinking_blocks`` is only ever set on an assistant message: the
+    reasoning model's own thinking from that turn, replayed in order.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -65,6 +97,13 @@ class CanonicalMessage(BaseModel):
     content: str | None
     tool_calls: tuple[CanonicalToolCall, ...] = ()
     tool_call_id: str | None = None
+    thinking_blocks: tuple[CanonicalThinkingBlock, ...] = ()
+
+    @model_validator(mode="after")
+    def _check_thinking_blocks_only_on_assistant(self) -> Self:
+        if self.thinking_blocks and self.role != "assistant":
+            raise ValueError("thinking_blocks are only permitted on an assistant message")
+        return self
 
 
 class ResponseFormatSpec(BaseModel):
@@ -131,6 +170,10 @@ class CanonicalResponse(BaseModel):
     tool_calls: tuple[CanonicalToolCall, ...] = ()
     finish_reason: FinishReason
     usage: CanonicalUsage | None = None
+    # The model's thinking for this turn, in order. The gateway returns it to
+    # the caller as ``thinking_blocks`` so the caller can replay it on the
+    # next tool-loop turn.
+    thinking_blocks: tuple[CanonicalThinkingBlock, ...] = ()
 
     @model_validator(mode="after")
     def _check_content_present(self) -> Self:

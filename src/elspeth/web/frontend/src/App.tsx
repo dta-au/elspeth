@@ -102,6 +102,21 @@ function CollapsedAuthoringStatus(): JSX.Element {
   );
 }
 
+/**
+ * Who shared the graph this session was imported from, or null.
+ *
+ * `composer_meta` is persisted JSON the composer treats as opaque, so it is
+ * read as untrusted: the notice is shown only for a `shared_import` object
+ * carrying a non-empty string `shared_by_username`.
+ */
+function sharedImportSharer(meta: Record<string, unknown> | null | undefined): string | null {
+  if (meta === null || meta === undefined) return null;
+  const imported = meta["shared_import"];
+  if (typeof imported !== "object" || imported === null) return null;
+  const sharer = (imported as Record<string, unknown>)["shared_by_username"];
+  return typeof sharer === "string" && sharer !== "" ? sharer : null;
+}
+
 function App() {
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   // Deploy-cache coherence beacon: this tab's own bundle identity (null in
@@ -560,6 +575,8 @@ function App() {
     wasAuthenticatedRef.current = isAuthenticated;
   }, [isAuthenticated, checkHealth]);
 
+  const sharedImportedBy = sharedImportSharer(compositionState?.composer_meta);
+
   const appNotices = useMemo<AppNotice[]>(() => {
     const notices: AppNotice[] = [];
     if (backendAvailable === false) {
@@ -685,8 +702,17 @@ function App() {
         ),
       });
     }
+    if (sharedImportedBy !== null) {
+      notices.push({
+        kind: "shared-import",
+        role: "status",
+        tone: "info",
+        content: `Imported from a link shared by ${sharedImportedBy}.`,
+      });
+    }
     return notices;
   }, [
+    sharedImportedBy,
     backendAvailable,
     checkHealth,
     healthChecking,

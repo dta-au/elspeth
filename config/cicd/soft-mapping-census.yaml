@@ -1084,11 +1084,15 @@ files:
   src/elspeth/web/sessions/service.py:
     Mapping[str, Any]: 15
     dict[str, Any]: 1
+  src/elspeth/web/shareable_reviews/file_manifest.py:
+    dict[str, object]: 1
+  src/elspeth/web/shareable_reviews/service.py:
+    dict[str, object]: 1
 totals:
   Mapping[str, Any]: 790
   Mapping[str, object]: 317
   MutableMapping[str, Any]: 8
   boundary: 60
   dict[str, Any]: 1102
-  dict[str, object]: 398
-  soft: 2615
+  dict[str, object]: 400
+  soft: 2617

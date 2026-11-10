@@ -627,13 +627,21 @@ service and its databases, and how that access is granted and reviewed.
 A shareable review link lets the owner of a composition show a frozen,
 read-only copy of it to another person
 ([ADR-022](../architecture/adr/022-shareable-reviews.md),
-`src/elspeth/web/shareable_reviews/`) [EV-117].
+`src/elspeth/web/shareable_reviews/`) [EV-117]. The owner can also allow, per
+link, the recipient to import a copy of the composition and its uploaded files
+into a new session of their own (ADR-022 D9).
 
 - **Issue.** Only the session owner can mark a composition ready for review
   or fetch its link (session ownership check, § 2.4). Marking is refused
   unless the composition passes validation and has no readiness errors. An
   audit record is written before the snapshot is stored, and the snapshot is
-  content-addressed in the payload store.
+  content-addressed in the payload store. When import is allowed, every
+  uploaded file the composition uses is read under the owner's session,
+  checked against its recorded hash and size, and stored in the payload store
+  before the audit record is written. Only a ready file the user uploaded
+  verbatim is accepted; a file the assistant wrote or a pipeline run produced
+  refuses the link (409). Stored bytes that fail their hash check, or are
+  missing, fail the request with 500; no link is issued either way.
 - **Token.** HMAC-SHA256 over a canonical-JSON envelope: version, session,
   state, creation and expiry times, a random nonce, the snapshot's digest and
   the creator's identity. The key is `shareable_link_signing_key`, separate
@@ -642,20 +650,40 @@ read-only copy of it to another person
   (`src/elspeth/web/config.py`). Signatures are compared in constant time;
   unknown versions and expired tokens are refused, and every failure returns
   the same generic 401.
-- **Scope.** One snapshot of one composition state, read-only. The token is
+- **Scope.** One snapshot of one composition state. The token is
   a capability, not a credential: the recipient must also be signed in, and
   the route returns 401 without a session token (measured, [EV-105]). Any
   `active` identity in the deployment who has the link can open it.
   Tampering with the stored snapshot is detected because it is read back by
-  its digest.
-- **Expiry.** `shareable_link_lifetime_seconds`, default 30 days. A link
-  also stops working when the snapshot is removed under payload retention
-  (default 90 days), with a 404 asking for a fresh link.
+  its digest. A view-only link, and any link minted before import existed,
+  is read-only and refuses import (403).
+- **Import.** On a link that allows it, any `active` identity with the
+  deployment-wide `user` role who has the link can import it
+  (`POST /api/sessions/shared/{token}/import`); without that role the request
+  is refused with 403. Each import creates a new session owned by the
+  importer, holding a copy of the composition and its own copy of each frozen
+  file, stored under the importer's storage quotas. The link therefore hands
+  the owner's file bytes to whoever holds it while it is valid, and an import
+  can be repeated. The shared session is not modified. Secret values are
+  refused by the ordinary YAML-import checks; secret references arrive
+  unresolved. Sink output paths inside the owner's session folders are
+  re-based under the importer's session; other sink paths do not travel. The
+  import is recorded in the new session's state (`shared_import`); nothing is
+  recorded on the owner's side and the owner is not notified.
+- **Expiry.** The owner picks 1, 7 or 30 days for each link, up to
+  `shareable_link_lifetime_seconds` (default 30 days), which is the maximum;
+  the server refuses a longer lifetime. An expired link stops working for
+  viewing and import alike. Nothing in the web application deletes stored
+  snapshots or frozen files, so they remain in the payload store after the
+  link expires and an imported copy is unaffected by expiry. A snapshot or
+  file removed by other means (for example `elspeth purge` of a run payload
+  with identical bytes) answers 404 asking for a fresh link.
 - **Revocation.** Rotating `shareable_link_signing_key` invalidates every
-  outstanding link at once. The deployment records its treatment of link
+  outstanding link at once. Copies already imported are separate sessions and
+  are not affected. The deployment records its treatment of link
   lifetime and distribution risk in § 7.1.
-- **Rate limiting.** Issue uses the per-user write limit; opening a link
-  uses the stricter per-user limit.
+- **Rate limiting.** Issue and the owner's file preview use the per-user write
+  limit; opening a link and importing from it use the stricter per-user limit.
 
 ### 6.1 Deployment record
 
@@ -665,6 +693,7 @@ read-only copy of it to another person
 | `shareable_link_lifetime_seconds` | DEPLOYMENT-TODO: |
 | Custody and rotation of `shareable_link_signing_key` — see [07](07-secrets-and-key-management.md) | DEPLOYMENT-TODO: |
 | Guidance to users on who links may be sent to | DEPLOYMENT-TODO: |
+| Guidance to users on when to allow import (the recipient receives a copy of the files) | DEPLOYMENT-TODO: |
 
 ## 7. Controlled risk references
 
@@ -683,7 +712,7 @@ evidence. Do not put sensitive finding detail in this repository.
 | Authentication rate limiting and reverse-proxy client-address trust | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
 | Any approved unauthenticated-route exception | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
 | Local credential-administration and two-store deletion residual risk | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
-| Shareable-link lifetime, distribution and all-links-at-once revocation | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Shareable-link lifetime, distribution, import of files and all-links-at-once revocation | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
 
 ## 8. Current evidence map
 

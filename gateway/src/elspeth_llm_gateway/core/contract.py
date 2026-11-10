@@ -23,13 +23,13 @@ OpenAI Chat Completions response shape.
 
 import json
 import math
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from elspeth_llm_gateway.core.errors import GatewayError, GatewayErrorCode
 from elspeth_llm_gateway.core.parsing import StrictJsonError, parse_strict_json
-from elspeth_llm_gateway.sdk.types import CanonicalResponse
+from elspeth_llm_gateway.sdk.types import CanonicalResponse, CanonicalThinkingBlock
 
 _VALID_STRING_TOOL_CHOICES = frozenset({"auto", "none", "required"})
 
@@ -101,6 +101,28 @@ class ChatToolCall(BaseModel):
     function: ChatToolCallFunction
 
 
+class ChatThinkingBlock(BaseModel):
+    """A reasoning model's signed thinking, replayed exactly as it was returned."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    type: Literal["thinking"]
+    thinking: str
+    signature: str = Field(min_length=1)
+
+
+class ChatRedactedThinkingBlock(BaseModel):
+    """A reasoning model's redacted thinking: opaque data, replayed exactly."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    type: Literal["redacted_thinking"]
+    data: str = Field(min_length=1)
+
+
+ChatThinkingBlockItem = Annotated[ChatThinkingBlock | ChatRedactedThinkingBlock, Field(discriminator="type")]
+
+
 class ChatMessage(BaseModel):
     """A single chat message in the inbound Chat Completions subset.
 
@@ -108,7 +130,8 @@ class ChatMessage(BaseModel):
     ``assistant`` message; ``tool_call_id`` is required exactly when the
     role is ``tool``; ``content`` must be nonempty for every role except
     ``assistant`` with one or more tool calls, where it may be empty or
-    omitted.
+    omitted. ``thinking_blocks`` (the shape ELSPETH and LiteLLM replay) may
+    only be set, non-empty, on an ``assistant`` message.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -117,6 +140,13 @@ class ChatMessage(BaseModel):
     content: str | None = None
     tool_calls: list[ChatToolCall] | None = None
     tool_call_id: str | None = Field(default=None, min_length=1, pattern=r"\S")
+    thinking_blocks: list[ChatThinkingBlockItem] | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _check_thinking_blocks_only_on_assistant(self) -> Self:
+        if self.role != "assistant" and self.thinking_blocks is not None:
+            raise ValueError("thinking_blocks is only permitted on an assistant message")
+        return self
 
     @model_validator(mode="after")
     def _check_tool_calls_only_on_assistant(self) -> Self:
@@ -383,6 +413,11 @@ def _iter_message_strings(message: ChatMessage) -> list[str]:
     if message.tool_calls:
         for tool_call in message.tool_calls:
             strings.append(tool_call.function.arguments)
+    for block in message.thinking_blocks or []:
+        if isinstance(block, ChatThinkingBlock):
+            strings.extend((block.thinking, block.signature))
+        else:
+            strings.append(block.data)
     return strings
 
 
@@ -419,6 +454,12 @@ def bounds_check(request: ChatRequest, bounds: Bounds) -> None:
         raise GatewayError(GatewayErrorCode.INVALID_REQUEST)
 
 
+def _native_thinking_block(block: CanonicalThinkingBlock) -> dict:
+    if block.kind == "thinking":
+        return {"type": "thinking", "thinking": block.thinking, "signature": block.signature}
+    return {"type": "redacted_thinking", "data": block.data}
+
+
 def build_completion_response(*, response_id: str, created: int, model_alias: str, canonical: CanonicalResponse) -> dict:
     """Render a ``CanonicalResponse`` into the OpenAI Chat Completions shape.
 
@@ -435,6 +476,8 @@ def build_completion_response(*, response_id: str, created: int, model_alias: st
             }
             for tool_call in canonical.tool_calls
         ]
+    if canonical.thinking_blocks:
+        message["thinking_blocks"] = [_native_thinking_block(block) for block in canonical.thinking_blocks]
 
     response: dict = {
         "id": response_id,

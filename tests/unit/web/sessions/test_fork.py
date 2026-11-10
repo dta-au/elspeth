@@ -2570,3 +2570,48 @@ class TestForkEndpoint:
         # length is unchanged.
         sessions = await service.list_sessions("alice", "local")
         assert len(sessions) == 1
+
+
+class TestForkRebasesSessionOwnedSinkOptions:
+    """Same-user fork moves a sink target from the parent's session folders to the child's."""
+
+    _PARENT = uuid.UUID("11111111-1111-4111-8111-111111111111")
+    _CHILD = uuid.UUID("22222222-2222-4222-8222-222222222222")
+
+    def _rewrite(self, options: dict[str, Any], data_dir: Path) -> tuple[dict[str, Any], bool]:
+        from elspeth.web.sessions.routes.sessions import _rewrite_session_owned_sink_options
+
+        return _rewrite_session_owned_sink_options(
+            options,
+            data_dir=data_dir,
+            parent_session_id=self._PARENT,
+            child_session_id=self._CHILD,
+            field_path="outputs[0].options",
+        )
+
+    def test_rebases_outputs_blobs_and_relative_forms_to_the_child(self, tmp_path: Path) -> None:
+        base = tmp_path.resolve()
+        options = {
+            "path": str(base / "outputs" / str(self._PARENT) / "nested" / "report.csv"),
+            "file": f"blobs/{self._PARENT}/out.jsonl",
+            "persist_directory": None,
+            "schema": {"mode": "observed"},
+        }
+
+        rebuilt, rewritten = self._rewrite(options, tmp_path)
+
+        assert rewritten is True
+        assert rebuilt == {
+            "path": str(base / "outputs" / str(self._CHILD) / "nested" / "report.csv"),
+            "file": str(base / "blobs" / str(self._CHILD) / "out.jsonl"),
+            "persist_directory": None,
+            "schema": {"mode": "observed"},
+        }
+
+    def test_leaves_paths_outside_the_parent_folders_unchanged(self, tmp_path: Path) -> None:
+        options = {"path": "outputs/report.csv", "file": "/srv/elsewhere/out.csv"}
+
+        rebuilt, rewritten = self._rewrite(options, tmp_path)
+
+        assert rewritten is False
+        assert rebuilt == options

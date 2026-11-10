@@ -304,3 +304,38 @@ def test_canonical_response_preserves_both_text_and_tool_calls():
 def test_canonical_response_rejects_neither_text_nor_tool_calls():
     with pytest.raises(ValidationError):
         CanonicalResponse(text=None, tool_calls=(), finish_reason=FinishReason.STOP)
+
+
+# --- CanonicalThinkingBlock ----------------------------------------------------
+
+
+def test_canonical_thinking_block_accepts_both_native_kinds():
+    from elspeth_llm_gateway.sdk.types import CanonicalThinkingBlock
+
+    assert CanonicalThinkingBlock(kind="thinking", thinking="t", signature="s").signature == "s"
+    assert CanonicalThinkingBlock(kind="redacted_thinking", data="d").data == "d"
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"kind": "thinking", "thinking": "t"},
+        {"kind": "thinking", "thinking": "t", "signature": ""},
+        {"kind": "thinking", "thinking": "t", "signature": "s", "data": "d"},
+        {"kind": "redacted_thinking"},
+        {"kind": "redacted_thinking", "data": "d", "thinking": "t"},
+    ],
+    ids=["no-signature", "blank-signature", "thinking-with-data", "no-data", "redacted-with-thinking"],
+)
+def test_canonical_thinking_block_rejects_incoherent_fields(fields):
+    from elspeth_llm_gateway.sdk.types import CanonicalThinkingBlock
+
+    with pytest.raises(ValidationError):
+        CanonicalThinkingBlock(**fields)
+
+
+def test_canonical_message_rejects_thinking_blocks_off_the_assistant_role():
+    from elspeth_llm_gateway.sdk.types import CanonicalThinkingBlock
+
+    with pytest.raises(ValidationError):
+        CanonicalMessage(role="user", content="hi", thinking_blocks=(CanonicalThinkingBlock(kind="redacted_thinking", data="d"),))

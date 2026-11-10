@@ -16,6 +16,7 @@ from elspeth.contracts.blobs_inline import (
     ContentEncoding,
     ResolvedBlobContent,
     WidenedBlobRefShape,
+    is_headless_blob_ref_fragment,
     is_widened_blob_ref,
 )
 
@@ -212,3 +213,37 @@ class TestBlobContentResolutionError:
         assert err.malformed == (("node:c.options.z", "missing mode"),)
         assert "missing=1" in str(err)
         assert "oversized=1" in str(err)
+
+
+class TestHeadlessBlobRefFragment:
+    """A marker whose ``blob_ref`` was stripped is recognisable, not plugin data."""
+
+    @pytest.mark.parametrize(
+        "fragment",
+        [
+            {"mode": "inline_content", "sha256": VALID_HASH, "encoding": "utf-8"},
+            {"mode": "inline_content", "sha256": VALID_HASH},
+            {"mode": "bind_source"},
+            {"mode": "bind_source", "path": "in.csv"},
+        ],
+    )
+    def test_recognises_marker_keys_with_a_blob_mode_and_no_blob_ref(self, fragment: dict[str, object]) -> None:
+        assert is_headless_blob_ref_fragment(fragment) is True
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            {"blob_ref": VALID_BLOB_ID, "mode": "inline_content", "sha256": VALID_HASH},  # whole marker
+            {"mode": "observed"},  # schema mode, not a blob mode
+            {"mode": "inline_content", "sha256": VALID_HASH, "fields": ["a"]},  # carries plugin keys
+            {"sha256": VALID_HASH},  # no mode
+            {"mode": []},  # unhashable mode: ordinary plugin data, not a marker
+            {"mode": {}},
+            {"mode": 1},
+            "inline_content",
+            ["mode", "inline_content"],
+            None,
+        ],
+    )
+    def test_rejects_whole_markers_and_ordinary_values(self, value: object) -> None:
+        assert is_headless_blob_ref_fragment(value) is False

@@ -7,11 +7,17 @@ web/ (not composer/ or execution/) to avoid cross-package coupling.
 
 from __future__ import annotations
 
-from pathlib import Path
+import unicodedata
+from pathlib import Path, PurePosixPath
+from typing import Final, Literal
 from uuid import UUID
 
 SOURCE_LOCAL_PATH_OPTION_KEYS: tuple[str, ...] = ("path", "file")
 SINK_LOCAL_PATH_OPTION_KEYS: tuple[str, ...] = ("path", "file", "persist_directory")
+# The two per-session folders a sink may write under:
+# ``data_dir/outputs/<session_id>`` and ``data_dir/blobs/<session_id>``.
+SessionFolder = Literal["outputs", "blobs"]
+SESSION_FOLDERS: tuple[SessionFolder, ...] = ("outputs", "blobs")
 # Local filesystem keys to confine inside a transform's
 # ``options["provider_config"]`` dict (RAG retrieval transforms carry a
 # Chroma persist_directory there). Confined like sink paths — persist_directory
@@ -131,3 +137,68 @@ def resolve_sink_data_path(value: str, data_dir: str, *, session_id: str | None)
             scoped = Path("outputs") / session_id / Path(*raw.parts[1:])
         return (Path(data_dir).resolve() / scoped).resolve()
     return resolve_data_path(value, data_dir)
+
+
+def locate_in_session_folder(resolved: Path, data_dir: str | Path, *, session_id: str) -> tuple[SessionFolder, Path] | None:
+    """Return which of a session's folders holds ``resolved``, and the path below it.
+
+    ``resolved`` must already be resolved (``resolve_data_path`` or
+    ``resolve_sink_data_path``). The answer is ``(folder, relative)`` where
+    ``resolved == data_dir/<folder>/<session_id>/<relative>``; ``relative`` is
+    ``Path(".")`` for the folder itself. ``None`` when the path lies outside
+    both of the session's folders.
+    """
+    _validate_session_path_segment(session_id, caller="locate_in_session_folder")
+    base = Path(data_dir).resolve()
+    for folder in SESSION_FOLDERS:
+        root = base / folder / session_id
+        if resolved.is_relative_to(root):
+            return folder, resolved.relative_to(root)
+    return None
+
+
+def session_folder_path(data_dir: str | Path, folder: SessionFolder, *, session_id: str, relative_path: str | Path) -> Path:
+    """Return ``data_dir/<folder>/<session_id>/<relative_path>`` (``data_dir`` resolved).
+
+    A pure join: the caller proves ``relative_path`` stays inside the folder
+    (``normalise_session_relative_path``) and checks containment of the result.
+    """
+    _validate_session_path_segment(session_id, caller="session_folder_path")
+    return Path(data_dir).resolve() / folder / session_id / relative_path
+
+
+# Longest session-relative path accepted anywhere one is recorded or bound.
+MAX_SESSION_RELATIVE_PATH_CHARS: Final = 1024
+# Unicode categories refused in a session-relative path: ``Cc`` (C0, DEL and
+# C1, which includes NEL U+0085), ``Zl`` (U+2028) and ``Zp`` (U+2029). Each
+# breaks a line in some log viewer or terminal.
+_LINE_BREAKING_CATEGORIES: Final = frozenset({"Cc", "Zl", "Zp"})
+
+
+def normalise_session_relative_path(value: str) -> str:
+    """Return ``value`` as a normalised POSIX path that stays inside a session folder.
+
+    Collapses ``.`` segments and repeated separators. Raises ``ValueError`` for
+    an empty result, an absolute path, any ``..`` segment, a backslash (a
+    separator on another platform) or a NUL byte: none of these can name a
+    file below a session folder. Also raises for a value longer than
+    ``MAX_SESSION_RELATIVE_PATH_CHARS`` or holding any other control
+    character (C0, DEL or C1) or a Unicode line or paragraph separator
+    (U+2028, U+2029): such a name is persisted into state and echoed in
+    validation messages and logs, where a line break forges a line.
+    """
+    if "\\" in value or "\x00" in value:
+        raise ValueError("a session-relative path must not contain a backslash or NUL byte")
+    if len(value) > MAX_SESSION_RELATIVE_PATH_CHARS:
+        raise ValueError(f"a session-relative path must not be longer than {MAX_SESSION_RELATIVE_PATH_CHARS} characters")
+    if any(unicodedata.category(char) in _LINE_BREAKING_CATEGORIES for char in value):
+        raise ValueError("a session-relative path must not contain a control character")
+    pure = PurePosixPath(value)
+    if pure.is_absolute():
+        raise ValueError("a session-relative path must not be absolute")
+    if ".." in pure.parts:
+        raise ValueError("a session-relative path must not contain '..'")
+    normalised = pure.as_posix()
+    if normalised == ".":
+        raise ValueError("a session-relative path must name a file or directory below the session folder")
+    return normalised

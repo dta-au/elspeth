@@ -34,6 +34,7 @@ from elspeth.web.shareable_reviews.models import (
     NodeSpecResponse,
     OutputSpecResponse,
     ShareableLinkResponse,
+    SharedFileSummary,
     SharedInspectResponse,
     SourceSpecResponse,
 )
@@ -168,6 +169,8 @@ def test_shared_inspect_response_carries_audit_readiness() -> None:
         audit_readiness=snapshot,
         created_by_user_id="user-1",
         created_by_username="user-one",
+        import_allowed=False,
+        files=[],
         created_at=datetime.now(UTC),
         expires_at=datetime.now(UTC),
     )
@@ -196,6 +199,8 @@ def test_shared_inspect_response_accepts_plural_sources_snapshot() -> None:
         audit_readiness=snapshot,
         created_by_user_id="user-1",
         created_by_username="user-one",
+        import_allowed=False,
+        files=[],
         created_at=datetime.now(UTC),
         expires_at=datetime.now(UTC),
     )
@@ -215,6 +220,8 @@ def test_shared_inspect_response_rejects_missing_username_attribution() -> None:
                 "audit_readiness": _make_audit_readiness_snapshot(),
                 "created_by_user_id": "user-1",
                 "created_by_username": None,
+                "import_allowed": False,
+                "files": [],
                 "created_at": datetime.now(UTC),
                 "expires_at": datetime.now(UTC),
             }
@@ -233,6 +240,8 @@ def test_shared_inspect_response_rejects_extra_field() -> None:
             audit_readiness=snapshot,
             created_by_user_id="user-1",
             created_by_username="user-one",
+            import_allowed=False,
+            files=[],
             created_at=datetime.now(UTC),
             expires_at=datetime.now(UTC),
             something_extra=True,  # type: ignore[call-arg]
@@ -250,6 +259,8 @@ def test_shared_inspect_response_requires_audit_readiness() -> None:
             yaml="version: 1\n",
             created_by_user_id="user-1",
             created_by_username="user-one",
+            import_allowed=False,
+            files=[],
             created_at=datetime.now(UTC),
             expires_at=datetime.now(UTC),
         )
@@ -278,6 +289,8 @@ def test_shared_inspect_response_rejects_extra_pipeline_metadata_key() -> None:
             audit_readiness=snapshot,
             created_by_user_id="user-1",
             created_by_username="user-one",
+            import_allowed=False,
+            files=[],
             created_at=datetime.now(UTC),
             expires_at=datetime.now(UTC),
         )
@@ -298,6 +311,8 @@ def test_shared_inspect_response_rejects_extra_composition_snapshot_key() -> Non
             audit_readiness=snapshot,
             created_by_user_id="user-1",
             created_by_username="user-one",
+            import_allowed=False,
+            files=[],
             created_at=datetime.now(UTC),
             expires_at=datetime.now(UTC),
         )
@@ -321,6 +336,8 @@ def test_shared_inspect_response_rejects_wrong_pipeline_metadata_field_type() ->
             audit_readiness=snapshot,
             created_by_user_id="user-1",
             created_by_username="user-one",
+            import_allowed=False,
+            files=[],
             created_at=datetime.now(UTC),
             expires_at=datetime.now(UTC),
         )
@@ -364,6 +381,8 @@ def test_shared_inspect_response_accepts_queue_node_in_snapshot() -> None:
         audit_readiness=snapshot,
         created_by_user_id="user-1",
         created_by_username="user-one",
+        import_allowed=False,
+        files=[],
         created_at=datetime.now(UTC),
         expires_at=datetime.now(UTC),
     )
@@ -536,3 +555,36 @@ def test_scope_name_is_admitted_because_the_public_yaml_consumer_requires_it() -
     assert public_yaml["scopes"] == [
         {"name": "per_document", "opener": "explode", "closer": "gather", "policy": "require_all"},
     ]
+
+
+def _shared_inspect_kwargs() -> dict[str, object]:
+    return {
+        "session_id": str(uuid4()),
+        "state_id": str(uuid4()),
+        "pipeline_metadata": {"name": "Demo", "description": ""},
+        "composition_snapshot": _make_composition_snapshot(),
+        "yaml": "version: 1\n",
+        "audit_readiness": _make_audit_readiness_snapshot(),
+        "created_by_user_id": "user-1",
+        "created_by_username": "user-one",
+        "created_at": datetime.now(UTC),
+        "expires_at": datetime.now(UTC),
+    }
+
+
+@pytest.mark.parametrize("missing", ["import_allowed", "files"])
+def test_shared_inspect_response_requires_import_fields(missing: str) -> None:
+    kwargs = {**_shared_inspect_kwargs(), "import_allowed": False, "files": []}
+    del kwargs[missing]
+    with pytest.raises(ValidationError, match=missing):
+        SharedInspectResponse.model_validate(kwargs)
+
+
+def test_shared_inspect_response_files_are_strict_filename_and_size() -> None:
+    kwargs = {**_shared_inspect_kwargs(), "import_allowed": True}
+    resp = SharedInspectResponse.model_validate({**kwargs, "files": [SharedFileSummary(filename="a.csv", size_bytes=3)]})
+    assert resp.files == [SharedFileSummary(filename="a.csv", size_bytes=3)]
+    with pytest.raises(ValidationError):
+        SharedInspectResponse.model_validate({**kwargs, "files": [{"filename": "a.csv", "size_bytes": 3, "sha256": "x"}]})
+    with pytest.raises(ValidationError):
+        SharedFileSummary.model_validate({"filename": "a.csv", "size_bytes": "3"})

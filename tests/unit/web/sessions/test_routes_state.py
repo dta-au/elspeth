@@ -6,6 +6,7 @@ import asyncio
 import json
 import threading
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -3025,8 +3026,83 @@ sinks:
         # the bind_source "mode" marker is web-layer bookkeeping and stays out.
         assert body["redaction"] == {
             "stripped_source_options": {"source": ["blob_ref", "path"]},
+            "stripped_node_options": {},
             "stripped_output_options": {"out": ["path"]},
             "blob_linked_sources": ["source"],
+            "rebind_guidance": PUBLIC_EXPORT_REBIND_GUIDANCE,
+        }
+        assert body["yaml"].startswith(PUBLIC_EXPORT_REDACTION_HEADER)
+
+    @pytest.mark.asyncio
+    async def test_yaml_export_accounts_for_a_node_file_marker_it_removed(self, tmp_path: Path) -> None:
+        """A transform's uploaded-file marker is removed whole and named.
+
+        Before the fix the export kept a headless ``{mode, sha256, encoding}``
+        fragment in the node's options and returned no redaction account at
+        all, because nothing else in this graph was stripped.
+        """
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        blob_id = "22222222-2222-4222-8222-222222222222"
+        file_digest = "cd" * 32
+        session = await service.create_session("alice", "Node file", "local")
+        await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(
+                source={
+                    "plugin": "csv",
+                    "on_success": "lookup_in",
+                    "options": {"schema": {"mode": "observed"}},
+                    "on_validation_failure": "discard",
+                },
+                nodes=[
+                    {
+                        "id": "lookup",
+                        "node_type": "transform",
+                        "plugin": "reference_join",
+                        "input": "lookup_in",
+                        "on_success": "out",
+                        "on_error": "discard",
+                        "options": {
+                            "tables": {
+                                "t": {
+                                    "reference_content": {
+                                        "blob_ref": blob_id,
+                                        "mode": "inline_content",
+                                        "sha256": file_digest,
+                                        "encoding": "utf-8",
+                                    },
+                                    "reference_format": "csv",
+                                }
+                            }
+                        },
+                    }
+                ],
+                outputs=[{"name": "out", "plugin": "json", "options": {}, "on_write_failure": "discard"}],
+                metadata_={"name": "Node file", "description": ""},
+                is_valid=True,
+            ),
+            provenance="session_seed",
+        )
+
+        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
+            return ValidationResult(is_valid=True, checks=[], errors=[])
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
+            resp = client.get(f"/api/sessions/{session.id}/state/yaml")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert blob_id not in json.dumps(body, sort_keys=True)
+        assert file_digest not in json.dumps(body, sort_keys=True)
+        exported_node_options = yaml.safe_load(body["yaml"])["transforms"][0]["options"]
+        assert exported_node_options == {"tables": {"t": {"reference_format": "csv"}}}
+        assert body["redaction"] == {
+            "stripped_source_options": {},
+            "stripped_node_options": {"lookup": ["tables.t.reference_content"]},
+            "stripped_output_options": {},
+            "blob_linked_sources": [],
             "rebind_guidance": PUBLIC_EXPORT_REBIND_GUIDANCE,
         }
         assert body["yaml"].startswith(PUBLIC_EXPORT_REDACTION_HEADER)
@@ -3747,3 +3823,785 @@ async def test_get_state_yaml_is_409_while_another_compose_is_live(tmp_path) -> 
         assert client.get(f"/api/sessions/{session_id}/state/yaml").status_code != 409
     finally:
         service.session_operation_authority.release(reader)
+
+
+# ---------------------------------------------------------------------------
+# Shared-graph import: re-binding inline file markers and multi-file sources
+# ---------------------------------------------------------------------------
+
+_REBIND_DIGEST_A = "a1" * 32
+_REBIND_DIGEST_B = "b2" * 32
+
+_REBIND_NODE_YAML = """
+sources:
+  source:
+    plugin: csv
+    on_success: lookup_in
+    on_validation_failure: discard
+    options:
+      schema:
+        mode: observed
+transforms:
+- name: lookup
+  plugin: reference_join
+  input: lookup_in
+  on_success: main
+  on_error: discard
+  options:
+    tables:
+      t:
+        reference_format: csv
+sinks:
+  main:
+    plugin: json
+    on_write_failure: discard
+"""
+
+
+_REBIND_GATE_YAML = """
+sources:
+  source:
+    plugin: csv
+    on_success: gate_in
+    on_validation_failure: discard
+    options:
+      schema:
+        mode: observed
+gates:
+  - name: threshold
+    input: gate_in
+    condition: row['amount'] > 500
+    routes:
+      true: high
+      false: standard
+sinks:
+  high:
+    plugin: json
+    on_write_failure: discard
+  standard:
+    plugin: json
+    on_write_failure: discard
+"""
+
+_REBIND_LLM_YAML = """
+sources:
+  source:
+    plugin: csv
+    on_success: score
+    on_validation_failure: discard
+    options:
+      schema:
+        mode: observed
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+sinks:
+  main:
+    plugin: json
+    on_write_failure: discard
+"""
+
+_BLOB_ROWS_YAML = """
+sources:
+  source:
+    plugin: blob_rows
+    on_success: main
+    on_validation_failure: discard
+    options: {}
+sinks:
+  main:
+    plugin: json
+    on_write_failure: discard
+"""
+
+
+def _hashed_blob(
+    *,
+    blob_id: uuid.UUID,
+    session_id: uuid.UUID,
+    content_hash: str,
+    filename: str = "reference.csv",
+    status: str = "ready",
+) -> Any:
+    from dataclasses import replace as dataclass_replace
+
+    record = _ready_blob_record(blob_id=blob_id, session_id=session_id, storage_path=f"/data/blobs/{session_id}/{filename}")
+    return dataclass_replace(record, content_hash=content_hash, size_bytes=17, status=status)
+
+
+def _blob_service_for(*blobs: Any) -> SimpleNamespace:
+    from elspeth.contracts.blobs import BlobNotFoundError
+
+    by_id = {blob.id: blob for blob in blobs}
+
+    async def _get_blob(blob_id: uuid.UUID, *, session_operation_context: Any) -> Any:
+        if blob_id not in by_id:
+            raise BlobNotFoundError(str(blob_id))
+        return by_id[blob_id]
+
+    return SimpleNamespace(get_blob=AsyncMock(spec=BlobServiceProtocol.get_blob, side_effect=_get_blob))
+
+
+async def _rebind_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
+    return ValidationResult(is_valid=True, checks=[], errors=[])
+
+
+class TestImportRebindsSharedFiles:
+    @pytest.mark.asyncio
+    async def test_import_rebinds_inline_marker_at_field_path(self, tmp_path: Path) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        node_blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A)
+        output_blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_B)
+        app.state.blob_service = _blob_service_for(node_blob, output_blob)
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
+            resp = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={
+                    "yaml": _REBIND_NODE_YAML,
+                    "inline_blob_bindings": {
+                        "node:lookup.options.tables.t.reference_content": {"blob_id": str(node_blob.id)},
+                        # Missing intermediate mappings are created.
+                        "output:main.options.template.body": {"blob_id": str(output_blob.id)},
+                    },
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        record = await service.get_current_state(session.id)
+        assert record is not None
+        node_options = record.nodes[0]["options"]
+        assert node_options["tables"] == {
+            "t": {
+                "reference_format": "csv",
+                "reference_content": {"blob_ref": str(node_blob.id), "mode": "inline_content", "sha256": _REBIND_DIGEST_A},
+            }
+        }
+        assert record.outputs[0]["options"]["template"] == {
+            "body": {"blob_ref": str(output_blob.id), "mode": "inline_content", "sha256": _REBIND_DIGEST_B}
+        }
+
+    @pytest.mark.asyncio
+    async def test_import_inline_binding_keeps_non_utf8_encoding(self, tmp_path: Path) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A)
+        app.state.blob_service = _blob_service_for(blob)
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
+            resp = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={
+                    "yaml": _REBIND_NODE_YAML,
+                    "inline_blob_bindings": {
+                        "node:lookup.options.tables.t.reference_content": {"blob_id": str(blob.id), "encoding": "latin-1"},
+                    },
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        record = await service.get_current_state(session.id)
+        assert record is not None
+        assert record.nodes[0]["options"]["tables"]["t"]["reference_content"] == {
+            "blob_ref": str(blob.id),
+            "mode": "inline_content",
+            "sha256": _REBIND_DIGEST_A,
+            "encoding": "latin-1",
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "field_path",
+        [
+            # The leaf already holds a value.
+            "node:lookup.options.tables.t.reference_format",
+            # An intermediate segment holds a non-mapping value.
+            "node:lookup.options.tables.t.reference_format.inner",
+        ],
+    )
+    async def test_import_inline_binding_refuses_occupied_path(self, tmp_path: Path, field_path: str) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A)
+        app.state.blob_service = _blob_service_for(blob)
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={"yaml": _REBIND_NODE_YAML, "inline_blob_bindings": {field_path: {"blob_id": str(blob.id)}}},
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert field_path in resp.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("blob_session", "status", "expected_status", "expected_detail"),
+        [
+            ("missing", "ready", 404, "Blob not found"),
+            ("foreign", "ready", 404, "Blob not found"),
+            ("own", "pending", 409, "Blob is not ready"),
+        ],
+    )
+    async def test_import_inline_binding_refuses_foreign_or_unready_blob(
+        self,
+        tmp_path: Path,
+        blob_session: str,
+        status: str,
+        expected_status: int,
+        expected_detail: str,
+    ) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        owner_session_id = session.id if blob_session == "own" else uuid.uuid4()
+        blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=owner_session_id, content_hash=_REBIND_DIGEST_A, status=status)
+        app.state.blob_service = _blob_service_for() if blob_session == "missing" else _blob_service_for(blob)
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={
+                "yaml": _REBIND_NODE_YAML,
+                "inline_blob_bindings": {"node:lookup.options.tables.t.reference_content": {"blob_id": str(blob.id)}},
+            },
+        )
+
+        assert resp.status_code == expected_status, resp.text
+        assert resp.json()["detail"] == expected_detail
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "field_path",
+        [
+            "lookup.options.tables.t.reference_content",  # no component prefix
+            "node:lookup.tables.t.reference_content",  # no .options segment
+            "node:lookup.options.tables[0].reference_content",  # list index
+            "node:missing.options.reference_content",  # unknown component
+            # Server-owned source roots: file linkage is bound by
+            # source_blob_ids / source_blob_rows, never as an inline marker.
+            "source:source.options.blob_ref",
+            "source:source.options.blobs",
+            "source:source.options.source_authoring",
+        ],
+    )
+    async def test_import_rejects_malformed_field_path_with_400(self, tmp_path: Path, field_path: str) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A)
+        app.state.blob_service = _blob_service_for(blob)
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={"yaml": _REBIND_NODE_YAML, "inline_blob_bindings": {field_path: {"blob_id": str(blob.id)}}},
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_import_rebinds_blob_rows_source_in_order(self, tmp_path: Path) -> None:
+        from elspeth.web.composer.yaml_generator import generate_public_yaml, public_export_redaction_header
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        first = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A, filename="a.csv")
+        second = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_B, filename="b.csv")
+        app.state.blob_service = _blob_service_for(first, second)
+        # Tom's graph, projected exactly as the public export projects it: the
+        # blobs list is removed whole and the export marker names the source.
+        tom_state = CompositionState(
+            source=SourceSpec(
+                plugin="blob_rows",
+                on_success="main",
+                options={
+                    "blobs": [
+                        {
+                            "blob_id": str(uuid.uuid4()),
+                            "payload_ref": _REBIND_DIGEST_A,
+                            "filename": "a.csv",
+                            "mime_type": "text/csv",
+                            "size_bytes": 17,
+                        }
+                    ]
+                },
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(OutputSpec(name="main", plugin="json", options={}, on_write_failure="discard"),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        yaml_text = public_export_redaction_header(tom_state) + generate_public_yaml(tom_state)
+        assert "blobs" not in yaml.safe_load(yaml_text)["sources"]["source"]["options"]
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
+            resp = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={"yaml": yaml_text, "source_blob_rows": {"source": {"blob_ids": [str(second.id), str(first.id)]}}},
+            )
+
+        assert resp.status_code == 200, resp.text
+        record = await service.get_current_state(session.id)
+        assert record is not None
+        from elspeth.contracts.freeze import deep_thaw
+
+        assert deep_thaw(record.sources["source"]["options"]["blobs"]) == [
+            {"blob_id": str(second.id), "payload_ref": _REBIND_DIGEST_B, "filename": "b.csv", "mime_type": "text/csv", "size_bytes": 17},
+            {"blob_id": str(first.id), "payload_ref": _REBIND_DIGEST_A, "filename": "a.csv", "mime_type": "text/csv", "size_bytes": 17},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_import_blob_rows_binding_refuses_non_blob_rows_source(self, tmp_path: Path) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A)
+        app.state.blob_service = _blob_service_for(blob)
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={"yaml": _REBIND_NODE_YAML, "source_blob_rows": {"source": {"blob_ids": [str(blob.id)]}}},
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert "blob_rows" in resp.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("blob_session", "status", "expected_status", "expected_detail"),
+        [
+            ("missing", "ready", 404, "Blob not found"),
+            ("foreign", "ready", 404, "Blob not found"),
+            ("own", "pending", 409, "Blob is not ready"),
+            ("own", "error", 409, "Blob is not ready"),
+        ],
+    )
+    async def test_import_blob_rows_binding_refuses_foreign_or_unready_blob(
+        self,
+        tmp_path: Path,
+        blob_session: str,
+        status: str,
+        expected_status: int,
+        expected_detail: str,
+    ) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        owner_session_id = session.id if blob_session == "own" else uuid.uuid4()
+        blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=owner_session_id, content_hash=_REBIND_DIGEST_A, status=status)
+        app.state.blob_service = _blob_service_for() if blob_session == "missing" else _blob_service_for(blob)
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={"yaml": _BLOB_ROWS_YAML, "source_blob_rows": {"source": {"blob_ids": [str(blob.id)]}}},
+        )
+
+        assert resp.status_code == expected_status, resp.text
+        assert resp.json()["detail"] == expected_detail
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("blob_ids", "detail_fragment"),
+        [
+            pytest.param(lambda first, second: [str(first.id), str(first.id)], "the same blob more than once", id="same-blob-twice"),
+            pytest.param(lambda first, second: [str(first.id), "not-a-uuid"], "blob_ids[1] must be a UUID", id="not-a-uuid"),
+            pytest.param(lambda first, second: [str(first.id), str(second.id)], "two files with the same content", id="same-content"),
+        ],
+    )
+    async def test_import_blob_rows_binding_refuses_duplicates_and_malformed_ids(
+        self, tmp_path: Path, blob_ids: Callable[[Any, Any], list[str]], detail_fragment: str
+    ) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        first = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A, filename="a.csv")
+        second = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A, filename="b.csv")
+        app.state.blob_service = _blob_service_for(first, second)
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={"yaml": _BLOB_ROWS_YAML, "source_blob_rows": {"source": {"blob_ids": blob_ids(first, second)}}},
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert detail_fragment in resp.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_import_blob_rows_binding_refuses_unknown_source(self, tmp_path: Path) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A)
+        app.state.blob_service = _blob_service_for(blob)
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={"yaml": _BLOB_ROWS_YAML, "source_blob_rows": {"missing": {"blob_ids": [str(blob.id)]}}},
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"] == "source_blob_rows references unknown source 'missing'"
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_import_blob_rows_binding_refuses_llm_authored_blob(self, tmp_path: Path) -> None:
+        """Parity with the canonical set_source_from_blobs writer: an LLM-authored file needs its review flow."""
+        from dataclasses import replace as dataclass_replace
+
+        from elspeth.contracts.enums import CreationModality
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = dataclass_replace(
+            _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A),
+            creation_modality=CreationModality.LLM_GENERATED,
+        )
+        app.state.blob_service = _blob_service_for(blob)
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
+            resp = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={"yaml": _BLOB_ROWS_YAML, "source_blob_rows": {"source": {"blob_ids": [str(blob.id)]}}},
+            )
+
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"].startswith(f"source_blob_rows.source: blob '{blob.id}' is LLM-authored")
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_import_rebinds_inline_marker_on_a_source(self, tmp_path: Path) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A)
+        app.state.blob_service = _blob_service_for(blob)
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
+            resp = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={
+                    "yaml": _REBIND_NODE_YAML,
+                    "inline_blob_bindings": {"source:source.options.lookup.doc": {"blob_id": str(blob.id)}},
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        record = await service.get_current_state(session.id)
+        assert record is not None
+        assert record.sources["source"]["options"]["lookup"] == {
+            "doc": {"blob_ref": str(blob.id), "mode": "inline_content", "sha256": _REBIND_DIGEST_A}
+        }
+        # Re-binding completes the imported graph; it is not an edit of it.
+        assert record.version == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("yaml_text", "field_path", "expected_detail"),
+        [
+            (
+                _REBIND_GATE_YAML,
+                "node:threshold.options.doc",
+                "Inline blob references can only be wired into source, transform, aggregation, collector, or output plugin options.",
+            ),
+            (
+                _REBIND_NODE_YAML,
+                "node:lookup.options.interpretation_requirements.doc",
+                "wire_blob_inline_ref cannot write node interpretation_requirements",
+            ),
+            (
+                _REBIND_NODE_YAML,
+                "source:source.options.interpretation_requirements.doc",
+                "wire_blob_inline_ref cannot write source interpretation_requirements",
+            ),
+            (
+                _REBIND_NODE_YAML,
+                "output:main.options.interpretation_requirements.doc",
+                "wire_blob_inline_ref cannot write output interpretation_requirements",
+            ),
+            (
+                _REBIND_LLM_YAML,
+                "node:score.options.approved_prompt_artifact_hash",
+                "targets runtime-owned top-level LLM option 'approved_prompt_artifact_hash'",
+            ),
+        ],
+        ids=[
+            "gate-node",
+            "node-interpretation-requirements",
+            "source-interpretation-requirements",
+            "output-interpretation-requirements",
+            "llm-runtime-owned-hash",
+        ],
+    )
+    async def test_import_inline_binding_refuses_what_the_canonical_writer_refuses(
+        self,
+        tmp_path: Path,
+        yaml_text: str,
+        field_path: str,
+        expected_detail: str,
+    ) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A)
+        app.state.blob_service = _blob_service_for(blob)
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
+            resp = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={"yaml": yaml_text, "inline_blob_bindings": {field_path: {"blob_id": str(blob.id)}}},
+            )
+
+        assert resp.status_code == 400, resp.text
+        assert expected_detail in resp.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_import_inline_binding_refuses_llm_authored_blob_on_prompt_surface(self, tmp_path: Path) -> None:
+        from dataclasses import replace as dataclass_replace
+
+        from elspeth.contracts.enums import CreationModality
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = dataclass_replace(
+            _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A),
+            creation_modality=CreationModality.LLM_GENERATED,
+        )
+        app.state.blob_service = _blob_service_for(blob)
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
+            resp = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={
+                    "yaml": _REBIND_LLM_YAML,
+                    "inline_blob_bindings": {"node:score.options.prompt_template": {"blob_id": str(blob.id)}},
+                },
+            )
+
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"].startswith(
+            f"wire_blob_inline_ref cannot wire LLM-authored blob '{blob.id}' into LLM node 'score' option 'prompt_template'"
+        )
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_seed_records_shared_import_meta(self, tmp_path: Path) -> None:
+        from starlette.requests import Request as StarletteRequest
+
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.web.sessions.routes.composer.state import (
+            ImportStateYamlRequest,
+            SharedImportMetaUpdates,
+            seed_state_from_runtime_yaml,
+        )
+
+        app, service = _make_app(tmp_path)
+        # The fixture's provisioned identity stands in for Chris.
+        session = await service.create_session("alice", "Copy of Tom's pipeline", "local")
+        blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A)
+        app.state.blob_service = _blob_service_for(blob)
+        facts: SharedImportMetaUpdates = {
+            "shared_import": {
+                "payload_digest": "c3" * 32,
+                "shared_by_user_id": "tom",
+                "shared_by_username": "Tom",
+                "shared_from_session_id": str(uuid.uuid4()),
+                "shared_from_state_id": str(uuid.uuid4()),
+                "files": [{"sha256": _REBIND_DIGEST_A, "blob_id": str(blob.id)}],
+            }
+        }
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
+            response = await seed_state_from_runtime_yaml(
+                session=session,
+                body=ImportStateYamlRequest(
+                    yaml=_REBIND_NODE_YAML,
+                    inline_blob_bindings={"node:lookup.options.tables.t.reference_content": {"blob_id": str(blob.id)}},
+                ),
+                request=StarletteRequest({"type": "http", "app": app}),
+                user=UserIdentity(user_id="alice", username="alice"),
+                composer_meta_updates=facts,
+            )
+
+        record = await service.get_current_state(session.id)
+        assert record is not None and record.composer_meta is not None and response.id == str(record.id)
+        assert deep_thaw(record.composer_meta["shared_import"]) == facts["shared_import"]
+        assert "ingress" in record.composer_meta
+        assert record.nodes[0]["options"]["tables"]["t"]["reference_content"]["blob_ref"] == str(blob.id)
+
+
+_SINK_BINDING_YAML_WITH_PATH = _REBIND_NODE_YAML.replace(
+    "    plugin: json\n    on_write_failure: discard\n",
+    "    plugin: json\n    on_write_failure: discard\n    options:\n      path: outputs/existing.json\n",
+)
+
+
+class TestImportRebasesSinkPaths:
+    """``sink_path_bindings`` re-authors a sink path under the CALLER's own session folders."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("folder", ["outputs", "blobs"])
+    async def test_binding_writes_a_path_under_the_callers_session(self, tmp_path: Path, folder: str) -> None:
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.web.composer.tools._common import _validate_sink_path
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebase", "local")
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
+            resp = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={
+                    "yaml": _REBIND_NODE_YAML,
+                    "sink_path_bindings": {"main": {"path": {"folder": folder, "relative_path": "nested/./out.jsonl"}}},
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        record = await service.get_current_state(session.id)
+        assert record is not None
+        options = deep_thaw(record.outputs[0]["options"])
+        assert options["path"] == str(tmp_path.resolve() / folder / str(session.id) / "nested" / "out.jsonl")
+        # The re-based path passes the composer's own sink-path guard unchanged.
+        assert _validate_sink_path(options, str(tmp_path), session_id=str(session.id)) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("bindings", "detail_fragment"),
+        [
+            pytest.param(
+                {"missing": {"path": {"folder": "outputs", "relative_path": "x.json"}}}, "unknown output 'missing'", id="unknown-output"
+            ),
+            pytest.param({"main": {"url": {"folder": "outputs", "relative_path": "x.json"}}}, "main.url", id="unknown-option"),
+            pytest.param({"main": {"path": {"folder": "outputs", "relative_path": "../x.json"}}}, "main.path", id="dotdot"),
+            pytest.param(
+                {"main": {"path": {"folder": "outputs", "relative_path": "nested/../../x.json"}}}, "main.path", id="nested-dotdot"
+            ),
+            pytest.param({"main": {"path": {"folder": "outputs", "relative_path": "/etc/passwd"}}}, "main.path", id="absolute"),
+            pytest.param({"main": {"path": {"folder": "outputs", "relative_path": ""}}}, "main.path", id="empty"),
+            pytest.param({"main": {"path": {"folder": "outputs", "relative_path": "."}}}, "main.path", id="the-folder-itself"),
+            pytest.param({"main": {"path": {"folder": "outputs", "relative_path": "..\\..\\x.json"}}}, "main.path", id="backslash"),
+            pytest.param(
+                {"main": {"path": {"folder": "outputs", "relative_path": "a\nINFO fake log line.json"}}}, "main.path", id="newline"
+            ),
+            pytest.param({"main": {"path": {"folder": "outputs", "relative_path": "a\x1b[2Jb.json"}}}, "main.path", id="escape"),
+        ],
+    )
+    async def test_binding_that_is_unknown_or_escapes_is_400(self, tmp_path: Path, bindings: dict[str, Any], detail_fragment: str) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebase", "local")
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={"yaml": _REBIND_NODE_YAML, "sink_path_bindings": bindings},
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert detail_fragment in resp.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_binding_through_a_symlink_out_of_the_session_is_400(self, tmp_path: Path) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebase", "local")
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        session_outputs = tmp_path / "outputs" / str(session.id)
+        session_outputs.mkdir(parents=True)
+        (session_outputs / "link").symlink_to(outside, target_is_directory=True)
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={
+                "yaml": _REBIND_NODE_YAML,
+                "sink_path_bindings": {"main": {"path": {"folder": "outputs", "relative_path": "link/x.json"}}},
+            },
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert "main.path" in resp.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_binding_refuses_an_option_that_already_has_a_value(self, tmp_path: Path) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebase", "local")
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={
+                "yaml": _SINK_BINDING_YAML_WITH_PATH,
+                "sink_path_bindings": {"main": {"path": {"folder": "outputs", "relative_path": "x.json"}}},
+            },
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert "main.path" in resp.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_binding_refuses_credential_material_in_the_path(self, tmp_path: Path) -> None:
+        """The bound path is persisted after the YAML's own credential guard ran, so it carries its own."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebase", "local")
+        candidate = "sk-" + "a" * 24
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={
+                "yaml": _REBIND_NODE_YAML,
+                "sink_path_bindings": {"main": {"path": {"folder": "outputs", "relative_path": f"{candidate}.json"}}},
+            },
+        )
+
+        assert resp.status_code == 422, resp.text
+        # This bare test app keeps FastAPI's default 422 body; the real app's
+        # RequestValidationError handler strips the echoed input.
+        assert [error["type"] for error in resp.json()["detail"]] == ["credential_material_rejected"]
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "binding",
+        [
+            pytest.param({"folder": "payloads", "relative_path": "x.json"}, id="unknown-folder"),
+            pytest.param({"folder": "outputs", "relative_path": "x.json", "extra": 1}, id="extra-key"),
+            pytest.param({"folder": "outputs"}, id="missing-relative-path"),
+            pytest.param({"folder": "outputs", "relative_path": "a" * 1025}, id="longer-than-1024"),
+        ],
+    )
+    async def test_binding_request_shape_is_validated(self, tmp_path: Path, binding: dict[str, Any]) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebase", "local")
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={"yaml": _REBIND_NODE_YAML, "sink_path_bindings": {"main": {"path": binding}}},
+        )
+
+        assert resp.status_code == 422, resp.text
+        assert await service.get_current_state(session.id) is None

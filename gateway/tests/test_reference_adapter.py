@@ -595,3 +595,81 @@ def test_build_invoke_forwards_reasoning_effort_as_generation_deliberation(effor
     plan = adapter.build_invoke(request)
 
     assert plan.body["generation"] == {"target": "backend-a", "deliberation": effort}
+
+
+# --- thinking blocks ------------------------------------------------------------
+
+
+def test_build_invoke_forwards_assistant_thinking_blocks_as_musings_before_operations():
+    from elspeth_llm_gateway.sdk.types import CanonicalThinkingBlock
+
+    adapter = ReferenceV1InvokeAdapter()
+    request = CanonicalRequest(
+        model_target={"target": "backend-a"},
+        model_alias="gpt-4o",
+        messages=(
+            CanonicalMessage(role="user", content="hi"),
+            CanonicalMessage(
+                role="assistant",
+                content=None,
+                tool_calls=(CanonicalToolCall(call_id="call_1", name="lookup", arguments_json="{}"),),
+                thinking_blocks=(
+                    CanonicalThinkingBlock(kind="thinking", thinking="let me think", signature="sig-abc"),
+                    CanonicalThinkingBlock(kind="redacted_thinking", data="opaque-blob"),
+                ),
+            ),
+            CanonicalMessage(role="tool", content="42", tool_call_id="call_1"),
+        ),
+        temperature=None,
+        seed=None,
+        max_tokens=None,
+        reasoning_effort="medium",
+    )
+
+    plan = adapter.build_invoke(request)
+
+    assert plan.body["conversation"][1] == {
+        "speaker": "assistant",
+        "musings": [{"kind": "thought", "text": "let me think", "seal": "sig-abc"}, {"kind": "sealed", "blob": "opaque-blob"}],
+        "operations": [{"ref": "call_1", "operation": "lookup", "payload": {}}],
+    }
+
+
+def test_parse_success_returns_musings_as_thinking_blocks_in_order():
+    adapter = ReferenceV1InvokeAdapter()
+    body = {
+        "result": {
+            "musings": [{"kind": "thought", "text": "let me think", "seal": "sig-abc"}, {"kind": "sealed", "blob": "opaque-blob"}],
+            "invocations": [{"ref": "call_1", "operation": "lookup", "payload": {}}],
+        },
+        "halt": "operations",
+    }
+
+    response = adapter.parse_success(body)
+
+    assert [(block.kind, block.thinking, block.signature, block.data) for block in response.thinking_blocks] == [
+        ("thinking", "let me think", "sig-abc", None),
+        ("redacted_thinking", None, None, "opaque-blob"),
+    ]
+
+
+def test_parse_success_without_musings_returns_no_thinking_blocks():
+    adapter = ReferenceV1InvokeAdapter()
+    assert adapter.parse_success({"result": {"text": "hi"}, "halt": "complete"}).thinking_blocks == ()
+
+
+def test_parse_success_rejects_an_unknown_musing_kind():
+    adapter = ReferenceV1InvokeAdapter()
+    with pytest.raises(ValueError, match="musing"):
+        adapter.parse_success({"result": {"text": "hi", "musings": [{"kind": "daydream", "text": "x"}]}, "halt": "complete"})
+
+
+@pytest.mark.parametrize(
+    "musing",
+    [{"text": "x"}, {"kind": "thought", "text": "x"}, {"kind": "thought", "seal": "s"}, {"kind": "sealed"}],
+    ids=["no-kind", "thought-no-seal", "thought-no-text", "sealed-no-blob"],
+)
+def test_parse_success_rejects_an_incomplete_musing_with_a_value_error(musing):
+    adapter = ReferenceV1InvokeAdapter()
+    with pytest.raises(ValueError, match="musing"):
+        adapter.parse_success({"result": {"text": "hi", "musings": [musing]}, "halt": "complete"})

@@ -1,6 +1,10 @@
+import { readFileSync } from "node:fs";
 import type { JSX } from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { parseResponse } from "@/api/client";
 import { render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { useSessionStore } from "@/stores/sessionStore";
 import { axe, toHaveNoViolations } from "jest-axe";
 import { SharedInspectView } from "./SharedInspectView";
 import { ReadOnlyProvider, useReadOnly } from "@/contexts/ReadOnlyContext";
@@ -68,6 +72,8 @@ const _validResponse: SharedInspectResponse = {
   created_by_username: "alice-the-analyst",
   created_at: "2026-05-19T00:00:00+00:00",
   expires_at: "2026-06-19T00:00:00+00:00",
+  import_allowed: false,
+  files: [],
 };
 
 describe("SharedInspectView", () => {
@@ -506,5 +512,259 @@ describe("SharedInspectView scroll ownership", () => {
     );
     expect(style.overflowY).toBe("auto");
     expect(style.minHeight).toBe("0px");
+  });
+});
+
+describe("SharedInspectView import", () => {
+  const importable: SharedInspectResponse = {
+    ..._validResponse,
+    import_allowed: true,
+    files: [
+      { filename: "people.csv", size_bytes: 2048 },
+      { filename: "notes.txt", size_bytes: 12 },
+    ],
+  };
+  const BUTTON = { name: "Import a copy into my workspace" };
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    window.location.hash = "#/shared/abc";
+  });
+
+  async function renderImportable(): Promise<void> {
+    vi.spyOn(api, "fetchSharedInspect").mockResolvedValueOnce(importable);
+    render(<SharedInspectView token="abc" />);
+    await screen.findByTestId("shared-inspect-loaded");
+  }
+
+  it("offers no import button for a view-only link", async () => {
+    vi.spyOn(api, "fetchSharedInspect").mockResolvedValueOnce(_validResponse);
+    render(<SharedInspectView token="abc" />);
+    await screen.findByTestId("shared-inspect-loaded");
+    expect(screen.queryByRole("button", BUTTON)).toBeNull();
+    expect(screen.queryByTestId("shared-inspect-import-files")).toBeNull();
+  });
+
+  it("lists the files an import would copy, with sizes", async () => {
+    await renderImportable();
+    const list = screen.getByRole("list", { name: "Files that will be copied" });
+    const items = within(list).getAllByRole("listitem");
+    expect(items.map((i) => i.textContent)).toEqual([
+      "people.csv (2.0 KB)",
+      "notes.txt (12 B)",
+    ]);
+  });
+
+  it("imports, reloads sessions, then navigates to the new session", async () => {
+    await renderImportable();
+    const order: string[] = [];
+    vi.spyOn(api, "importSharedSnapshot").mockResolvedValueOnce({
+      session_id: "sess-new",
+      state_id: "st-1",
+    });
+    const loadSessions = vi.fn().mockImplementation(async () => {
+      order.push(`load:${window.location.hash}`);
+    });
+    vi.spyOn(useSessionStore, "getState").mockReturnValue({ loadSessions } as never);
+    await userEvent.click(screen.getByRole("button", BUTTON));
+    await waitFor(() => expect(window.location.hash).toBe("#/sess-new"));
+    expect(api.importSharedSnapshot).toHaveBeenCalledWith("abc", expect.anything());
+    expect(order).toEqual(["load:#/shared/abc"]);
+  });
+
+  it.each([
+    ["before the import returns", "import"],
+    ["while the session list reloads", "sessions"],
+  ])("does not navigate when the user left the link %s", async (_label, leaveDuring) => {
+    vi.spyOn(api, "fetchSharedInspect").mockResolvedValueOnce(importable);
+    const view = render(<SharedInspectView token="abc" />);
+    await screen.findByTestId("shared-inspect-loaded");
+    let resolveImport!: (v: { session_id: string; state_id: string }) => void;
+    vi.spyOn(api, "importSharedSnapshot").mockImplementationOnce(
+      () => new Promise((r) => { resolveImport = r; }),
+    );
+    let resolveSessions!: () => void;
+    const loadSessions = vi.fn().mockImplementation(
+      () => new Promise<void>((r) => { resolveSessions = r; }),
+    );
+    vi.spyOn(useSessionStore, "getState").mockReturnValue({ loadSessions } as never);
+    await userEvent.click(screen.getByRole("button", BUTTON));
+
+    // The user picks another pipeline: App unmounts this view.
+    const leave = (): void => {
+      window.location.hash = "#/other-session";
+      view.unmount();
+    };
+    if (leaveDuring === "import") leave();
+    resolveImport({ session_id: "sess-new", state_id: "st-1" });
+    await waitFor(() => expect(loadSessions).toHaveBeenCalledTimes(1));
+    if (leaveDuring === "sessions") leave();
+    resolveSessions();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(window.location.hash).toBe("#/other-session");
+  });
+
+  it("disables the button while the import is in flight", async () => {
+    await renderImportable();
+    let resolve!: (v: { session_id: string; state_id: string }) => void;
+    const imp = vi.spyOn(api, "importSharedSnapshot").mockImplementationOnce(
+      () => new Promise((r) => { resolve = r; }),
+    );
+    vi.spyOn(useSessionStore, "getState").mockReturnValue({
+      loadSessions: vi.fn().mockResolvedValue(undefined),
+    } as never);
+    await userEvent.click(screen.getByRole("button", BUTTON));
+    expect(screen.getByRole("button", BUTTON)).toBeDisabled();
+    await userEvent.click(screen.getByRole("button", BUTTON));
+    expect(imp).toHaveBeenCalledTimes(1);
+    resolve({ session_id: "s2", state_id: "x" });
+    await waitFor(() => expect(window.location.hash).toBe("#/s2"));
+  });
+
+  it.each([
+    [{ status: 401, detail: "bad token" }, "This share link has expired", true],
+    [{ status: 403, detail: "This share link does not allow import" }, "This link doesn't allow importing", false],
+    [
+      {
+        status: 403,
+        error_type: "user_role_required",
+        detail: "A live deployment-wide user role is required for pipeline authoring and execution",
+      },
+      "Your account doesn't have the role needed to import pipelines. Ask an administrator for access.",
+      false,
+    ],
+    [{ status: 404, detail: "gone" }, "ask the sender for a fresh link", true],
+    [{ status: 413, detail: "quota" }, "You don't have enough storage to import these files", true],
+    [{ status: 422 }, "This pipeline can't be imported into your workspace", false],
+    [{ status: 400 }, "This pipeline can't be imported into your workspace", false],
+    [{ status: 429, detail: "Rate limit exceeded" }, "Too many import attempts. Wait a minute and try again.", true],
+    [
+      { status: 503, detail: "Importing a shared pipeline is unavailable" },
+      "Importing shared pipelines is unavailable right now. Try again later.",
+      true,
+    ],
+    [{ status: 500, detail: "boom" }, "Couldn't import the shared pipeline", true],
+  ])("shows the mapped message for %j", async (failure, text, retryable) => {
+    await renderImportable();
+    vi.spyOn(api, "importSharedSnapshot").mockRejectedValueOnce(failure);
+    await userEvent.click(screen.getByRole("button", BUTTON));
+    const alert = await screen.findByTestId("shared-inspect-import-error");
+    expect(alert).toHaveTextContent(text);
+    expect(alert).toHaveAttribute("role", "alert");
+    if (retryable) expect(screen.getByRole("button", BUTTON)).toBeEnabled();
+    else expect(screen.getByRole("button", BUTTON)).toBeDisabled();
+    expect(window.location.hash).toBe("#/shared/abc");
+    // The loaded view stays on screen after a failed import.
+    expect(screen.getByTestId("shared-inspect-loaded")).toBeInTheDocument();
+  });
+
+  // Refusal bodies recorded from the real import route. The backend test
+  // (tests/unit/web/shareable_reviews/test_importer.py) asserts the server
+  // still sends exactly these, so this replay cannot drift from the wire.
+  const REFUSALS = JSON.parse(
+    readFileSync("src/test/fixtures/shared-import-refusals.json", "utf8"),
+  ) as Record<string, { status: number; statusText: string; body: unknown }>;
+
+  /** The error the real client parser raises for a recorded response. */
+  async function parsedRefusal(
+    recorded: { status: number; statusText: string; body: unknown },
+  ): Promise<unknown> {
+    const response = new Response(JSON.stringify(recorded.body), {
+      status: recorded.status,
+      statusText: recorded.statusText,
+      headers: { "Content-Type": "application/json" },
+    });
+    try {
+      await parseResponse<unknown>(response);
+    } catch (error) {
+      return error;
+    }
+    throw new Error("expected the recorded refusal to be rejected");
+  }
+
+  async function importFailsWith(failure: unknown): Promise<HTMLElement> {
+    await renderImportable();
+    vi.spyOn(api, "importSharedSnapshot").mockRejectedValueOnce(failure);
+    await userEvent.click(screen.getByRole("button", BUTTON));
+    return screen.findByTestId("shared-inspect-import-error");
+  }
+
+  it("names the component a plugin-policy refusal is about", async () => {
+    const alert = await importFailsWith(await parsedRefusal(REFUSALS.plugin_policy));
+    expect(alert).toHaveTextContent(
+      'This pipeline uses source:blob_rows (in "docs"), which isn\'t enabled for your account, '
+        + "so it can't be imported into your workspace.",
+    );
+    expect(alert).not.toHaveTextContent("Unprocessable Entity");
+    expect(screen.getByRole("button", BUTTON)).toBeDisabled();
+  });
+
+  it("still explains a plugin-policy refusal behind a proxy that drops the status text", async () => {
+    const alert = await importFailsWith(
+      await parsedRefusal({ ...REFUSALS.plugin_policy, statusText: "" }),
+    );
+    expect(alert).toHaveTextContent("This pipeline uses source:blob_rows");
+    expect(screen.getByRole("button", BUTTON)).toBeDisabled();
+  });
+
+  it("says the pipeline is too large when the YAML cap refuses it", async () => {
+    const alert = await importFailsWith(await parsedRefusal(REFUSALS.yaml_too_large));
+    expect(alert).toHaveTextContent("This pipeline is too large to import into your workspace.");
+    expect(alert).not.toHaveTextContent("Unprocessable Entity");
+    expect(screen.getByRole("button", BUTTON)).toBeDisabled();
+  });
+
+  it("shows the seeder's reason for a 400 refusal and does not offer a retry", async () => {
+    const alert = await importFailsWith(await parsedRefusal({
+      status: 400,
+      statusText: "Bad Request",
+      body: { detail: "source_blob_rows.docs lists the same blob more than once" },
+    }));
+    expect(alert).toHaveTextContent(
+      "This pipeline can't be imported into your workspace: source_blob_rows.docs lists the same blob more than once",
+    );
+    expect(screen.getByRole("button", BUTTON)).toBeDisabled();
+  });
+
+  it("does not show a bare status text as the reason", async () => {
+    const alert = await importFailsWith(await parsedRefusal({
+      status: 422,
+      statusText: "Unprocessable Entity",
+      body: { detail: { error_type: "something_new" } },
+    }));
+    expect(alert).toHaveTextContent("This pipeline can't be imported into your workspace");
+    expect(alert).not.toHaveTextContent("Unprocessable Entity");
+  });
+
+  it("does not blame the link for a missing role", async () => {
+    await renderImportable();
+    vi.spyOn(api, "importSharedSnapshot").mockRejectedValueOnce({
+      status: 403,
+      error_type: "user_role_required",
+      detail: "A live deployment-wide user role is required for pipeline authoring and execution",
+    });
+    await userEvent.click(screen.getByRole("button", BUTTON));
+    const alert = await screen.findByTestId("shared-inspect-import-error");
+    expect(alert).not.toHaveTextContent(/link/i);
+  });
+
+  it("treats an authentication 401 as sign-in recovery, not an expired link", async () => {
+    await renderImportable();
+    vi.spyOn(api, "importSharedSnapshot").mockRejectedValueOnce({
+      status: 401,
+      error_type: "authentication_required",
+      detail: "Not authenticated",
+    });
+    await userEvent.click(screen.getByRole("button", BUTTON));
+    const alert = await screen.findByTestId("shared-inspect-import-error");
+    expect(alert).toHaveTextContent(/sign.in/i);
+    expect(alert).not.toHaveTextContent(/expired/i);
+    expect(screen.getByRole("button", BUTTON)).toBeEnabled();
+  });
+
+  it("has no axe violations with the import affordance", async () => {
+    await renderImportable();
+    expect(await axe(screen.getByTestId("shared-inspect-loaded"))).toHaveNoViolations();
   });
 });

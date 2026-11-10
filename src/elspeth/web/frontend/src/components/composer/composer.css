@@ -132,3 +132,75 @@
 .save-for-review-error > p {
   margin: 0 0 var(--space-sm);
 }
+
+/* Configure step: choose whether recipients may import a copy and how long
+   the link lives before anything is minted. */
+.save-for-review-configure {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.save-for-review-option {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.save-for-review-option-label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  min-height: var(--size-control-compact);
+  color: var(--color-text);
+}
+
+.save-for-review-option .save-for-review-tip {
+  margin: 0;
+}
+
+.save-for-review-lifetime {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.save-for-review-lifetime > legend {
+  padding: 0;
+  margin-bottom: var(--space-xs);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.save-for-review-file-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  font-size: var(--font-size-sm);
+}
+
+.save-for-review-file-list > li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs) var(--space-sm);
+}
+
+.save-for-review-file-name {
+  font-family: var(--font-mono);
+}
+
+.save-for-review-file-size,
+.save-for-review-file-used-by {
+  color: var(--color-text-muted);
+}
+
+.save-for-review-configure-actions {
+  display: flex;
+  justify-content: flex-end;
+}

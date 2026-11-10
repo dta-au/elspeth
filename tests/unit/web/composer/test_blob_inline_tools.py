@@ -1063,6 +1063,17 @@ def test_set_nested_option_rejects_non_object_segment_collision() -> None:
         _set_nested_option({"a": 5}, ["a", "b"], "marker")
 
 
+def test_set_nested_option_refuses_occupied_leaf_when_not_replacing() -> None:
+    """YAML import re-binding fills an empty slot and never overwrites; the
+    wire tool keeps its replace-in-place default."""
+    from elspeth.web.composer.tools.blobs import _set_nested_option
+
+    with pytest.raises(ValueError, match=r"leaf 'b' already holds a value"):
+        _set_nested_option({"a": {"b": "kept"}}, ["a", "b"], "marker", replace_existing=False)
+    assert _set_nested_option({"a": {"b": "old"}}, ["a", "b"], "marker") == {"a": {"b": "marker"}}
+    assert _set_nested_option({}, ["a", "b"], "marker", replace_existing=False) == {"a": {"b": "marker"}}
+
+
 def test_set_nested_option_rejects_empty_field_path() -> None:
     from elspeth.web.composer.tools.blobs import _set_nested_option
 

@@ -1,0 +1,28 @@
+{
+  "plugin_policy": {
+    "status": 422,
+    "statusText": "Unprocessable Entity",
+    "body": {
+      "detail": {
+        "error_code": "plugin_not_enabled",
+        "component_id": "docs",
+        "plugin_id": "source:blob_rows",
+        "snapshot_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "request_id": "00000000-0000-4000-8000-000000000000"
+      }
+    }
+  },
+  "yaml_too_large": {
+    "status": 422,
+    "statusText": "Unprocessable Entity",
+    "body": {
+      "detail": [
+        {
+          "type": "string_too_long",
+          "loc": ["yaml"],
+          "msg": "String should have at most 262144 characters"
+        }
+      ]
+    }
+  }
+}

@@ -14,6 +14,7 @@ from typing import Any, Literal, cast
 
 import yaml
 
+from elspeth.contracts.blobs_inline import is_headless_blob_ref_fragment
 from elspeth.contracts.enums import OutputMode
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.composer.state import (
@@ -284,7 +285,8 @@ def _optional_mapping(value: Any, path: str) -> Mapping[str, Any]:
     suppresses=("R5",),
     invariant=(
         "raises RuntimeYamlImportError for non-string mapping keys and for any value other than str, int, "
-        "finite float, bool, None, a non-string non-bytes sequence or a mapping, at every nested depth"
+        "finite float, bool, None, a non-string non-bytes sequence or a mapping, at every nested depth, "
+        "and for any nested value that is a widened blob marker stripped of its blob_ref"
     ),
     test_ref="tests/unit/web/composer/test_yaml_importer.py::test_reject_non_string_mapping_keys_rejects_non_json_keys_and_values",
     test_fingerprint="b84a5347dde33aa8ea4f9808c1a87070a8b56f2497489b2b83cea4ce47b65bfd",
@@ -298,17 +300,24 @@ def _reject_non_string_mapping_keys(value: object, path: str) -> None:
     the first four fail at the composition-state INSERT and a NaN persists as
     non-standard JSON that reads back as null. Messages name the dotted path
     and the type only, never the value.
+
+    A nested widened blob marker whose ``blob_ref`` is missing is refused too:
+    it names no file, so admitting it would persist an option value that can
+    never resolve and fails later as an unrelated type error. Only nested
+    values are checked, never the options mapping itself.
     """
     if isinstance(value, Mapping):
         for key, item in value.items():
             if not isinstance(key, str):
                 raise RuntimeYamlImportError(f"{path} contains non-string mapping key {key!r}")
+            _reject_headless_blob_marker(item, f"{path}.{key}")
             _reject_non_string_mapping_keys(item, f"{path}.{key}")
         return
     if isinstance(value, (bytes, bytearray)):
         raise RuntimeYamlImportError(f"{path} must be a JSON value, got {type(value).__name__}")
     if isinstance(value, Sequence) and not isinstance(value, str):
         for index, item in enumerate(value):
+            _reject_headless_blob_marker(item, f"{path}[{index}]")
             _reject_non_string_mapping_keys(item, f"{path}[{index}]")
         return
     if value is None or isinstance(value, (str, bool, int)):
@@ -316,6 +325,14 @@ def _reject_non_string_mapping_keys(value: object, path: str) -> None:
     if isinstance(value, float) and isfinite(value):
         return
     raise RuntimeYamlImportError(f"{path} must be a JSON value, got {type(value).__name__}")
+
+
+def _reject_headless_blob_marker(value: object, path: str) -> None:
+    if is_headless_blob_ref_fragment(value):
+        raise RuntimeYamlImportError(
+            f"{path} is an uploaded-file marker whose file reference was removed (a custody-redacted export); "
+            "re-attach the file in this session instead of importing the marker"
+        )
 
 
 def _json_mapping(value: Any, path: str) -> Mapping[str, Any]:

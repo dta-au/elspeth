@@ -16,7 +16,10 @@ Request body POSTed to ``v1/invoke``::
     {
         "conversation": [
             {"speaker": "<role>", "text": "<content>"},
-            {"speaker": "assistant", "operations": [
+            {"speaker": "assistant", "musings": [
+                {"kind": "thought", "text": "<thinking>", "seal": "<signature>"} |
+                {"kind": "sealed", "blob": "<redacted data>"}
+            ]?, "operations": [
                 {"ref": "<call id>", "operation": "<tool name>", "payload": {...}}
             ]},
             {"speaker": "tool", "text": "<result>", "operation_ref": "<call id>"}
@@ -65,6 +68,7 @@ Success response body::
     {
         "result": {
             "text": "..."?,
+            "musings": [<same shapes as the request's musings>]?,
             "invocations": [
                 {"ref": "<call id>", "operation": "<name>", "payload": {...}}
             ]?
@@ -99,6 +103,7 @@ from elspeth_llm_gateway.sdk.types import (
     CanonicalMessage,
     CanonicalRequest,
     CanonicalResponse,
+    CanonicalThinkingBlock,
     CanonicalToolCall,
     CanonicalUsage,
     Capability,
@@ -139,11 +144,38 @@ def _build_tool_call(invocation: dict) -> CanonicalToolCall:
     )
 
 
+def _musing(block: CanonicalThinkingBlock) -> dict:
+    if block.kind == "thinking":
+        return {"kind": "thought", "text": block.thinking, "seal": block.signature}
+    return {"kind": "sealed", "blob": block.data}
+
+
+def _thinking_block(musing: dict) -> CanonicalThinkingBlock:
+    # TRANSLATION POINT: the inverse of ``_musing`` for the upstream's
+    # returned thinking.
+    if "kind" not in musing:
+        raise ValueError("reference_v1_invoke: musing missing 'kind'")
+    required = {"thought": ("text", "seal"), "sealed": ("blob",)}
+    if musing["kind"] not in required:
+        raise ValueError(f"reference_v1_invoke: unknown musing kind {musing['kind']!r}")
+    for field in required[musing["kind"]]:
+        if field not in musing:
+            raise ValueError(f"reference_v1_invoke: musing missing {field!r}")
+    if musing["kind"] == "thought":
+        return CanonicalThinkingBlock(kind="thinking", thinking=musing["text"], signature=musing["seal"])
+    return CanonicalThinkingBlock(kind="redacted_thinking", data=musing["blob"])
+
+
 def _conversation_entry(message: CanonicalMessage) -> dict:
     # TRANSLATION POINT: a real agency's message-entry shape (role names,
     # field names for text/tool-calls/tool-results) will differ from this
     # fictional speaker/text/operations/operation_ref shape.
     entry: dict = {"speaker": message.role}
+    if message.thinking_blocks:
+        # TRANSLATION POINT: a real agency's thinking-replay shape will differ
+        # from this fictional musings shape. Every opaque value (seal, blob)
+        # must reach the upstream byte-for-byte and in order.
+        entry["musings"] = [_musing(block) for block in message.thinking_blocks]
     if message.content is not None and not (message.role == "assistant" and message.content == "" and message.tool_calls):
         entry["text"] = message.content
     if message.tool_calls:
@@ -314,7 +346,11 @@ class ReferenceV1InvokeAdapter:
                 total_tokens=input_units + output_units,
             )
 
-        return CanonicalResponse(text=text, tool_calls=tool_calls, finish_reason=finish_reason, usage=usage)
+        thinking_blocks = tuple(_thinking_block(musing) for musing in result["musings"]) if "musings" in result else ()
+
+        return CanonicalResponse(
+            text=text, tool_calls=tool_calls, finish_reason=finish_reason, usage=usage, thinking_blocks=thinking_blocks
+        )
 
     def classify_error(self, failure: UpstreamFailure) -> ErrorClassification:
         if failure.body is not None and "fault" in failure.body:
