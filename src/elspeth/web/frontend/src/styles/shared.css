@@ -652,6 +652,11 @@
   display: flex;
   flex-direction: column;
   background-color: var(--color-surface);
+  /* ARGOnite: a dialog owns its ink. Dialogs are not portalled, so one
+     mounted under .app-header (the session switcher's archive confirm) would
+     otherwise inherit --color-on-nav, which is white in the light theme, for
+     any text that does not set its own colour. */
+  color: var(--color-text);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-modal);
