@@ -11,7 +11,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Final, Literal, TypedDict, final
+from typing import Any, Final, Literal, TypedDict, assert_never, final
 from uuid import UUID
 
 from opentelemetry import metrics
@@ -24,7 +24,7 @@ from elspeth.contracts.schema import FieldDefinition, get_aggregation_contract_o
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.contracts.value_source import get_catalog_values
-from elspeth.core.expression_parser import ExpressionEvaluationError, ExpressionParser
+from elspeth.core.expression_parser import ExpressionEvaluationError, ExpressionEvaluationKind, ExpressionParser
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import (
     get_shared_plugin_manager,
@@ -3094,21 +3094,18 @@ def _gate_expression_type_diagnostics_for_observed_csv(
         for row_index, row in enumerate(rows):
             try:
                 parser.evaluate(row)
-            except ExpressionEvaluationError:
+            except ExpressionEvaluationError as exc:
+                message, suggested_repair = _gate_evaluation_failure_text(
+                    exc.kind,
+                    node_id=node.id,
+                    condition=condition,
+                    field=field,
+                )
                 diagnostics.append(
                     _blocking_diagnostic(
                         code="gate_expression_type_mismatch_against_source_schema",
-                        message=(
-                            f"Gate '{node.id}' condition {condition!r} fails against sampled observed CSV "
-                            "rows before runtime. Observed CSV source values are strings unless the "
-                            "source schema declares explicit field types. (The raw evaluation error is "
-                            "withheld: it can quote sampled row values and the observed field/key set.)"
-                        ),
-                        suggested_repair=(
-                            "Patch the source schema to declare the compared field with an explicit numeric "
-                            "type, for example schema.mode='fixed' or 'flexible' with schema.fields including "
-                            f"{field + ': int' if field is not None else '<field>: int'}, then re-run preview_pipeline."
-                        ),
+                        message=message,
+                        suggested_repair=suggested_repair,
                         evidence_locator={
                             "source": "blob",
                             "blob_id": str(blob_id),
@@ -3151,6 +3148,91 @@ def _gate_expression_type_diagnostics_for_observed_csv(
                 )
                 break
     return diagnostics
+
+
+_GATE_EVALUATION_WITHHELD_NOTE: Final[str] = (
+    "(The raw evaluation error is withheld: it can quote sampled row values and the observed field/key set.)"
+)
+
+
+def _gate_evaluation_failure_text(
+    kind: ExpressionEvaluationKind,
+    *,
+    node_id: str,
+    condition: str,
+    field: str | None,
+) -> tuple[str, str]:
+    """Value-free ``(message, suggested_repair)`` for a gate that failed on sampled rows.
+
+    Dispatches on the closed ``ExpressionEvaluationKind`` so the text names the
+    actual cause: only ``incompatible_types`` is the observed-CSV string-typing
+    problem that the numeric-field-type repair fixes. Every other kind would be
+    mis-repaired by it (a misspelt field name is not cured by declaring a type).
+    Only ``kind`` is used — never the evaluator text, which can quote row
+    values and the observed key set.
+    """
+    subject = f"Gate '{node_id}' condition {condition!r}"
+    match kind:
+        case "incompatible_types":
+            return (
+                f"{subject} fails against sampled observed CSV rows before runtime. Observed CSV "
+                "source values are strings unless the source schema declares explicit field types. "
+                f"{_GATE_EVALUATION_WITHHELD_NOTE}",
+                "Patch the source schema to declare the compared field with an explicit numeric "
+                "type, for example schema.mode='fixed' or 'flexible' with schema.fields including "
+                f"{field + ': int' if field is not None else '<field>: int'}, then re-run preview_pipeline.",
+            )
+        case "missing_key":
+            return (
+                f"{subject} reads a field that the sampled observed CSV rows do not carry. This is a "
+                f"field-name problem, not a field-typing mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
+                "Compare every field name the condition reads with the source's observed field names "
+                "(call inspect_source), correct the spelling in the gate condition or the source "
+                "column mapping, then re-run preview_pipeline.",
+            )
+        case "index_out_of_range":
+            return (
+                f"{subject} indexes past the end of a sequence value in the sampled rows. This is not a "
+                f"field-typing mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
+                "Guard the index (check the length first) or use an index that exists in every sampled row, then re-run preview_pipeline.",
+            )
+        case "division_by_zero":
+            return (
+                f"{subject} divides by zero for a sampled row. This is not a field-typing mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
+                "Guard the divisor in the gate condition (for example require it to be non-zero before "
+                "dividing), then re-run preview_pipeline.",
+            )
+        case "arithmetic_overflow":
+            return (
+                f"{subject} overflows during arithmetic on a sampled row. This is not a field-typing "
+                f"mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
+                "Simplify the arithmetic so it cannot produce out-of-range results (avoid large powers "
+                "or repeated multiplication), then re-run preview_pipeline.",
+            )
+        case "invalid_value":
+            return (
+                f"{subject} applied an operation to a sampled value that the operation cannot accept "
+                f"(an invalid value, not a wrong declared type). {_GATE_EVALUATION_WITHHELD_NOTE}",
+                "Restructure the condition so the operation only receives values it accepts (for "
+                "example avoid converting free-text fields with int() or float()), then re-run "
+                "preview_pipeline.",
+            )
+        case "non_finite_result":
+            return (
+                f"{subject} produced a non-finite result (NaN or infinity) for a sampled row. This is "
+                f"not a field-typing mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
+                "Rework the arithmetic so it cannot yield NaN or infinity (guard the operands), then re-run preview_pipeline.",
+            )
+        case "unexpected_error":
+            return (
+                f"{subject} failed with an unexpected evaluation error against sampled observed CSV "
+                "rows (this includes resource failures such as memory exhaustion). It is not a "
+                f"field-typing mismatch. {_GATE_EVALUATION_WITHHELD_NOTE}",
+                "Simplify the gate condition so it uses plain comparisons over the fields it needs and "
+                "does not build large intermediate values, then re-run preview_pipeline.",
+            )
+        case _:
+            assert_never(kind)
 
 
 _NUMERIC_VALUE_FIELD_AGGREGATION_PLUGINS: Final[frozenset[str]] = frozenset(

@@ -3578,6 +3578,111 @@ class TestPreviewProofStep:
             mismatch = [d for d in diagnostics if d["code"] == "gate_expression_type_mismatch_against_source_schema"]
             assert not mismatch, mismatch
 
+    def _preview_gate_against_observed_csv(self, condition: str, evaluator_patch: Any = None) -> list[dict[str, Any]]:
+        """Preview a one-gate pipeline over the observed CSV; return the mismatch diagnostics.
+
+        ``evaluator_patch`` is an optional context manager that replaces the
+        evaluator's ``visit`` so a kind the sampled CSV rows cannot naturally
+        produce (division by zero, a wrapped MemoryError) reaches the REAL
+        ``ExpressionParser.evaluate`` wrapping logic.
+        """
+        import contextlib
+
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
+            )
+            upserted = execute_tool(
+                "upsert_node",
+                {
+                    "id": "kind_gate",
+                    "node_type": "gate",
+                    "plugin": None,
+                    "input": "rows",
+                    "condition": condition,
+                    "routes": {"true": "out", "false": "out"},
+                    "options": {},
+                },
+                state,
+                _mock_catalog(),
+            )
+            assert upserted.success, upserted.data
+            with evaluator_patch if evaluator_patch is not None else contextlib.nullcontext():
+                result = execute_tool(
+                    "preview_pipeline",
+                    {},
+                    upserted.updated_state,
+                    _mock_catalog(),
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                    data_dir=str(self.data_dir),
+                    session_operation_authority=authority,
+                    session_operation_context=context,
+                )
+            assert result.data["preview_is_valid"] is False
+            return [d for d in result.data["proof_diagnostics"] if d["code"] == "gate_expression_type_mismatch_against_source_schema"]
+
+    def test_observed_csv_gate_missing_key_does_not_prescribe_numeric_typing(self) -> None:
+        """A misspelt field name is a missing_key failure: still blocking under the
+        same code, but the repair must point at the field name, not a numeric type."""
+        mismatch = self._preview_gate_against_observed_csv("row['prcie'] >= 100")
+        assert mismatch
+        diag = mismatch[0]
+        assert diag["severity"] == "blocking"
+        text = f"{diag['message']} {diag['suggested_repair']}".lower()
+        assert "inspect_source" in diag["suggested_repair"]
+        assert "numeric" not in text
+        assert "schema.fields" not in text
+        assert ": int" not in text
+
+    def test_observed_csv_gate_division_by_zero_does_not_prescribe_numeric_typing(self) -> None:
+        from unittest.mock import patch
+
+        from elspeth.core.expression_parser import ExpressionEvaluationError, _ExpressionEvaluator
+
+        def raising_visit(self: Any, node: Any) -> Any:
+            raise ExpressionEvaluationError("division by zero", kind="division_by_zero")
+
+        mismatch = self._preview_gate_against_observed_csv(
+            "row['price'] >= 100", patch.object(_ExpressionEvaluator, "visit", raising_visit)
+        )
+        assert mismatch
+        diag = mismatch[0]
+        assert diag["severity"] == "blocking"
+        text = f"{diag['message']} {diag['suggested_repair']}".lower()
+        assert "divisor" in text
+        assert "numeric" not in text
+        assert ": int" not in text
+
+    def test_observed_csv_gate_wrapped_memory_error_is_not_schema_typing_repair(self) -> None:
+        """MemoryError inside the evaluator is wrapped by ExpressionParser.evaluate
+        as kind=unexpected_error (it is not in TIER_1_ERRORS), so it reaches the
+        ExpressionEvaluationError arm: it must not be told to declare a numeric type."""
+        from unittest.mock import patch
+
+        from elspeth.core.expression_parser import _ExpressionEvaluator
+
+        def exploding_visit(self: Any, node: Any) -> Any:
+            raise MemoryError("simulated allocation failure")
+
+        mismatch = self._preview_gate_against_observed_csv(
+            "row['price'] >= 100", patch.object(_ExpressionEvaluator, "visit", exploding_visit)
+        )
+        assert mismatch
+        diag = mismatch[0]
+        assert diag["severity"] == "blocking"
+        text = f"{diag['message']} {diag['suggested_repair']}".lower()
+        assert "numeric" not in text
+        assert ": int" not in text
+        assert "simulated allocation failure" not in text
+
+    def test_observed_csv_gate_incompatible_types_keeps_numeric_typing_repair(self) -> None:
+        mismatch = self._preview_gate_against_observed_csv("row['price'] >= 100")
+        assert mismatch
+        repair = mismatch[0]["suggested_repair"]
+        assert "numeric" in repair
+        assert "price: int" in repair
+
     def test_observed_csv_batch_stats_string_value_field_blocks_through_transform(self) -> None:
         """Observed CSV strings must not reach numeric batch_stats at runtime.
 
