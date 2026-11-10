@@ -9,7 +9,7 @@ so the per-component request byte split from fix 4A is being recorded.
 
 The design that answers Phase 2 is
 [`docs/superpowers/specs/2026-11-09-composer-context-budget-design.md`](../superpowers/specs/2026-11-09-composer-context-budget-design.md),
-built for 0.8.12. Before every Web Composer provider call, on both the compose
+built for 0.8.13. Before every Web Composer provider call, on both the compose
 loop and the planner, a pure budgeter in
 `src/elspeth/web/composer/context_budget.py` sheds context to fit two
 ceilings, records what it shed on the call record (`context_budget`), or

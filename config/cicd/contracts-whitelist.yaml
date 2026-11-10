@@ -1123,7 +1123,7 @@ allowed_dict_patterns:
   # treats it as a separate shape; only `messages (list)` is whitelisted here.
   - "src/elspeth/web/composer/llm_response_parsing.py:apply_anthropic_cache_markers:messages (list)"
   - "src/elspeth/web/composer/prompts.py:build_messages:return (list)"
-  # Composer context budget (0.8.12): the budgeter measures and sheds the same
+  # Composer context budget (0.8.13): the budgeter measures and sheds the same
   # LiteLLM chat-completion message and tool payloads the call sites above
   # send. It reads roles, tool-call ids and byte sizes and replaces a tool
   # result's content with a constant stub; it never derives an internal
