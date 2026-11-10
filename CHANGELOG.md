@@ -4,10 +4,11 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## 0.8.12 - Unreleased (Composer tool remediation)
+## 0.8.12 - 2026-11-10
 
-This entry records the Composer tool remediation that follows the 0.8.11
-candidate. Verification status is recorded in the pull request.
+Composer tool remediation. Verification status is recorded in the pull
+request. The dated entry and package version do not establish qualification, a
+published tag or an image.
 
 ### Composer
 
@@ -104,11 +105,22 @@ candidate. Verification status is recorded in the pull request.
   `approval_proposal_pending`, `blob_content_size_limit`,
   `proposal_blob_reference_malformed`.
 - No schema epoch changed. Existing session and Landscape stores load
-  unchanged.
+  unchanged. Session epoch 78 and Landscape epoch 50 are unchanged from the
+  previous release; this release adds no schema-epoch cutover. Existing 0.8.10 session and
+  Landscape stores need no action, and the 0.8.10 cutover guidance below
+  continues to apply to older stores. This authorizes no migration, reset,
+  restamping or downgrade.
+
+### Publication and acceptance
+
+Automatic image publication from main remains held. The 0.8.12 tag and
+container publication follow successful required checks and the protected
+merge. Operator signing, live-provider acceptance and deployment remain
+separate steps.
 
 ---
 
-## Unreleased (0.8.11)
+## 0.8.11 - 2026-11-10
 
 This section records changes on the 0.8.11 candidate. It does not establish
 qualification, a published tag or an image.

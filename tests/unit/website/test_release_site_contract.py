@@ -54,6 +54,7 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     current_heading = f"\n## {CURRENT_VERSION} - "
     assert changelog.count(current_heading) == 1
     current_release = changelog.split(current_heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+    release_0810 = changelog.split("\n## 0.8.10 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_086 = changelog.split("\n## 0.8.6 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_085 = changelog.split("\n## 0.8.5 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_084 = changelog.split("\n## 0.8.4 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
@@ -62,26 +63,40 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     release_080 = changelog.split("\n## 0.8.0 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_071 = changelog.split("\n## 0.7.1 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
 
-    assert f"Session epoch advances from 77 to {SESSION_SCHEMA_EPOCH}" in current_release
-    assert f"Landscape advances from epoch 49 to {SQLITE_SCHEMA_EPOCH}" in current_release
-    assert "immutable graph snapshots" in current_release
-    assert "both distinct epoch-76" in current_release
-    assert "cannot share session stores or replicas" in current_release
-    assert "Preserve epoch-75 stores" in current_release
-    assert "epoch-77 session stores and epoch-49 Landscape stores" in " ".join(current_release.split())
-    assert f"new epoch-{SESSION_SCHEMA_EPOCH} target" in current_release
-    assert "Drain and isolate old/new deployments" in current_release
-    assert "no migration,\nreset, restamping or downgrade" in current_release
+    current_text = " ".join(current_release.split())
     release_date = current_release.splitlines()[0].strip()
     assert date.fromisoformat(release_date).isoformat() == release_date
+    assert "Composer tool remediation" in current_text
+    assert (
+        f"Session epoch {SESSION_SCHEMA_EPOCH} and Landscape epoch {SQLITE_SCHEMA_EPOCH} are unchanged from the previous release"
+        in current_text
+    )
+    assert "this release adds no schema-epoch cutover" in current_text
+    assert "Existing 0.8.10 session and Landscape stores need no action" in current_text
+    assert "This authorizes no migration, reset, restamping or downgrade" in current_text
+    assert "Session epoch advances" not in current_text
+    assert "Landscape advances from epoch" not in current_text
+    # The 0.8.10 cutover is history, pinned against its own section.
+    assert f"Session epoch advances from 77 to {SESSION_SCHEMA_EPOCH}" in release_0810
+    assert f"Landscape advances from epoch 49 to {SQLITE_SCHEMA_EPOCH}" in release_0810
+    assert "immutable graph snapshots" in release_0810
+    assert "both distinct epoch-76" in release_0810
+    assert "cannot share session stores or replicas" in release_0810
+    assert "Preserve epoch-75 stores" in release_0810
+    assert "epoch-77 session stores and epoch-49 Landscape stores" in " ".join(release_0810.split())
+    assert f"new epoch-{SESSION_SCHEMA_EPOCH} target" in release_0810
+    assert "Drain and isolate old/new deployments" in release_0810
+    assert "no migration,\nreset, restamping or downgrade" in release_0810
+    assert "Automatic image publication from main remains held" in " ".join(release_0810.split())
+    assert "The 0.8.10 tag and container publication follow successful required checks and the protected merge" in " ".join(
+        release_0810.split()
+    )
     assert "Composer correctness and recovery" in release_086
     assert "Reply admission does not clear graph" in release_086
     assert "Session epoch advances from 75 to 76" in release_086
     assert "explicitly new epoch-76 target" in release_086
-    assert "Automatic image publication from main remains held" in " ".join(current_release.split())
-    assert f"The {CURRENT_VERSION} tag and container publication follow successful required checks and the protected merge" in " ".join(
-        current_release.split()
-    )
+    assert "Automatic image publication from main remains held" in current_text
+    assert f"The {CURRENT_VERSION} tag and container publication follow successful required checks and the protected merge" in current_text
     assert "LLM compatibility and Composer recovery" in release_085
     assert "Omitted LLM temperature uses the provider default" in release_085
     assert "Session epoch 72 adds durable Composer jobs" in release_084
