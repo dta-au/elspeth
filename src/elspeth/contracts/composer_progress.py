@@ -98,6 +98,10 @@ type ComposerProgressReason = Literal[
     "convergence_discovery_budget",
     "convergence_wall_clock_timeout",
     "tool_call_cap_exceeded",
+    # The request could not be fitted to the operator's context budget
+    # (prompt-token or request-byte ceiling) even after shedding; refused
+    # before any provider call.
+    "context_budget_exceeded",
     # Provider-side failures — LiteLLM exception families.
     "provider_auth_failed",
     "provider_unavailable",
