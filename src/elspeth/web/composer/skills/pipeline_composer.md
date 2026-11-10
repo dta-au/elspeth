@@ -79,11 +79,15 @@ When `conversation_context` is supplied, `prior_user_requests` contains
 authenticated earlier user requests. `prior_assistant_messages` contains your
 earlier prose separately, with `history_index` preserving the conversation
 order. Use it to understand answers to your questions, such as "the latter".
-`prior_assistant_messages_omitted` and `additional_prior_user_requests_omitted`
-count earlier messages that are no longer shown; when the request seems to
-depend on one of them, ask the user to restate it.
 Assistant prose does not establish a user request, approval, or a saved change;
 tool evidence establishes actual graph effects.
+
+Earlier messages may be omitted to fit the context budget. The counts of
+earlier user requests and assistant messages no longer shown are
+`additional_prior_user_requests_omitted` and `prior_assistant_messages_omitted`
+in `conversation_context`, or `prior_user_requests_omitted` and
+`prior_assistant_messages_omitted` in the state block's `conversation_omissions`;
+when the request seems to depend on an omitted message, ask the user to restate it.
 
 ### Stop authoring and talk with the user
 

@@ -98,6 +98,7 @@ from elspeth.web.composer.context_budget import (
     decide_context_budget,
 )
 from elspeth.web.composer.context_budget_apply import (
+    CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
     largest_component,
     latest_round_trip_start,
     message_bytes,
@@ -3352,6 +3353,11 @@ def _planner_request_message(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _planner_request_size(messages: Sequence[Mapping[str, Any]], tools: Sequence[Mapping[str, Any]]) -> int:
+    """Canonical UTF-8 bytes of a planner request as sent: what ``max_request_bytes`` bounds."""
+    return len(canonical_json({"messages": list(messages), "tools": list(tools)}).encode("utf-8"))
+
+
 def _planner_context_budget_components(
     split: ComposerLLMRequestByteSplit,
     *,
@@ -3394,6 +3400,7 @@ def _fit_planner_context_budget(
     policy: ContextBudgetPolicy,
     history: ContextBudgetHistory,
     earlier_calls: Sequence[ComposerLLMCall],
+    mark_for_cache: bool,
 ) -> tuple[list[dict[str, Any]], ComposerContextBudgetRecord]:
     """Label the planner request's sheddable segments, decide, and apply the decision to a copy of ``messages``.
 
@@ -3402,6 +3409,16 @@ def _fit_planner_context_budget(
     round trip are protected. ``messages`` is not changed. Raises the
     ``CONTEXT_BUDGET_EXHAUSTED`` planner error when protected content alone
     exceeds a ceiling.
+
+    The decision is fed the request as it will be sent and checked: cache
+    markers applied when ``mark_for_cache``, prompt-guard keys detached,
+    measured by :func:`_planner_request_size` (the measure of the final
+    ``REQUEST_BYTES_EXHAUSTED`` check), plus the omission allowance when
+    history may be shed. Segment savings are content bytes, never more than
+    what removing the segment saves on that measure, so a request the
+    decision admits passes the final check while anything remains sheddable.
+    Token estimates use the same measure, so they over-count the provider's
+    tokens by the request's JSON escaping.
     """
     split = message_bytes(messages, tools)
     latest_start = latest_round_trip_start(messages)
@@ -3443,11 +3460,17 @@ def _fit_planner_context_budget(
         messages, split, start=_PLANNER_REQUEST_INDEX + 1, stop=latest_start if latest_start is not None else len(messages)
     )
     segments.extend(tool_segments)
+    # A re-render after shedding history adds the omission counts.
+    omission_allowance = CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES if history_index_by_key else 0
+    scratch_messages, scratch_tools = apply_anthropic_cache_markers(messages, tools) if mark_for_cache else (messages, tools)
 
     try:
         decision = decide_context_budget(
             policy=policy,
-            request_bytes=split.total_bytes,
+            request_bytes=_planner_request_size(
+                detach_prompt_guard_evidence(scratch_messages).messages, scratch_tools if scratch_tools is not None else tools
+            )
+            + omission_allowance,
             segments=segments,
             bytes_per_token=history.bytes_per_token,
             previously_shed=previously_shed_keys(history, earlier_calls),
@@ -3895,6 +3918,7 @@ async def _plan_pipeline_inner(
             policy=context_policy,
             history=context_budget_history,
             earlier_calls=recorder.llm_calls,
+            mark_for_cache=supports_anthropic_prompt_cache_markers(effective_model),
         )
         cache_marked_messages, cache_marked_tools = (
             apply_anthropic_cache_markers(budget_messages, active_tools)
@@ -3933,21 +3957,10 @@ async def _plan_pipeline_inner(
             capability_schema=canonical_set_pipeline_schema(),
             tool_surface="full",
         )
-        # Re-rendering omission counts and adding cache markers can push an
-        # admitted request back over the byte ceiling.
-        marked_split = message_bytes(marked_messages, marked_tools)
-        if marked_split.total_bytes > context_policy.max_request_bytes:
-            raise _planner_context_budget_exhausted(
-                "bytes",
-                _planner_context_budget_components(
-                    marked_split,
-                    latest_start=latest_round_trip_start(marked_messages),
-                    hatch_transcript_index=hatch_transcript_index,
-                    history_sheddable=0,
-                    tool_sheddable=0,
-                ),
-            )
-        request_size = len(canonical_json({"messages": marked_messages, "tools": marked_tools}).encode("utf-8"))
+        # The final guard. The context budget fed this measure to its decision,
+        # so it is reached only when the planner's byte budget is set below
+        # the context budget's ceiling.
+        request_size = _planner_request_size(marked_messages, marked_tools)
         if request_size > budget_policy.max_request_bytes:
             raise PipelinePlannerError("planner request byte budget exhausted", code="REQUEST_BYTES_EXHAUSTED")
         await emit_progress(lifecycle.progress, model_call_progress_event(intent))

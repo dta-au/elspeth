@@ -1754,6 +1754,18 @@ class TestConversationOmissions:
         payload = json.loads(context.split("\n", 1)[1])
         assert payload["conversation_omissions"] == {"prior_user_requests_omitted": 1, "prior_assistant_messages_omitted": 3}
 
+    def test_the_largest_omission_counts_fit_the_context_budget_allowance(self) -> None:
+        from elspeth.web.composer.context_budget_apply import CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES
+
+        largest = 10**20 - 1
+        baseline = build_context_string(_empty_state(), _stub_catalog())
+        with_counts = build_context_string(
+            _empty_state(),
+            _stub_catalog(),
+            conversation_omissions={"prior_user_requests_omitted": largest, "prior_assistant_messages_omitted": largest},
+        )
+        assert len(with_counts.encode()) - len(baseline.encode()) <= CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES
+
     @pytest.mark.parametrize(
         "omissions", [None, {"prior_user_requests_omitted": 0, "prior_assistant_messages_omitted": 0}], ids=["absent", "zero"]
     )

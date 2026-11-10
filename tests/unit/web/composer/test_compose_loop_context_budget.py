@@ -458,43 +458,111 @@ async def test_anthropic_shed_request_is_marked_hashed_recorded_and_sent_as_one(
     assert delivery_confirmations == [True]
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("model", ["openrouter/openai/gpt-5.5", _ANTHROPIC_MODEL], ids=["unmarked", "anthropic-marked"])
-async def test_applied_request_over_the_byte_ceiling_is_refused_before_any_provider_call(model: str) -> None:
-    """The decision fits the bytes it counted; the re-rendered state message and markers it did not count push it over.
+_MODELS = pytest.mark.parametrize("model", ["openrouter/openai/gpt-5.5", _ANTHROPIC_MODEL], ids=["unmarked", "anthropic-marked"])
 
-    Shedding the one assistant reply brings the counted request to exactly the
-    unshed size of the history without it, which the byte ceiling admits with
-    ten bytes to spare. Applying the shed re-renders the state message with
-    ``conversation_omissions`` (and, for Anthropic, adds cache markers), so
-    the request actually built is over the ceiling and must be refused by the
-    post-application measurement, never sent.
+
+async def _measure_split_total(model: str, history: list[ComposerHistoryMessage]) -> int:
+    """The recorded byte split of a request under a generous cap: what the record and the byte guard measure."""
+    service, session_id = _service(_GENEROUS_TOKENS, composer_model=model)
+    provider = _RecordingProvider(_make_llm_response(content="Done."))
+    result = await _compose(service, session_id, history, provider)
+    split = result.llm_calls[0].request_byte_split
+    assert split is not None
+    assert "conversation_omissions" not in _state_context(provider.requests[0]["messages"])
+    return int(split.total_bytes)
+
+
+async def _compose_or_refusal(
+    model: str, history: list[ComposerHistoryMessage], *, max_prompt_tokens: int, max_request_bytes: int
+) -> tuple[_RecordingProvider, Any]:
+    """Compose under the given ceilings; return the provider and either the result or the refusal."""
+    service, session_id = _service(max_prompt_tokens, composer_model=model, composer_planner_max_request_bytes=max_request_bytes)
+    provider = _RecordingProvider(_make_llm_response(content="Done."))
+    try:
+        result = await _compose(service, session_id, history, provider)
+    except ComposerConvergenceError as refusal:
+        return provider, refusal
+    return provider, result
+
+
+# The first reply is shed first (oldest assistant prose); the second is the "one more" segment.
+_FIRST_REPLY = _assistant("p" * 5_000)
+_SECOND_REPLY = _assistant("q" * 2_000)
+
+
+@pytest.mark.asyncio
+@_MODELS
+async def test_a_request_within_the_re_render_margin_sheds_one_more_segment_and_is_sent(model: str) -> None:
+    """Shedding the first reply lands ten bytes under the byte ceiling before the state message is re-rendered.
+
+    The re-rendered ``conversation_omissions`` (and, for Anthropic, the cache
+    markers the decision measured) would push it over, so the decision sheds
+    the second reply too and the request is sent at or under the ceiling.
     """
-    # Larger than any protected component, under the credential guard's bound,
-    # so the refusal names the current message.
+    user_request = _user(0, "Please read the CSV file.")
+    max_request_bytes = await _measure_split_total(model, [user_request, _SECOND_REPLY]) + 10
+
+    provider, result = await _compose_or_refusal(
+        model, [user_request, _FIRST_REPLY, _SECOND_REPLY], max_prompt_tokens=_GENEROUS_TOKENS, max_request_bytes=max_request_bytes
+    )
+
+    assert not isinstance(result, ComposerConvergenceError), result
+    (request,) = provider.requests
+    (call,) = result.llm_calls
+    _assert_record_matches_request(call, request)
+    assert call.request_byte_split is not None and call.request_byte_split.total_bytes <= max_request_bytes
+    assert [m for m in request["messages"] if m["role"] == "assistant"] == []
+    assert user_request["content"] in [m["content"] for m in request["messages"]]
+    assert _state_context(request["messages"])["conversation_omissions"] == {
+        "prior_user_requests_omitted": 0,
+        "prior_assistant_messages_omitted": 2,
+    }
+    assert call.context_budget is not None
+    assert call.context_budget.shed_history_indices == (1, 2)
+
+
+@pytest.mark.asyncio
+@_MODELS
+async def test_a_dispatched_request_never_exceeds_either_ceiling(model: str) -> None:
+    """Over ceilings straddling the size after one shed, every request is sent within both ceilings or refused unsent."""
+    user_request = _user(0, "Please read the CSV file.")
+    one_shed = await _measure_split_total(model, [user_request, _SECOND_REPLY])
+    history = [user_request, _FIRST_REPLY, _SECOND_REPLY]
+    deltas = (-3_000, -400, -10, 0, 10, 100, 400)
+    ceilings = [(_GENEROUS_TOKENS, one_shed + delta) for delta in deltas]
+    ceilings += [(-(-(one_shed + delta) // 3), 960 * 1024) for delta in deltas]
+    sent = 0
+    for max_prompt_tokens, max_request_bytes in ceilings:
+        provider, outcome = await _compose_or_refusal(
+            model, history, max_prompt_tokens=max_prompt_tokens, max_request_bytes=max_request_bytes
+        )
+        if isinstance(outcome, ComposerConvergenceError):
+            assert outcome.reason == "context_budget_exceeded", outcome.reason
+            assert provider.requests == [] and outcome.llm_calls == ()
+            continue
+        sent += 1
+        (call,) = outcome.llm_calls
+        assert call.request_byte_split is not None
+        assert call.request_byte_split.total_bytes <= max_request_bytes, (max_prompt_tokens, max_request_bytes)
+        assert call.context_budget is not None
+        assert call.context_budget.estimated_tokens_after <= max_prompt_tokens, (max_prompt_tokens, max_request_bytes)
+    assert sent >= len(ceilings) - 2  # the two tightest ceilings may refuse; the rest are sent
+
+
+@pytest.mark.asyncio
+async def test_with_nothing_left_to_shed_a_request_over_the_byte_ceiling_is_refused() -> None:
+    """Protected content alone over the byte ceiling is refused by the decision, naming the ceiling and the component."""
     current_message = "Please build the pipeline. " * 7_000
     assert len(current_message.encode()) < 262_144
-    user_request = _user(0, "Please read the CSV file.")
-    measure_service, measure_session = _service(_GENEROUS_TOKENS, composer_model=model)
-    measure_provider = _RecordingProvider(_make_llm_response(content="Done."))
-    with (
-        patch("litellm.acompletion", new_callable=AsyncMock, side_effect=measure_provider.complete),
-        patch.object(measure_service._preflight, "cached_runtime_preflight", new_callable=AsyncMock, return_value=_passing_preflight()),
-    ):
-        measured = await measure_service.compose(current_message, [user_request], _empty_state(), session_id=measure_session)
-    split = measured.llm_calls[0].request_byte_split
-    assert split is not None
-    request_bytes_without_reply = int(split.total_bytes)
-    assert "conversation_omissions" not in _state_context(measure_provider.requests[0]["messages"])
-
-    max_request_bytes = request_bytes_without_reply + 10
-    service, session_id = _service(_GENEROUS_TOKENS, composer_model=model, composer_planner_max_request_bytes=max_request_bytes)
+    max_request_bytes = len(current_message.encode()) + 1_000
+    service, session_id = _service(_GENEROUS_TOKENS, composer_planner_max_request_bytes=max_request_bytes)
     provider = _RecordingProvider(_make_llm_response(content="Done."))
+
     with (
         patch("litellm.acompletion", new_callable=AsyncMock, side_effect=provider.complete),
         pytest.raises(ComposerConvergenceError) as exc_info,
     ):
-        await service.compose(current_message, [user_request, _assistant("p" * 5_000)], _empty_state(), session_id=session_id)
+        await service.compose(current_message, [_user(0, "Please read the CSV file.")], _empty_state(), session_id=session_id)
 
     assert provider.requests == []
     error = exc_info.value
@@ -502,8 +570,42 @@ async def test_applied_request_over_the_byte_ceiling_is_refused_before_any_provi
     assert error.llm_calls == ()
     assert error.evidence["ceiling"] == "bytes"
     assert error.evidence["max_request_bytes"] == max_request_bytes
-    assert error.evidence["max_prompt_tokens"] == _GENEROUS_TOKENS
-    # Measured after application: over the ceiling, and by less than the
-    # assistant reply the decision shed.
-    assert max_request_bytes < error.evidence["request_bytes"] < max_request_bytes + 5_000
+    assert error.evidence["request_bytes"] > max_request_bytes
+    assert error.evidence["largest_component"] == "current_message"
+
+
+@pytest.mark.asyncio
+async def test_the_final_byte_guard_refuses_a_request_the_decision_did_not_fit() -> None:
+    """The post-application guard, reached directly.
+
+    The decision measures the marked request plus the omission allowance, so
+    no constructible input reaches this guard while anything is sheddable. A
+    wrapper grows the current message after the decision to prove the guard
+    still refuses rather than sends.
+    """
+    max_request_bytes = await _base_request_bytes() + 1_000
+    service, session_id = _service(_GENEROUS_TOKENS, composer_planner_max_request_bytes=max_request_bytes)
+    provider = _RecordingProvider(_make_llm_response(content="Done."))
+    decide = service._shed_to_context_budget
+
+    def _grown_after_decision(**kwargs: Any) -> Any:
+        messages, record, bytes_per_token = decide(**kwargs)
+        grown = list(messages)
+        current = kwargs["frame"].state_index + 1
+        assert grown[current]["content"] == "Build a CSV pipeline"
+        grown[current] = {**grown[current], "content": grown[current]["content"] + "x" * 200_000}
+        return grown, record, bytes_per_token
+
+    with (
+        patch.object(service, "_shed_to_context_budget", side_effect=_grown_after_decision),
+        patch("litellm.acompletion", new_callable=AsyncMock, side_effect=provider.complete),
+        pytest.raises(ComposerConvergenceError) as exc_info,
+    ):
+        await service.compose("Build a CSV pipeline", [], _empty_state(), session_id=session_id)
+
+    assert provider.requests == []
+    error = exc_info.value
+    assert error.reason == "context_budget_exceeded"
+    assert error.evidence["ceiling"] == "bytes"
+    assert error.evidence["request_bytes"] > max_request_bytes + 190_000
     assert error.evidence["largest_component"] == "current_message"
