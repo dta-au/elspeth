@@ -135,7 +135,17 @@ These settle items that were open below; where they differ, these win.
   `test_standalone_lifecycle.py`. Evidence from 2026-11-10: failing children
   sat in "closing landscape" and survived SIGKILL for over 2 s while host I/O
   pressure was 12% (full) with CPU pressure at 0; a 15 s stall was not
-  reproduced directly.
+  reproduced directly. Tracked as GitHub issue #360; this branch's ids are in
+  a comment there.
+  **This workstream's part, for 2026-11-11:** once the marker lands, apply it
+  to `test_stop_before_hello_retains_shutdown_through_handoff` (all 8
+  parameters), `test_fresh_embedded_real_host_owner_and_missing_owner` (both),
+  `test_healthy_child_fails_closed_when_supervisor_is_killed`,
+  `test_authentication_and_partial_startup_fail_closed[peer-flood]` and
+  `test_actual_controller_death_stops_public_owner_and_reaps_runner`; profile
+  the rest of the two files for other timing-bound ids; and add the new
+  selection as a stage of `scripts/full-suite-gate.sh` so a local gate still
+  runs these tests once they leave the default selection.
 
 ## C. Operator decisions outstanding
 
