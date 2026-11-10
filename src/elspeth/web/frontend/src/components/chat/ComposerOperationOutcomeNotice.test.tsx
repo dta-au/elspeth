@@ -24,6 +24,17 @@ describe("operation outcome notice", () => {
     expect(screen.getByRole("note")).toHaveTextContent("saved 2 draft revisions, last saved version 7. Later changes may be newer");
     expect(screen.getByRole("time")).toHaveAttribute("datetime", settled_at);
   });
+  it("names a context budget refusal with the server's detail and offers no retry", () => {
+    render(<ComposerOperationOutcomeNotice outcome={{ ...outcome, failure_code: "http_error", error_type: "context_budget_exceeded", diagnostic_id: null }} />);
+    expect(screen.getByRole("note")).toHaveTextContent(
+      "This conversation is too large for the composer to continue. Start a new session, or shorten your request.",
+    );
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+  it("adds no refusal detail to other outcomes", () => {
+    render(<ComposerOperationOutcomeNotice outcome={outcome} />);
+    expect(screen.getByRole("note")).not.toHaveTextContent("too large for the composer");
+  });
   it("falls back to the request reference and renders it as text", () => {
     render(<ComposerOperationOutcomeNotice outcome={{ ...outcome, failure_code: "worker_lost", diagnostic_id: null, request_id: "<script>synthetic</script>" }} />);
     expect(screen.getByRole("note")).toHaveTextContent("<script>synthetic</script>");

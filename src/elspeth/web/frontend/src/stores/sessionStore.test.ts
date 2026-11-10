@@ -1343,6 +1343,24 @@ describe("sessionStore", () => {
       expect(state.error).not.toContain("ran out of time");
     });
 
+    it.each([
+      ["the compose loop", { status: 422, error_type: "convergence", reason: "context_budget_exceeded" }],
+      ["the planner", { status: 500, error_type: "composer_planner_failure", planner_code: "CONTEXT_BUDGET_EXHAUSTED" }],
+    ])("shows the context budget refusal from %s verbatim on a failed row without Retry", async (_source, envelope) => {
+      const detail = "This conversation is too large for the composer to continue. Start a new session, or shorten your request.";
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({ ...envelope, detail, failure_code: "context_budget_exceeded" });
+
+      useSessionStore.setState({ compositionStateLoaded: true, activeSessionId: "20000000-0000-4000-8000-000000000001" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.error).toBe(detail);
+      expect(state.messages[0].local_status).toBe("failed");
+      expect(state.messages[0].local_error).toBe(detail);
+      expect(state.messages[0].local_failure_code).toBe("context_budget_exceeded");
+    });
+
     it("threads failure_code onto the failed optimistic message for policy_blocked (S1)", async () => {
       const { sendMessage: mockSendMessage } = await import("@/api/client");
       // policy_blocked is permanent by construction — a deployment policy

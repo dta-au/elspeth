@@ -4,7 +4,8 @@
 nothing about messages. These helpers measure a request exactly as the call
 record measures it, build the stubbed form of a tool result, label stubbable
 tool results, compose the previously shed keys, locate the most recent tool
-round trip, and name the largest component for a refusal. They
+round trip, name the largest component for a refusal, and say whether a call
+is the first of its turn to shed conversation history. They
 write no content derived from user or model text: the only server-authored
 string is the constant stub.
 """
@@ -14,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any, Final
 
-from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMRequestByteSplit
+from elspeth.contracts.composer_llm_audit import ComposerContextBudgetRecord, ComposerLLMCall, ComposerLLMRequestByteSplit
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_CONTENT_PARTS_KEY,
     PROMPT_GUARD_TRUST_KEY,
@@ -122,3 +123,16 @@ def previously_shed_keys(history: ContextBudgetHistory, calls: Iterable[Composer
             shed.update(f"tool:{tool_call_id}" for tool_call_id in call.context_budget.stubbed_tool_call_ids)
             shed.update(f"hatch:{index}" for index in call.context_budget.shed_hatch_event_indices)
     return frozenset(shed)
+
+
+def first_history_shed_of_turn(record: ComposerContextBudgetRecord, earlier_calls: Iterable[ComposerLLMCall]) -> bool:
+    """Whether this call's decision sheds conversation history and no earlier call of the turn did.
+
+    ``record`` is this call's decision; ``earlier_calls`` are the calls the
+    turn recorded before it. Stubbing tool results or leaving out escape-hatch
+    transcript events sheds no conversation history. A call site announces the
+    shed to the user exactly when this holds, so a turn announces it once.
+    """
+    if not record.shed_history_indices:
+        return False
+    return not any(call.context_budget is not None and call.context_budget.shed_history_indices for call in earlier_calls)

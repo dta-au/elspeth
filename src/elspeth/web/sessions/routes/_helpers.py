@@ -40,7 +40,12 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
-from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressReason, ComposerProgressSink
+from elspeth.contracts.composer_progress import (
+    CONTEXT_BUDGET_REFUSAL_DETAIL,
+    ComposerProgressEvent,
+    ComposerProgressReason,
+    ComposerProgressSink,
+)
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
@@ -132,7 +137,7 @@ from elspeth.web.sessions._auto_title import maybe_auto_title_session
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.audit_story_models import RunAuditStoryResponse
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryService
-from elspeth.web.sessions.composer_operations import ComposerRequiredRecoveryFailure
+from elspeth.web.sessions.composer_operations import CONTEXT_BUDGET_FAILURE_CODE, ComposerRequiredRecoveryFailure
 from elspeth.web.sessions.converters import state_from_record as _state_from_record
 from elspeth.web.sessions.models import composer_completion_events_table
 from elspeth.web.sessions.proposal_projection import project_composition_proposal
@@ -3011,8 +3016,8 @@ async def _failed_turn_response_body(
     }
 
 
-# Closed planner-failure taxonomy. ``COST_CAP_EXCEEDED`` and
-# ``REQUEST_BYTES_EXHAUSTED`` fall through to ``operation_failed``.
+# Closed planner-failure taxonomy. ``COST_CAP_EXCEEDED`` falls through to
+# ``operation_failed``.
 #
 # ``policy_blocked`` is NOT keyed on ``PipelinePlannerError.code`` at all — it is
 # keyed on the rejection's ``detail_codes`` (see
@@ -3056,6 +3061,11 @@ PLANNER_POLICY_DETAIL_CODES: Final[frozenset[str]] = frozenset(
         PluginUnavailableReason.WEB_SURFACE_PROHIBITED.value,
     }
 )
+# The planner codes that mean "this request cannot be fitted to the context
+# budget". ``CONTEXT_BUDGET_EXHAUSTED`` is the budgeter's own refusal;
+# ``REQUEST_BYTES_EXHAUSTED`` is the final byte guard behind it. Both are
+# refused before any provider call and are permanent for the session.
+_FREEFORM_PLANNER_CONTEXT_BUDGET_CODES: Final[frozenset[str]] = frozenset({"CONTEXT_BUDGET_EXHAUSTED", "REQUEST_BYTES_EXHAUSTED"})
 # ``failure_code -> (http_status, safe static detail)``. The detail text is
 # provider-safe (no exception message, no provider content).
 _FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
@@ -3081,6 +3091,10 @@ _FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
         "This pipeline is blocked by a deployment policy and cannot be built as configured. "
         "Change the blocked component — retrying will fail the same way.",
     ),
+    # The request does not fit the operator's context budget. A budget
+    # exhaustion like ``planner_repair_exhausted`` (our limit, not a gateway
+    # fault), but no retry can clear it for this session.
+    CONTEXT_BUDGET_FAILURE_CODE: (500, CONTEXT_BUDGET_REFUSAL_DETAIL),
     "operation_failed": (500, "The composer could not build a pipeline for this request."),
 }
 
@@ -3115,6 +3129,8 @@ _FREEFORM_PLANNER_PROGRESS_REASONS: Final[dict[str, ComposerProgressReason]] = {
     "DISCOVERY_EXHAUSTED": "convergence_discovery_budget",
     "TOOL_CALLS_EXHAUSTED": "tool_call_cap_exceeded",
     "TIMEOUT": "convergence_wall_clock_timeout",
+    "CONTEXT_BUDGET_EXHAUSTED": "context_budget_exceeded",
+    "REQUEST_BYTES_EXHAUSTED": "context_budget_exceeded",
 }
 
 
@@ -3142,6 +3158,8 @@ def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
         # The provider answered every repair turn; the planner loop could not
         # converge.
         return "planner_repair_exhausted"
+    if exc.code in _FREEFORM_PLANNER_CONTEXT_BUDGET_CODES:
+        return CONTEXT_BUDGET_FAILURE_CODE
     if exc.code in _FREEFORM_PLANNER_INVALID_PROVIDER_CODES:
         return "invalid_provider_response"
     return "operation_failed"
@@ -3201,7 +3219,7 @@ async def _handle_planner_failure(
         writer_principal="compose_loop",
         session_operation_context=session_operation_context,
     )
-    return status_code, {
+    body: dict[str, object] = {
         "error_type": "composer_planner_failure",
         "failure_code": failure_code,
         # The closed planner code reaches the CLIENT, not only the durable audit row above.
@@ -3214,6 +3232,12 @@ async def _handle_planner_failure(
         "planner_code": exc.code,
         "detail": detail,
     }
+    if failure_code == CONTEXT_BUDGET_FAILURE_CODE:
+        # A context budget refusal makes no provider call, so it leaves no
+        # call record: the operation record, which seals this body, is where
+        # the ceiling it hit and the largest component are kept.
+        body["detail_codes"] = sorted(set(exc.detail_codes))
+    return status_code, body
 
 
 async def _handle_convergence_error(
@@ -3273,7 +3297,7 @@ async def _handle_convergence_error(
     # this parity, the chat-side error UX (driven by detail + recovery_text)
     # could drift from the polling-side reason — exactly the failure mode
     # elspeth-5030f7373d called out, but at a different layer.
-    progress = convergence_progress_event(budget_exhausted=exc.budget_exhausted)
+    progress = convergence_progress_event(budget_exhausted=exc.budget_exhausted, reason=exc.reason)
     response_body: dict[str, object] = {
         "error_type": "convergence",
         "detail": str(exc),
@@ -3291,6 +3315,16 @@ async def _handle_convergence_error(
         # names the next practical action for each class" criterion.
         "recovery_text": progress.likely_next,
     }
+    if exc.reason == "context_budget_exceeded":
+        # The compose loop's context budget refusal: the same closed failure
+        # code and detail codes as the planner's (see
+        # ``_handle_planner_failure``). ``str(exc)`` is already the refusal's
+        # user-facing detail. The ceiling and the component are the
+        # refusal's own server-authored evidence.
+        response_body["failure_code"] = CONTEXT_BUDGET_FAILURE_CODE
+        response_body["detail_codes"] = sorted(
+            (f"context_ceiling_{exc.evidence['ceiling']}", f"largest_component_{exc.evidence['largest_component']}")
+        )
     if progress.reason == "convergence_wall_clock_timeout":
         # The elapsed budget, server-authoritative (R2-F9,
         # elspeth-114dd261bc). The SPA's timeout copy names this number, and
