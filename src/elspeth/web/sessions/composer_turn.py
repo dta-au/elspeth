@@ -70,6 +70,7 @@ from elspeth.web.composer.advisor_decision import AdvisorGateBlocked, AdvisorGat
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
 from elspeth.web.composer.audit import ComposerToolCancellation, ComposerToolFailure
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.no_tool_policy import compose_graph_recovery_refusal_message
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
@@ -1499,6 +1500,7 @@ async def _run_composer_turn(
                     provider_owner=provider_owner,
                     recovery_context=recovery_context,
                     retained_operation_context=retained_operation_context,
+                    context_budget_history=ContextBudgetHistory.from_records(records),
                     advisor_history=AdvisorTranscriptHistory.from_records(
                         session_id=str(turn.session_id),
                         actor_user_id=turn.actor_user_id,

@@ -94,6 +94,7 @@ from elspeth.web.composer.composition_completion import (
     _append_interpretation_review_handoff_message,
     _with_advisor_gate_decision,
 )
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.control_messages import anti_anchor_control_envelope
 from elspeth.web.composer.discovery_cache import (
     CachedDiscoveryPayload as _CachedDiscoveryPayload,
@@ -1127,6 +1128,7 @@ class ComposerServiceImpl:
         recovery_context: GraphRecoveryContext | None = None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        context_budget_history: ContextBudgetHistory | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop with dual-counter budget.
 
@@ -1270,6 +1272,7 @@ class ComposerServiceImpl:
                         retained_operation_context=retained_operation_context,
                         turn_evidence=turn_evidence,
                         request_deadline=deadline,
+                        context_budget_history=context_budget_history,
                     )
                 return await self._compose_loop(
                     message,
@@ -1291,6 +1294,7 @@ class ComposerServiceImpl:
                     recovery_context=recovery_context,
                     retained_operation_context=retained_operation_context,
                     turn_evidence=turn_evidence,
+                    context_budget_history=context_budget_history,
                 )
             except ComposerConvergenceError as exc:
                 await emit_progress(
@@ -2374,6 +2378,7 @@ class ComposerServiceImpl:
         recovery_context: GraphRecoveryContext | None = None,
         retained_operation_context: RetainedOperationContext | None = None,
         turn_evidence: TurnEvidence | None = None,
+        context_budget_history: ContextBudgetHistory | None = None,
     ) -> ComposerResult:
         """Inner composition loop with dual-counter budget tracking.
 

@@ -684,10 +684,11 @@ class _BlockingRecordingComposer:
         recovery_context=None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        context_budget_history: object | None = None,
     ) -> ComposerResult:
         del state, session_id, current_state_id, user_id, progress, user_message_id
         del session_operation_context, completion_gates, budget_seconds, required_work, provider_owner, recovery_context
-        del retained_operation_context, advisor_history
+        del retained_operation_context, advisor_history, context_budget_history
 
         self.calls.append(
             {
@@ -733,9 +734,10 @@ class _ProgressAwareComposer:
         recovery_context=None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        context_budget_history: object | None = None,
     ) -> ComposerResult:
         del message, chat_messages, session_id, current_state_id, user_id, user_message_id, completion_gates, budget_seconds
-        del required_work, provider_owner, recovery_context, retained_operation_context, advisor_history
+        del required_work, provider_owner, recovery_context, retained_operation_context, advisor_history, context_budget_history
         assert session_operation_context is not None
         assert progress is not None, "session routes must pass a composer progress sink"
         self.progress_sink_seen = True
@@ -11894,7 +11896,9 @@ class TestSendMessageTranscriptSnapshot:
                     role="audit",
                     content=json.dumps({"_kind": "llm_call_audit"}),
                     raw_content=None,
-                    tool_calls=[{"_kind": "llm_call_audit", "call": {}}],
+                    tool_calls=[
+                        {"_kind": "llm_call_audit", "call": {"status": "error", "prompt_tokens": None, "request_byte_split": None}}
+                    ],
                     created_at=record.created_at,
                     sequence_no=record.sequence_no + 1,
                     composition_state_id=None,
