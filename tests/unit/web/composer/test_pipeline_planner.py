@@ -294,10 +294,12 @@ _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES = 188
 # instruction states the argument shape, and the review corrections (discard
 # and fork as route destinations, fixed-sink refusal of undeclared fields, the
 # exemplar's source made fixed) land in the core and the aid. Measured
-# 139,533 B, +309 B. The value follows the measurement under the operator's
-# standing direction that this threshold tracks the working system: 3,803 B
-# over the prior 135,730 B pin.
-_SKILL_REWORK_0812_CANONICAL_BYTES = 3803
+# 139,533 B, +309 B. A live round then had three candidates rejected for a
+# bare `mode: flexible`, so the core says which schema modes need `fields`:
+# measured 139,608 B, +75 B. The value follows the measurement under the
+# operator's standing direction that this threshold tracks the working
+# system: 3,878 B over the prior 135,730 B pin.
+_SKILL_REWORK_0812_CANONICAL_BYTES = 3878
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES

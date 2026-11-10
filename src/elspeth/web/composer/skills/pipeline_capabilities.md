@@ -325,7 +325,8 @@ declare typed `fields` for what a consumer requires; you need not author
 `guaranteed_fields`. Sinks never coerce: declare sink `schema.fields` with
 the types that arrive when the output's columns are known. A `fixed` schema
 refuses any field it does not declare; use `flexible`, or project first, when
-an upstream node adds fields.
+an upstream node adds fields. `fixed` and `flexible` both require `fields`;
+only `observed` takes none.
 A downstream input type declaration validates arriving values without converting them:
 value-dependent mismatches use `on_error`; provable contradictions may be refused
 at build. Only `int` widens to `float`. Declare actual types; use `any` for created

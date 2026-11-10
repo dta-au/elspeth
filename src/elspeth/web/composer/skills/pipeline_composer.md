@@ -477,9 +477,14 @@ Two `status` values ride under `data` regardless of `success`.
 means the change is a proposal awaiting human approval and nothing was
 applied: tell the user it awaits approval and stop. Its `validation`
 describes the unchanged saved graph, not the proposed change, so never report
-the proposal as validated. Each mutation call becomes its own proposal against
-that same saved graph, and accepting one makes the others stale: when changes
-await approval, make the whole requested change in ONE mutation call.
+the proposal as validated. Where changes await approval (a result carried
+`APPROVAL_REQUIRED`, or a call was refused `approval_batch_not_atomic` or
+`approval_proposal_pending`), send exactly ONE composition-changing call per
+response: one narrow edit, or one complete `set_pipeline` carrying every part
+of a multi-part change. The narrowest-tool and staged-construction guidance
+applies only where changes apply directly; several changes in one response
+are refused whole. While a proposal is pending, do not stage another: tell
+the user to accept or reject it, and stop.
 `PREVALIDATION_REJECTED`
 with `applied` false (`candidate_version`, `message`) means the candidate was
 not applied: repair from `validation`, which describes the rejected candidate,

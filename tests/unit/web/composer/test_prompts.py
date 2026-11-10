@@ -1541,7 +1541,27 @@ class TestSkillFollowsCurrentToolBehaviour:
 
         assert "describes the unchanged saved graph, not the proposed change" in flattened
         assert "never report the proposal as validated" in flattened
-        assert "make the whole requested change in ONE mutation call" in flattened
+
+    def test_approval_mode_sends_one_composition_change_per_response(self) -> None:
+        # tool_batch.py refuses a multi-mutation response whole
+        # (approval_batch_not_atomic) and a further mutation while a proposal
+        # is pending (approval_proposal_pending); the narrowest-tool guidance
+        # would otherwise walk the model straight into both.
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert "send exactly ONE composition-changing call per response" in flattened
+        assert "one complete `set_pipeline` carrying every part of a multi-part change" in flattened
+        assert "`approval_batch_not_atomic`" in flattened
+        assert "`approval_proposal_pending`" in flattened
+        assert "applies only where changes apply directly" in flattened
+        assert "tell the user to accept or reject it, and stop" in flattened
+
+    def test_declared_schema_modes_say_which_need_fields(self) -> None:
+        # contracts.schema refuses mode fixed/flexible without `fields`; three
+        # live planner candidates were rejected for a bare `mode: flexible`.
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert "`fixed` and `flexible` both require `fields`; only `observed` takes none." in flattened
 
     def test_unchanged_result_and_hints_are_taught_as_the_server_sends_them(self) -> None:
         # tool_batch._unapplied_admission appends a server-authored hint to a
