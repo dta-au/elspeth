@@ -3422,6 +3422,7 @@ def _fit_planner_context_budget(
     hatch_transcript: AdvisorVisibleTranscript | None,
     policy: ContextBudgetPolicy,
     history: ContextBudgetHistory,
+    model: str,
     earlier_calls: Sequence[ComposerLLMCall],
     mark_for_cache: bool,
 ) -> tuple[list[dict[str, Any]], ComposerContextBudgetRecord]:
@@ -3434,6 +3435,10 @@ def _fit_planner_context_budget(
     ``messages`` and ``hatch_transcript`` are not changed. Raises the
     ``CONTEXT_BUDGET_EXHAUSTED`` planner error when protected content alone
     exceeds a ceiling.
+
+    ``model`` is the model this call requests (the planner's, or the escape
+    hatch's on a hatch turn); the bytes-per-token ratio is the one the
+    session measured on that model, when it has one.
 
     The decision is fed the request as it will be sent and checked: cache
     markers applied when ``mark_for_cache``, prompt-guard keys detached, in
@@ -3517,7 +3522,7 @@ def _fit_planner_context_budget(
             content_bytes=message_bytes(scratch_messages, sent_tools).total_bytes + omission_allowance,
             wire_bytes=_planner_request_size(detach_prompt_guard_evidence(scratch_messages).messages, sent_tools) + omission_allowance,
             segments=segments,
-            bytes_per_token=history.bytes_per_token,
+            bytes_per_token=history.ratio_for(model),
             previously_shed=previously_shed_keys(history, earlier_calls),
         )
     except ContextBudgetRefusal as refusal:
@@ -3970,6 +3975,7 @@ async def _plan_pipeline_inner(
             hatch_transcript=hatch_transcript,
             policy=context_policy,
             history=context_budget_history,
+            model=effective_model,
             earlier_calls=recorder.llm_calls,
             mark_for_cache=supports_anthropic_prompt_cache_markers(effective_model),
         )
