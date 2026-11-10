@@ -257,6 +257,67 @@ def test_splice_transform_supports_a_source_predecessor() -> None:
     assert result.updated_state.nodes[1].input == "inserted_out"
 
 
+@pytest.mark.parametrize(("predecessor_id", "successor_id"), (("source", "before"), ("before", "after")))
+def test_splice_transform_without_visual_edges_preserves_logical_path_and_replays(predecessor_id: str, successor_id: str) -> None:
+    state = replace(_state(), edges=())
+    arguments = {**_arguments(), "predecessor_id": predecessor_id, "successor_id": successor_id}
+    context = _context()
+
+    result = execute_tool("splice_transform", arguments, state, context.catalog, plugin_snapshot=context.plugin_snapshot)
+
+    assert result.success, result.validation.errors
+    updated = result.updated_state
+    assert updated.version == state.version + 1
+    assert updated.edges == ()
+    expected_order = ["inserted", "before", "after"] if predecessor_id == "source" else ["before", "inserted", "after"]
+    assert [node.id for node in updated.nodes] == expected_order
+    inserted = next(node for node in updated.nodes if node.id == "inserted")
+    successor = next(node for node in updated.nodes if node.id == successor_id)
+    assert inserted.input == ("rows" if predecessor_id == "source" else "middle")
+    assert inserted.on_success == successor.input == "inserted_out"
+    assert result.validation.is_valid
+    assert result.data["already_applied"] is False
+    assert "replaced_edge_id" not in result.data
+    assert "new_edge_id" not in result.data
+
+    replay = execute_tool("splice_transform", arguments, updated, context.catalog, plugin_snapshot=context.plugin_snapshot)
+
+    assert replay.success, replay.validation.errors
+    assert replay.updated_state is updated
+    assert replay.data["already_applied"] is True
+    divergent = {
+        **arguments,
+        "node": {
+            **_arguments()["node"],
+            "options": {"schema": {"mode": "observed"}, "required_input_fields": ["text"]},
+        },
+    }
+    rejected = execute_tool("splice_transform", divergent, updated, context.catalog, plugin_snapshot=context.plugin_snapshot)
+    assert not rejected.success
+    assert rejected.validation.errors[0].error_code == "splice_replay_conflict"
+    assert rejected.updated_state is updated
+
+
+@pytest.mark.parametrize("ambiguity", ("multiple-consumers", "sink-connection", "error-route", "fork"))
+def test_splice_transform_without_visual_edges_retains_logical_guards(ambiguity: str) -> None:
+    state = replace(_state(), edges=())
+    before, after = state.nodes
+    if ambiguity == "multiple-consumers":
+        state = replace(state, nodes=(*state.nodes, _node("other", input_name="middle", output_name="other_out")))
+    elif ambiguity == "sink-connection":
+        state = replace(state, outputs=(*state.outputs, replace(state.outputs[0], name="middle")))
+    elif ambiguity == "error-route":
+        state = replace(state, nodes=(replace(before, on_error="failure"), after))
+    else:
+        state = replace(state, nodes=(replace(before, fork_to=("result",)), after))
+
+    result = _execute_splice_transform(_arguments(), state, _context())
+
+    assert not result.success
+    assert result.validation.errors[0].error_code == "splice_topology_unsupported"
+    assert result.updated_state is state
+
+
 def test_splice_transform_identical_review_staged_replay_is_same_object() -> None:
     state = _state()
     arguments = {
