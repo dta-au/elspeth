@@ -191,7 +191,11 @@ from elspeth.web.interpretation_state import (
     interpretation_sites,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-from elspeth.web.sessions.proposal_blob_refs import PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE, ProposalResourceUnavailableError
+from elspeth.web.sessions.proposal_blob_refs import (
+    PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE,
+    MalformedProposalBlobReferenceError,
+    ProposalResourceUnavailableError,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -2402,12 +2406,18 @@ async def run_tool_batch(
                             audit=audit,
                             recorder=recorder,
                         )
-                except ProposalResourceUnavailableError:
+                except (ProposalResourceUnavailableError, MalformedProposalBlobReferenceError) as refusal:
                     unapplied_admission = _unapplied_admission(
                         _saved_graph_rejection_result(
                             state,
-                            PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE,
-                            error_code="proposal_resource_unavailable",
+                            PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE
+                            if type(refusal) is ProposalResourceUnavailableError
+                            else f"Proposal refused: {refusal}. Fix the blob reference and retry.",
+                            error_code=(
+                                "proposal_resource_unavailable"
+                                if type(refusal) is ProposalResourceUnavailableError
+                                else "proposal_blob_reference_malformed"
+                            ),
                             rejected_component=None,
                         ),
                         "refused",
@@ -3273,6 +3283,28 @@ async def run_tool_batch(
                     plugin_snapshot=ctx.plugin_snapshot,
                     policy_catalog=ctx.policy_catalog,
                 )
+            if (
+                _tool_name == "diff_pipeline"
+                and dispatched_result.success
+                and turn_sessions_service is not None
+                and turn_session_uuid is not None
+            ):
+                # The diff baseline is request-start state and held edits are not applied, so a
+                # pending proposal is invisible to it. Say so rather than let "0 changes" mislead.
+                pending = [
+                    proposal
+                    for proposal in await turn_sessions_service.list_composition_proposals(turn_session_uuid)
+                    if proposal.status == "pending"
+                ]
+                if pending:
+                    dispatched_result = replace(
+                        dispatched_result,
+                        post_call_hints=(
+                            *dispatched_result.post_call_hints,
+                            f"{len(pending)} proposed change(s) are pending approval and are not applied, "
+                            "so they do not appear in this diff. The user must accept them before they take effect.",
+                        ),
+                    )
             if is_discovery_tool(_tool_name) and response_contract_for(_tool_name) is not None:
                 return admit_discovery_result(_tool_name, dispatched_result)
             return dispatched_result

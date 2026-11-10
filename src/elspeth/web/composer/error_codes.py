@@ -203,6 +203,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "source_blob_review_required",
         "source_blob_unavailable",
         "proposal_resource_unavailable",
+        "proposal_blob_reference_malformed",
         "source_name_invalid",
         "source_not_found",
         "source_data_contract_required",

@@ -311,6 +311,13 @@ returned. Custody/lifecycle/integrity checks still precede the refusal, and
 every in-cap file still undergoes full-content credential inspection before
 any page slice. No bounds, response contracts or credential checks changed.
 
+**Correction (batch 2 review).** The commit message of 38045378b says it
+"preserves the credential guard across page boundaries". That overstates the
+diff: the commit adds only the byte-size gate in `blobs.py`. The full-content
+credential guard before slicing already existed and was not changed by U6;
+the existing `test_credential_after_page_boundary_refuses_the_first_page`
+covers it. History is not rewritten; this note is the correction.
+
 Test: `tests/unit/web/composer/test_tools_blobs.py::TestGetBlobContentGuards::test_content_inspection_size_limit_is_distinct_from_credentials`
 has oversize ASCII, oversize multibyte UTF-8 and exactly-at-limit cases.
 The existing `test_credential_after_page_boundary_refuses_the_first_page`
@@ -927,3 +934,26 @@ tests/unit/web/composer/test_wire_fidelity_matrix.py::test_openrouter_planner_li
 tests/unit/web/composer/test_wire_fidelity_matrix.py::test_openrouter_preferred_control_sends_no_strict_key
 tests/unit/web/execution/test_session_operation_lease.py::test_actual_setup_after_arm_retains_canonical_loss_group_and_pending_owner
 ```
+
+## Batch 2 review fixes
+
+Independent review: `tool-fixes-0812-batch2-review.md`. Logs under
+`.claude/lanes/batch2-fixes/`.
+
+- **M1 (U9) refreshed, 0d6b17115.** The `protocol.py:module-bindings` pin in
+  `reviewed-writer-recipes.json` was reviewed as text-only (four string
+  constants differ, targets and annotations identical) and recomputed; control:
+  pin matches, a scratch executable binding makes it mismatch, reverted. The
+  whole-tree test cannot be a clean control on this branch because
+  `async_workers.py` and `required_executor.py` full-source pins (landing
+  commit dc67bdd2f) fail first and return early, masking the writer loop.
+- **S1 (U2) 89231e76b.** Malformed model-supplied `blob_ref` at proposal
+  admission (Tier 3) is now an audited, repairable refusal
+  (`proposal_blob_reference_malformed`); a persisted pending row (Tier 1) still
+  raises `AuditIntegrityError`, pinned by a negative-control test. Server-owned
+  `set_pipeline` authority still raises `ValueError`.
+- **S3 (U7).** In explicit-approval mode `diff_pipeline` now adds a
+  `post_call_hints` entry (an existing envelope field) when the session has
+  pending proposals, stating held edits are not applied and do not appear.
+  Skills were not edited.
+- **S2 (U6).** Commit-message over-claim corrected in the U6 section above.

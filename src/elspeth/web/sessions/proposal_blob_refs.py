@@ -39,6 +39,16 @@ class ProposalResourceUnavailableError(Exception):
     """A queried proposal resource is missing, foreign, or known not ready."""
 
 
+class MalformedProposalBlobReferenceError(Exception):
+    """Model-supplied proposal arguments carry a malformed blob reference (Tier 3).
+
+    Raised only at proposal admission, where the arguments come from the
+    planner. The message names the offending position so the planner can
+    repair it. Rows already persisted by ELSPETH keep failing as
+    ``AuditIntegrityError`` in ``pending_proposal_reference_id``.
+    """
+
+
 def _canonical_sentinel_blob_id(value: str, *, position: str) -> str:
     raw = value.removeprefix(BLOB_REF_PATH_PREFIX)
     try:
@@ -200,7 +210,14 @@ def validate_proposal_blob_references(
     arguments: Mapping[str, Any],
 ) -> None:
     """Require every authoritative proposal blob to be owned and ready."""
-    for blob_id in proposal_blob_reference_ids(tool_name, arguments):
+    try:
+        blob_ids = proposal_blob_reference_ids(tool_name, arguments)
+    except ValueError as exc:
+        if tool_name == "set_pipeline" and is_owned_composition_state_authority(arguments):
+            # Server-owned authority is Tier 1: malformed here is our bug, not a planner error.
+            raise
+        raise MalformedProposalBlobReferenceError(str(exc)) from exc
+    for blob_id in blob_ids:
         row = conn.execute(select(blobs_table.c.session_id, blobs_table.c.status).where(blobs_table.c.id == blob_id)).first()
         if row is None:
             raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
