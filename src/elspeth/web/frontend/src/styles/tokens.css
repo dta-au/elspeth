@@ -195,8 +195,7 @@
   /* ── Interactive / accent ────────────────────────────────────────────────── */
   /* DTA green primary under navy --color-btn-primary-text (5.64:1 resting,
      6.69:1 on the lighter hover). The selected ring is solid, not
-     translucent: 4.86:1 on elevated/raised, 5.34:1 on --color-surface
-     (UX review). */
+     translucent (UX review). */
   --color-accent:            #29b480;
   --color-focus-ring:        #ffffff;
   --color-btn-primary-bg:    #29b480;
@@ -205,7 +204,9 @@
   --color-btn-danger-bg-hover: #c23d3a;
   --color-link:              #61daff;
   --color-highlight:         rgba(41, 180, 128, 0.14);
-  --color-selected-ring:     #29b480;
+  /* Gold, not the accent green: selection must read apart from the green
+     well and brand (operator choice 2026-11-11). 10.11:1 on --color-well. */
+  --color-selected-ring:     #f0c75e;
 
   /* ── Status badges ───────────────────────────────────────────────────────── */
   --color-status-pending:    #7a9a9a;
@@ -558,7 +559,7 @@
   /* The primary fill is ARGO's DTA green in both themes, under navy
      --color-btn-primary-text (5.64:1 resting, 4.56:1 on the darker hover —
      the thinnest pair here; do not darken the hover further). The selected
-     ring is the solid deep accent (UX review), not a translucent ring. */
+     ring is solid (UX review), not a translucent ring. */
   --color-accent:            #156048;
   --color-focus-ring:        #0f2d35;
   --color-btn-primary-bg:    #29b480;
@@ -567,7 +568,9 @@
   --color-btn-danger-bg-hover: #912f2d;
   --color-link:              #176d8a;
   --color-highlight:         rgba(21, 96, 72, 0.12);
-  --color-selected-ring:     #156048;
+  /* Gold, not the accent green (operator choice 2026-11-11). 5.77:1 on
+     --color-well. */
+  --color-selected-ring:     #7a5200;
 
   /* ── Status badges ───────────────────────────────────────────────────────── */
   --color-status-pending:    #5a7a84;
