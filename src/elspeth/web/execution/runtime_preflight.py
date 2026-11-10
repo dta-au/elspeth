@@ -192,7 +192,7 @@ class RuntimePreflightCoordinator:
                     logger.error("runtime_preflight_abandoned_failure exc_class=%s", retained.ordinary_failure_class)
                 elif retained.failure is not None and not retained.join_owned:
                     logger.error("runtime_preflight_abandoned_task_failure exc_class=%s", type(retained.failure).__name__)
-            self._retained.pop(retained.task, None)
+            del self._retained[retained.task]
 
     async def _join(self, retained: tuple[_RetainedPreflight, ...]) -> tuple[BaseException, ...]:
         if retained:
