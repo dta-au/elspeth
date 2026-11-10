@@ -716,9 +716,10 @@ blob with `wire_blob_inline_ref` at
 may consume an earlier lookup's exact output; only external keys are upstream
 requirements. Preserve each lookup's miss policy and the node's error route.
 These tables are transform configuration, not additional sources.
-In the composer, `file_inject` content must be a file the user uploaded: do not
-create the blob yourself or write literal text into `content`. (1) Tell the user
-to save the text as a file and upload it. (2) Once it is uploaded, find it with
+In the composer, `file_inject` content must be a file the user uploaded; anything
+else is refused, so do not create the blob yourself or write literal text into
+`content`. (1) Tell the user to save the text as a file and upload it. (2) Once
+it is uploaded, find it with
 `list_blobs` / `get_blob_metadata`. (3) Attach it: for an entry that already
 exists, `wire_blob_inline_ref` at
 `node:<node_id>.options.files.<entry_name>.content`; when the call creates the

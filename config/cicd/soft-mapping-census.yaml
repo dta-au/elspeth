@@ -990,7 +990,7 @@ files:
     Mapping[str, object]: 1
   src/elspeth/web/execution/_validation_materialization.py:
     Mapping[str, Any]: 1
-    boundary: 3
+    boundary: 4
   src/elspeth/web/execution/_validation_runtime.py:
     Mapping[str, object]: 1
     dict[str, object]: 2
@@ -1098,7 +1098,7 @@ totals:
   Mapping[str, Any]: 790
   Mapping[str, object]: 317
   MutableMapping[str, Any]: 8
-  boundary: 64
+  boundary: 65
   dict[str, Any]: 1104
   dict[str, object]: 402
   soft: 2621

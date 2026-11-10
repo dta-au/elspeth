@@ -121,7 +121,7 @@ from elspeth.web.execution._semantic_helpers import semantic_affected_component_
 from elspeth.web.execution._validation_materialization import (
     FILE_INJECT_PLUGIN,
     file_inject_admission_message,
-    file_inject_blob_refusal,
+    file_inject_blob_refusals,
     file_inject_runtime_config_refusals,
     is_llm_authored_prompt_surface_binding,
     runtime_config_node_plugins,
@@ -1317,21 +1317,9 @@ class ExecutionServiceImpl:
                     creation_modality=records_by_id[ref.blob_id].creation_modality,
                 )
             ]
-            file_inject_blob_refusals = [
-                refusal
-                for ref in refused_prompt_refs
-                if (
-                    refusal := file_inject_blob_refusal(
-                        ref.field_path,
-                        blob_id=ref.blob_id,
-                        node_plugins=node_plugins,
-                        creation_modality=records_by_id[ref.blob_id].creation_modality,
-                    )
-                )
-                is not None
-            ]
-            if file_inject_blob_refusals:
-                raise InlineBlobPromptSurfaceAdmissionError(file_inject_admission_message(file_inject_blob_refusals))
+            file_inject_blob_refs = file_inject_blob_refusals(inline_refs, records_by_id, node_plugins=node_plugins)
+            if file_inject_blob_refs:
+                raise InlineBlobPromptSurfaceAdmissionError(file_inject_admission_message(file_inject_blob_refs))
             if refused_prompt_refs:
                 bound = ", ".join(f"{ref.field_path} (blob {ref.blob_id})" for ref in refused_prompt_refs)
                 raise InlineBlobPromptSurfaceAdmissionError(
@@ -3870,21 +3858,9 @@ class ExecutionServiceImpl:
                                 creation_modality=records_by_blob_id[ref.blob_id].creation_modality,
                             )
                         ]
-                        file_inject_blob_refusals = [
-                            refusal
-                            for ref in llm_authored_prompt_refs
-                            if (
-                                refusal := file_inject_blob_refusal(
-                                    ref.field_path,
-                                    blob_id=ref.blob_id,
-                                    node_plugins=node_plugins,
-                                    creation_modality=records_by_blob_id[ref.blob_id].creation_modality,
-                                )
-                            )
-                            is not None
-                        ]
-                        if file_inject_blob_refusals:
-                            raise InlineBlobPromptSurfaceAdmissionError(file_inject_admission_message(file_inject_blob_refusals))
+                        file_inject_blob_refs = file_inject_blob_refusals(inline_refs, records_by_blob_id, node_plugins=node_plugins)
+                        if file_inject_blob_refs:
+                            raise InlineBlobPromptSurfaceAdmissionError(file_inject_admission_message(file_inject_blob_refs))
                         if llm_authored_prompt_refs:
                             bound = ", ".join(f"{ref.field_path} (blob {ref.blob_id})" for ref in llm_authored_prompt_refs)
                             raise InlineBlobPromptSurfaceAdmissionError(

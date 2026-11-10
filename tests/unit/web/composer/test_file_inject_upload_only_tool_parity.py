@@ -17,13 +17,19 @@ showing the same call accepted with a user-uploaded blob marker.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
+from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.contracts.blobs import BlobCreator, BlobRecord
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.dependencies import create_catalog_service
@@ -40,8 +46,49 @@ _MARKER_SHAPE = '{"blob_ref": "<blob_id>", "mode": "inline_content", "sha256": "
 _ERROR_CODE = "file_inject_content_not_uploaded"
 
 
-def _blob(blob_env: dict[str, Any], modality: CreationModality, *, content: str = "Check the totals.\n") -> dict[str, str]:
-    """Create a ready blob with ``modality`` and return its inline_content marker."""
+def _marker(record: BlobRecord) -> dict[str, str]:
+    assert record.content_hash is not None
+    return {"blob_ref": str(record.id), "mode": "inline_content", "sha256": record.content_hash}
+
+
+async def _run_on_this_thread(func: Callable[[], Any]) -> Any:
+    """Stand in for the worker hand-off: the fixture's in-memory database is visible to this thread only."""
+    return func()
+
+
+async def _stored_blob_async(blob_env: dict[str, Any], *, created_by: BlobCreator, content: str, source_description: str) -> dict[str, str]:
+    """Write a ready blob with ``BlobServiceImpl.create_blob``, the call the upload route makes, and return its marker."""
+    service = BlobServiceImpl(blob_env["engine"], Path(blob_env["data_dir"]))
+    with patch("elspeth.web.blobs.service.run_sync_in_worker", _run_on_this_thread):
+        record = await service.create_blob(
+            UUID(blob_env["session_id"]),
+            "guidance.txt",
+            content.encode(),
+            "text/plain",
+            created_by=created_by,
+            source_description=source_description,
+            session_operation_context=blob_env["operation"],
+        )
+    assert record.status == "ready"
+    assert (record.created_by, record.creation_modality) == (created_by, CreationModality.VERBATIM)
+    return _marker(record)
+
+
+def _stored_blob(blob_env: dict[str, Any], *, created_by: BlobCreator, content: str, source_description: str) -> dict[str, str]:
+    return asyncio.run(_stored_blob_async(blob_env, created_by=created_by, content=content, source_description=source_description))
+
+
+def _upload(blob_env: dict[str, Any], *, content: str = "Check the totals.\n") -> dict[str, str]:
+    """A file the user uploaded: ``created_by="user"``, as ``create_blob_upload`` writes it."""
+    return _stored_blob(blob_env, created_by="user", content=content, source_description="uploaded")
+
+
+def _composer_blob(blob_env: dict[str, Any], modality: CreationModality, *, content: str = "Check the totals.\n") -> dict[str, str]:
+    """A blob the composer's ``create_blob`` tool wrote, with ``modality``.
+
+    ``VERBATIM`` is the case where the content is text from the user's message:
+    still ``created_by="assistant"``, so still not an upload.
+    """
     llm_authored = modality.requires_llm_provenance()
     created = blob_tools._create_blob(blob_env, filename="guidance.txt", content=content, llm_authored=llm_authored)
     assert created.success is True
@@ -49,7 +96,41 @@ def _blob(blob_env: dict[str, Any], modality: CreationModality, *, content: str 
     if llm_authored:
         with blob_env["engine"].begin() as conn:
             conn.execute(blobs_table.update().where(blobs_table.c.id == blob_id).values(creation_modality=modality.value))
+    with blob_env["engine"].connect() as conn:
+        row = conn.execute(blobs_table.select().where(blobs_table.c.id == blob_id)).one()
+    assert (row.created_by, row.creation_modality) == ("assistant", modality.value)
     return {"blob_ref": blob_id, "mode": "inline_content", "sha256": created.data["content_hash"]}
+
+
+def _not_uploaded_verbatim_blob(blob_env: dict[str, Any], kind: str) -> dict[str, str]:
+    """A blob that records ``VERBATIM`` and is not a user upload.
+
+    ``copy_blobs_for_fork`` keeps the source's ``created_by`` and relabels the
+    copy ``VERBATIM`` with no provenance, so a fork copy of a planner-created
+    blob is the row written here for ``fork_copy_of_composer_blob``.
+    """
+    if kind == "composer_create_blob_verbatim":
+        return _composer_blob(blob_env, CreationModality.VERBATIM)
+    if kind == "fork_copy_of_composer_blob":
+        return _stored_blob(
+            blob_env,
+            created_by="assistant",
+            content="Check the totals.\n",
+            source_description=f"copied from session fork (original: {uuid4()})",
+        )
+    if kind == "pipeline_output":
+        return _stored_blob(blob_env, created_by="pipeline", content="Check the totals.\n", source_description="pipeline output")
+    raise AssertionError(f"unknown blob kind {kind!r}")
+
+
+_NOT_UPLOADED_VERBATIM_KINDS = ("composer_create_blob_verbatim", "fork_copy_of_composer_blob", "pipeline_output")
+
+
+def _blob(blob_env: dict[str, Any], modality: CreationModality, *, content: str = "Check the totals.\n") -> dict[str, str]:
+    """A user upload for ``VERBATIM``; a composer-created blob for every LLM-authored modality."""
+    if modality is CreationModality.VERBATIM:
+        return _upload(blob_env, content=content)
+    return _composer_blob(blob_env, modality, content=content)
 
 
 def _options(content: object, **extra: object) -> dict[str, Any]:
@@ -238,7 +319,7 @@ def test_llm_authored_blob_refused_for_file_inject_content(blob_env: dict[str, A
     result, state, node_id = _run(tool, _options(marker), blob_env)
 
     message = _assert_refused(result, state, tool=tool, node_id=node_id, option_path="files.invoice.content")
-    assert f"blob '{marker['blob_ref']}' was created by the composer, not uploaded by the user" in message
+    assert f"blob '{marker['blob_ref']}' is not a file the user uploaded" in message
     _assert_steers_to_an_upload(message, node_id=node_id)
     assert "Check the totals." not in message
 
@@ -272,7 +353,8 @@ def test_wire_blob_inline_ref_refuses_llm_authored_blob_for_file_inject_content(
     assert result.updated_state is state
     [error] = result.validation.errors
     assert "wire_blob_inline_ref cannot set file_inject node 'inject' option 'files.invoice.content': " in error.message
-    assert f"blob '{authored['blob_ref']}' was created by the composer, not uploaded by the user" in error.message
+    assert f"blob '{authored['blob_ref']}' is not a file the user uploaded" in error.message
+    assert error.error_code == _ERROR_CODE
     _assert_steers_to_an_upload(error.message, node_id="inject")
 
 
@@ -306,6 +388,68 @@ def test_wire_blob_inline_ref_accepts_user_uploaded_blob_for_file_inject_content
     _assert_uploaded_marker_stored(result, "inject", uploaded)
 
 
+# ── cause 1, continued: VERBATIM blobs that are not user uploads ─────────────
+
+
+@pytest.mark.parametrize("kind", _NOT_UPLOADED_VERBATIM_KINDS)
+@pytest.mark.parametrize("tool", _NODE_OPTION_TOOLS)
+def test_verbatim_blob_the_user_did_not_upload_refused_for_file_inject_content(blob_env: dict[str, Any], tool: str, kind: str) -> None:
+    """Creator and modality are read as a pair: VERBATIM alone does not make a blob an upload."""
+    marker = _not_uploaded_verbatim_blob(blob_env, kind)
+
+    result, state, node_id = _run(tool, _options(marker), blob_env)
+
+    message = _assert_refused(result, state, tool=tool, node_id=node_id, option_path="files.invoice.content")
+    assert f"blob '{marker['blob_ref']}' is not a file the user uploaded" in message
+    assert "LLM-authored" not in message and "created by the composer" not in message
+    _assert_steers_to_an_upload(message, node_id=node_id)
+
+
+@pytest.mark.parametrize("kind", _NOT_UPLOADED_VERBATIM_KINDS)
+def test_wire_blob_inline_ref_refuses_verbatim_blob_the_user_did_not_upload(blob_env: dict[str, Any], kind: str) -> None:
+    state = _state(_node("inject", _options(_upload(blob_env, content="Earlier upload.\n"))))
+    marker = _not_uploaded_verbatim_blob(blob_env, kind)
+
+    result = _execute(
+        "wire_blob_inline_ref", {"field_path": "node:inject.options.files.invoice.content", "blob_id": marker["blob_ref"]}, state, blob_env
+    )
+
+    assert result.success is False
+    assert result.updated_state is state
+    [error] = result.validation.errors
+    assert error.error_code == _ERROR_CODE
+    assert f"blob '{marker['blob_ref']}' is not a file the user uploaded" in error.message
+    _assert_steers_to_an_upload(error.message, node_id="inject")
+
+
+@pytest.mark.parametrize("tool", (*_NODE_OPTION_TOOLS, "wire_blob_inline_ref"))
+def test_session_fork_copy_of_a_user_upload_is_still_accepted(blob_env: dict[str, Any], tool: str) -> None:
+    """A fork copy keeps its source's creator, so a copied upload is still an upload."""
+    marker = _stored_blob(
+        blob_env, created_by="user", content="Check the totals.\n", source_description=f"copied from session fork (original: {uuid4()})"
+    )
+
+    if tool == "wire_blob_inline_ref":
+        state = _state(_node("inject", _options(_upload(blob_env, content="Earlier upload.\n"))))
+        result = _execute(tool, {"field_path": "node:inject.options.files.invoice.content", "blob_id": marker["blob_ref"]}, state, blob_env)
+        node_id = "inject"
+    else:
+        result, _state_before, node_id = _run(tool, _options(marker), blob_env)
+
+    _assert_uploaded_marker_stored(result, node_id, marker)
+
+
+@pytest.mark.parametrize("tool", _NODE_OPTION_TOOLS)
+def test_marker_for_a_blob_outside_the_session_is_deferred_at_authoring(blob_env: dict[str, Any], tool: str) -> None:
+    """No record to judge here; /validate reports the blob missing (see the readiness tests)."""
+    marker = {"blob_ref": str(uuid4()), "mode": "inline_content", "sha256": "0" * 64}
+
+    result, _state_before, node_id = _run(tool, _options(marker), blob_env)
+
+    assert all(error.error_code != _ERROR_CODE for error in result.validation.errors)
+    _assert_uploaded_marker_stored(result, node_id, marker)
+
+
 # ── cause 2: literal content ────────────────────────────────────────────────
 
 
@@ -336,6 +480,79 @@ def test_literal_content_refused_in_any_entry(blob_env: dict[str, Any], tool: st
     assert f"wire_blob_inline_ref at 'node:{node_id}.options.files.contract.content'" in message
 
 
+def test_patch_adding_a_literal_entry_beside_an_upload_is_refused(blob_env: dict[str, Any]) -> None:
+    """The patch is judged on the options the node would hold, not on the patch alone."""
+    uploaded = _upload(blob_env)
+    state = _state(_node("inject", _options(uploaded)))
+    patch = {
+        "files": {"invoice": {"content": uploaded, "format": "text"}, "contract": {"content": "Check the parties.\n", "format": "text"}}
+    }
+
+    result = _execute("patch_node_options", {"node_id": "inject", "patch": patch}, state, blob_env)
+
+    message = _assert_refused(result, state, tool="patch_node_options", node_id="inject", option_path="files.contract.content")
+    assert "wire_blob_inline_ref at 'node:inject.options.files.contract.content'" in message
+
+
+@pytest.mark.parametrize("content_kind", ["uploaded_marker", "literal"])
+@pytest.mark.parametrize("entry_name", ["v1.2", "Type A", "2024"])
+@pytest.mark.parametrize("tool", _NODE_OPTION_TOOLS)
+def test_entry_name_no_inline_reference_can_address_is_refused(
+    blob_env: dict[str, Any], tool: str, entry_name: str, content_kind: str
+) -> None:
+    """An inline-reference field path cannot name such an entry, so no upload can ever be attached to it.
+
+    Without this refusal a marker beneath the entry is stored and ``/validate``
+    then fails on the field path instead of telling the planner what to change.
+    """
+    options = _options(_upload(blob_env))
+    content: object = _upload(blob_env, content="Check the parties.\n") if content_kind == "uploaded_marker" else "Check the parties.\n"
+    options["files"][entry_name] = {"content": content, "format": "text"}
+
+    result, state, node_id = _run(tool, options, blob_env)
+
+    message = _assert_refused(result, state, tool=tool, node_id=node_id, option_path=f"files.{entry_name}")
+    assert f"an uploaded file cannot be attached to an entry named '{entry_name}'" in message
+    assert "an entry name must start with a letter or '_' and contain only letters, digits, '_' and '-'" in message
+    assert "Give the entry a name of that form, then attach the user's upload to it." in message
+    assert "wire_blob_inline_ref at" not in message
+
+
+@pytest.mark.parametrize("entry_name", ["invoice", "_x", "Type-A_2"])
+def test_addressable_entry_names_agree_with_the_inline_reference_grammar(blob_env: dict[str, Any], entry_name: str) -> None:
+    """The guard's name rule is the grammar ``wire_blob_inline_ref`` itself accepts."""
+    earlier = _upload(blob_env, content="Earlier upload.\n")
+    options = _options(earlier)
+    options["files"][entry_name] = {"content": earlier, "format": "text"}
+    state = _state(_node("inject", options))
+    uploaded = _upload(blob_env)
+
+    result = _execute(
+        "wire_blob_inline_ref",
+        {"field_path": f"node:inject.options.files.{entry_name}.content", "blob_id": uploaded["blob_ref"]},
+        state,
+        blob_env,
+    )
+
+    assert result.success is True, [error.message for error in result.validation.errors]
+
+
+@pytest.mark.parametrize("entry_name", ["v1.2", "Type A", "2024"])
+def test_wire_blob_inline_ref_cannot_address_the_names_the_guard_refuses(blob_env: dict[str, Any], entry_name: str) -> None:
+    state = _state(_node("inject", _options(_upload(blob_env, content="Earlier upload.\n"))))
+    uploaded = _upload(blob_env)
+
+    result = _execute(
+        "wire_blob_inline_ref",
+        {"field_path": f"node:inject.options.files.{entry_name}.content", "blob_id": uploaded["blob_ref"]},
+        state,
+        blob_env,
+    )
+
+    assert result.success is False
+    assert result.updated_state is state
+
+
 @pytest.mark.parametrize("tool", _NODE_OPTION_TOOLS)
 def test_non_inline_marker_is_not_an_upload(blob_env: dict[str, Any], tool: str) -> None:
     """A ``bind_source`` marker is a mapping, but it is not an attached upload."""
@@ -351,7 +568,9 @@ def test_non_inline_marker_is_not_an_upload(blob_env: dict[str, Any], tool: str)
 
 def _assert_steers_away_from_default_content(message: str) -> None:
     assert "default_content is not accepted in the composer" in message
-    assert "Use on_miss: null or on_miss: fail and handle the miss downstream" in message
+    assert message.endswith("Use on_miss: null or on_miss: fail and handle the miss downstream.")
+    # In mode select a miss names no entry, so an extra files entry is not a fallback.
+    assert "files entry" not in message
     assert "dta-au/elspeth#361" not in message
 
 

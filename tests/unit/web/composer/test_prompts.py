@@ -783,8 +783,8 @@ class TestBuildSystemPrompt:
         assert "State `format` on every entry" in flattened
         # The rule, said once: a user upload, never a planner-created blob, never literal text.
         assert (
-            "In the composer, `file_inject` content must be a file the user uploaded: do not create the blob "
-            "yourself or write literal text into `content`."
+            "In the composer, `file_inject` content must be a file the user uploaded; anything else is refused, "
+            "so do not create the blob yourself or write literal text into `content`."
         ) in flattened
         steps = (
             "(1) Tell the user to save the text as a file and upload it.",

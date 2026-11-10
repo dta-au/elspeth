@@ -24,7 +24,11 @@ from elspeth.web.catalog.schemas import PluginKind
 from elspeth.web.compartments import compartment_ingress_record, compartment_marking_header
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.state import CompositionState, SourceSpec
-from elspeth.web.composer.tools.blobs import _apply_inline_blob_marker, _llm_authored_prompt_surface_error
+from elspeth.web.composer.tools.blobs import (
+    _apply_inline_blob_marker,
+    _file_inject_blob_binding_error,
+    _llm_authored_prompt_surface_error,
+)
 from elspeth.web.composer.yaml_generator import (
     PUBLIC_EXPORT_REBIND_GUIDANCE,
     PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX,
@@ -721,6 +725,15 @@ async def _state_with_imported_inline_blobs(
         )
         if prompt_surface_error is not None:
             raise HTTPException(status_code=400, detail=prompt_surface_error)
+        file_inject_blob_error = _file_inject_blob_binding_error(
+            state,
+            ref.field_path,
+            blob_id=blob.id,
+            created_by=blob.created_by,
+            creation_modality=blob.creation_modality,
+        )
+        if file_inject_blob_error is not None:
+            raise HTTPException(status_code=400, detail=file_inject_blob_error)
         marker = {"blob_ref": str(blob.id), "mode": "inline_content", "sha256": content_hash}
         if encoding != "utf-8":
             marker["encoding"] = encoding
@@ -1416,6 +1429,8 @@ def _reject_file_inject_content_not_uploaded(state: CompositionState) -> None:
     refusal = refusals[0]
     if refusal.cause == "default_content":
         action = "Remove default_content from the YAML and use on_miss: null or on_miss: fail, then import again."
+    elif refusal.cause == "unaddressable_entry":
+        action = "Rename the entry in the YAML to a name of that form and import again."
     else:
         action = (
             f"Remove '{refusal.option_path}' from the YAML and import again, upload the file in this session, then attach it to that entry."
