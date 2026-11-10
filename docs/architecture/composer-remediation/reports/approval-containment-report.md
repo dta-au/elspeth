@@ -321,3 +321,91 @@ applied with exact-match string replacements, each asserted to match exactly
 once, and reviewed in the diff. That departs from the brief's "Edit tool for
 edits". No `sed`/`awk`, no suppression comments,
 no skips or xfails were added.
+
+## Review follow-ups (commit `4fe5dd5c2` plus the test-repair commit after it)
+
+Response to `approval-containment-review.md` (written in the sibling
+`composer-0812` worktree). This section supersedes decision 4, follow-up 6 and
+the two quoted refusal texts above.
+
+1. **Pending refusal is now truthful for stale proposals.** Staleness is
+   cheaply knowable at the guard: the pending row carries `base_state_id` and
+   the batch already holds the current state id it would record as a new
+   proposal's base. When they differ the refusal says the proposal "can no
+   longer be accepted because the saved pipeline changed after it was created:
+   tell the user they must reject it first"; otherwise it keeps "accept or
+   reject". When several are pending the text describes the first.
+2. **Batch refusal wording.** The count is by tool name, so it can include a
+   sibling that is refused for its own malformed arguments. I kept the counting
+   (it is what makes the refusal precede every effect) and changed the sentence
+   from "carried N of them. All N were refused before any effect" to "carried N
+   pipeline-change calls. None of them was applied and no proposal was
+   recorded", which is true of every call whatever its own result says.
+3. **Empty-pipeline planner publisher: reproduced and guarded.**
+   - Reproduction: `test_second_empty_build_while_a_proposal_is_pending_stages_no_second_proposal_under_explicit_approval`
+     in `tests/integration/web/composer/test_freeform_pipeline_planner.py`. Before
+     the change, two compose requests against an empty pipeline under
+     `explicit_approve` left two pending `set_pipeline` proposals on the same
+     null base.
+   - Guard: in `PlanningApplication._stage_pipeline_plan`
+     (`src/elspeth/web/composer/planning_application.py`, +21 lines), when the
+     current trust mode is `explicit_approve` and a pending composition proposal
+     exists, the new proposal is not published and the turn returns a message
+     naming the pending proposal.
+   - Invariants: the guard sits after planning, so the provider is called for
+     every request exactly as before (the test asserts two provider requests)
+     and the planner audit is already durable. Nothing is authored server-side.
+     I deliberately did not refuse before the provider call: that would remove a
+     provider call on the rootless entry path, which is the pattern the standing
+     review trigger exists for, and it would also block a plain question.
+   - Cost: the second planning run is spent and discarded. A user who wants a
+     revised first proposal must reject the pending one and ask again.
+   - `auto_commit` is unchanged; the test's `auto_commit` case pins that two
+     pending proposals still result there (the review-handoff case, research
+     item E).
+   - The review says accepting the second proposal after the first "silently
+     overwrites". Read, not exercised: canonical settlement raises
+     `StaleComposeStateError("pipeline proposal absent base conflicts with
+     current state")` for an absent-base proposal once a state exists
+     (`src/elspeth/web/sessions/service.py`, the `AbsentBase` branch), which
+     matches the probe's 409 on a later `set_pipeline`. I did not build an
+     accept-path test to settle which is right.
+
+Skill text: still not edited, per instruction. The refusal still costs one
+provider round when the model follows the skill's narrow-tool advice until the
+owning agent applies the sentence above.
+
+### Follow-up verification
+
+| Run | Exit | Result |
+|---|---|---|
+| Red, before the change (`followup-red.log`): new containment file + planner file | 1 | 5 failed, 30 passed: three batch-wording cases, the stale-wording case, the planner reproduction |
+| Green (`followup-green.log`), same two files | 0 | 35 passed |
+| Negative control (`followup-negative.log`): planner guard condition replaced by `if False`, planner file | 1 | 1 failed (the `explicit_approve` reproduction), 21 passed; guard restored afterwards |
+| Broad on `4fe5dd5c2` (`followup-broad.log`): `tests/unit/web/composer`, `tests/integration/web/composer`, attribute contracts, `tests/unit/architecture/test_pipeline_publication_authority_guards.py`; `-n 6` | 1 | 9 failed, 14224 passed: the 6 known base reds in those directories plus 3 new in `test_planner_stage_runtime_preflight.py` (see below) |
+| Planner-staging callers outside the composer directories (`followup-fake.log`) | 1 | 8 failed, 733 passed, 1 xfailed: all 8 in `test_pipeline_rejection_callers.py` (see below) |
+| Race test after repair (`followup-race.log`), `-k test_actual_planner_resource_race` | 0 | 30 passed |
+| Broad after the test repairs (`followup-broad2.log`): the directories above plus `tests/unit/web/sessions`; `-n 6` | 1 | 7 failed, 17609 passed; the failed set is identical to the 7 base reds recorded earlier (`comm` against `known.failed`: nothing new, nothing missing) |
+| `ruff check`, `ruff format`, `mypy` (both production files), `scripts.check_contracts` | 0 | clean |
+
+### Existing tests the planner guard broke (repaired in a second commit)
+
+The first broad run on `4fe5dd5c2` was red beyond the base set, so that commit
+alone is not green; the repair commit follows it.
+
+- `tests/unit/web/composer/test_planner_stage_runtime_preflight.py` (3 cases):
+  its `_FakeSessionsService` modelled only the two methods the staging step
+  used to call. Added `list_composition_proposals` returning no pending rows.
+- `tests/unit/web/sessions/test_pipeline_rejection_callers.py::test_actual_planner_resource_race_retains_receipts_and_original_cancellation`
+  (8 cases, those whose current trust mode is `explicit_approve`): the fixture
+  leaves an undecided pipeline proposal in the session and then stages a second
+  one, which is the situation the guard refuses, so the creation race under test
+  was never reached (timeout). The test now rejects the fixture proposal first
+  in those cases; every assertion is unchanged and all 30 cases pass. This is a
+  behaviour consequence worth a reviewer's eye: it is the one existing test that
+  depended on two same-base pending planner proposals under explicit approval.
+
+The stale and batch wording have no separate mutation control beyond the red
+run. Not rerun for these commits: the rest of `tests/unit/architecture`, the
+trust-tier corpus comparison, testcontainer, the full suite.
+Production edits used the Edit tool except the one-line import; test edits used exact-match replacement scripts.
