@@ -191,7 +191,11 @@ from elspeth.web.interpretation_state import (
     interpretation_sites,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-from elspeth.web.sessions.proposal_blob_refs import PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE, ProposalResourceUnavailableError
+from elspeth.web.sessions.proposal_blob_refs import (
+    PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE,
+    MalformedProposalBlobReferenceError,
+    ProposalResourceUnavailableError,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -2402,12 +2406,18 @@ async def run_tool_batch(
                             audit=audit,
                             recorder=recorder,
                         )
-                except ProposalResourceUnavailableError:
+                except (ProposalResourceUnavailableError, MalformedProposalBlobReferenceError) as refusal:
                     unapplied_admission = _unapplied_admission(
                         _saved_graph_rejection_result(
                             state,
-                            PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE,
-                            error_code="proposal_resource_unavailable",
+                            PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE
+                            if type(refusal) is ProposalResourceUnavailableError
+                            else f"Proposal refused: {refusal}. Fix the blob reference and retry.",
+                            error_code=(
+                                "proposal_resource_unavailable"
+                                if type(refusal) is ProposalResourceUnavailableError
+                                else "proposal_blob_reference_malformed"
+                            ),
                             rejected_component=None,
                         ),
                         "refused",

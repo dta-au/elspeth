@@ -2366,6 +2366,45 @@ async def test_blob_admission_refuses_known_ineligible_effect_once_without_propo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", [5, ""])
+async def test_malformed_model_supplied_blob_ref_is_an_audited_repairable_refusal(tmp_path: Path, malformed: object) -> None:
+    """Tier-3 admission: a malformed blob_ref in model options refuses, it does not raise."""
+    harness = _harness(tmp_path)
+    state = _incremental_base_state(tmp_path)
+    output = _valid_pipeline_args(tmp_path)["outputs"][0]
+    llm = _ScriptedLLM(
+        _tool_turn(
+            "call_bad_ref",
+            "set_output",
+            {**output, "options": {**output["options"], "schema": {"mode": "observed", "blob_ref": malformed}}},
+        ),
+        _tool_turn("call_repair", "set_metadata", {"patch": {"name": "repaired draft"}}),
+        _fake_llm_response(content="The repair awaits approval."),
+    )
+    with patch.object(harness.service._provider_gateway, "_call_llm", new=llm), _record_phase3_outcomes(harness.service) as batches:
+        result = await harness.service.compose(
+            "Review this source change.",
+            [],
+            state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+    proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+    assert [proposal.tool_call_id for proposal in proposals] == ["call_repair"]
+    feedback = [message for message in llm.message_snapshots[1] if message.get("tool_call_id") == "call_bad_ref"]
+    assert len(feedback) == 1
+    payload = json.loads(feedback[0]["content"])
+    assert payload["success"] is False
+    assert payload["validation"]["errors"][0]["error_code"] == "proposal_blob_reference_malformed"
+    assert "blob_ref" in feedback[0]["content"]
+    outcomes = [outcome for batch in batches for outcome in batch if outcome.call.id == "call_bad_ref"]
+    assert len(outcomes) == 1
+    assert outcomes[0].pre_version == outcomes[0].post_version == state.version
+    assert result.state is state
+
+
+@pytest.mark.asyncio
 async def test_complete_auto_raw_equality_still_applies_required_control_and_review_finalization(tmp_path: Path) -> None:
     from elspeth.web.composer.pipeline_proposal import composition_content_hash
     from elspeth.web.composer.required_controls import wire_required_controls
