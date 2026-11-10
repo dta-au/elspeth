@@ -107,6 +107,7 @@ from elspeth.web.composer.context_budget import (
 from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
     first_history_shed_of_turn,
+    held_tool_keys,
     largest_component,
     latest_round_trip_start,
     message_bytes,
@@ -1698,6 +1699,7 @@ class ComposerServiceImpl:
                 # The ratio measured on this model's own budgeted calls, when the session has one.
                 bytes_per_token=frame.history.ratio_for(self._model),
                 previously_shed=previously_shed_keys(frame.history, recorder.llm_calls),
+                held=held_tool_keys(recorder.llm_calls),
             )
         except ContextBudgetRefusal as refusal:
             raise self._context_budget_refusal(

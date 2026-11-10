@@ -164,9 +164,14 @@ class ComposerContextBudgetRecord:
     the estimate used. ``request_wire_bytes`` is the size of the request this
     call sent: the canonical JSON of its ``{messages, tools}``, which counts
     content, tool-call arguments, thinking blocks and tool definitions. The
-    token estimates are on that same measure, and a later call's
-    bytes-per-token ratio is this size over the call's reported prompt
-    tokens. (``request_byte_split`` on the call stays the content split.)
+    token estimates are on that same measure. ``estimated_tokens_before``
+    is the estimate of the unshed request. ``estimated_tokens_after`` is an
+    UPPER BOUND on the estimate of the request sent, not that estimate: it
+    credits each shed segment with a lower bound of what shedding it saves
+    and includes the decision's re-render allowance, so it can be larger
+    than ``request_wire_bytes`` over the ratio. A later call's
+    bytes-per-token ratio is ``request_wire_bytes`` over the call's reported
+    prompt tokens. (``request_byte_split`` on the call stays the content split.)
     The shed decisions are by position
     (``shed_history_indices``, ``shed_hatch_event_indices``, ascending) or by
     tool-call id (``stubbed_tool_call_ids``, in request order).
