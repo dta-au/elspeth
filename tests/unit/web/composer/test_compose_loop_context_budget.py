@@ -8,14 +8,17 @@ call record that describes it.
 from __future__ import annotations
 
 import json
+import time
 from copy import deepcopy
 from dataclasses import replace
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from elspeth.contracts.composer_llm_audit import ComposerLLMCall
+from elspeth.contracts.composer_llm_audit import ComposerContextBudgetRecord, ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.audit import BufferingRecorder
@@ -28,6 +31,7 @@ from elspeth.web.composer.context_budget_apply import (
     tool_result_segments,
 )
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory
+from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.composer.prompts import STATE_CONTEXT_PREFIX
 from elspeth.web.composer.protocol import (
     COMPOSER_HISTORY_USER_AUTHORED_KEY,
@@ -36,7 +40,8 @@ from elspeth.web.composer.protocol import (
     ComposerHistoryMessage,
 )
 from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
-from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.recovery_controls import recovery_tool_definitions
+from elspeth.web.composer.service import ComposerServiceImpl, _reply_stage_instruction
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationSummary
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.turn_effects import TurnEvidence
@@ -822,3 +827,122 @@ async def test_stubbing_tool_results_alone_sends_no_notice() -> None:
     last = result.llm_calls[-1].context_budget
     assert last is not None and last.stubbed_tool_call_ids == ("call-1", "call-2")
     assert probe.notices() == []
+
+
+# --- The reply stage: its request is derived from the budgeted loop messages ---------------------
+
+
+def _tool_round(call_id: str, content: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": call_id, "type": "function", "function": {"name": "get_pipeline_state", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": call_id, "content": content},
+    ]
+
+
+async def _prepare_reply(
+    service: ComposerServiceImpl, llm_messages: list[dict[str, Any]], recorder: Any = None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], Any]:
+    """Prepare the reply-stage request for a turn whose loop messages are ``llm_messages``."""
+    plugin_snapshot, policy_catalog = service._policy_context.build("test-user")
+    state = _empty_state()
+    frame = service._context_budget_frame(
+        chat_history=[],
+        llm_messages=llm_messages[:4],
+        state=state,
+        session_id=None,
+        plugin_snapshot=plugin_snapshot,
+        policy_catalog=policy_catalog,
+        history=ContextBudgetHistory.empty(),
+    )
+    selected, tools, _delivery, record = await service._prepare_primary_delivery(
+        messages=llm_messages,
+        tools=recovery_tool_definitions(service._planner_dialect),
+        recorder=recorder if recorder is not None else BufferingRecorder(),
+        turn_evidence=None,
+        budget_frame=frame,
+        state=state,
+        initial_version=state.version,
+        composition_turns_used=0,
+        discovery_turns_used=0,
+        failed_turn=None,
+        progress=None,
+        reply_instruction=_reply_stage_instruction(),
+    )
+    return selected, tools, record
+
+
+def _two_round_turn(service: ComposerServiceImpl, first: str, second: str) -> list[dict[str, Any]]:
+    plugin_snapshot, policy_catalog = service._policy_context.build("test-user")
+    llm_messages = service._build_messages(
+        [], _empty_state(), "Build a CSV pipeline", plugin_snapshot=plugin_snapshot, policy_catalog=policy_catalog
+    )
+    assert len(llm_messages) == 4
+    return [*llm_messages, *_tool_round("call-1", first), *_tool_round("call-2", second)]
+
+
+@pytest.mark.asyncio
+async def test_the_reply_stage_request_stubs_earlier_tool_results_and_keeps_the_latest_round() -> None:
+    base = await _base_request_bytes()
+    first, second = "f" * (base * 6 // 10), "s" * (base * 6 // 10)
+    generous, _ = _service(_GENEROUS_TOKENS)
+    unshed, unshed_tools, unshed_record = await _prepare_reply(generous, _two_round_turn(generous, first, second))
+    full_content = message_bytes(unshed, unshed_tools).total_bytes
+    assert unshed_record.stubbed_tool_call_ids == ()
+    # The reply stage sends no tool-role message: each tool record is quoted as text.
+    assert [m["role"] for m in unshed[4:]] == ["assistant", "user", "assistant", "user", "system"]
+    assert first in unshed[5]["content"] and second in unshed[7]["content"]
+    # The unshed reply request is over the high mark and under the cap.
+    cap = -(-full_content // 3) * 10 // 9
+    service, _ = _service(cap)
+    llm_messages = _two_round_turn(service, first, second)
+    before = deepcopy(llm_messages)
+
+    selected, tools, record = await _prepare_reply(service, llm_messages)
+
+    assert record.stubbed_tool_call_ids == ("call-1",)
+    assert record.estimated_tokens_after < record.estimated_tokens_before <= cap
+    assert [m["role"] for m in selected[4:]] == ["assistant", "user", "assistant", "user", "system"]
+    # The earlier round's result is quoted as the stub; the latest round is quoted in full.
+    assert first not in selected[5]["content"] and CONTEXT_BUDGET_TOOL_RESULT_STUB in selected[5]["content"]
+    assert second in selected[7]["content"]
+    assert selected[8] == _reply_stage_instruction()
+    assert message_bytes(selected, tools).total_bytes < full_content - len(first) + 1_000
+    assert request_wire_bytes(selected, tools) <= service._context_budget_policy.max_request_bytes
+    # The loop's own messages keep their tool roles and full results.
+    assert llm_messages == before
+
+
+@pytest.mark.asyncio
+async def test_a_result_stubbed_on_an_earlier_call_stays_stubbed_in_the_reply_stage_request() -> None:
+    base = await _base_request_bytes()
+    first, second = "f" * (base * 6 // 10), "s" * (base * 6 // 10)
+    generous, _ = _service(_GENEROUS_TOKENS)
+    unshed, unshed_tools, _ = await _prepare_reply(generous, _two_round_turn(generous, first, second))
+    full_content = message_bytes(unshed, unshed_tools).total_bytes
+    # The unshed reply request sits at 70% of the cap: between the marks, so nothing new is shed.
+    service, _ = _service(-(-full_content // 3) * 10 // 7)
+    earlier = build_llm_call_record(
+        model_requested="openrouter/openai/gpt-5.5",
+        messages=[{"role": "system", "content": "skill"}],
+        tools=None,
+        status=ComposerLLMCallStatus.SUCCESS,
+        started_at=datetime.now(UTC),
+        started_ns=time.monotonic_ns(),
+        temperature=None,
+        seed=None,
+        response=None,
+        context_budget=ComposerContextBudgetRecord.from_shed_keys(
+            policy_hash="a" * 64, bytes_per_token=3.0, estimated_tokens_before=2, estimated_tokens_after=1, shed_keys=("tool:call-1",)
+        ),
+    )
+
+    for earlier_calls, expected in (((earlier,), ("call-1",)), ((), ())):
+        recorder = SimpleNamespace(llm_calls=earlier_calls, invocations=())
+        selected, _tools, record = await _prepare_reply(service, _two_round_turn(service, first, second), recorder)
+        assert record.stubbed_tool_call_ids == expected
+        assert (first in selected[5]["content"]) == (not expected)
+        assert second in selected[7]["content"]
