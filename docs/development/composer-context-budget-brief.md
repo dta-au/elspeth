@@ -5,6 +5,37 @@ instruction. It assumes the composer performance remediation branch
 (`docs/development/composer-performance-remediation.md`) has landed on main,
 so the per-component request byte split from fix 4A is being recorded.
 
+## Design, as built
+
+The design that answers Phase 2 is
+[`docs/superpowers/specs/2026-11-09-composer-context-budget-design.md`](../superpowers/specs/2026-11-09-composer-context-budget-design.md),
+built for 0.8.12. Before every Web Composer provider call, on both the compose
+loop and the planner, a pure budgeter in
+`src/elspeth/web/composer/context_budget.py` sheds context to fit two
+ceilings, records what it shed on the call record (`context_budget`), or
+refuses with `context_budget_exceeded` before any provider call.
+
+Settings (`WebSettings`, `src/elspeth/web/config.py`):
+
+| Setting | Environment variable | Default |
+|---|---|---|
+| `composer_context_max_prompt_tokens` | `ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` | none; required |
+| `composer_context_shed_above` | `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_ABOVE` | `0.85` |
+| `composer_context_shed_to` | `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_TO` | `0.60` |
+| `composer_planner_max_request_bytes` | `ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES` | 960 KiB (was 2 MiB); now also bounds the compose loop |
+
+Shed order, oldest first within each: tool-result bodies from earlier round
+trips of the current turn (replaced by a fixed stub), prior assistant prose,
+escape-hatch transcript events, prior user requests. Tokens are estimated
+from bytes with the session's last recorded bytes-per-token ratio (3.0 before
+its first successful call).
+
+Not done: the Phase 1 records investigation below, and its acceptance
+evidence (replaying the affected users' failing sessions through the new
+policy), were not carried out. The design bounds all four growth paths
+instead of the one a records investigation might single out. No live
+provider run has exercised the budget.
+
 ---
 
 ## Prompt
