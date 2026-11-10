@@ -2,8 +2,9 @@
 
 :mod:`elspeth.web.composer.context_budget` decides what to shed and knows
 nothing about messages. These helpers measure a request exactly as the call
-record measures it, build the stubbed form of a tool result, locate the most
-recent tool round trip, and name the largest component for a refusal. They
+record measures it, build the stubbed form of a tool result, label stubbable
+tool results, compose the previously shed keys, locate the most recent tool
+round trip, and name the largest component for a refusal. They
 write no content derived from user or model text: the only server-authored
 string is the constant stub.
 """
