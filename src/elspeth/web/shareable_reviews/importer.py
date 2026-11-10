@@ -49,6 +49,7 @@ from elspeth.contracts.blobs import (
 )
 from elspeth.contracts.blobs_inline import ContentEncoding
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.async_workers import run_sync_in_worker
@@ -98,10 +99,13 @@ class _InlineSite:
 class _BindingPlan:
     """Every manifest binding site, pointing at the sha256 of its file, plus the sink paths."""
 
-    source_blob_ref: dict[str, str]
-    source_blob_rows: dict[str, list[str]]
-    inline_content: dict[str, _InlineSite]
+    source_blob_ref: Mapping[str, str]
+    source_blob_rows: Mapping[str, Sequence[str]]
+    inline_content: Mapping[str, _InlineSite]
     sink_paths: Mapping[str, Mapping[str, SinkPathBindingRequest]]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "source_blob_ref", "source_blob_rows", "inline_content", "sink_paths")
 
     def import_request(self, *, public_yaml: str, blob_ids: dict[str, str]) -> ImportStateYamlRequest:
         """The seeder request that re-binds every site to the recipient's copy."""

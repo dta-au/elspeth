@@ -78,6 +78,7 @@ import hashlib
 import json
 import re
 import secrets
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Protocol, TypedDict, cast
@@ -94,6 +95,7 @@ from elspeth.contracts.blobs import (
     BlobStateError,
 )
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import canonical_json
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -405,10 +407,13 @@ def _content_refusal(record: BlobRecord, content: bytes) -> str | None:
 class _InspectedFile:
     """One bound blob as read and judged: ``refusal`` is ``None`` when it can travel."""
 
-    bindings: list[FileBinding]
+    bindings: Sequence[FileBinding]
     record: BlobRecord | None
     content: bytes | None
     refusal: str | None
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "bindings")
 
 
 def _describe_use(binding: FileBinding) -> str:
