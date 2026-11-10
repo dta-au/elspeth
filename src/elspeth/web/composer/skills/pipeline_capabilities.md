@@ -320,7 +320,7 @@ Declare fields as `name: type`. A coercing source turns integer text into `int`,
 numeric text into `float`, and `true`/`false`, `yes`/`no`, `1`/`0` into `bool`;
 a cell that does not parse fails source validation.
 Source validation failures use `on_validation_failure`.
-Fields declared under `fixed`/`flexible` are guaranteed. For rows you generated,
+Non-optional fields declared under `fixed`/`flexible` are guaranteed. For rows you generated,
 declare typed `fields` for what a consumer requires; you need not author
 `guaranteed_fields`. Sinks never coerce: declare sink `schema.fields` with
 the types that arrive when the output's columns are known.
