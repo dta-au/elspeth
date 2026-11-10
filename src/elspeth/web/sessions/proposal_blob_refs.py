@@ -23,7 +23,9 @@ _TOP_LEVEL_BLOB_TOOLS = frozenset(
         "wire_blob_inline_ref",
     }
 )
-_BLOB_REFERENCE_TOOLS = _TOP_LEVEL_BLOB_TOOLS | {"set_pipeline", "set_source_from_blobs"}
+_OPTIONS_BLOB_TOOLS = frozenset({"upsert_node", "set_source", "set_output"})
+_PATCH_BLOB_TOOLS = frozenset({"patch_node_options", "patch_source_options", "patch_output_options"})
+_BLOB_REFERENCE_TOOLS = _TOP_LEVEL_BLOB_TOOLS | _OPTIONS_BLOB_TOOLS | _PATCH_BLOB_TOOLS | {"set_pipeline", "set_source_from_blobs"}
 
 _BLOB_SENTINEL_OPTION_KEYS = frozenset({"path", "file"})
 
@@ -114,6 +116,19 @@ def proposal_blob_reference_ids(tool_name: str, arguments: Mapping[str, Any]) ->
     """
     if tool_name not in _BLOB_REFERENCE_TOOLS:
         return ()
+
+    if tool_name in _OPTIONS_BLOB_TOOLS or tool_name in _PATCH_BLOB_TOOLS:
+        field = "patch" if tool_name in _PATCH_BLOB_TOOLS else "options"
+        if field not in arguments:
+            return ()
+        options = arguments[field]
+        if options is None:
+            return ()
+        if type(options) is not dict:
+            raise ValueError(f"{tool_name} {field} must be a mapping")
+        option_references: list[str] = []
+        _collect_option_blob_references(options, position=f"{tool_name}.{field}", into=option_references)
+        return tuple(dict.fromkeys(canonical_resource_uuid(value) or value for value in option_references))
 
     if tool_name == "set_source_from_blobs":
         raw_blob_ids = arguments["blob_ids"] if "blob_ids" in arguments else None

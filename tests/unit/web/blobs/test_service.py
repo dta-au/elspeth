@@ -760,6 +760,12 @@ class TestDeleteBlob:
             ("set_source_from_blob", lambda blob_id: {"blob_id": blob_id}),
             ("update_blob", lambda blob_id: {"blob_id": blob_id}),
             ("wire_blob_inline_ref", lambda blob_id: {"blob_id": blob_id}),
+            ("patch_node_options", lambda blob_id: {"node_id": "enrich", "patch": {"prompt": {"blob_ref": blob_id}}}),
+            ("patch_source_options", lambda blob_id: {"patch": {"prompt": {"blob_ref": blob_id}}}),
+            ("patch_output_options", lambda blob_id: {"sink_name": "result", "patch": {"template": {"blob_ref": blob_id}}}),
+            ("upsert_node", lambda blob_id: {"node_id": "enrich", "options": {"prompt": {"blob_ref": blob_id}}}),
+            ("set_source", lambda blob_id: {"options": {"prompt": {"blob_ref": blob_id}}}),
+            ("set_output", lambda blob_id: {"sink_name": "result", "options": {"template": {"blob_ref": blob_id}}}),
         ],
     )
     async def test_delete_blob_rejects_blob_referenced_by_pending_proposal(
