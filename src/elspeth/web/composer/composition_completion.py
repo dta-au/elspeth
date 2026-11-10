@@ -21,6 +21,7 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerP
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.core.canonical import canonical_json
 from elspeth.web.composer import advisor_context as _advisor_context
 from elspeth.web.composer import advisor_policy as _advisor_policy
 from elspeth.web.composer._compose_loop_carriers import (
@@ -97,6 +98,7 @@ from elspeth.web.composer.protocol import (
     ComposerResult,
 )
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
+from elspeth.web.composer.reply_stage_refusal import ReplyStageRefusal
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools.generation import (
     ComposerProofContext,
@@ -917,6 +919,36 @@ class CompositionCompletion:
             content,
             writer_principal="compose_loop",
             tool_calls=[withheld_reply_envelope(origin, content)],
+            session_operation_context=session_operation_context,
+        )
+
+    async def _persist_reply_stage_refusal(
+        self,
+        refusal: ReplyStageRefusal,
+        *,
+        session_id: str | None,
+        session_operation_context: SessionOperationContext | None,
+    ) -> None:
+        """Record a reply stage the context budget refused as a non-rendered audit row.
+
+        No provider call was made, so there is no call record; this row is the
+        turn's durable trace of the refusal. Like a withheld reply it is an
+        ``audit`` row with its own envelope kind, out of the chat view and out
+        of later provider context. Its content is the envelope's canonical
+        JSON: sizes and closed-vocabulary names only. A sessionless compose
+        has nowhere to write.
+        """
+        if session_id is None:
+            return
+        if session_operation_context is None:
+            raise TypeError("reply stage refusal record requires the turn's session_operation_context")
+        envelope = refusal.envelope()
+        await self._require_sessions_service().add_message(
+            UUID(session_id),
+            "audit",
+            canonical_json(envelope),
+            writer_principal="compose_loop",
+            tool_calls=[envelope],
             session_operation_context=session_operation_context,
         )
 

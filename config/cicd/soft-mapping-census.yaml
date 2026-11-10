@@ -805,7 +805,7 @@ files:
     Mapping[str, Any]: 2
     dict[str, Any]: 4
   src/elspeth/web/composer/context_budget_apply.py:
-    Mapping[str, Any]: 2
+    Mapping[str, Any]: 4
     dict[str, Any]: 6
   src/elspeth/web/composer/context_budget_history.py:
     Mapping[str, Any]: 1
@@ -1100,10 +1100,10 @@ files:
   src/elspeth/web/shareable_reviews/service.py:
     dict[str, object]: 1
 totals:
-  Mapping[str, Any]: 796
+  Mapping[str, Any]: 798
   Mapping[str, object]: 317
   MutableMapping[str, Any]: 8
   boundary: 65
   dict[str, Any]: 1125
   dict[str, object]: 402
-  soft: 2648
+  soft: 2650

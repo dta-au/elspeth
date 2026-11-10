@@ -182,6 +182,7 @@ from elspeth.web.composer.recovery_controls import (
     recovery_context_message,
     recovery_tool_definitions,
 )
+from elspeth.web.composer.reply_stage_refusal import ReplyStageRefusal
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.composer.session_tool import SessionToolOwner
 from elspeth.web.composer.skills import assert_skill_hash_unchanged_on_disk
@@ -2318,6 +2319,7 @@ class ComposerServiceImpl:
                     session_operation_context=session_operation_context,
                 )
                 reply: _AdmittedAssistantMessage | None = None
+                reply_refused_by_context_budget = False
                 remaining = deadline - asyncio.get_event_loop().time()
                 provider_failures: tuple[type[Exception], ...] = (TimeoutError, _BadRequestLLMError, *advisor_provider_failure_types())
                 # Nothing is prepared, recorded or announced for a call that will not be made.
@@ -2353,11 +2355,25 @@ class ComposerServiceImpl:
                         if refusal.reason != "context_budget_exceeded":
                             raise
                         # The turn's work is done and this reply is optional: a request
-                        # the context budget cannot fit is not sent, and the turn ends
-                        # as it does when the provider fails this call. No provider
-                        # call was made, so no call record is written for it; the
-                        # trusted notice below reports the unavailable reply.
+                        # the context budget cannot fit is not sent, and the turn
+                        # completes without a reply. No provider call was made, so no
+                        # call record is written; the refusal's own audit row records
+                        # what was measured, and a trusted notice below tells the user
+                        # why there is no reply.
                         reply = None
+                        reply_refused_by_context_budget = True
+                        await self._completion._persist_reply_stage_refusal(
+                            ReplyStageRefusal(
+                                ceiling=refusal.evidence["ceiling"],
+                                estimated_tokens=refusal.evidence["estimated_tokens"],
+                                request_wire_bytes=refusal.evidence["request_bytes"],
+                                max_prompt_tokens=refusal.evidence["max_prompt_tokens"],
+                                max_request_bytes=refusal.evidence["max_request_bytes"],
+                                largest_component=refusal.evidence["largest_component"],
+                            ),
+                            session_id=session_id,
+                            session_operation_context=session_operation_context,
+                        )
                     else:
                         await emit_progress(
                             progress,
@@ -2517,7 +2533,11 @@ class ComposerServiceImpl:
                 if reply is None:
                     handoff_result = replace(
                         handoff_result,
-                        message=_no_tool_policy.compose_review_reply_unavailable_message(handoff_result.message),
+                        message=(
+                            _no_tool_policy.compose_review_reply_context_budget_message(handoff_result.message)
+                            if reply_refused_by_context_budget
+                            else _no_tool_policy.compose_review_reply_unavailable_message(handoff_result.message)
+                        ),
                         raw_assistant_content=(
                             "" if handoff_result.raw_assistant_content is None else handoff_result.raw_assistant_content
                         ),
