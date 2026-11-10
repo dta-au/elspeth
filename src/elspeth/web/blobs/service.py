@@ -2671,7 +2671,7 @@ class BlobServiceImpl:
             filename=safe_filename,
             mime_type=mime_type,
             size_bytes=len(content),
-            content_hash=content_hash(content),
+            content_hash=await self._run_sync(lambda: content_hash(content)),  # whole-upload hash: off the loop
             storage_path=str(storage),
             created_at=self._now(),
             created_by=created_by,

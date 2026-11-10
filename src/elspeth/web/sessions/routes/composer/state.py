@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.blobs_inline import BlobInlineRef, ContentEncoding
 from elspeth.contracts.composer_interpretation import InterpretationSurfaceOrigin
+from elspeth.contracts.enums import is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
@@ -48,6 +49,7 @@ from elspeth.web.interpretation_state import (
     parse_interpretation_requirements,
 )
 from elspeth.web.paths import (
+    MAX_SESSION_RELATIVE_PATH_CHARS,
     SINK_LOCAL_PATH_OPTION_KEYS,
     SOURCE_LOCAL_PATH_OPTION_KEYS,
     SessionFolder,
@@ -306,7 +308,7 @@ class SinkPathBindingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     folder: SessionFolder
-    relative_path: str
+    relative_path: str = Field(max_length=MAX_SESSION_RELATIVE_PATH_CHARS)
 
     # The bound path is written into the state after the imported YAML's
     # credential guard has run, so it needs its own.
@@ -774,6 +776,17 @@ async def _state_with_imported_source_blob_rows(
                 session_operation_context=session_operation_context,
             )
             content_hash = _ready_blob_content_hash(blob)
+            if is_llm_authored_creation_modality(blob.creation_modality):
+                # Parity with the canonical set_source_from_blobs writer
+                # (``_resolve_source_blobs``): an LLM-authored file reaches a
+                # source only through the singular flow that stages its review.
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"source_blob_rows.{source_name}: blob '{blob.id}' is LLM-authored; bind it with "
+                        "set_source_from_blob so its interpretation review is staged"
+                    ),
+                )
             if content_hash in seen_hashes:
                 raise HTTPException(
                     status_code=400,

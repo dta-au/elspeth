@@ -42,7 +42,7 @@ import pytest
 import yaml
 from sqlalchemy import select, text
 
-from elspeth.contracts.blobs import BlobNotFoundError, BlobRecord, BlobStatus, StorageMimeType
+from elspeth.contracts.blobs import BlobCreator, BlobNotFoundError, BlobRecord, BlobStatus, StorageMimeType
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.payload_store import PayloadNotFoundError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
@@ -266,6 +266,7 @@ class _FakeBlobService:
         creation_modality: CreationModality = CreationModality.VERBATIM,
         content_hash: str | None = "computed",
         size_bytes: int | None = None,
+        created_by: BlobCreator = "user",
     ) -> UUID:
         blob_id = uuid4()
         self.records[blob_id] = BlobRecord(
@@ -277,7 +278,7 @@ class _FakeBlobService:
             content_hash=hashlib.sha256(content).hexdigest() if content_hash == "computed" else content_hash,
             storage_path=f"/srv/elspeth/blobs/{session_id}/{blob_id}_{filename}",
             created_at=datetime(2026, 1, 1, tzinfo=UTC),
-            created_by="user",
+            created_by=created_by,
             source_description=None,
             status=status,
             creation_modality=creation_modality,
@@ -2613,8 +2614,10 @@ async def test_preview_lists_each_file_once_with_every_use(
     assert [(f.filename, f.size_bytes, f.used_by) for f in response.files] == [
         ("customers.csv", len(b"id,name\n1,Ada\n"), ["source 'source'", "node 'lookup' (tables.t.reference_content)"])
     ]
-    assert blob_service.reads == [blob_id]
+    # The preview judges each file from its blob row: no content is read.
+    assert blob_service.reads == []
     assert set(blob_service.contexts) == {session_operation_context}
+    assert response.max_lifetime_seconds == _FakeSettings().shareable_link_lifetime_seconds
 
 
 @pytest.mark.asyncio
@@ -2651,6 +2654,207 @@ async def test_preview_reports_llm_authored_file_as_not_importable(
     assert response.importable is False
     assert response.not_importable_reason == "'notes.txt' was written by the assistant and cannot be shared for import"
     assert sorted(f.filename for f in response.files) == ["customers.csv", "notes.txt"]
+
+
+_NOT_USER_CREATED = [
+    pytest.param("assistant", "'notes.txt' was written by the assistant and cannot be shared for import", id="assistant"),
+    pytest.param("pipeline", "'notes.txt' was produced by a pipeline run and cannot be shared for import", id="pipeline"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("created_by", "reason"), _NOT_USER_CREATED)
+async def test_preview_refuses_a_verbatim_file_the_user_did_not_upload(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+    created_by: BlobCreator,
+    reason: str,
+):
+    """R20: VERBATIM alone is not enough — only a user upload travels."""
+    blob_service = _FakeBlobService()
+    user_blob = blob_service.add(session_record.id, filename="customers.csv", content=b"id\n1\n")
+    other_blob = blob_service.add(
+        session_record.id, filename="notes.txt", content=b"not uploaded\n", mime_type="text/plain", created_by=created_by
+    )
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=_file_bound_state(state_record, source_blob=user_blob, node_value=_inline_marker(other_blob)),
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+        blob_service=blob_service,
+    )
+
+    response = await service.preview_shareable_files(session_id=session_record.id, session_operation_context=session_operation_context)
+
+    assert response.importable is False
+    assert response.not_importable_reason == reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("created_by", "reason"), _NOT_USER_CREATED)
+async def test_mark_ready_with_import_refuses_a_verbatim_file_the_user_did_not_upload(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+    monkeypatch: pytest.MonkeyPatch,
+    created_by: BlobCreator,
+    reason: str,
+):
+    blob_service = _FakeBlobService()
+    user_blob = blob_service.add(session_record.id, filename="customers.csv", content=b"id\n1\n")
+    other_blob = blob_service.add(
+        session_record.id, filename="notes.txt", content=b"not uploaded\n", mime_type="text/plain", created_by=created_by
+    )
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=_file_bound_state(state_record, source_blob=user_blob, node_value=_inline_marker(other_blob)),
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+        blob_service=blob_service,
+    )
+    store_calls = _track_store(payload_store, monkeypatch)
+
+    await _assert_refused_without_side_effects(
+        service,
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        session_record=session_record,
+        session_operation_context=session_operation_context,
+        store_calls=store_calls,
+        reason="file_not_shareable",
+        detail_fragment=reason,
+    )
+    # Refused from the row: the bytes of the refused file are never read.
+    assert other_blob not in blob_service.reads
+
+
+@pytest.mark.asyncio
+async def test_preview_judges_from_blob_rows_without_reading_content(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+):
+    """R18: the preview reads row metadata only; a stale row/bytes pair is the share's to refuse."""
+    blob_service = _FakeBlobService()
+    blob_id = blob_service.add(session_record.id, filename="customers.csv", content=b"id\n1\n", content_hash="d" * 64)
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=_file_bound_state(state_record, source_blob=blob_id, node_value="plain"),
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+        blob_service=blob_service,
+        settings=_FakeSettings(shareable_link_lifetime_seconds=3 * 86400),
+    )
+
+    response = await service.preview_shareable_files(session_id=session_record.id, session_operation_context=session_operation_context)
+
+    assert response.importable is True
+    assert blob_service.reads == []
+    assert response.max_lifetime_seconds == 3 * 86400
+
+
+@pytest.mark.asyncio
+async def test_preview_without_state_still_reports_max_lifetime(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+):
+    service, session_service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=state_record,
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+        settings=_FakeSettings(shareable_link_lifetime_seconds=7200),
+    )
+    session_service.current_state = None
+
+    response = await service.preview_shareable_files(session_id=session_record.id, session_operation_context=session_operation_context)
+
+    assert response.importable is False
+    assert response.max_lifetime_seconds == 7200
+
+
+@pytest.mark.asyncio
+async def test_mark_ready_with_import_hashes_and_stores_files_off_the_event_loop(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """R18: verifying and storing a frozen file's bytes runs in a worker thread, never on the loop."""
+    import threading
+
+    from elspeth.web.shareable_reviews import service as service_module
+
+    content = b"id,name\n1,Ada\n"
+    blob_service = _FakeBlobService()
+    blob_id = blob_service.add(session_record.id, filename="customers.csv", content=content)
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=_file_bound_state(state_record, source_blob=blob_id, node_value="plain"),
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+        blob_service=blob_service,
+    )
+    loop_thread = threading.get_ident()
+    threads: dict[str, list[int]] = {"verify": [], "store": []}
+    original_store = payload_store.store
+    original_verify = service_module._content_refusal
+
+    def recording_store(data: bytes) -> str:
+        threads["store"].append(threading.get_ident())
+        return original_store(data)
+
+    def recording_verify(record: BlobRecord, data: bytes) -> str | None:
+        threads["verify"].append(threading.get_ident())
+        return original_verify(record, data)
+
+    monkeypatch.setattr(payload_store, "store", recording_store)
+    monkeypatch.setattr(service_module, "_content_refusal", recording_verify)
+
+    await service.mark_ready_for_review(
+        session_id=session_record.id,
+        user_id=session_record.user_id,
+        username=_OWNER_USERNAME,
+        session_operation_context=session_operation_context,
+        allow_import=True,
+    )
+
+    assert len(threads["verify"]) == 1
+    # The frozen file and the snapshot are both stored.
+    assert len(threads["store"]) == 2
+    assert loop_thread not in threads["verify"] + threads["store"]
 
 
 def _v2_blob(**overrides: object) -> dict[str, Any]:

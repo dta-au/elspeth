@@ -35,6 +35,7 @@ from elspeth.contracts.blobs_inline import (
     ContentEncoding,
     is_widened_blob_ref,
 )
+from elspeth.contracts.credential_material import find_credential_material
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec
@@ -286,7 +287,9 @@ def collect_sink_paths(state: CompositionState, *, data_dir: str | Path, session
     (``resolve_sink_data_path``: the stable ``outputs/<file>`` authoring form
     is scoped to the session). A value that is not a string, resolves
     anywhere else, or names a session folder itself is not recorded: it
-    cannot be re-authored under another session. Sorted by (output, option).
+    cannot be re-authored under another session. Nor is a relative path the
+    normaliser refuses (over-long or holding a control character) or one
+    shaped like a credential. Sorted by (output, option).
     """
     data_dir_text = str(data_dir)
     found: list[SinkPathEntry] = []
@@ -308,6 +311,11 @@ def collect_sink_paths(state: CompositionState, *, data_dir: str | Path, session
             try:
                 relative_path = normalise_session_relative_path(relative.as_posix())
             except ValueError:
+                continue
+            # The import binds this value after the recipient's YAML
+            # credential guard has run, and refuses a credential-shaped one;
+            # recording it would make every import of the link fail.
+            if find_credential_material(relative_path) is not None:
                 continue
             found.append(SinkPathEntry(output.name, cast(SinkPathOption, option), folder, relative_path))
     return tuple(sorted(found, key=lambda entry: (entry.output, entry.option)))

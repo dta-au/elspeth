@@ -269,6 +269,9 @@ def test_collects_every_path_key_of_one_output_sorted_by_option(tmp_path: Path) 
         pytest.param({"path": None}, id="none"),
         pytest.param({"path": 7}, id="not-a-string"),
         pytest.param({"path": "outputs/bad\x00name.csv"}, id="nul-byte"),
+        pytest.param({"path": "outputs/a\nINFO fake log line.csv"}, id="control-character"),
+        pytest.param({"path": "outputs/" + "/".join(["d" * 100] * 11) + "/x.csv"}, id="longer-than-1024"),
+        pytest.param({"path": "outputs/sk-" + "a" * 24 + ".json"}, id="credential-shaped"),
         pytest.param({"url": "outputs/report.csv", "dataset": {"path": "outputs/nested.csv"}}, id="not-a-top-level-path-key"),
     ],
 )
@@ -312,6 +315,8 @@ _GOOD_SINK_JSON: dict[str, object] = {"output": "out", "option": "path", "folder
         pytest.param({**_GOOD_SINK_JSON, "relative_path": "../x"}, id="relative-dotdot"),
         pytest.param({**_GOOD_SINK_JSON, "relative_path": "/etc/passwd"}, id="relative-absolute"),
         pytest.param({**_GOOD_SINK_JSON, "relative_path": "a/./b"}, id="relative-not-normalised"),
+        pytest.param({**_GOOD_SINK_JSON, "relative_path": "a\tb.csv"}, id="relative-control-character"),
+        pytest.param({**_GOOD_SINK_JSON, "relative_path": "a" * 1025}, id="relative-longer-than-1024"),
     ],
 )
 def test_sink_path_entry_from_json_rejects_shape_drift(value: object) -> None:

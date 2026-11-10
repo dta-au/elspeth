@@ -127,6 +127,10 @@ class ShareableFilesResponse(_StrictResponse):
     files: list[ShareableFileView]
     importable: bool
     not_importable_reason: str | None
+    # The deployment's ``shareable_link_lifetime_seconds``: the share
+    # refuses any longer ``lifetime_seconds``, so the dialog offers only
+    # lifetimes at or below it.
+    max_lifetime_seconds: int
 
 
 # ── Strict Pydantic mirrors of CompositionState dataclasses ──────────────

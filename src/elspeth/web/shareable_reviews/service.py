@@ -97,6 +97,7 @@ from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import canonical_json
 from elspeth.core.payload_store import FilesystemPayloadStore
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.audit_readiness.models import AuditReadinessSnapshot
 from elspeth.web.compartments import is_compartment_id
 from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
@@ -367,26 +368,36 @@ def _public_audit_readiness(snapshot: AuditReadinessSnapshot) -> AuditReadinessS
     return snapshot.model_copy(update={"rows": rows})
 
 
-def _check_shareable_blob(record: BlobRecord, content: bytes | None) -> str | None:
+def _check_shareable_blob(record: BlobRecord) -> str | None:
     """Return why ``record`` cannot travel with an importable share, or ``None``.
 
-    The message is user register and names the file. ``content`` is the
-    blob's bytes as read under the caller's session-operation context, or
-    ``None`` when they were not read (a blob that is not ready is refused
-    from its row alone). Shared by the mark-ready freeze and the owner's
-    file preview, so both report the same verdict.
+    Judged from the blob row alone, so the owner's file preview never reads
+    file content. Only a ready file the user uploaded verbatim travels: the
+    creator and the creation modality are read as a pair, because an
+    assistant- or pipeline-created blob can also be VERBATIM. The message is
+    user register and names the file. Shared by the mark-ready freeze and the
+    preview, so both report the same verdict; the freeze then also checks the
+    bytes (``_content_refusal``).
     """
     name = record.filename
     if record.status != "ready":
         return f"'{name}' is not ready to share (its upload is {record.status})"
     if record.content_hash is None:
         return f"'{name}' has no recorded content hash and cannot be shared for import"
-    if record.creation_modality is not CreationModality.VERBATIM:
+    if record.created_by == "assistant" or record.creation_modality is not CreationModality.VERBATIM:
         return f"'{name}' was written by the assistant and cannot be shared for import"
-    if content is None:
-        return f"'{name}' could not be read and cannot be shared for import"
+    if record.created_by == "pipeline":
+        return f"'{name}' was produced by a pipeline run and cannot be shared for import"
+    return None
+
+
+def _content_refusal(record: BlobRecord, content: bytes) -> str | None:
+    """Return why ``content`` is not the bytes ``record`` describes, or ``None``.
+
+    Hashes the whole file, so the freeze runs it in a worker thread.
+    """
     if len(content) != record.size_bytes or hashlib.sha256(content).hexdigest() != record.content_hash:
-        return f"'{name}' does not match its recorded content and cannot be shared for import"
+        return f"'{record.filename}' does not match its recorded content and cannot be shared for import"
     return None
 
 
@@ -796,8 +807,10 @@ class ShareableReviewService:
         # Files before the audit row: the row's digest commits to a manifest
         # whose bytes are already frozen, so no audited share can name a
         # file the payload store never received.
+        # Storing hashes (and, for a file already stored, re-reads) the
+        # whole file: a worker thread keeps that off the event loop.
         for frozen in frozen_files:
-            stored_file_hex = self._payload_store.store(frozen.content)
+            stored_file_hex = await run_sync_in_worker(self._payload_store.store, frozen.content)
             if stored_file_hex != frozen.entry["sha256"]:
                 raise RuntimeError(
                     f"payload store returned digest {stored_file_hex} for a frozen share file whose verified sha256 is {frozen.entry['sha256']}"
@@ -833,7 +846,7 @@ class ShareableReviewService:
         record_session_completed(self._telemetry, completion_verb="mark_ready_for_review")
 
         # Then blob.
-        stored_hex = self._payload_store.store(snapshot.canonical_bytes)
+        stored_hex = await run_sync_in_worker(self._payload_store.store, snapshot.canonical_bytes)
         # Defense in depth: the payload store recomputes the digest;
         # a mismatch here is a Tier-1 corruption event.
         if stored_hex != snapshot.digest_hex:
@@ -978,7 +991,7 @@ class ShareableReviewService:
         """
         payload = self._signer.verify(token)
         digest_hex = payload.payload_digest.removeprefix(_DIGEST_PREFIX)
-        blob_bytes = self._payload_store.retrieve(digest_hex)
+        blob_bytes = await run_sync_in_worker(self._payload_store.retrieve, digest_hex)
         # The payload store has already verified the digest matches —
         # any tampering on the filesystem path raises IntegrityError
         # before we get here.
@@ -991,16 +1004,18 @@ class ShareableReviewService:
         composition_state: CompositionState,
         *,
         session_operation_context: SessionOperationContext,
-        stop_on_refusal: bool,
+        read_content: bool,
     ) -> tuple[list[_InspectedFile], str | None]:
-        """Read each file ``composition_state`` binds once and judge it.
+        """Judge each file ``composition_state`` binds once, from its blob row.
 
         Returns one ``_InspectedFile`` per distinct blob, in collector order,
         and a refusal for a binding collection that is itself malformed. The
         share freeze and the owner's preview both go through here, so they
-        refuse for exactly the same reasons. With ``stop_on_refusal`` the walk
-        ends at the first refused file (the freeze raises on it); without it
-        every file is judged (the preview lists what it can).
+        refuse for exactly the same row reasons. With ``read_content`` (the
+        freeze) the walk also reads each shareable file's bytes, checks them
+        against the row in a worker thread, and ends at the first refused
+        file; without it (the preview) no content is read and every file is
+        judged, so the preview lists what it can.
         """
         try:
             bound = collect_file_bindings(composition_state)
@@ -1023,20 +1038,20 @@ class ShareableReviewService:
                         refusal=f"the file used by {_binding_site(bindings[0])} no longer exists; reattach it before sharing for import",
                     )
                 )
-                if stop_on_refusal:
+                if read_content:
                     break
                 continue
             content: bytes | None = None
-            refusal: str | None = None
-            if record.status == "ready":
+            refusal = _check_shareable_blob(record)
+            if refusal is None and read_content:
                 try:
                     content = await self._blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context)
                 except (BlobNotFoundError, BlobStateError):
                     refusal = f"'{record.filename}' changed while preparing the share; retry"
-            if refusal is None:
-                refusal = _check_shareable_blob(record, content)
+                else:
+                    refusal = await run_sync_in_worker(_content_refusal, record, content)
             inspected.append(_InspectedFile(bindings=bindings, record=record, content=content, refusal=refusal))
-            if refusal is not None and stop_on_refusal:
+            if refusal is not None and read_content:
                 break
         return inspected, None
 
@@ -1048,15 +1063,24 @@ class ShareableReviewService:
     ) -> ShareableFilesResponse:
         """List the files an importable share of the current state would carry.
 
-        Same refusal rules as ``mark_ready_for_review(allow_import=True)``,
-        reported instead of raised. Reads blobs under the caller's context and
-        stores nothing. The response names no blob id, path or hash.
+        Same row refusal rules as ``mark_ready_for_review(allow_import=True)``,
+        reported instead of raised. Reads blob rows (never their content)
+        under the caller's context and stores nothing; a file whose bytes no
+        longer match its row is refused by the share itself. The response
+        names no blob id, path or hash, and carries the deployment's maximum
+        link lifetime so the dialog offers only lifetimes the share accepts.
         """
+        max_lifetime_seconds = self._settings.shareable_link_lifetime_seconds
         state_record = await self._session_service.get_current_state(session_id)
         if state_record is None:
-            return ShareableFilesResponse(files=[], importable=False, not_importable_reason="No composition state exists for this session")
+            return ShareableFilesResponse(
+                files=[],
+                importable=False,
+                not_importable_reason="No composition state exists for this session",
+                max_lifetime_seconds=max_lifetime_seconds,
+            )
         inspected, collect_refusal = await self._inspect_bound_files(
-            state_from_record(state_record), session_operation_context=session_operation_context, stop_on_refusal=False
+            state_from_record(state_record), session_operation_context=session_operation_context, read_content=False
         )
         reason = collect_refusal
         views: dict[str, ShareableFileView] = {}
@@ -1072,7 +1096,12 @@ class ShareableReviewService:
                 label = _describe_use(binding)
                 if label not in view.used_by:
                     view.used_by.append(label)
-        return ShareableFilesResponse(files=list(views.values()), importable=reason is None, not_importable_reason=reason)
+        return ShareableFilesResponse(
+            files=list(views.values()),
+            importable=reason is None,
+            not_importable_reason=reason,
+            max_lifetime_seconds=max_lifetime_seconds,
+        )
 
     async def _verify_shareable_files(
         self,
@@ -1091,7 +1120,7 @@ class ShareableReviewService:
         first blob's filename and MIME type name it.
         """
         inspected, collect_refusal = await self._inspect_bound_files(
-            composition_state, session_operation_context=session_operation_context, stop_on_refusal=True
+            composition_state, session_operation_context=session_operation_context, read_content=True
         )
         if collect_refusal is not None:
             raise CompositionNotRunnableError(reason="file_not_shareable", detail=collect_refusal)

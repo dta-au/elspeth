@@ -127,8 +127,10 @@ def _plan_sink_paths(entries: Sequence[SinkPathEntry]) -> dict[str, dict[str, Si
 
     The manifest is server-written, but the importer does not trust it to
     stay inside the recipient's folder: a relative path that is not already
-    normalised (empty, absolute, ``..``, a backslash) or an option bound
-    twice is an integrity anomaly, raised before any session exists.
+    normalised (empty, absolute, ``..``, a backslash, a control character,
+    over-long), one the binding request refuses (credential-shaped) or an
+    option bound twice is an integrity anomaly, raised before any session
+    exists.
     """
     bindings: dict[str, dict[str, SinkPathBindingRequest]] = {}
     for entry in entries:
@@ -143,7 +145,16 @@ def _plan_sink_paths(entries: Sequence[SinkPathEntry]) -> dict[str, dict[str, Si
         options = bindings[entry.output]
         if entry.option in options:
             raise AuditIntegrityError(f"share manifest sink path binds output {entry.output!r} option {entry.option!r} twice")
-        options[entry.option] = SinkPathBindingRequest(folder=entry.folder, relative_path=entry.relative_path)
+        try:
+            options[entry.option] = SinkPathBindingRequest(folder=entry.folder, relative_path=entry.relative_path)
+        except ValidationError as exc:
+            # The binding request refuses a credential-shaped path. The share
+            # side never records one, so meeting it here is corruption, not
+            # a recipient error. The value itself is not echoed.
+            reasons = sorted({error["type"] for error in exc.errors(include_url=False, include_input=False, include_context=False)})
+            raise AuditIntegrityError(
+                f"share manifest sink path for output {entry.output!r} is invalid: refused by the binding request ({', '.join(reasons)})"
+            ) from None
     return bindings
 
 

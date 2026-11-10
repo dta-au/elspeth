@@ -390,7 +390,18 @@ def test_import_rebases_sink_paths_under_the_recipients_session(client: SyncASGI
     assert validated.json()["is_valid"] is True, validated.json()["errors"]
 
 
-@pytest.mark.parametrize("relative_path", ["../escape.jsonl", "/etc/passwd", "", "nested/../../x"])
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "../escape.jsonl",
+        "/etc/passwd",
+        "",
+        "nested/../../x",
+        pytest.param("sk-" + "a" * 24 + ".jsonl", id="credential-shaped"),
+        pytest.param("a\nINFO fake log line.jsonl", id="control-character"),
+        pytest.param("a" * 1025, id="longer-than-1024"),
+    ],
+)
 def test_import_tampered_sink_path_is_an_integrity_error_and_creates_no_session(
     client: SyncASGITestClient,
     actor: _Actor,

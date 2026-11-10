@@ -593,6 +593,7 @@ def test_preview_lists_each_file_once_with_every_use(
         "files": [{"filename": "customers.csv", "size_bytes": len(content), "used_by": ["source 'source'"]}],
         "importable": True,
         "not_importable_reason": None,
+        "max_lifetime_seconds": client.app.state.settings.shareable_link_lifetime_seconds,
     }
 
 
@@ -634,6 +635,34 @@ def test_preview_reports_llm_authored_file_as_not_importable(
     assert body["importable"] is False
     assert body["not_importable_reason"] == "'customers.csv' was written by the assistant and cannot be shared for import"
     assert [f["filename"] for f in body["files"]] == ["customers.csv"]
+
+
+@pytest.mark.parametrize(
+    ("created_by", "reason"),
+    [
+        pytest.param("assistant", "'customers.csv' was written by the assistant and cannot be shared for import", id="assistant"),
+        pytest.param("pipeline", "'customers.csv' was produced by a pipeline run and cannot be shared for import", id="pipeline"),
+    ],
+)
+def test_preview_and_mark_ready_refuse_a_verbatim_file_the_user_did_not_upload(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+    created_by: str,
+    reason: str,
+) -> None:
+    """R20: a VERBATIM blob travels only when the user created it."""
+    client, session_id = audit_readiness_client_with_state
+    seeded = _seed_uploaded_file_source(client, session_id, b"id\n1\n")
+    with client.app.state.session_engine.begin() as conn:
+        conn.execute(blobs_table.update().where(blobs_table.c.id == seeded["id"]).values(created_by=created_by))
+
+    preview = client.get(f"/api/sessions/{session_id}/shareable-files")
+    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review", json={"allow_import": True})
+
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["importable"] is False
+    assert preview.json()["not_importable_reason"] == reason
+    assert marked.status_code == 409, marked.text
+    assert marked.json()["detail"] == reason
 
 
 def test_preview_route_is_owner_only_404_for_other_user(

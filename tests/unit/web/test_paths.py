@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from elspeth.web.paths import (
+    MAX_SESSION_RELATIVE_PATH_CHARS,
     allowed_sink_directories,
     allowed_source_directories,
     locate_in_session_folder,
@@ -264,3 +265,24 @@ class TestSessionFolderRelativePaths:
     def test_normalise_refuses_empty_absolute_dotdot_and_backslash(self, value: str) -> None:
         with pytest.raises(ValueError):
             normalise_session_relative_path(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("a\nINFO fake log line.csv", id="newline"),
+            pytest.param("a\rb.csv", id="carriage-return"),
+            pytest.param("a\tb.csv", id="tab"),
+            pytest.param("a\x1bb.csv", id="escape"),
+            pytest.param("a\x7fb.csv", id="delete"),
+        ],
+    )
+    def test_normalise_refuses_control_characters(self, value: str) -> None:
+        with pytest.raises(ValueError, match="control character"):
+            normalise_session_relative_path(value)
+
+    def test_normalise_bounds_the_path_length(self) -> None:
+        longest = "a" * MAX_SESSION_RELATIVE_PATH_CHARS
+        assert MAX_SESSION_RELATIVE_PATH_CHARS == 1024
+        assert normalise_session_relative_path(longest) == longest
+        with pytest.raises(ValueError, match="longer than 1024"):
+            normalise_session_relative_path(longest + "a")

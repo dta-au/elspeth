@@ -8,7 +8,7 @@ web/ (not composer/ or execution/) to avoid cross-package coupling.
 from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Final, Literal
 from uuid import UUID
 
 SOURCE_LOCAL_PATH_OPTION_KEYS: tuple[str, ...] = ("path", "file")
@@ -166,16 +166,27 @@ def session_folder_path(data_dir: str | Path, folder: SessionFolder, *, session_
     return Path(data_dir).resolve() / folder / session_id / relative_path
 
 
+# Longest session-relative path accepted anywhere one is recorded or bound.
+MAX_SESSION_RELATIVE_PATH_CHARS: Final = 1024
+
+
 def normalise_session_relative_path(value: str) -> str:
     """Return ``value`` as a normalised POSIX path that stays inside a session folder.
 
     Collapses ``.`` segments and repeated separators. Raises ``ValueError`` for
     an empty result, an absolute path, any ``..`` segment, a backslash (a
     separator on another platform) or a NUL byte: none of these can name a
-    file below a session folder.
+    file below a session folder. Also raises for a value longer than
+    ``MAX_SESSION_RELATIVE_PATH_CHARS`` or holding any other control
+    character (C0 or DEL): such a name is persisted into state and echoed in
+    validation messages and logs, where a newline forges a line.
     """
     if "\\" in value or "\x00" in value:
         raise ValueError("a session-relative path must not contain a backslash or NUL byte")
+    if len(value) > MAX_SESSION_RELATIVE_PATH_CHARS:
+        raise ValueError(f"a session-relative path must not be longer than {MAX_SESSION_RELATIVE_PATH_CHARS} characters")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise ValueError("a session-relative path must not contain a control character")
     pure = PurePosixPath(value)
     if pure.is_absolute():
         raise ValueError("a session-relative path must not be absolute")

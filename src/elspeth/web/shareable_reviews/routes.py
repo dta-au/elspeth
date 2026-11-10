@@ -180,10 +180,12 @@ def create_shareable_reviews_router() -> APIRouter:
     ) -> JSONResponse:
         """List the files an importable share of the current state would carry.
 
-        Owner-only (404 for anyone else). Reads blobs but writes nothing, so
-        it takes BLOB_READ authority rather than a COMPOSE lease and never
-        conflicts with a live compose. A graph that cannot be shared for
-        import answers 200 with ``importable: false`` and the reason.
+        Owner-only (404 for anyone else). Reads blob rows (never file
+        content) and writes nothing, so it takes BLOB_READ authority rather
+        than a COMPOSE lease and never conflicts with a live compose. A graph
+        that cannot be shared for import answers 200 with
+        ``importable: false`` and the reason. ``max_lifetime_seconds`` is the
+        longest link lifetime the share accepts on this deployment.
         """
         await rate_limiter.check(user.user_id)
         await verify_session_ownership(session_id, user, request)

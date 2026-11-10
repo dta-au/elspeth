@@ -6,6 +6,7 @@ import asyncio
 import json
 import threading
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -3905,6 +3906,19 @@ sinks:
     on_write_failure: discard
 """
 
+_BLOB_ROWS_YAML = """
+sources:
+  source:
+    plugin: blob_rows
+    on_success: main
+    on_validation_failure: discard
+    options: {}
+sinks:
+  main:
+    plugin: json
+    on_write_failure: discard
+"""
+
 
 def _hashed_blob(
     *,
@@ -4167,6 +4181,111 @@ class TestImportRebindsSharedFiles:
         assert await service.get_current_state(session.id) is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("blob_session", "status", "expected_status", "expected_detail"),
+        [
+            ("missing", "ready", 404, "Blob not found"),
+            ("foreign", "ready", 404, "Blob not found"),
+            ("own", "pending", 409, "Blob is not ready"),
+            ("own", "error", 409, "Blob is not ready"),
+        ],
+    )
+    async def test_import_blob_rows_binding_refuses_foreign_or_unready_blob(
+        self,
+        tmp_path: Path,
+        blob_session: str,
+        status: str,
+        expected_status: int,
+        expected_detail: str,
+    ) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        owner_session_id = session.id if blob_session == "own" else uuid.uuid4()
+        blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=owner_session_id, content_hash=_REBIND_DIGEST_A, status=status)
+        app.state.blob_service = _blob_service_for() if blob_session == "missing" else _blob_service_for(blob)
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={"yaml": _BLOB_ROWS_YAML, "source_blob_rows": {"source": {"blob_ids": [str(blob.id)]}}},
+        )
+
+        assert resp.status_code == expected_status, resp.text
+        assert resp.json()["detail"] == expected_detail
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("blob_ids", "detail_fragment"),
+        [
+            pytest.param(lambda first, second: [str(first.id), str(first.id)], "the same blob more than once", id="same-blob-twice"),
+            pytest.param(lambda first, second: [str(first.id), "not-a-uuid"], "blob_ids[1] must be a UUID", id="not-a-uuid"),
+            pytest.param(lambda first, second: [str(first.id), str(second.id)], "two files with the same content", id="same-content"),
+        ],
+    )
+    async def test_import_blob_rows_binding_refuses_duplicates_and_malformed_ids(
+        self, tmp_path: Path, blob_ids: Callable[[Any, Any], list[str]], detail_fragment: str
+    ) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        first = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A, filename="a.csv")
+        second = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A, filename="b.csv")
+        app.state.blob_service = _blob_service_for(first, second)
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={"yaml": _BLOB_ROWS_YAML, "source_blob_rows": {"source": {"blob_ids": blob_ids(first, second)}}},
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert detail_fragment in resp.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_import_blob_rows_binding_refuses_unknown_source(self, tmp_path: Path) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A)
+        app.state.blob_service = _blob_service_for(blob)
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={"yaml": _BLOB_ROWS_YAML, "source_blob_rows": {"missing": {"blob_ids": [str(blob.id)]}}},
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"] == "source_blob_rows references unknown source 'missing'"
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_import_blob_rows_binding_refuses_llm_authored_blob(self, tmp_path: Path) -> None:
+        """Parity with the canonical set_source_from_blobs writer: an LLM-authored file needs its review flow."""
+        from dataclasses import replace as dataclass_replace
+
+        from elspeth.contracts.enums import CreationModality
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = dataclass_replace(
+            _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A),
+            creation_modality=CreationModality.LLM_GENERATED,
+        )
+        app.state.blob_service = _blob_service_for(blob)
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
+            resp = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={"yaml": _BLOB_ROWS_YAML, "source_blob_rows": {"source": {"blob_ids": [str(blob.id)]}}},
+            )
+
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"].startswith(f"source_blob_rows.source: blob '{blob.id}' is LLM-authored")
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
     async def test_import_rebinds_inline_marker_on_a_source(self, tmp_path: Path) -> None:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
@@ -4381,6 +4500,10 @@ class TestImportRebasesSinkPaths:
             pytest.param({"main": {"path": {"folder": "outputs", "relative_path": ""}}}, "main.path", id="empty"),
             pytest.param({"main": {"path": {"folder": "outputs", "relative_path": "."}}}, "main.path", id="the-folder-itself"),
             pytest.param({"main": {"path": {"folder": "outputs", "relative_path": "..\\..\\x.json"}}}, "main.path", id="backslash"),
+            pytest.param(
+                {"main": {"path": {"folder": "outputs", "relative_path": "a\nINFO fake log line.json"}}}, "main.path", id="newline"
+            ),
+            pytest.param({"main": {"path": {"folder": "outputs", "relative_path": "a\x1b[2Jb.json"}}}, "main.path", id="escape"),
         ],
     )
     async def test_binding_that_is_unknown_or_escapes_is_400(self, tmp_path: Path, bindings: dict[str, Any], detail_fragment: str) -> None:
@@ -4467,6 +4590,7 @@ class TestImportRebasesSinkPaths:
             pytest.param({"folder": "payloads", "relative_path": "x.json"}, id="unknown-folder"),
             pytest.param({"folder": "outputs", "relative_path": "x.json", "extra": 1}, id="extra-key"),
             pytest.param({"folder": "outputs"}, id="missing-relative-path"),
+            pytest.param({"folder": "outputs", "relative_path": "a" * 1025}, id="longer-than-1024"),
         ],
     )
     async def test_binding_request_shape_is_validated(self, tmp_path: Path, binding: dict[str, Any]) -> None:
