@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -454,6 +455,11 @@ _BARE_SUFFIX_ROUND_TRIP_CASES = [
         id="_REVIEW_REPLY_UNAVAILABLE_SUFFIX",
     ),
     pytest.param(
+        no_tool_policy._REVIEW_REPLY_CONTEXT_BUDGET_SUFFIX,
+        no_tool_policy._REVIEW_REPLY_CONTEXT_BUDGET_NOTICE,
+        id="_REVIEW_REPLY_CONTEXT_BUDGET_SUFFIX",
+    ),
+    pytest.param(
         no_tool_policy._EMPTY_STATE_FINALIZE_SUFFIX,
         no_tool_policy._EMPTY_STATE_NOTICE_BODY,
         id="_EMPTY_STATE_FINALIZE_SUFFIX",
@@ -764,6 +770,40 @@ def test_review_reply_unavailable_is_trusted_alongside_handoff() -> None:
     assert len(segments) == 2
     assert all(isinstance(segment, no_tool_policy.TrustedSystemNoticeSegment) for segment in segments)
     assert segments[-1].content == no_tool_policy._REVIEW_REPLY_UNAVAILABLE_NOTICE
+
+
+def test_review_reply_context_budget_notice_is_one_static_trusted_sentence_pair_without_a_retry_offer() -> None:
+    notice = no_tool_policy._REVIEW_REPLY_CONTEXT_BUDGET_NOTICE
+    assert notice == (
+        "This turn's work was completed, but the model's final reply could not be produced because this conversation "
+        "is too large for the composer. Start a new session, or shorten your request."
+    )
+    assert "retry" not in notice.lower()
+    handoff = no_tool_policy.compose_interpretation_review_handoff_message("")
+    content = no_tool_policy.compose_review_reply_context_budget_message(handoff)
+    segments = no_tool_policy.visible_message_segments(content=content, raw_content="")
+    assert len(segments) == 2
+    assert all(isinstance(segment, no_tool_policy.TrustedSystemNoticeSegment) for segment in segments)
+    assert segments[-1].content == notice
+    assert no_tool_policy.visible_message_segments(
+        content=no_tool_policy.compose_review_reply_context_budget_message(""), raw_content=""
+    ) == (TrustedSystemNoticeSegment(notice),)
+
+
+@pytest.mark.parametrize(
+    "compose_twice",
+    [
+        lambda c: no_tool_policy.compose_review_reply_context_budget_message(no_tool_policy.compose_review_reply_context_budget_message(c)),
+        lambda c: no_tool_policy.compose_review_reply_context_budget_message(no_tool_policy.compose_review_reply_unavailable_message(c)),
+        lambda c: no_tool_policy.compose_review_reply_unavailable_message(no_tool_policy.compose_review_reply_context_budget_message(c)),
+    ],
+    ids=["budget-twice", "unavailable-then-budget", "budget-then-unavailable"],
+)
+def test_two_absent_reply_notices_are_never_both_trusted(compose_twice: Callable[[str], str]) -> None:
+    """An absent reply has one cause; a message carrying two such notices is not a shape the backend writes."""
+    handoff = no_tool_policy.compose_interpretation_review_handoff_message("")
+    content = compose_twice(handoff)
+    assert visible_message_segments(content=content, raw_content="") == (AssistantTextSegment(content),)
 
 
 def test_failed_graph_recovery_publishes_only_a_trusted_refusal() -> None:
