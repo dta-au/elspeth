@@ -111,6 +111,14 @@ def compose_graph_recovery_refusal_message() -> str:
 
 _REVIEW_REPLY_UNAVAILABLE_NOTICE: Final = "The model's final reply is unavailable. Please retry your question."
 _REVIEW_REPLY_UNAVAILABLE_SUFFIX = _bare_trusted_suffix(_REVIEW_REPLY_UNAVAILABLE_NOTICE)
+# The reply after staged review cards was not requested because its request
+# cannot fit the context budget. Retrying cannot help, so this notice gives
+# the context-budget refusal's recourse instead. One static sentence pair.
+_REVIEW_REPLY_CONTEXT_BUDGET_NOTICE: Final = (
+    "This turn's work was completed, but the model's final reply could not be produced because this conversation "
+    "is too large for the composer. Start a new session, or shorten your request."
+)
+_REVIEW_REPLY_CONTEXT_BUDGET_SUFFIX = _bare_trusted_suffix(_REVIEW_REPLY_CONTEXT_BUDGET_NOTICE)
 _ADVISOR_REVIEW_BUDGET_NOTICE: Final = (
     "The reply was withheld because the completion review could not run within the existing request limits. "
     "Saved draft progress remains available; continue in a new message."
@@ -121,6 +129,11 @@ _ADVISOR_REVIEW_BUDGET_SUFFIX = _bare_trusted_suffix(_ADVISOR_REVIEW_BUDGET_NOTI
 def compose_review_reply_unavailable_message(content: str) -> str:
     """Keep a missing provider reply distinct from model-authored prose."""
     return content + _REVIEW_REPLY_UNAVAILABLE_SUFFIX
+
+
+def compose_review_reply_context_budget_message(content: str) -> str:
+    """Report a reply the context budget refused: the turn's work stands and retrying will not help."""
+    return content + _REVIEW_REPLY_CONTEXT_BUDGET_SUFFIX
 
 
 _EMPTY_STATE_NOTICE_HEADER: Final = "The pipeline is still empty — the composer did not complete a valid build this turn."
@@ -664,18 +677,25 @@ def _canonical_base_suffix_segments(suffix: str, *, allow_request_rejection: boo
                         return (*preceding_segments, TrustedSystemNoticeSegment(rejection_notice))
     if suffix == _GRAPH_RECOVERY_REFUSAL_SUFFIX:
         return (TrustedSystemNoticeSegment(_GRAPH_RECOVERY_REFUSAL_NOTICE),)
-    if suffix == _REVIEW_REPLY_UNAVAILABLE_SUFFIX:
-        return (TrustedSystemNoticeSegment(_REVIEW_REPLY_UNAVAILABLE_NOTICE),)
     if suffix == _ADVISOR_REVIEW_BUDGET_SUFFIX:
         return (TrustedSystemNoticeSegment(_ADVISOR_REVIEW_BUDGET_NOTICE),)
-    if suffix.endswith(_REVIEW_REPLY_UNAVAILABLE_SUFFIX):
-        preceding = suffix[: -len(_REVIEW_REPLY_UNAVAILABLE_SUFFIX)]
-        if _REVIEW_REPLY_UNAVAILABLE_SUFFIX in preceding:
+    # One final notice for an absent reply: the provider's was unavailable, or
+    # the context budget refused its request. Never both, never twice.
+    absent_reply_suffixes = (
+        (_REVIEW_REPLY_UNAVAILABLE_SUFFIX, _REVIEW_REPLY_UNAVAILABLE_NOTICE),
+        (_REVIEW_REPLY_CONTEXT_BUDGET_SUFFIX, _REVIEW_REPLY_CONTEXT_BUDGET_NOTICE),
+    )
+    for absent_suffix, absent_notice in absent_reply_suffixes:
+        if suffix == absent_suffix:
+            return (TrustedSystemNoticeSegment(absent_notice),)
+        if suffix.endswith(absent_suffix):
+            preceding = suffix[: -len(absent_suffix)]
+            if any(other_suffix in preceding for other_suffix, _notice in absent_reply_suffixes):
+                return None
+            segments = _canonical_base_suffix_segments(preceding)
+            if segments is not None:
+                return (*segments, TrustedSystemNoticeSegment(absent_notice))
             return None
-        segments = _canonical_base_suffix_segments(preceding)
-        if segments is not None:
-            return (*segments, TrustedSystemNoticeSegment(_REVIEW_REPLY_UNAVAILABLE_NOTICE))
-        return None
     if suffix == _EMPTY_STATE_FINALIZE_SUFFIX:
         return (TrustedSystemNoticeSegment(_EMPTY_STATE_NOTICE_BODY),)
     if suffix == _CLARIFICATION_FINALIZE_SUFFIX:
