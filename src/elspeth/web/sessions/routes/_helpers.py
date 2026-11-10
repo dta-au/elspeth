@@ -3091,10 +3091,11 @@ _FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
         "This pipeline is blocked by a deployment policy and cannot be built as configured. "
         "Change the blocked component — retrying will fail the same way.",
     ),
-    # The request does not fit the operator's context budget. A budget
-    # exhaustion like ``planner_repair_exhausted`` (our limit, not a gateway
-    # fault), but no retry can clear it for this session.
-    CONTEXT_BUDGET_FAILURE_CODE: (500, CONTEXT_BUDGET_REFUSAL_DETAIL),
+    # The request does not fit the operator's context budget. No retry can
+    # clear it for this session, and it is the request that cannot be
+    # processed, not a server fault: 422, the status the compose loop gives
+    # the same refusal (one user condition, one status).
+    CONTEXT_BUDGET_FAILURE_CODE: (422, CONTEXT_BUDGET_REFUSAL_DETAIL),
     "operation_failed": (500, "The composer could not build a pipeline for this request."),
 }
 
