@@ -1839,6 +1839,7 @@ def build_set_pipeline_candidate(
         out_path_error = _validate_sink_path(
             out_options,
             data_dir,
+            plugin=out_plugin,
             session_id=session_id,
             require_data_dir=context.require_data_dir_for_paths,
             mcp_root_authority=context.mcp_root_authority,
