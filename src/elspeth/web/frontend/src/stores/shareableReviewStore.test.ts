@@ -16,6 +16,7 @@ const FILES = {
   files: [{ filename: "a.csv", size_bytes: 3, used_by: ["source"] }],
   importable: true,
   not_importable_reason: null,
+  max_lifetime_seconds: 2592000,
 };
 const OPTIONS = { allowImport: true, lifetimeSeconds: 86400 } as const;
 

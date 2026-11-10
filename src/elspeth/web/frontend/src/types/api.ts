@@ -201,7 +201,8 @@ export type ShareLifetimeSeconds = 86400 | 604800 | 2592000;
 /** Options for POST /api/sessions/{session_id}/mark-ready-for-review. */
 export interface MarkReadyOptions {
   allowImport: boolean;
-  lifetimeSeconds: ShareLifetimeSeconds;
+  /** ``null`` sends no lifetime: the server's configured maximum applies. */
+  lifetimeSeconds: ShareLifetimeSeconds | null;
 }
 
 /** One file an importable share would carry, as the owner sees it. */
@@ -216,6 +217,8 @@ export interface ShareableFilesResponse {
   files: ShareableFile[];
   importable: boolean;
   not_importable_reason: string | null;
+  /** The longest link lifetime this deployment accepts, in seconds. */
+  max_lifetime_seconds: number;
 }
 
 /** Response from POST /api/sessions/shared/{token}/import. */

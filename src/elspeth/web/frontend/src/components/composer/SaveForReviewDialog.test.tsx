@@ -29,12 +29,13 @@ const _FILES = {
   ],
   importable: true,
   not_importable_reason: null,
+  max_lifetime_seconds: 2592000,
 };
 const _OPTIONS = { allowImport: true, lifetimeSeconds: 604800 } as const;
 
 async function _openAndConfirm(
   sessionId: string,
-  options: { allowImport: boolean; lifetimeSeconds: 86400 | 604800 | 2592000 },
+  options: { allowImport: boolean; lifetimeSeconds: 86400 | 604800 | 2592000 | null },
 ) {
   vi.spyOn(api, "fetchShareableFiles").mockResolvedValue(_FILES);
   await useShareableReviewStore.getState().openConfigure(sessionId);
@@ -452,6 +453,7 @@ describe("SaveForReviewDialog", () => {
       files: [],
       importable: false,
       not_importable_reason: "a.csv is a blob source and cannot travel",
+      max_lifetime_seconds: 2592000,
     } as unknown as typeof _FILES);
     const checkbox = screen.getByRole("checkbox", { name: "Let recipients import a copy" });
     expect(checkbox).toBeDisabled();
@@ -484,11 +486,49 @@ describe("SaveForReviewDialog", () => {
     expect(mint).not.toHaveBeenCalled();
   });
 
-  it("a file-list failure does not block creating a view-only link", async () => {
+  it("a file-list failure does not block creating a view-only link at the server maximum", async () => {
     const { mint } = await _renderConfigure(new Error("boom"));
+    // The deployment maximum is unknown, so no lifetime is offered and none is sent.
+    expect(screen.queryByRole("radio")).toBeNull();
+    expect(screen.getByTestId("save-for-review-lifetime-note")).toHaveTextContent(
+      "longest this deployment allows",
+    );
     fireEvent.click(screen.getByRole("button", { name: "Create link" }));
     await waitFor(() =>
-      expect(mint).toHaveBeenCalledWith("sess-cfg", { allowImport: false, lifetimeSeconds: 2592000 }),
+      expect(mint).toHaveBeenCalledWith("sess-cfg", { allowImport: false, lifetimeSeconds: null }),
+    );
+  });
+
+  it("offers only lifetimes up to the deployment maximum and defaults to the largest", async () => {
+    const { mint } = await _renderConfigure({ ..._FILES, max_lifetime_seconds: 604800 });
+    expect(screen.getByRole("radio", { name: "7 days" })).toBeChecked();
+    expect(screen.getByRole("radio", { name: "1 day" })).not.toBeChecked();
+    expect(screen.queryByRole("radio", { name: "30 days" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Create link" }));
+    await waitFor(() =>
+      expect(mint).toHaveBeenCalledWith("sess-cfg", { allowImport: false, lifetimeSeconds: 604800 }),
+    );
+  });
+
+  it("a maximum between listed lifetimes offers the ones below it", async () => {
+    const { mint } = await _renderConfigure({ ..._FILES, max_lifetime_seconds: 3 * 86400 });
+    expect(screen.getAllByRole("radio").map((radio) => radio.getAttribute("value"))).toEqual(["86400"]);
+    expect(screen.getByRole("radio", { name: "1 day" })).toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "Create link" }));
+    await waitFor(() =>
+      expect(mint).toHaveBeenCalledWith("sess-cfg", { allowImport: false, lifetimeSeconds: 86400 }),
+    );
+  });
+
+  it("a maximum below one day offers no lifetime, says so, and sends none", async () => {
+    const { mint } = await _renderConfigure({ ..._FILES, max_lifetime_seconds: 7200 });
+    expect(screen.queryByRole("radio")).toBeNull();
+    expect(screen.getByTestId("save-for-review-lifetime-note")).toHaveTextContent(
+      "Links on this deployment last at most 2 hours. This link will last that long.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Create link" }));
+    await waitFor(() =>
+      expect(mint).toHaveBeenCalledWith("sess-cfg", { allowImport: false, lifetimeSeconds: null }),
     );
   });
 

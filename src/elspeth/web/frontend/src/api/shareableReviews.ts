@@ -206,7 +206,10 @@ function validateShareableFilesResponse(body: unknown, status: number): Shareabl
     !Array.isArray(body.files) ||
     !body.files.every(isShareableFile) ||
     typeof body.importable !== "boolean" ||
-    !(typeof body.not_importable_reason === "string" || body.not_importable_reason === null)
+    !(typeof body.not_importable_reason === "string" || body.not_importable_reason === null) ||
+    typeof body.max_lifetime_seconds !== "number" ||
+    !Number.isInteger(body.max_lifetime_seconds) ||
+    body.max_lifetime_seconds <= 0
   ) {
     throw unexpectedShape(status, "shareable-files");
   }
@@ -218,6 +221,7 @@ function validateShareableFilesResponse(body: unknown, status: number): Shareabl
     })),
     importable: body.importable,
     not_importable_reason: body.not_importable_reason,
+    max_lifetime_seconds: body.max_lifetime_seconds,
   };
 }
 
@@ -232,7 +236,8 @@ function validateSharedImportResponse(body: unknown, status: number): SharedImpo
  * POST /api/sessions/{session_id}/mark-ready-for-review.
  *
  * ``options`` is required: the share dialog's configure step always chooses
- * whether recipients may import and how long the link lives.
+ * whether recipients may import and how long the link lives. A ``null``
+ * lifetime omits ``lifetime_seconds``, so the server's maximum applies.
  */
 export async function markReadyForReview(
   sessionId: string,
@@ -242,10 +247,11 @@ export async function markReadyForReview(
   const response = await authFetch(`/api/sessions/${sessionId}/mark-ready-for-review`, {
     method: "POST",
     headers: authHeaders("application/json"),
-    body: JSON.stringify({
-      allow_import: options.allowImport,
-      lifetime_seconds: options.lifetimeSeconds,
-    }),
+    body: JSON.stringify(
+      options.lifetimeSeconds === null
+        ? { allow_import: options.allowImport }
+        : { allow_import: options.allowImport, lifetime_seconds: options.lifetimeSeconds },
+    ),
     signal,
   });
   return validateMarkReadyResponse(await parseResponse<unknown>(response), response.status);

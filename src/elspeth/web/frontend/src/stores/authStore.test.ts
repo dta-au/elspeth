@@ -293,6 +293,7 @@ describe("authStore account-scoped store reset", () => {
       files: [],
       importable: false,
       not_importable_reason: null,
+      max_lifetime_seconds: 2592000,
     });
     await useShareableReviewStore.getState().openConfigure("alice-session");
     await useShareableReviewStore
@@ -347,6 +348,7 @@ describe("authStore account-scoped store reset", () => {
       files: [],
       importable: false,
       not_importable_reason: null,
+      max_lifetime_seconds: 2592000,
     });
     await useShareableReviewStore.getState().openConfigure("alice-session");
     const mintPromise = useShareableReviewStore

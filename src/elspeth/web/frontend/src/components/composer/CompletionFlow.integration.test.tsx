@@ -98,7 +98,7 @@ function _invalidValidation(): ValidationResult {
   };
 }
 
-const _FILES = { files: [], importable: true, not_importable_reason: null };
+const _FILES = { files: [], importable: true, not_importable_reason: null, max_lifetime_seconds: 2592000 };
 
 /** Open the configure step from the bar and (optionally) confirm it. */
 async function _openConfigure() {

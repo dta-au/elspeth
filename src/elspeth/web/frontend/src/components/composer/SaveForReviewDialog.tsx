@@ -39,14 +39,29 @@ const LIFETIME_CHOICES: ReadonlyArray<{ seconds: ShareLifetimeSeconds; label: st
   { seconds: 604800, label: "7 days" },
   { seconds: 2592000, label: "30 days" },
 ];
-const DEFAULT_LIFETIME_SECONDS: ShareLifetimeSeconds = 2592000;
+
+/** A whole number of days, hours or minutes when the value is one, else seconds. */
+function _describeSeconds(seconds: number): string {
+  const units: ReadonlyArray<[number, string]> = [
+    [86400, "day"],
+    [3600, "hour"],
+    [60, "minute"],
+  ];
+  for (const [size, unit] of units) {
+    if (seconds >= size && seconds % size === 0) {
+      const count = seconds / size;
+      return `${count} ${unit}${count === 1 ? "" : "s"}`;
+    }
+  }
+  return `${seconds} second${seconds === 1 ? "" : "s"}`;
+}
 
 interface ConfigureStepProps {
   files: ShareableFilesResponse | null;
   filesError: string | null;
   createDisabled: boolean;
   createDisabledTitle: string | undefined;
-  onCreate: (allowImport: boolean, lifetimeSeconds: ShareLifetimeSeconds) => void;
+  onCreate: (allowImport: boolean, lifetimeSeconds: ShareLifetimeSeconds | null) => void;
   onReloadFiles: () => void;
 }
 
@@ -61,7 +76,18 @@ function ConfigureStep({
   onReloadFiles,
 }: ConfigureStepProps): JSX.Element {
   const [allowImport, setAllowImport] = useState(false);
-  const [lifetime, setLifetime] = useState<ShareLifetimeSeconds>(DEFAULT_LIFETIME_SECONDS);
+  // The owner's pick, if any. The choices depend on the deployment maximum,
+  // which arrives with the file list, so the effective lifetime is derived.
+  const [pickedLifetime, setPickedLifetime] = useState<ShareLifetimeSeconds | null>(null);
+
+  // Only lifetimes the server accepts are offered. Until the maximum is known
+  // (or if the file list failed) none is, and the link takes the server maximum.
+  const maxLifetimeSeconds = files?.max_lifetime_seconds ?? null;
+  const lifetimeChoices = maxLifetimeSeconds === null
+    ? []
+    : LIFETIME_CHOICES.filter((choice) => choice.seconds <= maxLifetimeSeconds);
+  const largestChoice = lifetimeChoices.length > 0 ? lifetimeChoices[lifetimeChoices.length - 1].seconds : null;
+  const lifetime = lifetimeChoices.some((choice) => choice.seconds === pickedLifetime) ? pickedLifetime : largestChoice;
 
   const loading = files === null && filesError === null;
   const importable = files !== null && files.importable;
@@ -132,21 +158,31 @@ function ConfigureStep({
         )}
       </div>
 
-      <fieldset className="save-for-review-lifetime">
-        <legend>Link expires after</legend>
-        {LIFETIME_CHOICES.map((choice) => (
-          <label key={choice.seconds} className="save-for-review-option-label">
-            <Input
-              type="radio"
-              name="save-for-review-lifetime"
-              value={choice.seconds}
-              checked={lifetime === choice.seconds}
-              onChange={() => setLifetime(choice.seconds)}
-            />
-            <span>{choice.label}</span>
-          </label>
-        ))}
-      </fieldset>
+      {lifetimeChoices.length > 0 ? (
+        <fieldset className="save-for-review-lifetime">
+          <legend>Link expires after</legend>
+          {lifetimeChoices.map((choice) => (
+            <label key={choice.seconds} className="save-for-review-option-label">
+              <Input
+                type="radio"
+                name="save-for-review-lifetime"
+                value={choice.seconds}
+                checked={lifetime === choice.seconds}
+                onChange={() => setPickedLifetime(choice.seconds)}
+              />
+              <span>{choice.label}</span>
+            </label>
+          ))}
+        </fieldset>
+      ) : (
+        !loading && (
+          <p className="save-for-review-tip" data-testid="save-for-review-lifetime-note">
+            {maxLifetimeSeconds === null
+              ? "This link will last the longest this deployment allows."
+              : `Links on this deployment last at most ${_describeSeconds(maxLifetimeSeconds)}. This link will last that long.`}
+          </p>
+        )
+      )}
 
       <div className="save-for-review-configure-actions">
         <Button

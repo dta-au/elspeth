@@ -64,9 +64,12 @@
  * * Other / network → "Couldn't load the shared pipeline" with retry.
  *
  * Import errors keep the loaded view on screen and show an inline alert:
- * capability 401 → expired, 403 → not allowed, 404 → ask for a fresh link,
- * 413 → storage quota, authentication 401 → sign-in recovery, anything else →
- * generic message with the button re-enabled for retry.
+ * capability 401 → expired, 403 with ``user_role_required`` → the account's
+ * role, other 403 → the link does not allow importing, 404 → ask for a fresh
+ * link, 413 → storage quota, 422 → the server's reason, 429 → wait and retry,
+ * 503 → unavailable, authentication 401 → sign-in recovery, anything else →
+ * generic message. The button stays disabled after a 403 or 422 (a retry
+ * cannot succeed) and is re-enabled otherwise.
  */
 
 import { type JSX, useEffect, useRef, useState, type CSSProperties } from "react";
@@ -212,21 +215,52 @@ function _classifyError(exc: unknown): ClassifiedError {
   return { status: null, authentication: false, message: "Couldn't load the shared pipeline." };
 }
 
-/** User-facing copy for a failed import, on top of the shared classifier. */
-function _importFailureMessage(exc: unknown): string {
+interface ImportFailure {
+  message: string;
+  /** A retry cannot succeed: the button stays disabled. */
+  final: boolean;
+}
+
+/** User-facing copy for a failed import, on top of the shared classifier.
+ *
+ *  Two different refusals answer 403: the viewer's account lacks the role
+ *  every pipeline write requires (``error_type: user_role_required``), or the
+ *  link is view-only. A 422 is the seeder refusing the graph for this viewer
+ *  (a component their policy disallows, say): its detail says why. Neither a
+ *  403 nor a 422 can succeed on retry, and each retry would build and archive
+ *  a session, so the button stays disabled for them. */
+function _importFailure(exc: unknown): ImportFailure {
   const classified = _classifyError(exc);
-  if (classified.authentication) return classified.message;
+  if (classified.authentication) return { message: classified.message, final: false };
   switch (classified.status) {
     case 401:
-      return "This share link has expired";
+      return { message: "This share link has expired", final: false };
     case 403:
-      return "This link doesn't allow importing";
+      if (_isApiError(exc) && exc.error_type === "user_role_required") {
+        return {
+          message: "Your account doesn't have the role needed to import pipelines. Ask an administrator for access.",
+          final: true,
+        };
+      }
+      return { message: "This link doesn't allow importing", final: true };
     case 404:
-      return classified.message;
+      return { message: classified.message, final: false };
     case 413:
-      return "You don't have enough storage to import these files";
+      return { message: "You don't have enough storage to import these files", final: false };
+    case 422:
+      return {
+        message:
+          _isApiError(exc) && typeof exc.detail === "string" && exc.detail.trim().length > 0
+            ? exc.detail
+            : "This pipeline can't be imported into your workspace",
+        final: true,
+      };
+    case 429:
+      return { message: "Too many import attempts. Wait a minute and try again.", final: false };
+    case 503:
+      return { message: "Importing shared pipelines is unavailable right now. Try again later.", final: false };
     default:
-      return "Couldn't import the shared pipeline";
+      return { message: "Couldn't import the shared pipeline", final: false };
   }
 }
 
@@ -245,7 +279,7 @@ function _returnToWorkspaceUrl(): string {
 export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Element {
   const [state, setState] = useState<LoadState>({ kind: "loading" });
   const [importing, setImporting] = useState(false);
-  const [importError, setImportError] = useState<{ status: number | null; message: string } | null>(null);
+  const [importError, setImportError] = useState<ImportFailure | null>(null);
   const importingRef = useRef(false);
 
   useEffect(() => {
@@ -282,7 +316,7 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
       await useSessionStore.getState().loadSessions();
       window.location.hash = `#/${imported.session_id}`;
     } catch (exc: unknown) {
-      setImportError({ status: _classifyError(exc).status, message: _importFailureMessage(exc) });
+      setImportError(_importFailure(exc));
       setImporting(false);
     } finally {
       importingRef.current = false;
@@ -388,7 +422,7 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
               <Button
                 type="button"
                 variant="primary"
-                disabled={importing || importError?.status === 403}
+                disabled={importing || importError?.final === true}
                 onClick={() => void importCopy()}
               >
                 Import a copy into my workspace

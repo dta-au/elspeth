@@ -589,9 +589,30 @@ describe("SharedInspectView import", () => {
 
   it.each([
     [{ status: 401, detail: "bad token" }, "This share link has expired", true],
-    [{ status: 403, detail: "no" }, "This link doesn't allow importing", false],
+    [{ status: 403, detail: "This share link does not allow import" }, "This link doesn't allow importing", false],
+    [
+      {
+        status: 403,
+        error_type: "user_role_required",
+        detail: "A live deployment-wide user role is required for pipeline authoring and execution",
+      },
+      "Your account doesn't have the role needed to import pipelines. Ask an administrator for access.",
+      false,
+    ],
     [{ status: 404, detail: "gone" }, "ask the sender for a fresh link", true],
     [{ status: 413, detail: "quota" }, "You don't have enough storage to import these files", true],
+    [
+      { status: 422, detail: "Plugin 'llm' is not allowed for your account" },
+      "Plugin 'llm' is not allowed for your account",
+      false,
+    ],
+    [{ status: 422 }, "This pipeline can't be imported into your workspace", false],
+    [{ status: 429, detail: "Rate limit exceeded" }, "Too many import attempts. Wait a minute and try again.", true],
+    [
+      { status: 503, detail: "Importing a shared pipeline is unavailable" },
+      "Importing shared pipelines is unavailable right now. Try again later.",
+      true,
+    ],
     [{ status: 500, detail: "boom" }, "Couldn't import the shared pipeline", true],
   ])("shows the mapped message for %j", async (failure, text, retryable) => {
     await renderImportable();
@@ -601,9 +622,22 @@ describe("SharedInspectView import", () => {
     expect(alert).toHaveTextContent(text);
     expect(alert).toHaveAttribute("role", "alert");
     if (retryable) expect(screen.getByRole("button", BUTTON)).toBeEnabled();
+    else expect(screen.getByRole("button", BUTTON)).toBeDisabled();
     expect(window.location.hash).toBe("#/shared/abc");
     // The loaded view stays on screen after a failed import.
     expect(screen.getByTestId("shared-inspect-loaded")).toBeInTheDocument();
+  });
+
+  it("does not blame the link for a missing role", async () => {
+    await renderImportable();
+    vi.spyOn(api, "importSharedSnapshot").mockRejectedValueOnce({
+      status: 403,
+      error_type: "user_role_required",
+      detail: "A live deployment-wide user role is required for pipeline authoring and execution",
+    });
+    await userEvent.click(screen.getByRole("button", BUTTON));
+    const alert = await screen.findByTestId("shared-inspect-import-error");
+    expect(alert).not.toHaveTextContent(/link/i);
   });
 
   it("treats an authentication 401 as sign-in recovery, not an expired link", async () => {

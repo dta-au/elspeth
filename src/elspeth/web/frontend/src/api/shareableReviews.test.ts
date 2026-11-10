@@ -520,22 +520,48 @@ describe("shareableReviews API client", () => {
     });
   });
 
+  it("markReadyForReview omits lifetime_seconds when no listed lifetime is chosen", async () => {
+    _mockJsonResponse(MARK_READY_BODY);
+    await markReadyForReview(SESSION_ID, { allowImport: false, lifetimeSeconds: null });
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init?.body as string)).toEqual({ allow_import: false });
+  });
+
   it("fetchShareableFiles GETs the URL and parses the response", async () => {
     _mockJsonResponse({
       files: [{ filename: "a.csv", size_bytes: 3, used_by: ["source"] }],
       importable: false,
       not_importable_reason: "too big",
+      max_lifetime_seconds: 604800,
     });
     const response = await fetchShareableFiles(SESSION_ID);
     expect(response.files[0].used_by).toEqual(["source"]);
     expect(response.not_importable_reason).toBe("too big");
+    expect(response.max_lifetime_seconds).toBe(604800);
     const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(url).toBe(`/api/sessions/${SESSION_ID}/shareable-files`);
     expect(init?.method).toBe("GET");
   });
 
   it("fetchShareableFiles rejects a malformed body", async () => {
-    _mockJsonResponse({ files: [{ filename: "a.csv", size_bytes: 3 }], importable: true, not_importable_reason: null });
+    _mockJsonResponse({
+      files: [{ filename: "a.csv", size_bytes: 3 }],
+      importable: true,
+      not_importable_reason: null,
+      max_lifetime_seconds: 86400,
+    });
+    await expect(fetchShareableFiles(SESSION_ID)).rejects.toMatchObject({
+      detail: expect.stringContaining("shareable-files"),
+    });
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["a string", "86400"],
+    ["zero", 0],
+    ["fractional", 1.5],
+  ])("fetchShareableFiles rejects a max_lifetime_seconds that is %s", async (_label, value) => {
+    _mockJsonResponse({ files: [], importable: true, not_importable_reason: null, max_lifetime_seconds: value });
     await expect(fetchShareableFiles(SESSION_ID)).rejects.toMatchObject({
       detail: expect.stringContaining("shareable-files"),
     });
