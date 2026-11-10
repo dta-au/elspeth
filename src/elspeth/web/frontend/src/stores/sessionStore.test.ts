@@ -1345,7 +1345,7 @@ describe("sessionStore", () => {
 
     it.each([
       ["the compose loop", { status: 422, error_type: "convergence", reason: "context_budget_exceeded" }],
-      ["the planner", { status: 500, error_type: "composer_planner_failure", planner_code: "CONTEXT_BUDGET_EXHAUSTED" }],
+      ["the planner", { status: 422, error_type: "composer_planner_failure", planner_code: "CONTEXT_BUDGET_EXHAUSTED" }],
     ])("shows the context budget refusal from %s verbatim on a failed row without Retry", async (_source, envelope) => {
       const detail = "This conversation is too large for the composer to continue. Start a new session, or shorten your request.";
       const { sendMessage: mockSendMessage } = await import("@/api/client");
