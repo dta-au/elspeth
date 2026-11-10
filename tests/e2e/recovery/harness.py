@@ -411,7 +411,8 @@ class SpawnedProcessAtSeam:
             self._process.kill()
             self._process.join(timeout=_PROCESS_CLEANUP_JOIN_SECONDS)
         if self._process.is_alive():
-            raise AssertionError(f"could not clean up child at process seam {self._seam!s}")
+            evidence = self._diagnostics.snapshot(self._process)
+            raise AssertionError(f"could not clean up child at process seam {self._seam!s}\n{evidence}")
         self._ready_reader.close()
         self._release_writer.close()
         self._process.close()

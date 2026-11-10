@@ -37,6 +37,42 @@ from tests.helpers.process_diagnostics import ProcessDiagnostics, trace_child_pr
 _PROCESS_TIMEOUT_SECONDS = 20.0
 
 
+def test_cleanup_failure_includes_final_child_proc_snapshot() -> None:
+    class StuckProcess:
+        pid = None
+        exitcode = None
+
+        def is_alive(self) -> bool:
+            return True
+
+        def join(self, *, timeout: float) -> None:
+            pass
+
+        def terminate(self) -> None:
+            pass
+
+        def kill(self) -> None:
+            pass
+
+    ready_reader, ready_writer = multiprocessing.Pipe(duplex=False)
+    release_reader, release_writer = multiprocessing.Pipe(duplex=False)
+    diagnostics = ProcessDiagnostics()
+    child = SpawnedProcessAtSeam(
+        process=StuckProcess(), ready_reader=ready_reader, release_writer=release_writer, seam="stuck-cleanup", diagnostics=diagnostics
+    )
+    try:
+        with pytest.raises(AssertionError, match="could not clean up child at process seam stuck-cleanup") as failure:
+            child.close()
+        assert "proc:" in str(failure.value)
+        assert "alive=True" in str(failure.value)
+    finally:
+        ready_reader.close()
+        ready_writer.close()
+        release_reader.close()
+        release_writer.close()
+        diagnostics.close()
+
+
 def _heartbeat_crashed_lease(
     db: LandscapeDB,
     run_id: str,
