@@ -41,7 +41,7 @@ from elspeth.web.composer.protocol import (
 )
 from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 from elspeth.web.composer.recovery_controls import recovery_tool_definitions
-from elspeth.web.composer.service import ComposerServiceImpl, _reply_stage_instruction
+from elspeth.web.composer.service import _REPLY_STAGE_INSTRUCTION, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationSummary
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.turn_effects import TurnEvidence
@@ -938,7 +938,7 @@ async def _prepare_reply(
         discovery_turns_used=0,
         failed_turn=None,
         progress=None,
-        reply_instruction=_reply_stage_instruction(),
+        reply_stage=True,
     )
     return selected, tools, record
 
@@ -977,7 +977,7 @@ async def test_the_reply_stage_request_stubs_earlier_tool_results_and_keeps_the_
     # The earlier round's result is quoted as the stub; the latest round is quoted in full.
     assert first not in selected[5]["content"] and CONTEXT_BUDGET_TOOL_RESULT_STUB in selected[5]["content"]
     assert second in selected[7]["content"]
-    assert selected[8] == _reply_stage_instruction()
+    assert (selected[8]["role"], selected[8]["content"]) == ("system", _REPLY_STAGE_INSTRUCTION)
     assert message_bytes(selected, tools).total_bytes < full_content - len(first) + 1_000
     assert request_wire_bytes(selected, tools) <= service._context_budget_policy.max_request_bytes
     # The loop's own messages keep their tool roles and full results.

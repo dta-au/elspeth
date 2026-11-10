@@ -89,20 +89,17 @@ class ContextBudgetHistory:
                     continue
                 if "call" not in envelope or not isinstance(envelope["call"], Mapping):
                     raise AuditIntegrityError("Stored composer call audit envelope lacks its call mapping")
-                call = envelope["call"]
-                budget = _context_budget(call)
-                if budget is None:
+                call = _budgeted_call(envelope["call"])
+                if call is None:
                     continue
                 if shed is None:
-                    shed = _shed_history_keys(budget)
-                ratio = _bytes_per_token(call, budget)
-                if ratio is None:
+                    shed = call.shed_history
+                if call.bytes_per_token is None:
                     continue
-                model = _model_requested(call)
                 if newest_ratio is None:
-                    newest_ratio = ratio
-                if model not in ratio_by_model:
-                    ratio_by_model[model] = ratio
+                    newest_ratio = call.bytes_per_token
+                if call.model_requested not in ratio_by_model:
+                    ratio_by_model[call.model_requested] = call.bytes_per_token
         return cls(
             bytes_per_token=newest_ratio,
             previously_shed_history=shed if shed is not None else frozenset(),
@@ -110,57 +107,58 @@ class ContextBudgetHistory:
         )
 
 
-def _required(call: Mapping[str, Any], key: str) -> Any:
-    """Read a key every budgeted call record stores; its absence is corruption, not an older shape."""
-    if key not in call:
-        raise AuditIntegrityError(f"Stored budgeted composer call audit lacks {key}")
-    return call[key]
+@final
+@dataclass(frozen=True, slots=True)
+class _BudgetedCall:
+    """What the history needs from one stored budgeted call, parsed and validated."""
+
+    model_requested: str
+    shed_history: frozenset[str]
+    # The clamped ratio the call measured; ``None`` when it failed or reported no usable counts.
+    bytes_per_token: float | None
 
 
-def _context_budget(call: Mapping[str, Any]) -> Mapping[str, Any] | None:
-    """Return the call's stored context-budget record, or ``None`` when it was not a budgeted call."""
-    # Absent on records written before context budgeting; null on advisor and auto-title calls.
+def _budgeted_call(call: Mapping[str, Any]) -> _BudgetedCall | None:
+    """Parse a stored call; ``None`` when it was not a budgeted composer call.
+
+    ``context_budget`` is absent on records written before context budgeting
+    and null on advisor and auto-title calls. Every other key read here is
+    stored on every budgeted call, so its absence is corruption, not an older
+    shape, and raises.
+    """
     if "context_budget" not in call or call["context_budget"] is None:
         return None
     budget = call["context_budget"]
     if not isinstance(budget, Mapping):
         raise AuditIntegrityError("Stored composer call context_budget is not a mapping")
-    return budget
-
-
-def _model_requested(call: Mapping[str, Any]) -> str:
-    model = _required(call, "model_requested")
+    for key in ("model_requested", "status", "prompt_tokens"):
+        if key not in call:
+            raise AuditIntegrityError(f"Stored budgeted composer call audit lacks {key}")
+    model, status, prompt_tokens = call["model_requested"], call["status"], call["prompt_tokens"]
     if type(model) is not str or not model:
         raise AuditIntegrityError("Stored composer call audit has no requested model")
-    return model
-
-
-def _bytes_per_token(call: Mapping[str, Any], budget: Mapping[str, Any]) -> float | None:
-    """The clamped ratio a budgeted call measured, or ``None`` when it failed or reported no usable counts."""
-    status = _required(call, "status")
     if type(status) is not str:
         raise AuditIntegrityError("Stored composer call audit has a non-string status")
-    prompt_tokens = _required(call, "prompt_tokens")
     if prompt_tokens is not None and (type(prompt_tokens) is not int or prompt_tokens < 0):
         raise AuditIntegrityError("Stored composer call prompt_tokens is not a non-negative integer")
-    # Absent only on records written by pre-release builds: no ratio, so the fallback applies.
-    if "request_wire_bytes" not in budget:
-        return None
-    wire_bytes = budget["request_wire_bytes"]
-    if type(wire_bytes) is not int or wire_bytes < 0:
-        raise AuditIntegrityError("Stored composer call context_budget.request_wire_bytes is not a non-negative integer")
-    if status != ComposerLLMCallStatus.SUCCESS.value or prompt_tokens is None or prompt_tokens == 0 or wire_bytes == 0:
-        return None
-    # Positive integers divide to a finite positive float; the clamp bounds
-    # what provider-reported token counts can do to the estimate.
-    return min(max(wire_bytes / prompt_tokens, CONTEXT_BUDGET_MIN_BYTES_PER_TOKEN), CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN)
-
-
-def _shed_history_keys(budget: Mapping[str, Any]) -> frozenset[str]:
-    """Return the history keys a stored context-budget record shed."""
     if "shed_history_indices" not in budget:
         raise AuditIntegrityError("Stored composer call context_budget lacks shed_history_indices")
     indices = budget["shed_history_indices"]
     if not isinstance(indices, list | tuple) or not all(type(index) is int and index >= 0 for index in indices):
         raise AuditIntegrityError("Stored composer call context_budget.shed_history_indices is not a list of indices")
-    return frozenset(_history_key(index) for index in indices)
+    ratio: float | None = None
+    # ``request_wire_bytes`` is absent only on records written by pre-release
+    # builds: no ratio, so the fallback applies.
+    if "request_wire_bytes" in budget:
+        wire_bytes = budget["request_wire_bytes"]
+        if type(wire_bytes) is not int or wire_bytes < 0:
+            raise AuditIntegrityError("Stored composer call context_budget.request_wire_bytes is not a non-negative integer")
+        if status == ComposerLLMCallStatus.SUCCESS.value and prompt_tokens is not None and prompt_tokens > 0 and wire_bytes > 0:
+            # Positive integers divide to a finite positive float; the clamp
+            # bounds what provider-reported token counts can do to the estimate.
+            ratio = min(max(wire_bytes / prompt_tokens, CONTEXT_BUDGET_MIN_BYTES_PER_TOKEN), CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN)
+    return _BudgetedCall(
+        model_requested=model,
+        shed_history=frozenset(_history_key(index) for index in indices),
+        bytes_per_token=ratio,
+    )
