@@ -29,12 +29,13 @@ Settings (`WebSettings`, `src/elspeth/web/config.py`):
 
 Shed order, oldest first within each: tool-result bodies from earlier round
 trips of the current turn (replaced by a fixed stub), prior assistant prose,
-escape-hatch transcript events, prior user requests. Tokens are estimated
-from the request's content bytes with the bytes-per-token ratio of the
-session's newest successful budgeted call on the same model (failing that, on
-any model), clamped to 2.0-5.0; before the session has one the ratio is 3.0.
-The byte ceiling is checked against the request as sent (canonical JSON of
-its messages and tools).
+escape-hatch transcript events, prior user requests. Both ceilings are judged
+on the request as sent (canonical JSON of its messages and tools, so
+tool-call arguments and thinking blocks count; they are never shed). Tokens
+are estimated from that size with a bytes-per-token ratio: the recorded
+`request_wire_bytes` over the prompt tokens of the session's newest
+successful budgeted call on the same model (failing that, on any model),
+clamped to 2.0-6.0; before the session has one the ratio is 3.0.
 
 Not done: the Phase 1 records investigation below, and its acceptance
 evidence (replaying the affected users' failing sessions through the new
