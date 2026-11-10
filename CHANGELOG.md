@@ -45,15 +45,18 @@ fractions of the token cap; `SHED_TO` must be below `SHED_ABOVE`.
   catalog, tool definitions, current request, pipeline state and latest tool
   round trip are never removed. The budgeter makes no provider call and adds
   no text of its own beyond the stub and counts of omitted messages.
-- **The two ceilings are measured differently.** The request-byte ceiling is
-  checked against the request as sent (the JSON of its messages and tools,
-  escaping included), which is what a gateway's body cap sees. The token
-  estimate uses the request's content bytes, the same measure as the stored
-  `request_byte_split`.
+- **Both ceilings are judged on the request as sent.** The measure is the
+  JSON of the request's messages and tools, escaping included: what a
+  gateway's body cap sees, and everything the model reads (content,
+  tool-call arguments, thinking blocks and tool definitions). The token
+  estimate divides that size by a bytes-per-token ratio measured on the same
+  basis. The stored `request_byte_split` keeps its meaning (the content
+  split) and is not what the budget is judged on.
 - **What was shed is recorded on each call.** Composer call records gain a
   `context_budget` field (the policy hash, estimated tokens before and after,
-  the `bytes_per_token` ratio the estimate used, and what was removed or
-  stubbed). Older records without it read as "no shedding recorded".
+  the `bytes_per_token` ratio the estimate used, `request_wire_bytes` (the
+  size of the request sent), and what was removed or stubbed). Older records
+  without it read as "no shedding recorded".
 - **A request that cannot fit is refused with a named cause.** When the
   protected content alone exceeds either ceiling, the server refuses before
   any provider call with `context_budget_exceeded`: "This conversation is too
@@ -74,12 +77,14 @@ fractions of the token cap; `SHED_TO` must be below `SHED_ABOVE`.
 
 Known limits:
 
-- Token counts are estimated from request content bytes, not a tokenizer. The
-  bytes-per-token ratio comes from the session's newest successful budgeted
-  call on the same model (failing that, on any model), clamped to 2.0-5.0.
-  Until the session has such a call the ratio is 3.0, which over-estimates
-  tokens; this includes the first turn of an existing session after the
-  upgrade.
+- Token counts are estimated from request bytes, not a tokenizer. The
+  bytes-per-token ratio is the recorded `request_wire_bytes` over the
+  reported prompt tokens of the session's newest successful budgeted call on
+  the same model (failing that, on any model), clamped to 2.0-6.0. Until the
+  session has such a call the ratio is 3.0, which over-estimates tokens; this
+  includes the first turn of an existing session after the upgrade.
+- Tool-call arguments and thinking blocks count toward the budget but are
+  not shed. A turn whose arguments alone cannot fit is refused.
 - If the provider still rejects a request for context length, it is recorded
   as before and there is no automatic retry.
 - Advisor and review calls are not yet bounded by the context budget. In a
