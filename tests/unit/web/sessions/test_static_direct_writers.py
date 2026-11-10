@@ -2542,6 +2542,19 @@ _TEST_FIXTURE_REVIEWED_WRITERS: tuple[ReviewedWriter, ...] = (
             "rather than matched by spelling — the one live writer that widening surfaced."
         ),
     ),
+    ReviewedWriter(
+        path="tests/integration/web/test_shareable_reviews_routes.py",
+        enclosing_symbol="test_preview_reports_llm_authored_file_as_not_importable",
+        table="chat_messages",
+        operation="sqlalchemy_table_insert",
+        purpose=(
+            "shareable-files preview fixture: seeds the one originating user message that the "
+            "blob provenance FK (fk_blobs_created_from_message_session) requires before the "
+            "uploaded blob row can be re-marked llm_generated, so the route's refusal of an "
+            "assistant-written file is exercised against a real row; no production sequence "
+            "allocation is under test"
+        ),
+    ),
 )
 
 _ALLOWLIST: tuple[ReviewedWriter, ...] = _REVIEWED_ALLOWLIST + _TEST_FIXTURE_REVIEWED_WRITERS
