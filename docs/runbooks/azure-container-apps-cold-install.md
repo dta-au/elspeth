@@ -480,11 +480,12 @@ flat JSON object mapping Bicep parameter names to values, without an ARM
 
 - `composerMaxCompositionTurns`, `composerMaxDiscoveryTurns`,
   `composerTimeoutSeconds`, `composerRateLimitPerMinute`: select actual limits.
-- `composerContextMaxPromptTokens`: required; set it to your model gateway's
-  prompt-token limit (the shipped `200000` is a placeholder).
   The durable job timeout is independent of the transport idle ceiling. Keep the ceiling above 30 seconds for synchronous request headroom. Use package and image from the same commit: older images reject a job budget above the socket-safe cap.
   These parameters flow to web **and both doctor Jobs**; web-only
   `extraEnvironment` cannot fix doctor startup.
+- `composerContextMaxPromptTokens`: required; set it to your model gateway's
+  prompt-token limit (the shipped `200000` is a placeholder). Like the limits
+  above, it flows to web and both doctor Jobs.
 - `composerModel` and `composerAdvisorModel`, plus paired
   `composerEndpointBaseUrl` / primary key and `composerAdvisorEndpointBaseUrl` /
   advisor key. Both roles need valid model access. Never set a key without its
