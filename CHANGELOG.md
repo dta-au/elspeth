@@ -68,6 +68,26 @@ published tag or an image.
   a third of what the proposal planner receives still describes tools it does
   not have.
 
+### Web interface
+
+- **The ARGOnite skin.** The web interface takes the ARGOnite look in light
+  and dark themes, with a high-contrast palette built on the same hues.
+- **Header pills share one height**, the model chips included.
+- **The conversation runs the full height of the window.** The control that
+  hides and shows it now sits beside "Share inspect link".
+- **Selection is gold.** A selected node and a selected edge use one colour,
+  distinct from the keyboard focus colour.
+- Known and deferred: between workspace widths of 960 and 1041 px the pipeline
+  card is narrower than its 640 px target.
+
+### Plugins
+
+- **`file_inject` transform.** Writes the content of whole files, bound as
+  configuration, into row fields. The content is part of node identity, so
+  editing a bound file between a run and its resume refuses the resume. It is
+  installed but not in the default web plugin set; a deployment authorises it
+  through its plugin allowlist.
+
 ### MCP server
 
 - **File paths are confined to the configured data directory.** File paths
