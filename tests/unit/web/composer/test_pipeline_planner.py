@@ -300,6 +300,25 @@ _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES = 188
 # operator's standing direction that this threshold tracks the working
 # system: 3,878 B over the prior 135,730 B pin.
 _SKILL_REWORK_0812_CANONICAL_BYTES = 3878
+# file_inject transform (2026-11-10). Operator ruling 2026-11-10 (John): the
+# cap is a trigger to review for waste, not a reason to cut; with no obvious
+# cut, the measured increase is authorised. Measured on the same live request,
+# omitting only the file_inject summary in the catalog control: 135,730 B
+# without the summary and the capability-core passage, 136,597 B with both:
+# +867 B. That is HARNESS growth: this harness renders the capability core
+# only. The upload-rule passage in pipeline_composer.md rides every production
+# planner request and is outside this measurement: +681 canonical B there
+# (672 B raw + 9 B escaping; rendered production system message 138,554 ->
+# 139,235 B with the same encoder). Of the 867 B, the discovery-digest entry is
+# +509 B (508 B entry, 1 B list separator) and its outer JSON escaping +30 B;
+# the capability-core passage on the two modes is +322 B of system text and
+# +6 B of escaping. Payload and tool-palette bytes are
+# identical, and the small-catalog case measures the same 136,597 B. The waste
+# review removed the mode/format sentence and the content rule that the two
+# skill files would otherwise each have carried. Price only this measured
+# growth: the baseline, 10% band and prior headroom (zero before this change)
+# are preserved, with the exact-boundary / +1-byte overflow control.
+_FILE_INJECT_CATALOG_CANONICAL_BYTES = 867
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
@@ -312,6 +331,7 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _INFORMATION_BOUNDARY_DISCOVERY_CANONICAL_BYTES
     + _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES
     + _SKILL_REWORK_0812_CANONICAL_BYTES
+    + _FILE_INJECT_CATALOG_CANONICAL_BYTES
 )
 
 

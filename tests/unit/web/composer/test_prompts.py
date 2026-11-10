@@ -25,6 +25,7 @@ from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSecretRequirement, PluginSummary
+from elspeth.web.composer.capability_skill import load_pipeline_capability_core
 from elspeth.web.composer.discovery_cache import serialize_tool_result, tool_result_content_parts
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids
 from elspeth.web.composer.prompts import (
@@ -762,6 +763,40 @@ class TestBuildSystemPrompt:
         assert "For a user-uploaded LLM prompt, wire the ready user-verbatim blob" in flattened
         assert "Do not synthesize a replacement artifact" in flattened
         assert "ask one narrow file-selection question" in flattened
+
+    def test_file_inject_guidance_names_path_and_upload_rule(self) -> None:
+        """file_inject content is an attached user upload: never a planner blob, never literal text."""
+        flattened = " ".join(build_system_prompt(None).split())
+
+        assert "`mode: select`" in flattened and "`mode: all`" in flattened
+        assert "State `format` on every entry" in flattened
+        assert (
+            "Only files the user uploaded can be attached to `file_inject`. If the user wants text injected "
+            "that they have not uploaded, tell them they need to save it as a file and upload it; attach it "
+            "only once the upload exists. Do not create the blob yourself."
+        ) in flattened
+        assert "Literal text in `content` is not accepted in the composer either" in flattened
+        steps = (
+            "(1) tell the user to save the text as a file and upload it",
+            "(2) once it is uploaded, find it with `list_blobs` / `get_blob_metadata`",
+            "(3) attach it with `wire_blob_inline_ref` at `node:<node_id>.options.files.<entry_name>.content`",
+        )
+        positions = [flattened.find(step) for step in steps]
+        assert -1 not in positions, positions
+        assert positions == sorted(positions)
+        # Scoped to this plugin: other planner-created content keeps its own rules.
+        assert "This rule is specific to `file_inject`" in flattened
+
+    def test_capability_core_teaches_file_inject_modes(self) -> None:
+        """The shared core carries the mode semantics once; the interaction skill does not repeat them."""
+        core = " ".join(load_pipeline_capability_core().split())
+
+        assert "For a selected `file_inject`" in core
+        assert "`mode: select`" in core and "`mode: all`" in core
+        assert "`key_field`" in core and "`on_miss`" in core
+        assert "State `format` on every entry" in core
+        # Said once: the interaction skill must not carry a second copy of the passage.
+        assert " ".join(build_system_prompt(None).split()).count("For a selected `file_inject`") == 1
 
     def test_core_skill_rejects_persona_column_and_format_fabrication(self) -> None:
         """Panel-persona prose must not override inspected source facts."""

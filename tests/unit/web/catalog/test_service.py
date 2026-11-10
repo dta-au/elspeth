@@ -61,7 +61,7 @@ class TestCatalogService:
             ("transform", catalog.list_transforms(), plugin_manager.get_transforms()),
             ("sink", catalog.list_sinks(), plugin_manager.get_sinks()),
         )
-        assert sum(len(summaries) for _, summaries, _ in groups) == 60
+        assert sum(len(summaries) for _, summaries, _ in groups) == 61
 
         for kind, summaries, plugin_classes in groups:
             classes_by_name = {plugin_cls.name: plugin_cls for plugin_cls in plugin_classes}
@@ -842,7 +842,7 @@ class TestSummaryCache:
         # schema generation, once per registered plugin, during construction.
         _, calls, plugin_count = self._counting_catalog(monkeypatch)
 
-        assert plugin_count == 60
+        assert plugin_count == 61
         assert len(calls) == plugin_count
         assert set(calls.values()) == {1}
 

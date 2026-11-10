@@ -165,6 +165,7 @@ def _rows_for(plugin_key: str) -> list[dict[str, object]]:
         "transform:blob_text_expand": [{"blob_ref": "filled-by-harness"}],
         "transform:blob_fetch": [{"document_url": "filled-by-harness"}],
         "transform:field_mapper": [{"id": 1, "applicant": "Ada", "notes": "ok"}],
+        "transform:file_inject": [{"document_kind": "invoice"}],
         "transform:json_explode": [{"items": ["a", "b"]}],
         "transform:keyword_filter": [{"notes": "public material"}],
         "transform:line_explode": [{"content": "alpha\nbeta"}],
@@ -437,7 +438,7 @@ def _stop_server(server: multiprocessing.Process | None) -> None:
 
 def test_local_lifecycle_cases_cover_the_exact_reviewed_subject_set() -> None:
     assert tuple(case.plugin_key for case in LOCAL_LIFECYCLE_CASES) == _reviewed_local_subjects()
-    assert len(LOCAL_LIFECYCLE_CASES) == 42
+    assert len(LOCAL_LIFECYCLE_CASES) == 43
     assert {case.profile_case for case in LOCAL_LIFECYCLE_CASES} == {SQLITE_SINGLE_LEADER}
 
 

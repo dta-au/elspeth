@@ -65,6 +65,7 @@ _TRANSFORM_CLASSES = {
     "blob_json_expand": ("elspeth.plugins.transforms.blob_json_expand", "BlobJSONExpand"),
     "blob_text_expand": ("elspeth.plugins.transforms.blob_text_expand", "BlobTextExpand"),
     "field_mapper": ("elspeth.plugins.transforms.field_mapper", "FieldMapper"),
+    "file_inject": ("elspeth.plugins.transforms.file_inject", "FileInject"),
     "json_explode": ("elspeth.plugins.transforms.json_explode", "JSONExplode"),
     "keyword_filter": ("elspeth.plugins.transforms.keyword_filter", "KeywordFilter"),
     "line_explode": ("elspeth.plugins.transforms.line_explode", "LineExplode"),
