@@ -124,20 +124,27 @@ def decide_context_budget(
     low = policy.shed_to * policy.max_prompt_tokens
     tokens_before = tokens(request_bytes)
 
-    sticky = [segment for segment in segments if segment.key in previously_shed]
-    over = tokens_before > high or request_bytes > policy.max_request_bytes
+    # Hysteresis. Segments shed on an earlier call are restored only when the
+    # fully unshed request is back at or below the low mark (and under the byte
+    # ceiling). Otherwise they stay shed, and whether MORE must go is judged on
+    # the request with that sticky set already shed -- what would be sent if
+    # nothing new were shed. Judging it on the unshed size would shed again on
+    # every call once a session had crossed the high mark, pinning the request
+    # at the low mark and changing the sent prefix each time.
+    sticky: list[SheddableSegment] = []
+    if tokens_before > low or request_bytes > policy.max_request_bytes:
+        sticky = [segment for segment in segments if segment.key in previously_shed]
+    kept = request_bytes - sum(segment.saving_bytes for segment in sticky)
+    over = tokens(kept) > high or kept > policy.max_request_bytes
 
-    shed: list[SheddableSegment]
-    if not over:
-        shed = sticky if tokens_before > low else []
-    else:
+    shed: list[SheddableSegment] = list(sticky)
+    if over:
         remaining = sorted(
             (segment for segment in segments if segment.key not in previously_shed),
             key=lambda segment: _KIND_RANK[segment.kind],
         )
-        shed = []
-        after = request_bytes
-        for segment in [*sticky, *remaining]:
+        after = kept
+        for segment in remaining:
             if tokens(after) <= low and after <= policy.max_request_bytes:
                 break
             shed.append(segment)
