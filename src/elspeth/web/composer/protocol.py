@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
-from elspeth.contracts.composer_progress import ComposerProgressReason, ComposerProgressSink
+from elspeth.contracts.composer_progress import CONTEXT_BUDGET_REFUSAL_DETAIL, ComposerProgressReason, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata, FrameworkBugError
 from elspeth.web.composer.advisor_audit import AdvisorGraphReviewIdentity, AdvisorTerminalPublication
 from elspeth.web.composer.advisor_decision import AdvisorGateDecision
@@ -607,13 +607,17 @@ class ComposerConvergenceError(ComposerServiceError):
         # spent by tool-call turns, so the loop wording is true for those. A
         # timeout is not: the deadline can expire after the model's final
         # reply, while the END gate re-validates, so the timeout wording claims
-        # only what every timeout has in common.
-        cause = (
-            "The request ran out of time before the turn could be completed."
-            if budget_exhausted == "timeout"
-            else "The LLM kept making tool calls without producing a final response."
-        )
-        super().__init__(f"Composer did not converge within {max_turns} turns (budget exhausted: {budget_exhausted}). {cause}")
+        # only what every timeout has in common. A context budget refusal is
+        # neither: it is refused before the provider call and says so.
+        if reason == "context_budget_exceeded":
+            super().__init__(CONTEXT_BUDGET_REFUSAL_DETAIL)
+        else:
+            cause = (
+                "The request ran out of time before the turn could be completed."
+                if budget_exhausted == "timeout"
+                else "The LLM kept making tool calls without producing a final response."
+            )
+            super().__init__(f"Composer did not converge within {max_turns} turns (budget exhausted: {budget_exhausted}). {cause}")
         self.max_turns = max_turns
         self.budget_exhausted = budget_exhausted
         self.partial_state = partial_state

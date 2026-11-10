@@ -1,3 +1,4 @@
+import { COMPOSE_CONTEXT_BUDGET_EXCEEDED, COMPOSE_CONTEXT_BUDGET_EXCEEDED_DETAIL } from "@/config/composer";
 import type { ComposerOperationFailureNotice } from "@/types/composerOperations";
 
 const OUTCOME_LABELS = {
@@ -15,6 +16,7 @@ export function ComposerOperationOutcomeNotice({ outcome }: { outcome: ComposerO
   return (
     <aside className="trusted-system-notice" role="note" aria-label="Composer operation outcome" data-operation-id={outcome.operation_id}>
       <strong>{OUTCOME_LABELS[outcome.failure_code]}</strong>
+      {outcome.error_type === COMPOSE_CONTEXT_BUDGET_EXCEEDED && <p>{COMPOSE_CONTEXT_BUDGET_EXCEEDED_DETAIL}</p>}
       {outcome.settled_at !== null && <p><time dateTime={outcome.settled_at}>{new Date(outcome.settled_at).toLocaleString()}</time></p>}
       {saved.attribution === "unavailable" ? (
         <p>Saved progress has not been confirmed. Review the current draft before deciding what to do next.</p>

@@ -102,6 +102,7 @@ async def _compose(
     *,
     tool_data: dict[str, Any] | None = None,
     budget_history: ContextBudgetHistory | None = None,
+    progress: Any = None,
 ) -> Any:
     state = _empty_state()
     results = iter(range(2, 100))
@@ -122,7 +123,9 @@ async def _compose(
         patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=_execute),
         patch.object(service._preflight, "cached_runtime_preflight", new_callable=AsyncMock, return_value=_passing_preflight()),
     ):
-        return await service.compose("Build a CSV pipeline", history, state, session_id=session_id, context_budget_history=budget_history)
+        return await service.compose(
+            "Build a CSV pipeline", history, state, session_id=session_id, context_budget_history=budget_history, progress=progress
+        )
 
 
 def _user(index: int, content: str) -> ComposerHistoryMessage:
@@ -376,7 +379,7 @@ async def test_tool_result_shorter_than_the_stub_is_never_stubbed() -> None:
         llm_messages.append({"role": "tool", "tool_call_id": call_id, "content": short})
     unshed = deepcopy(llm_messages)
 
-    selected, _tools, _delivery, record = service._prepare_primary_delivery(
+    selected, _tools, _delivery, record = await service._prepare_primary_delivery(
         messages=llm_messages,
         tools=composer_loop_tool_definitions(service._planner_dialect),
         recorder=BufferingRecorder(),
@@ -387,6 +390,7 @@ async def test_tool_result_shorter_than_the_stub_is_never_stubbed() -> None:
         composition_turns_used=0,
         discovery_turns_used=0,
         failed_turn=None,
+        progress=None,
     )
 
     # The history pushed the request over the high mark, so shedding ran ...
@@ -419,6 +423,8 @@ async def test_current_message_larger_than_the_cap_is_refused_before_any_provide
     assert provider.requests == []
     error = exc_info.value
     assert error.reason == "context_budget_exceeded"
+    # The refusal is not a non-convergence; its message is the user-facing refusal.
+    assert str(error) == "This conversation is too large for the composer to continue. Start a new session, or shorten your request."
     assert error.llm_calls == ()
     assert error.evidence["largest_component"] == "current_message"
     assert error.evidence["ceiling"] == "tokens"
@@ -609,3 +615,75 @@ async def test_the_final_byte_guard_refuses_a_request_the_decision_did_not_fit()
     assert error.evidence["ceiling"] == "bytes"
     assert error.evidence["request_bytes"] > max_request_bytes + 190_000
     assert error.evidence["largest_component"] == "current_message"
+
+
+# --- The shed-history notice ----------------------------------------------------------------
+
+
+_CONTEXT_REDUCED_HEADLINE = "Earlier conversation is no longer visible to the composer."
+
+
+class _NoticeProbe(_RecordingProvider):
+    """A provider and progress sink that record how many shed-history notices preceded each provider call."""
+
+    def __init__(self, *responses: Any) -> None:
+        super().__init__(*responses)
+        self.events: list[Any] = []
+        self.notices_at_call: list[int] = []
+
+    async def sink(self, event: Any) -> None:
+        self.events.append(event)
+
+    def notices(self) -> list[Any]:
+        return [event for event in self.events if event.reason == "context_reduced"]
+
+    async def complete(self, **kwargs: Any) -> Any:
+        self.notices_at_call.append(len(self.notices()))
+        return await super().complete(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_sheds_history_announces_it_once_before_the_first_shedding_call() -> None:
+    base = await _base_request_bytes()
+    service, session_id = _service(_cap_for(base))
+    probe = _NoticeProbe(_tool_turn("call-1"), _make_llm_response(content="Done."))
+
+    result = await _compose(service, session_id, _long_history(base), probe, progress=probe.sink)
+
+    # Both calls of the turn shed history; the notice is sent once, before the first.
+    assert len(result.llm_calls) == 2
+    for call in result.llm_calls:
+        assert call.context_budget is not None and call.context_budget.shed_history_indices == (1, 3, 5)
+    assert probe.notices_at_call == [1, 1]
+    (notice,) = probe.notices()
+    assert notice.phase == "calling_model"
+    assert notice.headline == _CONTEXT_REDUCED_HEADLINE
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_sheds_nothing_sends_no_notice() -> None:
+    base = await _base_request_bytes()
+    service, session_id = _service(_GENEROUS_TOKENS)
+    probe = _NoticeProbe(_tool_turn("call-1"), _make_llm_response(content="Done."))
+
+    result = await _compose(service, session_id, _long_history(base), probe, progress=probe.sink)
+
+    for call in result.llm_calls:
+        assert call.context_budget is not None and call.context_budget.shed_history_indices == ()
+    assert probe.events, "the turn emitted its ordinary progress events"
+    assert probe.notices() == []
+
+
+@pytest.mark.asyncio
+async def test_stubbing_tool_results_alone_sends_no_notice() -> None:
+    base = await _base_request_bytes()
+    big = "r" * (base * 3 // 10)
+    tool_data = {"call-1": {"rows": big + "1"}, "call-2": {"rows": big + "2"}, "call-3": {"rows": big + "3"}}
+    service, session_id = _service(_cap_for(base))
+    probe = _NoticeProbe(_tool_turn("call-1"), _tool_turn("call-2"), _tool_turn("call-3"), _make_llm_response(content="Pipeline built."))
+
+    result = await _compose(service, session_id, [], probe, tool_data=tool_data, progress=probe.sink)
+
+    last = result.llm_calls[-1].context_budget
+    assert last is not None and last.stubbed_tool_call_ids == ("call-1", "call-2")
+    assert probe.notices() == []
