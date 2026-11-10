@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -16,21 +17,115 @@ ROOT = Path(__file__).resolve().parents[3]
 PROBE = ROOT / "tests/helpers/portable_supervisor_probe.py"
 
 
+def read_proc_stat(pid):
+    """Fields of /proc/<pid>/stat, or None once the entry is gone.
+
+    A zombie can be reaped between any existence check and the read that
+    follows it, so existence is never tested separately: the read itself
+    reports it (FileNotFoundError, or ProcessLookupError on a vanishing task).
+    """
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    head, tail = text.rsplit(")", 1)  # comm may hold spaces; keep proc(5) field numbering
+    return [head.split()[0], head.split("(", 1)[1], *tail.split()]
+
+
+def test_read_proc_stat_reports_a_vanished_entry_as_none_not_an_error(monkeypatch):
+    # Both ways a reaped zombie surfaces on a read that followed a successful
+    # existence check: the file is gone, or the task vanished mid-read.
+    assert read_proc_stat(2**22 + 1) is None
+    original = Path.read_text
+
+    def vanishing(self, *args, **kwargs):
+        if self.name == "stat" and self.parent.name == str(os.getpid()):
+            raise ProcessLookupError(3, "No such process")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", vanishing)
+    assert read_proc_stat(os.getpid()) is None
+    monkeypatch.undo()
+    fields = read_proc_stat(os.getpid())
+    assert fields[0] == str(os.getpid()) and fields[2] in {"R", "S"} and len(fields) > 51
+
+
+def probe_evidence(directory):
+    evidence = []
+    for name in ("timeline.jsonl", "diagnostics.txt"):
+        try:
+            content = (directory / name).read_text(errors="replace")
+        except OSError:
+            content = "unreadable"
+        evidence.append(f"{name}:\n{content}")
+    return "\n".join(evidence)
+
+
 def launch(directory, mode, *, speed=1, ignored_chld=False):
     command = [sys.executable, str(PROBE), "supervisor", str(directory), mode, str(speed)]
     if ignored_chld:
         command.append("ignored-chld")
-    return subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ.copy())
+    return subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ.copy(), start_new_session=os.name == "posix"
+    )
 
 
 def finish(process, directory, *, timeout=15):
     # The probe's shorter outer alarm unwinds the real production owner, which
     # kills/reaps its own Popen child before this outer process timeout expires.
-    out, err = process.communicate(timeout=timeout)
+    try:
+        out, err = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        from tests.helpers.process_diagnostics import linux_process_snapshot
+
+        proc = linux_process_snapshot(process.pid)
+        if process.poll() is None:
+            if sys.platform == "linux":
+                # The real owner launches its runner in another session. The
+                # kernel's direct-child list belongs to this retained Popen;
+                # event-file PIDs must never become signal authority.
+                try:
+                    children = Path(f"/proc/{process.pid}/task/{process.pid}/children").read_text().split()
+                except OSError as read_error:
+                    proc += f"\nowned child lookup unreadable: {read_error}"
+                    children = []
+                for child in children:
+                    child_pid = int(child)
+                    try:
+                        status = Path(f"/proc/{child_pid}/status").read_text().splitlines()
+                        if f"PPid:\t{process.pid}" not in status:
+                            continue  # The owner exited or custody changed.
+                        proc += f"\nrunner pid={child_pid} {linux_process_snapshot(child_pid)}"
+                        if os.getpgid(child_pid) == child_pid:
+                            os.killpg(child_pid, signal.SIGKILL)
+                        else:
+                            os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass  # The owner reaped its runner during observation.
+                    except OSError as child_error:
+                        proc += f"\nowned child cleanup failed: {child_error}"
+            try:
+                if os.name == "posix" and os.getpgid(process.pid) == process.pid:
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                pass  # It exited between poll and kill.
+        try:
+            out, err = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as cleanup_error:
+            out, err = cleanup_error.output or b"", cleanup_error.stderr or b""
+        (directory / "stdout").write_bytes(out)
+        (directory / "stderr").write_bytes(err)
+        raise AssertionError(
+            f"Portable supervisor timed out after {timeout}s; returncode={process.poll()}\n{proc}\n"
+            + probe_evidence(directory)
+            + f"\nstderr:\n{err.decode(errors='replace')}"
+        ) from error
     (directory / "stdout").write_bytes(out)
     (directory / "stderr").write_bytes(err)
     (directory / "exit").write_text(str(process.returncode))
-    assert not err, err.decode()
+    assert not err, f"{probe_evidence(directory)}\nstderr:\n{err.decode(errors='replace')}"
     return out, json.loads((directory / "supervisor.json").read_text())
 
 
@@ -40,6 +135,168 @@ def wait_event(process, directory, name):
         assert process.poll() is None
         assert time.monotonic() < deadline
         time.sleep(0.01)
+
+
+def test_finish_timeout_retains_timeline_stderr_and_reaps_process(tmp_path):
+    (tmp_path / "timeline.jsonl").write_text("controlled child-started timeline\n")
+    (tmp_path / "diagnostics.txt").write_text("controlled alarm diagnostics\n")
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import sys, time; print('controlled stderr', file=sys.stderr, flush=True); time.sleep(60)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=os.name == "posix",
+    )
+    try:
+        with pytest.raises(AssertionError) as failure:
+            finish(process, tmp_path, timeout=0.5)
+        message = str(failure.value)
+        assert "controlled child-started timeline" in message
+        assert "controlled alarm diagnostics" in message
+        assert "controlled stderr" in message
+        assert process.poll() is not None
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="detached runner custody control reads Linux proc")
+def test_finish_timeout_also_stops_runner_in_separate_session(tmp_path):
+    command = (
+        "import subprocess, sys, time; "
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True); "
+        "print(child.pid, flush=True); time.sleep(60)"
+    )
+    process = subprocess.Popen([sys.executable, "-c", command], stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    runner_pid = None
+    try:
+        assert process.stdout is not None
+        runner_pid = int(process.stdout.readline())
+        with pytest.raises(AssertionError, match="Portable supervisor timed out"):
+            finish(process, tmp_path, timeout=0.5)
+        assert process.poll() is not None
+        deadline = time.monotonic() + 5
+        while (fields := read_proc_stat(runner_pid)) is not None and fields[2] != "Z":
+            assert time.monotonic() < deadline, "detached runner survived probe timeout cleanup"
+            time.sleep(0.01)
+    finally:
+        if runner_pid is not None:
+            with suppress(ProcessLookupError):
+                os.killpg(runner_pid, signal.SIGKILL)
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
+
+
+def test_probe_alarm_records_owner_proc_and_stacks(tmp_path, monkeypatch):
+    import runpy
+
+    from tests.helpers import portable_supervisor_probe as probe
+
+    child_pids = []
+
+    class AlarmOwner:
+        def __init__(self, command, *, _clock_ns):
+            self.child = None
+            self.armed_at = None
+            self.deadline = None
+            self.stop_requested = False
+            self.failed = False
+            self.completed = False
+
+        def run(self):
+            self.child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            child_pids.append(self.child.pid)
+            try:
+                signal.raise_signal(signal.SIGALRM)
+            finally:
+                self.child.kill()
+                self.child.wait(timeout=5)
+
+    monkeypatch.setattr(runpy, "run_path", lambda path: {"_Supervisor": AlarmOwner})
+    previous = signal.getsignal(signal.SIGALRM)
+    try:
+        with pytest.raises(TimeoutError, match="Outer owned-process probe expired"):
+            probe.supervise(tmp_path, "early-stop-abort", 20, False)
+    finally:
+        signal.signal(signal.SIGALRM, previous)
+    diagnostics = (tmp_path / "diagnostics.txt").read_text()
+    assert "elapsed=" in diagnostics and "stop_requested=True" in diagnostics
+    assert f"child_pid={child_pids[0]}" in diagnostics and "proc:" in diagnostics
+    assert f"threads=[{child_pids[0]}:" in diagnostics
+    assert "test_probe_alarm_records_owner_proc_and_stacks" in diagnostics
+
+
+def test_probe_records_child_import_and_connection_timeline(tmp_path):
+    process = launch(tmp_path, "bootstrap")
+    finish(process, tmp_path)
+    timeline = [json.loads(line) for line in (tmp_path / "timeline.jsonl").read_text().splitlines()]
+    assert [entry["event"] for entry in timeline] == ["child-started", "imports-done", "connected", "bootstrap-completed"]
+    assert all(entry["pid"] > 0 for entry in timeline)
+    assert [entry["monotonic_ns"] for entry in timeline] == sorted(entry["monotonic_ns"] for entry in timeline)
+
+
+def test_child_start_is_recorded_before_application_import_failure(tmp_path, monkeypatch):
+    import builtins
+
+    from tests.helpers import portable_supervisor_probe as probe
+
+    original_import = builtins.__import__
+
+    def fail_bootstrap_import(name, *args, **kwargs):
+        if name == "elspeth.composer_mcp.portable_bootstrap":
+            assert (tmp_path / "child-started").exists()
+            raise ModuleNotFoundError("controlled first application import failure")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_bootstrap_import)
+    with pytest.raises(ModuleNotFoundError, match="controlled first application import failure"):
+        probe.child(tmp_path, "bootstrap")
+    timeline = [json.loads(line) for line in (tmp_path / "timeline.jsonl").read_text().splitlines()]
+    assert [entry["event"] for entry in timeline] == ["child-started"]
+    assert timeline[0]["pid"] == int((tmp_path / "child-started").read_text())
+
+
+def test_child_timeline_with_controlled_bootstrap_transport(tmp_path, monkeypatch):
+    from elspeth.composer_mcp import portable_bootstrap, portable_control
+    from elspeth.contracts.process_watchdog_wire import ProcessWatchdogTarget
+    from tests.helpers import portable_supervisor_probe as probe
+
+    connection = object()
+    target = ProcessWatchdogTarget(os.getpid(), "a" * 64)
+    completed = []
+
+    class BootstrapControl:
+        def __init__(self, received, draining):
+            assert received is connection
+            self.target = target
+
+        def complete_bootstrap(self, witness):
+            completed.append(witness.target)
+
+    monkeypatch.setattr(portable_bootstrap, "connect_supervisor", lambda: connection)
+    monkeypatch.setattr(portable_control, "PortableProcessWatchdog", BootstrapControl)
+    assert probe.child(tmp_path, "bootstrap") == 0
+    assert completed == [target]
+    timeline = [json.loads(line) for line in (tmp_path / "timeline.jsonl").read_text().splitlines()]
+    assert [entry["event"] for entry in timeline] == ["child-started", "imports-done", "connected", "bootstrap-completed"]
+    assert all(entry["pid"] == os.getpid() for entry in timeline)
+    assert [entry["monotonic_ns"] for entry in timeline] == sorted(entry["monotonic_ns"] for entry in timeline)
+
+
+def test_finish_alarm_failure_includes_saved_evidence(tmp_path):
+    (tmp_path / "timeline.jsonl").write_text("controlled alarm timeline\n")
+    (tmp_path / "diagnostics.txt").write_text("controlled alarm stacks\n")
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import sys; print('controlled alarm stderr', file=sys.stderr); raise SystemExit(1)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    with pytest.raises(AssertionError) as failure:
+        finish(process, tmp_path)
+    assert "controlled alarm timeline" in str(failure.value)
+    assert "controlled alarm stacks" in str(failure.value)
+    assert "controlled alarm stderr" in str(failure.value)
 
 
 def test_shutdown_intent_has_closed_roundtrip():
@@ -321,15 +578,16 @@ def test_healthy_child_fails_closed_when_supervisor_is_killed(tmp_path):
     assert process.returncode == -signal.SIGKILL
     assert out == err == b""
     deadline = time.monotonic() + 5
-    state_file = Path(f"/proc/{child_pid}/stat")
-    while state_file.exists() and state_file.read_text().split()[2] != "Z":
+    while (fields := read_proc_stat(child_pid)) is not None and fields[2] != "Z":
         assert time.monotonic() < deadline
         time.sleep(0.01)
     # Its supervisor was destroyed: adoption/reaping belongs to init, so this
     # establishes actual exit, not a claim that the dead supervisor reaped it.
     assert not (tmp_path / "completed").exists()
-    if state_file.exists():
-        assert int(state_file.read_text().split()[51]) == 70 << 8
+    # Init may reap the zombie at any moment: the exit code is only observable
+    # while the entry still exists, and a reaped child is an exited child.
+    if (fields := read_proc_stat(child_pid)) is not None:
+        assert int(fields[51]) == 70 << 8
 
 
 def test_private_bootstrap_missing_authority_refuses_and_consumes_environment(tmp_path):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import faulthandler
 import json
 import os
 import signal
@@ -11,9 +12,12 @@ from contextlib import suppress
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 
 def event(directory: Path, name: str) -> None:
+    with (directory / "timeline.jsonl").open("a", encoding="utf-8") as timeline:
+        timeline.write(json.dumps({"event": name, "pid": os.getpid(), "monotonic_ns": time.monotonic_ns()}) + "\n")
     (directory / name).write_text(str(os.getpid()))
 
 
@@ -21,6 +25,9 @@ def supervise(directory: Path, mode: str, speed: int, ignored_chld: bool) -> int
     import runpy
     import socket
 
+    from tests.helpers.process_diagnostics import linux_process_snapshot
+
+    started = time.monotonic()
     namespace = runpy.run_path(str(ROOT / "src/elspeth/composer_mcp/portable_supervisor.py"))
     phase_started = None
 
@@ -64,6 +71,20 @@ def supervise(directory: Path, mode: str, speed: int, ignored_chld: bool) -> int
         signal.signal(signal.SIGCHLD, signal.SIG_IGN)
 
     def expired(signum: int, frame: object) -> None:
+        pid = None if owner.child is None else owner.child.pid
+        diagnostic = (
+            f"elapsed={time.monotonic() - started:.6f}s mode={mode} speed={speed} "
+            f"stop_requested={owner.stop_requested} armed_at={owner.armed_at} deadline={owner.deadline} "
+            f"failed={owner.failed} completed={owner.completed} child_pid={pid}\n"
+            f"{linux_process_snapshot(pid)}\n"
+        )
+        try:
+            with (directory / "diagnostics.txt").open("a", encoding="utf-8") as output:
+                output.write(diagnostic)
+                output.flush()
+                faulthandler.dump_traceback(file=output, all_threads=True)
+        except OSError as error:
+            sys.stderr.write(f"Could not persist probe alarm diagnostics: {error}\n{diagnostic}")
         raise TimeoutError("Outer owned-process probe expired")
 
     signal.signal(signal.SIGALRM, expired)
@@ -189,6 +210,7 @@ def raw_child(directory: Path, mode: str) -> int:
 
 
 def child(directory: Path, mode: str) -> int:
+    event(directory, "child-started")
     if mode in {
         "no-handshake",
         "peer-flood",
@@ -208,6 +230,8 @@ def child(directory: Path, mode: str) -> int:
     # This is deliberately the first application-facing import/call. Bootstrap
     # environment must disappear before runtime imports or worker construction.
     from elspeth.composer_mcp.portable_bootstrap import connect_supervisor
+
+    event(directory, "imports-done")
 
     if mode == "early-stop-signal":
         event(directory, "before-hello")
