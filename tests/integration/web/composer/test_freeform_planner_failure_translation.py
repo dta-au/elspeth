@@ -1029,7 +1029,7 @@ def test_send_message_planner_context_budget_refusal_names_its_cause_on_the_oper
     There is no call record, so the operation record is where the refusal, the
     ceiling it hit and the largest component must be found.
     """
-    provider = AsyncMock(side_effect=AssertionError("a context budget refusal makes no provider call"))
+    provider = AsyncMock(spec=litellm.acompletion, side_effect=AssertionError("a context budget refusal makes no provider call"))
     # 1,000 tokens at the fallback 3.0 bytes per token: the system skill alone is over the ceiling.
     client, engine, _sessions = _build_app(tmp_path, monkeypatch, provider, context_max_prompt_tokens=1_000)
     session_id = client.post("/api/sessions", json={"title": "planner context budget refusal"}).json()["id"]
