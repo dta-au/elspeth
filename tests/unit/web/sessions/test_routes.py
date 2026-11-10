@@ -6160,7 +6160,7 @@ class TestMessageRoutes:
         assert review["saved_effects"]["net_changed"] is False
         advisor_context = json.dumps(provider_requests[1]["messages"])
         assert all(canary in advisor_context for canary in canaries.values())
-        transcript_prefix = "Complete available same-session visible conversation evidence."
+        transcript_prefix = "Available same-session visible conversation evidence;"
         hatch_transcript = next(
             message["content"]
             for message in provider_requests[1]["messages"]
