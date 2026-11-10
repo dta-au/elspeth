@@ -104,7 +104,15 @@ from elspeth.web.composer.context_budget import (
     SheddableSegment,
     decide_context_budget,
 )
-from elspeth.web.composer.context_budget_apply import largest_component, latest_round_trip_start, message_bytes, stubbed_tool_message
+from elspeth.web.composer.context_budget_apply import (
+    CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
+    largest_component,
+    latest_round_trip_start,
+    message_bytes,
+    previously_shed_keys,
+    stubbed_tool_message,
+    tool_result_segments,
+)
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.control_messages import anti_anchor_control_envelope
 from elspeth.web.composer.discovery_cache import (
@@ -1583,6 +1591,8 @@ class ComposerServiceImpl:
         Returns the messages to send, the record of the decision, and the
         bytes-per-token ratio it used.
         """
+        from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
+
         state_index = frame.state_index
         if len(messages) < state_index + 2 or messages[state_index]["content"] != frame.state_message_content:
             raise InvariantError("compose-loop request does not have the layout its context budget frame describes")
@@ -1594,37 +1604,27 @@ class ComposerServiceImpl:
             saving = split.message_bytes[_CONTEXT_BUDGET_HISTORY_START + position]
             if kind is not None and saving > 0:
                 segments.append(SheddableSegment(kind=kind, key=f"history:{chat_index}", saving_bytes=saving))
-        # A provider may reuse a tool-call id across rounds; one key then
-        # covers every earlier result that carries it.
-        tool_positions: dict[str, list[int]] = {}
-        tool_savings: dict[str, int] = {}
-        for index in range(state_index + 2, latest_start if latest_start is not None else len(messages)):
-            message = messages[index]
-            if message["role"] != "tool":
-                continue
-            saving = split.message_bytes[index] - message_bytes([stubbed_tool_message(message)], None).total_bytes
-            if saving <= 0:
-                continue
-            key = f"tool:{message['tool_call_id']}"
-            tool_positions.setdefault(key, []).append(index)
-            tool_savings[key] = tool_savings.get(key, 0) + saving
-        segments.extend(
-            SheddableSegment(kind=SheddableKind.TOOL_RESULT, key=key, saving_bytes=saving) for key, saving in tool_savings.items()
+        # A re-render after shedding history adds the omission counts.
+        omission_allowance = CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES if segments else 0
+        tool_segments, tool_positions = tool_result_segments(
+            messages, split, start=state_index + 2, stop=latest_start if latest_start is not None else len(messages)
         )
+        segments.extend(tool_segments)
 
-        previously_shed = set(frame.history.previously_shed_history)
-        for call in recorder.llm_calls:
-            if call.context_budget is not None:
-                previously_shed.update(f"history:{index}" for index in call.context_budget.shed_history_indices)
-                previously_shed.update(f"tool:{tool_call_id}" for tool_call_id in call.context_budget.stubbed_tool_call_ids)
+        # The decision measures the request as it will be sent: with cache
+        # markers, plus the worst case the omission counts can add.
+        sent_split = split
+        if supports_anthropic_prompt_cache_markers(self._model):
+            scratch_messages, scratch_tools = apply_anthropic_cache_markers(messages, tools, mark_history_tail=True)
+            sent_split = message_bytes(scratch_messages, scratch_tools or None)
 
         try:
             decision = decide_context_budget(
                 policy=self._context_budget_policy,
-                request_bytes=split.total_bytes,
+                request_bytes=sent_split.total_bytes + omission_allowance,
                 segments=segments,
                 bytes_per_token=frame.history.bytes_per_token,
-                previously_shed=frozenset(previously_shed),
+                previously_shed=previously_shed_keys(frame.history, recorder.llm_calls),
             )
         except ContextBudgetRefusal as refusal:
             raise self._context_budget_refusal(
