@@ -1885,9 +1885,11 @@ def test_workflow_requires_all_shards_and_combined_unchanged_floors() -> None:
     assert "matrix.shard" in jobs["test"]["env"]["CI_CHECKOUT_PATH"]
     aggregate = jobs["coverage"]
     assert aggregate["needs"] == ["test", "landscape-proof", "timing-sensitive"]
+    # Runs after failed shards but not after a cancelled run: with always() the
+    # job started once a cancelled run's shards finished and held a runner.
     assert (
         aggregate["if"]
-        == "always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)"
+        == "${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}"
     )
     commands = "\n".join(step.get("run", "") for step in aggregate["steps"])
     assert "needs.test.result" in commands

@@ -51,6 +51,7 @@ jobs:
   # ===========================================================================
   static-analysis:
     name: Static analysis
+    timeout-minutes: 30
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
@@ -369,6 +370,7 @@ jobs:
   # ===========================================================================
   test:
     name: Test (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
+    timeout-minutes: 120
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
@@ -720,11 +722,14 @@ jobs:
 
   coverage:
     name: Combined coverage
+    timeout-minutes: 20
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
       image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
     needs: [test, landscape-proof, timing-sensitive]
-    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    # !cancelled(), not always(): see the timing-sensitive job. This still runs
+    # after failed shards, and no longer starts after a cancelled run.
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-coverage
     steps:
@@ -839,6 +844,7 @@ jobs:
   # ===========================================================================
   integration:
     name: Integration Tests
+    timeout-minutes: 60
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
       image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
@@ -1211,6 +1217,7 @@ jobs:
 
   supply-chain-audit:
     name: Dependency and License Audit
+    timeout-minutes: 20
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
@@ -1371,6 +1378,7 @@ jobs:
   # ===========================================================================
   gateway:
     name: Gateway (locked tests and image)
+    timeout-minutes: 30
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs: [static-analysis]
@@ -1542,6 +1550,7 @@ jobs:
   # browser journey blocks merge instead of being waved through.
   e2e-frontend:
     name: Frontend E2E (Playwright)
+    timeout-minutes: 45
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     env:
@@ -1651,6 +1660,7 @@ jobs:
   # blocks merge.
   frontend-unit:
     name: Frontend unit (vitest + typecheck)
+    timeout-minutes: 20
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     env:
@@ -1687,6 +1697,7 @@ jobs:
   # ===========================================================================
   ci-success:
     name: CI Success
+    timeout-minutes: 5
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs:
       - static-analysis
