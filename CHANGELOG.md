@@ -95,6 +95,19 @@ qualification, a published tag or an image.
   like the composer's own multi-file source tool, refuses a file the assistant
   wrote. The Import YAML dialog does not offer these fields yet.
 
+### LLM gateway
+
+- **The gateway carries thinking blocks through tool loops.** Assistant
+  messages accept `thinking_blocks` (`thinking` with a signature, or
+  `redacted_thinking` with opaque data), adapters receive them in order and
+  unmodified, and thinking an adapter reports is returned on the response
+  message in the same shape, so ELSPETH replays it on the next turn. Without
+  this, a model that requires its signed thinking back (Claude with thinking
+  enabled) rejects the second turn of every Composer tool loop. Replayed
+  thinking to an adapter without the `reasoning` capability is refused with
+  `capability_unsupported`. The reference adapter and mock upstream implement
+  the round trip, and the reference image's `adapter-fingerprint` label changes accordingly.
+
 ## 0.8.10 - 2026-11-09
 
 This entry records the Composer performance remediation and the fixes landed
@@ -204,16 +217,6 @@ establish qualification, a published tag or an image.
   declares it and forwards the hint as `generation.deliberation`, and the
   conformance capability sweep covers it. The reference image's
   `adapter-fingerprint` label changes accordingly.
-- **The gateway carries thinking blocks through tool loops.** Assistant
-  messages accept `thinking_blocks` (`thinking` with a signature, or
-  `redacted_thinking` with opaque data), adapters receive them in order and
-  unmodified, and thinking an adapter reports is returned on the response
-  message in the same shape, so ELSPETH replays it on the next turn. Without
-  this, a model that requires its signed thinking back (Claude with thinking
-  enabled) rejects the second turn of every Composer tool loop. Replayed
-  thinking to an adapter without the `reasoning` capability is refused with
-  `capability_unsupported`. The reference adapter and mock upstream implement
-  the round trip, and the reference image's `adapter-fingerprint` changes again.
 
 ### Dependencies
 
