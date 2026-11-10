@@ -2792,7 +2792,7 @@ def _exclusive_required_detail(alternatives: object) -> str | None:
     return "Supply exactly one of " + ", ".join(names) + " and omit the other key entirely, even as an empty value."
 
 
-def _terminal_payload_shape_violations(arguments: Mapping[str, Any]) -> tuple[_SchemaViolation, ...]:
+def _terminal_payload_shape_violations(pipeline: object) -> tuple[_SchemaViolation, ...]:
     """Locate a terminal payload whose ``pipeline`` member is not an object.
 
     Providers have returned the whole document as one JSON-encoded string. The
@@ -2801,7 +2801,7 @@ def _terminal_payload_shape_violations(arguments: Mapping[str, Any]) -> tuple[_S
     value-free: it names the member, the rule and the expected type only.
     """
     violation: _SchemaViolation = {"path": "pipeline", "rule": "type", "constraint": "object"}
-    if type(arguments["pipeline"]) is str:
+    if type(pipeline) is str:
         violation["detail"] = "pipeline must be a JSON object, not a JSON-encoded string."
     return (violation,)
 
@@ -4557,7 +4557,7 @@ async def _plan_pipeline_inner(
                 try:
                     payload = _PlannerTerminalPayload.model_validate(deep_thaw(call.arguments))
                 except ValueError:
-                    terminal_feedback = _canonical_schema_feedback(_terminal_payload_shape_violations(call.arguments))
+                    terminal_feedback = _canonical_schema_feedback(_terminal_payload_shape_violations(call.arguments["pipeline"]))
                 else:
                     schema_errors = (
                         [] if payload.pipeline is None else list(canonical_set_pipeline_validator().iter_errors(payload.pipeline))
