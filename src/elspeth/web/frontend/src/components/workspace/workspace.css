@@ -170,7 +170,10 @@
   grid-column: 1 / -1;
   grid-template-columns: subgrid;
   min-width: 0;
-  /* ARGOnite: transparent on the canvas, no top rule. Forced colours: Task 9. */
+  /* ARGOnite: transparent on the canvas, no top rule. Forced colours needs no
+     restatement in themes.css: the bar has no boundary of its own in any
+     mode, and the pane cards above it and the controls inside it each keep
+     their own border. */
   background: transparent;
 }
 
