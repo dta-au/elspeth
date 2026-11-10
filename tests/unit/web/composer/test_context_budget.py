@@ -42,9 +42,7 @@ def test_constants_are_exact() -> None:
 
 
 def test_below_high_mark_sheds_nothing() -> None:
-    d = decide_context_budget(
-        policy=_policy(), content_bytes=850, wire_bytes=850, segments=_segs(), bytes_per_token=1.0, previously_shed=frozenset()
-    )
+    d = decide_context_budget(policy=_policy(), request_bytes=850, segments=_segs(), bytes_per_token=1.0, previously_shed=frozenset())
     assert d.shed_keys == () and d.estimated_tokens_after == 850
 
 
@@ -56,9 +54,7 @@ def test_crossing_high_mark_sheds_in_kind_order_oldest_first_to_low_mark() -> No
         _seg(ASSISTANT_PROSE, "history:1", 100),
         _seg(HATCH_EVENT, "hatch:0", 100),
     ]
-    d = decide_context_budget(
-        policy=_policy(), content_bytes=900, wire_bytes=900, segments=segs, bytes_per_token=1.0, previously_shed=frozenset()
-    )
+    d = decide_context_budget(policy=_policy(), request_bytes=900, segments=segs, bytes_per_token=1.0, previously_shed=frozenset())
     assert d.shed_keys == ("tool:a", "tool:b", "history:1")
     assert d.estimated_tokens_after == 600
 
@@ -66,20 +62,18 @@ def test_crossing_high_mark_sheds_in_kind_order_oldest_first_to_low_mark() -> No
 def test_byte_ceiling_overflow_sheds_even_under_token_high_mark() -> None:
     d = decide_context_budget(
         policy=_policy(cap=10**9, max_bytes=500),
-        content_bytes=560,
-        wire_bytes=560,
+        request_bytes=560,
         segments=[_seg(TOOL_RESULT, "tool:a", 100)],
         bytes_per_token=1.0,
         previously_shed=frozenset(),
     )
-    assert d.shed_keys == ("tool:a",) and d.wire_bytes_after == 460
+    assert d.shed_keys == ("tool:a",) and d.request_bytes_after == 460
 
 
 def test_previously_shed_stays_shed_between_marks() -> None:
     d = decide_context_budget(
         policy=_policy(),
-        content_bytes=700,
-        wire_bytes=700,
+        request_bytes=700,
         segments=[_seg(ASSISTANT_PROSE, "history:1", 50)],
         bytes_per_token=1.0,
         previously_shed=frozenset({"history:1"}),
@@ -90,8 +84,7 @@ def test_previously_shed_stays_shed_between_marks() -> None:
 def test_previously_shed_is_released_at_or_below_low_mark() -> None:
     d = decide_context_budget(
         policy=_policy(),
-        content_bytes=600,
-        wire_bytes=600,
+        request_bytes=600,
         segments=[_seg(ASSISTANT_PROSE, "history:1", 50)],
         bytes_per_token=1.0,
         previously_shed=frozenset({"history:1"}),
@@ -102,8 +95,7 @@ def test_previously_shed_is_released_at_or_below_low_mark() -> None:
 def test_unknown_previously_shed_keys_are_ignored() -> None:
     d = decide_context_budget(
         policy=_policy(),
-        content_bytes=700,
-        wire_bytes=700,
+        request_bytes=700,
         segments=[],
         bytes_per_token=1.0,
         previously_shed=frozenset({"history:99", "tool:gone"}),
@@ -114,8 +106,7 @@ def test_unknown_previously_shed_keys_are_ignored() -> None:
 def test_everything_shed_but_under_ceiling_is_allowed() -> None:
     d = decide_context_budget(
         policy=_policy(),
-        content_bytes=990,
-        wire_bytes=990,
+        request_bytes=990,
         segments=[_seg(TOOL_RESULT, "tool:a", 100)],
         bytes_per_token=1.0,
         previously_shed=frozenset(),
@@ -127,8 +118,7 @@ def test_protected_overflow_refuses_naming_the_ceiling() -> None:
     with pytest.raises(ContextBudgetRefusal) as e:
         decide_context_budget(
             policy=_policy(),
-            content_bytes=1200,
-            wire_bytes=1200,
+            request_bytes=1200,
             segments=[_seg(TOOL_RESULT, "tool:a", 100)],
             bytes_per_token=1.0,
             previously_shed=frozenset(),
@@ -137,8 +127,7 @@ def test_protected_overflow_refuses_naming_the_ceiling() -> None:
     with pytest.raises(ContextBudgetRefusal) as e:
         decide_context_budget(
             policy=_policy(cap=10**9, max_bytes=500),
-            content_bytes=700,
-            wire_bytes=700,
+            request_bytes=700,
             segments=[],
             bytes_per_token=1.0,
             previously_shed=frozenset(),
@@ -147,9 +136,7 @@ def test_protected_overflow_refuses_naming_the_ceiling() -> None:
 
 
 def test_missing_ratio_uses_fallback_and_rounds_tokens_up() -> None:
-    d = decide_context_budget(
-        policy=_policy(cap=10**6), content_bytes=10, wire_bytes=10, segments=[], bytes_per_token=None, previously_shed=frozenset()
-    )
+    d = decide_context_budget(policy=_policy(cap=10**6), request_bytes=10, segments=[], bytes_per_token=None, previously_shed=frozenset())
     assert d.bytes_per_token == 3.0 and d.estimated_tokens_before == 4
 
 
@@ -157,9 +144,7 @@ def test_same_input_same_decision_and_policy_hash_changes_with_each_parameter() 
     segs = [_seg(TOOL_RESULT, "tool:a", 100), _seg(ASSISTANT_PROSE, "history:1", 100)]
 
     def run() -> ContextBudgetDecision:
-        return decide_context_budget(
-            policy=_policy(), content_bytes=900, wire_bytes=900, segments=segs, bytes_per_token=1.0, previously_shed=frozenset()
-        )
+        return decide_context_budget(policy=_policy(), request_bytes=900, segments=segs, bytes_per_token=1.0, previously_shed=frozenset())
 
     first, second = run(), run()
     assert first == second
@@ -214,7 +199,7 @@ def test_sticky_segments_are_shed_before_the_ranked_remainder() -> None:
         _seg(ASSISTANT_PROSE, "history:1", 100),
     ]
     d = decide_context_budget(
-        policy=_policy(), content_bytes=1000, wire_bytes=1000, segments=segs, bytes_per_token=1.0, previously_shed=frozenset({"history:0"})
+        policy=_policy(), request_bytes=1000, segments=segs, bytes_per_token=1.0, previously_shed=frozenset({"history:0"})
     )
     # 1000 - 100 (sticky) = 900 is over the high mark, so shedding continues by kind to the low mark.
     assert d.shed_keys == ("history:0", "tool:a", "history:1")
@@ -230,7 +215,7 @@ def test_over_is_judged_on_the_size_with_the_sticky_set_already_shed() -> None:
         _seg(USER_REQUEST, "history:0", 60),
     ]
     d = decide_context_budget(
-        policy=_policy(), content_bytes=1200, wire_bytes=1200, segments=segs, bytes_per_token=1.0, previously_shed=frozenset({"history:1"})
+        policy=_policy(), request_bytes=1200, segments=segs, bytes_per_token=1.0, previously_shed=frozenset({"history:1"})
     )
     assert d.shed_keys == ("history:1",)
     assert d.estimated_tokens_before == 1200 and d.estimated_tokens_after == 800
@@ -240,8 +225,7 @@ def test_sticky_set_alone_over_the_byte_ceiling_keeps_shedding() -> None:
     segs = [_seg(TOOL_RESULT, "tool:a", 100), _seg(TOOL_RESULT, "tool:b", 100)]
     d = decide_context_budget(
         policy=_policy(cap=10**9, max_bytes=500),
-        content_bytes=650,
-        wire_bytes=650,
+        request_bytes=650,
         segments=segs,
         bytes_per_token=1.0,
         previously_shed=frozenset({"tool:a"}),
@@ -263,9 +247,7 @@ def _grow_session(turns: int) -> list[tuple[int, int, tuple[str, ...], tuple[str
             segs.append(_seg(USER_REQUEST, f"history:{2 * prior}", 60))
             segs.append(_seg(ASSISTANT_PROSE, f"history:{2 * prior + 1}", 90))
         full = 300 + 150 * (turn - 1)
-        d = decide_context_budget(
-            policy=_policy(), content_bytes=full, wire_bytes=full, segments=segs, bytes_per_token=1.0, previously_shed=carried
-        )
+        d = decide_context_budget(policy=_policy(), request_bytes=full, segments=segs, bytes_per_token=1.0, previously_shed=carried)
         newly = tuple(key for key in d.shed_keys if key not in carried)
         rows.append((full, d.estimated_tokens_after, d.shed_keys, newly))
         carried = frozenset(d.shed_keys)
@@ -301,7 +283,7 @@ def test_within_a_turn_tool_stubs_hold_the_band_between_sheds() -> None:
         segs = [_seg(TOOL_RESULT, f"tool:c{earlier}", 120) for earlier in range(1, call)]
         full = 300 + 150 * call
         d = decide_context_budget(
-            policy=_policy(), content_bytes=full, wire_bytes=full, segments=segs, bytes_per_token=1.0, previously_shed=frozenset(carried)
+            policy=_policy(), request_bytes=full, segments=segs, bytes_per_token=1.0, previously_shed=frozenset(carried)
         )
         newly_by_call.append(tuple(key for key in d.shed_keys if key not in carried))
         after_by_call.append(d.estimated_tokens_after)
@@ -318,67 +300,34 @@ def test_within_a_turn_tool_stubs_hold_the_band_between_sheds() -> None:
     assert newly_by_call[7] == ()
 
 
-def test_the_byte_ceiling_is_checked_on_wire_bytes_and_the_marks_on_content_bytes() -> None:
-    segs = [_seg(TOOL_RESULT, "tool:a", 100)]
-    # Content is far under the high mark and under the byte ceiling; the wire size is over the byte ceiling.
+def test_one_measure_serves_both_ceilings_and_a_refusal_reports_it() -> None:
+    # Over the byte ceiling and far under the token marks: shed by bytes.
     d = decide_context_budget(
         policy=_policy(cap=1000, max_bytes=500),
-        content_bytes=450,
-        wire_bytes=560,
-        segments=segs,
+        request_bytes=560,
+        segments=[_seg(TOOL_RESULT, "tool:a", 100)],
         bytes_per_token=1.0,
         previously_shed=frozenset(),
     )
     assert d.shed_keys == ("tool:a",)
-    assert (d.content_bytes_before, d.content_bytes_after) == (450, 350)
-    assert (d.wire_bytes_before, d.wire_bytes_after) == (560, 460)
-    # Token estimates are on content bytes only.
-    assert (d.estimated_tokens_before, d.estimated_tokens_after) == (450, 350)
-    # A wire size under the byte ceiling never moves the token decision, however much larger than the content.
-    d = decide_context_budget(
-        policy=_policy(cap=1000, max_bytes=10_000),
-        content_bytes=850,
-        wire_bytes=9_000,
-        segments=segs,
-        bytes_per_token=1.0,
-        previously_shed=frozenset(),
-    )
-    assert d.shed_keys == () and d.estimated_tokens_after == 850
-
-
-def test_wire_bytes_over_the_ceiling_with_nothing_sheddable_is_refused_naming_bytes() -> None:
+    assert (d.request_bytes_before, d.request_bytes_after) == (560, 460)
+    assert (d.estimated_tokens_before, d.estimated_tokens_after) == (560, 460)
     with pytest.raises(ContextBudgetRefusal) as e:
         decide_context_budget(
-            policy=_policy(cap=1000, max_bytes=500),
-            content_bytes=450,
-            wire_bytes=560,
-            segments=[],
-            bytes_per_token=1.0,
-            previously_shed=frozenset(),
+            policy=_policy(cap=1000, max_bytes=500), request_bytes=560, segments=[], bytes_per_token=1.0, previously_shed=frozenset()
         )
-    assert e.value.ceiling == "bytes"
-    assert (e.value.estimated_tokens, e.value.content_bytes, e.value.wire_bytes) == (450, 450, 560)
-
-
-def test_a_token_refusal_reports_the_content_estimate_and_both_sizes() -> None:
+    assert (e.value.ceiling, e.value.estimated_tokens, e.value.request_bytes) == ("bytes", 560, 560)
     with pytest.raises(ContextBudgetRefusal) as e:
         decide_context_budget(
-            policy=_policy(cap=1000, max_bytes=10_000),
-            content_bytes=1200,
-            wire_bytes=1500,
-            segments=[],
-            bytes_per_token=1.0,
-            previously_shed=frozenset(),
+            policy=_policy(cap=1000, max_bytes=10_000), request_bytes=1200, segments=[], bytes_per_token=1.0, previously_shed=frozenset()
         )
-    assert e.value.ceiling == "tokens"
-    assert (e.value.estimated_tokens, e.value.content_bytes, e.value.wire_bytes) == (1200, 1200, 1500)
+    assert (e.value.ceiling, e.value.estimated_tokens, e.value.request_bytes) == ("tokens", 1200, 1200)
 
 
-def test_sticky_set_is_kept_while_unshed_wire_bytes_are_over_the_ceiling_even_at_the_low_mark() -> None:
+def test_sticky_set_is_kept_while_the_unshed_request_is_over_the_byte_ceiling_even_at_the_low_mark() -> None:
     d = decide_context_budget(
         policy=_policy(cap=1000, max_bytes=500),
-        content_bytes=400,
-        wire_bytes=560,
+        request_bytes=560,
         segments=[_seg(TOOL_RESULT, "tool:a", 100), _seg(TOOL_RESULT, "tool:b", 100)],
         bytes_per_token=1.0,
         previously_shed=frozenset({"tool:a"}),
@@ -390,6 +339,4 @@ def test_sticky_set_is_kept_while_unshed_wire_bytes_are_over_the_ceiling_even_at
 def test_a_ratio_that_is_not_a_finite_positive_number_is_rejected(ratio: float) -> None:
     """An infinite ratio would estimate zero tokens for any request and switch the token ceiling off."""
     with pytest.raises(ValueError, match="bytes_per_token must be a finite positive number"):
-        decide_context_budget(
-            policy=_policy(), content_bytes=10**9, wire_bytes=10, segments=[], bytes_per_token=ratio, previously_shed=frozenset()
-        )
+        decide_context_budget(policy=_policy(), request_bytes=10**9, segments=[], bytes_per_token=ratio, previously_shed=frozenset())

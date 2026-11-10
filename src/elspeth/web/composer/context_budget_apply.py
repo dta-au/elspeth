@@ -1,9 +1,10 @@
 """Message-shape helpers for applying a context-budget decision at a call site.
 
 :mod:`elspeth.web.composer.context_budget` decides what to shed and knows
-nothing about messages. These helpers measure a request exactly as the call
-record measures it and as the wire carries it, build the stubbed form of a tool result, label stubbable
-tool results, compose the previously shed keys, locate the most recent tool
+nothing about messages. These helpers measure a request as the wire carries
+it (the measure the budget is judged on) and as the call record's content
+split measures it (used to label segments), build the stubbed form of a tool
+result, label stubbable tool results, compose the previously shed keys, locate the most recent tool
 round trip, name the largest component for a refusal, and say whether a call
 is the first of its turn to shed conversation history. They
 write no content derived from user or model text: the only server-authored
@@ -12,7 +13,7 @@ string is the constant stub.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Final
 
 from elspeth.contracts.composer_llm_audit import ComposerContextBudgetRecord, ComposerLLMCall, ComposerLLMRequestByteSplit
@@ -26,14 +27,14 @@ from elspeth.web.composer.context_budget import CONTEXT_BUDGET_TOOL_RESULT_STUB,
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.llm_response_parsing import _hash_and_measure_request
 
-# Worst-case bytes a re-render after shedding history can add to a request
-# that the segment savings do not count. It bounds: the compose loop's
+# Worst-case wire bytes a re-render after shedding history can add to a
+# request that the segment savings do not count. It bounds: the compose loop's
 # ``"conversation_omissions":{...}`` object with both counts; on the planner,
 # the ``"prior_assistant_messages_omitted":N`` key and the growth of
 # ``additional_prior_user_requests_omitted``'s digits, both as JSON-escaped
 # inside the request string; and the one separator a saving over-counts when
 # the last entry of a list is removed. Counts are sized as 20-digit integers.
-# Each call site adds it to both request sizes it feeds the decision whenever
+# Each call site adds it to the request size it feeds the decision whenever
 # history may be shed, so an admitted request still fits once re-rendered.
 CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES: Final[int] = 256
 
@@ -44,8 +45,7 @@ CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES: Final[int] = 256
 # the one byte an event's saving over-counts when the transcript's only event
 # is removed. Those total 47; the rest is margin so a longer gap spelling or
 # one more separator-level edge cannot silently turn the bound into an
-# over-count. The planner adds it to both request sizes whenever transcript
-# events may be shed.
+# over-count. The planner adds it whenever transcript events may be shed.
 CONTEXT_BUDGET_TRANSCRIPT_GAP_ALLOWANCE_BYTES: Final[int] = 64
 
 
@@ -54,16 +54,21 @@ def message_bytes(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | 
     return _hash_and_measure_request(detach_prompt_guard_messages(messages)[0], tools)[2]
 
 
-def request_wire_bytes(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> int:
+def request_wire_bytes(messages: Sequence[Mapping[str, Any]], tools: Sequence[Mapping[str, Any]] | None) -> int:
     """Canonical UTF-8 bytes of a request's ``{messages, tools}`` as the wire carries them.
 
-    JSON escaping and message framing included, prompt-guard keys detached:
-    the measure the gateway's body cap and ``max_request_bytes`` bound. The
-    content split of :func:`message_bytes` counts a string message by its
-    content alone, so it is never larger than this.
+    The one measure the context budget judges both ceilings on. It is the
+    whole of each message, not only its string content: tool-call arguments,
+    replayed thinking blocks, JSON escaping and framing all count, as do the
+    tool definitions. Prompt-guard keys are detached first, as they are
+    before sending. The content split of :func:`message_bytes` counts a
+    string-content message by that content alone, so it is never larger than
+    this and is used only to label segments and name components.
     """
     return len(
-        canonical_json({"messages": detach_prompt_guard_messages(messages)[0], "tools": tools if tools is not None else []}).encode("utf-8")
+        canonical_json({"messages": detach_prompt_guard_messages(messages)[0], "tools": list(tools) if tools is not None else []}).encode(
+            "utf-8"
+        )
     )
 
 

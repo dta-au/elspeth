@@ -105,6 +105,7 @@ from elspeth.web.composer.context_budget_apply import (
     latest_round_trip_start,
     message_bytes,
     previously_shed_keys,
+    request_wire_bytes,
     stubbed_tool_message,
     tool_result_segments,
 )
@@ -3375,8 +3376,8 @@ def _hatch_transcript_message(transcript: AdvisorVisibleTranscript) -> dict[str,
 
 
 def _planner_request_size(messages: Sequence[Mapping[str, Any]], tools: Sequence[Mapping[str, Any]]) -> int:
-    """Canonical UTF-8 bytes of a planner request as sent: what ``max_request_bytes`` bounds."""
-    return len(canonical_json({"messages": list(messages), "tools": list(tools)}).encode("utf-8"))
+    """Wire bytes of a planner request as sent: what ``max_request_bytes`` bounds (see :func:`request_wire_bytes`)."""
+    return request_wire_bytes(messages, tools)
 
 
 def _planner_context_budget_components(
@@ -3441,16 +3442,17 @@ def _fit_planner_context_budget(
     session measured on that model, when it has one.
 
     The decision is fed the request as it will be sent and checked: cache
-    markers applied when ``mark_for_cache``, prompt-guard keys detached, in
-    two sizes. The wire size is :func:`_planner_request_size` (the measure of
-    the final ``REQUEST_BYTES_EXHAUSTED`` check) and is what the byte ceiling
-    bounds. The content size is the call record's byte split, the basis the
-    stored bytes-per-token ratio is calibrated on, and gives the token
-    estimate. Both carry the omission allowance when history may be shed and
-    the transcript gap allowance when transcript events may be shed. Segment
-    savings are content bytes, never more than what removing the segment
-    saves on the wire, so a request the decision admits passes the final
-    check while anything remains sheddable.
+    markers applied when ``mark_for_cache``, prompt-guard keys detached,
+    measured in wire bytes by :func:`request_wire_bytes` (the measure of the
+    final ``REQUEST_BYTES_EXHAUSTED`` check, which counts content, tool-call
+    arguments, thinking blocks and tool definitions), plus the omission
+    allowance when history may be shed and the transcript gap allowance when
+    transcript events may be shed. Token estimates use the same measure, with
+    a ratio calibrated on it. Segment savings are content bytes, never more
+    than what removing the segment saves on the wire, so a request the
+    decision admits passes the final check while anything remains sheddable.
+    The record's ``request_wire_bytes`` is the decision's bound; the caller
+    replaces it with the exact size of the request it sends.
     """
     if (hatch_transcript_index is None) != (hatch_transcript is None):
         raise FrameworkBugError("the hatch transcript and its message index are set together")
@@ -3516,11 +3518,9 @@ def _fit_planner_context_budget(
     scratch_messages, scratch_tools = apply_anthropic_cache_markers(messages, tools) if mark_for_cache else (messages, tools)
 
     try:
-        sent_tools = scratch_tools if scratch_tools is not None else tools
         decision = decide_context_budget(
             policy=policy,
-            content_bytes=message_bytes(scratch_messages, sent_tools).total_bytes + omission_allowance,
-            wire_bytes=_planner_request_size(detach_prompt_guard_evidence(scratch_messages).messages, sent_tools) + omission_allowance,
+            request_bytes=request_wire_bytes(scratch_messages, scratch_tools if scratch_tools is not None else tools) + omission_allowance,
             segments=segments,
             bytes_per_token=history.ratio_for(model),
             previously_shed=previously_shed_keys(history, earlier_calls),
@@ -3542,6 +3542,7 @@ def _fit_planner_context_budget(
         bytes_per_token=decision.bytes_per_token,
         estimated_tokens_before=decision.estimated_tokens_before,
         estimated_tokens_after=decision.estimated_tokens_after,
+        request_wire_bytes=decision.request_bytes_after,
         shed_keys=decision.shed_keys,
     )
     shed = frozenset(decision.shed_keys)
@@ -4020,6 +4021,8 @@ async def _plan_pipeline_inner(
         # so it is reached only when the planner's byte budget is set below
         # the context budget's ceiling.
         request_size = _planner_request_size(marked_messages, marked_tools)
+        # The exact wire bytes of the request sent, where a later call's bytes-per-token ratio is read from.
+        context_budget = replace(context_budget, request_wire_bytes=request_size)
         if request_size > budget_policy.max_request_bytes:
             raise PipelinePlannerError("planner request byte budget exhausted", code="REQUEST_BYTES_EXHAUSTED")
         await emit_progress(lifecycle.progress, model_call_progress_event(intent))

@@ -17,25 +17,34 @@ from typing import Final, Literal
 from elspeth.core.canonical import stable_hash
 
 CONTEXT_BUDGET_FALLBACK_BYTES_PER_TOKEN: Final[float] = 3.0
-# The closed range a bytes-per-token ratio measured from a stored call record
-# is clamped to. The ratio is provider-reported data steering a control
-# decision, so a value outside the range is clamped, never trusted and never
-# rejected. The one measured composer figure is about 4.3 bytes per prompt
-# token (docs/development/composer-context-budget-brief.md).
+# Every size in this module is WIRE bytes: the canonical JSON of the request
+# body's ``{messages, tools}`` as sent, so content, tool-call arguments,
+# replayed thinking blocks and tool definitions all count. The ratio is wire
+# bytes per provider-reported prompt token.
 #
-# Upper bound 5.0: a ratio that is too high under-estimates tokens and sheds
-# late. With the default high mark of 0.85, a session whose true ratio is the
-# measured 4.3 and whose report is clamped to 5.0 starts shedding at
-# 0.85 * 5.0 / 4.3 = 0.99 of the token ceiling, so a mis-reported prompt
-# count (for example one that leaves out cached tokens) cannot carry a
-# request past the ceiling before shedding starts.
+# The closed range a ratio measured from a stored call record is clamped to.
+# The ratio is provider-reported data steering a control decision, so a value
+# outside the range is clamped, never trusted and never rejected. The one
+# measured composer figure is about 4.3 bytes per prompt token
+# (docs/development/composer-context-budget-brief.md), on a prose-heavy
+# request whose wire size is close to its content size. JSON carried as
+# content grows on the wire by a measured 1.02x (prose) to 1.36x (JSON nested
+# as a string), which puts honest wire ratios between about 4.4 and 5.8.
+#
+# Upper bound 6.0: just above that span. A ratio that is too high
+# under-estimates tokens and sheds late, so nothing above the honest span is
+# believed: a prompt count reported without cached tokens (a ratio several
+# times too high) degrades to 6.0 rather than switching the token ceiling off.
 #
 # Lower bound 2.0: a ratio that is too low over-estimates tokens, which is the
 # safe direction, but without a floor a wildly inflated prompt count would
 # refuse every request. 2.0 is below the 3.0 fallback and still admits the
 # fixed prefix under any realistic ceiling.
+#
+# The 3.0 fallback is below every honest wire ratio, so before a session has
+# a measured ratio the estimate is high and shedding starts early.
 CONTEXT_BUDGET_MIN_BYTES_PER_TOKEN: Final[float] = 2.0
-CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN: Final[float] = 5.0
+CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN: Final[float] = 6.0
 CONTEXT_BUDGET_TOOL_RESULT_STUB: Final[str] = "[Result omitted by ELSPETH to fit the context budget. Call the tool again if you need it.]"
 
 
@@ -105,70 +114,57 @@ class SheddableSegment:
 
 @dataclass(frozen=True, slots=True)
 class ContextBudgetDecision:
-    """What to shed, with both sizes before and after.
+    """What to shed, with the request's wire size before and after.
 
-    ``wire_bytes_after`` is an upper bound on the wire size of the request
+    ``request_bytes_after`` is an upper bound on the wire size of the request
     once the decision is applied (see :func:`decide_context_budget`).
     """
 
     policy_hash: str
     bytes_per_token: float
-    content_bytes_before: int
-    wire_bytes_before: int
+    request_bytes_before: int
     estimated_tokens_before: int
-    content_bytes_after: int
-    wire_bytes_after: int
+    request_bytes_after: int
     estimated_tokens_after: int
     shed_keys: tuple[str, ...]
 
 
 class ContextBudgetRefusal(Exception):
-    """Protected content alone exceeds a ceiling.
+    """Protected content alone exceeds a ceiling; ``request_bytes`` is wire bytes."""
 
-    ``ceiling`` names the one that was hit: ``tokens`` is ``estimated_tokens``
-    (from ``content_bytes``) against the prompt-token ceiling; ``bytes`` is
-    ``wire_bytes`` against the request-byte ceiling.
-    """
-
-    def __init__(self, *, ceiling: Literal["tokens", "bytes"], estimated_tokens: int, content_bytes: int, wire_bytes: int) -> None:
+    def __init__(self, *, ceiling: Literal["tokens", "bytes"], estimated_tokens: int, request_bytes: int) -> None:
         super().__init__(
-            f"context budget exceeded the {ceiling} ceiling: "
-            f"estimated_tokens={estimated_tokens} content_bytes={content_bytes} wire_bytes={wire_bytes}"
+            f"context budget exceeded the {ceiling} ceiling: estimated_tokens={estimated_tokens} request_bytes={request_bytes}"
         )
         self.ceiling = ceiling
         self.estimated_tokens = estimated_tokens
-        self.content_bytes = content_bytes
-        self.wire_bytes = wire_bytes
+        self.request_bytes = request_bytes
 
 
 def decide_context_budget(
     *,
     policy: ContextBudgetPolicy,
-    content_bytes: int,
-    wire_bytes: int,
+    request_bytes: int,
     segments: Sequence[SheddableSegment],
     bytes_per_token: float | None,
     previously_shed: frozenset[str],
 ) -> ContextBudgetDecision:
     """Decide which segments to shed from one request, or refuse.
 
-    The request is given in two sizes, both of the request as it will be sent:
+    ``request_bytes`` is the wire size of the request as it will be sent: the
+    canonical JSON of the body's ``{messages, tools}``, escaping and framing
+    included. One measure serves both ceilings. It is what the gateway's body
+    cap sees, so ``max_request_bytes`` bounds it directly; and it counts
+    everything the model reads (content, tool-call arguments, thinking
+    blocks, tool definitions), so with a ratio calibrated on the same measure
+    it gives the token estimate.
 
-    - ``content_bytes``: the content split's total (a string message counts
-      its content's UTF-8 bytes). The stored bytes-per-token ratio is
-      calibrated on this measure, so it gives the token estimate and is what
-      the shed marks and the token ceiling are judged on.
-    - ``wire_bytes``: the canonical JSON of the request body's
-      ``{messages, tools}``, escaping and framing included. It is what the
-      gateway's body cap sees, so it is what ``max_request_bytes`` bounds.
-
-    A segment's ``saving_bytes`` is content bytes: exact for the token
-    estimate. Shedding a segment never saves less on the wire than in content
-    (JSON escaping and message framing only add bytes, and the constant stub
-    escapes to itself), so subtracting content savings from ``wire_bytes``
-    over-states the wire size that remains. An admitted request therefore fits
-    the byte ceiling; the cost is that shedding may go one segment further
-    than the wire strictly needed.
+    A segment's ``saving_bytes`` must never exceed what shedding it removes
+    from the wire. A content-byte saving qualifies: JSON escaping and message
+    framing only add bytes, and the constant stub escapes to itself. Because
+    savings are lower bounds, the sizes computed after shedding over-state
+    what will be sent: an admitted request fits both ceilings, at the cost
+    that shedding may go one segment further than strictly needed.
     """
     if bytes_per_token is not None and not (math.isfinite(bytes_per_token) and bytes_per_token > 0):
         raise ValueError("bytes_per_token must be a finite positive number or None")
@@ -179,10 +175,10 @@ def decide_context_budget(
     def tokens(size: int) -> int:
         return math.ceil(size / ratio)
 
-    def fits_low(content: int, wire: int) -> bool:
-        return tokens(content) <= low and wire <= policy.max_request_bytes
+    def fits_low(size: int) -> bool:
+        return tokens(size) <= low and size <= policy.max_request_bytes
 
-    tokens_before = tokens(content_bytes)
+    tokens_before = tokens(request_bytes)
 
     # Hysteresis. Segments shed on an earlier call are restored only when the
     # fully unshed request is back at or below the low mark (and under the byte
@@ -192,12 +188,10 @@ def decide_context_budget(
     # every call once a session had crossed the high mark, pinning the request
     # at the low mark and changing the sent prefix each time.
     sticky: list[SheddableSegment] = []
-    if not fits_low(content_bytes, wire_bytes):
+    if not fits_low(request_bytes):
         sticky = [segment for segment in segments if segment.key in previously_shed]
-    sticky_saving = sum(segment.saving_bytes for segment in sticky)
-    kept_content = content_bytes - sticky_saving
-    kept_wire = wire_bytes - sticky_saving
-    over = tokens(kept_content) > high or kept_wire > policy.max_request_bytes
+    kept = request_bytes - sum(segment.saving_bytes for segment in sticky)
+    over = tokens(kept) > high or kept > policy.max_request_bytes
 
     shed: list[SheddableSegment] = list(sticky)
     if over:
@@ -205,31 +199,26 @@ def decide_context_budget(
             (segment for segment in segments if segment.key not in previously_shed),
             key=lambda segment: _KIND_RANK[segment.kind],
         )
-        after_content, after_wire = kept_content, kept_wire
+        after = kept
         for segment in remaining:
-            if fits_low(after_content, after_wire):
+            if fits_low(after):
                 break
             shed.append(segment)
-            after_content -= segment.saving_bytes
-            after_wire -= segment.saving_bytes
+            after -= segment.saving_bytes
 
-    saved = sum(segment.saving_bytes for segment in shed)
-    content_after = content_bytes - saved
-    wire_after = wire_bytes - saved
-    tokens_after = tokens(content_after)
+    bytes_after = request_bytes - sum(segment.saving_bytes for segment in shed)
+    tokens_after = tokens(bytes_after)
     if tokens_after > policy.max_prompt_tokens:
-        raise ContextBudgetRefusal(ceiling="tokens", estimated_tokens=tokens_after, content_bytes=content_after, wire_bytes=wire_after)
-    if wire_after > policy.max_request_bytes:
-        raise ContextBudgetRefusal(ceiling="bytes", estimated_tokens=tokens_after, content_bytes=content_after, wire_bytes=wire_after)
+        raise ContextBudgetRefusal(ceiling="tokens", estimated_tokens=tokens_after, request_bytes=bytes_after)
+    if bytes_after > policy.max_request_bytes:
+        raise ContextBudgetRefusal(ceiling="bytes", estimated_tokens=tokens_after, request_bytes=bytes_after)
 
     return ContextBudgetDecision(
         policy_hash=policy.audit_hash,
         bytes_per_token=ratio,
-        content_bytes_before=content_bytes,
-        wire_bytes_before=wire_bytes,
+        request_bytes_before=request_bytes,
         estimated_tokens_before=tokens_before,
-        content_bytes_after=content_after,
-        wire_bytes_after=wire_after,
+        request_bytes_after=bytes_after,
         estimated_tokens_after=tokens_after,
         shed_keys=tuple(segment.key for segment in shed),
     )
