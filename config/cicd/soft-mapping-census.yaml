@@ -566,6 +566,8 @@ files:
     dict[str, Any]: 3
   src/elspeth/plugins/transforms/field_mapper.py:
     dict[str, Any]: 3
+  src/elspeth/plugins/transforms/file_inject.py:
+    dict[str, object]: 1
   src/elspeth/plugins/transforms/json_explode.py:
     dict[str, Any]: 3
   src/elspeth/plugins/transforms/keyword_filter.py:
@@ -1096,5 +1098,5 @@ totals:
   MutableMapping[str, Any]: 8
   boundary: 60
   dict[str, Any]: 1102
-  dict[str, object]: 401
-  soft: 2618
+  dict[str, object]: 402
+  soft: 2619
