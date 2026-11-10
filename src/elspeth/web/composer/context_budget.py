@@ -17,6 +17,25 @@ from typing import Final, Literal
 from elspeth.core.canonical import stable_hash
 
 CONTEXT_BUDGET_FALLBACK_BYTES_PER_TOKEN: Final[float] = 3.0
+# The closed range a bytes-per-token ratio measured from a stored call record
+# is clamped to. The ratio is provider-reported data steering a control
+# decision, so a value outside the range is clamped, never trusted and never
+# rejected. The one measured composer figure is about 4.3 bytes per prompt
+# token (docs/development/composer-context-budget-brief.md).
+#
+# Upper bound 5.0: a ratio that is too high under-estimates tokens and sheds
+# late. With the default high mark of 0.85, a session whose true ratio is the
+# measured 4.3 and whose report is clamped to 5.0 starts shedding at
+# 0.85 * 5.0 / 4.3 = 0.99 of the token ceiling, so a mis-reported prompt
+# count (for example one that leaves out cached tokens) cannot carry a
+# request past the ceiling before shedding starts.
+#
+# Lower bound 2.0: a ratio that is too low over-estimates tokens, which is the
+# safe direction, but without a floor a wildly inflated prompt count would
+# refuse every request. 2.0 is below the 3.0 fallback and still admits the
+# fixed prefix under any realistic ceiling.
+CONTEXT_BUDGET_MIN_BYTES_PER_TOKEN: Final[float] = 2.0
+CONTEXT_BUDGET_MAX_BYTES_PER_TOKEN: Final[float] = 5.0
 CONTEXT_BUDGET_TOOL_RESULT_STUB: Final[str] = "[Result omitted by ELSPETH to fit the context budget. Call the tool again if you need it.]"
 
 
@@ -151,7 +170,11 @@ def decide_context_budget(
     the byte ceiling; the cost is that shedding may go one segment further
     than the wire strictly needed.
     """
-    ratio = bytes_per_token if bytes_per_token is not None and bytes_per_token > 0 else policy.fallback_bytes_per_token
+    if bytes_per_token is not None and not (math.isfinite(bytes_per_token) and bytes_per_token > 0):
+        raise ValueError("bytes_per_token must be a finite positive number or None")
+    ratio = bytes_per_token if bytes_per_token is not None else policy.fallback_bytes_per_token
+    high = policy.shed_above * policy.max_prompt_tokens
+    low = policy.shed_to * policy.max_prompt_tokens
 
     def tokens(size: int) -> int:
         return math.ceil(size / ratio)
@@ -159,8 +182,6 @@ def decide_context_budget(
     def fits_low(content: int, wire: int) -> bool:
         return tokens(content) <= low and wire <= policy.max_request_bytes
 
-    high = policy.shed_above * policy.max_prompt_tokens
-    low = policy.shed_to * policy.max_prompt_tokens
     tokens_before = tokens(content_bytes)
 
     # Hysteresis. Segments shed on an earlier call are restored only when the
