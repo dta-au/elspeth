@@ -23,7 +23,8 @@ ContentKind = Literal["text", "yaml"]
 # rejected before it runs. `reference_file` (added 2026-08-26) is the first
 # registered key outside the LLM transform and does not change this: `ReferenceJoin`
 # is a per-row enricher that leaves `is_batch_aware` at its default False, so it
-# is not collector-legal either. Swept the live registry at 2026-08-26: 13
+# is not collector-legal either. `content_file` (added 2026-11-10) is nested-only,
+# under the per-row `file_inject` transform's `files`. Swept the live registry at 2026-08-26: 13
 # batch-aware (collector-legal) transforms exist and NONE declares any registered
 # key, so on a legal collector the key is an extra and `extra="forbid"` rejects it
 # at config load.
@@ -47,6 +48,15 @@ class FileBackedTemplateOption:
     source_key: str
     label: str
     content_kind: ContentKind
+    # (plugin_name, container_option_key): the key is ALSO resolved inside each
+    # named entry of that plugin's container option, e.g. `tables.<name>.reference_file`.
+    # Bound to the plugin name so another plugin's same-named option stays opaque data.
+    nested_in: tuple[str, str] | None = None
+    # Prefix naming the entry in a nested error; defaults to `label`.
+    nested_label: str | None = None
+    # False for a nested-only key: it has no top-level form, so the top-level
+    # materialization and the in-memory rejection scan both leave it alone.
+    top_level: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,9 +98,34 @@ FILE_BACKED_TEMPLATE_OPTION_REGISTRY: tuple[FileBackedTemplateOption, ...] = (
         source_key="reference_source",
         label="Reference table file",
         content_kind="text",
+        nested_in=("reference_join", "tables"),
+        nested_label="Reference table",
+    ),
+    # Nested-only: file_inject has no single-file top-level form. Text for the
+    # same reason as reference_file — the web surface substitutes a string, and
+    # file_inject parses each entry by its declared `format`.
+    FileBackedTemplateOption(
+        file_key="content_file",
+        content_key="content",
+        source_key="content_source",
+        label="Injected file",
+        content_kind="text",
+        nested_in=("file_inject", "files"),
+        top_level=False,
     ),
 )
-FILE_BACKED_TEMPLATE_OPTION_KEYS = frozenset(rule.file_key for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY)
+# The keys with a TOP-LEVEL form. A nested-only key is deliberately absent: at
+# the top level of an options mapping it is not a file-backed option at all.
+FILE_BACKED_TEMPLATE_OPTION_KEYS = frozenset(rule.file_key for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY if rule.top_level)
+
+
+def _nested_rules_for(plugin_name: object) -> tuple[tuple[FileBackedTemplateOption, str], ...]:
+    """Return each rule nested under this plugin, paired with its container option key."""
+    return tuple(
+        (rule, rule.nested_in[1])
+        for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY
+        if rule.nested_in is not None and rule.nested_in[0] == plugin_name
+    )
 
 
 def _resolve_template_path(file_ref: str, settings_path: Path, label: str) -> Path:
@@ -159,6 +194,8 @@ class TemplateOptionMaterializer:
     ) -> dict[str, Any]:
         result = dict(options)
         for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY:
+            if not rule.top_level:
+                continue
             materialized = self._materialize_file_option(result, rule, run_mode=run_mode, source_options=source_options)
             if materialized is not None:
                 result.pop(rule.file_key)
@@ -224,11 +261,13 @@ class TemplateOptionMaterializer:
                     continue
                 present = sorted(key for key in FILE_BACKED_TEMPLATE_OPTION_KEYS if key in options)
                 plugin_name = plugin_config["plugin"] if "plugin" in plugin_config else None
-                tables = options["tables"] if "tables" in options else None
-                if plugin_name == "reference_join" and type(tables) is dict:
-                    for table_name, table in tables.items():
-                        if type(table) is dict and "reference_file" in table:
-                            present.append(f"tables[{table_name!r}].reference_file")
+                for rule, container_key in _nested_rules_for(plugin_name):
+                    container = options[container_key] if container_key in options else None
+                    if type(container) is not dict:
+                        continue
+                    for entry_name, entry in container.items():
+                        if type(entry) is dict and rule.file_key in entry:
+                            present.append(f"{container_key}[{entry_name!r}].{rule.file_key}")
                 if not present:
                     continue
                 raw_name = plugin_config["name"] if "name" in plugin_config else index
@@ -267,34 +306,57 @@ class TemplateOptionMaterializer:
                     source_options = candidate
             materialized = self.materialize_options(options, run_mode=run_mode, source_options=source_options)
             plugin_name = plugin["plugin"] if "plugin" in plugin else None
-            raw_tables = options["tables"] if "tables" in options else None
-            if plugin_name == "reference_join" and type(raw_tables) is dict:
-                source_tables = source_options["tables"] if type(source_options) is dict and "tables" in source_options else None
-                tables = dict(raw_tables)
-                reference_rule = next(rule for rule in FILE_BACKED_TEMPLATE_OPTION_REGISTRY if rule.file_key == "reference_file")
-                for table_name, table in tables.items():
-                    if type(table) is not dict:
-                        continue
-                    table_result = dict(table)
-                    source_table = source_tables[table_name] if type(source_tables) is dict and table_name in source_tables else None
-                    try:
-                        materialized_table = self._materialize_file_option(
-                            table_result,
-                            reference_rule,
-                            run_mode=run_mode,
-                            source_options=source_table,
-                            reference_contents=reference_contents,
-                        )
-                    except TemplateFileError as exc:
-                        raise TemplateFileError(f"Reference table {table_name!r}: {exc}") from exc
-                    if materialized_table is not None:
-                        table_result.pop(reference_rule.file_key)
-                        table_result[reference_rule.content_key] = materialized_table.content
-                        table_result[reference_rule.source_key] = materialized_table.source
-                    tables[table_name] = table_result
-                materialized["tables"] = tables
+            for rule, container_key in _nested_rules_for(plugin_name):
+                # Read from `materialized`, not `options`, so two rules sharing a
+                # container compose instead of the second discarding the first.
+                raw_container = materialized[container_key] if container_key in materialized else None
+                if type(raw_container) is not dict:
+                    continue
+                source_container = (
+                    source_options[container_key] if type(source_options) is dict and container_key in source_options else None
+                )
+                materialized[container_key] = self._materialize_nested_entries(
+                    raw_container,
+                    rule,
+                    run_mode=run_mode,
+                    source_container=source_container,
+                    reference_contents=reference_contents,
+                )
             plugin["options"] = materialized
         return plugin
+
+    def _materialize_nested_entries(
+        self,
+        raw_container: dict[Any, Any],
+        rule: FileBackedTemplateOption,
+        *,
+        run_mode: RunMode,
+        source_container: object | None,
+        reference_contents: dict[Path, str],
+    ) -> dict[Any, Any]:
+        entry_label = rule.nested_label if rule.nested_label is not None else rule.label
+        entries = dict(raw_container)
+        for entry_name, entry in entries.items():
+            if type(entry) is not dict:
+                continue
+            entry_result = dict(entry)
+            source_entry = source_container[entry_name] if type(source_container) is dict and entry_name in source_container else None
+            try:
+                materialized_entry = self._materialize_file_option(
+                    entry_result,
+                    rule,
+                    run_mode=run_mode,
+                    source_options=source_entry,
+                    reference_contents=reference_contents,
+                )
+            except TemplateFileError as exc:
+                raise TemplateFileError(f"{entry_label} {entry_name!r}: {exc}") from exc
+            if materialized_entry is not None:
+                entry_result.pop(rule.file_key)
+                entry_result[rule.content_key] = materialized_entry.content
+                entry_result[rule.source_key] = materialized_entry.source
+            entries[entry_name] = entry_result
+        return entries
 
     def _load_content(self, rule: FileBackedTemplateOption, file_path: Path) -> Any:
         if rule.content_kind == "text":
