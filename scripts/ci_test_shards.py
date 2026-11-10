@@ -24,6 +24,7 @@ import pytest
 from pluggy import Result
 
 PROOF_MARKER = "landscape_long_run"
+TIMING_MARKER = "timing_sensitive"
 ASSIGNMENT_ALGORITHM = "duration-lpt-v1"
 DURATION_PROFILE_PATH = Path("config/cicd/pytest-duration-profile.json")
 _PROOF_CALL_PASSED = pytest.StashKey[bool | None]()
@@ -183,6 +184,34 @@ def build_long_run_manifest(
     }
 
 
+def build_timing_manifest(checkout: Path, nodeids: list[str], marked_nodeids: list[str]) -> dict[str, object]:
+    """Bind the serial collection to markers observed on actual pytest items."""
+    if not nodeids or len(nodeids) != len(set(nodeids)) or nodeids != marked_nodeids:
+        raise ValueError("Timing evidence requires a nonempty unique collection carrying the timing_sensitive marker on every item")
+    if set(nodeids) & set(LONG_RUN_CASES.values()):
+        raise ValueError("Timing evidence cannot contain long-run proof cases")
+    identity = evidence_identity(checkout)
+    producer = os.environ.get("GITHUB_JOB") if identity["github_run_id"] is not None else None
+    if identity["github_run_id"] is not None and producer != "timing-sensitive":
+        raise ValueError("Timing evidence requires the exact native producer role")
+    return {
+        "schema_version": 4,
+        "assignment_algorithm": ASSIGNMENT_ALGORITHM,
+        "duration_profile_sha256": load_duration_profile(checkout).sha256,
+        **identity,
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+        "producer_job": producer,
+        "partition": "timing",
+        "proof_case": None,
+        "shard_count": 1,
+        "shard_index": 0,
+        "collection_digest": collection_digest(nodeids),
+        "selected_nodeids": nodeids,
+        "timing_marked_nodeids": marked_nodeids,
+        "exit_status": None,
+    }
+
+
 def long_run_call_result(case: str, nodeid: str, phase: str, passed: bool, xfail_marked: bool, previous: bool | None) -> bool | None:
     """Retain one exact call result, with failure/refusal absorbing later calls."""
     if case not in LONG_RUN_CASES or phase not in {"setup", "call", "teardown"}:
@@ -216,14 +245,18 @@ def finalize_long_run_manifest(
         raise ValueError("Finalize only unfinalized schema-4 collection evidence")
     partition = manifest["partition"]
     case = manifest["proof_case"]
-    if partition == "ordinary":
+    if partition in {"ordinary", "timing"}:
         if case is not None or proof_call_passed is not None:
-            raise ValueError("Ordinary evidence cannot carry a proof case/call result")
+            raise ValueError("Ordinary/timing evidence cannot carry a proof case/call result")
+        if partition == "timing" and (
+            not manifest["selected_nodeids"] or manifest["timing_marked_nodeids"] != manifest["selected_nodeids"]
+        ):
+            raise ValueError("Timing evidence requires a nonempty marker-selected collection")
     elif partition == "proof":
         if not isinstance(case, str) or case not in LONG_RUN_CASES or manifest["selected_nodeids"] != [LONG_RUN_CASES[case]]:
             raise ValueError("Proof evidence requires its exact catalog singleton")
     else:
-        raise ValueError("Terminal evidence requires an ordinary or proof partition")
+        raise ValueError("Terminal evidence requires an ordinary, proof, or timing partition")
     terminal = {**manifest, "exit_status": exit_status}
     if partition == "proof":
         terminal["proof_call_passed"] = proof_call_passed is True
@@ -246,7 +279,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     group.addoption("--ci-shard-count", type=int)
     group.addoption("--ci-shard-index", type=int)
     group.addoption("--ci-shard-report", type=Path)
-    group.addoption("--ci-partition", choices=("all", "ordinary", "proof"), default="all")
+    group.addoption("--ci-partition", choices=("all", "ordinary", "proof", "timing"), default="all")
     group.addoption("--ci-proof-case", choices=tuple(LONG_RUN_CASES))
 
 
@@ -262,8 +295,8 @@ def pytest_configure(config: pytest.Config) -> None:
         return
     if count is None or index is None or report is None or count < 1 or not 0 <= index < count:
         raise pytest.UsageError("Supply a positive --ci-shard-count, an index in range, and --ci-shard-report")
-    if partition == "proof" and (count != 1 or index != 0 or config.getoption("numprocesses", default=None) not in (None, 0)):
-        raise pytest.UsageError("The proof partition requires one shard at index zero and serial pytest execution")
+    if partition in {"proof", "timing"} and (count != 1 or index != 0 or config.getoption("numprocesses", default=None) not in (None, 0)):
+        raise pytest.UsageError(f"The {partition} partition requires one shard at index zero and serial pytest execution")
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
@@ -302,6 +335,13 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
                 "selected_nodeids": [item.nodeid for item in selected],
                 "exit_status": None,
             }
+        elif partition == "timing":
+            manifest = build_timing_manifest(
+                Path.cwd(),
+                [item.nodeid for item in items],
+                [item.nodeid for item in items if list(item.iter_markers(name=TIMING_MARKER))],
+            )
+            selected = items.copy()
         else:
             manifest = build_long_run_manifest(
                 Path.cwd(),
@@ -447,7 +487,7 @@ def _combine_coverage(databases: list[str], checkout: Path) -> None:
 
 
 def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, python_version: str) -> dict[str, str]:
-    """Validate one interpreter's ordinary/proof union, combining covered 3.13.
+    """Validate ordinary/proof and disjoint timing evidence, combining covered 3.13.
 
     Each artifact name binds a producer and attempt. Select the highest observed
     attempt before reading its content; superseded content is irrelevant. Never
@@ -471,6 +511,7 @@ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, pyt
     }
     for proof_case in cases:
         producers[f"landscape-proof-{proof_case}-{python_version}"] = ("proof", 0, 1, "proof", proof_case)
+    producers[f"timing-shard-{python_version}"] = ("timing", 0, 1, "timing-sensitive", None)
     candidates: dict[str, dict[int, Path]] = {producer: {} for producer in producers}
     for folder in sorted(artifact_dir.iterdir()):
         producer, separator, raw_attempt = folder.name.rpartition("-attempt-")
@@ -493,6 +534,7 @@ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, pyt
     databases: list[str] = []
     resolved: dict[str, str] = {}
     ordinary_groups: dict[int, list[str]] = {}
+    timing_selected: list[str] = []
     for producer, attempts in candidates.items():
         if not attempts:
             raise ValueError(f"Missing producer evidence: {producer}")
@@ -517,7 +559,7 @@ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, pyt
             or manifest.get("shard_index") != index
             or "proof_case" not in manifest
             or manifest["proof_case"] != case
-            or (partition == "ordinary" and "proof_call_passed" in manifest)
+            or (partition != "proof" and "proof_call_passed" in manifest)
         ):
             raise ValueError(f"Artifact {folder.name} differs from its expected producer identity")
         nodeids = manifest.get("selected_nodeids")
@@ -533,6 +575,14 @@ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, pyt
             assert case is not None
             if nodeids != [cases[case]] or manifest.get("proof_call_passed") is not True:
                 raise ValueError(f"Artifact {folder.name} lacks the singleton successful proof call")
+        elif partition == "timing":
+            # This list is recorded from iter_markers on the actual collected
+            # items, not from node-ID names or a separate hand-maintained list.
+            if manifest.get("timing_marked_nodeids") != nodeids or len(nodeids) != len(set(nodeids)):
+                raise ValueError(f"Artifact {folder.name} lacks timing_sensitive markers for every selected item")
+            if manifest.get("collection_digest") != collection_digest(nodeids):
+                raise ValueError(f"Artifact {folder.name} differs from its timing collection digest")
+            timing_selected = nodeids
         else:
             if any(nodeid in cases.values() for nodeid in nodeids):
                 raise ValueError(f"Artifact {folder.name} contains a proof overlap or misassigned ordinary test")
@@ -540,13 +590,16 @@ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, pyt
         digest = manifest.get("collection_digest")
         if not isinstance(digest, str):
             raise ValueError(f"Artifact {folder.name} lacks a collection digest")
-        digests.add(digest)
-        selected.extend(nodeids)
+        if partition != "timing":
+            digests.add(digest)
+            selected.extend(nodeids)
         resolved[producer] = folder.name
         if python_version == "3.13":
             databases.append(_coverage_database(folder, manifest))
     if len(selected) != len(set(selected)) or digests != {collection_digest(selected)}:
         raise ValueError("Ordinary and proof collections overlap, differ, or omit selected tests")
+    if set(timing_selected) & set(selected):
+        raise ValueError("Timing collection overlaps ordinary or proof tests")
     assignment = ordinary_assignment([node for group in ordinary_groups.values() for node in group], count, profile)
     if any(assignment[node] != index for index, group in ordinary_groups.items() for node in group):
         raise ValueError("Artifact union contains a misassigned ordinary test")

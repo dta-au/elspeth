@@ -483,8 +483,8 @@ addopts = [
     "-ra",
     "--strict-markers",
     "--strict-config",
-    "-m", "not slow and not stress and not performance and not testcontainer and not live_provider",  # Remote-provider evidence is separately operator-gated
-    # The default selection IS the pre-merge gate (AGENTS.md), so it has to be
+    "-m", "not slow and not stress and not performance and not testcontainer and not live_provider and not timing_sensitive",  # Remote-provider evidence is separately operator-gated
+    # The default selection is the ordinary pre-merge gate (AGENTS.md), so it has to be
     # a run somebody can actually sit through. The marker expression above
     # selects 48,675 of the 49,121 collected tests (measured 2026-09-08 via
     # `pytest tests/ --collect-only -q`); serial, that is many hours. At -n 12
@@ -506,6 +506,7 @@ markers = [
     "composer_llm_eval: characterization/replay tests for the 2026-04-28 composer LLM evaluation scenarios",
     "chaosllm: Configure ChaosLLM server for the test (preset=None, **kwargs)",
     "testcontainer: marks tests requiring Docker via testcontainers-python (deselect with '-m \"not testcontainer\"')",
+    "timing_sensitive: tests that assert against a wall-clock deadline or spawn and kill real processes, fail when the host is busy while passing alone; run serially in their own CI job or locally with 'pytest tests/ -m timing_sensitive -n 0'",
     "fingerprint_baseline: Plan A baseline capture/verify across all elspeth-lints rules",
     "live_aws: marks opt-in tests that call live AWS services with operator-approved fixtures",
     "live_provider: marks protected tests that cross a real remote-provider boundary",
