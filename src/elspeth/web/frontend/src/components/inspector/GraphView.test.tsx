@@ -3691,6 +3691,32 @@ describe("GraphView", () => {
         styleOf("other").border.split(" ")[0],
       );
     });
+
+    it("keeps the validation colour on a selected node's border", () => {
+      // The selected green is close to the valid green, so a selected error
+      // node whose border took the selection colour would read as valid.
+      // Selection is the gap ring; the border goes on saying what validation
+      // found.
+      validatedState();
+      useSessionStore.setState({ selectedNodeId: "needs_fix" } as never);
+      const { unmount } = render(<GraphView />);
+
+      expect(styleOf("needs_fix").border).toBe("1px solid var(--color-error)");
+      expect(styleOf("needs_fix").boxShadow).toBe(
+        "0 0 0 2px var(--color-well), 0 0 0 4px var(--color-selected-ring), var(--shadow-card)",
+      );
+      unmount();
+
+      useSessionStore.setState({ selectedNodeId: "needs_review" } as never);
+      render(<GraphView />);
+      expect(styleOf("needs_review").border).toBe(
+        "1px solid var(--color-warning)",
+      );
+      // The unselected sibling is back on its own 1px validation ring.
+      expect(styleOf("needs_fix").boxShadow).toBe(
+        "0 0 0 1px var(--color-error), var(--shadow-card)",
+      );
+    });
   });
 
   // A lowercase Latin letter standing in for the close glyph reads as text

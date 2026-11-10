@@ -1109,26 +1109,33 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
       // ring, which paints outside the border box and costs no layout. That is
       // the idiom the selection state already used for its outer halo, so
       // selection now uses it for its whole emphasis rather than half of it.
-      // Selection ring takes priority over the validation ring.
-      const ringColor = isSelected
-        ? SELECTED_RING_COLOR
-        : validationStatus === "error"
+      const validationColor =
+        validationStatus === "error"
           ? VALIDATION_COLORS.invalid
           : validationStatus === "warning"
             ? VALIDATION_COLORS.warning
             : validationStatus === "valid"
               ? VALIDATION_COLORS.valid
               : null;
+      // The border keeps the validation colour when the node is selected:
+      // selection is the gap ring outside the box, and the selected green is
+      // close to the valid green, so a selected error or warning node that
+      // took the selection colour on its border would read as valid. Only an
+      // unvalidated selected node takes the selection colour on its border.
+      // This matches a selected route's endpoints (renderedNodes below),
+      // which swap the ring and leave the border alone.
+      const borderColor =
+        validationColor ?? (isSelected ? SELECTED_RING_COLOR : null);
       // ARGOnite: the resting edge is the node-border role (>= 3:1 on the
       // graph well), so the card never relies on its shadow for a boundary.
-      const borderStyle = `1px solid ${ringColor ?? NODE_BORDER_COLOR}`;
+      const borderStyle = `1px solid ${borderColor ?? NODE_BORDER_COLOR}`;
       // ARGOnite: selection is the gap ring (SELECTED_NODE_RING above), far
-      // heavier than the 1px validation ring. The ring layers come first so
-      // they paint over the card's soft drop shadow.
+      // heavier than the 1px validation ring, which it replaces. The ring
+      // layers come first so they paint over the card's soft drop shadow.
       const ringShadow = isSelected
         ? SELECTED_NODE_RING
-        : ringColor
-          ? `0 0 0 1px ${ringColor}`
+        : validationColor
+          ? `0 0 0 1px ${validationColor}`
           : undefined;
       const cardShadow = ringShadow
         ? `${ringShadow}, var(--shadow-card)`

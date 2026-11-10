@@ -1348,6 +1348,19 @@ describe("ChatInput composer well CSS (ARGOnite Task 8)", () => {
     expect(css).not.toMatch(/\.chat-input-row:focus-within/);
   });
 
+  it("puts the focus ring back on the textarea where :has() is unsupported", () => {
+    // The textarea's own outline is removed, so an engine that cannot match
+    // the :has() rule above would show no keyboard focus at all.
+    const removal = css.indexOf("\n.chat-input-textarea:focus-visible {");
+    const fallback = css.match(
+      /@supports not selector\(:has\(\*\)\)\s*\{\s*\.chat-input-textarea:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-focus-ring\)/s,
+    );
+    expect(removal).toBeGreaterThan(-1);
+    expect(fallback).not.toBeNull();
+    // Equal specificity: the fallback only wins if it comes later.
+    expect(fallback?.index ?? -1).toBeGreaterThan(removal);
+  });
+
   it("rounds the icon buttons into circles and the send button into a pill", () => {
     expect(rule(".chat-input-icon-btn")).toMatch(/border-radius:\s*var\(--radius-pill\)/);
     expect(rule(".chat-input-send-btn")).toMatch(/border-radius:\s*var\(--radius-pill\)/);

@@ -202,7 +202,10 @@
      border on :root .react-flow__controls below, never this shadow. */
   --xy-controls-box-shadow-default: var(--shadow-pill);
   --xy-minimap-background-color-default: var(--color-surface);
-  --xy-minimap-mask-background-color-default: rgba(15, 45, 53, 0.55);
+  /* ARGOnite: the dark mask is the page ground (--color-bg #141d1b) at 55%,
+     replacing the pre-ARGOnite teal ink that tinted the navy minimap. The
+     light override below keeps the teal ink on purpose, like --color-scrim. */
+  --xy-minimap-mask-background-color-default: rgba(20, 29, 27, 0.55);
   --xy-minimap-mask-stroke-color-default: var(--color-border-strong);
   --xy-minimap-node-background-color-default: var(--color-text-muted);
   --xy-minimap-node-stroke-color-default: var(--color-border-strong);

@@ -7,6 +7,11 @@
 /* ---------------------------------------------------------------------------
    Colour Palette
    --------------------------------------------------------------------------- */
+/* ARGOnite: this palette no longer matches website/tokens/colors.css, which
+   still carries the whole pre-ARGOnite teal/navy palette (backgrounds, text,
+   borders, accents), not only the tokens whose comments say so. Per the
+   ARGOnite design doc the marketing site's tokens follow later, separately;
+   do not copy values in either direction to "restore" a mirror. */
 :root {
   /* ── Backgrounds — ARGOnite three-family role palette ────────────────────── */
   /* Workspace family — ARGO's near-black green page under DTA-navy panels
