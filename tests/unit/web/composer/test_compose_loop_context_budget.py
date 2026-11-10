@@ -85,9 +85,12 @@ class _RecordingProvider:
         return next(self._responses)
 
 
-def _service(max_prompt_tokens: int) -> tuple[ComposerServiceImpl, str]:
+_ANTHROPIC_MODEL = "anthropic/claude-3-5-sonnet-20241022"
+
+
+def _service(max_prompt_tokens: int, **overrides: Any) -> tuple[ComposerServiceImpl, str]:
     return _composer_service_with_session(
-        catalog=_mock_catalog(), settings=_make_settings(composer_context_max_prompt_tokens=max_prompt_tokens)
+        catalog=_mock_catalog(), settings=_make_settings(composer_context_max_prompt_tokens=max_prompt_tokens, **overrides)
     )
 
 
@@ -424,3 +427,83 @@ async def test_current_message_larger_than_the_cap_is_refused_before_any_provide
     assert error.evidence["estimated_tokens"] > cap
     # The protected request plus the oversized message, nothing shed.
     assert error.evidence["request_bytes"] > len(current_message) + base // 2
+
+
+@pytest.mark.asyncio
+async def test_anthropic_shed_request_is_marked_hashed_recorded_and_sent_as_one(delivery_confirmations: list[bool]) -> None:
+    base = await _base_request_bytes()
+    history = _long_history(base)
+    service, session_id = _service(_cap_for(base), composer_model=_ANTHROPIC_MODEL)
+    provider = _RecordingProvider(_make_llm_response(content="Done."))
+    delivery_confirmations.clear()
+
+    result = await _compose(service, session_id, history, provider)
+
+    (request,) = provider.requests
+    sent = request["messages"]
+    # Cache markers were applied to the request that was sent ...
+    assert "cache_control" in sent[0]
+    assert "cache_control" in sent[-1]
+    assert "cache_control" in request["tools"][-1]
+    # ... and it is the shed request: no assistant history, omissions counted.
+    assert [m for m in sent if m["role"] == "assistant"] == []
+    assert _state_context(sent)["conversation_omissions"] == {
+        "prior_user_requests_omitted": 0,
+        "prior_assistant_messages_omitted": 3,
+    }
+    (call,) = result.llm_calls
+    assert call.context_budget is not None
+    assert call.context_budget.shed_history_indices == (1, 3, 5)
+    _assert_record_matches_request(call, request)
+    assert delivery_confirmations == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["openrouter/openai/gpt-5.5", _ANTHROPIC_MODEL], ids=["unmarked", "anthropic-marked"])
+async def test_applied_request_over_the_byte_ceiling_is_refused_before_any_provider_call(model: str) -> None:
+    """The decision fits the bytes it counted; the re-rendered state message and markers it did not count push it over.
+
+    Shedding the one assistant reply brings the counted request to exactly the
+    unshed size of the history without it, which the byte ceiling admits with
+    ten bytes to spare. Applying the shed re-renders the state message with
+    ``conversation_omissions`` (and, for Anthropic, adds cache markers), so
+    the request actually built is over the ceiling and must be refused by the
+    post-application measurement, never sent.
+    """
+    # Larger than any protected component, under the credential guard's bound,
+    # so the refusal names the current message.
+    current_message = "Please build the pipeline. " * 7_000
+    assert len(current_message.encode()) < 262_144
+    user_request = _user(0, "Please read the CSV file.")
+    measure_service, measure_session = _service(_GENEROUS_TOKENS, composer_model=model)
+    measure_provider = _RecordingProvider(_make_llm_response(content="Done."))
+    with (
+        patch("litellm.acompletion", new_callable=AsyncMock, side_effect=measure_provider.complete),
+        patch.object(measure_service._preflight, "cached_runtime_preflight", new_callable=AsyncMock, return_value=_passing_preflight()),
+    ):
+        measured = await measure_service.compose(current_message, [user_request], _empty_state(), session_id=measure_session)
+    split = measured.llm_calls[0].request_byte_split
+    assert split is not None
+    request_bytes_without_reply = int(split.total_bytes)
+    assert "conversation_omissions" not in _state_context(measure_provider.requests[0]["messages"])
+
+    max_request_bytes = request_bytes_without_reply + 10
+    service, session_id = _service(_GENEROUS_TOKENS, composer_model=model, composer_planner_max_request_bytes=max_request_bytes)
+    provider = _RecordingProvider(_make_llm_response(content="Done."))
+    with (
+        patch("litellm.acompletion", new_callable=AsyncMock, side_effect=provider.complete),
+        pytest.raises(ComposerConvergenceError) as exc_info,
+    ):
+        await service.compose(current_message, [user_request, _assistant("p" * 5_000)], _empty_state(), session_id=session_id)
+
+    assert provider.requests == []
+    error = exc_info.value
+    assert error.reason == "context_budget_exceeded"
+    assert error.llm_calls == ()
+    assert error.evidence["ceiling"] == "bytes"
+    assert error.evidence["max_request_bytes"] == max_request_bytes
+    assert error.evidence["max_prompt_tokens"] == _GENEROUS_TOKENS
+    # Measured after application: over the ceiling, and by less than the
+    # assistant reply the decision shed.
+    assert max_request_bytes < error.evidence["request_bytes"] < max_request_bytes + 5_000
+    assert error.evidence["largest_component"] == "current_message"
