@@ -235,8 +235,35 @@ existing guard, through the same predicate module so the three cannot drift:
 2. `/validate` materialization;
 3. run admission.
 
-The refusal text is repairable and tells the planner what to do: ask the user to
-save the text as a file and upload it, then attach the upload.
+Literal content is refused as well (decided 2026-11-10, after the transform was
+built). The blob guard alone leaves a second route open: a composer authoring
+tool can write literal text straight into `files.<name>.content` with no blob
+involved, and unlike an `llm` prompt nothing reviews it. So in the composer, the
+only accepted value at `files.<name>.content` on a `file_inject` node is an
+`inline_content` marker for a user-uploaded blob. A literal string there, from
+any node-option authoring tool, is refused at authoring, and a composition state
+that carries one is refused at `/validate` and run admission. Literal `content`
+in a hand-written settings file run from the CLI is unaffected: its author wrote
+it.
+
+Every refusal, for a planner-created blob and for literal content alike, is
+repairable and steers the planner to the path that works, naming the actual node
+id and entry name:
+
+1. tell the user they need to save the text as a file and upload it;
+2. once it is uploaded, find it with `list_blobs` / `get_blob_metadata`;
+3. attach it with `wire_blob_inline_ref` at
+   `node:<node_id>.options.files.<entry_name>.content`.
+
+The wording is specific to `file_inject`. It must not suggest planner-created
+files are refused elsewhere: a planner-created source and planner-written prompt
+text remain allowed behind their own review cards. Tests assert the steering
+text on every tool that can trigger a refusal, and that the same call with a
+user-uploaded blob then succeeds.
+
+An approval card for planner-created `file_inject` content ("for the LLM to use
+this you have to approve it", as for an invented source) is tracked separately
+as dta-au/elspeth#361 and is out of scope here.
 
 This is validation and rejection of planner output, which the composer
 invariants permit. It adds no server-authored structure and no tutorial-specific
@@ -305,3 +332,26 @@ suite is not run: no schema, SQL, persistence or lock is touched.
 - Guarding `reference_join.reference_content` against planner-written blobs.
 - Operator signing of any trust-tier allowlist entries.
 - Changelog and release-notes entries, until the target release is confirmed.
+
+## Decisions taken during implementation
+
+Recorded here so the spec matches what was built.
+
+- **JSON nesting** deeper than 100 levels is refused (`MAX_FILE_INJECT_JSON_DEPTH`).
+- **A CSV cell** longer than Python's per-cell limit (131,072 characters) is
+  refused with a message that says so. The limit is process-wide and is not
+  raised; longer text belongs in a `text` or `json` file.
+- **`default_content`** must be canonical JSON, fits the per-entry cap and
+  counts toward the per-node cap. `default_content: null` with
+  `on_miss: default` is refused in favour of `on_miss: null`.
+- **Entry names** must be quoted strings, non-empty, with no leading or trailing
+  whitespace.
+- **Collision with the declared input** means the output field is named in
+  `required_input_fields` or equals `key_field`. Declaring a written field's
+  type in the node's `schema` is allowed and is checked against the derived
+  type.
+- **A leading byte-order mark** is stripped before parsing `json`, `jsonl` and
+  `csv`; `text` is written unmodified.
+- **Shared parsing helpers** live in `plugins/infrastructure/config_content.py`
+  and raise neutral `ValueError` subclasses; `reference_join` wraps them to keep
+  its existing exception types and text.
