@@ -333,6 +333,7 @@ async def test_second_empty_build_while_a_proposal_is_pending_stages_no_second_p
         composer_boot_probe_enabled=False,
         composer_prompt_guard_mode="debug-when-unconfigured",
         composer_max_composition_turns=3,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=2,
         composer_timeout_seconds=20.0,
         composer_rate_limit_per_minute=10,
