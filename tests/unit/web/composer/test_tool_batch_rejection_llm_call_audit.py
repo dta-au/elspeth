@@ -10,6 +10,7 @@ turn exceeded a composer budget), not a composer-service outage.
 
 from __future__ import annotations
 
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -20,7 +21,11 @@ from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.sessions.models import sessions_table
 from elspeth.web.sessions.routes._helpers import _llm_calls_from_exception
-from tests.unit.web.composer.test_compose_loop_persistence import _capture_tool_batch_rejection, _tool_batch_response
+from tests.unit.web.composer.test_compose_loop_persistence import (
+    _blob_deletion_calls,
+    _capture_tool_batch_rejection,
+    _tool_batch_response,
+)
 
 
 def _set_explicit_approve(service: ComposerServiceImpl, session_id: str) -> None:
@@ -33,10 +38,21 @@ def _set_explicit_approve(service: ComposerServiceImpl, session_id: str) -> None
 async def test_proposal_cap_rejection_is_convergence_error_carrying_llm_calls(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _set_explicit_approve(composer_service_with_real_sessions, result_session_id)
+    # Blob-only proposals: a response carrying several composition-changing
+    # mutations is refused before publication and never reaches the cap.
     response = _tool_batch_response(
-        *((f"call_cap_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}}) for index in range(11))
+        *await _blob_deletion_calls(
+            composer_service_with_real_sessions,
+            result_session_id,
+            tmp_path,
+            monkeypatch,
+            prefix="call_cap_proposal",
+            count=11,
+        )
     )
 
     caught = await _capture_tool_batch_rejection(
