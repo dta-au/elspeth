@@ -903,6 +903,27 @@ def test_transcript_events_shed_on_an_earlier_call_of_the_request_stay_shed_betw
     assert "".join(part.text for part in sticky[3][PROMPT_GUARD_CONTENT_PARTS_KEY]) == sticky[3]["content"]
 
 
+@pytest.mark.parametrize("gaps", [[], ["authenticated_persisted_history_not_supplied"]], ids=["no-gaps", "a-gap"])
+def test_a_fitted_hatch_request_shedding_a_lone_event_never_exceeds_the_byte_ceiling(gaps: list[str]) -> None:
+    """The worst case for the gap allowance: no escaping slack, and the transcript's only event is shed."""
+    transcript, _ = _hatch_message([{"role": "user", "content": "x" * 2_000}], gaps)
+    full, _, _ = _fit_hatch_request(transcript, earlier_calls=(), policy=_context_policy(max_request_bytes=1_000_000))
+    full_bytes = _request_size_of(full)
+    one_shed = full_bytes - transcript.event_bytes()[0]
+    sent = 0
+    for delta in range(-8, 72, 4):
+        policy = _context_policy(max_request_bytes=one_shed + delta)
+        try:
+            applied, record, _ = _fit_hatch_request(transcript, earlier_calls=(), policy=policy)
+        except PipelinePlannerError as refusal:
+            assert refusal.code == "CONTEXT_BUDGET_EXHAUSTED"
+            continue
+        sent += 1
+        assert record.shed_hatch_event_indices == (0,)
+        assert _request_size_of(applied) <= policy.max_request_bytes, delta
+    assert sent >= 2  # the ceilings past the allowance are fitted, not refused
+
+
 def test_a_hatch_message_that_is_not_the_labelled_transcript_is_a_framework_bug() -> None:
     transcript, _ = _hatch_message(_AWKWARD_EVENTS, [])
     other, _ = _hatch_message(_AWKWARD_EVENTS[1:], [])
