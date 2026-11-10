@@ -3692,6 +3692,15 @@ class ExecutionServiceImpl:
             # Resolved values exist only in this thread's local memory — the
             # original pipeline_yaml (persisted in the Run record) is untouched.
             resolved_dict: dict[str, Any] | None = executable_config
+            # In the composer a file_inject entry admits only a user-uploaded
+            # file and no default_content. Checked before secret and blob
+            # substitution, while a literal and a marker can be told apart,
+            # and before marker discovery, which cannot build a field path
+            # through an entry name the check refuses with a repair.
+            if resolved_dict is not None:
+                file_inject_refusals = file_inject_runtime_config_refusals(resolved_dict)
+                if file_inject_refusals:
+                    raise InlineBlobPromptSurfaceAdmissionError(file_inject_admission_message(file_inject_refusals))
             secret_resolution_inputs: list[SecretResolutionInput] = []
             inline_blob_candidate = (
                 bool(_discover_blob_content_refs(executable_config))
@@ -3721,13 +3730,11 @@ class ExecutionServiceImpl:
                             f"generate_yaml() produced non-dict YAML (got {type(config_dict).__name__}) — this is a bug in the YAML generator"
                         )
                     resolved_dict = cast(dict[str, Any], config_dict)
-
-                # In the composer a file_inject entry admits only a user-uploaded
-                # file and no default_content. Checked before secret and blob
-                # substitution, while a literal and a marker can be told apart.
-                file_inject_refusals = file_inject_runtime_config_refusals(resolved_dict)
-                if file_inject_refusals:
-                    raise InlineBlobPromptSurfaceAdmissionError(file_inject_admission_message(file_inject_refusals))
+                    # The same check for a config loaded here: nothing has
+                    # walked this tree for markers yet.
+                    file_inject_refusals = file_inject_runtime_config_refusals(resolved_dict)
+                    if file_inject_refusals:
+                        raise InlineBlobPromptSurfaceAdmissionError(file_inject_admission_message(file_inject_refusals))
 
                 runtime_secret_resolver = self._secret_service if restored_envelope is None else restored_envelope.secret_resolver
                 if runtime_secret_resolver is not None and user_id is not None:

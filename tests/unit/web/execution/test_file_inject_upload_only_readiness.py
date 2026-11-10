@@ -37,10 +37,13 @@ from elspeth.web.blobs.protocol import BlobIntegrityError
 from elspeth.web.composer import yaml_generator as composer_yaml_generator
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution import _validation_materialization as guard
 from elspeth.web.execution.preflight import resolve_runtime_yaml_paths
+from elspeth.web.execution.protocol import FrozenRunSettings
 from elspeth.web.execution.service import InlineBlobPromptSurfaceAdmissionError
 from elspeth.web.execution.validation import validate_pipeline_for_trained_operator
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from tests.helpers import execution_custody
 from tests.helpers.execution_custody import ExecutionTestCustody
 
@@ -158,8 +161,13 @@ def _run_admission(
     modality: CreationModality = CreationModality.VERBATIM,
     *,
     record: BlobRecord | None = None,
+    governed: bool = False,
 ) -> tuple[BaseException | None, Any, Any]:
-    """Drive ``_run_pipeline`` with the runtime YAML the composer generates for the same state."""
+    """Drive ``_run_pipeline`` with the runtime YAML the composer generates for the same state.
+
+    ``governed`` passes the same config as frozen run settings, the arm a
+    policy-governed run takes; otherwise the YAML is loaded from the run record.
+    """
     service, session_service, loop = agreement.TestComposerRuntimeBlobInlineAgreement._execution_service(
         tmp_path, execution_fixture=execution_fixture
     )
@@ -171,7 +179,11 @@ def _run_admission(
         str(tmp_path),
         session_id=str(_SESSION_ID),
     )
-    assert type(yaml.safe_load(pipeline_yaml)) is dict
+    config = yaml.safe_load(pipeline_yaml)
+    assert type(config) is dict
+    frozen_run_settings = (
+        FrozenRunSettings(PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service()), config, config) if governed else None
+    )
     raised: BaseException | None = None
     with (
         patch("elspeth.web.execution.service.Orchestrator"),
@@ -183,7 +195,13 @@ def _run_admission(
         try:
             lease = agreement._execute_lease(loop, session_service.run.session_id, service=service, execution_fixture=execution_fixture)
             try:
-                service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event(), session_operation_lease=lease)
+                service._run_pipeline(
+                    str(uuid4()),
+                    pipeline_yaml,
+                    threading.Event(),
+                    frozen_run_settings=frozen_run_settings,
+                    session_operation_lease=lease,
+                )
             except Exception as exc:
                 raised = exc
         finally:
@@ -225,10 +243,14 @@ def _assert_steers_to_an_upload(suggestion: str) -> None:
 # ── the shared predicate ────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("option_path", ["files", "files.A", "files.A.content"])
-def test_guard_covers_nested_marker_beneath_files(option_path: str) -> None:
+@pytest.mark.parametrize(
+    ("option_path", "entry_name"),
+    [("files", None), ("files.A", "A"), ("files.A.content", "A"), ("files.A.format", "A"), ("files.A.format.nested", "A")],
+)
+def test_guard_covers_nested_marker_beneath_files(option_path: str, entry_name: str | None) -> None:
     field_path = f"node:n.options.{option_path}"
     node_plugins = {"n": "file_inject"}
+    attach_at = f"node:n.options.files.{'<entry_name>' if entry_name is None else entry_name}.content"
 
     assert guard.guarded_inline_surface_field(field_path, node_plugins=node_plugins) == ("n", option_path, "file_inject")
     for modality in CreationModality:
@@ -236,6 +258,11 @@ def test_guard_covers_nested_marker_beneath_files(option_path: str) -> None:
             field_path, blob_id=_BLOB_ID, node_plugins=node_plugins, created_by="user", creation_modality=modality
         )
         assert (refusal is not None) is modality.requires_llm_provenance()
+        if refusal is not None:
+            # Wherever beneath the entry the blob was bound, the repair attaches at the entry's content.
+            assert refusal.entry_name == entry_name
+            assert f"wire_blob_inline_ref at '{attach_at}'" in refusal.repair
+            assert refusal.repair_for_person.endswith(f"attach the upload at '{attach_at}'.")
         # The llm prompt-surface rule is a separate, modality-only rule for llm nodes.
         assert guard.is_llm_authored_prompt_surface_binding(field_path, node_plugins=node_plugins, creation_modality=modality) is False
 
@@ -309,6 +336,38 @@ def test_validate_and_run_admission_both_refuse_an_unaddressable_entry_name(
     assert error.suggestion.startswith("Give the entry a name of that form, then attach the user's upload to it.")
     _assert_admission_refuses(raised, blob_service, session_service, option_path="files.v1.2")
     assert "Rename the entry to a name of that form, then attach the uploaded file to it." in str(raised)
+    # A rename is not free in mode select, and the person is told so as the planner is.
+    assert "In mode select the entry name is the value rows are matched on, so renaming it changes which rows match." in str(raised)
+
+
+def test_governed_run_admission_refuses_an_unaddressable_entry_name_with_the_repair(
+    tmp_path: Path, execution_fixture: ExecutionTestCustody
+) -> None:
+    """The frozen-settings arm judges the options before it looks for markers.
+
+    Marker discovery cannot build a field path through ``v1.2`` and raises a
+    bare ``ValueError``; the options check has to come first for the person to
+    be told what to rename.
+    """
+    options = _options(_marker())
+    options["files"] = {"v1.2": {"content": _marker(), "format": "text"}}
+
+    raised, blob_service, session_service = _run_admission(tmp_path, options, execution_fixture, governed=True)
+
+    _assert_admission_refuses(raised, blob_service, session_service, option_path="files.v1.2")
+    assert "an uploaded file cannot be attached to an entry named 'v1.2'" in str(raised)
+    assert "Rename the entry to a name of that form, then attach the uploaded file to it." in str(raised)
+
+
+def test_governed_run_admission_accepts_user_uploaded_file_inject_ref(tmp_path: Path, execution_fixture: ExecutionTestCustody) -> None:
+    """Control for the governed arm: the same state with an addressable entry is admitted."""
+    raised, blob_service, session_service = _run_admission(tmp_path, _options(_marker()), execution_fixture, governed=True)
+
+    # As in the ungoverned control: admitted and substituted; the run stops later on the fixture's settings fake.
+    assert type(raised) is not InlineBlobPromptSurfaceAdmissionError
+    assert [call[0] for call in blob_service.link_blob_to_run_calls] == [_BLOB_ID]
+    assert blob_service.read_blob_content_calls == [_BLOB_ID]
+    assert len(session_service.recorded_blob_inline_resolutions) == 1
 
 
 @pytest.mark.parametrize("plugin", ["reference_join", "llm", "field_mapper"])

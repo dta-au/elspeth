@@ -228,6 +228,10 @@ FileInjectRefusalCause = Literal["not_user_uploaded_blob", "literal_content", "d
 #: ``wire_blob_inline_ref``, and a marker beneath it cannot be resolved.
 _INLINE_REF_PATH_SEGMENT: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 _ENTRY_NAME_RULE: Final = "in the composer an entry name must start with a letter or '_' and contain only letters, digits, '_' and '-'"
+#: What a rename costs, for the person-facing repairs of an unaddressable entry name.
+FILE_INJECT_ENTRY_RENAME_CONSEQUENCE: Final = (
+    "In mode select the entry name is the value rows are matched on, so renaming it changes which rows match."
+)
 
 
 def is_user_uploaded_blob(*, created_by: str, creation_modality: CreationModality) -> bool:
@@ -380,11 +384,12 @@ class FileInjectContentRefusal:
         """The ``files`` entry this refusal names, or ``None`` when it names no single entry."""
         if self.entry is not None:
             return self.entry
-        prefix = f"{FILE_INJECT_CONTENT_OPTION_ROOT}."
-        if not self.option_path.startswith(prefix):
+        # Without ``entry`` the path came from an inline reference, whose
+        # segments hold no dot: ``files.<entry>[.<key>...]`` names ``<entry>``.
+        segments = self.option_path.split(".")
+        if len(segments) < 2 or segments[0] != FILE_INJECT_CONTENT_OPTION_ROOT or not segments[1]:
             return None
-        entry_name = self.option_path.removeprefix(prefix).removesuffix(".content")
-        return entry_name if entry_name else None
+        return segments[1]
 
     @property
     def problem(self) -> str:
@@ -430,7 +435,7 @@ class FileInjectContentRefusal:
         if self.cause == "default_content":
             return "Remove default_content and use on_miss: null or on_miss: fail."
         if self.cause == "unaddressable_entry":
-            return "Rename the entry to a name of that form, then attach the uploaded file to it."
+            return f"Rename the entry to a name of that form, then attach the uploaded file to it. {FILE_INJECT_ENTRY_RENAME_CONSEQUENCE}"
         return f"Save the text as a file, upload it in this session, then attach the upload at '{self._content_path}'."
 
 

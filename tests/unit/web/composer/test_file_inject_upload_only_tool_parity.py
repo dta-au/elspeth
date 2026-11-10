@@ -7,7 +7,8 @@ for a blob the user uploaded, and ``default_content`` (written into rows on a
 miss) is not accepted at all. Three refusal causes follow, on every tool that
 can write node options:
 
-* a marker naming an LLM-authored blob;
+* a marker naming a blob that is not a user upload (planner-created, a
+  pipeline output, or a fork copy of either);
 * literal content;
 * ``default_content`` in any form.
 
