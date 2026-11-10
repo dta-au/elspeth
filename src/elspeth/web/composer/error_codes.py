@@ -41,6 +41,8 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "aggregation_on_success_dangling",
         "aggregation_output_mode_invalid",
         "aggregation_trigger_invalid",
+        "approval_batch_not_atomic",
+        "approval_proposal_pending",
         "argument_error",
         "batch_required_fields_invalid",
         "batch_transform_misplaced",

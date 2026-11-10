@@ -414,6 +414,60 @@ async def _preflight_session_tool_call_ids(
         raise reused_id_error
 
 
+def _stages_composition_proposal(tool_name: str) -> bool:
+    """Whether explicit approval stages this tool as a composition-changing proposal.
+
+    Blob-store-only tools are excluded: ``create_blob`` stays immediate and the
+    destructive ``update_blob``/``delete_blob`` proposals never advance the
+    composition state, so they keep their existing staging behaviour.
+    """
+    return is_mutation_tool(tool_name) and not is_blob_store_only_mutation_tool(tool_name)
+
+
+async def _approval_containment_refusal(
+    calls: tuple[_AdmittedToolCall, ...],
+    *,
+    sessions_service: SessionServiceProtocol,
+    session_id: UUID,
+) -> tuple[Literal["batch", "pending"], str] | None:
+    """Return ``(reason, message)`` when this batch may not stage a composition proposal.
+
+    Every staged composition edit is previewed against the committed pipeline
+    and recorded with that pipeline as its base; accepting one moves the base
+    and its siblings then fail the accept-time base check for ever. Until
+    proposals are cumulative, at most one composition proposal is outstanding:
+    a batch carrying several is refused whole, and a single one is refused
+    while an earlier proposal still awaits the user. The decision is made from
+    tool names and durable rows alone, before any call is previewed, so no
+    refused call has an effect.
+    """
+    staged = sum(1 for call in calls if _stages_composition_proposal(call.function.name))
+    if staged > 1:
+        return (
+            "batch",
+            f"This session requires approval for pipeline changes and this response carried {staged} of them. All {staged} "
+            "were refused before any effect: nothing was applied and no proposal was recorded. Separate proposals are each "
+            "drawn against the same saved pipeline, so the user could only ever accept one of them. Submit the whole "
+            "intended result as one change: a single set_pipeline call containing every edit, with no other pipeline "
+            "mutation in the same response.",
+        )
+    if staged == 1:
+        pending = [
+            proposal
+            for proposal in await sessions_service.list_composition_proposals(session_id, status="pending")
+            if not is_blob_store_only_mutation_tool(proposal.tool_name)
+        ]
+        if pending:
+            others = f" ({len(pending) - 1} more are also pending)" if len(pending) > 1 else ""
+            return (
+                "pending",
+                f"Proposal {pending[0].id} ({pending[0].tool_name}) is still awaiting the user's decision{others}. Nothing "
+                "from this call was applied and no new proposal was recorded. Do not retry or rephrase this change: tell "
+                "the user they must accept or reject the pending proposal first, then ask again.",
+            )
+    return None
+
+
 def _pending_proposal_cap_error(
     observed: int,
     *,
@@ -1137,6 +1191,19 @@ async def run_tool_batch(
     promises_by_call: dict[str, frozenset[Resource]] = {}
     from elspeth.web.composer.redaction import MANIFEST, redact_tool_call_arguments
 
+    approval_containment_refusal = (
+        await _approval_containment_refusal(
+            assistant_tool_calls,
+            sessions_service=turn_sessions_service,
+            session_id=turn_session_uuid,
+        )
+        if turn_sessions_service is not None
+        and turn_session_uuid is not None
+        and turn_preferences is not None
+        and turn_preferences.trust_mode == "explicit_approve"
+        else None
+    )
+
     for tool_call in assistant_tool_calls:
         if ctx.cancellation_requested.is_set():
             # The enclosing compose-loop critical section has observed a
@@ -1566,10 +1633,19 @@ async def run_tool_batch(
             all_cache_hits = False
             continue
 
-        # A refused producer cannot supply a new prerequisite to another call
-        # authored in this same response. Existing saved resources remain usable.
-        if is_mutation_tool(tool_name) and has_unavailable_prerequisite(tool_name, arguments, refused_resources, state):
-            reject = _candidate_rejection_result if tool_name == "set_pipeline" else _saved_graph_rejection_result
+        # Explicit approval keeps at most one composition proposal outstanding
+        # (see ``_approval_containment_refusal``); the refusal is non-``None``
+        # only in that mode. Otherwise: a refused producer cannot supply a new
+        # prerequisite to another call authored in this same response.
+        # Existing saved resources remain usable.
+        containment = approval_containment_refusal if _stages_composition_proposal(tool_name) else None
+        reject = _candidate_rejection_result if tool_name == "set_pipeline" else _saved_graph_rejection_result
+        blocked: ToolResult | None = None
+        if containment is not None and containment[0] == "batch":
+            blocked = reject(state, containment[1], error_code="approval_batch_not_atomic", rejected_component=None)
+        elif containment is not None:
+            blocked = reject(state, containment[1], error_code="approval_proposal_pending", rejected_component=None)
+        elif is_mutation_tool(tool_name) and has_unavailable_prerequisite(tool_name, arguments, refused_resources, state):
             blocked = reject(
                 state,
                 "This mutation depends on a new resource or connection from an earlier refused call in this batch. "
@@ -1578,6 +1654,7 @@ async def run_tool_batch(
                 error_code="batch_dependency_refused",
                 rejected_component=None,
             )
+        if blocked is not None:
             blocked = finalize_tool_result(
                 blocked,
                 tool_name=tool_name,
@@ -2351,7 +2428,11 @@ async def run_tool_batch(
                         proposal_id=str(proposal.id),
                         tool_name=proposal_tool_name,
                         summary=proposal.summary,
-                        message="The requested pipeline change is pending human approval and has not been applied.",
+                        message=(
+                            "The proposal is recorded and awaits human approval; it has not been applied. This result's "
+                            "validation describes the unchanged current pipeline and does not validate the proposed change. "
+                            "Send no further pipeline changes until the user accepts or rejects this proposal."
+                        ),
                     ),
                 )
                 recorder.record(
