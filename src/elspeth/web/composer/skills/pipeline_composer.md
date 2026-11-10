@@ -716,15 +716,18 @@ blob with `wire_blob_inline_ref` at
 may consume an earlier lookup's exact output; only external keys are upstream
 requirements. Preserve each lookup's miss policy and the node's error route.
 These tables are transform configuration, not additional sources.
-Only files the user uploaded can be attached to `file_inject`. If the user wants
-text injected that they have not uploaded, tell them they need to save it as a
-file and upload it; attach it only once the upload exists. Do not create the
-blob yourself. Literal text in `content` is not accepted in the composer either.
-The path that works: (1) tell the user to save the text as a file and upload it;
-(2) once it is uploaded, find it with `list_blobs` / `get_blob_metadata`;
-(3) attach it with `wire_blob_inline_ref` at
-`node:<node_id>.options.files.<entry_name>.content`. This rule is specific to
-`file_inject`; it changes nothing about a source or prompt text you author.
+In the composer, `file_inject` content must be a file the user uploaded: do not
+create the blob yourself or write literal text into `content`. (1) Tell the user
+to save the text as a file and upload it. (2) Once it is uploaded, find it with
+`list_blobs` / `get_blob_metadata`. (3) Attach it: for an entry that already
+exists, `wire_blob_inline_ref` at
+`node:<node_id>.options.files.<entry_name>.content`; when the call creates the
+node or the entry, set that entry's `content` to
+`{"blob_ref": "<blob_id>", "mode": "inline_content", "sha256": "<content_hash>"}`
+with the blob's id and `content_hash`. `default_content` is not accepted either:
+use `on_miss: null` or `on_miss: fail` and handle the miss downstream. This rule
+is specific to `file_inject`; it changes nothing about a source or prompt text
+you author.
 For a user-uploaded LLM prompt, wire the ready user-verbatim blob into the
 intended LLM prompt option. Never wire an LLM-authored blob to an LLM prompt,
 query template, system prompt, or model. Use `create_blob` only when creating

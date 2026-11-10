@@ -295,12 +295,18 @@ def test_agent_assistance_teaches_wiring_and_the_upload_rule() -> None:
         "tell them to save it as a file and upload it",
         "find the ready upload with list_blobs and get_blob_metadata",
         "attach it with wire_blob_inline_ref at 'node:<node_id>.options.files.<entry_name>.content'",
+        # A node cannot exist without content, so creating one carries the marker in the same call.
+        'set that entry\'s content to {"blob_ref": "<blob_id>", "mode": "inline_content", "sha256": "<content_hash>"}',
     )
     positions = [hints.find(step) for step in steps]
     assert -1 not in positions, positions
     assert positions == sorted(positions)
     assert "Do not use create_blob to supply file_inject content" in hints
     assert "do not write literal text into content" in hints
+    # The composer refuses default_content, so no hint may offer it as a way to continue there.
+    assert "The composer does not accept default_content: use on_miss null or fail there" in hints
+    assert "or default with default_content, to continue" not in hints
+    assert all(len(hint) <= 280 for hint in assistance.composer_hints)
     assert FileInject.get_agent_assistance(issue_code="anything") is None
 
 

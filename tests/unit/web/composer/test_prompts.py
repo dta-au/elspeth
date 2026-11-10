@@ -781,22 +781,29 @@ class TestBuildSystemPrompt:
 
         assert "`mode: select`" in flattened and "`mode: all`" in flattened
         assert "State `format` on every entry" in flattened
+        # The rule, said once: a user upload, never a planner-created blob, never literal text.
         assert (
-            "Only files the user uploaded can be attached to `file_inject`. If the user wants text injected "
-            "that they have not uploaded, tell them they need to save it as a file and upload it; attach it "
-            "only once the upload exists. Do not create the blob yourself."
+            "In the composer, `file_inject` content must be a file the user uploaded: do not create the blob "
+            "yourself or write literal text into `content`."
         ) in flattened
-        assert "Literal text in `content` is not accepted in the composer either" in flattened
         steps = (
-            "(1) tell the user to save the text as a file and upload it",
-            "(2) once it is uploaded, find it with `list_blobs` / `get_blob_metadata`",
-            "(3) attach it with `wire_blob_inline_ref` at `node:<node_id>.options.files.<entry_name>.content`",
+            "(1) Tell the user to save the text as a file and upload it.",
+            "(2) Once it is uploaded, find it with `list_blobs` / `get_blob_metadata`.",
+            "(3) Attach it: for an entry that already exists, `wire_blob_inline_ref` at "
+            "`node:<node_id>.options.files.<entry_name>.content`;",
+            # A node cannot exist without content, so creating one carries the marker in the same call.
+            "when the call creates the node or the entry, set that entry's `content` to "
+            '`{"blob_ref": "<blob_id>", "mode": "inline_content", "sha256": "<content_hash>"}`',
         )
         positions = [flattened.find(step) for step in steps]
         assert -1 not in positions, positions
         assert positions == sorted(positions)
+        assert "`default_content` is not accepted either: use `on_miss: null` or `on_miss: fail`" in flattened
         # Scoped to this plugin: other planner-created content keeps its own rules.
-        assert "This rule is specific to `file_inject`" in flattened
+        assert "This rule is specific to `file_inject`; it changes nothing about a source or prompt text you author." in flattened
+        # Non-duplication: the upload instruction and the marker shape each appear once.
+        assert flattened.count("save the text as a file and upload it") == 1
+        assert flattened.count('"mode": "inline_content"') == 1
 
     def test_capability_core_teaches_file_inject_modes(self) -> None:
         """The shared core carries the mode semantics once; the interaction skill does not repeat them."""

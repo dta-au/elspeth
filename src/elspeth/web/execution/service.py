@@ -59,7 +59,6 @@ from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.blobs_inline import (
-    _NODE_COLLECTION_KEYS,
     BLOB_INLINE_AGGREGATE_BYTE_CAP,
     BLOB_INLINE_PER_REF_BYTE_CAP,
     _discover_blob_content_refs,
@@ -119,7 +118,14 @@ from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.quota_authority import TokenUsageEntry
 from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.execution._semantic_helpers import semantic_affected_component_id
-from elspeth.web.execution._validation_materialization import is_llm_authored_prompt_surface_binding
+from elspeth.web.execution._validation_materialization import (
+    FILE_INJECT_PLUGIN,
+    file_inject_admission_message,
+    file_inject_blob_refusal,
+    file_inject_runtime_config_refusals,
+    is_llm_authored_prompt_surface_binding,
+    runtime_config_node_plugins,
+)
 from elspeth.web.execution.accounting import load_run_accounting_from_db
 from elspeth.web.execution.completion_gates import (
     CompletionGateFacts,
@@ -308,6 +314,11 @@ def _log_loss_watcher_poll_failed(exc: SQLAlchemyError, *, run_id: UUID) -> None
 
 class InlineBlobPromptSurfaceAdmissionError(Exception):
     """An LLM-authored blob was bound as inline content into an LLM prompt surface.
+
+    Also raised for a ``file_inject`` node whose content is not a user-uploaded
+    file (an LLM-authored blob at or beneath ``files``, literal ``content``, or
+    any ``default_content``): that content is written into row data and can
+    reach a prompt with no review at all.
 
     Raised at run admission, before any blob is linked to the run or read, when
     an ``inline_content`` marker in an ``llm`` node's prompt surface or model
@@ -1272,6 +1283,11 @@ class ExecutionServiceImpl:
                 user_id,
                 env_ref_names=env_ref_names,
             )
+        # Before any blob is substituted: afterwards a literal and an attached
+        # upload are both strings.
+        file_inject_refusals = file_inject_runtime_config_refusals(executable_config)
+        if file_inject_refusals:
+            raise InlineBlobPromptSurfaceAdmissionError(file_inject_admission_message(file_inject_refusals))
         inline_refs = _discover_blob_content_refs(executable_config)
         if inline_refs:
             blob_service = self._blob_service
@@ -1291,22 +1307,31 @@ class ExecutionServiceImpl:
                 per_ref_byte_cap=BLOB_INLINE_PER_REF_BYTE_CAP,
                 aggregate_byte_cap=BLOB_INLINE_AGGREGATE_BYTE_CAP,
             )
-            llm_node_names = {
-                node["name"]
-                for collection_key in _NODE_COLLECTION_KEYS
-                if collection_key in executable_config and type(executable_config[collection_key]) is list
-                for node in executable_config[collection_key]
-                if type(node) is dict and "plugin" in node and node["plugin"] == "llm" and "name" in node
-            }
+            node_plugins = runtime_config_node_plugins(executable_config)
             refused_prompt_refs = [
                 ref
                 for ref in inline_refs
                 if is_llm_authored_prompt_surface_binding(
                     ref.field_path,
-                    llm_node_names=llm_node_names,
+                    node_plugins=node_plugins,
                     creation_modality=records_by_id[ref.blob_id].creation_modality,
                 )
             ]
+            file_inject_blob_refusals = [
+                refusal
+                for ref in refused_prompt_refs
+                if (
+                    refusal := file_inject_blob_refusal(
+                        ref.field_path,
+                        blob_id=ref.blob_id,
+                        node_plugins=node_plugins,
+                        creation_modality=records_by_id[ref.blob_id].creation_modality,
+                    )
+                )
+                is not None
+            ]
+            if file_inject_blob_refusals:
+                raise InlineBlobPromptSurfaceAdmissionError(file_inject_admission_message(file_inject_blob_refusals))
             if refused_prompt_refs:
                 bound = ", ".join(f"{ref.field_path} (blob {ref.blob_id})" for ref in refused_prompt_refs)
                 raise InlineBlobPromptSurfaceAdmissionError(
@@ -3691,11 +3716,14 @@ class ExecutionServiceImpl:
             # blob ids and expected payload refs admitted for staging into the
             # run's payload store after it is constructed below.
             admitted_blob_rows: list[tuple[UUID, str]] = []
+            # A file_inject node is judged on its authored options, so its
+            # config tree is loaded even when nothing else needs one.
             needs_config_tree = (
                 executable_config is not None
                 or (self._secret_service is not None and user_id is not None)
                 or inline_blob_candidate
                 or blob_rows_candidate
+                or FILE_INJECT_PLUGIN in pipeline_yaml
             )
             if needs_config_tree:
                 if resolved_dict is None:
@@ -3705,6 +3733,13 @@ class ExecutionServiceImpl:
                             f"generate_yaml() produced non-dict YAML (got {type(config_dict).__name__}) — this is a bug in the YAML generator"
                         )
                     resolved_dict = cast(dict[str, Any], config_dict)
+
+                # In the composer a file_inject entry admits only a user-uploaded
+                # file and no default_content. Checked before secret and blob
+                # substitution, while a literal and a marker can be told apart.
+                file_inject_refusals = file_inject_runtime_config_refusals(resolved_dict)
+                if file_inject_refusals:
+                    raise InlineBlobPromptSurfaceAdmissionError(file_inject_admission_message(file_inject_refusals))
 
                 runtime_secret_resolver = self._secret_service if restored_envelope is None else restored_envelope.secret_resolver
                 if runtime_secret_resolver is not None and user_id is not None:
@@ -3825,22 +3860,31 @@ class ExecutionServiceImpl:
                         # LLM-authored blob would make planner-written text the
                         # executed prompt (or model) with no human review. Fail
                         # closed before any link or read.
-                        llm_node_names = {
-                            node["name"]
-                            for collection_key in _NODE_COLLECTION_KEYS
-                            if collection_key in resolved_dict and type(resolved_dict[collection_key]) is list
-                            for node in resolved_dict[collection_key]
-                            if type(node) is dict and "plugin" in node and node["plugin"] == "llm" and "name" in node
-                        }
+                        node_plugins = runtime_config_node_plugins(resolved_dict)
                         llm_authored_prompt_refs = [
                             ref
                             for ref in inline_refs
                             if is_llm_authored_prompt_surface_binding(
                                 ref.field_path,
-                                llm_node_names=llm_node_names,
+                                node_plugins=node_plugins,
                                 creation_modality=records_by_blob_id[ref.blob_id].creation_modality,
                             )
                         ]
+                        file_inject_blob_refusals = [
+                            refusal
+                            for ref in llm_authored_prompt_refs
+                            if (
+                                refusal := file_inject_blob_refusal(
+                                    ref.field_path,
+                                    blob_id=ref.blob_id,
+                                    node_plugins=node_plugins,
+                                    creation_modality=records_by_blob_id[ref.blob_id].creation_modality,
+                                )
+                            )
+                            is not None
+                        ]
+                        if file_inject_blob_refusals:
+                            raise InlineBlobPromptSurfaceAdmissionError(file_inject_admission_message(file_inject_blob_refusals))
                         if llm_authored_prompt_refs:
                             bound = ", ".join(f"{ref.field_path} (blob {ref.blob_id})" for ref in llm_authored_prompt_refs)
                             raise InlineBlobPromptSurfaceAdmissionError(

@@ -916,7 +916,7 @@ files:
   src/elspeth/web/composer/tools/_registry.py:
     Mapping[str, Any]: 2
   src/elspeth/web/composer/tools/blobs.py:
-    boundary: 3
+    boundary: 4
     dict[str, Any]: 12
   src/elspeth/web/composer/tools/declarations.py:
     Mapping[str, Any]: 4
@@ -990,6 +990,7 @@ files:
     Mapping[str, object]: 1
   src/elspeth/web/execution/_validation_materialization.py:
     Mapping[str, Any]: 1
+    boundary: 3
   src/elspeth/web/execution/_validation_runtime.py:
     Mapping[str, object]: 1
     dict[str, object]: 2
@@ -1097,7 +1098,7 @@ totals:
   Mapping[str, Any]: 790
   Mapping[str, object]: 317
   MutableMapping[str, Any]: 8
-  boundary: 60
+  boundary: 64
   dict[str, Any]: 1104
   dict[str, object]: 402
   soft: 2621

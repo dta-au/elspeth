@@ -250,6 +250,7 @@ _EMITTED_POLICY_AND_EXECUTION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "disallowed_secret_ref",
         "empty_pipeline",
         "fabricated_secret",
+        "file_inject_content_not_uploaded",
         "interpretation_review_drift",
         "llm_authored_inline_blob_content",
         "llm_base_url_not_allowed",

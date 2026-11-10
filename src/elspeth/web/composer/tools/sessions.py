@@ -120,6 +120,7 @@ from elspeth.web.composer.tools._common import (
 from elspeth.web.composer.tools.blobs import (
     _blob_create_payload,
     _blob_creation_provenance,
+    _file_inject_node_option_error,
     _llm_authored_inline_prompt_surface_error,
     _persist_prepared_blob_create,
     _prepare_blob_create,
@@ -1634,6 +1635,19 @@ def build_set_pipeline_candidate(
             if prompt_surface_error is not None:
                 _record_component_rejection(
                     _failure_result(state, prompt_surface_error, error_code="llm_authored_inline_blob_content", rejected_component=node_ref)
+                )
+                continue
+            # file_inject content is a user-uploaded file on every authoring path.
+            file_inject_error = _file_inject_node_option_error(
+                context,
+                tool_name="set_pipeline",
+                node_id=node_id,
+                plugin=node_plugin,
+                options=review_options,
+            )
+            if file_inject_error is not None:
+                _record_component_rejection(
+                    _failure_result(state, file_inject_error, error_code="file_inject_content_not_uploaded", rejected_component=node_ref)
                 )
                 continue
 

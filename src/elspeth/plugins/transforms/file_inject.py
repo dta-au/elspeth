@@ -595,7 +595,7 @@ class FileInject(BaseTransform):
     name = "file_inject"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0ca9eb5c9ba46a72"
+    source_file_hash: str | None = "sha256:0cac4b3227ea3242"
     config_model = FileInjectConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -683,18 +683,21 @@ class FileInject(BaseTransform):
                     "In mode select the entry names are the key values. They are compared exactly, with no trimming "
                     "and no case folding, and the key value must be a string; quote every entry name.",
                     "on_miss applies to mode select only and defaults to fail, because a row without its guidance "
-                    "looks like any other row at a sink. Use null, or default with default_content, to continue. "
+                    "looks like any other row at a sink. Use null to continue. "
                     "A row with no key_field, or a non-string value there, is a row error under every on_miss.",
+                    "on_miss: default with default_content works in CLI settings only. The composer does not accept "
+                    "default_content: use on_miss null or fail there and handle the miss downstream.",
                     "Set format on every entry: text, json, jsonl or csv. It is never inferred from a file name. "
                     "text writes the content as one string, unmodified; json writes the parsed value; jsonl and csv "
                     "write a list, and csv cells remain strings.",
-                    "In the composer an entry's content must be a file the user uploaded. When the user wants text "
-                    "they have not uploaded, tell them to save it as a file and upload it; attach it only once the "
-                    "upload exists.",
-                    "Then find the ready upload with list_blobs and get_blob_metadata, and attach it with "
-                    "wire_blob_inline_ref at 'node:<node_id>.options.files.<entry_name>.content', once per entry.",
-                    "Do not use create_blob to supply file_inject content, and do not write literal text into "
-                    "content: in the composer neither is accepted for this plugin.",
+                    "In the composer an entry's content must be a file the user uploaded. Do not use create_blob to "
+                    "supply file_inject content, and do not write literal text into content. When the user wants "
+                    "text they have not uploaded, tell them to save it as a file and upload it.",
+                    "Then find the ready upload with list_blobs and get_blob_metadata. For an entry that already "
+                    "exists, attach it with wire_blob_inline_ref at 'node:<node_id>.options.files.<entry_name>.content'.",
+                    "When the call creates the node or the entry, set that entry's content to "
+                    '{"blob_ref": "<blob_id>", "mode": "inline_content", "sha256": "<content_hash>"} with the '
+                    "blob's id and content_hash.",
                     "On the CLI put content_file: <name> under each entry, beside settings.yaml; the loader reads it "
                     "into that entry's content.",
                     "An output field must not already exist on the arriving row: file_inject never overwrites, and "

@@ -355,3 +355,23 @@ Recorded here so the spec matches what was built.
 - **Shared parsing helpers** live in `plugins/infrastructure/config_content.py`
   and raise neutral `ValueError` subclasses; `reference_join` wraps them to keep
   its existing exception types and text.
+- **Attaching an upload when the node does not exist yet.** A `file_inject`
+  entry without `content` fails config validation, and literal `content` is
+  refused in the composer, so a node can only be created by a call that already
+  carries the marker. Step 3 of the working path therefore has two forms: for an
+  entry that already exists, `wire_blob_inline_ref` at
+  `node:<node_id>.options.files.<entry_name>.content`; when the call creates the
+  node or the entry, the entry's `content` is set to
+  `{"blob_ref": "<blob_id>", "mode": "inline_content", "sha256": "<content_hash>"}`
+  in the same call. No new incomplete state was added. A wrong or stale hash
+  fails closed at `/validate` and at run admission.
+- **`default_content` is refused in the composer** in any form (literal or
+  marker), at authoring, YAML import, `/validate` and run admission: it is
+  planner-authorable text written into rows on a miss. The refusal steers to
+  `on_miss: null` or `on_miss: fail`. CLI settings are unaffected.
+- **YAML import** refuses literal `content` and `default_content` on a
+  `file_inject` node with HTTP 400; an `inline_content` marker is left
+  untouched.
+- **One error code**, `file_inject_content_not_uploaded`, covers the three
+  refusal causes. The pipeline planner's feedback withholds validator messages,
+  so the code carries static guidance with the same working path.

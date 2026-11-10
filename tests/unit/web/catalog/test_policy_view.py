@@ -88,12 +88,22 @@ def test_lists_only_snapshot_available_plugins(view: PolicyCatalogView) -> None:
     assert {item.name for item in view.list_sinks()} == {"csv", "document", "json", "text"}
     assert {item.name for item in view.list_transforms()} == {
         "field_mapper",
+        "file_inject",
         "line_explode",
         "llm",
         "reference_join",
         "report_assemble",
         "web_scrape",
     }
+
+
+def test_file_inject_is_in_default_web_surface(view: PolicyCatalogView) -> None:
+    from elspeth.web.plugin_policy.compiler import REQUIRED_WEB_PLUGIN_IDS
+    from elspeth.web.plugin_policy.models import PluginId
+
+    assert PluginId("transform", "file_inject") in REQUIRED_WEB_PLUGIN_IDS
+    assert "file_inject" in {item.name for item in view.list_transforms()}
+    assert view.get_schema("transform", "file_inject").name == "file_inject"
 
 
 def test_public_llm_schema_contains_only_usable_alias(view: PolicyCatalogView) -> None:
