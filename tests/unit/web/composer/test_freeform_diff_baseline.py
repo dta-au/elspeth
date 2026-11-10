@@ -104,6 +104,14 @@ async def test_diff_uses_request_start_and_resets_for_next_request(
     assert payloads[1]["data"]["from_version"] == state.version
     assert payloads[1]["data"]["metadata_changed"] is (not explicit_approval)
     assert payloads[1]["data"]["total_changes"] == (0 if explicit_approval else 1)
+    # Held (staged, unapplied) edits are invisible to the diff: say so truthfully, and only then.
+    assert "post_call_hints" not in payloads[0]
+    if explicit_approval:
+        assert len(payloads[1]["post_call_hints"]) == 1
+        assert "not applied" in payloads[1]["post_call_hints"][0]
+        assert "pending approval" in payloads[1]["post_call_hints"][0]
+    else:
+        assert "post_call_hints" not in payloads[1]
 
     current_record = await service._require_sessions_service().get_current_state(UUID(session_id))
     with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as provider:
