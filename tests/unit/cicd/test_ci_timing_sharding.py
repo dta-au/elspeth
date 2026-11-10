@@ -14,6 +14,7 @@ from scripts.ci_test_shards import (
     build_timing_manifest,
     collection_digest,
     evidence_identity,
+    finalize_long_run_manifest,
     validate_long_run_shards,
 )
 from tests.unit.cicd.test_ci_sharding import _init_checkout, _long_run_artifacts, _partition_run, _partition_suite
@@ -90,6 +91,147 @@ def test_timing_partition_records_real_marker_selection_and_success(tmp_path: Pa
     assert manifest["shard_count"] == 1
     assert manifest["shard_index"] == 0
     assert "proof_call_passed" not in manifest
+    assert manifest["timing_call_outcomes"] == {"tests/test_tiny_timing.py::test_timing": "passed"}
+    assert manifest["timing_passed_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("control", "body", "expected", "exit_status"),
+    [
+        ("", "pytest.skip('controlled skip')", "skipped", 0),
+        ("", "pytest.xfail('controlled xfail')", "xfailed", 0),
+        ("@pytest.mark.xfail(reason='controlled xpass', strict=False)\n", "assert True", "xpassed", 0),
+        ("", "assert False", "failed", 1),
+        ("@pytest.mark.skip(reason='controlled setup skip')\n", "assert False", None, 0),
+    ],
+    ids=["call-skip", "xfail", "xpass", "failed", "setup-skip"],
+)
+def test_timing_partition_records_only_call_outcomes(
+    tmp_path: Path, control: str, body: str, expected: str | None, exit_status: int
+) -> None:
+    _tiny_timing_suite(tmp_path)
+    (tmp_path / "tests" / "test_tiny_timing.py").write_text(
+        "import pytest\n"
+        "@pytest.mark.timing_sensitive\ndef test_pass(): assert True\n"
+        f"@pytest.mark.timing_sensitive\n{control}def test_control(): {body}\n",
+        encoding="utf-8",
+    )
+    result, report = _partition_run(tmp_path, "timing", extra_args=["-m", "timing_sensitive"])
+    assert result.returncode == exit_status, result.stdout + result.stderr
+    manifest = json.loads(report.read_text(encoding="utf-8"))
+    outcomes = {"tests/test_tiny_timing.py::test_pass": "passed"}
+    if expected is not None:
+        outcomes["tests/test_tiny_timing.py::test_control"] = expected
+    assert manifest["timing_call_outcomes"] == outcomes
+    assert manifest["timing_passed_count"] == 1
+    assert manifest["exit_status"] == exit_status
+
+
+def test_timing_finalizer_copies_call_evidence_without_mutating_collection_or_state(tmp_path: Path) -> None:
+    _init_checkout(tmp_path)
+    nodeids = ["test_tiny.py::test_pass", "test_tiny.py::test_skip"]
+    manifest = build_timing_manifest(tmp_path, nodeids, nodeids)
+    outcomes = dict(zip(nodeids, ["passed", "skipped"], strict=True))
+    terminal = finalize_long_run_manifest(manifest, 0, None, timing_call_outcomes=outcomes)
+    assert terminal["timing_call_outcomes"] == outcomes
+    assert terminal["timing_passed_count"] == 1
+    assert terminal["exit_status"] == 0
+    assert manifest["exit_status"] is None
+    assert "timing_call_outcomes" not in manifest
+    outcomes.clear()
+    assert terminal["timing_call_outcomes"] == dict(zip(nodeids, ["passed", "skipped"], strict=True))
+    with pytest.raises(ValueError, match="unfinalized"):
+        finalize_long_run_manifest(terminal, 0, None)
+
+
+@pytest.mark.parametrize("collect_only", [False, True], ids=["all-skipped", "collect-only"])
+def test_timing_real_no_pass_evidence_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, collect_only: bool) -> None:
+    _tiny_timing_suite(tmp_path)
+    (tmp_path / "tests" / "test_tiny_timing.py").write_text(
+        "import pytest\n@pytest.mark.timing_sensitive\ndef test_timing(): pytest.skip('controlled call skip')\n",
+        encoding="utf-8",
+    )
+    result, report = _partition_run(
+        tmp_path, "timing", extra_args=["-m", "timing_sensitive", *(["--collect-only"] if collect_only else [])]
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = json.loads(report.read_text(encoding="utf-8"))
+    nodeids = ["tests/test_tiny_timing.py::test_timing"]
+    assert manifest["selected_nodeids"] == nodeids
+    artifacts = _long_run_artifacts(tmp_path, monkeypatch, "3.12")
+    validate_long_run_shards(artifacts, 4, tmp_path, "3.12")
+    target = artifacts / "timing-shard-3.12-attempt-2" / "shard-manifest.json"
+    # Supply only the native producer envelope from the artifact fixture. The
+    # collection and call evidence must come from the real subprocess above.
+    envelope = json.loads(target.read_text(encoding="utf-8"))
+    for field in ("tested_commit", "duration_profile_sha256", "python_version", "github_run_id", "github_run_attempt", "producer_job"):
+        manifest[field] = envelope[field]
+    positive = {**manifest, "timing_call_outcomes": dict.fromkeys(nodeids, "passed"), "timing_passed_count": 1}
+    target.write_text(json.dumps(positive), encoding="utf-8")
+    validate_long_run_shards(artifacts, 4, tmp_path, "3.12")
+    target.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="timing call"):
+        validate_long_run_shards(artifacts, 4, tmp_path, "3.12")
+    assert manifest["timing_call_outcomes"] == ({} if collect_only else {nodeids[0]: "skipped"})
+    assert manifest["timing_passed_count"] == 0
+
+
+@pytest.mark.parametrize("version", ["3.12", "3.13"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "all-skipped",
+        "missing-one",
+        "zero-passed",
+        "collect-only",
+        "missing-outcomes",
+        "missing-count",
+        "extra-id",
+        "invalid-outcome",
+        "bool-count",
+    ],
+)
+def test_timing_consumer_requires_complete_calls_and_a_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str, mutation: str
+) -> None:
+    artifacts = _long_run_artifacts(tmp_path, monkeypatch, version)
+    report = artifacts / f"timing-shard-{version}-attempt-2" / "shard-manifest.json"
+    manifest = json.loads(report.read_text(encoding="utf-8"))
+    nodeids = ["test_sample.py::test_timing", "test_sample.py::test_other_timing"]
+    manifest.update(
+        selected_nodeids=nodeids,
+        timing_marked_nodeids=nodeids,
+        collection_digest=collection_digest(nodeids),
+        timing_call_outcomes={nodeids[0]: "passed", nodeids[1]: "skipped"},
+        timing_passed_count=1,
+    )
+    report.write_text(json.dumps(manifest), encoding="utf-8")
+    # An individual skipped call is valid alongside a passing call.
+    validate_long_run_shards(artifacts, 4, tmp_path, version)
+    if mutation == "all-skipped":
+        manifest["timing_call_outcomes"] = dict.fromkeys(nodeids, "skipped")
+        manifest["timing_passed_count"] = 0
+    elif mutation == "missing-one":
+        del manifest["timing_call_outcomes"][nodeids[1]]
+    elif mutation == "zero-passed":
+        manifest["timing_passed_count"] = 0
+    elif mutation == "collect-only":
+        manifest["timing_call_outcomes"] = {}
+        manifest["timing_passed_count"] = 0
+    elif mutation == "missing-outcomes":
+        del manifest["timing_call_outcomes"]
+    elif mutation == "missing-count":
+        del manifest["timing_passed_count"]
+    elif mutation == "extra-id":
+        manifest["timing_call_outcomes"]["test_sample.py::test_foreign"] = "passed"
+        manifest["timing_passed_count"] = 2
+    elif mutation == "invalid-outcome":
+        manifest["timing_call_outcomes"][nodeids[1]] = "unknown"
+    else:
+        manifest["timing_passed_count"] = True
+    report.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="timing call"):
+        validate_long_run_shards(artifacts, 4, tmp_path, version)
 
 
 @pytest.mark.parametrize(("count", "workers"), [(2, "0"), (1, "1"), (1, "2")])
@@ -162,8 +304,11 @@ def test_timing_consumer_refuses_invalid_identity_collection_or_marker_evidence(
             nodeids = json.loads(ordinary.read_text(encoding="utf-8"))["selected_nodeids"][:1]
         manifest["selected_nodeids"] = manifest["timing_marked_nodeids"] = nodeids
         manifest["collection_digest"] = collection_digest(nodeids)
+        if mutation == "overlap":
+            manifest["timing_call_outcomes"] = dict.fromkeys(nodeids, "passed")
+            manifest["timing_passed_count"] = len(nodeids)
     report.write_text(json.dumps(manifest), encoding="utf-8")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Timing collection overlaps" if mutation == "overlap" else None):
         validate_long_run_shards(artifacts, 4, tmp_path, version)
 
 

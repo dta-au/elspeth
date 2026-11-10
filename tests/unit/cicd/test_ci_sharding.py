@@ -1383,6 +1383,8 @@ def _long_run_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version
     manifest = build_timing_manifest(tmp_path, timing_ids, timing_ids)
     manifest["python_version"] = version
     manifest["exit_status"] = 0
+    manifest["timing_call_outcomes"] = dict.fromkeys(timing_ids, "passed")
+    manifest["timing_passed_count"] = len(timing_ids)
     if version == "3.13":
         source = tmp_path / "producer-timing" / "src" / "elspeth" / "sample.py"
         source.parent.mkdir(parents=True)

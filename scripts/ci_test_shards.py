@@ -28,6 +28,7 @@ TIMING_MARKER = "timing_sensitive"
 ASSIGNMENT_ALGORITHM = "duration-lpt-v1"
 DURATION_PROFILE_PATH = Path("config/cicd/pytest-duration-profile.json")
 _PROOF_CALL_PASSED = pytest.StashKey[bool | None]()
+_TIMING_CALL_OUTCOMES = pytest.StashKey[dict[str, str]]()
 LONG_RUN_CASES = {
     "no-escape": (
         "tests/unit/architecture/test_web_landscape_mutation_fencing.py::test_no_mutation_alias_wrapper_dynamic_or_raw_write_escape_exists"
@@ -224,7 +225,11 @@ def long_run_call_result(case: str, nodeid: str, phase: str, passed: bool, xfail
 
 
 def finalize_long_run_manifest(
-    manifest: dict[str, object], exit_status: int, proof_call_passed: bool | None, coverage_database: Path | None = None
+    manifest: dict[str, object],
+    exit_status: int,
+    proof_call_passed: bool | None,
+    coverage_database: Path | None = None,
+    timing_call_outcomes: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Copy owned collection evidence after coverage closes, before publication.
 
@@ -241,6 +246,8 @@ def finalize_long_run_manifest(
         or manifest["exit_status"] is not None
         or "proof_call_passed" in manifest
         or "coverage_sha256" in manifest
+        or "timing_call_outcomes" in manifest
+        or "timing_passed_count" in manifest
     ):
         raise ValueError("Finalize only unfinalized schema-4 collection evidence")
     partition = manifest["partition"]
@@ -257,7 +264,13 @@ def finalize_long_run_manifest(
             raise ValueError("Proof evidence requires its exact catalog singleton")
     else:
         raise ValueError("Terminal evidence requires an ordinary, proof, or timing partition")
+    if partition != "timing" and timing_call_outcomes is not None:
+        raise ValueError("Only timing evidence can carry timing call outcomes")
     terminal = {**manifest, "exit_status": exit_status}
+    if partition == "timing":
+        outcomes = dict(timing_call_outcomes) if timing_call_outcomes is not None else {}
+        terminal["timing_call_outcomes"] = outcomes
+        terminal["timing_passed_count"] = sum(outcome == "passed" for outcome in outcomes.values())
     if partition == "proof":
         terminal["proof_call_passed"] = proof_call_passed is True
         if proof_call_passed is not True and exit_status == 0:
@@ -300,6 +313,8 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
+    if session.config.getoption("ci_partition") == "timing":
+        session.config.stash[_TIMING_CALL_OUTCOMES] = {}
     report = session.config.getoption("ci_shard_report")
     if report is not None and "PYTEST_XDIST_WORKER" not in os.environ:
         report.unlink(missing_ok=True)
@@ -385,6 +400,13 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]) ->
             bool(list(item.iter_markers(name="xfail"))),
             item.config.stash.get(_PROOF_CALL_PASSED, None),
         )
+    elif item.config.getoption("ci_partition") == "timing" and report.when == "call":
+        # Pytest adds wasxfail only to reports for an effective xfail. A
+        # non-strict XPASS is report.passed, but must not count as a pass.
+        outcome = report.outcome
+        if "wasxfail" in report.__dict__:
+            outcome = "xfailed" if report.skipped else "xpassed"
+        item.config.stash[_TIMING_CALL_OUTCOMES][item.nodeid] = outcome
     return report
 
 
@@ -403,7 +425,13 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> Generator[
     manifest = json.loads(report.read_text(encoding="utf-8"))
     database = Path(os.environ.get("COVERAGE_FILE", ".coverage")) if session.config.getoption("cov_source", default=None) else None
     if session.config.getoption("ci_partition") != "all":
-        manifest = finalize_long_run_manifest(manifest, int(session.exitstatus), proof_passed if proof_partition else None, database)
+        manifest = finalize_long_run_manifest(
+            manifest,
+            int(session.exitstatus),
+            proof_passed if proof_partition else None,
+            database,
+            session.config.stash.get(_TIMING_CALL_OUTCOMES, None),
+        )
         effective_status = manifest["exit_status"]
         assert type(effective_status) is int
         session.exitstatus = effective_status
@@ -582,6 +610,17 @@ def validate_long_run_shards(artifact_dir: Path, count: int, checkout: Path, pyt
                 raise ValueError(f"Artifact {folder.name} lacks timing_sensitive markers for every selected item")
             if manifest.get("collection_digest") != collection_digest(nodeids):
                 raise ValueError(f"Artifact {folder.name} differs from its timing collection digest")
+            outcomes = manifest.get("timing_call_outcomes")
+            passed_count = manifest.get("timing_passed_count")
+            if (
+                not isinstance(outcomes, dict)
+                or set(outcomes) != set(nodeids)
+                or any(outcome not in ("passed", "failed", "skipped", "xfailed", "xpassed") for outcome in outcomes.values())
+                or type(passed_count) is not int
+                or passed_count < 1
+                or passed_count != sum(outcome == "passed" for outcome in outcomes.values())
+            ):
+                raise ValueError(f"Artifact {folder.name} lacks complete timing call outcomes with at least one pass")
             timing_selected = nodeids
         else:
             if any(nodeid in cases.values() for nodeid in nodeids):
