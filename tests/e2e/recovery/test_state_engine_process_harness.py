@@ -102,6 +102,7 @@ def _signal_during_trace_retirement(path: str) -> None:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="trace retirement control uses a POSIX signal")
+@pytest.mark.timing_sensitive
 def test_trace_retirement_ignores_late_signal_with_live_secondary_thread() -> None:
     diagnostics = ProcessDiagnostics()
     process = multiprocessing.get_context("spawn").Process(target=_signal_during_trace_retirement, args=(diagnostics.path,))
@@ -117,6 +118,7 @@ def test_trace_retirement_ignores_late_signal_with_live_secondary_thread() -> No
         diagnostics.close()
 
 
+@pytest.mark.timing_sensitive
 def test_durable_seam_process_reports_early_failure_without_postgres() -> None:
     from tests.testcontainer.web.test_cross_process_run_reconciliation_postgres import _process
 
@@ -124,6 +126,7 @@ def test_durable_seam_process_reports_early_failure_without_postgres() -> None:
         _process(_fail_before_durable_seam, expected_exit=75)
 
 
+@pytest.mark.timing_sensitive
 def test_durable_seam_process_preserves_deliberate_exit_without_postgres() -> None:
     from tests.testcontainer.web.test_cross_process_run_reconciliation_postgres import _process
 
@@ -181,6 +184,7 @@ def test_follower_readiness_distinguishes_absent_work_from_database_failure(tmp_
 
 @pytest.mark.skipif(os.name != "posix", reason="child stack capture uses a POSIX signal")
 @pytest.mark.parametrize("spawn", [spawn_database_process_at_seam, spawn_database_process_with_pause])
+@pytest.mark.timing_sensitive
 def test_readiness_timeout_captures_live_action_stack_before_cleanup(tmp_path: Path, spawn: Any) -> None:
     database_url = f"sqlite:///{tmp_path / 'blocked.db'}"
     with LandscapeDB(database_url):
@@ -199,7 +203,36 @@ def test_readiness_timeout_captures_live_action_stack_before_cleanup(tmp_path: P
         assert not child.is_alive
 
 
+@pytest.mark.skipif(os.name != "posix", reason="child stack capture uses a POSIX signal")
+@pytest.mark.timing_sensitive
+def test_readiness_timeout_evidence_survives_a_failed_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A child that outlives the cleanup ladder must not hide why readiness expired."""
+    database_url = f"sqlite:///{tmp_path / 'blocked.db'}"
+    with LandscapeDB(database_url):
+        pass
+    entered = multiprocessing.get_context("spawn").Event()
+    with spawn_database_process_at_seam(
+        database_url=database_url, seam="blocked-action", action=_block_before_process_seam, action_args=(entered,)
+    ) as child:
+        assert entered.wait(20), "child did not enter controlled blocking action"
+        real_close = child.close
+
+        def failing_close() -> None:
+            raise AssertionError("could not clean up child at process seam blocked-action")
+
+        monkeypatch.setattr(child, "close", failing_close)
+        with pytest.raises(AssertionError) as failure:
+            child.wait_until_ready(timeout=0.05)
+        message = str(failure.value)
+        assert "did not reach process seam blocked-action" in message
+        assert "_block_before_process_seam" in message
+        assert failure.value.__notes__ == ["could not clean up child at process seam blocked-action"]
+        monkeypatch.undo()
+        real_close()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="SIGKILL exit-code oracle is POSIX-specific")
+@pytest.mark.timing_sensitive
 def test_spawned_child_is_killed_at_named_seam_then_fresh_objects_resume(
     tmp_path: Path,
     request: pytest.FixtureRequest,
@@ -256,6 +289,7 @@ def test_spawned_child_is_killed_at_named_seam_then_fresh_objects_resume(
     assert resume_source.load_invocations == 0
 
 
+@pytest.mark.timing_sensitive
 def test_readiness_failure_is_bounded_and_cleans_up_child(tmp_path: Path) -> None:
     database_url = f"sqlite:///{tmp_path / 'child-failure.db'}"
     db = LandscapeDB(database_url)
@@ -274,6 +308,7 @@ def test_readiness_failure_is_bounded_and_cleans_up_child(tmp_path: Path) -> Non
     assert child.is_alive is False
 
 
+@pytest.mark.timing_sensitive
 def test_spawned_child_release_has_bounded_clean_exit(tmp_path: Path) -> None:
     database_url = f"sqlite:///{tmp_path / 'child-release.db'}"
     db = LandscapeDB(database_url)
