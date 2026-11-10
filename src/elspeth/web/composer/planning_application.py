@@ -51,6 +51,7 @@ from elspeth.web.composer.audit_storage import (
 from elspeth.web.composer.availability import ComposerAvailability
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 from elspeth.web.composer.composer_preflight import ComposerPreflight
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory
 from elspeth.web.composer.discovery_cache import RuntimePreflightCache as _RuntimePreflightCache
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext
 from elspeth.web.composer.invariants import InvariantError
@@ -1072,6 +1073,7 @@ class PlanningApplication:
         retained_operation_context: RetainedOperationContext | None = None,
         turn_evidence: TurnEvidence | None = None,
         request_deadline: float | None = None,
+        context_budget_history: ContextBudgetHistory | None = None,
     ) -> ComposerResult:
         """Build one canonical full-pipeline proposal for an empty topology."""
 
@@ -1209,6 +1211,7 @@ class PlanningApplication:
                 recorder=recorder,
                 provider_service=self._sessions_service if provider_owner is not None else None,
                 provider_owner=provider_owner,
+                context_budget_history=context_budget_history,
                 candidate_finalizer=_required_controls_candidate_finalizer(
                     policy_catalog=policy_catalog,
                     plugin_snapshot=plugin_snapshot,
