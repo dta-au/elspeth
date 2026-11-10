@@ -99,8 +99,9 @@ published tag or an image.
 - **`file_inject` transform.** Writes the content of whole files, bound as
   configuration, into row fields. The content is part of node identity, so
   editing a bound file between a run and its resume refuses the resume. It is
-  installed but not in the default web plugin set; a deployment authorises it
-  through its plugin allowlist.
+  in the default web plugin set. In the Composer its content must be a file the
+  user uploaded: content written by the planner is refused. A shipped example
+  is in `examples/file_inject/`.
 
 ### MCP server
 
