@@ -142,6 +142,120 @@ function contrastRatio(foreground: string, background: string): number {
   return (lighter + 0.05) / (darker + 0.05);
 }
 
+// Match complete nested blocks: a non-greedy media regex would capture only
+// :root and silently omit the light override. Comments cannot supply a match.
+function completeCssBlock(css: string, header: string): string {
+  const source = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  const start = source.indexOf(header);
+  if (start === -1) {
+    throw new Error(`Missing CSS block ${header}`);
+  }
+  const open = source.indexOf("{", start + header.length);
+  if (open === -1 || source.slice(start + header.length, open).trim() !== "") {
+    throw new Error(`Invalid CSS block ${header}`);
+  }
+  let depth = 1;
+  for (let end = open + 1; end < source.length; end += 1) {
+    if (source[end] === "{") depth += 1;
+    if (source[end] === "}") depth -= 1;
+    if (depth === 0) return source.slice(open + 1, end);
+  }
+  throw new Error(`Unclosed CSS block ${header}`);
+}
+
+describe("ARGOnite prefers-contrast palette", () => {
+  const themesCss = readFileSync("src/styles/themes.css", "utf8");
+  const themes = ["dark", "light"] as const;
+  const textTokens = ["--color-text", "--color-text-secondary", "--color-text-muted"];
+  const borderTokens = ["--color-border", "--color-border-strong"];
+  const bodySurfaces = [
+    "--color-bg",
+    "--color-surface",
+    "--color-well",
+    "--color-surface-elevated",
+    "--color-pane-header",
+  ];
+
+  function override(css: string, theme: "dark" | "light", token: string): string {
+    const media = completeCssBlock(css, "@media (prefers-contrast: more)");
+    const block = completeCssBlock(media, theme === "dark" ? ":root" : '[data-theme="light"]');
+    return extractTokenFromBlock(token, block, `prefers-contrast ${theme}`);
+  }
+
+  function assertContrast(css: string): void {
+    for (const theme of themes) {
+      // The light green navigation band uses --color-on-nav(-muted), not
+      // these body roles. Even pure black/white cannot reach 7:1 on that
+      // band; header role assignments and their own AA pairs stay gated.
+      const surfaces = theme === "dark" ? [...bodySurfaces, "--color-surface-nav"] : bodySurfaces;
+      for (const token of [...textTokens, ...borderTokens]) {
+        const foreground = override(css, theme, token);
+        const floor = textTokens.includes(token) ? 7 : 3;
+        for (const surface of surfaces) {
+          expect(
+            contrastRatio(foreground, resolveHex(theme, surface)),
+            `prefers-contrast ${token} on ${surface} (${theme})`,
+          ).toBeGreaterThanOrEqual(floor);
+        }
+      }
+    }
+  }
+
+  it("extracts both theme blocks without accepting a comment or adjacent media block", () => {
+    const fixture = `/* @media (prefers-contrast: more) { :root { --color-text: #999999; } } */
+      @media (prefers-contrast: more) {
+        :root { --color-text: #ffffff; }
+        [data-theme="light"] { --color-text: #000000; }
+      }
+      @media (forced-colors: active) { :root { --color-text: #123456; } }`;
+    expect(override(fixture, "dark", "--color-text")).toBe("#ffffff");
+    expect(override(fixture, "light", "--color-text")).toBe("#000000");
+    const missingMedia = fixture.split("prefers-contrast: more").join("prefers-contrast: less");
+    expect(() => override(missingMedia, "dark", "--color-text"))
+      .toThrow("Missing CSS block");
+    expect(() => completeCssBlock("@media (prefers-contrast: more) { :root { }", "@media (prefers-contrast: more)"))
+      .toThrow("Unclosed CSS block");
+  });
+
+  it("detects deliberate failing pairs and text or border regressions in either theme", () => {
+    expect(contrastRatio("#ffffff", "#000000")).toBe(21);
+    expect(contrastRatio("#ffffff", "#ffffff")).toBe(1);
+    for (const theme of themes) {
+      for (const token of [...textTokens, ...borderTokens]) {
+        const value = override(themesCss, theme, token);
+        const failedCss = themesCss.replace(value, resolveHex(theme, "--color-surface-elevated"));
+        expect(failedCss, `${theme} ${token} mutation`).not.toBe(themesCss);
+        expect(() => assertContrast(failedCss)).toThrow(token);
+      }
+    }
+  });
+
+  it("keeps body text at 7:1 and both border strengths at 3:1 on their pane surfaces", () => {
+    assertContrast(themesCss);
+  });
+
+  it("strengthens each register while preserving text and border hierarchy", () => {
+    for (const theme of themes) {
+      expect(override(themesCss, theme, "--color-text")).toBe(theme === "dark" ? "#ffffff" : "#000000");
+      const ground = resolveHex(theme, "--color-bg");
+      const ratio = (token: string) => contrastRatio(override(themesCss, theme, token), ground);
+      for (const token of [...textTokens, ...borderTokens]) {
+        expect(ratio(token), `${token} strengthens (${theme})`)
+          .toBeGreaterThan(contrastRatio(resolveHex(theme, token), ground));
+      }
+      expect(ratio("--color-text")).toBeGreaterThan(ratio("--color-text-secondary"));
+      expect(ratio("--color-text-secondary")).toBeGreaterThan(ratio("--color-text-muted"));
+      expect(ratio("--color-border-strong")).toBeGreaterThan(ratio("--color-border"));
+    }
+  });
+
+  it("keeps header text on the dedicated navigation roles rather than body ink", () => {
+    expect(extractCssRule(".app-header")).toContain("color: var(--color-on-nav);");
+    expect(extractCssRule(".app-header .chat-model-chip")).toContain("color: var(--color-on-nav-muted);");
+    expect(extractCssRule(".app-header .chat-model-chip-label")).toContain("color: inherit;");
+  });
+});
+
 describe("action bar reason text on the canvas (ARGOnite Task 8)", () => {
   it("keeps body and muted text at AA on --color-bg in both themes", () => {
     for (const extract of [extractRootToken, extractLightThemeToken]) {
