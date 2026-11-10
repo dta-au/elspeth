@@ -88,6 +88,7 @@ class TestRateLimiterWindowReset:
     """Tests that the sliding window resets correctly."""
 
     @pytest.mark.asyncio
+    @pytest.mark.timing_sensitive
     async def test_window_resets_after_60_seconds(self) -> None:
         limiter = ComposerRateLimiter(limit=1)
         # Manually inject an old timestamp to simulate window expiry. Inject the

@@ -133,7 +133,6 @@
     "tests/unit/web/test_app.py::TestSecretsExceptionHandlers::test_create_ack_omits_available_and_validate_true_agrees": 11132,
     "tests/unit/web/test_app_failed_physical_exit.py::test_failed_physical_app_exit_uses_actual_producer_receipts": 5784,
     "tests/unit/web/test_app_failed_physical_exit.py::test_failed_physical_partial_constructor_does_not_replay_claim": 5780,
-    "tests/unit/web/test_composer_stream.py::test_default_asgi_send_deadline_bounds_actual_send_and_keeps_resistant_permit": 5053,
     "tests/unit/web/test_credential_boundary_inventory.py::test_every_scoped_request_free_text_field_has_a_closed_disposition": 6260,
     "tests/unit/web/test_credential_boundary_inventory.py::test_llm_audit_constructor_inventory_detects_new_bypass_and_guard_removal": 19963,
     "tests/unit/web/test_credential_boundary_inventory.py::test_llm_audit_constructors_are_behind_the_common_metadata_guard": 6534,

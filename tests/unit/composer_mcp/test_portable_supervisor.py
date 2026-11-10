@@ -120,6 +120,7 @@ def test_authentication_and_partial_startup_fail_closed(tmp_path, mode):
         "required-worker",
     ],
 )
+@pytest.mark.timing_sensitive
 def test_deadline_survives_real_protocol_and_child_faults(tmp_path, mode):
     started = time.monotonic()
     process = launch(tmp_path, mode, speed=50)

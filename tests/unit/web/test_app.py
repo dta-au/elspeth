@@ -633,6 +633,7 @@ class TestHealthEndpoint:
         assert response.json() == {"status": "ok"}
 
     @pytest.mark.asyncio
+    @pytest.mark.timing_sensitive
     async def test_health_responds_during_malicious_jinja_render(self, tmp_path) -> None:
         app = create_app(_settings(tmp_path))
         attempted = threading.Event()
@@ -669,6 +670,7 @@ class TestHealthEndpoint:
         assert client.get("/api/ready").status_code == 503
 
     @pytest.mark.asyncio
+    @pytest.mark.timing_sensitive
     async def test_health_remains_responsive_while_blob_resolution_blocks_in_worker(self, tmp_path, monkeypatch) -> None:
         import elspeth.web.readiness as readiness_module
 
