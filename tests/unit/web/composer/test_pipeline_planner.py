@@ -289,7 +289,15 @@ _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES = 188
 # declined, the value is 1,682. Operator ruling 2026-11-10: the 3,494 B
 # allowance, gate_routing aid included, is approved; the prompt is scheduled
 # for a per-surface restructure that is expected to replace this pin.
-_SKILL_REWORK_0812_CANONICAL_BYTES = 3494
+# Follow-up the same day, after a live battery showed planners sending the
+# pipeline as a JSON-encoded string or beside an empty sources map: the
+# instruction states the argument shape, and the review corrections (discard
+# and fork as route destinations, fixed-sink refusal of undeclared fields, the
+# exemplar's source made fixed) land in the core and the aid. Measured
+# 139,533 B, +309 B. The value follows the measurement under the operator's
+# standing direction that this threshold tracks the working system: 3,803 B
+# over the prior 135,730 B pin.
+_SKILL_REWORK_0812_CANONICAL_BYTES = 3803
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
@@ -2985,9 +2993,91 @@ async def test_missing_source_candidate_fails_closed_before_full_candidate_is_ac
             "severity": "high",
             "error_code": "canonical_schema",
             "error_class": "SchemaValidationError",
-            "schema_violations": [{"path": "pipeline", "rule": "oneOf"}],
+            "schema_violations": [
+                {
+                    "path": "pipeline",
+                    "rule": "oneOf",
+                    "detail": "Supply exactly one of source, sources and omit the other key entirely, even as an empty value.",
+                }
+            ],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_json_encoded_pipeline_string_is_rejected_with_a_located_type_violation(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A provider that stringifies the whole document is told so, not handed a bare code.
+
+    Live planners sent ``{"pipeline": "<json text>"}`` and received a
+    ``canonical_schema`` entry with no violation at all, then resent the same
+    string until the repair budget was spent.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": json.dumps(_pipeline(tmp_path))})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
+
+    assert proposal.proposal.repair_count == 1
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    assert feedback["validation"]["errors"] == [
+        {
+            "component": "pipeline",
+            "severity": "high",
+            "error_code": "canonical_schema",
+            "error_class": "SchemaValidationError",
+            "schema_violations": [
+                {
+                    "path": "pipeline",
+                    "rule": "type",
+                    "constraint": "object",
+                    "detail": "pipeline must be a JSON object, not a JSON-encoded string.",
+                }
+            ],
+        }
+    ]
+    # Value-free: nothing from the rejected string is echoed back.
+    assert "metadata" not in completion.requests[1]["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_source_beside_an_empty_sources_map_is_told_which_keys_are_exclusive(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The second live shape: a valid ``source`` plus ``"sources": {}``."""
+    both = _pipeline(tmp_path)
+    both["sources"] = {}
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": both})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
+
+    assert proposal.proposal.repair_count == 1
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    (entry,) = feedback["validation"]["errors"]
+    assert entry["error_code"] == "canonical_schema"
+    assert {
+        "path": "pipeline",
+        "rule": "oneOf",
+        "detail": "Supply exactly one of source, sources and omit the other key entirely, even as an empty value.",
+    } in entry["schema_violations"]
+
+
+def test_exclusive_required_detail_abstains_for_any_other_one_of_shape() -> None:
+    assert pipeline_planner._exclusive_required_detail([{"required": ["a"]}, {"required": ["b"]}]) == (
+        "Supply exactly one of a, b and omit the other key entirely, even as an empty value."
+    )
+    assert pipeline_planner._exclusive_required_detail([{"required": ["a"]}]) is None
+    assert pipeline_planner._exclusive_required_detail([{"required": ["a"]}, {"type": "object"}]) is None
+    assert pipeline_planner._exclusive_required_detail([{"required": ["a", "b"]}, {"required": ["c"]}]) is None
+    assert pipeline_planner._exclusive_required_detail("oneOf") is None
 
 
 def _feedback_result(validation: ValidationSummary, state: CompositionState | None = None) -> ToolResult:
@@ -4380,7 +4470,13 @@ _MISSING_SOURCE_SCHEMA_FEEDBACK = {
                 "severity": "high",
                 "error_code": "canonical_schema",
                 "error_class": "SchemaValidationError",
-                "schema_violations": [{"path": "pipeline", "rule": "oneOf"}],
+                "schema_violations": [
+                    {
+                        "path": "pipeline",
+                        "rule": "oneOf",
+                        "detail": "Supply exactly one of source, sources and omit the other key entirely, even as an empty value.",
+                    }
+                ],
             }
         ],
     },
