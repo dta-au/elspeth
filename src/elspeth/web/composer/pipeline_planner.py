@@ -1963,7 +1963,8 @@ _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES: Final[int] = 48 * 1024
 # The terminal instruction rides every planner request.
 PLANNER_TERMINAL_INSTRUCTION: Final[str] = (
     "Use read-only discovery as needed in earlier turns, then call emit_pipeline_proposal "
-    "alone in its turn with one complete canonical set_pipeline argument object. Never "
+    "alone in its turn with one complete canonical set_pipeline argument object: pipeline is a JSON "
+    "object, never a JSON-encoded string, and carries exactly one of source or sources. Never "
     "batch it with discovery or another call: a mixed terminal batch executes no calls. "
     "After a rejection, repair and resubmit the complete proposal. At any stage, you may instead call "
     "handoff_to_user or restore_parked_graph alone with your message to end authoring and talk to the user. "
@@ -2770,6 +2771,41 @@ def _schema_violation_component_ref(parts: Sequence[Any]) -> str | None:
     return None
 
 
+def _exclusive_required_detail(alternatives: object) -> str | None:
+    """Say which keys a ``oneOf`` of bare ``required`` alternatives chooses between.
+
+    A root ``oneOf`` violation names only ``pipeline``: a candidate carrying
+    both ``source`` and an empty ``sources`` map, or neither, got back a rule
+    name with nothing to repair. The names come from the owned schema's own
+    alternatives, never from the rejected document.
+    """
+    if type(alternatives) is not list or len(alternatives) < 2:
+        return None
+    names: list[str] = []
+    for alternative in alternatives:
+        if type(alternative) is not dict or set(alternative) != {"required"}:
+            return None
+        required = alternative["required"]
+        if type(required) is not list or len(required) != 1 or type(required[0]) is not str:
+            return None
+        names.append(required[0])
+    return "Supply exactly one of " + ", ".join(names) + " and omit the other key entirely, even as an empty value."
+
+
+def _terminal_payload_shape_violations(arguments: Mapping[str, Any]) -> tuple[_SchemaViolation, ...]:
+    """Locate a terminal payload whose ``pipeline`` member is not an object.
+
+    Providers have returned the whole document as one JSON-encoded string. The
+    bare ``canonical_schema`` code gave them nothing to repair, so they resent
+    the same string until the repair budget was spent. The violation is
+    value-free: it names the member, the rule and the expected type only.
+    """
+    violation: _SchemaViolation = {"path": "pipeline", "rule": "type", "constraint": "object"}
+    if type(arguments["pipeline"]) is str:
+        violation["detail"] = "pipeline must be a JSON object, not a JSON-encoded string."
+    return (violation,)
+
+
 def _structural_schema_violations(errors: Iterable[Any]) -> tuple[list[_SchemaViolation], int]:
     """Project JSON-Schema errors into located, value-free repair facts.
 
@@ -2803,6 +2839,10 @@ def _structural_schema_violations(errors: Iterable[Any]) -> tuple[list[_SchemaVi
             constraint = error.validator_value
             if type(constraint) is str or type(constraint) is int:
                 violation["constraint"] = constraint
+            if error.validator == "oneOf":
+                exclusive_detail = _exclusive_required_detail(constraint)
+                if exclusive_detail is not None:
+                    violation["detail"] = exclusive_detail
             violations.append(violation)
     return violations, withheld
 
@@ -4517,7 +4557,7 @@ async def _plan_pipeline_inner(
                 try:
                     payload = _PlannerTerminalPayload.model_validate(deep_thaw(call.arguments))
                 except ValueError:
-                    terminal_feedback = _canonical_schema_feedback()
+                    terminal_feedback = _canonical_schema_feedback(_terminal_payload_shape_violations(call.arguments))
                 else:
                     schema_errors = (
                         [] if payload.pipeline is None else list(canonical_set_pipeline_validator().iter_errors(payload.pipeline))
