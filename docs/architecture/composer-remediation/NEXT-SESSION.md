@@ -93,6 +93,35 @@ not a message defect.
 | B18 | "The model's final reply is unavailable. Please retry your question." appeared as a system note after the Apply turn and stayed in the transcript. Not diagnosed. | same walk, session `e5f0f169` |
 | B19 | After a failed compose and a page reload the tutorial shows no Retry, only "Ask it to continue in the chat" with an empty message box. A pending account is told "Invalid username or password" at sign-in. The audit step shows the run's start time in UTC as if local. It also shows "LLM calls 4" beside a three-row result with no explanation: the fourth is the provider's `runtime_preflight` reachability call. Operator ruling 2026-11-10: explain it in the tutorial's audit-step copy; no systematic change. | same walk |
 
+## Operator rulings, 2026-11-10 (evening)
+
+These settle items that were open below; where they differ, these win.
+
+- **B10, credential-shaped reasoning:** withhold the reasoning and keep the
+  turn, covering Anthropic thinking blocks, with a stored record of each
+  withhold and the assurance pack (F8, EV-227) updated. "Make sure the model
+  has a way out": a refusal on this path must reach the model as feedback it
+  can act on, not end the turn with no route forward.
+- **B1, stringified `pipeline`:** approved. Decode at the provider boundary;
+  it is Tier-3 parsing, consistent with the tiering policy.
+- **B2, `diff_pipeline` baseline:** compare against the last accepted state.
+  Settle the definition of "accepted" with the A2 design.
+- **B17, tutorial:** the tutorial brief asks the Composer to create the
+  failed-rows output as part of the pipeline. `_tutorial_launch_blocker`
+  must admit that output in the same change.
+- **B19:** explain the preflight LLM call in the tutorial's audit-step copy.
+- **Batch plugins:** move `batch_stats`, `batch_replicate` and
+  `batch_experiment_compare` into general availability. Fix B11 in the same
+  patch. When `file_inject` is ready, fold it in as generally available too.
+- **`origin/fix/composer-tool-remediation`:** deletion approved (the
+  lane-assets commit `a1cc53b6d`). Do it once 0.8.12 is on `main`.
+- **`file_inject`** (`origin/claude/happy-cray-mbfmm1`): lands with the next
+  patch, the night of 2026-11-11.
+- **Context budget** (`origin/claude/lucid-lamport-wank6h`, session
+  "4. Hysteresis"): lands Friday 2026-11-13 night or later, depending on
+  progress. It carries a required new setting, so it needs an upgrade note.
+- **0.8.12 and 0.8.11:** pre-approved through to `main`; merge commits.
+
 ## C. Operator decisions outstanding
 
 - Decided 2026-11-10: the three batch plugins (`batch_stats`,
