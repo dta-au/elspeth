@@ -4,9 +4,9 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## Unreleased (0.8.12)
+## Unreleased (0.8.13)
 
-This section records changes intended for 0.8.12. It does not establish
+This section records changes intended for 0.8.13. It does not establish
 qualification, a published tag or an image.
 
 ### Upgrade notes
