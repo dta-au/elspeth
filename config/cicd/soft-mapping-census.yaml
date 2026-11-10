@@ -805,9 +805,10 @@ files:
     Mapping[str, Any]: 2
     dict[str, Any]: 4
   src/elspeth/web/composer/context_budget_apply.py:
+    Mapping[str, Any]: 2
     dict[str, Any]: 6
   src/elspeth/web/composer/context_budget_history.py:
-    Mapping[str, Any]: 2
+    Mapping[str, Any]: 1
   src/elspeth/web/composer/control_messages.py:
     Mapping[str, Any]: 1
   src/elspeth/web/composer/discovery_cache.py:
@@ -885,7 +886,7 @@ files:
   src/elspeth/web/composer/service.py:
     Mapping[str, Any]: 3
     Mapping[str, object]: 1
-    dict[str, Any]: 20
+    dict[str, Any]: 22
   src/elspeth/web/composer/session_tool.py:
     boundary: 1
     dict[str, Any]: 4
@@ -1099,10 +1100,10 @@ files:
   src/elspeth/web/shareable_reviews/service.py:
     dict[str, object]: 1
 totals:
-  Mapping[str, Any]: 795
+  Mapping[str, Any]: 796
   Mapping[str, object]: 317
   MutableMapping[str, Any]: 8
   boundary: 65
-  dict[str, Any]: 1123
+  dict[str, Any]: 1125
   dict[str, object]: 402
-  soft: 2645
+  soft: 2648
