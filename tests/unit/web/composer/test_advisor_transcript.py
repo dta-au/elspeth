@@ -423,12 +423,75 @@ def _transcript_with_history():
     return owner.snapshot().with_request_reference("initial_planner_request.intent")
 
 
-def test_only_events_without_a_content_reference_are_sheddable():
+def test_every_event_but_the_current_request_reference_is_sheddable():
     transcript = _transcript_with_history()
     events = json.loads(transcript.provider_json)["events"]
 
-    assert len(events) == 5 and "content_ref" in events[2]
+    assert len(events) == 5 and events[2]["content_ref"] == "initial_planner_request.intent"
     assert transcript.sheddable_event_indices() == (0, 1, 3, 4)
+
+
+def _legacy_invocation(call_id: str, arguments: dict, result: dict) -> dict:
+    arguments_canonical = json.dumps(arguments, separators=(",", ":"), sort_keys=True)
+    result_canonical = json.dumps(result, separators=(",", ":"), sort_keys=True)
+    return {
+        "tool_call_id": call_id,
+        "tool_name": "get_blob_content",
+        "status": "success",
+        "arguments_canonical": arguments_canonical,
+        "arguments_hash": hashlib.sha256(arguments_canonical.encode()).hexdigest(),
+        "result_canonical": result_canonical,
+        "result_hash": hashlib.sha256(result_canonical.encode()).hexdigest(),
+    }
+
+
+def legacy_history_transcript(*, reference: str | None = "initial_planner_request.intent"):
+    """A forked/legacy history: humans and legacy tool rows whose content is a reference into their own invocation."""
+    sid = uuid4()
+    rows = []
+    for sequence_no, (call_id, body) in enumerate(
+        [("legacy-1", 'Rows: "a","b" \u00e9 \\ ' * 40), ("legacy-2", "Second result \n with a newline " * 30)], start=1
+    ):
+        rows.append(_row(sid, "user", f"Read part {sequence_no}", writer="route_user_message", sequence_no=2 * sequence_no - 1))
+        invocation = _legacy_invocation(call_id, {"blob_id": call_id, "offset": sequence_no}, {"success": True, "data": {"content": body}})
+        rows.append(
+            _row(
+                sid,
+                "tool",
+                invocation["result_canonical"],
+                sequence_no=2 * sequence_no,
+                tool_call_id=call_id,
+                tool_calls=[{"_kind": "audit", "invocation": invocation}],
+            )
+        )
+    current = _row(sid, "user", "Continue", writer="route_user_message", sequence_no=5)
+    history = AdvisorTranscriptHistory.from_records(
+        session_id=str(sid), actor_user_id="actor", current_request_id=str(current.id), request="Continue", records=(*rows, current)
+    )
+    snapshot = AdvisorTranscriptOwner(request="Continue", history=history).snapshot()
+    return snapshot.with_request_reference(reference) if reference is not None else snapshot
+
+
+@pytest.mark.parametrize("reference", [None, "initial_planner_request.intent"], ids=["original-section", "planner-intent"])
+def test_legacy_reference_events_are_sheddable_and_only_the_current_request_reference_is_protected(reference):
+    transcript = legacy_history_transcript(reference=reference)
+    events = json.loads(transcript.provider_json)["events"]
+
+    refs = [event.get("content_ref") for event in events]
+    assert refs == [
+        None,
+        "legacy_invocations[0].result_canonical",
+        None,
+        "legacy_invocations[0].result_canonical",
+        reference or "complete_original_user_request_section",
+    ]
+    # Each legacy reference points inside its own event.
+    assert all(events[index]["legacy_invocations"][0]["result_canonical"] for index in (1, 3))
+    assert transcript.sheddable_event_indices() == (0, 1, 2, 3)
+    reduced = json.loads(transcript.without_events(frozenset({0, 1})).provider_json)["events"]
+    assert reduced == events[2:]
+    with pytest.raises(ValueError, match="sheddable"):
+        transcript.without_events(frozenset({4}))
 
 
 def test_event_bytes_are_each_events_serialization_in_the_transcript_plus_its_separator():

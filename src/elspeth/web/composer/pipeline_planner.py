@@ -3427,7 +3427,8 @@ def _fit_planner_context_budget(
 
     The skill, the reference block, the tools, the request message (except its
     conversation-context entries), the hatch transcript (except its events
-    without a ``content_ref``) and the latest tool round trip are protected.
+    other than the current request's reference) and the latest tool round
+    trip are protected.
     ``messages`` and ``hatch_transcript`` are not changed. Raises the
     ``CONTEXT_BUDGET_EXHAUSTED`` planner error when protected content alone
     exceeds a ceiling.
@@ -4688,7 +4689,9 @@ async def _plan_pipeline_inner(
                 messages.append({"role": "user", "content": _prose_reply_notice()})
                 continue
             if exc.code != "RESPONSE_TRUNCATED":
-                if is_hatch_turn:
+                # A context budget refusal names its own ceiling and component;
+                # it does not stand in for the exhaustion that engaged the hatch.
+                if is_hatch_turn and exc.code != "CONTEXT_BUDGET_EXHAUSTED":
                     trail.finalize_active_exception(exc)
                     assert hatch_error is not None
                     raise hatch_error from None
