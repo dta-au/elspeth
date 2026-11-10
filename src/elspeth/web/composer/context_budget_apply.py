@@ -35,6 +35,14 @@ from elspeth.web.composer.llm_response_parsing import _hash_and_measure_request
 # history may be shed, so an admitted request still fits once re-rendered.
 CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES: Final[int] = 256
 
+# Worst-case bytes rebuilding the escape hatch's transcript without some events
+# can add to a request that the event savings do not count: the
+# ``"oldest_events_omitted_for_context_budget"`` gap with its quotes and
+# separator, as JSON-escaped inside the transcript message's content (46), and
+# the one byte an event's saving over-counts when the transcript's only event
+# is removed. The planner adds it whenever transcript events may be shed.
+CONTEXT_BUDGET_TRANSCRIPT_GAP_ALLOWANCE_BYTES: Final[int] = 64
+
 
 def message_bytes(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> ComposerLLMRequestByteSplit:
     """Measure a request the way its call record will, after detaching prompt-guard keys."""
@@ -110,4 +118,5 @@ def previously_shed_keys(history: ContextBudgetHistory, calls: Iterable[Composer
         if call.context_budget is not None:
             shed.update(f"history:{index}" for index in call.context_budget.shed_history_indices)
             shed.update(f"tool:{tool_call_id}" for tool_call_id in call.context_budget.stubbed_tool_call_ids)
+            shed.update(f"hatch:{index}" for index in call.context_budget.shed_hatch_event_indices)
     return frozenset(shed)

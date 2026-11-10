@@ -11,26 +11,44 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from copy import deepcopy
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from elspeth.contracts.composer_llm_audit import ComposerLLMCall
+from elspeth.contracts.composer_llm_audit import (
+    ComposerContextBudgetRecord,
+    ComposerLLMCall,
+    ComposerLLMCallStatus,
+    ComposerLLMRequestByteSplit,
+)
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttemptOutcome, ComposerPlannerAttemptPhase, ComposerPlannerCode
+from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_CONTENT_PARTS_KEY, detach_prompt_guard_evidence
 from elspeth.core.canonical import canonical_json
+from elspeth.web.composer.advisor_transcript import CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP, AdvisorVisibleTranscript
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.context_budget import CONTEXT_BUDGET_TOOL_RESULT_STUB, ContextBudgetPolicy
-from elspeth.web.composer.context_budget_apply import CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES
+from elspeth.web.composer.context_budget_apply import (
+    CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
+    CONTEXT_BUDGET_TRANSCRIPT_GAP_ALLOWANCE_BYTES,
+    largest_component,
+)
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory
-from elspeth.web.composer.llm_response_parsing import _hash_and_measure_request
+from elspeth.web.composer.llm_response_parsing import _hash_and_measure_request, build_llm_call_record
 from elspeth.web.composer.pipeline_planner import (
+    _HATCH_TRANSCRIPT_HEADER,
     PipelinePlannerError,
     PlannerConversationContext,
     PlannerDeclined,
     PlannerPriorAssistantMessage,
     PlannerPriorUserRequest,
+    _fit_planner_context_budget,
+    _hatch_transcript_message,
+    _planner_context_budget_components,
     _planner_request_message,
     _planner_request_size,
     _PlannerAttemptTrail,
@@ -51,6 +69,7 @@ _ANTHROPIC = "anthropic/claude-planner"
 _UNMARKED = "openai/gpt-planner"
 _FALLBACK_RATIO = 3.0
 _ALLOWANCE = CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES
+_TRANSCRIPT_ALLOWANCE = CONTEXT_BUDGET_TRANSCRIPT_GAP_ALLOWANCE_BYTES
 
 
 def _entry_saving(index: int, content: str) -> int:
@@ -348,9 +367,9 @@ async def test_the_escape_hatch_request_sheds_its_conversation_context_and_keeps
 ) -> None:
     assistants = {1: "a" * 40_000}
     context = _context(users={0: "Convert the data."}, assistants=assistants)
-    measured_completion, measured = await _hatch_run(tmp_path, tool_context, context, None)
-    del measured
+    measured_completion, measured_recorder = await _hatch_run(tmp_path, tool_context, context, None)
     first_bytes, _, hatch_bytes = (_sent_bytes(request) + _ALLOWANCE for request in measured_completion.requests)
+    hatch_bytes += _TRANSCRIPT_ALLOWANCE
     saving = _entry_saving(1, assistants[1])
     policy = _policy_shedding_to(hatch_bytes - saving + 200, shed_to=0.8)
     # Both requests are over the high mark and fit once the assistant message is shed.
@@ -366,12 +385,16 @@ async def test_the_escape_hatch_request_sheds_its_conversation_context_and_keeps
     assert "prior_assistant_messages" not in sent and sent["prior_assistant_messages_omitted"] == 1
     assert sent["prior_user_requests"] == [{"history_index": 0, "content": "Convert the data."}]
     assert "prior_assistant_messages" in _payload(measured_hatch)["conversation_context"]
-    # The hatch transcript and everything after it are not touched by this budget.
+    # Shedding the assistant message is enough: the hatch transcript and everything after it are sent as measured.
     assert len(hatch_request["messages"]) == len(measured_hatch["messages"])
     assert hatch_request["messages"][3]["role"] == "user"
-    assert len(hatch_request["messages"][3]["content"]) == len(measured_hatch["messages"][3]["content"])
+    assert _normalised(hatch_request["messages"][3]["content"], recorder) == _normalised(
+        measured_hatch["messages"][3]["content"], measured_recorder
+    )
+    assert hatch_request["messages"][4] == measured_hatch["messages"][4]
     for call in recorder.llm_calls:
         assert call.context_budget is not None and call.context_budget.shed_history_indices == (1,)
+        assert call.context_budget.shed_hatch_event_indices == ()
 
 
 @pytest.mark.asyncio
@@ -686,3 +709,335 @@ def test_a_context_budget_refusal_settles_an_open_attempt_as_budget_exhaustion()
     (attempt,) = recorder.planner_attempts
     assert attempt.outcome is ComposerPlannerAttemptOutcome.BUDGET_EXHAUSTED
     assert attempt.planner_code is ComposerPlannerCode.CONTEXT_BUDGET_EXHAUSTED
+
+
+# --- The escape hatch's transcript ------------------------------------------------------------
+
+
+def _normalised(content: str, recorder: BufferingRecorder) -> str:
+    """A run's text with its physical call ids replaced, so two runs' transcripts compare by content."""
+    for index, call in enumerate(recorder.llm_calls):
+        content = content.replace(call.call_id, f"physical-call-{index}")
+    return content
+
+
+def _transcript_of(content: str) -> AdvisorVisibleTranscript:
+    """The transcript a hatch message renders, rebuilt from the message content."""
+    assert content.startswith(_HATCH_TRANSCRIPT_HEADER)
+    return AdvisorVisibleTranscript("", "binding", content.removeprefix(_HATCH_TRANSCRIPT_HEADER), "semantic")
+
+
+def _hatch_events(request: dict[str, Any]) -> list[dict[str, Any]]:
+    events = json.loads(_transcript_of(request["messages"][3]["content"]).provider_json)["events"]
+    assert type(events) is list
+    return events
+
+
+@pytest.mark.asyncio
+async def test_the_escape_hatch_sheds_its_oldest_transcript_events_after_assistant_prose(tmp_path: Path, tool_context: ToolContext) -> None:
+    assistants = {1: "a" * 40_000}
+    context = _context(users={0: "Convert the data."}, assistants=assistants)
+    measured_completion, measured_recorder = await _hatch_run(tmp_path, tool_context, context, None)
+    measured_hatch = measured_completion.requests[2]
+    measured_transcript = _transcript_of(_normalised(measured_hatch["messages"][3]["content"], measured_recorder))
+    sheddable = measured_transcript.sheddable_event_indices()
+    event_sizes = measured_transcript.event_bytes()
+    assert len(sheddable) >= 3
+    hatch_bytes = _sent_bytes(measured_hatch) + _ALLOWANCE + _TRANSCRIPT_ALLOWANCE
+    # Shedding the assistant message and the two oldest events lands under the low mark; one fewer does not.
+    target = hatch_bytes - _entry_saving(1, assistants[1]) - event_sizes[sheddable[0]] - event_sizes[sheddable[1]]
+    policy = _policy_shedding_to(target + 30, shed_to=0.8)
+    assert hatch_bytes / _FALLBACK_RATIO > policy.shed_above * policy.max_prompt_tokens
+
+    completion, recorder = await _hatch_run(tmp_path, tool_context, context, policy)
+
+    hatch_request = completion.requests[2]
+    hatch_call = recorder.llm_calls[2]
+    _sent_matches_record(hatch_request, hatch_call)
+    assert hatch_call.context_budget is not None
+    assert hatch_call.context_budget.shed_history_indices == (1,)
+    assert hatch_call.context_budget.shed_hatch_event_indices == sheddable[:2]
+    # The user request was not shed: hatch events go before it.
+    assert _payload(hatch_request)["conversation_context"]["prior_user_requests"] == [{"history_index": 0, "content": "Convert the data."}]
+    # The sent transcript is the measured one without its two oldest events, byte for byte.
+    sent_content = _normalised(hatch_request["messages"][3]["content"], recorder)
+    expected = measured_transcript.without_events(frozenset(sheddable[:2]))
+    assert sent_content == _HATCH_TRANSCRIPT_HEADER + expected.provider_json
+    payload = json.loads(expected.provider_json)
+    assert payload["events"] == json.loads(measured_transcript.provider_json)["events"][2:]
+    assert payload["availability_gaps"][-1] == CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP
+    # Nothing else in the hatch request moved.
+    assert len(hatch_request["messages"]) == len(measured_hatch["messages"])
+    assert hatch_request["messages"][4] == measured_hatch["messages"][4]
+    # The calls before the hatch carry no transcript.
+    for call in recorder.llm_calls[:2]:
+        assert call.context_budget is not None and call.context_budget.shed_hatch_event_indices == ()
+
+
+def _hatch_message(events: list[Any], gaps: list[str]) -> tuple[AdvisorVisibleTranscript, dict[str, Any]]:
+    payload = {"events": events, "availability_gaps": gaps, "current_request_ref": "initial_planner_request.intent", "scope": "s"}
+    transcript = AdvisorVisibleTranscript("", "binding", json.dumps(payload, ensure_ascii=False), "semantic")
+    return transcript, _hatch_transcript_message(transcript)
+
+
+def _request_size(message: dict[str, Any]) -> int:
+    return _planner_request_size(detach_prompt_guard_evidence([message]).messages, [])
+
+
+_AWKWARD_EVENTS: list[Any] = [
+    {"role": "user", "content": 'quotes " and \\ backslashes \\" and \n newlines \t tabs \u0001'},
+    {"role": "tool", "content": "non-ASCII \u00e9\u4e2d\U0001f600 and line separators \u2028\u2029"},
+    {"role": "assistant", "number": 1e20, "small": 1e-7, "nested": {"list": [1, 2.5, None, True]}},
+    {"content_ref": "initial_planner_request.intent", "role": "user"},
+    {"role": "tool", "content": '{"success": true}'},
+]
+
+
+@pytest.mark.parametrize("gaps", [[], ["authenticated_persisted_history_not_supplied"]], ids=["no-gaps", "a-gap"])
+@pytest.mark.parametrize(
+    "events",
+    [_AWKWARD_EVENTS, _AWKWARD_EVENTS[:1], [_AWKWARD_EVENTS[2], _AWKWARD_EVENTS[3]]],
+    ids=["mixed", "single-event", "reference-last"],
+)
+def test_transcript_event_savings_with_the_gap_allowance_never_exceed_the_bytes_shedding_saves(events: list[Any], gaps: list[str]) -> None:
+    """For every prefix the budget can shed, counted savings minus the allowance are at most the bytes actually saved."""
+    transcript, message = _hatch_message(events, gaps)
+    full = _request_size(message)
+    sheddable = transcript.sheddable_event_indices()
+    sizes = transcript.event_bytes()
+    assert sheddable
+    for count in range(1, len(sheddable) + 1):
+        shed = sheddable[:count]
+        reduced = _request_size(_hatch_transcript_message(transcript.without_events(frozenset(shed))))
+        counted = sum(sizes[index] for index in shed)
+        assert counted <= full - reduced + _TRANSCRIPT_ALLOWANCE, (shed, counted, full - reduced)
+
+
+def test_the_transcript_gap_allowance_is_needed() -> None:
+    """Negative control: without the allowance, shedding a lone event over-counts its saving."""
+    transcript, message = _hatch_message(_AWKWARD_EVENTS[:1], [])
+    reduced = _request_size(_hatch_transcript_message(transcript.without_events(frozenset({0}))))
+
+    assert transcript.event_bytes()[0] > _request_size(message) - reduced
+
+
+def test_a_refusal_names_the_transcript_without_the_events_that_could_still_be_shed() -> None:
+    transcript, message = _hatch_message(_AWKWARD_EVENTS, [])
+    sizes = transcript.event_bytes()
+    hatch_sheddable = sum(sizes[index] for index in transcript.sheddable_event_indices())
+    content_bytes = len(message["content"].encode("utf-8"))
+    split = ComposerLLMRequestByteSplit(message_bytes=(10, 20, 30, content_bytes), tools_bytes=5, total_bytes=65 + content_bytes)
+
+    named = _planner_context_budget_components(
+        split, latest_start=None, hatch_transcript_index=3, history_sheddable=0, tool_sheddable=0, hatch_sheddable=hatch_sheddable
+    )
+
+    assert named["transcript"] == content_bytes - hatch_sheddable
+    assert named["other"] == 0
+    assert largest_component(named) == "transcript"
+
+
+def _fit_hatch_request(
+    transcript: AdvisorVisibleTranscript, *, earlier_calls: tuple[ComposerLLMCall, ...], policy: ContextBudgetPolicy | None = None
+) -> tuple[list[dict[str, Any]], ComposerContextBudgetRecord, ContextBudgetPolicy]:
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": "skill"},
+        {"role": "user", "content": "reference"},
+        _planner_request_message({"intent": "Convert the data."}),
+        _hatch_transcript_message(transcript),
+        {"role": "user", "content": "notice"},
+    ]
+    if policy is None:
+        # Between the marks: the request is not over the high mark, but above the low mark.
+        size = _request_size_of(messages) + _TRANSCRIPT_ALLOWANCE
+        policy = _context_policy(max_prompt_tokens=math.ceil(size / _FALLBACK_RATIO / 0.7), max_request_bytes=1_000_000)
+        assert policy.shed_to * policy.max_prompt_tokens < size / _FALLBACK_RATIO <= policy.shed_above * policy.max_prompt_tokens
+    before = deepcopy(messages)
+    applied, record = _fit_planner_context_budget(
+        messages=messages,
+        tools=[],
+        request_conversation_context=None,
+        hatch_transcript_index=3,
+        hatch_transcript=transcript,
+        policy=policy,
+        history=ContextBudgetHistory.empty(),
+        earlier_calls=earlier_calls,
+        mark_for_cache=False,
+    )
+    assert messages == before  # the caller's messages are never shed in place
+    return applied, record, policy
+
+
+def _request_size_of(messages: list[dict[str, Any]]) -> int:
+    return _planner_request_size(detach_prompt_guard_evidence(messages).messages, [])
+
+
+def _earlier_call(shed_keys: tuple[str, ...]) -> ComposerLLMCall:
+    return build_llm_call_record(
+        model_requested="test/advisor",
+        messages=[{"role": "system", "content": "skill"}],
+        tools=None,
+        status=ComposerLLMCallStatus.SUCCESS,
+        started_at=datetime.now(UTC),
+        started_ns=time.monotonic_ns(),
+        temperature=None,
+        seed=None,
+        response=None,
+        context_budget=ComposerContextBudgetRecord.from_shed_keys(
+            policy_hash="a" * 64, bytes_per_token=3.0, estimated_tokens_before=2, estimated_tokens_after=1, shed_keys=shed_keys
+        ),
+    )
+
+
+def test_transcript_events_shed_on_an_earlier_call_of_the_request_stay_shed_between_the_marks() -> None:
+    transcript, _ = _hatch_message(_AWKWARD_EVENTS, ["authenticated_persisted_history_not_supplied"])
+
+    fresh, fresh_record, policy = _fit_hatch_request(transcript, earlier_calls=())
+    sticky, sticky_record, _ = _fit_hatch_request(transcript, earlier_calls=(_earlier_call(("hatch:0", "hatch:1")),), policy=policy)
+
+    assert fresh_record.shed_hatch_event_indices == ()
+    assert fresh[3]["content"] == _HATCH_TRANSCRIPT_HEADER + transcript.provider_json
+    assert sticky_record.shed_hatch_event_indices == (0, 1)
+    assert sticky[3]["content"] == _HATCH_TRANSCRIPT_HEADER + transcript.without_events(frozenset({0, 1})).provider_json
+    # The rebuilt message's prompt-guard parts describe the content it now carries.
+    assert "".join(part.text for part in sticky[3][PROMPT_GUARD_CONTENT_PARTS_KEY]) == sticky[3]["content"]
+
+
+def test_a_hatch_message_that_is_not_the_labelled_transcript_is_a_framework_bug() -> None:
+    transcript, _ = _hatch_message(_AWKWARD_EVENTS, [])
+    other, _ = _hatch_message(_AWKWARD_EVENTS[1:], [])
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": "skill"},
+        {"role": "user", "content": "reference"},
+        _planner_request_message({"intent": "Convert the data."}),
+        _hatch_transcript_message(other),
+    ]
+
+    with pytest.raises(FrameworkBugError, match="transcript"):
+        _fit_planner_context_budget(
+            messages=messages,
+            tools=[],
+            request_conversation_context=None,
+            hatch_transcript_index=3,
+            hatch_transcript=transcript,
+            policy=_context_policy(max_request_bytes=1_000_000),
+            history=ContextBudgetHistory.empty(),
+            earlier_calls=(),
+            mark_for_cache=False,
+        )
+
+
+def _context_budget_refusal(outcome: PipelinePlannerError) -> PipelinePlannerError:
+    """The context budget refusal that ended a run, directly or as the context of the hatch's original exhaustion."""
+    if outcome.code == "CONTEXT_BUDGET_EXHAUSTED":
+        return outcome
+    refusal = outcome.__context__
+    assert type(refusal) is PipelinePlannerError and refusal.code == "CONTEXT_BUDGET_EXHAUSTED", (outcome.code, refusal)
+    return refusal
+
+
+async def _hatch_run_or_refusal(
+    tmp_path: Path, tool_context: ToolContext, policy: ContextBudgetPolicy
+) -> tuple[_ScriptedCompletion, BufferingRecorder, PipelinePlannerError]:
+    """A hatch run under ``policy``; the planner's byte budget is the same ceiling, as in production."""
+    completion = _ScriptedCompletion(
+        _response_with_call_id("state", "get_pipeline_state", {}),
+        _response_with_call_id("sources", "list_sources", {}),
+        _text_response("Please upload the input for JSON conversion."),
+    )
+    recorder = BufferingRecorder()
+    with pytest.raises(PipelinePlannerError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            intent="The latter.",
+            context_policy=policy,
+            budget=_budget(max_request_bytes=policy.max_request_bytes),
+            model_overrides={
+                "model_identifier": _UNMARKED,
+                "max_discovery_turns": 1,
+                "escape_hatch_model": "test/advisor",
+                "escape_hatch_provider": "test-provider",
+            },
+        )
+    return completion, recorder, caught.value
+
+
+@pytest.mark.asyncio
+async def test_a_dispatched_hatch_request_never_exceeds_either_ceiling(tmp_path: Path, tool_context: ToolContext) -> None:
+    """Over ceilings straddling the hatch request after one event is shed, every request is sent within both ceilings or refused unsent."""
+    measured_completion, _ = await _hatch_run(tmp_path, tool_context, None, None)
+    measured_hatch = measured_completion.requests[2]
+    transcript = _transcript_of(measured_hatch["messages"][3]["content"])
+    one_shed = _sent_bytes(measured_hatch) - transcript.event_bytes()[transcript.sheddable_event_indices()[0]]
+    deltas = (-2_000, -400, -10, 0, 10, 100, 400)
+    policies = [_context_policy(max_request_bytes=one_shed + delta) for delta in deltas]
+    policies += [
+        _context_policy(max_prompt_tokens=math.ceil((one_shed + delta) / _FALLBACK_RATIO), max_request_bytes=1_000_000) for delta in deltas
+    ]
+    hatch_sent = 0
+    hatch_shed = 0
+    for policy in policies:
+        completion, recorder, outcome = await _hatch_run_or_refusal(tmp_path, tool_context, policy)
+        # Every dispatched request is the recorded one and fits both ceilings.
+        assert len(completion.requests) == len(recorder.llm_calls)
+        for request, call in zip(completion.requests, recorder.llm_calls, strict=True):
+            _sent_matches_record(request, call)
+            assert _sent_bytes(request) <= policy.max_request_bytes, policy
+            assert call.context_budget is not None
+            assert call.context_budget.estimated_tokens_after <= policy.max_prompt_tokens, policy
+        if type(outcome) is PlannerDeclined:
+            hatch_sent += 1
+            assert completion.requests[2]["model"] == "test/advisor"
+            hatch_record = recorder.llm_calls[2].context_budget
+            assert hatch_record is not None
+            shed_events = hatch_record.shed_hatch_event_indices
+            # Oldest first: what is shed is always a prefix of the sheddable events, so the rest stays contiguous.
+            assert shed_events == transcript.sheddable_event_indices()[: len(shed_events)]
+            hatch_shed += bool(shed_events)
+        else:
+            # Only the budget may refuse, and only before dispatch.
+            _context_budget_refusal(outcome)
+    assert hatch_sent >= len(policies) - 2  # the two tightest ceilings may refuse; the rest are sent
+    assert hatch_shed >= 4  # the ceilings below the full hatch request shed transcript events to send it
+
+
+@pytest.mark.asyncio
+async def test_a_hatch_request_whose_protected_content_cannot_fit_is_refused_after_shedding_every_event(
+    tmp_path: Path, tool_context: ToolContext
+) -> None:
+    """The calls before the hatch are sent; the hatch call cannot fit with its whole transcript shed and is not dispatched.
+
+    The refusal names the largest protected component. With every event shed
+    the transcript is its header and envelope (plus any content-referenced
+    event), far smaller than the catalog reference block, so it is the
+    reference that is named here.
+    """
+    measured_completion, _ = await _hatch_run(tmp_path, tool_context, None, None)
+    measured_hatch = measured_completion.requests[2]
+    transcript = _transcript_of(measured_hatch["messages"][3]["content"])
+    emptied = transcript.without_events(frozenset(transcript.sheddable_event_indices()))
+    assert json.loads(emptied.provider_json)["events"] == []
+    protected_hatch = _sent_bytes(
+        {
+            **measured_hatch,
+            "messages": [
+                *measured_hatch["messages"][:3],
+                {"role": "user", "content": _HATCH_TRANSCRIPT_HEADER + emptied.provider_json},
+                *measured_hatch["messages"][4:],
+            ],
+        }
+    )
+    earlier = max(_sent_bytes(request) for request in measured_completion.requests[:2])
+    cap_bytes = (earlier + protected_hatch) // 2
+    assert earlier <= cap_bytes < protected_hatch
+
+    completion, recorder, outcome = await _hatch_run_or_refusal(tmp_path, tool_context, _context_policy(max_request_bytes=cap_bytes))
+
+    # A failed hatch turn reports the exhaustion that engaged the hatch; the refusal is its context.
+    assert outcome.code == "DISCOVERY_EXHAUSTED"
+    refusal = _context_budget_refusal(outcome)
+    assert refusal.detail_codes == ("context_ceiling_bytes", "largest_component_reference")
+    assert len(completion.requests) == len(recorder.llm_calls) == 2
