@@ -458,8 +458,8 @@ _LEGACY_PLUGIN_UNAVAILABLE_REASONS: Final = (
 _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"diff_baseline_unavailable|No baseline available",
-        "diff_pipeline has nothing to compare against: the session was created without a loaded baseline state.",
-        "Do not retry diff_pipeline in this session. Use get_pipeline_state to read the current state instead.",
+        "This surface supplied no comparison baseline; this does not establish whether saved revisions exist.",
+        "Use get_pipeline_state for the current state. Request a diff again when this surface supplies its comparison baseline.",
     ),
     (
         r"No source configured",
@@ -4681,7 +4681,7 @@ def _execute_diff_pipeline(
         # current version already rides the envelope's ``version``.
         return _saved_graph_rejection_result(
             state,
-            "No baseline available. Load or create a session first.",
+            "No baseline available. This surface supplied no comparison state; saved revisions may still exist.",
             error_code="diff_baseline_unavailable",
             rejected_component=None,
         )
@@ -4701,7 +4701,7 @@ _DIFF_PIPELINE_DECLARATION = ToolDeclaration(
     response_contract=DIFF_PIPELINE_RESPONSE_CONTRACT,
     handler=_execute_diff_pipeline,
     kind=ToolKind.DISCOVERY,
-    description="Compare the current pipeline with the baseline supplied by this surface, which may be the request-start state. "
+    description="Compare with this surface's baseline (Web Composer: request-start state, fixed across provider rounds). "
     "On success `data` carries `from_version` (the baseline; the version it "
     "changed TO is the envelope's own `version`), `sources_changed`, "
     "`metadata_changed`, `total_changes`, `warnings_introduced`, "
