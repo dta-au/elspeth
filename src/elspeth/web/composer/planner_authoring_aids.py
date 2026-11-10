@@ -494,9 +494,10 @@ _GATE_ROUTING_EXEMPLAR_CONTENT: Final[str] = "parcel_id,weight_kg\nP-3001,4\nP-3
 # schemas and source typing from scattered rules on every such request.
 _GATE_ROUTING_RULES: Final[tuple[str, ...]] = (
     "A boolean condition (a comparison, and/or/not) routes on exactly the labels 'true' and 'false'. "
-    "Each route value is a sink_name or a downstream node's input connection.",
+    "Each route value is a sink_name, a downstream node's input connection, fork, or discard.",
     "Declare the compared field's type in the source schema so the source coerces it at ingestion; "
-    "an observed CSV cell is a string. Sinks never coerce: each sink declares the fields and types that arrive.",
+    "an observed CSV cell is a string. Sinks never coerce: each sink declares the fields and types that arrive, "
+    "and a fixed sink refuses any field it does not declare.",
 )
 
 _FORK_ROW_UNION_RULES: Final[tuple[str, ...]] = (
@@ -2701,7 +2702,11 @@ def gate_routing_exemplar_args(
         "source": {
             "plugin": "csv",
             "on_success": "parcels",
-            "options": {"schema": {"mode": "flexible", "fields": list(fields)}},
+            # Fixed on both sides: the source declares every column of its own
+            # rows, so nothing undeclared can reach the fixed sinks. A flexible
+            # source feeding fixed sinks validates and then fails on the first
+            # row that carries an extra column.
+            "options": {"schema": {"mode": "fixed", "fields": list(fields)}},
             "on_validation_failure": "discard",
             "inline_blob": {
                 "filename": "parcels.csv",

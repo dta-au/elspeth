@@ -953,6 +953,9 @@ class TestGateRoutingExemplar:
         # custody's: inline_blob sits beside options and no path is authored.
         source = args["source"]
         assert "weight_kg: int" in source["options"]["schema"]["fields"]
+        # A flexible source feeding fixed sinks validates and then fails at run
+        # time on any undeclared column, so the exemplar is closed on both sides.
+        assert source["options"]["schema"]["mode"] == "fixed"
         assert "path" not in source["options"]
         assert "inline_blob" not in source["options"]
         assert "interpretation_requirements" not in source["options"]
@@ -971,6 +974,61 @@ class TestGateRoutingExemplar:
         candidate = build_set_pipeline_candidate(args, _empty_state(), context)
 
         assert candidate.acceptable is False
+
+    def test_a_discard_route_is_accepted_as_the_rules_say(self, tmp_path: Path) -> None:
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _trained_view()
+        args = planner_authoring_aids.gate_routing_exemplar_args(view)
+        assert args is not None
+        args["nodes"][0]["routes"] = {"true": "freight", "false": "discard"}
+        args["outputs"] = [output for output in args["outputs"] if output["sink_name"] == "freight"]
+        content = args["source"]["inline_blob"]["content"]
+        context = _custody_context(tmp_path, content, view=view, snapshot=snapshot)
+
+        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
+        assert candidate.acceptable is True, f"discard route rejected: {rejection}"
+        rendered = " ".join(planner_authoring_aids._GATE_ROUTING_RULES)
+        assert "a sink_name, a downstream node's input connection, fork, or discard" in rendered
+
+    @pytest.mark.parametrize("generated", [True, False])
+    def test_an_authored_invented_source_row_is_replaced_only_on_generated_rows(self, tmp_path: Path, generated: bool) -> None:
+        """The skill's claim about an authored invented_source row, exercised on both binds."""
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _trained_view()
+        args = planner_authoring_aids.gate_routing_exemplar_args(view)
+        assert args is not None
+        content = args["source"]["inline_blob"]["content"]
+        args["source"]["options"]["interpretation_requirements"] = [
+            {"kind": "invented_source", "user_term": "my_rows", "draft": "I made these"}
+        ]
+        # Content absent from the user's message is planner-generated; content
+        # the message carries is the user's own, bound verbatim.
+        context = _custody_context(tmp_path, "Please make up a few parcels." if generated else content, view=view, snapshot=snapshot)
+        if generated:
+            # A generated bind records which model authored the bytes.
+            context = replace(
+                context,
+                composer_model_identifier="test-model",
+                composer_model_version="test-version",
+                composer_provider="test-provider",
+                composer_skill_hash="0" * 64,
+                tool_arguments_hash="1" * 64,
+            )
+
+        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+
+        assert candidate.acceptable is True
+        (row,) = candidate.result.updated_state.sources["source"].options["interpretation_requirements"]
+        assert row["kind"] == "invented_source"
+        assert row["status"] == "pending"
+        if generated:
+            assert row["user_term"] == "inline_source_data"
+            assert row["draft"] == content
+        else:
+            assert row["user_term"] == "my_rows"
+            assert row["draft"] == "I made these"
 
     def test_authoring_aids_publish_gate_routing_rules_and_exemplar(self) -> None:
         view, _snapshot = _trained_view()
