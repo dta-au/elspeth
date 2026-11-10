@@ -318,13 +318,65 @@ that start many of them, not for long pipelines.
   of samples on the gate workload. Plugin code is 7.5% on the transform
   workload, part of which is finding 9.
 
-## Suggested sequence
+## Master fix list
 
-1 (fence and clock helpers) → 6 → 5 → 1 (remaining repositories) → 4 → 3 →
-re-measure → rulings on 2, 7 and the catalog part of 8.
+Everything found, in the order it should be worked. Nothing here has
+landed; update the status column as items do. "Finding" points at the
+section above; items marked "new" were noticed during the review and are
+described only here. IDs are stable so commits and issues can cite them.
 
-Findings 1, 5 and 6 are independent of each other and of the fences.
-Findings 3 and 4 touch Landscape SQL and locks, so they owe the
+### Ready to fix (no ruling needed)
+
+| ID | Fix | Finding | Scope | Verification | Status |
+|---|---|---|---|---|---|
+| E-1a | Prebuild the fence and clock statements with `bindparam()` | 1 | `database_clock.py`, three functions in `run_coordination_repository.py` | Repository suites; testcontainer (statements run on PostgreSQL); smoke gate | open — prototyped, reverted |
+| E-6a | Memoise `SchemaContract.version_hash()` on the frozen instance | 6 | `contracts/schema_contract.py` | Contract and checkpoint unit suites; pickle/equality unaffected by a non-compared slot | open — prototyped, reverted |
+| E-6b | Stop transforms rebuilding an equal `SchemaContract` per row; retain it per (input contract, transform) | 6 | `plugins/infrastructure/base.py` stamp path | Transform executor and ADR-050 declaration suites | open |
+| E-5 | Skip `update_node_output_contract` once this executor has folded that version hash into that node | 5 | `engine/executors/transform.py` | Executor unit suite with a negative control (a genuinely new contract still writes); smoke gate | open |
+| E-1b | Prebuild the per-row scheduler, node-state and token statements | 1 | `scheduler/{queue,leases,dispositions,events,work_items}.py`, `execution/node_states.py`, `data_flow/tokens.py`; includes `pending_sink_bundle_clause()` | As E-1a; one prebuilt statement per branch shape | open |
+| E-4 | Batch sink-flush lineage loads onto one read-only connection | 4 | `execution/sink_effect_identity.py`, `query_repository.py` | Sink-effect suites; testcontainer; identical `lineage_hash` values before and after | open |
+| E-3a | Return after-images with `RETURNING` instead of selecting them back | 3 | `node_states.py`, `scheduler/dispositions.py`, `scheduler/leases.py`, `scheduler/work_items.py` | Repository suites; testcontainer; every removed read keeps its `rowcount` check and integrity error | open |
+| E-3b | Skip `validate_work_item_references` and the repeated work-item selects when the caller is the ingest verb that just inserted those rows | 3 | `scheduler/queue.py`, `scheduler/work_items.py` | Scheduler suites; standalone callers keep the validation | open |
+| E-9a | Compute the topology hash once per run, not per checkpoint draft | 9 | `orchestrator/checkpointing.py` | Checkpoint suites | open |
+| E-9b | Derive `ValueTransform` declared fields and expression kinds once at construction | 9 | `plugins/transforms/value_transform.py` | Plugin unit suite | open |
+| E-9c | Run the barrier intake poll on the drain's existing connection, or skip it when no barrier node has blocked items | 9 | `engine/barrier_coordination.py`, `scheduler/barrier.py` | Aggregation and coalesce suites | open — mechanism not yet read in full |
+| E-8a | Compute the catalog digest without importing all of litellm | 8 | `plugins/llm/model_catalog.py` | Digest equals the current value on the same litellm version | open |
+| E-8b | Avoid rebuilding the runtime VAL manifest on every CLI start | 8 | `contracts/runtime_val_manifest.py` | Manifest equality; invalidation on a changed tree needs care (compare composer item P-15) | open — design not settled |
+| E-10 | Give engine-internal reads a plain read transaction instead of the `PRAGMA query_only` wrapper built for untrusted SQL | new | `landscape/database.py`, `_database_ops.py` | Confirm the MCP query path keeps the wrapper; testcontainer | open — partly subsumed by E-4 |
+| E-11 | Measure the run-end `token_outcomes … NOT EXISTS (token_parents …)` query at two more run sizes and index or rewrite it if it is super-linear | new | One query; site not yet located | 0.58 s at 1,000 fork/coalesce rows is the only data point | open — measurement first |
+
+### Needs a ruling first
+
+| ID | Decision | Finding | Why it is a decision | Status |
+|---|---|---|---|---|
+| R-2a | Let `_on` verbs accept a fenced-connection witness instead of re-taking the leader fence | 2 | ADR-047 gives raw-connection callers an explicit renewal obligation | not started |
+| R-2b | Make the leader context's post-body renewal conditional on elapsed time | 2 | Deliberate part of the leader context | not started |
+| R-7 | Fold a gate's begin/route/complete/dispose commits, and the complete/dispose pair of any node, into fewer transactions | 7 | Changes what a crash leaves behind; likely an ADR-030 note | not started |
+| R-8 | Record the OpenRouter catalog digest only for pipelines with an LLM node | 8 | Audit column on `runs`; today a CSV-only run is stamped `bundled` | not started |
+| R-12 | Take the fence locks with `SELECT … FOR UPDATE` rather than a no-op `UPDATE` | new | ADR-030 D7 chose the verify-UPDATE form; about eight no-op writes per row land on one hot row, which on PostgreSQL means dead tuples. Inferred from the SQL, not measured | not started |
+| R-13 | Decide whether `node_states.started_at`/`completed_at` should use the Landscape clock | new | `record_completed_node_state_on` uses the process clock while scheduler rows in the same transaction use the database clock; may be correct under ADR-047's scope | not started — confirm it is a defect first |
+
+### Measurement and housekeeping
+
+| ID | Item | Status |
+|---|---|---|
+| M-1 | Repeat the baseline on PostgreSQL (testcontainer) and with a follower worker; the review is SQLite, single process | open |
+| M-2 | Re-measure after E-1a to E-3b and replace the estimates in the findings table with measured figures | open |
+| M-3 | Profile one external-call pipeline (ChaosLLM example) to confirm the overhead here is the floor, not something the call path adds to | open |
+| H-1 | Move the harness from `executor-perf-harness/*.py.txt` to `notes/` as lint-clean `.py` files (that path already allows `print`) | open |
+| H-2 | Commit a generator for the scaled workloads so the 1,000-row inputs are reproducible rather than living in a gitignored lane directory | open |
+
+Outside this review: PR 359's base (`release/0.8.11-candidate`) had moved
+past the commit the 0.8.12 branch was cut from when it was checked (on a
+shallow clone); confirm on a full clone before relying on its CI.
+
+### Order
+
+E-1a → E-6a → E-6b → E-5 → E-1b → E-4 → E-3a → E-3b → M-2 → E-9a/b/c →
+E-8a/b → E-10 → E-11, with the R items raised once M-2 shows what is left.
+
+E-1a, E-5, E-6a and E-6b are independent of each other and of the fences.
+E-3 and E-4 touch Landscape SQL and locks, so they owe the
 testcontainer suite as well as the default one. Every fix should keep the
 smoke gate the composer plan used for engine changes: same exit code, same
 row counts, same sink output digests and the same `node_states`
