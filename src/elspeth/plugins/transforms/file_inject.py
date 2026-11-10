@@ -591,11 +591,11 @@ class FileInject(BaseTransform):
     # WRITES; key_field is the column it reads. Mode 'all' names its written
     # fields per entry, under ``files``, which is not a column-naming option by
     # ``is_column_naming_config_option`` and so needs no classification here.
-    output_naming_config_keys = frozenset({"output_field"})
+    output_naming_config_keys: frozenset[str] = frozenset({"output_field"})
     name = "file_inject"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:095243a6a51d1710"
+    source_file_hash: str | None = "sha256:0ca9eb5c9ba46a72"
     config_model = FileInjectConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -616,10 +616,10 @@ class FileInject(BaseTransform):
     output_field: review_guidance
     files:
       "invoice":
-        content: "Check the totals against the line items.\n"
+        content: "Check the totals against the line items.\\n"
         format: text
       "contract":
-        content: "Check the parties, dates and signatures.\n"
+        content: "Check the parties, dates and signatures.\\n"
         format: text
     on_miss: fail
     schema:
@@ -688,14 +688,15 @@ class FileInject(BaseTransform):
                     "Set format on every entry: text, json, jsonl or csv. It is never inferred from a file name. "
                     "text writes the content as one string, unmodified; json writes the parsed value; jsonl and csv "
                     "write a list, and csv cells remain strings.",
-                    "In the composer, discover an uploaded ready file with list_blobs and get_blob_metadata. "
-                    "Wire it with wire_blob_inline_ref at 'node:<node_id>.options.files.<entry_name>.content', "
-                    "once per entry.",
+                    "In the composer an entry's content must be a file the user uploaded. When the user wants text "
+                    "they have not uploaded, tell them to save it as a file and upload it; attach it only once the "
+                    "upload exists.",
+                    "Then find the ready upload with list_blobs and get_blob_metadata, and attach it with "
+                    "wire_blob_inline_ref at 'node:<node_id>.options.files.<entry_name>.content', once per entry.",
+                    "Do not use create_blob to supply file_inject content, and do not write literal text into "
+                    "content: in the composer neither is accepted for this plugin.",
                     "On the CLI put content_file: <name> under each entry, beside settings.yaml; the loader reads it "
                     "into that entry's content.",
-                    "Only files the user has uploaded can be attached. When the user wants text they have not "
-                    "uploaded, tell them to save it as a file and upload it, then attach that upload. Do not use "
-                    "create_blob as a substitute, and do not paste the text into content yourself.",
                     "An output field must not already exist on the arriving row: file_inject never overwrites, and "
                     "a row that already carries the field is a row error. Pick a new name.",
                     "Every entry is parsed when the configuration is validated, so malformed json, jsonl or csv "

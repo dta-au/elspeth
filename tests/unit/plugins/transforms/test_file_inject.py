@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import pytest
+import yaml
 
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.transforms import file_inject
@@ -285,11 +286,30 @@ def test_agent_assistance_teaches_wiring_and_the_upload_rule() -> None:
     assert assistance is not None
     assert assistance.plugin_name == "file_inject"
     hints = " ".join(assistance.composer_hints)
-    assert "select" in hints and "all" in hints
+    assert "mode: all writes every files entry onto every row" in hints
+    assert "mode: select writes one entry" in hints
     assert "never inferred" in hints
-    assert "wire_blob_inline_ref" in hints
-    assert "node:<node_id>.options.files.<entry_name>.content" in hints
     assert "content_file" in hints
-    assert "upload" in hints
-    assert "create_blob" in hints
+    # The composer path, in the order the planner must follow it.
+    steps = (
+        "tell them to save it as a file and upload it",
+        "find the ready upload with list_blobs and get_blob_metadata",
+        "attach it with wire_blob_inline_ref at 'node:<node_id>.options.files.<entry_name>.content'",
+    )
+    positions = [hints.find(step) for step in steps]
+    assert -1 not in positions, positions
+    assert positions == sorted(positions)
+    assert "Do not use create_blob to supply file_inject content" in hints
+    assert "do not write literal text into content" in hints
     assert FileInject.get_agent_assistance(issue_code="anything") is None
+
+
+def test_example_use_is_yaml_that_builds_the_plugin() -> None:
+    options = yaml.safe_load(FileInject.example_use)["transform"]["options"]
+
+    assert options["files"]["invoice"]["content"] == "Check the totals against the line items.\n"
+    assert options["files"]["contract"]["content"].endswith("signatures.\n")
+    transform = FileInject(options)
+    result = transform.process(make_pipeline_row({"document_kind": "invoice"}), make_source_context())
+    assert result.row is not None
+    assert result.row.to_dict()["review_guidance"] == "Check the totals against the line items.\n"
