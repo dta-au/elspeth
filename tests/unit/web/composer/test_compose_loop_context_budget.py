@@ -1020,6 +1020,15 @@ async def test_a_result_stubbed_on_an_earlier_call_stays_stubbed_in_the_reply_st
         assert (first in selected[5]["content"]) == (not expected)
         assert second in selected[7]["content"]
 
+    # Under the low mark too: the reply-stage request is smaller than the loop's, and a
+    # result stubbed earlier in the turn stays stubbed for the rest of the turn.
+    recorder = SimpleNamespace(llm_calls=(earlier,), invocations=())
+    selected, _tools, record = await _prepare_reply(generous, _two_round_turn(generous, first, second), recorder)
+    assert record.estimated_tokens_before < generous._context_budget_policy.shed_to * generous._context_budget_policy.max_prompt_tokens
+    assert record.stubbed_tool_call_ids == ("call-1",)
+    assert first not in selected[5]["content"] and CONTEXT_BUDGET_TOOL_RESULT_STUB in selected[5]["content"]
+    assert second in selected[7]["content"]
+
 
 # --- The bytes-per-token ratio is the budgeted model's own ---------------------------------------
 
