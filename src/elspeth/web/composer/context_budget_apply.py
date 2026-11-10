@@ -72,6 +72,22 @@ def request_wire_bytes(messages: Sequence[Mapping[str, Any]], tools: Sequence[Ma
     )
 
 
+def message_wire_split(messages: Sequence[Mapping[str, Any]], tools: Sequence[Mapping[str, Any]] | None) -> ComposerLLMRequestByteSplit:
+    """Each message's and the tool block's own wire bytes, for naming a refusal's largest component.
+
+    A message is sized by its whole canonical JSON, so tool-call arguments
+    and thinking blocks count toward the component that carries them, as
+    they do in the measure the decision refused on. The total is the sum of
+    the parts; the few bytes of list framing in :func:`request_wire_bytes`
+    belong to no component.
+    """
+    sizes = tuple(len(canonical_json(message).encode("utf-8")) for message in detach_prompt_guard_messages(messages)[0])
+    tools_bytes = len(canonical_json(list(tools)).encode("utf-8")) if tools is not None else None
+    return ComposerLLMRequestByteSplit(
+        message_bytes=sizes, tools_bytes=tools_bytes, total_bytes=sum(sizes) + (tools_bytes if tools_bytes is not None else 0)
+    )
+
+
 def stubbed_tool_message(message: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of a tool result whose content is the constant stub.
 

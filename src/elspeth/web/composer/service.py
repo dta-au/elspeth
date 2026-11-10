@@ -111,6 +111,7 @@ from elspeth.web.composer.context_budget_apply import (
     largest_component,
     latest_round_trip_start,
     message_bytes,
+    message_wire_split,
     previously_shed_keys,
     request_wire_bytes,
     stubbed_tool_message,
@@ -627,7 +628,12 @@ class _ContextBudgetRefusalScope:
 def _context_budget_component_bytes(
     split: ComposerLLMRequestByteSplit, *, state_index: int, latest_start: int | None, sheddable_bytes: int
 ) -> dict[str, int]:
-    """Name each component of a measured request; ``other`` excludes what could still be shed."""
+    """Name each component of a request sized per message on the wire; ``other`` excludes what could still be shed.
+
+    ``split`` is :func:`message_wire_split`, so an assistant tool-call turn
+    counts with its arguments. ``sheddable_bytes`` is what the decision
+    credited the sheddable segments with.
+    """
     sizes = split.message_bytes
     if latest_start is not None and latest_start <= state_index + 1:
         raise InvariantError("compose-loop tool round precedes the current user message")
@@ -1609,7 +1615,7 @@ class ComposerServiceImpl:
         marked_wire_bytes = request_wire_bytes(marked_messages, marked_tools or None)
         budget_record = replace(budget_record, request_wire_bytes=marked_wire_bytes)
         if marked_wire_bytes > self._context_budget_policy.max_request_bytes:
-            marked_split = message_bytes(marked_messages, marked_tools or None)
+            marked_split = message_wire_split(marked_messages, marked_tools or None)
             kept_history = len(budget_frame.history_entries) - len(budget_record.shed_history_indices)
             raise self._context_budget_refusal(
                 ContextBudgetRefusal(
@@ -1705,7 +1711,7 @@ class ComposerServiceImpl:
             raise self._context_budget_refusal(
                 refusal,
                 _context_budget_component_bytes(
-                    split,
+                    message_wire_split(messages, tools or None),
                     state_index=state_index,
                     latest_start=latest_start,
                     sheddable_bytes=sum(segment.saving_bytes for segment in segments),
