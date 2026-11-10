@@ -179,11 +179,29 @@ def test_valid_preview_call_does_not_claim_valid_pipeline(producer_results):
 
 
 def test_proof_evidence_rejects_unknown_nested_field_and_wrong_count(producer_results):
-    for key, value in (("unpublished", "hidden"), ("observed_header_count", True), ("blob_id", None)):
+    for key, value in (
+        ("unpublished", "hidden"),
+        ("observed_header_count", True),
+        ("selected_record_count", True),
+        ("sample_extra_record_count", "1"),
+        ("all_rows_inspected", 1),
+        ("blob_id", None),
+    ):
         raw = deep_thaw(producer_results["preview_proof"].data)
         raw["proof_diagnostics"][0]["evidence_locator"][key] = value
         with pytest.raises(FrameworkBugError):
             responses.PREVIEW_PIPELINE_RESPONSE_CONTRACT.admit(raw)
+
+
+@pytest.mark.parametrize("count_key", ["selected_record_count", "sample_extra_record_count"])
+def test_preview_contract_preserves_json_warning_and_record_counts(producer_results, count_key):
+    raw = deep_thaw(producer_results["preview_proof"].data)
+    diagnostic = raw["proof_diagnostics"][0]
+    diagnostic["severity"] = "warning"
+    diagnostic["evidence_locator"].update({count_key: 2, "all_rows_inspected": False})
+    admitted = responses.PREVIEW_PIPELINE_RESPONSE_CONTRACT.admit(raw)
+    assert admitted.to_wire() == raw
+    assert admitted.readmit(responses.PREVIEW_PIPELINE_RESPONSE_CONTRACT).to_wire() == raw
 
 
 def test_preview_contract_admits_declared_input_type_budget_evidence(producer_results):

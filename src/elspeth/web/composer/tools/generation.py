@@ -3886,7 +3886,12 @@ def _compute_proof_diagnostics_for_source(
                     code="source_inspection_failed",
                     message="Configured JSON source inspection failed; source options cannot support runtime record selection and field resolution.",
                     suggested_repair="Correct JSON format, data_key, encoding, field_mapping and schema options using get_plugin_schema, then preview again.",
-                    evidence_locator={"blob_id": str(blob_id), "source_plugin": source.plugin, "error_class": type(exc).__name__},
+                    evidence_locator={
+                        "source": "blob",
+                        "blob_id": str(blob_id),
+                        "source_plugin": source.plugin,
+                        "error_class": type(exc).__name__,
+                    },
                 )
             )
             return diagnostics
@@ -4049,6 +4054,7 @@ def _compute_proof_diagnostics_for_source(
                                 ),
                                 suggested_repair="Declare the carried JSON fields or use schema.mode='flexible', then preview again.",
                                 evidence_locator={
+                                    "source": "blob",
                                     "blob_id": str(blob_id),
                                     "selected_record_count": len(extra_rows),
                                     "all_rows_inspected": True,
@@ -4061,6 +4067,7 @@ def _compute_proof_diagnostics_for_source(
                                 "message": "Some sampled JSON records contain undeclared fields and will be discarded; the sample does not prove every row will be lost.",
                                 "suggested_repair": "Inspect the configured record selection and declare its carried fields or use schema.mode='flexible'.",
                                 "evidence_locator": {
+                                    "source": "blob",
                                     "blob_id": str(blob_id),
                                     "sample_extra_record_count": len(extra_rows),
                                     "all_rows_inspected": json_inspection.all_rows_inspected,
