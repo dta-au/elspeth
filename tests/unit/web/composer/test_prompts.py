@@ -1623,6 +1623,12 @@ class TestHotPathAuthoringFacts:
 
         assert "`inline_blob` sits on `source` beside `options`, never inside it" in flattened
         assert "you need not author `guaranteed_fields`" in flattened
+        # contracts/schema.py: only REQUIRED declared fields are implicitly guaranteed.
+        from elspeth.contracts.schema import SchemaConfig
+
+        assert "Non-optional fields declared under `fixed`/`flexible` are guaranteed" in flattened
+        declared = SchemaConfig.from_dict({"mode": "flexible", "fields": ["kept: str", "maybe: str?"]})
+        assert declared.get_effective_guaranteed_fields() == frozenset({"kept"})
         assert "omits or substitutes any part of the request, say so first in your reply and in `metadata.description`" in flattened
         assert "if the missing part is the request's core operation, decline with the named gap instead" in flattened
 

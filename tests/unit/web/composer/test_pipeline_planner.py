@@ -281,12 +281,15 @@ _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES = 188
 # +2,624 B: boolean route labels, source coercion spellings, declared-field
 # guarantees, sink typing and the inline_blob position in the capability core,
 # plus a worked source -> gate -> two sinks exemplar with two rules in the
-# authoring aids (the exemplar is most of the growth). Price only the 3,481 B
+# authoring aids (the gate_routing aid is 1,812 B of it: the request measures
+# 137,412 B with that aid withheld). Qualifying the guarantee sentence to
+# non-optional fields then measures 139,224 B, +13 B. Price only the 3,494 B
 # excess over the prior 135,730 B pin, keeping zero new headroom and the
-# exact-boundary / +1-byte overflow control. NOT YET OPERATOR-RULED: this allowance follows the 2026-10-18
+# exact-boundary / +1-byte overflow control. If the gate_routing aid is
+# declined, the value is 1,682. NOT YET OPERATOR-RULED: this allowance follows the 2026-10-18
 # direction on justified guidance growth and is flagged for the maintainer in
 # docs/architecture/composer-remediation/reports/skill-rework-report.md.
-_SKILL_REWORK_0812_CANONICAL_BYTES = 3481
+_SKILL_REWORK_0812_CANONICAL_BYTES = 3494
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
